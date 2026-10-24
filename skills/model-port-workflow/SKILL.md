@@ -94,6 +94,14 @@ same family-owned schedule. Record construction-time chunk overrides and
 separate their BF16 numerical evidence from decode-attention changes. A 2 GiB
 allocator-cache limit is separate from live KV memory.
 
+MiniCPM5's prepared request also owns its resolved attention mode. Automatic
+exact attention covers compiled requests with 16384–65536 prompt tokens and
+1–128 output tokens; other requests use buckets. Preserve construction-time
+overrides, replace callable/profile state when modes or exact geometry change,
+and invalidate both on preparation failure. Test same-capacity transitions on
+the actual model. Exact-width graph preparation does not imply every Metal
+pipeline is warm; report cold preparation and BF16 trajectory differences.
+
 Ordinary asynchronous text decode can use `LlmTrait::token_sequence` while the
 shared loop retains publication, EOS, budget and cancellation. Compiled Qwen3
 and ordinary MiniCPM5 share the MLX cursor in `mlx_decode.rs`; graph construction

@@ -19,15 +19,108 @@ struct LocalMath {
     rope: Compiled,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodeAttention {
     Bucketed,
     Exact,
 }
 
+enum DecodeAttentionPolicy {
+    Auto,
+    Bucketed,
+    Exact,
+}
+
+impl DecodeAttentionPolicy {
+    fn from_override(value: Option<&std::ffi::OsStr>) -> Self {
+        match value {
+            None => Self::Auto,
+            Some(value) if value == "1" => Self::Exact,
+            Some(_) => Self::Bucketed,
+        }
+    }
+
+    fn resolve(&self, variant: Variant, prompt: usize, output: usize) -> DecodeAttention {
+        if variant != Variant::Compiled {
+            return DecodeAttention::Bucketed;
+        }
+        match self {
+            Self::Exact => DecodeAttention::Exact,
+            Self::Auto if (16384..=65536).contains(&prompt) && (1..=128).contains(&output) => {
+                DecodeAttention::Exact
+            }
+            _ => DecodeAttention::Bucketed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod attention_policy_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn automatic_attention_is_bounded_by_request_geometry_and_variant() {
+        let policy = DecodeAttentionPolicy::from_override(None);
+        for (prompt, output, expected) in [
+            (16383, 128, DecodeAttention::Bucketed),
+            (16384, 0, DecodeAttention::Bucketed),
+            (16384, 1, DecodeAttention::Exact),
+            (16384, 128, DecodeAttention::Exact),
+            (16384, 129, DecodeAttention::Bucketed),
+            (65536, 128, DecodeAttention::Exact),
+            (65537, 128, DecodeAttention::Bucketed),
+        ] {
+            assert_eq!(policy.resolve(Variant::Compiled, prompt, output), expected);
+            for variant in [Variant::Public, Variant::DSpark] {
+                assert_eq!(
+                    policy.resolve(variant, prompt, output),
+                    DecodeAttention::Bucketed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_attention_override_preserves_existing_semantics() {
+        let exact = DecodeAttentionPolicy::from_override(Some(OsStr::new("1")));
+        assert_eq!(
+            exact.resolve(Variant::Compiled, 1, 0),
+            DecodeAttention::Exact
+        );
+        assert_eq!(
+            exact.resolve(Variant::Compiled, 16384, 256),
+            DecodeAttention::Exact
+        );
+        assert_eq!(
+            exact.resolve(Variant::Public, 16384, 128),
+            DecodeAttention::Bucketed
+        );
+        for value in ["0", "", "true", "invalid"] {
+            let policy = DecodeAttentionPolicy::from_override(Some(OsStr::new(value)));
+            assert_eq!(
+                policy.resolve(Variant::Compiled, 16384, 128),
+                DecodeAttention::Bucketed
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_override_selects_bucketed_attention() {
+        use std::os::unix::ffi::OsStrExt;
+        let policy = DecodeAttentionPolicy::from_override(Some(OsStr::from_bytes(&[0xff])));
+        assert_eq!(
+            policy.resolve(Variant::Compiled, 16384, 128),
+            DecodeAttention::Bucketed
+        );
+    }
+}
+
 struct PreparedRequest {
     prefill: PrefillPlan,
     output: usize,
+    attention: DecodeAttention,
     positions: HashMap<usize, Array>,
 }
 
@@ -43,7 +136,7 @@ pub struct MiniCpm5 {
     local: Option<LocalMath>,
     swiglu: Compiled,
     step: Option<Compiled>,
-    attention: DecodeAttention,
+    attention_policy: DecodeAttentionPolicy,
     prepared: Option<PreparedRequest>,
     states: Vec<Array>,
     capacity: usize,
@@ -88,13 +181,9 @@ impl MiniCpm5 {
         };
         let swiglu =
             Compiled::with_shapeless(stream, 1, true, |a| Ok(vec![math::swiglu(&a[0], &a[1])?]))?;
-        let attention = if variant == Variant::Compiled
-            && std::env::var("APXINF_MINICPM5_EXACT_ATTN").as_deref() == Ok("1")
-        {
-            DecodeAttention::Exact
-        } else {
-            DecodeAttention::Bucketed
-        };
+        let attention_policy = DecodeAttentionPolicy::from_override(
+            std::env::var_os("APXINF_MINICPM5_EXACT_ATTN").as_deref(),
+        );
         Ok(Self {
             backend,
             weights: Rc::new(weights),
@@ -107,7 +196,7 @@ impl MiniCpm5 {
             local,
             swiglu,
             step: None,
-            attention,
+            attention_policy,
             prepared: None,
             states: Vec::new(),
             capacity: 0,
@@ -128,6 +217,7 @@ impl MiniCpm5 {
                 // No partially built or unsuccessfully warmed plan is ready.
                 // The next request must reset and complete preparation again.
                 self.prepared = None;
+                self.step = None;
                 self.failure = Some(error.to_string());
                 Err(error)
             }
@@ -136,6 +226,7 @@ impl MiniCpm5 {
 
     fn prepare_inner(&mut self, prompt: usize, output: usize) -> Result<()> {
         let capacity = self.config.request_capacity(self.variant, prompt, output)?;
+        let attention = self.attention_policy.resolve(self.variant, prompt, output);
         if self.capacity == capacity
             && self
                 .prepared
@@ -151,7 +242,14 @@ impl MiniCpm5 {
                 "reset before changing MiniCPM request preparation",
             ));
         }
-        if self.attention == DecodeAttention::Exact {
+        let reuse_bucket = attention == DecodeAttention::Bucketed
+            && self.capacity == capacity
+            && !self.states.is_empty()
+            && self
+                .prepared
+                .as_ref()
+                .is_some_and(|p| p.attention == DecodeAttention::Bucketed);
+        if !reuse_bucket {
             self.step = None;
             self.prepared = None;
         }
@@ -177,7 +275,7 @@ impl MiniCpm5 {
             self.capacity = capacity;
         }
         if self.step.is_none() && self.variant != Variant::Public {
-            self.step = Some(self.compile_step()?);
+            self.step = Some(self.compile_step(attention)?);
         }
         // Warm shape-dependent RoPE traces used by prefill. Norm and SwiGLU
         // are shapeless; changed request values are never captured.
@@ -219,7 +317,7 @@ impl MiniCpm5 {
             } else {
                 1
             };
-            let (first, last, stride) = match self.attention {
+            let (first, last, stride) = match attention {
                 DecodeAttention::Exact => (prompt, prompt + output.saturating_sub(1), 1),
                 DecodeAttention::Bucketed => (
                     attention_width(self.variant, prompt, capacity),
@@ -235,17 +333,14 @@ impl MiniCpm5 {
                     for rows in 1..=max_rows {
                         let tokens =
                             Array::from_i32(self.backend.stream(), &[1, rows], &vec![0; rows])?;
-                        let position = if self.attention == DecodeAttention::Exact {
+                        let position = if attention == DecodeAttention::Exact {
                             width - 1
                         } else {
                             0
                         };
                         let args =
                             self.step_inputs(tokens, position, rows, &self.states, &key_positions)?;
-                        if self.attention == DecodeAttention::Exact
-                            && width != first
-                            && width != last
-                        {
+                        if attention == DecodeAttention::Exact && width != first && width != last {
                             step.prepare_trace(&args)?;
                         } else {
                             step.prepare(&args)?;
@@ -263,6 +358,7 @@ impl MiniCpm5 {
         self.prepared = Some(PreparedRequest {
             prefill,
             output,
+            attention,
             positions,
         });
         Ok(())
@@ -304,7 +400,7 @@ impl MiniCpm5 {
         Ok(args)
     }
 
-    fn compile_step(&self) -> Result<Compiled> {
+    fn compile_step(&self, attention: DecodeAttention) -> Result<Compiled> {
         let stream = self.backend.stream();
         let packed = Rc::new(PackedResidualRmsNorm::new(
             stream,
@@ -313,7 +409,7 @@ impl MiniCpm5 {
         let weights = self.weights.clone();
         let eps = self.epsilon.clone();
         let tapped = self.variant == Variant::DSpark;
-        let exact = self.attention == DecodeAttention::Exact;
+        let exact = attention == DecodeAttention::Exact;
         Compiled::new(stream, 85 + usize::from(tapped), move |a| {
             let rows = a[0].shape()[1];
             let width = a[4].shape()[0];
@@ -542,16 +638,20 @@ impl MiniCpm5 {
         let compiled =
             position > 0 && (rows == 1 || (self.variant == Variant::DSpark && rows <= 8));
         let positions = if self.step.is_some() && compiled {
-            let width = match self.attention {
+            let prepared = self
+                .prepared
+                .as_ref()
+                .ok_or(Error::Contract("MiniCPM request was not prepared"))?;
+            let width = match prepared.attention {
                 DecodeAttention::Exact => position + rows,
                 DecodeAttention::Bucketed => {
                     attention_width(self.variant, position + rows, self.capacity)
                 }
             };
             Some(
-                self.prepared
-                    .as_ref()
-                    .and_then(|p| p.positions.get(&width))
+                prepared
+                    .positions
+                    .get(&width)
                     .ok_or(Error::Contract("MiniCPM attention width was not prepared"))?
                     .clone(),
             )
