@@ -73,6 +73,17 @@ its explicit `dspark` variant adds the compiled draft chain and target
 verification schedule. Use the exact scope/profile table in `doc/mlx-backend.md`.
 None of these is CUDA Graph replay or evidence for an unrelated model family.
 
+Qwen3 `bf16-compiled` prepares one BF16 weight array for every norm site,
+including the final norm, and uses native weighted RMSNorm with BF16 activations.
+The private prepared dtype selects arithmetic through the existing compiled
+array slots. Public and MixedW8 retain FP32 weights and ordered FP32 norm math.
+Require numerical and full-model performance qualification for a replacement
+that changes rounding. Check every prepared norm category and
+keep the tiny public/compiled trajectory assertions unchanged. Record all
+short-token differences and enforce each language's external teacher floor
+before accepting full-model performance results. Compare frozen reference and
+candidate binaries with the same inputs and policies.
+
 MiniCPM5 compiled prefill uses native weighted RMSNorm with existing BF16
 weights. In pinned MLX 0.32.3, the Metal kernel rounds the normalized value to
 BF16 before multiplying the BF16 weight, preserving this family's rounding

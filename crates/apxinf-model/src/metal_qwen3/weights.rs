@@ -164,12 +164,16 @@ impl Weights {
         let q = config.num_attention_heads * config.head_dim;
         let kv = config.num_key_value_heads * config.head_dim;
         let mixed = variant == Variant::MixedW8;
+        let norm_dtype = if variant == Variant::Bf16Compiled {
+            MlxDType::BF16
+        } else {
+            MlxDType::F32
+        };
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
             let p = format!("model.layers.{i}");
             let mut norm = |suffix: &str, size: usize| -> Result<Array> {
-                take(&mut map, &format!("{p}.{suffix}.weight"), &[size], stream)?
-                    .cast(MlxDType::F32)
+                take(&mut map, &format!("{p}.{suffix}.weight"), &[size], stream)?.cast(norm_dtype)
             };
             let input_norm = norm("input_layernorm", h)?;
             let post_norm = norm("post_attention_layernorm", h)?;
@@ -252,7 +256,7 @@ impl Weights {
             stream.eval(&[embedding.clone(), output.clone()])?;
             Table::Bf16 { embedding, output }
         };
-        let final_norm = take(&mut map, "model.norm.weight", &[h], stream)?.cast(MlxDType::F32)?;
+        let final_norm = take(&mut map, "model.norm.weight", &[h], stream)?.cast(norm_dtype)?;
         // An unexpected tensor can indicate a biased, hybrid or quantized model.
         if !map.is_empty() {
             let mut names: Vec<_> = map.keys().cloned().collect();
