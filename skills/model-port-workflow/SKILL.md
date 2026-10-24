@@ -73,6 +73,16 @@ its explicit `dspark` variant adds the compiled draft chain and target
 verification schedule. Use the exact scope/profile table in `doc/mlx-backend.md`.
 None of these is CUDA Graph replay or evidence for an unrelated model family.
 
+MiniCPM5 compiled prefill uses native weighted RMSNorm with existing BF16
+weights. In pinned MLX 0.32.3, the Metal kernel rounds the normalized value to
+BF16 before multiplying the BF16 weight, preserving this family's rounding
+boundary. Check the pinned implementation and operand dtypes before replacing
+an ordered norm. Operator naming alone does not establish interchangeability.
+Keep Public and DSpark ordered normalization and packed decode normalization
+unchanged. Require full-model numerical checks and paired performance gates
+for such replacements. Check real short and long outputs,
+external-teacher agreement, and request-state behavior before accepting results.
+
 Long-context preparation distinguishes total request capacity from active
 attention width. Qwen3 admits 40960 total positions, ordinary MiniCPM5 65792,
 and DSpark retains 4096. Keep short BF16 shapes and rounding boundaries intact;
