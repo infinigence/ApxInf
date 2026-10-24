@@ -512,9 +512,34 @@ impl Qwen3Model {
             &[len],
             &tokens.iter().map(|&id| id as i32).collect::<Vec<_>>(),
         )?;
+        let (output, pending) = self.run_graph(&ids, end, emit_logits)?;
+        let output = output
+            .map(|array| self.backend.from_array(array))
+            .transpose()?;
+        let mut required = Vec::with_capacity(pending.len() * 2 + 1);
+        if let Some(output) = &output {
+            required.push(self.backend.array(output)?);
+        }
+        required.extend(
+            pending
+                .iter()
+                .flat_map(|kv| [kv.keys.clone(), kv.values.clone()]),
+        );
+        self.backend.stream().eval(&required)?;
+        Ok((output, pending))
+    }
+
+    fn run_graph(
+        &mut self,
+        ids: &Array,
+        end: usize,
+        emit_logits: bool,
+    ) -> Result<(Option<Array>, Vec<KvState>)> {
+        let s = self.backend.stream();
+        let len = ids.numel();
         let mut x = self
             .weights
-            .embed(&ids)?
+            .embed(ids)?
             .reshape(&[1, len, self.config.hidden_size])?;
         let index = Array::from_i32(s, &[1], &[self.position as i32])?;
         let cos = self
@@ -569,21 +594,10 @@ impl Qwen3Model {
                 .weights
                 .project(&self.normalized(&x, &self.weights.final_norm)?)?
                 .reshape(&[len, self.config.vocab_size])?;
-            Some(self.backend.from_array(logits)?)
+            Some(logits)
         } else {
             None
         };
-        let mut required = Vec::with_capacity(pending.len() * 2 + 1);
-        if let Some(output) = &output {
-            required.push(self.backend.array(output)?);
-        }
-        required.extend(
-            pending
-                .iter()
-                .flat_map(|kv| [kv.keys.clone(), kv.values.clone()]),
-        );
-        s.eval(&required)?;
-        // Stream::eval includes stream synchronization and exception checking.
         Ok((output, pending))
     }
 
@@ -633,7 +647,81 @@ impl Qwen3Model {
     }
 }
 
+impl crate::mlx_decode::DeviceDecode for Qwen3Model {
+    fn stream(&self) -> &Stream {
+        self.backend.stream()
+    }
+    fn decode(&mut self, token: &Array) -> Result<Array> {
+        if self.invalid.is_some() || self.position >= self.capacity {
+            return Err(err("Qwen3 decode requires valid prepared capacity"));
+        }
+        let end = self.position + 1;
+        match self.run_graph(token, end, true) {
+            Ok((Some(logits), pending)) => {
+                self.kv = pending;
+                self.position = end;
+                Ok(logits)
+            }
+            Ok(_) => Err(err("missing Qwen3 decode logits")),
+            Err(error) => {
+                self.invalid = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+    fn kv_outputs(&self) -> Vec<Array> {
+        self.kv
+            .iter()
+            .flat_map(|kv| [kv.keys.clone(), kv.values.clone()])
+            .collect()
+    }
+    fn finish_decode(&mut self, outcome: crate::mlx_decode::DecodeFinish) -> Result<()> {
+        if let Err(error) = self.backend.stream().synchronize() {
+            self.invalid = Some(error.to_string());
+            return Err(error);
+        }
+        match outcome {
+            crate::mlx_decode::DecodeFinish::PublishedPosition(position)
+                if self.invalid.is_none()
+                    && position <= self.position
+                    && self.position - position <= 1 =>
+            {
+                self.position = position;
+                Ok(())
+            }
+            crate::mlx_decode::DecodeFinish::Invalidated => {
+                self.invalid
+                    .get_or_insert_with(|| "greedy request failed or was abandoned".into());
+                Ok(())
+            }
+            _ => {
+                self.invalid = Some("invalid greedy rollback position".into());
+                Err(err("invalid Qwen3 greedy rollback position"))
+            }
+        }
+    }
+}
+
 impl LlmTrait for Qwen3Model {
+    fn token_sequence<'a>(
+        &'a mut self,
+        first: Tensor,
+        sampler: Box<dyn apxinf_core::TokenSampler>,
+        params: &apxinf_core::TokenSamplingParams,
+        prompt_end: u32,
+    ) -> Result<Box<dyn crate::llm_trait::TokenSequence + 'a>> {
+        if self.variant == Variant::Bf16Compiled && crate::mlx_decode::enabled(params) {
+            let first = self.backend.array(&first)?;
+            Ok(Box::new(crate::mlx_decode::GreedySequence::new(
+                self, first, prompt_end,
+            )?))
+        } else {
+            Ok(Box::new(crate::llm_trait::SyncTokenSequence::new(
+                self, first, sampler, prompt_end,
+            )))
+        }
+    }
+
     fn preparation_status(&self) -> TextPreparationStatus {
         let implementation_ready = match self.variant {
             Variant::Bf16Public => true,

@@ -25,6 +25,8 @@ pub mod musa_pi05;
 pub mod metal_qwen_image;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3_tts;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+mod mlx_decode;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
@@ -58,9 +60,9 @@ pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingM
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
 pub use llama::{GeneralLlama, KVCache, LlamaModel, LlamaWeights, TransformerLayer};
 pub use llm_trait::{
-    generate_streaming, generate_streaming_with_options, GeneratedToken, GenerationOutput,
-    GenerationRequest, ImageInput, LlmCapabilities, LlmInput, LlmTrait, TextCompilationScope,
-    TextPreparationState, TextPreparationStatus,
+    generate_streaming, generate_streaming_with_options, GeneratedToken, GenerationCancellation,
+    GenerationOutput, GenerationRequest, ImageInput, LlmCapabilities, LlmInput, LlmTrait,
+    TextCompilationScope, TextPreparationState, TextPreparationStatus,
 };
 pub use pi05::{Pi05Config, Pi05PerformanceProfile};
 pub use profiling::GenerationProfile;

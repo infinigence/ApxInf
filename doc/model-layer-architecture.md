@@ -59,6 +59,15 @@ return its final `[1, vocab_size]` row. The common sampler selects the last row
 through `NextTokenLogits::last`; specialized schedules such as DSpark override
 the request-level generation hook without weakening `forward`.
 
+The optional `LlmTrait::token_sequence` hook changes token production while the
+shared driver retains publication, EOS, budget and cancellation. Its default is
+synchronous. `mlx_decode.rs` owns the one-step greedy cursor used by compiled
+Qwen3 and MiniCPM5; each family builds its own lazy step and drains/trims its KV.
+The backend owns array operations and greedy selection, not the request schedule.
+`LoadedModel::generate_streaming_cancellable` accepts a sticky
+`GenerationCancellation` handle. Cancellation is cooperative at token boundaries;
+DSpark's specialized schedule rejects this new entry explicitly.
+
 `decision.rs` defines the non-generative Decision category and two request
 protocols. A family implements the one it supports, and loading wraps it in
 `DecisionModel`, so `LoadedModel::Decision` states the protocol at load time.

@@ -54,6 +54,14 @@ may admit bounded chunk shapes without admitting a full prompt-sized forward;
 report those actual shapes in `preparation_status`. Specialized speculative
 generation belongs to the request-level hook.
 
+For asynchronous ordinary decode, opt into `token_sequence` and retain the
+shared publication/EOS/cancellation loop. Keep public `forward` synchronous.
+Test one-step lookahead, discarded EOS work, cancellation, position restoration,
+error cleanup and the synchronous fallback through `LoadedModel`. With P prompt
+tokens and N published tokens, the retained position is P+N.saturating_sub(1).
+The MLX cursor in `mlx_decode.rs` is shared model-layer scheduling; family KV
+and graph construction remain local.
+
 A small model commonly starts with:
 
 ```text
