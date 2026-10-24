@@ -21,6 +21,18 @@ struct LocalMath {
     rope: Compiled,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeAttention {
+    Bucketed,
+    Exact,
+}
+
+struct PreparedDecode {
+    prompt: usize,
+    output: usize,
+    positions: HashMap<usize, Array>,
+}
+
 pub struct MiniCpm5 {
     pub(crate) backend: MlxBackend,
     pub(crate) weights: Rc<Weights>,
@@ -32,13 +44,13 @@ pub struct MiniCpm5 {
     local: Option<LocalMath>,
     swiglu: Compiled,
     step: Option<Compiled>,
-    decode_positions: HashMap<usize, Array>,
+    attention: DecodeAttention,
+    prepared: Option<PreparedDecode>,
     states: Vec<Array>,
     capacity: usize,
     pub(crate) offset: usize,
     pub(crate) last_taps: Option<Array>,
     failure: Option<String>,
-    prepared_prompt: Option<usize>,
 }
 
 impl MiniCpm5 {
@@ -69,6 +81,13 @@ impl MiniCpm5 {
         };
         let swiglu =
             Compiled::with_shapeless(stream, 1, true, |a| Ok(vec![math::swiglu(&a[0], &a[1])?]))?;
+        let attention = if variant == Variant::Compiled
+            && std::env::var("APXINF_MINICPM5_EXACT_ATTN").as_deref() == Ok("1")
+        {
+            DecodeAttention::Exact
+        } else {
+            DecodeAttention::Bucketed
+        };
         Ok(Self {
             backend,
             weights: Rc::new(weights),
@@ -80,17 +99,19 @@ impl MiniCpm5 {
             local,
             swiglu,
             step: None,
-            decode_positions: HashMap::new(),
+            attention,
+            prepared: None,
             states: Vec::new(),
             capacity: 0,
             offset: 0,
             last_taps: None,
             failure: None,
-            prepared_prompt: None,
         })
     }
 
-    /// Prepare one bounded native KV capacity and warm the actual decode path.
+    /// Prepare bounded KV capacity and all admitted decode graph profiles.
+    /// Exact attention evaluates endpoint profiles and traces interior profiles.
+    /// Bucketed attention evaluates every prepared profile.
     /// All changing tokens, positions and K/V are explicit compiled arguments.
     pub fn prepare(&mut self, prompt: usize, output: usize) -> Result<()> {
         match self.prepare_inner(prompt, output) {
@@ -98,7 +119,7 @@ impl MiniCpm5 {
             Err(error) => {
                 // No partially built or unsuccessfully warmed plan is ready.
                 // The next request must reset and complete preparation again.
-                self.prepared_prompt = None;
+                self.prepared = None;
                 self.failure = Some(error.to_string());
                 Err(error)
             }
@@ -108,7 +129,10 @@ impl MiniCpm5 {
     fn prepare_inner(&mut self, prompt: usize, output: usize) -> Result<()> {
         let capacity = self.config.request_capacity(self.variant, prompt, output)?;
         if self.capacity == capacity
-            && self.prepared_prompt == Some(prompt)
+            && self
+                .prepared
+                .as_ref()
+                .is_some_and(|p| p.prompt == prompt && p.output == output)
             && self.failure.is_none()
             && !self.states.is_empty()
         {
@@ -119,10 +143,14 @@ impl MiniCpm5 {
                 "reset before changing MiniCPM request preparation",
             ));
         }
+        if self.attention == DecodeAttention::Exact {
+            self.step = None;
+            self.prepared = None;
+        }
         if self.capacity != capacity || self.states.is_empty() {
             self.states.clear();
             self.step = None;
-            self.decode_positions.clear();
+            self.prepared = None;
             self.capacity = 0;
             let stream = self.backend.stream();
             let (cos, sin) = math::tables(stream, capacity)?;
@@ -137,14 +165,11 @@ impl MiniCpm5 {
                 )?);
             }
             stream.eval(&states)?;
-            let step = if self.variant == Variant::Public {
-                None
-            } else {
-                Some(self.compile_step()?)
-            };
             self.states = states;
             self.capacity = capacity;
-            self.step = step;
+        }
+        if self.step.is_none() && self.variant != Variant::Public {
+            self.step = Some(self.compile_step()?);
         }
         // Warm shape-dependent RoPE traces used by prefill. Norm and SwiGLU
         // are shapeless; changed request values are never captured.
@@ -170,6 +195,11 @@ impl MiniCpm5 {
             let activation = Array::zeros(self.backend.stream(), &[1, rows, 6144], MlxDType::BF16)?;
             self.swiglu.prepare(&[activation.clone(), activation])?;
         }
+        let mut positions = self
+            .prepared
+            .take()
+            .map(|p| p.positions)
+            .unwrap_or_default();
         if let Some(step) = &self.step {
             // Shape-specialized DSpark verification warms all admitted row counts.
             let max_rows = if self.variant == Variant::DSpark {
@@ -177,28 +207,52 @@ impl MiniCpm5 {
             } else {
                 1
             };
-            let first = attention_width(self.variant, prompt, capacity);
+            let (first, last, stride) = match self.attention {
+                DecodeAttention::Exact => (prompt, prompt + output.saturating_sub(1), 1),
+                DecodeAttention::Bucketed => (
+                    attention_width(self.variant, prompt, capacity),
+                    capacity,
+                    256,
+                ),
+            };
             let mut width = first;
             loop {
-                if !self.decode_positions.contains_key(&width) {
-                    let positions =
+                if !positions.contains_key(&width) {
+                    let key_positions =
                         Array::arange(self.backend.stream(), 0., width as f32, 1., MlxDType::I32)?;
                     for rows in 1..=max_rows {
                         let tokens =
                             Array::from_i32(self.backend.stream(), &[1, rows], &vec![0; rows])?;
-                        let args = self.step_inputs(tokens, 0, rows, &self.states, &positions)?;
-                        step.prepare(&args)?;
+                        let position = if self.attention == DecodeAttention::Exact {
+                            width - 1
+                        } else {
+                            0
+                        };
+                        let args =
+                            self.step_inputs(tokens, position, rows, &self.states, &key_positions)?;
+                        if self.attention == DecodeAttention::Exact
+                            && width != first
+                            && width != last
+                        {
+                            step.prepare_trace(&args)?;
+                        } else {
+                            step.prepare(&args)?;
+                        }
                     }
-                    self.decode_positions.insert(width, positions);
+                    positions.insert(width, key_positions);
                 }
-                if width == capacity {
+                if width == last {
                     break;
                 }
-                width = (width + 256).min(capacity);
+                width = (width + stride).min(last);
             }
         }
         self.failure = None;
-        self.prepared_prompt = Some(prompt);
+        self.prepared = Some(PreparedDecode {
+            prompt,
+            output,
+            positions,
+        });
         Ok(())
     }
 
@@ -247,10 +301,15 @@ impl MiniCpm5 {
         let weights = self.weights.clone();
         let eps = self.epsilon.clone();
         let tapped = self.variant == Variant::DSpark;
+        let exact = self.attention == DecodeAttention::Exact;
         Compiled::new(stream, 85 + usize::from(tapped), move |a| {
             let rows = a[0].shape()[1];
             let width = a[4].shape()[0];
-            let mask = math::causal_mask(&a[4], &a[1], rows)?;
+            let mask = if exact && rows == 1 {
+                None
+            } else {
+                Some(math::causal_mask(&a[4], &a[1], rows)?)
+            };
             let mut x = weights.embedding.take(&a[0], 0)?;
             let mut delta: Option<Array> = None;
             let mut states = Vec::with_capacity(84);
@@ -300,7 +359,7 @@ impl MiniCpm5 {
                         &values.slice_axis(2, 0, width)?,
                         128f32.powf(-0.5),
                         false,
-                        Some(&mask),
+                        mask.as_ref(),
                     )?
                     .transpose(&[0, 2, 1, 3])?
                     .reshape(&[1, rows, 2048])?;
@@ -430,10 +489,10 @@ impl MiniCpm5 {
                 "invalid MiniCPM tokens, position, or context",
             ));
         }
-        if self.states.is_empty() || self.prepared_prompt.is_none() {
+        if self.states.is_empty() || self.prepared.is_none() {
             return Err(Error::Contract("prepare MiniCPM before inference"));
         }
-        let prompt = self.prepared_prompt.unwrap();
+        let prompt = self.prepared.as_ref().unwrap().prompt;
         let admitted = if prompt > DSPARK_CONTEXT_CAPACITY && position < prompt {
             position % PREFILL_CHUNK == 0 && ids.len() == PREFILL_CHUNK.min(prompt - position)
         } else if position == 0 {
@@ -464,18 +523,34 @@ impl MiniCpm5 {
 
     fn run_graph(&mut self, tokens: Array, position: usize, last_only: bool) -> Result<Vec<Array>> {
         let rows = tokens.numel();
-        let previous = std::mem::take(&mut self.states);
         let compiled =
             position > 0 && (rows == 1 || (self.variant == Variant::DSpark && rows <= 8));
+        let positions = if self.step.is_some() && compiled {
+            let width = match self.attention {
+                DecodeAttention::Exact => position + rows,
+                DecodeAttention::Bucketed => {
+                    attention_width(self.variant, position + rows, self.capacity)
+                }
+            };
+            Some(
+                self.prepared
+                    .as_ref()
+                    .and_then(|p| p.positions.get(&width))
+                    .ok_or(Error::Contract("MiniCPM attention width was not prepared"))?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let previous = std::mem::take(&mut self.states);
         let output = match (&self.step, compiled) {
-            (Some(step), true) => {
-                let width = attention_width(self.variant, position + rows, self.capacity);
-                let positions = self
-                    .decode_positions
-                    .get(&width)
-                    .ok_or(Error::Contract("MiniCPM attention width was not prepared"))?;
-                step.call(&self.step_inputs(tokens, position, rows, &previous, positions)?)?
-            }
+            (Some(step), true) => step.call(&self.step_inputs(
+                tokens,
+                position,
+                rows,
+                &previous,
+                positions.as_ref().unwrap(),
+            )?)?,
             _ => self.eager(&tokens, position, last_only, &previous)?,
         };
         drop(previous);
@@ -509,8 +584,7 @@ impl crate::mlx_decode::DeviceDecode for MiniCpm5 {
         self.backend.stream()
     }
     fn decode(&mut self, token: &Array) -> Result<Array> {
-        if self.failure.is_some() || self.offset >= self.capacity || self.prepared_prompt.is_none()
-        {
+        if self.failure.is_some() || self.offset >= self.capacity || self.prepared.is_none() {
             return Err(Error::Contract(
                 "MiniCPM decode requires valid prepared capacity",
             ));
@@ -575,8 +649,7 @@ impl LlmTrait for MiniCpm5 {
     }
 
     fn preparation_status(&self) -> TextPreparationStatus {
-        let ready =
-            self.failure.is_none() && self.prepared_prompt.is_some() && !self.states.is_empty();
+        let ready = self.failure.is_none() && self.prepared.is_some() && !self.states.is_empty();
         let mut scopes = Vec::new();
         let mut lengths = Vec::new();
         let max_rows = if self.variant == Variant::DSpark {
@@ -590,7 +663,7 @@ impl LlmTrait for MiniCpm5 {
                 scopes.push(TextCompilationScope::DecodeStep);
             }
             lengths.extend(1..=max_rows);
-            lengths.extend(prefill_lengths(self.prepared_prompt.unwrap()));
+            lengths.extend(prefill_lengths(self.prepared.as_ref().unwrap().prompt));
             lengths.sort_unstable();
             lengths.dedup();
         }
@@ -609,7 +682,7 @@ impl LlmTrait for MiniCpm5 {
                 Variant::DSpark => "dspark-target",
             }),
             compiled_scopes: scopes,
-            prepared_prompt_tokens: if ready { self.prepared_prompt } else { None },
+            prepared_prompt_tokens: self.prepared.as_ref().filter(|_| ready).map(|p| p.prompt),
             prepared_sequence_lengths: lengths,
             kv_capacity: (self.capacity > 0).then_some(self.capacity),
             max_decode_rows: ready.then_some(max_rows),
@@ -651,7 +724,7 @@ impl LlmTrait for MiniCpm5 {
             return Err(Error::Contract("MiniCPM5 is text-only"));
         }
         if self.offset != 0
-            || self.prepared_prompt != Some(input.token_ids.len())
+            || self.prepared.as_ref().map(|p| p.prompt) != Some(input.token_ids.len())
             || input.token_ids.is_empty()
             || input
                 .token_ids

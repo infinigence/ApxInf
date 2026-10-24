@@ -236,8 +236,12 @@ capture instead of fabricating a no-op graph.
 The current text implementations select compiled execution through explicit
 family variants and fallible family `prepare` methods. `Compiled` owns the pure
 Rust callback; `call` is lazy and `call_and_eval` completes all returned arrays.
-Preparation uses `Compiled::prepare`, which evaluates twice and rejects any
-Rust trace callback on the second invocation. Callable construction rejects
+`Compiled::prepare` evaluates twice and rejects any Rust trace callback on the
+second invocation. `Compiled::prepare_trace` checks graph reuse without evaluation.
+The experimental MiniCPM5 exact-attention path evaluates its first and last
+widths and uses graph-only preparation for intermediate widths. Their first
+device evaluation can still compile shaders and allocate buffers; cold-request
+timing includes that work. Callable construction rejects
 the presence of `MLX_DISABLE_COMPILE`, even when its value is `0`; that MLX
 setting otherwise disables compilation silently. The reuse check observes
 Rust tracing, not all native shader compilation.
@@ -264,7 +268,7 @@ norm/RoPE kernel is not proof that full-step compilation was assessed.
 | --- | --- |
 | Construct | Bind device/runtime identity, weights, public semantics and supported profiles |
 | Prepare | Validate structural contracts; materialize immutable weights; create kernels/closures; trace/compile/warm supported profiles; establish memory bounds |
-| Run | Check live operands; bind explicit state; call the prepared closure; enqueue device work without retracing, retuning or creating persistent resources |
+| Run | Check live operands; bind explicit state; call the prepared closure without new Rust graph traces; include deferred device JIT/allocation in cold timing when preparation was graph-only |
 | Complete | Evaluate required outputs and new state on the correct stream; publish state only after successful completion |
 | Reset / invalidate | Make old request state unreachable; preserve retained resources or invalidate dependents before replacing them |
 | Release | Retain resources until dependent asynchronous work is complete; release partial preparations on failure |

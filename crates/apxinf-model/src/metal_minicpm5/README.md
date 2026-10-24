@@ -46,6 +46,17 @@ rounded to 256 tokens, with unwritten positions masked. Capacity at most 4096
 retains the original attention shape. The actual decode buckets are prepared
 before inference; crossing a bucket does not retrace the compiled step.
 
+The default-off `APXINF_MINICPM5_EXACT_ATTN=1` experiment selects exact KV
+views without a mask for ordinary compiled one-row decode. Public and DSpark
+paths keep their existing attention. Preparation owns the prompt, output
+budget and exact width profiles together; changing that geometry replaces the
+compiled graph. The first and last widths are evaluated during preparation;
+intermediate widths receive graph-only preparation. This verifies Rust trace
+reuse, not every Metal pipeline's warm state. Cold-request measurements include
+remaining device compilation and allocation. Direct forward calls beyond the
+prepared prompt/output profile are rejected. This experiment changes BF16
+attention rounding and is not a qualified default.
+
 On a 16 GiB host, BF16 KV uses
 `2 * 42 layers * 2 KV heads * 128 channels * 2 bytes = 42 KiB/token`.
 At 65536 tokens the live cache is 2.625 GiB. The extra 256-token capacity bucket

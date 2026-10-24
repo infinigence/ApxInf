@@ -79,6 +79,29 @@ fn preparation_verifies_replay_once_per_profile() -> Result<()> {
 }
 
 #[test]
+fn trace_preparation_defers_evaluation_and_reuses_each_shape_with_changed_values() -> Result<()> {
+    let s = Stream::cpu()?;
+    let compiled = Compiled::new(&s, 1, |a| Ok(vec![a[0].add(&a[0])?]))?;
+    for values in [&[1., 2.][..], &[3., 4., 5.][..]] {
+        let input = Array::from_f32(&s, &[values.len()], values)?;
+        compiled.prepare_trace(&[input])?;
+    }
+    let prepared = s.counters();
+    assert_eq!(prepared.eval_calls, 0);
+    assert!(prepared.trace_callbacks > 0);
+    for values in [&[10., 20.][..], &[30., 40., 50.][..]] {
+        let input = Array::from_f32(&s, &[values.len()], values)?;
+        let output = compiled.call_and_eval(&[input])?;
+        assert_eq!(s.counters().trace_callbacks, prepared.trace_callbacks);
+        assert_eq!(
+            output[0].to_f32_vec()?,
+            values.iter().map(|x| 2. * x).collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn upload_views_dtype_and_owned_lifetime() -> Result<()> {
     let s = Stream::cpu()?;
     let a = Array::from_f32(&s, &[2, 3], &[1., 2., 3., 4., 5., 6.])?;
