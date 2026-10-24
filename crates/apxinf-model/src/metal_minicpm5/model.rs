@@ -268,14 +268,8 @@ impl MiniCpm5 {
             let (cos, sin) = math::tables(stream, capacity)?;
             self.cos = cos;
             self.sin = sin;
-            let mut states = Vec::with_capacity(84);
-            for _ in 0..84 {
-                states.push(Array::zeros(
-                    stream,
-                    &[1, 2, capacity, 128],
-                    MlxDType::BF16,
-                )?);
-            }
+            let zero = Array::zeros(stream, &[1, 2, capacity, 128], MlxDType::BF16)?;
+            let states = vec![zero; 84];
             stream.eval(&states)?;
             self.states = states;
             self.capacity = capacity;

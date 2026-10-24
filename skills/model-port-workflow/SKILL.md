@@ -108,6 +108,12 @@ BF16 defaults to 1024 above 4096 prompt tokens. Other variants retain their
 512-token default. Family environment overrides remain captured at construction.
 Derive preparation, row admission and execution from the same family plan.
 
+MiniCPM5 shares one initial zero array across its 84 KV slots. Preserve separate
+changing compiled arguments and per-layer outputs. Validate replay with different
+nonzero KV after aliased preparation, retained outputs, reset/reprepare and
+physical memory. Sharing initial zeros does not reduce the required live KV
+of an executed request.
+
 Long-context preparation distinguishes total request capacity from active
 attention width. Qwen3 admits 40960 total positions, ordinary MiniCPM5 65792,
 and DSpark retains 4096. Keep short BF16 shapes and rounding boundaries intact;

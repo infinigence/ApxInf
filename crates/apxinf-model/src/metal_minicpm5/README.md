@@ -36,6 +36,12 @@ decode with the fixed packed residual/norm kernel. Every new KV array and output
 is evaluated before the request state is published; failed preparation cannot
 be reported ready. Changing prepared capacity requires a reset.
 
+Initial allocation gives all 84 K/V slots one shared immutable BF16 zero array.
+This applies to Public, Compiled and DSpark. Each layer's functional update
+returns its own K/V values; compiled inputs and outputs keep separate slots.
+Reset retains the current KV and restores only the logical position. It does
+not restore the initial zero array.
+
 `LlmTrait::forward` always returns `[input_tokens, vocabulary]` logits.
 Generation `prefill` consumes prompts up to 4096 tokens in the original shape.
 Longer prompts use 1024-token chunks in compiled mode and 512 in public mode,

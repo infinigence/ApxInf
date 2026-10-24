@@ -204,6 +204,11 @@ rotation, shape validation and device indexing. The family still supplies
 explicit Q/K and table operands and owns normalization, positions and KV updates.
 Prefill and the fresh first-token path keep their local RoPE composition.
 
+MiniCPM5 owns initial KV allocation in `model.rs`. Public, Compiled and DSpark
+initialize their 84 slots from one immutable BF16 zero array. Functional updates
+produce the per-layer KV values. Reset retains current KV and resets the
+logical position.
+
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
 separately migrated; do not rename or import them as part of an unrelated port.
