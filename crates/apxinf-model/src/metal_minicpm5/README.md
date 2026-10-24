@@ -77,6 +77,13 @@ Only greedy sampling without penalties/log-probability is currently implemented
 by the native backend. Unsupported sampling requests fail explicitly. DSpark is
 an explicit selection with a separately pinned drafter; it is never the default.
 
+Ordinary compiled BF16 generation uses device greedy IDs and one-step async
+lookahead. `APXINF_MLX_SYNC_DECODE=1` selects the synchronous fallback; public
+`forward` remains synchronous. EOS/cancellation drain and trim unused work.
+`LoadedModel::generate_streaming_cancellable` returns the published prefix;
+the new cancellation entry is unsupported for DSpark. Async failures invalidate
+state and require reset/preparation.
+
 Source adaptations and MIT notices are recorded in the repository `NOTICE`.
 Select the target and drafter explicitly through the public CLI:
 

@@ -1,10 +1,14 @@
 //! Common LLM trait for all model implementations.
 
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use apxinf_core::{
     Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSampler, TokenSamplingInit,
-    TokenSamplingSpec,
+    TokenSamplingParams, TokenSamplingSpec,
 };
 use apxinf_loader::ModelConfig;
 use serde::Serialize;
@@ -172,6 +176,83 @@ impl GenerationOutput {
     }
 }
 
+/// Cooperative cancellation. A cancelled handle stays cancelled; use a new
+/// handle for a new request. An in-flight token read can publish one last token.
+#[derive(Clone, Default)]
+pub struct GenerationCancellation(Arc<AtomicBool>);
+
+impl GenerationCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Request-owned token production. The shared driver owns publication and stops.
+#[doc(hidden)]
+pub trait TokenSequence {
+    /// May submit one successor before reading the current token.
+    fn next(&mut self, lookahead: bool) -> Result<GeneratedToken>;
+    /// Drain work and restore the state corresponding to the published prefix.
+    fn finish(self: Box<Self>, published: usize) -> Result<()>;
+    fn overlaps_callbacks(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) struct SyncTokenSequence<'a, M: LlmTrait + ?Sized> {
+    model: &'a mut M,
+    sampler: Box<dyn TokenSampler>,
+    first: Option<Tensor>,
+    previous: Option<GeneratedToken>,
+    position: u32,
+}
+
+impl<'a, M: LlmTrait + ?Sized> SyncTokenSequence<'a, M> {
+    pub(crate) fn new(
+        model: &'a mut M,
+        first: Tensor,
+        sampler: Box<dyn TokenSampler>,
+        position: u32,
+    ) -> Self {
+        Self {
+            model,
+            sampler,
+            first: Some(first),
+            previous: None,
+            position,
+        }
+    }
+}
+
+impl<M: LlmTrait + ?Sized> TokenSequence for SyncTokenSequence<'_, M> {
+    fn next(&mut self, _lookahead: bool) -> Result<GeneratedToken> {
+        let logits = if let Some(first) = self.first.take() {
+            first
+        } else {
+            let logits = self
+                .model
+                .forward(&[self.previous.unwrap().token_id], self.position)?;
+            self.position += 1;
+            logits
+        };
+        let sample = self
+            .sampler
+            .sample(NextTokenLogits::last(&logits, self.model.vocab_size())?)?;
+        let token = GeneratedToken {
+            token_id: sample.token_id,
+            logprob: sample.logprob,
+        };
+        self.previous = Some(token);
+        Ok(token)
+    }
+    fn finish(self: Box<Self>, _published: usize) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Common interface for all LLM implementations.
 pub trait LlmTrait {
     /// Load model weights and configure for the given device.
@@ -272,6 +353,38 @@ pub trait LlmTrait {
         Self: Sized,
     {
         generate_streaming_with_options(self, request, on_token)
+    }
+
+    /// Request-owned producer; the default preserves synchronous sampling.
+    #[doc(hidden)]
+    fn token_sequence<'a>(
+        &'a mut self,
+        first: Tensor,
+        sampler: Box<dyn TokenSampler>,
+        _params: &TokenSamplingParams,
+        prompt_end: u32,
+    ) -> Result<Box<dyn TokenSequence + 'a>> {
+        Ok(Box::new(SyncTokenSequence::new(
+            self, first, sampler, prompt_end,
+        )))
+    }
+
+    /// Cooperative cancellation through the same shared publication loop.
+    fn generate_streaming_cancellable_dyn(
+        &mut self,
+        request: GenerationRequest<'_>,
+        cancel: &GenerationCancellation,
+        on_token: &mut dyn FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        let options = request.options.resolve()?;
+        if cancel.is_cancelled() {
+            return Ok(empty_generation_output(request.input.token_ids.len(), GenerationProfile::new()));
+        }
+        generate_streaming_with_resolved_options(self, request.input, &options, |event| {
+            if cancel.is_cancelled() { return Ok(false); }
+            if let GenerationBoundary::Token(token) = event { on_token(token); }
+            Ok(!cancel.is_cancelled())
+        })
     }
 
     /// Ergonomic, statically typed streaming entrypoint. Models that replace
