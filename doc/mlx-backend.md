@@ -59,8 +59,9 @@ combinations fail at construction with an explicit error.
 `LlmTrait::forward` retains its full `[seq_len, vocab_size]` logits contract.
 The generation-oriented `prefill(LlmInput)` hook may consume the whole prompt
 and return only `[1, vocab_size]`. Qwen3 uses cache-only prefix chunks of at
-most 512 by default followed by a final-token forward; MiniCPM5 uses 512-token chunks above
-4096 prompt tokens and projects the final normalized row of each chunk.
+most 2048 in compiled BF16 mode followed by a final-token forward. MiniCPM5
+uses 1024-token chunks above 4096 prompt tokens in compiled mode and projects
+the last row of the final chunk. Other variants retain the 512-token default.
 Experimental family-specific `APXINF_QWEN3_PREFILL_CHUNK` and
 `APXINF_MINICPM5_PREFILL_CHUNK` overrides select 512/1024/2048 at construction.
 Each family derives preparation and execution from the same private range plan;

@@ -286,7 +286,12 @@ impl MiniCpm5 {
         // are shapeless; changed request values are never captured.
         let prefill = PrefillPlan::new(
             prompt,
-            self.prefill_chunk.unwrap_or(PrefillChunk::Tokens512),
+            self.prefill_chunk
+                .unwrap_or(if self.variant == Variant::Compiled {
+                    PrefillChunk::Tokens1024
+                } else {
+                    PrefillChunk::Tokens512
+                }),
         )?;
         let lengths = prefill.required_rows();
         for &rows in &lengths {
