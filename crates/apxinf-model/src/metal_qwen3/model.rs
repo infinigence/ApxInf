@@ -344,7 +344,12 @@ impl Qwen3Model {
     fn prefill_plan(&self, prompt: usize) -> Result<PrefillPlan> {
         PrefillPlan::new(
             prompt,
-            self.prefill_chunk.unwrap_or(PrefillChunk::Tokens512),
+            self.prefill_chunk
+                .unwrap_or(if self.variant == Variant::Bf16Compiled {
+                    PrefillChunk::Tokens2048
+                } else {
+                    PrefillChunk::Tokens512
+                }),
         )
     }
 

@@ -73,12 +73,14 @@ session until reset. Outputs own immutable array handles; a later forward/reset
 does not overwrite earlier results.
 
 Generation `prefill` follows the source schedule: consume all but the last token
-in chunks of at most 512, evaluating only updated KV; then consume the last
+in chunks of at most 2048 for `bf16-compiled`, evaluating only updated KV;
+then consume the last
 token and return `[1,vocab_size]`. The chunk head is never evaluated. The shared
 generation driver uses this hook, while `forward` continues
 to return every row. All prompt chunk shapes are warmed by `prepare`.
 The experimental `APXINF_QWEN3_PREFILL_CHUNK` override accepts 512, 1024 or
-2048 and is captured at construction; the default remains 512. A family-local
+2048 and is captured at construction. Public and MixedW8 default to 512;
+compiled BF16 defaults to 2048. A family-local
 plan supplies the same prefix ranges to preparation and execution. Existing
 prepared-row admission for public `forward` remains unchanged.
 

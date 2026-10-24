@@ -94,6 +94,11 @@ unchanged. Require full-model numerical checks and paired performance gates
 for such replacements. Check real short and long outputs,
 external-teacher agreement, and request-state behavior before accepting results.
 
+Qwen3 compiled BF16 defaults to 2048-token prefill chunks; MiniCPM5 compiled
+BF16 defaults to 1024 above 4096 prompt tokens. Other variants retain their
+512-token default. Family environment overrides remain captured at construction.
+Derive preparation, row admission and execution from the same family plan.
+
 Long-context preparation distinguishes total request capacity from active
 attention width. Qwen3 admits 40960 total positions, ordinary MiniCPM5 65792,
 and DSpark retains 4096. Keep short BF16 shapes and rounding boundaries intact;
