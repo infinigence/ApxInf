@@ -21,6 +21,14 @@ value is cast to BF16 before multiplication by the BF16 affine weight. NeoX RoPE
 retains the separate BF16 products and sum. Public SwiGLU remains compiled as in
 the source runtime, including the `bf16-public` selection.
 
+Compiled prefill uses native weighted RMSNorm with the existing BF16 weights.
+The pinned [MLX 0.32.3 Metal kernel](https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/backend/metal/kernels/rms_norm.metal)
+rounds the normalized value to BF16 before multiplying the BF16 weight.
+Public and DSpark keep the ordered expression. Compiled decode keeps its
+packed residual/norm. Short-token, external-teacher and eight long logits/state
+checks match the unweighted path. Five clean 1K blocks give a median total-time
+ratio of 0.9961 against that path; the complete MLX matrix remains pending.
+
 `model.rs` owns the forward order, per-request position/KV, precomputed position
 tables, and pure compiled decode function. `bf16-public` is the ordered reference
 composition. `bf16-compiled` selects local norm/RoPE compilation and whole-step
