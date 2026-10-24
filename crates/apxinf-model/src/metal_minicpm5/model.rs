@@ -446,50 +446,52 @@ impl MiniCpm5 {
                 "MiniCPM input shape is outside its prepared prompt/decode profile",
             ));
         }
-        let previous = std::mem::take(&mut self.states);
         let result = (|| {
-            let ids = ids.iter().map(|&v| v as i32).collect::<Vec<_>>();
-            let tokens = Array::from_i32(self.backend.stream(), &[1, ids.len()], &ids)?;
-            let compiled = position > 0
-                && (ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8));
-            let output = match (&self.step, compiled) {
-                (Some(step), true) => {
-                    let width = attention_width(self.variant, position + ids.len(), self.capacity);
-                    let positions = self
-                        .decode_positions
-                        .get(&width)
-                        .ok_or(Error::Contract("MiniCPM attention width was not prepared"))?;
-                    step.call(&self.step_inputs(
-                        tokens,
-                        position,
-                        ids.len(),
-                        &previous,
-                        positions,
-                    )?)?
-                }
-                _ => self.eager(&tokens, position, last_only, &previous)?,
-            };
-            drop(previous);
+            let tokens = Array::from_i32(
+                self.backend.stream(),
+                &[1, ids.len()],
+                &ids.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+            )?;
+            let output = self.run_graph(tokens, position, last_only)?;
             self.backend.stream().eval(&output)?;
-            Ok::<_, Error>(output)
+            Ok::<_, Error>(self.install_output(output, position + ids.len()))
         })();
-        match result {
-            Ok(mut output) => {
-                let logits = output.remove(0);
-                self.last_taps = if self.variant == Variant::DSpark {
-                    output.pop()
-                } else {
-                    None
-                };
-                self.states = output;
-                self.offset = position + ids.len();
-                Ok(logits)
-            }
-            Err(e) => {
-                self.failure = Some(e.to_string());
-                Err(e)
-            }
+        if let Err(error) = &result {
+            self.failure = Some(error.to_string());
         }
+        result
+    }
+
+    fn run_graph(&mut self, tokens: Array, position: usize, last_only: bool) -> Result<Vec<Array>> {
+        let rows = tokens.numel();
+        let previous = std::mem::take(&mut self.states);
+        let compiled =
+            position > 0 && (rows == 1 || (self.variant == Variant::DSpark && rows <= 8));
+        let output = match (&self.step, compiled) {
+            (Some(step), true) => {
+                let width = attention_width(self.variant, position + rows, self.capacity);
+                let positions = self
+                    .decode_positions
+                    .get(&width)
+                    .ok_or(Error::Contract("MiniCPM attention width was not prepared"))?;
+                step.call(&self.step_inputs(tokens, position, rows, &previous, positions)?)?
+            }
+            _ => self.eager(&tokens, position, last_only, &previous)?,
+        };
+        drop(previous);
+        Ok(output)
+    }
+
+    fn install_output(&mut self, mut output: Vec<Array>, end: usize) -> Array {
+        let logits = output.remove(0);
+        self.last_taps = if self.variant == Variant::DSpark {
+            output.pop()
+        } else {
+            None
+        };
+        self.states = output;
+        self.offset = end;
+        logits
     }
 
     pub(crate) fn trim_to(&mut self, position: usize) -> Result<()> {
@@ -502,7 +504,79 @@ impl MiniCpm5 {
     }
 }
 
+impl crate::mlx_decode::DeviceDecode for MiniCpm5 {
+    fn stream(&self) -> &apxinf_mlx::Stream {
+        self.backend.stream()
+    }
+    fn decode(&mut self, token: &Array) -> Result<Array> {
+        if self.failure.is_some() || self.offset >= self.capacity || self.prepared_prompt.is_none()
+        {
+            return Err(Error::Contract(
+                "MiniCPM decode requires valid prepared capacity",
+            ));
+        }
+        let result = self.run_graph(
+            token.cast(MlxDType::I32)?.reshape(&[1, 1])?,
+            self.offset,
+            false,
+        );
+        match result {
+            Ok(output) => Ok(self.install_output(output, self.offset + 1)),
+            Err(error) => {
+                self.failure = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+    fn kv_outputs(&self) -> Vec<Array> {
+        self.states.clone()
+    }
+    fn finish_decode(&mut self, outcome: crate::mlx_decode::DecodeFinish) -> Result<()> {
+        if let Err(error) = self.backend.stream().synchronize() {
+            self.failure = Some(error.to_string());
+            return Err(error);
+        }
+        match outcome {
+            crate::mlx_decode::DecodeFinish::PublishedPosition(position)
+                if self.failure.is_none()
+                    && position <= self.offset
+                    && self.offset - position <= 1 =>
+            {
+                self.trim_to(position)
+            }
+            crate::mlx_decode::DecodeFinish::Invalidated => {
+                self.failure
+                    .get_or_insert_with(|| "greedy request failed or was abandoned".into());
+                Ok(())
+            }
+            _ => {
+                self.failure = Some("invalid greedy rollback position".into());
+                Err(Error::Contract("invalid MiniCPM greedy rollback position"))
+            }
+        }
+    }
+}
+
 impl LlmTrait for MiniCpm5 {
+    fn token_sequence<'a>(
+        &'a mut self,
+        first: Tensor,
+        sampler: Box<dyn apxinf_core::TokenSampler>,
+        params: &apxinf_core::TokenSamplingParams,
+        prompt_end: u32,
+    ) -> Result<Box<dyn crate::llm_trait::TokenSequence + 'a>> {
+        if self.variant == Variant::Compiled && crate::mlx_decode::enabled(params) {
+            let first = self.backend.array(&first)?;
+            Ok(Box::new(crate::mlx_decode::GreedySequence::new(
+                self, first, prompt_end,
+            )?))
+        } else {
+            Ok(Box::new(crate::llm_trait::SyncTokenSequence::new(
+                self, first, sampler, prompt_end,
+            )))
+        }
+    }
+
     fn preparation_status(&self) -> TextPreparationStatus {
         let ready =
             self.failure.is_none() && self.prepared_prompt.is_some() && !self.states.is_empty();

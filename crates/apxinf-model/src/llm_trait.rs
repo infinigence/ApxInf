@@ -1,9 +1,14 @@
 //! Common LLM trait for all model implementations.
 
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use apxinf_core::{
-    Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSamplingInit, TokenSamplingSpec,
+    Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSampler, TokenSamplingInit,
+    TokenSamplingParams, TokenSamplingSpec,
 };
 use apxinf_loader::ModelConfig;
 use serde::Serialize;
@@ -160,6 +165,83 @@ impl GenerationOutput {
     }
 }
 
+/// Cooperative cancellation. A cancelled handle stays cancelled; use a new
+/// handle for a new request. An in-flight token read can publish one last token.
+#[derive(Clone, Default)]
+pub struct GenerationCancellation(Arc<AtomicBool>);
+
+impl GenerationCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Request-owned token production. The shared driver owns publication and stops.
+#[doc(hidden)]
+pub trait TokenSequence {
+    /// May submit one successor before reading the current token.
+    fn next(&mut self, lookahead: bool) -> Result<GeneratedToken>;
+    /// Drain work and restore the state corresponding to the published prefix.
+    fn finish(self: Box<Self>, published: usize) -> Result<()>;
+    fn overlaps_callbacks(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) struct SyncTokenSequence<'a, M: LlmTrait + ?Sized> {
+    model: &'a mut M,
+    sampler: Box<dyn TokenSampler>,
+    first: Option<Tensor>,
+    previous: Option<GeneratedToken>,
+    position: u32,
+}
+
+impl<'a, M: LlmTrait + ?Sized> SyncTokenSequence<'a, M> {
+    pub(crate) fn new(
+        model: &'a mut M,
+        first: Tensor,
+        sampler: Box<dyn TokenSampler>,
+        position: u32,
+    ) -> Self {
+        Self {
+            model,
+            sampler,
+            first: Some(first),
+            previous: None,
+            position,
+        }
+    }
+}
+
+impl<M: LlmTrait + ?Sized> TokenSequence for SyncTokenSequence<'_, M> {
+    fn next(&mut self, _lookahead: bool) -> Result<GeneratedToken> {
+        let logits = if let Some(first) = self.first.take() {
+            first
+        } else {
+            let logits = self
+                .model
+                .forward(&[self.previous.unwrap().token_id], self.position)?;
+            self.position += 1;
+            logits
+        };
+        let sample = self
+            .sampler
+            .sample(NextTokenLogits::last(&logits, self.model.vocab_size())?)?;
+        let token = GeneratedToken {
+            token_id: sample.token_id,
+            logprob: sample.logprob,
+        };
+        self.previous = Some(token);
+        Ok(token)
+    }
+    fn finish(self: Box<Self>, _published: usize) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Common interface for all LLM implementations.
 pub trait LlmTrait {
     /// Load model weights and configure for the given device.
@@ -227,6 +309,31 @@ pub trait LlmTrait {
         generate_streaming_with_options(self, request, on_token)
     }
 
+    /// Request-owned producer; the default preserves synchronous sampling.
+    #[doc(hidden)]
+    fn token_sequence<'a>(
+        &'a mut self,
+        first: Tensor,
+        sampler: Box<dyn TokenSampler>,
+        _params: &TokenSamplingParams,
+        prompt_end: u32,
+    ) -> Result<Box<dyn TokenSequence + 'a>> {
+        Ok(Box::new(SyncTokenSequence::new(
+            self, first, sampler, prompt_end,
+        )))
+    }
+
+    /// Cooperative cancellation through the same shared publication loop.
+    fn generate_streaming_cancellable_dyn(
+        &mut self,
+        request: GenerationRequest<'_>,
+        cancel: &GenerationCancellation,
+        on_token: &mut dyn FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        let options = request.options.resolve()?;
+        generate_streaming_with_resolved_options(self, request.input, &options, cancel, on_token)
+    }
+
     /// Ergonomic, statically typed streaming entrypoint. Models that replace
     /// the shared greedy algorithm should override `generate_streaming_dyn`
     /// so the same behavior is visible through `AutoModel`.
@@ -279,13 +386,20 @@ where
     F: FnMut(GeneratedToken),
 {
     let options = request.options.resolve()?;
-    generate_streaming_with_resolved_options(model, request.input, &options, on_token)
+    generate_streaming_with_resolved_options(
+        model,
+        request.input,
+        &options,
+        &GenerationCancellation::default(),
+        on_token,
+    )
 }
 
 fn generate_streaming_with_resolved_options<M, F>(
     model: &mut M,
     input: LlmInput<'_>,
     options: &ResolvedGenerationOptions,
+    cancel: &GenerationCancellation,
     mut on_token: F,
 ) -> Result<GenerationOutput>
 where
@@ -302,7 +416,7 @@ where
         ));
     }
     let mut profile = GenerationProfile::new();
-    if options.max_new_tokens == 0 {
+    if options.max_new_tokens == 0 || cancel.is_cancelled() {
         profile.finalize(prompt_tokens.len(), 0);
         return Ok(GenerationOutput {
             tokens: Vec::new(),
@@ -314,6 +428,9 @@ where
         .len()
         .checked_add(options.max_new_tokens)
         .ok_or_else(|| Error::Other("generation sequence length overflow".into()))?;
+    let prompt_end = u32::try_from(prompt_tokens.len())
+        .map_err(|_| Error::Other("generation position exceeds u32".into()))?;
+    u32::try_from(capacity).map_err(|_| Error::Other("generation position exceeds u32".into()))?;
     let spec = TokenSamplingSpec {
         vocab_size: model.vocab_size(),
         max_sequence_len: capacity,
@@ -328,34 +445,41 @@ where
     model.reset();
     model.prewarm_decode(prompt_tokens.len(), options.max_new_tokens);
 
-    let mut generated = Vec::with_capacity(options.max_new_tokens);
     let logits = model.prefill(input)?;
-    let first = sampler.sample(NextTokenLogits::last(&logits, spec.vocab_size)?)?;
-    profile.record_first_token();
-    let mut current = GeneratedToken {
-        token_id: first.token_id,
-        logprob: first.logprob,
-    };
-    generated.push(current);
-    profile.run_unprofiled(|| on_token(current));
-
-    for index in 1..options.max_new_tokens {
-        if options.eos_token_ids.contains(&current.token_id) {
-            break;
+    let mut sequence = model.token_sequence(logits, sampler, &options.sampling, prompt_end)?;
+    let overlaps = sequence.overlaps_callbacks();
+    let mut generated = Vec::with_capacity(options.max_new_tokens);
+    let run = (|| -> Result<()> {
+        for index in 0..options.max_new_tokens {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let token = sequence.next(index + 1 < options.max_new_tokens)?;
+            if index == 0 {
+                profile.record_first_token();
+            }
+            generated.push(token);
+            if overlaps {
+                on_token(token);
+            } else {
+                profile.run_unprofiled(|| on_token(token));
+            }
+            if options.eos_token_ids.contains(&token.token_id) {
+                break;
+            }
         }
-        let position = prompt_tokens
-            .len()
-            .checked_add(index - 1)
-            .and_then(|position| u32::try_from(position).ok())
-            .ok_or_else(|| Error::Other("generation position exceeds u32".into()))?;
-        let logits = model.forward(&[current.token_id], position)?;
-        let sample = sampler.sample(NextTokenLogits::last(&logits, spec.vocab_size)?)?;
-        current = GeneratedToken {
-            token_id: sample.token_id,
-            logprob: sample.logprob,
-        };
-        generated.push(current);
-        profile.run_unprofiled(|| on_token(current));
+        Ok(())
+    })();
+    let cleanup = sequence.finish(generated.len());
+    match (run, cleanup) {
+        (Err(primary), Err(cleanup)) => {
+            return Err(Error::Other(format!(
+                "{primary}; cleanup failed: {cleanup}"
+            )))
+        }
+        (Err(primary), _) => return Err(primary),
+        (_, Err(cleanup)) => return Err(cleanup),
+        _ => {}
     }
 
     profile.finalize(prompt_tokens.len(), generated.len());
