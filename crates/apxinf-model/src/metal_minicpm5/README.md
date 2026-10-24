@@ -38,8 +38,8 @@ be reported ready. Changing prepared capacity requires a reset.
 
 `LlmTrait::forward` always returns `[input_tokens, vocabulary]` logits.
 Generation `prefill` consumes prompts up to 4096 tokens in the original shape.
-Longer prompts use 512-token chunks, with a causal mask that includes the prior
-cache and the current chunk. Compiled non-final chunks evaluate all KV outputs
+Longer prompts use 1024-token chunks in compiled mode and 512 in public mode,
+with a causal mask that includes the prior cache and the current chunk. Compiled non-final chunks evaluate all KV outputs
 after dropping unused logits. The final chunk evaluates its final-row logits.
 Public mode evaluates final-row logits on every chunk; both modes return only
 the final chunk's result. Long preparation advertises these
@@ -48,7 +48,7 @@ chunk shapes, and rejects a full prompt-sized `forward`. Every admitted
 ApxInf's shared sampler/EOS loop.
 
 The experimental `APXINF_MINICPM5_PREFILL_CHUNK` override accepts 512, 1024 or
-2048 and is captured at construction; the default remains 512. It applies only
+2048 and is captured at construction. It applies only
 above 4096 prompt tokens. Short prompts and DSpark retain their original shape.
 The prepared request owns one prefill plan whose ranges determine warm shapes,
 position/row admission and execution. Chunk-size changes can alter BF16 rounding
