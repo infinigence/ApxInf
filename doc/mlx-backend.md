@@ -114,7 +114,7 @@ selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
 | Family selection | Profile admitted by current code | Actual prepared execution |
 | --- | --- | --- |
 | Qwen3 `bf16-public` | Qwen3-0.6B BF16, B1, up to 40960 total positions | Ordered device composition; source public SwiGLU remains locally compiled |
-| Qwen3 `bf16-compiled` (default) | Same profile | Local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
+| Qwen3 `bf16-compiled` (default) | Same profile | Native weighted RMSNorm with prepared BF16 weights; local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
 | Qwen3 `mixed-w8` | Same profile; affine W8/group 64 | Transformer projections use W8 at M1 and BF16 for larger M; fused gate/up; the tied input/output table is packed at every M; local norm/RoPE and fixed Q/K norm-to-RoPE Metal fusion; no BF16 decoder-block callable |
 | MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 65792 total positions, including 65536 prompt + 256 output | Ordered device composition; source public SwiGLU remains locally compiled |
 | MiniCPM5 `bf16-compiled` (default) | Same profile | KV-only evaluation of non-final prefill chunks, native weighted prefill RMSNorm with BF16 rounding before weight multiplication, local RoPE and complete decode-step compilation with packed residual/RMSNorm |
@@ -224,6 +224,15 @@ normalization rounding, attention masking, weight packing and fused selection.
 For example, cast-before-affine and cast-after-affine norms cannot share a fused
 candidate just because both are called RMSNorm. The compatibility adapter's
 existing Backend methods do not define the native models' layer arithmetic.
+
+Qwen3 `bf16-compiled` retains BF16 checkpoint norm weights and uses native
+weighted RMSNorm for all input, post-attention, Q, K, and final norms in prefill
+and decode. Its private norm helper selects arithmetic from the prepared weight
+dtype. BF16 weights require BF16 activations; FP32 weights retain the ordered
+FP32 expression used by `bf16-public` and `mixed-w8`. This changes 222 of 1024
+text-fixed tokens relative to b2d58ea. External-teacher agreement is 221/222
+with no per-language regression. Five clean 1K blocks improve total time
+against ordered normalization; the full MLX matrix remains pending.
 
 MiniCPM5 compiled prefill uses native weighted RMSNorm with its existing BF16
 weights. The pinned MLX 0.32.3 Metal kernel casts the normalized value to BF16
