@@ -70,8 +70,8 @@ invalidated error returned by the next fallible call.
 
 Compiled Qwen3 and ordinary compiled MiniCPM5 use one-step greedy lookahead.
 `greedy_token_arrays` produces an in-vocabulary device ID and a checked ID with
-an invalid-logits sentinel. `mlx_decode.rs` submits the next decode and complete
-KV outputs with `async_eval` before reading the current checked ID with
+an invalid-logits sentinel. `mlx_decode.rs` submits only the next checked ID
+with `async_eval` before reading the current checked ID with
 `to_bytes_ready`. The latter waits only for that array. Stop/error cleanup drains
 the stream; EOS/cancellation then trims the unused logical position. No KV
 snapshot is retained. `APXINF_MLX_SYNC_DECODE=1` selects the synchronous fallback.

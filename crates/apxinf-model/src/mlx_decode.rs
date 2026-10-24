@@ -16,8 +16,8 @@ pub(crate) enum DecodeFinish {
 
 pub(crate) trait DeviceDecode {
     fn stream(&self) -> &Stream;
+    /// Evaluating the returned logits must evaluate every state array updated by this step.
     fn decode(&mut self, token: &Array) -> Result<Array>;
-    fn kv_outputs(&self) -> Vec<Array>;
     fn finish_decode(&mut self, outcome: DecodeFinish) -> Result<()>;
 }
 
@@ -86,8 +86,7 @@ impl<'a, M: DeviceDecode> GreedySequence<'a, M> {
         if lookahead {
             let logits = self.model.decode(&current.feed)?;
             self.successor = Some(PendingToken::new(&logits)?);
-            let mut outputs = self.model.kv_outputs();
-            outputs.push(self.successor.as_ref().unwrap().checked.clone());
+            let outputs = [self.successor.as_ref().unwrap().checked.clone()];
             self.model.stream().async_eval(&outputs)?;
         }
         let token = current.read()?;
@@ -176,9 +175,6 @@ mod tests {
             }
             self.observed.borrow_mut().position += 1;
             self.logits(position - self.prompt + 1)
-        }
-        fn kv_outputs(&self) -> Vec<Array> {
-            vec![]
         }
         fn finish_decode(&mut self, outcome: DecodeFinish) -> Result<()> {
             self.stream.synchronize()?;

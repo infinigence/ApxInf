@@ -669,12 +669,6 @@ impl crate::mlx_decode::DeviceDecode for Qwen3Model {
             }
         }
     }
-    fn kv_outputs(&self) -> Vec<Array> {
-        self.kv
-            .iter()
-            .flat_map(|kv| [kv.keys.clone(), kv.values.clone()])
-            .collect()
-    }
     fn finish_decode(&mut self, outcome: crate::mlx_decode::DecodeFinish) -> Result<()> {
         if let Err(error) = self.backend.stream().synchronize() {
             self.invalid = Some(error.to_string());
