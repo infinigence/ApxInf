@@ -39,8 +39,10 @@ be reported ready. Changing prepared capacity requires a reset.
 `LlmTrait::forward` always returns `[input_tokens, vocabulary]` logits.
 Generation `prefill` consumes prompts up to 4096 tokens in the original shape.
 Longer prompts use 512-token chunks, with a causal mask that includes the prior
-cache and the current chunk. Each chunk projects only its final normalized row;
-only the last chunk's logits are returned. Long preparation advertises these
+cache and the current chunk. Compiled non-final chunks evaluate all KV outputs
+after dropping unused logits. The final chunk evaluates its final-row logits.
+Public mode evaluates final-row logits on every chunk; both modes return only
+the final chunk's result. Long preparation advertises these
 chunk shapes, and rejects a full prompt-sized `forward`. Every admitted
 `forward` still returns all of its input rows. Ordinary generation uses
 ApxInf's shared sampler/EOS loop.

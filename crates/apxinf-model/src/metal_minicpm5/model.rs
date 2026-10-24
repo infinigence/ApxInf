@@ -19,6 +19,11 @@ struct LocalMath {
     rope: Compiled,
 }
 
+enum RequiredOutput {
+    CacheOnly,
+    Logits { last_only: bool },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DecodeAttention {
     Bucketed,
@@ -587,6 +592,17 @@ impl MiniCpm5 {
         position: usize,
         last_only: bool,
     ) -> Result<Array> {
+        Ok(self
+            .execute_tokens(ids, position, RequiredOutput::Logits { last_only })?
+            .expect("logits requested"))
+    }
+
+    fn execute_tokens(
+        &mut self,
+        ids: &[u32],
+        position: usize,
+        required: RequiredOutput,
+    ) -> Result<Option<Array>> {
         if let Some(failure) = &self.failure {
             return Err(Error::Other(format!(
                 "MiniCPM state invalid: {failure}; reset and prepare again"
@@ -617,15 +633,34 @@ impl MiniCpm5 {
                 "MiniCPM input shape is outside its prepared prompt/decode profile",
             ));
         }
+        let end = position + ids.len();
+        let cache_only = matches!(required, RequiredOutput::CacheOnly);
+        if cache_only && (self.variant != Variant::Compiled || end >= prefill.prompt) {
+            return Err(Error::Contract(
+                "MiniCPM cache-only evaluation requires a compiled non-final prefill chunk",
+            ));
+        }
+        let last_only = match required {
+            RequiredOutput::CacheOnly => true,
+            RequiredOutput::Logits { last_only } => last_only,
+        };
         let result = (|| {
             let tokens = Array::from_i32(
                 self.backend.stream(),
                 &[1, ids.len()],
                 &ids.iter().map(|&v| v as i32).collect::<Vec<_>>(),
             )?;
-            let output = self.run_graph(tokens, position, last_only)?;
+            let mut output = self.run_graph(tokens, position, last_only)?;
+            if cache_only {
+                drop(output.remove(0));
+            }
             self.backend.stream().eval(&output)?;
-            Ok::<_, Error>(self.install_output(output, position + ids.len()))
+            if cache_only {
+                self.install_cache_output(output, end);
+                Ok(None)
+            } else {
+                Ok::<_, Error>(Some(self.install_output(output, end)))
+            }
         })();
         if let Err(error) = &result {
             self.failure = Some(error.to_string());
@@ -675,6 +710,11 @@ impl MiniCpm5 {
 
     fn install_output(&mut self, mut output: Vec<Array>, end: usize) -> Array {
         let logits = output.remove(0);
+        self.install_cache_output(output, end);
+        logits
+    }
+
+    fn install_cache_output(&mut self, mut output: Vec<Array>, end: usize) {
         self.last_taps = if self.variant == Variant::DSpark {
             output.pop()
         } else {
@@ -682,7 +722,6 @@ impl MiniCpm5 {
         };
         self.states = output;
         self.offset = end;
-        logits
     }
 
     pub(crate) fn trim_to(&mut self, position: usize) -> Result<()> {
@@ -858,9 +897,14 @@ impl LlmTrait for MiniCpm5 {
         let plan = self.prepared.as_ref().unwrap().prefill;
         let mut logits = None;
         for range in plan.chunks() {
-            logits = Some(self.run_tokens(&input.token_ids[range], self.offset, true)?);
+            let required = if self.variant == Variant::Compiled && range.end < plan.prompt {
+                RequiredOutput::CacheOnly
+            } else {
+                RequiredOutput::Logits { last_only: true }
+            };
+            logits = self.execute_tokens(&input.token_ids[range], self.offset, required)?;
         }
-        let logits = logits.unwrap();
+        let logits = logits.expect("the final prefill chunk requires logits");
         self.backend
             .from_array(logits.reshape(&[1, self.vocab_size()])?)
     }
