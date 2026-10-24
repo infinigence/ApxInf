@@ -1,9 +1,7 @@
 //! Native MiniCPM5 forward and request state. No Python model provider.
 //! Arithmetic/schedule adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin.
 use super::{
-    config::{
-        attention_width, prefill_lengths, Config, Variant, DSPARK_CONTEXT_CAPACITY, PREFILL_CHUNK,
-    },
+    config::{attention_width, Config, PrefillChunk, PrefillPlan, Variant},
     math,
     weights::Weights,
 };
@@ -22,20 +20,14 @@ struct LocalMath {
     rope: Compiled,
 }
 
-#[derive(Clone, Copy)]
-enum TokenPass {
-    Forward,
-    PrefillChunk,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DecodeAttention {
     Bucketed,
     Exact,
 }
 
-struct PreparedDecode {
-    prompt: usize,
+struct PreparedRequest {
+    prefill: PrefillPlan,
     output: usize,
     positions: HashMap<usize, Array>,
 }
@@ -45,6 +37,7 @@ pub struct MiniCpm5 {
     pub(crate) weights: Rc<Weights>,
     config: Config,
     variant: Variant,
+    prefill_chunk: Option<PrefillChunk>,
     epsilon: Array,
     cos: Array,
     sin: Array,
@@ -52,7 +45,7 @@ pub struct MiniCpm5 {
     swiglu: Compiled,
     step: Option<Compiled>,
     attention: DecodeAttention,
-    prepared: Option<PreparedDecode>,
+    prepared: Option<PreparedRequest>,
     states: Vec<Array>,
     capacity: usize,
     pub(crate) offset: usize,
@@ -72,6 +65,7 @@ impl MiniCpm5 {
         variant: Variant,
     ) -> Result<Self> {
         config.validate_variant(variant)?;
+        let prefill_chunk = PrefillChunk::from_env()?;
         let stream = backend.stream();
         let epsilon = Array::scalar(stream, config.rms_norm_eps, MlxDType::F32)?;
         let (cos, sin) = math::tables(stream, 256)?;
@@ -100,6 +94,7 @@ impl MiniCpm5 {
             weights: Rc::new(weights),
             config,
             variant,
+            prefill_chunk,
             epsilon,
             cos,
             sin,
@@ -139,7 +134,7 @@ impl MiniCpm5 {
             && self
                 .prepared
                 .as_ref()
-                .is_some_and(|p| p.prompt == prompt && p.output == output)
+                .is_some_and(|p| p.prefill.prompt == prompt && p.output == output)
             && self.failure.is_none()
             && !self.states.is_empty()
         {
@@ -180,7 +175,11 @@ impl MiniCpm5 {
         }
         // Warm shape-dependent RoPE traces used by prefill. Norm and SwiGLU
         // are shapeless; changed request values are never captured.
-        let lengths = prefill_lengths(prompt);
+        let prefill = PrefillPlan::new(
+            prompt,
+            self.prefill_chunk.unwrap_or(PrefillChunk::Tokens512),
+        )?;
+        let lengths = prefill.required_rows();
         for &rows in &lengths {
             if let Some(local) = &self.local {
                 let stream = self.backend.stream();
@@ -255,8 +254,8 @@ impl MiniCpm5 {
             }
         }
         self.failure = None;
-        self.prepared = Some(PreparedDecode {
-            prompt,
+        self.prepared = Some(PreparedRequest {
+            prefill,
             output,
             positions,
         });
@@ -480,16 +479,6 @@ impl MiniCpm5 {
         position: usize,
         last_only: bool,
     ) -> Result<Array> {
-        self.run_tokens_for(ids, position, last_only, TokenPass::Forward)
-    }
-
-    fn run_tokens_for(
-        &mut self,
-        ids: &[u32],
-        position: usize,
-        last_only: bool,
-        pass: TokenPass,
-    ) -> Result<Array> {
         if let Some(failure) = &self.failure {
             return Err(Error::Other(format!(
                 "MiniCPM state invalid: {failure}; reset and prepare again"
@@ -509,14 +498,11 @@ impl MiniCpm5 {
         if self.states.is_empty() || self.prepared.is_none() {
             return Err(Error::Contract("prepare MiniCPM before inference"));
         }
-        let admitted = match pass {
-            TokenPass::PrefillChunk => self.prepared.as_ref().map(|p| p.prompt).is_some_and(|prompt| {
-                self.variant.prefill_rows(prompt, position) == Some(ids.len())
-            }),
-            TokenPass::Forward if position == 0 => self.prepared.as_ref().map(|p| p.prompt) == Some(ids.len()),
-            TokenPass::Forward => {
-                ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8)
-            }
+        let prefill = self.prepared.as_ref().unwrap().prefill;
+        let admitted = if position < prefill.prompt {
+            prefill.admits(position, ids.len())
+        } else {
+            ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8)
         };
         if !admitted {
             return Err(Error::Contract(
@@ -526,8 +512,7 @@ impl MiniCpm5 {
         let result = (|| {
             let ids = ids.iter().map(|&v| v as i32).collect::<Vec<_>>();
             let tokens = Array::from_i32(self.backend.stream(), &[1, ids.len()], &ids)?;
-            let compiled = matches!(pass, TokenPass::Forward)
-                && position > 0
+            let compiled = position > 0
                 && (ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8));
             let output = match (&self.step, compiled) {
                 (Some(step), true) => {
@@ -604,7 +589,7 @@ impl MiniCpm5 {
         if ids.is_empty()
             || ids.iter().any(|&id| id >= self.config.vocab_size as u32)
             || self.offset != 0
-            || self.prepared.as_ref().map(|p| p.prompt) != Some(ids.len())
+            || self.prepared.as_ref().map(|p| p.prefill.prompt) != Some(ids.len())
             || self.states.is_empty()
             || self.failure.is_some()
             || ids.len() > self.capacity
@@ -617,14 +602,10 @@ impl MiniCpm5 {
         if !boundary(GenerationBoundary::PrefillStart)? {
             return Ok(None);
         }
-        while let Some(rows) = self.variant.prefill_rows(ids.len(), self.offset) {
-            let end = self.offset + rows;
-            let logits = self.run_tokens_for(
-                &ids[self.offset..end],
-                self.offset,
-                true,
-                TokenPass::PrefillChunk,
-            )?;
+        let plan = self.prepared.as_ref().unwrap().prefill;
+        for range in plan.chunks() {
+            let end = range.end;
+            let logits = self.run_tokens(&ids[range], self.offset, true)?;
             if !boundary(GenerationBoundary::PrefillProgress {
                 consumed_tokens: end,
             })? {
@@ -736,7 +717,7 @@ impl LlmTrait for MiniCpm5 {
                 scopes.push(TextCompilationScope::DecodeStep);
             }
             lengths.extend(1..=max_rows);
-            lengths.extend(prefill_lengths(self.prepared.as_ref().unwrap().prompt));
+            lengths.extend(self.prepared.as_ref().unwrap().prefill.required_rows());
             lengths.sort_unstable();
             lengths.dedup();
         }
@@ -755,7 +736,11 @@ impl LlmTrait for MiniCpm5 {
                 Variant::DSpark => "dspark-target",
             }),
             compiled_scopes: scopes,
-            prepared_prompt_tokens: self.prepared.as_ref().filter(|_| ready).map(|p| p.prompt),
+            prepared_prompt_tokens: self
+                .prepared
+                .as_ref()
+                .filter(|_| ready)
+                .map(|p| p.prefill.prompt),
             prepared_sequence_lengths: lengths,
             kv_capacity: (self.capacity > 0).then_some(self.capacity),
             max_decode_rows: ready.then_some(max_rows),

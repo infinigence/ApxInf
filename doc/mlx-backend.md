@@ -59,8 +59,12 @@ combinations fail at construction with an explicit error.
 `LlmTrait::forward` retains its full `[seq_len, vocab_size]` logits contract.
 The generation-oriented `prefill(LlmInput)` hook may consume the whole prompt
 and return only `[1, vocab_size]`. Qwen3 uses cache-only prefix chunks of at
-most 512 followed by a final-token forward; MiniCPM5 uses 512-token chunks above
+most 512 by default followed by a final-token forward; MiniCPM5 uses 512-token chunks above
 4096 prompt tokens and projects the final normalized row of each chunk.
+Experimental family-specific `APXINF_QWEN3_PREFILL_CHUNK` and
+`APXINF_MINICPM5_PREFILL_CHUNK` overrides select 512/1024/2048 at construction.
+Each family derives preparation and execution from the same private range plan;
+Mini's override preserves whole prompts through 4096 and all DSpark behavior.
 Long preparation advertises bounded chunk shapes, not a full prompt-sized
 forward. Call `forward` on an admitted shape for every input row's logits. Ordinary
 generation uses the shared sampler/EOS loop; DSpark overrides the request-level

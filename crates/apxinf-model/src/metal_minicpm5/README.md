@@ -37,6 +37,13 @@ chunk shapes, and rejects a full prompt-sized `forward`. Every admitted
 `forward` still returns all of its input rows. Ordinary generation uses
 ApxInf's shared sampler/EOS loop.
 
+The experimental `APXINF_MINICPM5_PREFILL_CHUNK` override accepts 512, 1024 or
+2048 and is captured at construction; the default remains 512. It applies only
+above 4096 prompt tokens. Short prompts and DSpark retain their original shape.
+The prepared request owns one prefill plan whose ranges determine warm shapes,
+position/row admission and execution. Chunk-size changes can alter BF16 rounding
+and require separate numerical qualification.
+
 Ordinary BF16 generation supports one sequence with at most 65792 total tokens,
 including prompt and reserved output, within the checkpoint's 131072 positions.
 This admits a 65536-token prompt with up to 256 reserved output tokens.
