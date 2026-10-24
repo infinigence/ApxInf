@@ -404,19 +404,25 @@ impl MiniCpm5 {
         let index = Array::from_i32(self.backend.stream(), &[1], &[position as i32])?;
         let cos = self.cos.slice_axis(2, position, end)?;
         let sin = self.sin.slice_axis(2, position, end)?;
-        let k_positions = Array::arange(self.backend.stream(), 0., end as f32, 1., MlxDType::I32)?
-            .reshape(&[1, end])?;
-        let q_positions = Array::arange(
-            self.backend.stream(),
-            position as f32,
-            end as f32,
-            1.,
-            MlxDType::I32,
-        )?
-        .reshape(&[rows, 1])?;
-        let mask = k_positions
-            .less_equal(&q_positions)?
-            .reshape(&[1, 1, rows, end])?;
+        let mask = if self.variant == Variant::Compiled {
+            None
+        } else {
+            let k_positions =
+                Array::arange(self.backend.stream(), 0., end as f32, 1., MlxDType::I32)?
+                    .reshape(&[1, end])?;
+            let q_positions = Array::arange(
+                self.backend.stream(),
+                position as f32,
+                end as f32,
+                1.,
+                MlxDType::I32,
+            )?
+            .reshape(&[rows, 1])?;
+            let mask = k_positions
+                .less_equal(&q_positions)?
+                .reshape(&[1, 1, rows, end])?;
+            Some(mask)
+        };
         let mut x = self.weights.embedding.take(tokens, 0)?;
         let mut states = Vec::with_capacity(84);
         let mut taps = Vec::new();
@@ -443,8 +449,8 @@ impl MiniCpm5 {
                     &keys.slice_axis(2, 0, end)?,
                     &values.slice_axis(2, 0, end)?,
                     128f32.powf(-0.5),
-                    false,
-                    Some(&mask),
+                    self.variant == Variant::Compiled && rows > 1,
+                    mask.as_ref(),
                 )?
                 .transpose(&[0, 2, 1, 3])?
                 .reshape(&[1, rows, 2048])?;
