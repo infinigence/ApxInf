@@ -374,6 +374,19 @@ impl Array {
             .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
         Ok(out)
     }
+    /// Like [`to_bytes`](Self::to_bytes), but waits only for this array's
+    /// computation, not for other work queued on its stream, and adds no
+    /// operation: work submitted later with [`Stream::async_eval`] keeps
+    /// running. The array must be row-contiguous (for example a kernel output).
+    pub fn to_bytes_ready(&self) -> Result<Vec<u8>> {
+        let mut out = vec![0; self.numel() * self.dtype().size_in_bytes()];
+        self.stream()
+            .record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_array_read_ready(self.raw(), out.as_mut_ptr(), out.len()) })?;
+        self.stream()
+            .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
+        Ok(out)
+    }
     pub fn to_f32_vec(&self) -> Result<Vec<f32>> {
         Ok(self
             .cast(MlxDType::F32)?
