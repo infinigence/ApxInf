@@ -5,7 +5,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/apxinf/apxinf/serving"))
-from audio_contracts import AttemptKey, AttemptState, parse_frame
+from audio_contracts import AttemptKey, AttemptState, is_text, parse_frame
 from audio_wav import inspect
 
 
@@ -13,6 +13,9 @@ class Conformance(unittest.TestCase):
     def test_shared_original_corpus(self):
         corpus = json.loads((ROOT / "tests/fixtures/audio-serving/cases.json").read_text())
         frames = {}
+        for case in corpus["texts"]:
+            with self.subTest(case=case["name"]):
+                self.assertEqual(is_text(case["text"]), case["valid"])
         for case in corpus["frames"]:
             with self.subTest(case=case["name"]):
                 try:
@@ -39,6 +42,22 @@ class Conformance(unittest.TestCase):
                         state.event(frames[name].message)
                     valid = True
                 except ValueError:
+                    valid = False
+                self.assertEqual(valid, case["valid"])
+        for case in corpus["encodings"]:
+            with self.subTest(case=case["name"]):
+                if "hex" in case:
+                    raw = bytes.fromhex(case["hex"])
+                else:
+                    source = next(c["raw"] for c in corpus["frames"] if c["name"] == case["frame"])
+                    encoding = {"utf8":"utf-8", "utf16le":"utf-16le", "utf32le":"utf-32le"}[case["encoding"]]
+                    raw = source.encode(encoding)
+                    if case["bom"]:
+                        raw = {"utf8":b"\xef\xbb\xbf", "utf16le":b"\xff\xfe", "utf32le":b"\xff\xfe\x00\x00"}[case["encoding"]] + raw
+                try:
+                    parse_frame(raw)
+                    valid = True
+                except (ValueError, UnicodeError):
                     valid = False
                 self.assertEqual(valid, case["valid"])
 

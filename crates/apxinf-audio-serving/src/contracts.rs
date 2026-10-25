@@ -172,7 +172,11 @@ pub fn digest(value: &str) -> bool {
             .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
 }
 pub fn text(value: &str) -> bool {
-    !value.trim().is_empty() && value.len() <= 16384 && value.chars().count() <= 4096
+    value.chars().any(|c| !white_space(c)) && value.len() <= 16384 && value.chars().count() <= 4096
+}
+fn white_space(c: char) -> bool {
+    matches!(c, '\u{0009}'..='\u{000d}' | '\u{0020}' | '\u{0085}' | '\u{00a0}' | '\u{1680}'
+        | '\u{2000}'..='\u{200a}' | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}')
 }
 fn key(value: &AttemptKey) -> bool {
     uuid(&value.request_id) && (1..=SAFE_INTEGER).contains(&value.attempt)

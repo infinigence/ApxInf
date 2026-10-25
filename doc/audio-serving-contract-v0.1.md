@@ -63,8 +63,9 @@ The response retains its output lease until transmission finishes or the connect
 The WAV parser checks the exact RIFF length and every chunk extent.
 The parser requires one 16-byte `fmt ` chunk and one nonempty `data` chunk.
 The parser checks byte rate, block alignment, frame alignment, and zero padding.
-The parser rejects duplicate chunks, compressed formats, truncated chunks, and trailing bytes outside RIFF.
+The parser rejects duplicate `fmt ` or `data` chunks, compressed formats, truncated chunks, and trailing bytes outside RIFF.
 Unknown chunks consume the metadata limit.
+Unknown chunk identifiers may repeat within both limits.
 
 These limits bound ingress and retained output.
 They do not prove a universal provider device-allocation bound.
@@ -118,6 +119,9 @@ UUID fields use lowercase canonical hyphenated strings.
 Revision and content digests use 64 lowercase SHA-256 hexadecimal characters.
 Labels contain 1 through 128 UTF-8 bytes and no control characters.
 Strings retain their exact Unicode scalar values.
+TTS text must contain a scalar outside the fixed whitespace set below.
+The set contains U+0009 through U+000D, U+0020, U+0085, U+00A0, U+1680, and U+2000 through U+200A.
+The set also contains U+2028, U+2029, U+202F, U+205F, and U+3000.
 
 `key` has exactly `request_id` and `attempt`.
 `MediaGrant` has exactly `handle`, `worker_epoch`, `key`, `bytes`, `sha256`, `frames`, and `sample_rate`.

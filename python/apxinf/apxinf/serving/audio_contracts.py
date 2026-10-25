@@ -192,7 +192,8 @@ def is_digest(value):
 
 
 def is_text(value):
-    return isinstance(value, str) and bool(value.strip()) and len(value) <= 4096 and len(value.encode("utf-8")) <= 16384
+    whitespace = "\u0009\u000a\u000b\u000c\u000d\u0020\u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+    return isinstance(value, str) and any(c not in whitespace for c in value) and len(value) <= 4096 and len(value.encode("utf-8")) <= 16384
 
 
 def _object(value, fields):
@@ -257,7 +258,7 @@ def strict_json(raw):
     def constant(value):
         raise ValueError("nonfinite number")
 
-    value = json.loads(raw, object_pairs_hook=pairs, parse_int=integer, parse_float=floating, parse_constant=constant)
+    value = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=pairs, parse_int=integer, parse_float=floating, parse_constant=constant)
 
     def check(item, depth):
         _require(depth <= 12)

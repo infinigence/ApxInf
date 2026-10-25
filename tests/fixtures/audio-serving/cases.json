@@ -49,6 +49,7 @@
     {"name":"trailing_json", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"stopped\"}}{}"}
   ],
   "wav": [
+    {"name":"repeated_unknown_chunks", "asr":true, "valid":true, "hex":"524946463600000057415645666d74201000000001000100803e0000007d000002001000646174610200000000004a554e4b000000004a554e4b00000000"},
     {"name":"one_sample_asr", "asr":true, "valid":true, "hex":"524946462600000057415645666d74201000000001000100803e0000007d00000200100064617461020000000000"},
     {"name":"one_sample_tts", "asr":false, "valid":true, "hex":"524946462600000057415645666d74201000000001000100c05d000080bb0000020010006461746102000000ff7f"},
     {"name":"wrong_asr_rate", "asr":true, "valid":false, "hex":"524946462600000057415645666d74201000000001000100c05d000080bb0000020010006461746102000000ff7f"},
@@ -58,6 +59,20 @@
     {"name":"truncated_chunk", "asr":true, "valid":false, "hex":"524946462600000057415645666d74201000000001000100803e0000007d00000200100064617461ffffffff0000"},
     {"name":"metadata_padding", "asr":true, "valid":true, "hex":"5249464630000000574156454a554e4b010000001100666d74201000000001000100803e0000007d00000200100064617461020000000000"},
     {"name":"nonzero_padding", "asr":true, "valid":false, "hex":"5249464630000000574156454a554e4b0100000011ff666d74201000000001000100803e0000007d00000200100064617461020000000000"}
+  ],
+  "texts": [
+    {"name":"space", "text":" ", "valid":false},
+    {"name":"c0_separators", "text":"\u001c\u001d\u001e\u001f", "valid":true},
+    {"name":"nbsp", "text":"\u00a0", "valid":false},
+    {"name":"ideographic_space", "text":"\u3000", "valid":false},
+    {"name":"nonblank", "text":"\u00a0晴\u3000", "valid":true}
+  ],
+  "encodings": [
+    {"name":"utf8", "frame":"stopped", "encoding":"utf8", "bom":false, "valid":true},
+    {"name":"utf8_bom", "frame":"stopped", "encoding":"utf8", "bom":true, "valid":false},
+    {"name":"utf16le_bom", "frame":"stopped", "encoding":"utf16le", "bom":true, "valid":false},
+    {"name":"utf32le_bom", "frame":"stopped", "encoding":"utf32le", "bom":true, "valid":false},
+    {"name":"invalid_utf8", "hex":"fffe7b7d", "valid":false}
   ],
   "states": [
     {"name":"settles_once", "events":["accepted","terminal","released"], "valid":true},
