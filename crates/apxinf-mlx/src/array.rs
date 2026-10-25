@@ -817,6 +817,14 @@ unsafe extern "C" fn trace_callback(
 
 /// Prepared custom Metal primitive. Source validity and operand geometry remain
 /// the safe model-neutral wrapper's contract; no Python execution is involved.
+/// Compile-time argument of a custom Metal kernel template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateArg {
+    DType(MlxDType),
+    Int(i32),
+    Bool(bool),
+}
+
 pub struct MetalKernel {
     raw: NonNull<c_void>,
     stream: Stream,
@@ -874,7 +882,7 @@ impl MetalKernel {
         output_specs: &[(&[usize], MlxDType)],
         grid: [usize; 3],
         threadgroup: [usize; 3],
-        template_dtype: Option<MlxDType>,
+        templates: &[(&str, TemplateArg)],
     ) -> Result<Vec<Array>> {
         if inputs.len() != self.input_count || output_specs.len() != self.output_count {
             return Err(error("Metal kernel arity mismatch"));
@@ -894,6 +902,19 @@ impl MetalKernel {
         if g.contains(&0) || tg.contains(&0) {
             return Err(error("zero Metal launch geometry"));
         }
+        let names = templates
+            .iter()
+            .map(|(n, _)| CString::new(*n).map_err(|_| error("NUL in Metal template name")))
+            .collect::<Result<Vec<_>>>()?;
+        let name_ptrs: Vec<_> = names.iter().map(|n| n.as_ptr()).collect();
+        let (kinds, values): (Vec<i32>, Vec<i32>) = templates
+            .iter()
+            .map(|(_, arg)| match *arg {
+                TemplateArg::DType(d) => (0, d as i32),
+                TemplateArg::Int(v) => (1, v),
+                TemplateArg::Bool(v) => (2, v as i32),
+            })
+            .unzip();
         let mut out = vec![std::ptr::null_mut(); self.output_count];
         check(ffi::apx_mlx_metal_call(
             self.stream.raw(),
@@ -906,7 +927,10 @@ impl MetalKernel {
             self.output_count,
             g.as_ptr(),
             tg.as_ptr(),
-            template_dtype.map_or(-1, |d| d as i32),
+            name_ptrs.as_ptr(),
+            kinds.as_ptr(),
+            values.as_ptr(),
+            templates.len(),
             out.as_mut_ptr(),
         ))?;
         own_many(&self.stream, &mut out)
