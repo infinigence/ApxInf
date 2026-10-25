@@ -1,0 +1,128 @@
+{
+  "date": "2026-10-25",
+  "host": {
+    "processor": "Apple M4",
+    "memory_bytes": 17179869184
+  },
+  "quality_approved": false,
+  "device_allocation_qualified": false,
+  "observations": [
+    {
+      "task": "tts",
+      "quality_approved": false,
+      "device_allocation_qualified": false,
+      "result_sha256": "7b40273e94984d7682ddec7a0cb42dcc704b3b005ad2a94b2272b4fefa20e255",
+      "output_frames": 96000,
+      "sample_rate": 24000,
+      "duration_seconds": 4.0,
+      "saturated_samples": 0,
+      "deployment": {
+        "model": "qualified-tts",
+        "provider": "mlx_audio",
+        "worker_epoch": "1a7ac472-858d-40e8-a610-1debd03ff2aa",
+        "model_revision": "01b9c1619652f1d1a63df1bd4eb2688811752d40b4e9edf1af38e988bc93502c",
+        "capability_revision": "4592d8b3e9651c5366bbd3e7cf1cf5cfc5f7a3b809f8b56e9b67d77ef0b906fa",
+        "pressure_policy": "macos_normal",
+        "runtime": {
+          "python": "3.12.10",
+          "mlx": "0.32.4",
+          "mlx_audio": "0.6.1",
+          "mlx_audio_commit": "f976eab8b47a3cada5aeb3b52a78451ee06117bc",
+          "packages": {
+            "numpy": "2.5.4",
+            "scipy": "1.18.1",
+            "transformers": "5.20.2",
+            "tokenizers": "0.23.3",
+            "safetensors": "0.8.0",
+            "huggingface_hub": "2.3.0",
+            "mlx-metal": "0.32.4",
+            "misaki": "0.9.4",
+            "spacy": "3.8.7",
+            "en_core_web_sm": "3.8.0",
+            "phonemizer-fork": "3.3.2",
+            "espeakng-loader": "0.2.4",
+            "num2words": "0.5.14",
+            "torch": "2.14.1",
+            "spacy-curated-transformers": "0.3.1",
+            "curated-transformers": "0.1.1",
+            "preshed": "3.0.10"
+          }
+        },
+        "precision_profile": "frozen_artifact",
+        "artifact_count": 89
+      },
+      "lifecycle": {
+        "task": "tts",
+        "revision": "01b9c1619652f1d1a63df1bd4eb2688811752d40b4e9edf1af38e988bc93502c",
+        "pressure_before": "1",
+        "metrics": {
+          "apxinf_audio_ready": 1,
+          "apxinf_audio_active": 0,
+          "apxinf_audio_queued": 0,
+          "apxinf_audio_media_reserved_bytes": 0,
+          "apxinf_audio_completed_total": 1,
+          "apxinf_audio_faults_total": 0,
+          "apxinf_audio_worker_reaped": 0
+        },
+        "service_returncode": 0,
+        "worker_pids_reaped": [
+          "61885"
+        ]
+      }
+    },
+    {
+      "task": "asr",
+      "quality_approved": false,
+      "device_allocation_qualified": false,
+      "result_sha256": "da4b6e0f3ebe8f2a58953bc998f1c1f3210bdb3f7019657812d98445d1f7ce01",
+      "text": " The local audio service returns one complete recording.",
+      "input_frames": 64000,
+      "input_sample_rate": 16000,
+      "wer": 0.0,
+      "wer_policy": "case-sensitive Unicode whitespace word split, no other normalization",
+      "deployment": {
+        "model": "qualified-asr",
+        "provider": "mlx_audio",
+        "worker_epoch": "0f76fd1b-8d4f-479b-b566-fc0372d54a2f",
+        "model_revision": "a1184cc562265b3a1b5ca465ecfb7271dad0d43be834bbb7044cf85090ca3e9f",
+        "capability_revision": "57eefef80a9974b3dc2f102a60d90b15567fbf74f7132d4a71fa122b4b3d7b0d",
+        "pressure_policy": "macos_normal",
+        "runtime": {
+          "python": "3.12.10",
+          "mlx": "0.32.4",
+          "mlx_audio": "0.6.1",
+          "mlx_audio_commit": "f976eab8b47a3cada5aeb3b52a78451ee06117bc",
+          "packages": {
+            "numpy": "2.5.4",
+            "scipy": "1.18.1",
+            "transformers": "5.20.2",
+            "tokenizers": "0.23.3",
+            "safetensors": "0.8.0",
+            "huggingface_hub": "2.3.0",
+            "mlx-metal": "0.32.4"
+          }
+        },
+        "precision_profile": "frozen_artifact",
+        "artifact_count": 12
+      },
+      "lifecycle": {
+        "task": "asr",
+        "revision": "a1184cc562265b3a1b5ca465ecfb7271dad0d43be834bbb7044cf85090ca3e9f",
+        "pressure_before": "1",
+        "metrics": {
+          "apxinf_audio_ready": 1,
+          "apxinf_audio_active": 0,
+          "apxinf_audio_queued": 0,
+          "apxinf_audio_media_reserved_bytes": 0,
+          "apxinf_audio_completed_total": 1,
+          "apxinf_audio_faults_total": 0,
+          "apxinf_audio_worker_reaped": 0
+        },
+        "service_returncode": 0,
+        "worker_pids_reaped": [
+          "62803"
+        ]
+      }
+    }
+  ]
+}

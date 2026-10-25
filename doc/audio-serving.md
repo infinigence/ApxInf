@@ -163,6 +163,7 @@ The hardware gate requires fixed runtime, model, voice, and frontend identities.
 The gate must measure ASR quality, TTS quality, peak allocation, pressure, cancellation, and cleanup.
 CPU fixture success cannot close that gate.
 No GPU inference or model-quality acceptance formed part of the CPU implementation checks.
+Separate [hardware observations](audio-serving-validation-20261025.md) record the selected local model profiles and remaining checks.
 
 The reusable qualification command records a real production observation without granting quality approval.
 Run this command only against the selected offline deployment.
