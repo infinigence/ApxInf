@@ -122,8 +122,9 @@ int apx_mlx_quantize(void* s,const void* input,int32_t group,int32_t bits,void**
 int apx_mlx_metal_new(const char* name,const char* source,const char* header,const char* const* ins,size_t ni,const char* const* outs,size_t no,void** out){TRY
  std::vector<std::string> input_names,output_names;for(size_t i=0;i<ni;++i)input_names.emplace_back(ins[i]);for(size_t i=0;i<no;++i)output_names.emplace_back(outs[i]);*out=new K(mx::fast::metal_kernel(name,input_names,output_names,source,header,true,false));CATCH}
 void apx_mlx_metal_free(void* p){delete static_cast<K*>(p);}
-int apx_mlx_metal_call(void* stream,void* kernel,const void* const* inputs,size_t ni,const int32_t* dims,const size_t* ranks,const int32_t* dtypes,size_t no,const int32_t* grid,const int32_t* group,int32_t templ,void** outputs){TRY
+int apx_mlx_metal_call(void* stream,void* kernel,const void* const* inputs,size_t ni,const int32_t* dims,const size_t* ranks,const int32_t* dtypes,size_t no,const int32_t* grid,const int32_t* group,const char* const* tnames,const int32_t* tkinds,const int32_t* tvalues,size_t nt,void** outputs){TRY
  std::vector<mx::Shape> shapes;std::vector<mx::Dtype> types;size_t offset=0;for(size_t j=0;j<no;++j){shapes.push_back(shape(dims+offset,ranks[j]));offset+=ranks[j];types.push_back(dtype(dtypes[j]));}
- std::vector<std::pair<std::string,mx::fast::TemplateArg>> templates;if(templ>=0)templates.push_back({"T",dtype(templ)});
+ // Template kinds: 0 dtype code, 1 int, 2 bool.
+ std::vector<std::pair<std::string,mx::fast::TemplateArg>> templates;for(size_t j=0;j<nt;++j){switch(tkinds[j]){case 0:templates.push_back({tnames[j],dtype(tvalues[j])});break;case 1:templates.push_back({tnames[j],int(tvalues[j])});break;case 2:templates.push_back({tnames[j],tvalues[j]!=0});break;default:throw std::invalid_argument("unknown Metal template kind");}}
  auto result=(*static_cast<K*>(kernel))(arrays(inputs,ni),shapes,types,{grid[0],grid[1],grid[2]},{group[0],group[1],group[2]},templates,std::nullopt,false,*static_cast<S*>(stream));publish(result,outputs,no);CATCH}
 }

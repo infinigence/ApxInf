@@ -8,7 +8,7 @@ mod ffi;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use array::{
     clear_cache, loaded_library_path, memory_stats, reset_peak_memory, set_memory_limit, Array, Compiled, MemoryStats, MetalKernel,
-    MlxDType, Stream, StreamCounters,
+    MlxDType, Stream, StreamCounters, TemplateArg,
 };
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use backend::{greedy_token_arrays, MlxBackend};
