@@ -5,7 +5,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python/apxinf/apxinf/serving"))
-from audio_contracts import AttemptKey, AttemptState, is_text, parse_frame
+from audio_contracts import AttemptKey, AttemptState, is_text, parse_frame, strict_json
 from audio_wav import inspect
 
 
@@ -13,6 +13,14 @@ class Conformance(unittest.TestCase):
     def test_shared_original_corpus(self):
         corpus = json.loads((ROOT / "tests/fixtures/audio-serving/cases.json").read_text())
         frames = {}
+        for case in corpus["json"]:
+            with self.subTest(case=case["name"]):
+                try:
+                    strict_json(case["raw"].encode())
+                    valid = True
+                except ValueError:
+                    valid = False
+                self.assertEqual(valid,case["valid"])
         for case in corpus["texts"]:
             with self.subTest(case=case["name"]):
                 self.assertEqual(is_text(case["text"]), case["valid"])

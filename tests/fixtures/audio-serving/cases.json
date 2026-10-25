@@ -60,6 +60,15 @@
     {"name":"metadata_padding", "asr":true, "valid":true, "hex":"5249464630000000574156454a554e4b010000001100666d74201000000001000100803e0000007d00000200100064617461020000000000"},
     {"name":"nonzero_padding", "asr":true, "valid":false, "hex":"5249464630000000574156454a554e4b0100000011ff666d74201000000001000100803e0000007d00000200100064617461020000000000"}
   ],
+  "json": [
+    {"name":"safe_integer_literal", "raw":"9007199254740991", "valid":true},
+    {"name":"unsafe_integer_literal", "raw":"9007199254740992", "valid":false},
+    {"name":"beyond_u64_integer_literal", "raw":"100000000000000000000000000000", "valid":false},
+    {"name":"finite_exponent", "raw":"1e24", "valid":true},
+    {"name":"nonfinite_exponent", "raw":"1e999", "valid":false},
+    {"name":"negative_zero_literal", "raw":"-0", "valid":false},
+    {"name":"digits_in_string", "raw":"\"100000000000000000000000000000\"", "valid":true}
+  ],
   "texts": [
     {"name":"space", "text":" ", "valid":false},
     {"name":"c0_separators", "text":"\u001c\u001d\u001e\u001f", "valid":true},

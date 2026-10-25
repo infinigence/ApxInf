@@ -389,6 +389,7 @@ pub fn strict_json(bytes: &[u8]) -> Result<Value, String> {
     if bytes.len() > MAX_FRAME {
         return Err("frame limit".into());
     }
+    check_integer_literals(bytes)?;
     let mut parser = serde_json::Deserializer::from_slice(bytes);
     let value = StrictValue::deserialize(&mut parser)
         .map_err(|e| e.to_string())?
@@ -406,6 +407,54 @@ pub fn strict_json(bytes: &[u8]) -> Result<Value, String> {
         return Err("nesting limit".into());
     }
     Ok(value)
+}
+
+fn check_integer_literals(bytes: &[u8]) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if bytes[offset] == b'"' {
+            offset += 1;
+            while offset < bytes.len() && bytes[offset] != b'"' {
+                offset += if bytes[offset] == b'\\' { 2 } else { 1 };
+            }
+            offset += 1;
+        } else if bytes[offset] == b'-' || bytes[offset].is_ascii_digit() {
+            let start = offset;
+            offset += 1;
+            while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+                offset += 1;
+            }
+            let mut floating = false;
+            if offset < bytes.len() && bytes[offset] == b'.' {
+                floating = true;
+                offset += 1;
+                while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+                    offset += 1;
+                }
+            }
+            if offset < bytes.len() && matches!(bytes[offset], b'e' | b'E') {
+                floating = true;
+                offset += 1;
+                if offset < bytes.len() && matches!(bytes[offset], b'+' | b'-') {
+                    offset += 1;
+                }
+                while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+                    offset += 1;
+                }
+            }
+            if !floating {
+                let raw = std::str::from_utf8(&bytes[start..offset])
+                    .map_err(|_| "invalid integer literal")?;
+                let value = raw.parse::<i64>().map_err(|_| "unsafe integer literal")?;
+                if raw == "-0" || value.unsigned_abs() > SAFE_INTEGER {
+                    return Err("unsafe integer literal".into());
+                }
+            }
+        } else {
+            offset += 1;
+        }
+    }
+    Ok(())
 }
 pub fn parse_frame(bytes: &[u8]) -> Result<Frame, String> {
     let frame: Frame = serde_json::from_value(strict_json(bytes)?).map_err(|e| e.to_string())?;
