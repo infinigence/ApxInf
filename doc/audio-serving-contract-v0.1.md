@@ -93,14 +93,41 @@ The request voice must occur in the immutable capability list.
 Unknown fields return `invalid_request`.
 Known unsupported fields return `unsupported_feature` before worker submission.
 Unsupported fields include streaming, timestamps, prompts, temperature, speed, instructions, and reference audio.
-Duplicate JSON keys, duplicate form fields, duplicate files, and duplicate HTTP framing headers are invalid.
+Duplicate JSON keys, duplicate form fields, duplicate files, and duplicate content types are invalid.
+Hyper normalizes repeated content lengths with equal numeric values.
+The service accepts that normalized length and rejects conflicting lengths.
 The service rejects transfer encoding and requires an exact content length for POST.
 The profile does not implement realtime, SSE, remote URLs, or client file paths.
 
 Errors use `{"error":{"code":"...","message":"..."}}` before response headers.
-Stable codes include `invalid_request`, `unsupported_feature`, `task_mismatch`, `invalid_audio`, and `payload_too_large`.
-Admission codes include `queue_full`, `queue_timeout`, `deadline_exceeded`, `not_ready`, `media_quota`, and `pressure`.
-Execution codes include `provider_error`, `output_limit`, `missing_resource`, `worker_fault`, and `cancelled`.
+Public HTTP errors use these exact codes and status values.
+
+| Condition | HTTP status | Public code |
+| --- | --- | --- |
+| Invalid request structure | 400 | `invalid_request` |
+| Unsupported parameter or feature | 400 | `unsupported_feature` |
+| Wrong audio task | 400 | `task_mismatch` |
+| Unsupported WAV content | 400 | `invalid_audio` |
+| Cancelled public request | 400 | `cancelled` |
+| Wrong model alias | 404 | `model_not_found` |
+| Input limit | 413 | `payload_too_large` |
+| Full waiting queue | 429 | `queue_full` |
+| Provider failure | 500 | `provider_error` |
+| Output limit | 500 | `output_limit` |
+| Missing frozen resource | 500 | `missing_resource` |
+| Invalid worker protocol | 500 | `protocol_fault` |
+| Worker not ready | 503 | `model_unavailable` |
+| Host pressure or media quota | 503 | `capacity_unavailable` |
+| Worker channel loss | 503 | `worker_lost` |
+| Queue or original deadline | 504 | `deadline_exceeded` |
+
+Worker `failed` results use only `provider_error`, `output_limit`, and `missing_resource`.
+HTTP framing rejection can occur before the application creates a JSON error body.
+
+Whisper readiness requires its public tokenizer for every declared language.
+Each declared language must occur in the loaded tokenizer's supported language codes.
+An English-only model must declare only `en`.
+Kokoro readiness requires the public English frontend and phonemizer fallback constructors to succeed.
 
 ## Protocol envelope and primitives
 

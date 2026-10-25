@@ -305,25 +305,7 @@ impl Frame {
 }
 
 pub fn error_code(value: &str) -> bool {
-    [
-        "invalid_request",
-        "unsupported_feature",
-        "task_mismatch",
-        "invalid_audio",
-        "payload_too_large",
-        "queue_full",
-        "queue_timeout",
-        "deadline_exceeded",
-        "cancelled",
-        "worker_fault",
-        "not_ready",
-        "media_quota",
-        "provider_error",
-        "output_limit",
-        "pressure",
-        "missing_resource",
-    ]
-    .contains(&value)
+    ["provider_error", "output_limit", "missing_resource"].contains(&value)
 }
 
 struct StrictValue(Value);

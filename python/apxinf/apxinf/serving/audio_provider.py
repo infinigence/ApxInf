@@ -1,4 +1,3 @@
-"""Adapters call pinned MLX Audio public APIs without embedding dependency implementations."""
 from __future__ import annotations
 
 import hashlib
@@ -71,7 +70,6 @@ def verify_local_profile(manifest):
             spec = importlib.util.find_spec(module)
             if spec is None or spec.origin is None or declared.get(str(Path(spec.origin).resolve())) != "frontend":
                 raise ValueError("missing_resource: frozen English frontend " + module)
-        # The frontend can execute package data, so the manifest covers its entire package directory.
         for module in ("misaki", "en_core_web_sm"):
             root = Path(importlib.util.find_spec(module).origin).resolve().parent
             for path in root.rglob("*"):
@@ -95,10 +93,10 @@ class MlxAudioProvider:
         self.np = importlib.import_module("numpy")
         self.mx = importlib.import_module("mlx.core")
         if manifest["family"] == "kokoro":
-            # Exercise the same public English fallback before model readiness.
             fallback = importlib.import_module("misaki.espeak").EspeakFallback(british=False)
             if fallback is None:
                 raise ValueError("missing_resource: English phonemizer fallback")
+            importlib.import_module("misaki.en").G2P(trf=False, british=False, fallback=fallback, unk="")
         path = Path(manifest["model_dir"])
         if manifest["family"] == "whisper":
             loader = importlib.import_module("mlx_audio.stt.utils").load_model
@@ -108,6 +106,11 @@ class MlxAudioProvider:
         family = manifest["family"]
         if family not in type(self.model).__module__.split("."):
             raise ValueError("loaded model family differs from the manifest")
+        if family == "whisper":
+            for language in manifest["languages"]:
+                tokenizer = self.model.get_tokenizer(language=language, task="transcribe")
+                if language not in tokenizer.all_language_codes or (not self.model.is_multilingual and language != "en"):
+                    raise ValueError("unsupported Whisper language profile")
 
     def transcribe(self, operation: AsrInput, audio: bytes, cancelled):
         info = inspect(audio, True)
@@ -137,7 +140,6 @@ class MlxAudioProvider:
                 if type(rate) is not int or not 8000 <= rate <= 48000 or (sample_rate is not None and rate != sample_rate):
                     raise ValueError("invalid provider sample rate")
                 sample_rate = rate
-                # Check shape and size before any device-to-host copy or PCM allocation.
                 if len(audio.shape) != 1 or type(audio.shape[0]) is not int or audio.shape[0] <= 0:
                     raise ValueError("invalid provider waveform shape")
                 count = audio.shape[0]
@@ -166,7 +168,6 @@ class MlxAudioProvider:
 
 
 class CpuFixtureProvider:
-    """Transport fixture, enabled only by explicit test configuration."""
     def __init__(self, manifest, delay_ms=0):
         self.delay_ms = delay_ms
 

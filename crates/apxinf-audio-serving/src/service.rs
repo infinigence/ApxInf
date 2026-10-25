@@ -436,7 +436,6 @@ async fn run_actor(
                         Message::ControlAck { command_id, status } => {
                             match (commands.get(command_id), status.as_str()) {
                                 (Some(&"cancel"), "cancel_requested" | "already_terminal") | (Some(&"shutdown"), "shutdown_requested") => {
-                                    // An acknowledgement does not change execution or lease ownership.
                                     commands.insert(command_id.clone(), "acknowledged");
                                 },
                                 _ => fault = Some("protocol_fault"),

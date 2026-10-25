@@ -38,6 +38,7 @@ Record its package versions, package data, voice file, and preprocessing assets 
 The worker checks every regular model file and every selected frontend package file.
 The worker denies network access and subprocess fallback.
 Missing phonemizer or frontend resources must fail instead of invoking a download.
+Startup constructs the public Misaki English frontend before model readiness.
 
 ## Freeze the manifest
 
@@ -81,6 +82,8 @@ File hashes use bounded reads, including large model weights.
 The ASR adapter calls `mlx_audio.stt.utils.load_model(Path, lazy=False, strict=True)`.
 It calls `model.generate(audio=array, language=language, stream=False, temperature=0, return_timestamps=False)`.
 It reads the returned `STTOutput.text` attribute.
+Startup calls `model.get_tokenizer(language=language, task="transcribe")` for each declared language.
+Missing processor resources or unsupported languages prevent readiness.
 The TTS adapter calls `mlx_audio.tts.utils.load_model(Path, lazy=False, strict=True)`.
 It calls `model.generate(text=text, voice=local_safetensors_path, speed=1.0, lang_code="a")`.
 It checks each yielded waveform shape and cumulative output before host conversion or WAV writing.

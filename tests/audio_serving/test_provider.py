@@ -1,4 +1,3 @@
-"""Original public-API doubles exercise the production adapter without MLX or NumPy."""
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -70,6 +69,16 @@ class PublicModel:
     def __init__(self, output):
         self.output = output
         self.calls = []
+        self.tokenizer_error = None
+        self.language_codes = ("en", "fr")
+        self.is_multilingual = True
+        self.tokenizer_calls = []
+
+    def get_tokenizer(self, **kwargs):
+        self.tokenizer_calls.append(kwargs)
+        if self.tokenizer_error:
+            raise self.tokenizer_error
+        return types.SimpleNamespace(all_language_codes=self.language_codes)
 
     def generate(self, **kwargs):
         self.calls.append(kwargs)
@@ -77,20 +86,49 @@ class PublicModel:
 
 
 class ProviderAdapter(unittest.TestCase):
-    def adapter(self, model, family="whisper"):
+    def adapter(self, model, family="whisper", languages=None, frontend_factory=None):
         PublicModel.__module__ = "mlx_audio.stt.models.whisper" if family == "whisper" else "mlx_audio.tts.models.kokoro"
         arrays = PublicArrayApi()
         device = types.SimpleNamespace(synchronize=lambda: None, clear_cache=lambda: None)
         loads = []
         loader = types.SimpleNamespace(load_model=lambda path, **kwargs: (loads.append((path,kwargs)),model)[1])
         modules = {"numpy":arrays, "mlx.core":device, "mlx_audio.stt.utils":loader, "mlx_audio.tts.utils":loader,
-            "misaki.espeak":types.SimpleNamespace(EspeakFallback=lambda british: object())}
-        manifest = {"family":family,"model_dir":"/original/local/model","voices":{"heart":"/original/local/heart.safetensors"}}
+            "misaki.espeak":types.SimpleNamespace(EspeakFallback=lambda british: object()),
+            "misaki.en":types.SimpleNamespace(G2P=frontend_factory or (lambda **kwargs: object()))}
+        manifest = {"family":family,"model_dir":"/original/local/model","voices":{"heart":"/original/local/heart.safetensors"},
+            "languages":languages or ["en"]}
         with patch.object(audio_provider,"verify_local_profile") as verify, patch.object(audio_provider.sys,"addaudithook"), patch.object(audio_provider.importlib,"import_module",side_effect=modules.__getitem__):
             adapter = audio_provider.MlxAudioProvider(manifest)
         verify.assert_called_once_with(manifest)
         self.assertEqual(loads,[(Path("/original/local/model"),{"lazy":False,"strict":True})])
         return adapter, arrays
+
+    def test_missing_whisper_processor_fails_before_readiness(self):
+        model = PublicModel(SttOutput("unreachable"))
+        model.tokenizer_error = ValueError("Processor not found")
+        with self.assertRaisesRegex(ValueError, "Processor not found"):
+            self.adapter(model)
+
+    def test_kokoro_frontend_failure_prevents_readiness(self):
+        def unavailable_frontend(**kwargs):
+            raise ValueError("English tokenizer cannot load")
+        with self.assertRaisesRegex(ValueError, "English tokenizer cannot load"):
+            self.adapter(PublicModel(iter([])), "kokoro", frontend_factory=unavailable_frontend)
+
+    def test_whisper_declared_languages_require_model_support(self):
+        model = PublicModel(SttOutput("unreachable"))
+        with self.assertRaisesRegex(ValueError, "language"):
+            self.adapter(model, languages=["en", "unsupported"])
+        model.is_multilingual = False
+        with self.assertRaisesRegex(ValueError, "language"):
+            self.adapter(model, languages=["fr"])
+
+    def test_whisper_preflights_each_declared_language(self):
+        model = PublicModel(SttOutput("unreachable"))
+        self.adapter(model, languages=["en", "fr"])
+        self.assertEqual(model.tokenizer_calls, [
+            {"language":"en", "task":"transcribe"},
+            {"language":"fr", "task":"transcribe"}])
 
     def test_whisper_public_dataclass_result_and_exact_arguments(self):
         model = PublicModel(SttOutput("An original transcript."))

@@ -102,7 +102,6 @@ async fn main() {
 }
 async fn run() -> Result<(), String> {
     let options = options()?;
-    // Signal streams exist before manifest checks or model loading.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| e.to_string())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())

@@ -1,4 +1,3 @@
-"""Strict file-only audio protocol. This module needs only the Python standard library."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,9 +13,7 @@ SAFE_INTEGER = 9007199254740991
 MAX_UPLOAD = 2 * 1024 * 1024
 MAX_OUTPUT = 8 * 1024 * 1024
 MEDIA_QUOTA = 32 * 1024 * 1024
-ERROR_CODES = frozenset(("invalid_request", "unsupported_feature", "task_mismatch", "invalid_audio",
-    "payload_too_large", "queue_full", "queue_timeout", "deadline_exceeded", "cancelled",
-    "worker_fault", "not_ready", "media_quota", "provider_error", "output_limit", "pressure", "missing_resource"))
+ERROR_CODES = frozenset(("provider_error", "output_limit", "missing_resource"))
 AudioTask = Literal["asr", "tts"]
 
 

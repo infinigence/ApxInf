@@ -1,4 +1,3 @@
-"""Original fault-injection worker for the standalone CLI integration tests."""
 import os
 from pathlib import Path
 import sys

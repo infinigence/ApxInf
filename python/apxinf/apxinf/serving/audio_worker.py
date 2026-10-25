@@ -1,4 +1,3 @@
-"""Persistent single-task audio worker with an independent control reader."""
 from __future__ import annotations
 
 import argparse
@@ -65,14 +64,22 @@ class Worker:
 
     def controls(self):
         try:
+            pending = b""
             while True:
-                raw = sys.stdin.buffer.readline(MAX_FRAME + 2)
-                if not raw:
-                    self.stop()
-                    return
-                if not raw.endswith(b"\n") or len(raw) > MAX_FRAME + 1:
-                    raise ValueError("invalid control framing")
-                frame = parse_frame(raw[:-1])
+                boundary = pending.find(b"\n")
+                if boundary < 0:
+                    if len(pending) > MAX_FRAME:
+                        raise ValueError("invalid control framing")
+                    block = os.read(0, min(4096, MAX_FRAME + 1 - len(pending)))
+                    if not block:
+                        if pending:
+                            raise ValueError("incomplete control frame")
+                        self.stop()
+                        return
+                    pending += block
+                    continue
+                raw, pending = pending[:boundary], pending[boundary + 1:]
+                frame = parse_frame(raw)
                 if frame.worker_epoch != self.args.epoch:
                     raise ValueError("stale worker epoch")
                 message = frame.message
@@ -98,6 +105,7 @@ class Worker:
                     else:
                         self.stop()
                         self.emit(ControlAck(message.command_id, "shutdown_requested"))
+                        return
         except Exception as error:
             print("audio control fault: " + str(error), file=sys.stderr)
             os._exit(2)
@@ -190,7 +198,6 @@ class Worker:
             finally:
                 deadline.cancel()
             self.emit(Terminal(submit.key, 1, result))
-            # Cleanup runs on the execution owner before settlement can release admission.
             provider.settle()
             with self.state_lock:
                 self.active = None

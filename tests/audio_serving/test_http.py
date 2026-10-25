@@ -1,4 +1,3 @@
-"""Exercise the actual Rust CLI, TCP parser, worker process, and completed media."""
 from concurrent.futures import ThreadPoolExecutor
 import http.client
 import hashlib
@@ -146,6 +145,23 @@ class HttpAudio(unittest.TestCase):
             self.assertGreater(max(samples), 3000)
             self.assertLess(min(samples), -3000)
         eventually(lambda: service.metrics()["apxinf_audio_media_reserved_bytes"] == 0)
+
+    def test_wire_content_length_normalization_and_conflict(self):
+        service = self.start("tts")
+        body = json.dumps({"model":service.model,"input":"Original framing check.","voice":"fixture"}).encode()
+        for lengths, expected in (([str(len(body)), str(len(body))], 200),
+            ([str(len(body)), str(len(body) + 1)], 400)):
+            connection = http.client.HTTPConnection(service.host, service.port, timeout=5)
+            connection.putrequest("POST", "/v1/audio/speech")
+            connection.putheader("Content-Type", "application/json")
+            for length in lengths:
+                connection.putheader("Content-Length", length)
+            connection.endheaders(body)
+            response = connection.getresponse()
+            self.assertEqual(response.status, expected)
+            response.read()
+            connection.close()
+        self.assertEqual(service.metrics()["apxinf_audio_completed_total"], 1)
 
     def test_public_validation_and_error_mapping(self):
         service = self.start("asr")
@@ -317,6 +333,27 @@ class HttpAudio(unittest.TestCase):
             self.assertEqual(result.returncode,2)
             self.assertEqual(result.stdout,b"")
             self.assertIn(b"manifest changed before provider construction",result.stderr)
+
+    def test_startup_failure_with_open_stdin_exits_without_interpreter_abort(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "manifest.json"
+            path.write_bytes(b'{}')
+            process = subprocess.Popen([sys.executable,str(ROOT / "python/apxinf/apxinf/serving/audio_worker.py"),
+                "--manifest",str(path),"--manifest-revision","0" * 64,
+                "--epoch","11111111-1111-4111-8111-111111111111","--media-dir",temporary,
+                "--allow-cpu-fixture","--disable-pressure-check"],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+            try:
+                self.assertEqual(process.wait(timeout=4), 2)
+                diagnostics = process.stderr.read()
+                self.assertIn(b"manifest changed before provider construction", diagnostics)
+                self.assertNotIn(b"Fatal Python error", diagnostics)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                process.stdin.close()
+                process.stdout.close()
+                process.stderr.close()
 
 
 if __name__ == "__main__":

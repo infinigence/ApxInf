@@ -1,4 +1,3 @@
-"""Bounded PCM16 mono WAV inspection and encoding."""
 from dataclasses import dataclass
 import struct
 
