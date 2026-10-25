@@ -264,6 +264,7 @@ class HttpAudio(unittest.TestCase):
                 self.assertEqual((status,json.loads(body)["error"]["code"]),(500,"protocol_fault"))
                 eventually(lambda: service.metrics()["apxinf_audio_worker_reaped"] == 1)
                 self.assertFalse(service.ready())
+                self.assertEqual(json.loads(service.request("/readyz")[2])["failure"], "protocol_fault")
                 self.assertEqual(service.asr()[0],503)
                 eventually(lambda: service.metrics()["apxinf_audio_media_reserved_bytes"] == 0)
 

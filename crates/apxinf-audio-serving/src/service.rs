@@ -643,12 +643,12 @@ async fn run_actor(
                             Err(AudioError::new(fault.unwrap_or("worker_lost"))),
                         );
                     }
-                    if !stopping {
+                    if !stopping && fault.is_none() {
                         fault = Some("worker_lost");
                     }
                 }
                 Err(_) => {
-                    fault = Some("worker_lost");
+                    fault.get_or_insert("worker_lost");
                 }
                 Ok(None) => {}
             }
