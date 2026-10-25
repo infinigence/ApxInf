@@ -46,6 +46,14 @@ pub struct Manifest {
     pub languages: Vec<String>,
     pub voices: BTreeMap<String, PathBuf>,
 }
+impl Manifest {
+    fn has_artifact_role(&self, role: &str) -> bool {
+        self.artifacts.iter().any(|artifact| {
+            artifact.role == role
+                || (role == "preprocess" && self.family == "kokoro" && artifact.role == "frontend")
+        })
+    }
+}
 #[derive(Clone)]
 pub struct Config {
     pub manifest: Manifest,
@@ -230,12 +238,7 @@ impl Config {
                 }
             }
             for role in ["model", "config", "preprocess"] {
-                if !manifest.artifacts.iter().any(|a| {
-                    a.role == role
-                        || (role == "preprocess"
-                            && manifest.family == "kokoro"
-                            && a.role == "frontend")
-                }) {
+                if !manifest.has_artifact_role(role) {
                     return Err(format!("missing {role} identity"));
                 }
             }
@@ -259,5 +262,43 @@ impl Config {
             worker,
             pressure,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kokoro_frontend_defines_preprocessing_without_an_unused_artifact() {
+        let mut manifest = Manifest {
+            schema: "apxinf-audio-manifest/1".into(),
+            task: AudioTask::Tts,
+            model: "local-kokoro".into(),
+            provider: "mlx_audio".into(),
+            family: "kokoro".into(),
+            precision: "frozen_artifact".into(),
+            model_dir: "/local/model".into(),
+            runtime: RuntimeIdentity {
+                python: "3.12.10".into(),
+                mlx: "0.32.4".into(),
+                mlx_audio: "0.6.1".into(),
+                mlx_audio_commit: AUDIO_COMMIT.into(),
+                packages: BTreeMap::new(),
+            },
+            artifacts: vec![Artifact {
+                path: "/local/frontend/__init__.py".into(),
+                sha256: "0".repeat(64),
+                role: "frontend".into(),
+            }],
+            languages: vec!["en".into()],
+            voices: BTreeMap::new(),
+        };
+        assert!(manifest.has_artifact_role("preprocess"));
+        assert!(!manifest.has_artifact_role("model"));
+        manifest.family = "whisper".into();
+        assert!(!manifest.has_artifact_role("preprocess"));
+        manifest.artifacts[0].role = "preprocess".into();
+        assert!(manifest.has_artifact_role("preprocess"));
     }
 }
