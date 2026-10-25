@@ -263,3 +263,22 @@ fn async_evaluation_completes_before_reads_and_checks_streams() -> Result<()> {
     assert!(s.async_eval(&[foreign]).is_err());
     Ok(())
 }
+
+#[test]
+fn ready_downloads_wait_for_their_own_array_and_need_row_contiguity() -> Result<()> {
+    let s = Stream::cpu()?;
+    let a = Array::from_f32(&s, &[2, 2], &[1., 2., 3., 4.])?;
+    let first = a.add(&a)?;
+    let later = first.mul(&a)?;
+    s.async_eval(&[first.clone()])?;
+    s.async_eval(&[later.clone()])?;
+    let bytes = first.to_bytes_ready()?;
+    let values: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(values, [2., 4., 6., 8.]);
+    assert_eq!(later.to_f32_vec()?, [2., 8., 18., 32.]);
+    assert!(a.transpose(&[1, 0])?.to_bytes_ready().is_err());
+    Ok(())
+}
