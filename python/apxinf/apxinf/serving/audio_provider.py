@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import stat
 import re
 import struct
 import sys
@@ -21,9 +22,11 @@ AUDIO_COMMIT = "f976eab8b47a3cada5aeb3b52a78451ee06117bc"
 
 def file_digest(path):
     result = hashlib.sha256()
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as source:
         before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("artifact is not a regular file")
         while block := source.read(1024 * 1024):
             result.update(block)
         after = os.fstat(source.fileno())

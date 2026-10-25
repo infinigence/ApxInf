@@ -267,6 +267,18 @@ class HttpAudio(unittest.TestCase):
                 self.assertEqual(service.asr()[0],503)
                 eventually(lambda: service.metrics()["apxinf_audio_media_reserved_bytes"] == 0)
 
+    def test_nonregular_output_reaps_without_blocking_the_actor(self):
+        service = self.start("tts", fault="fifo_output")
+        connection = http.client.HTTPConnection(service.host, service.port, timeout=2)
+        self.addCleanup(connection.close)
+        body = json.dumps({"model":service.model,"input":"A complete original request.","voice":"fixture"}).encode()
+        connection.request("POST", "/v1/audio/speech", body, {"Content-Type":"application/json"})
+        response = connection.getresponse()
+        self.assertEqual((response.status, json.loads(response.read())["error"]["code"]), (500, "protocol_fault"))
+        eventually(lambda: service.metrics()["apxinf_audio_worker_reaped"] == 1)
+        eventually(lambda: service.metrics()["apxinf_audio_media_reserved_bytes"] == 0)
+        self.assertFalse(service.ready())
+
     def test_idle_eof_and_partial_frame(self):
         service = self.start("asr",fault="idle_eof")
         eventually(lambda: service.metrics()["apxinf_audio_worker_reaped"] == 1)

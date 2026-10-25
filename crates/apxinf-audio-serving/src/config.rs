@@ -71,7 +71,7 @@ pub fn sha256(bytes: &[u8]) -> String {
 pub fn file_digest(path: &Path, cancelled: &AtomicBool) -> Result<String, String> {
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| e.to_string())?;
     let before = file.metadata().map_err(|e| e.to_string())?;
@@ -123,9 +123,12 @@ impl Config {
         }
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(manifest_path)
             .map_err(|e| e.to_string())?;
+        if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+            return Err("manifest is not a regular file".into());
+        }
         let mut raw = Vec::new();
         file.take(crate::contracts::MAX_FRAME as u64 + 1)
             .read_to_end(&mut raw)

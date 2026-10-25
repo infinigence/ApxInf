@@ -112,7 +112,7 @@ class Worker:
 
     def read_input(self, grant):
         path = Path(self.args.media_dir) / grant.handle
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as source:
             before = os.fstat(source.fileno())
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size != grant.bytes:
@@ -142,7 +142,10 @@ class Worker:
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
         threading.Thread(target=self.controls, name="audio-control", daemon=True).start()
-        with open(self.args.manifest, "rb") as source:
+        descriptor = os.open(self.args.manifest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("manifest is not a regular file")
             raw = source.read(MAX_FRAME + 1)
         revision = hashlib.sha256(raw).hexdigest()
         if revision != self.args.manifest_revision:

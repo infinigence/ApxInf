@@ -410,8 +410,9 @@ async fn run_actor(
                     if frame.worker_epoch != service.epoch { fault = Some("protocol_fault"); }
                     else { match &frame.message {
                         Message::Ready { .. } if !obs.ready.load(Ordering::SeqCst) && !stopping => {
-                            if ready_matches(&service, &frame) && (!service.config.pressure || normal_pressure()) { obs.ready.store(true, Ordering::SeqCst); }
-                            else { fault = Some("protocol_fault"); }
+                            if !ready_matches(&service, &frame) { fault = Some("protocol_fault"); }
+                            else if service.config.pressure && !normal_pressure() { fault = Some("capacity_unavailable"); }
+                            else { obs.ready.store(true, Ordering::SeqCst); }
                         }
                         Message::Accepted { .. } | Message::Terminal { .. } | Message::ResourcesReleased { .. } => {
                             if let Some(current) = active.as_mut() {

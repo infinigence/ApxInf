@@ -6,13 +6,17 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python/apxinf/apxinf/serving"))
 import audio_worker
-from audio_contracts import Ready, Terminal, ResourcesReleased
+from audio_contracts import Ready, Speech, Terminal, ResourcesReleased
 
 scenario = os.environ["APXINF_AUDIO_TEST_FAULT"]
 original = audio_worker.Worker.emit
 
 
 def emit(self, message):
+    if isinstance(message, Terminal) and isinstance(message.result, Speech) and scenario == "fifo_output":
+        path = Path(self.args.media_dir) / message.result.output.handle
+        path.unlink()
+        os.mkfifo(path, 0o600)
     if isinstance(message, Ready) and scenario == "partial_ready":
         os.write(self.protocol_fd, b'{"protocol":')
         time.sleep(30)

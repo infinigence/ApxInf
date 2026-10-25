@@ -82,7 +82,7 @@ impl MediaLease {
         }
         let mut file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(self.root.path.join(&grant.handle))
             .map_err(|e| e.to_string())?;
         let before = file.metadata().map_err(|e| e.to_string())?;

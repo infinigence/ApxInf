@@ -128,6 +128,7 @@ Whisper readiness requires its public tokenizer for every declared language.
 Each declared language must occur in the loaded tokenizer's supported language codes.
 An English-only model must declare only `en`.
 Kokoro readiness requires the public English frontend and phonemizer fallback constructors to succeed.
+File readers must reject nonregular descriptors without waiting for another process.
 
 ## Protocol envelope and primitives
 
