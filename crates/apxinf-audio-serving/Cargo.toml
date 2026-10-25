@@ -10,6 +10,17 @@ serde_json = "1"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "signal", "sync", "time"] }
+multer = "3"
+futures-util = "0.3"
+
+[[bin]]
+name = "apxinf-audio-serve"
+path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3"

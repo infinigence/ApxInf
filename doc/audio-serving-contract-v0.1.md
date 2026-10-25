@@ -52,6 +52,7 @@ Only the execution owner accesses model objects.
 | Original request deadline | 120000 milliseconds from accepted connection |
 | Queue deadline | 5000 milliseconds after checked submission |
 | Cancellation grace | 1000 milliseconds before forced termination |
+| Terminal settlement grace | 1000 milliseconds before a protocol fault |
 | Send deadline | 15000 milliseconds for the complete response |
 
 The complete output limit includes the RIFF container.

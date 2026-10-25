@@ -53,7 +53,7 @@ pub fn inspect(bytes: &[u8], asr: bool) -> Result<WavInfo, String> {
             }
             format = Some(rate);
         } else if id == b"data" {
-            if data.is_some() || size == 0 || size % 2 != 0 {
+            if data.is_some() || size == 0 || size & 1 != 0 {
                 return Err("invalid WAV data".into());
             }
             data = Some((start, size));
