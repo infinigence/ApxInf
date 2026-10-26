@@ -10,9 +10,9 @@ mod linear {
 
     #[derive(Debug)]
     pub struct Bf16LinearWeights {
-        /// Canonical row-major `[input, output]` matrix. Candidate-specific
-        /// preparation belongs to cuda-new and is never stored in model state.
+        /// `[input, output]` matrix; `layout` tracks committed physical packing.
         pub weight: Tensor,
+        pub layout: crate::pi05::backend::ops::RepackedWeight,
         pub bias: Option<Tensor>,
     }
 
@@ -51,6 +51,7 @@ mod linear {
                 ));
             };
             Ok(Self {
+                layout: crate::pi05::backend::ops::RepackedWeight::new(&weight)?,
                 weight,
                 bias,
             })

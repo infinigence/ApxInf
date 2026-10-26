@@ -88,6 +88,10 @@ struct Implementation {
   DestroyExecutionFn destroy;
 };
 
+uint32_t weight_layout(const Implementation& implementation);
+bool supports_weight_layout(const Implementation& implementation, const Spec& spec);
+uint32_t commit_cutlass_weight(Execution& execution);
+
 bool supports_device(const Implementation& implementation,
                      int device,
                      std::string* reason = nullptr);

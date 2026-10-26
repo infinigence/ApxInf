@@ -23,6 +23,10 @@ typedef enum {
   APXINF_GEMM_LAYOUT_KN = 0,
   APXINF_GEMM_LAYOUT_NK = 1,
   APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256 = 2,
+  APXINF_GEMM_LAYOUT_GATE_UP_ADJACENT = 3,
+  /* Canonical B whose inline packing is disabled; the caller owns the
+     physical layout and no candidate declares this layout. */
+  APXINF_GEMM_LAYOUT_CANONICAL = 4,
 } apxinf_gemm_layout_t;
 
 typedef enum {
@@ -63,7 +67,8 @@ typedef struct {
   uint32_t quantization;
   /* Physical B storage. KN is canonical; NK is accepted by contracts such as
      W8A8 and packed NVFP4 whose checkpoints are already output-major;
-     GATE_UP_INTERLEAVED_256 is the paired-column SwiGLU encoding. */
+     GATE_UP_INTERLEAVED_256 and GATE_UP_ADJACENT are the paired-column
+     encodings; CANONICAL disables inline packing for a caller-owned weight. */
   uint32_t b_layout;
   /* Provider-neutral numerical constraint. LEGACY_CUBLAS preserves the
      established BF16 reduction path while dispatch remains inside GEMM. */

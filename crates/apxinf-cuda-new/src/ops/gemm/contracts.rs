@@ -83,6 +83,7 @@ pub struct GemmArgs<'a> {
     /// identity: both the tensor address and this version identify a prepared
     /// weight.
     pub weight_version: Option<WeightVersion>,
+    pub repacked_weight: Option<&'a super::RepackedWeight>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -153,6 +154,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            repacked_weight: None,
         }
     }
 
@@ -197,6 +199,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy,
             weight_version: None,
+            repacked_weight: None,
         }
     }
 
@@ -210,6 +213,13 @@ impl<'a> GemmArgs<'a> {
     /// Consume a W8A8 checkpoint weight stored physically as `[N, K]`.
     pub fn with_output_major_weight(mut self) -> Self {
         self.weight_layout = GemmWeightLayout::OutputMajor;
+        self
+    }
+
+    /// Use model-owned layout state. All consumers of B must use this state.
+    pub fn with_repacked_weight(mut self, weight: &'a super::RepackedWeight) -> Self {
+        self.repacked_weight = Some(weight);
+        self.weight_version = Some(WeightVersion::new(0));
         self
     }
 
@@ -240,6 +250,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            repacked_weight: None,
         }
     }
 }
@@ -287,6 +298,7 @@ pub(crate) struct Normalized {
     pub policy: GemmPolicy,
     pub bindings: abi::Bindings,
     pub storage: Vec<CudaBuffer>,
+    pub repacked_weight: Option<super::RepackedWeight>,
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
@@ -751,6 +763,7 @@ fn normalize_fused<'a>(
             alpha_is_unit: u32::from(args.alpha == 1.0),
             output_scale_is_unit: u32::from(args.output_scale == 1.0),
         },
+        repacked_weight: args.repacked_weight.cloned(),
         policy,
         bindings,
         storage,
