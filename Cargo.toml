@@ -40,6 +40,7 @@ hip = ["dep:apxinf-hip", "apxinf-model/hip"]
 # if you want the CPU path to use OpenBLAS. Drive OS aarch64 doesn't ship
 # libopenblas — leave this off on Thor.
 openblas = ["apxinf-core/openblas"]
+accelerate = ["apxinf-core/accelerate"]
 
 [dependencies]
 apxinf-core = { path = "crates/apxinf-core" }

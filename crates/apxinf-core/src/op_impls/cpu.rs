@@ -21,6 +21,16 @@ impl SamplingBackend for CpuBackend {
 }
 
 impl Backend for CpuBackend {
+    fn layer_norm(&self, input: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
+        super::cpu_dense::layer_norm(input, weight, bias, eps)
+    }
+    fn gelu_tanh(&self, input: &Tensor) -> Result<Tensor> {
+        super::cpu_dense::gelu(input)
+    }
+    fn add_bias(&self, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+        super::cpu_dense::add_bias(input, bias)
+    }
+
     fn rms_norm(&self, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
         let data = input.as_f32()?;
         let w = weight.as_f32()?;

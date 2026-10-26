@@ -611,7 +611,7 @@ fn fold_input_scale(mut linear: LinearWeights, scale: &Tensor) -> Result<LinearW
     Ok(linear)
 }
 
-fn validate_shapes(config: &Pi05Config, weights: &Pi05Weights) -> Result<()> {
+pub(super) fn validate_shapes(config: &Pi05Config, weights: &Pi05Weights) -> Result<()> {
     expect_shape(
         "token_embedding",
         &weights.vision.token_embedding,
@@ -738,7 +738,7 @@ fn validate_mlp(
     )
 }
 
-fn expect_linear(name: &str, linear: &LinearWeights, input: usize, output: usize) -> Result<()> {
+pub(super) fn expect_linear(name: &str, linear: &LinearWeights, input: usize, output: usize) -> Result<()> {
     expect_shape(name, &linear.weight, &[input, output])?;
     if let Some(bias) = &linear.bias {
         expect_shape(&format!("{name}.bias"), bias, &[output])?;
@@ -746,7 +746,7 @@ fn expect_linear(name: &str, linear: &LinearWeights, input: usize, output: usize
     Ok(())
 }
 
-fn expect_shape(name: &str, tensor: &Tensor, expected: &[usize]) -> Result<()> {
+pub(super) fn expect_shape(name: &str, tensor: &Tensor, expected: &[usize]) -> Result<()> {
     if tensor.shape().dims() != expected {
         return Err(Error::Other(format!(
             "π0.5 {name}: expected shape {expected:?}, got {:?}",

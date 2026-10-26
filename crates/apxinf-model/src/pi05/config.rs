@@ -434,6 +434,59 @@ impl Pi05Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if [
+            self.patch_size,
+            self.image_size,
+            self.num_views,
+            self.vision_width,
+            self.vision_depth,
+            self.vision_mlp_dim,
+            self.vision_heads,
+            self.vision_head_dim,
+            self.vocab_size,
+            self.max_token_len,
+            self.action_dim,
+        ]
+        .contains(&0)
+            || self.vision_width != self.vision_heads * self.vision_head_dim
+        {
+            return Err(Error::Other(
+                "pi05 dimensions must be nonzero and vision width must match head geometry".into(),
+            ));
+        }
+        for expert in [self.language, self.action_expert] {
+            if [
+                expert.width,
+                expert.depth,
+                expert.mlp_dim,
+                expert.num_heads,
+                expert.num_kv_heads,
+                expert.head_dim,
+            ]
+            .contains(&0)
+                || expert.num_heads % expert.num_kv_heads != 0
+                || expert.head_dim % 2 != 0
+                || expert.width % 2 != 0
+            {
+                return Err(Error::Other(
+                    "pi05 invalid expert dimensions/head geometry".into(),
+                ));
+            }
+        }
+        if [
+            self.rms_norm_eps,
+            self.layer_norm_eps,
+            self.rope_theta,
+            self.time_min_period,
+            self.time_max_period,
+        ]
+        .iter()
+        .any(|x| !x.is_finite() || *x <= 0.)
+        {
+            return Err(Error::Other(
+                "pi05 normalization/position/time constants must be finite and positive".into(),
+            ));
+        }
         if self.image_size % self.patch_size != 0 {
             return Err(Error::Other(format!(
                 "pi05 image size {} is not divisible by patch size {}",

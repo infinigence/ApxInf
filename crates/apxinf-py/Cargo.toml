@@ -26,7 +26,8 @@ mlx = ["apxinf-model/mlx"]
 # Enabled by maturin so the cdylib does not link libpython. Left off for
 # `cargo test`, which needs to link a Python interpreter for the harness.
 extension-module = ["pyo3/extension-module"]
-# Forward CUDA support to the model crate. Required for the pi05 runtime,
-# which is only registered on CUDA devices. Without it the extension still
-# imports and reports shapes, but `load` errors for pi05.
+# CPU reference GEMM providers; choose one. With neither, use the Rust fallback.
+openblas = ["apxinf-core/openblas"]
+accelerate = ["apxinf-core/accelerate"]
+# Forward CUDA support to the model crate. CPU PI0.5 needs no CUDA feature.
 cuda = ["apxinf-model/cuda"]

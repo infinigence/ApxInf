@@ -341,8 +341,10 @@ pip install -e "python/apxinf[serving]"
 Activate a venv or conda env before installing. The `serving` extra adds msgpack/websockets.
 
 `--features cuda` is a Cargo feature, not a CUDA installation: it compiles the
-CUDA backend into the binding, and it is required — the PI0.5 runtime is only
-registered on CUDA devices, as is WallOSS.
+CUDA backend into the binding for GPU inference. WallOSS requires CUDA.
+PI0.5 also supports an eager [FP32 CPU reference](doc/pi05-cpu-reference.md):
+build with `openblas` (or `accelerate` on macOS), then select `device="cpu"`
+and `model_variant="fp32_reference"`.
 
 The build queries the visible GPU for its compute capability and compiles the
 kernels for exactly that architecture, so build on the machine you deploy to;

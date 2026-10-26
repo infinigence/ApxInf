@@ -1,6 +1,6 @@
 """Shared fixtures for the ``apxinf_py`` PyO3 smoke tests.
 
-These tests need a CUDA machine (the pi05 runtime is CUDA-only) plus a pi05
+These GPU integration tests need a CUDA machine plus a pi05
 checkpoint. They are gated on environment variables and skip cleanly when the
 extension is not built with ``--features cuda`` or no checkpoint is provided:
 

@@ -11,9 +11,7 @@ mod config;
 #[cfg(feature = "cuda")]
 mod load;
 mod math;
-#[cfg(feature = "cuda")]
 mod model;
-#[cfg(feature = "cuda")]
 mod model_runner;
 mod weights;
 
@@ -58,3 +56,5 @@ pub use model::{Bf16Model, Fp8StaticModel, Int8DynamicModel};
 pub use model::{Bf16PrefixKvCache, Fp8StaticPrefixKvCache, Int8DynamicPrefixKvCache};
 #[cfg(feature = "cuda")]
 pub use model_runner::{capture_patches, capture_rgb, CapturedGraph};
+
+pub(crate) mod cpu_load;

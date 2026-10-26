@@ -426,8 +426,16 @@ impl Tensor {
 
         let out_shape = self.shape.matmul_shape(other.shape())?;
 
-        let a = self.to_f32_vec()?;
-        let b = other.to_f32_vec()?;
+        let a = if self.dtype() == DType::F32 {
+            std::borrow::Cow::Borrowed(self.as_f32()?)
+        } else {
+            std::borrow::Cow::Owned(self.to_f32_vec()?)
+        };
+        let b = if other.dtype() == DType::F32 {
+            std::borrow::Cow::Borrowed(other.as_f32()?)
+        } else {
+            std::borrow::Cow::Owned(other.to_f32_vec()?)
+        };
 
         let m = self.shape.dims()[self.ndim() - 2];
         let k = self.shape.dims()[self.ndim() - 1];

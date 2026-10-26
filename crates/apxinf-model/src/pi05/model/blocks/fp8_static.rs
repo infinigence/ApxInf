@@ -1521,6 +1521,7 @@ pub(in crate::pi05::model) mod backbone {
     }
 
     impl super::super::Blocks for Fp8StaticBlocks {
+        type TokenIds = CudaBuffer;
         type Prefix = Fp8StaticPrefixKvCache;
         type StepModulation = Fp8StaticStepModulation;
         fn config(&self) -> &Pi05Config {
