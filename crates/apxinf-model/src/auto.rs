@@ -50,9 +50,9 @@ pub struct LoadOptions {
     /// `config.json:model_type`.
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
-    /// auto, bf16, fp8_static and int8_dynamic. Native Metal families parse
-    /// their own variants. Every VLA family accepts this option; legacy
-    /// executors adapt it inside their own loader.
+    /// auto, bf16, fp8_static and int8_dynamic on CUDA; auto/fp32_reference on CPU.
+    /// Native Metal families parse their own variants. Every VLA family accepts
+    /// this option; legacy executors adapt it inside their own loader.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
@@ -498,6 +498,9 @@ impl AutoModel {
         }
 
         if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip" | "pi05-musa") {
+            if device == Device::Cpu && model_name == "pi05" {
+                return crate::pi05::cpu_load::load(path, options);
+            }
             #[cfg(feature = "hip")]
             if matches!(device, Device::Hip(_)) {
                 let config = options.config.as_ref().map(hip_pi05_config);
@@ -515,7 +518,7 @@ impl AutoModel {
 
             #[cfg(not(feature = "cuda"))]
             return Err(Error::Other(
-                "PI0.5 requires CUDA, HIP or MUSA support".into(),
+                "PI0.5 requires CPU, CUDA, HIP or MUSA support".into(),
             ));
         }
 

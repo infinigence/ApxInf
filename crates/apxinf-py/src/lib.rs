@@ -1065,7 +1065,8 @@ impl ModelRunner {
     /// * `path` — checkpoint directory or index file.
     /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
     ///   The selected family and compiled features must support that backend.
-    /// * `model_variant` — family-owned implementation selection for every VLA policy.
+    /// * `model_variant` — family-owned implementation selection for every VLA policy;
+    ///   PI0.5 CPU accepts auto/fp32_reference.
     /// * `precision` — legacy runtime compatibility; leave auto when using model_variant.
     /// * `calibration` — optional FP8 calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
@@ -1189,7 +1190,8 @@ impl ModelRunner {
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
     ///   The selected family and compiled features must support that backend.
-    /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
+    /// * `model_variant` — CUDA: `bf16` (default), `fp8_static`, or `int8_dynamic`;
+    ///   CPU: explicitly select `auto` or `fp32_reference`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
     /// * `tactics` - optional hardware-wide GEMM tactics json.

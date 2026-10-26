@@ -17,5 +17,5 @@ test = ["pytest>=7", "ml_dtypes>=0.2"]
 module-name = "apxinf_py"
 # `extension-module` keeps the cdylib from linking libpython. CUDA builds add
 # the model runtime with `maturin develop --features cuda` (additive), which is
-# required for the pi05 runtime to be registered.
+# required for GPU execution. CPU PI0.5 can add `openblas` or `accelerate`.
 features = ["extension-module"]
