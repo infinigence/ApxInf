@@ -79,6 +79,22 @@ impl Config {
         {
             return Err(Error::Other("unsupported Fast-WAM action schedule".into()));
         }
+        // These top-level inference options override the scheduler defaults in
+        // the reference. Reject incompatible overrides before loading weights.
+        if v.get("num_inference_steps")
+            .is_some_and(|value| value.as_u64() != Some(10))
+        {
+            return Err(Error::Other(
+                "unsupported Fast-WAM num_inference_steps: expected 10".into(),
+            ));
+        }
+        if v.get("sigma_shift")
+            .is_some_and(|value| !value.is_null() && value.as_f64() != Some(5.))
+        {
+            return Err(Error::Other(
+                "unsupported Fast-WAM sigma_shift: expected null or 5".into(),
+            ));
+        }
         Ok(Self { steps: 10 })
     }
 }
@@ -147,6 +163,43 @@ mod tests {
             let result = Config::from_value(&profile);
             assert!(result.is_err(), "accepted {}", profile["fp32_attention"]);
             assert!(result.err().unwrap().to_string().contains("fp32_attention"));
+        }
+    }
+
+    #[test]
+    fn fastwam_config_validates_effective_inference_schedule() {
+        let mut profile = supported_profile();
+        assert!(Config::from_value(&profile).is_ok());
+        profile["num_inference_steps"] = json!(10);
+        for shift in [json!(null), json!(5), json!(5.0)] {
+            profile["sigma_shift"] = shift;
+            assert!(Config::from_value(&profile).is_ok());
+        }
+        for (field, values) in [
+            (
+                "num_inference_steps",
+                vec![
+                    json!(20),
+                    json!(0),
+                    json!(null),
+                    json!("10"),
+                    json!(true),
+                    json!(10.5),
+                ],
+            ),
+            (
+                "sigma_shift",
+                vec![json!(3), json!(0), json!("5"), json!(true)],
+            ),
+        ] {
+            for value in values {
+                let mut profile = supported_profile();
+                profile[field] = value;
+                let error = Config::from_value(&profile)
+                    .err()
+                    .expect("unsupported schedule accepted");
+                assert!(error.to_string().contains(field));
+            }
         }
     }
 

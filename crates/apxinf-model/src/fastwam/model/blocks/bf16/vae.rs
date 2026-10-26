@@ -1,8 +1,10 @@
 //! Wan 2.2 encoder for a single observed frame. Temporal causal convolutions
 //! use their final temporal tap because the cache is empty for every request.
 //! This module never keeps a video cache or invokes a reference framework.
-use super::backend::{self, ops, Context};
-use super::weights::vae::{Attention, Conv, DownBlock, Norm, Residual, Vae};
+use super::ops as compute;
+use crate::fastwam::backend::{ops, Context};
+use crate::fastwam::weights::cast;
+use crate::fastwam::weights::vae::{Attention, Conv, DownBlock, Norm, Residual, Vae};
 use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 // Each arena allocation can consume at most 255 leading alignment bytes.
@@ -69,7 +71,7 @@ impl Norm {
         Ok(out)
     }
     fn activated(&self, ctx: &Context, x: &Tensor) -> Result<Tensor> {
-        backend::activation(ctx, &self.forward(ctx, x)?, ops::PointwiseActivation::Silu)
+        compute::activation(ctx, &self.forward(ctx, x)?, ops::PointwiseActivation::Silu)
     }
 }
 
@@ -106,7 +108,7 @@ impl Residual {
         let x = self
             .conv2
             .forward(ctx, &self.norm2.activated(ctx, &x)?, h, w, policy)?;
-        backend::add(ctx, &x, &residual)
+        compute::add(ctx, &x, &residual)
     }
 }
 
@@ -138,7 +140,7 @@ impl DownBlock {
             self.temporal_factor,
             y.shape().dims()[1],
         )?;
-        backend::add(ctx, &y, &residual)
+        compute::add(ctx, &y, &residual)
     }
 }
 
@@ -153,15 +155,15 @@ impl Attention {
     ) -> Result<Tensor> {
         let normalized = self.norm.forward(ctx, x)?;
         let channels = x.shape().dims()[1];
-        let q = backend::reshape(
+        let q = compute::reshape(
             &self.q.forward_conv(ctx, &normalized, policy)?,
             vec![1, h * w, 1, channels],
         )?;
-        let k = backend::reshape(
+        let k = compute::reshape(
             &self.k.forward_conv(ctx, &normalized, policy)?,
             vec![1, h * w, 1, channels],
         )?;
-        let v = backend::reshape(
+        let v = compute::reshape(
             &self.v.forward_conv(ctx, &normalized, policy)?,
             vec![1, h * w, 1, channels],
         )?;
@@ -170,8 +172,8 @@ impl Attention {
         args.policy.online_tune = policy.online_tune;
         args.policy.cache_dir = policy.cache_dir.clone();
         ops::attention(ctx, args)?;
-        let output = backend::reshape(&output, vec![h * w, channels])?;
-        backend::add(
+        let output = compute::reshape(&output, vec![h * w, channels])?;
+        compute::add(
             ctx,
             &self.projection.forward(ctx, &output, h, w, policy)?,
             x,
@@ -182,7 +184,7 @@ impl Attention {
 impl Vae {
     /// Conservative arena capacity derived from this encoder's allocation
     /// schedule. Native provider workspaces are separately owned by executions.
-    pub(super) fn workspace_bytes(&self) -> usize {
+    pub(in crate::fastwam) fn workspace_bytes(&self) -> usize {
         let mut bytes = allocation_bytes(224*448*3,self.dtype) // possible input cast
             +allocation_bytes(112*224*12,self.dtype); // width-first patchify
         let (mut h, mut w) = (112, 224);
@@ -217,7 +219,7 @@ impl Vae {
     }
     /// One stitched HWC RGB frame in [-1,1], flattened `[224*448,3]`.
     /// Returns standardized posterior mean `[14*28,48]` in F32.
-    pub(super) fn forward(
+    pub(in crate::fastwam) fn forward(
         &self,
         ctx: &Context,
         input: &Tensor,
@@ -228,7 +230,7 @@ impl Vae {
                 "Wan VAE requires one 224x448 RGB frame".into(),
             ));
         }
-        let input = backend::cast(ctx, input, self.dtype)?;
+        let input = cast(ctx, input, self.dtype)?;
         let mut packed = ctx.allocate_output(Shape::new(vec![112 * 224, 12]), self.dtype)?;
         ops::image_space_to_depth(ctx, &input, &mut packed, 224, 448, 2)?;
         let (mut h, mut w) = (112, 224);
@@ -256,6 +258,7 @@ impl Vae {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fastwam::backend;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -312,7 +315,7 @@ mod tests {
             .unwrap();
             let model = Vae::load(&ctx, Path::new(&assets), dtype).unwrap();
             let input = backend::upload(&ctx, fixtures.get("input").unwrap()).unwrap();
-            let input = backend::cast(&ctx, &input, dtype).unwrap();
+            let input = cast(&ctx, &input, dtype).unwrap();
             let mut packed = ctx
                 .allocate_output(Shape::new(vec![112 * 224, 12]), dtype)
                 .unwrap();

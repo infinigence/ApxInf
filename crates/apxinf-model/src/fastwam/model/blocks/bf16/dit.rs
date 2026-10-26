@@ -1,14 +1,22 @@
 //! Wan video prefill and action denoising. Weights and cached text projections
 //! are family local; backend calls express only mathematical operations.
-use super::backend::binary;
-use super::backend::{self, ops, Context};
-use super::weights::dit::{Expert, Projections};
+use super::ops as compute;
+use super::ops::binary;
+use crate::fastwam::backend::{ops, Context};
+use crate::fastwam::weights::cast;
+use crate::fastwam::weights::dit::{Expert as ExpertWeights, Projections};
+pub(in crate::fastwam) struct Expert {
+    pub weights: ExpertWeights,
+    /// [step][block][shift/scale/gate], computed once during construction.
+    pub modulations: Vec<Vec<Vec<Tensor>>>,
+}
+
 use apxinf_core::{DType, Result, Shape, Tensor};
 
 // Preserve residual state across blocks without repeated BF16 rounding. Branch
 // projections and gates retain their checkpoint dtype and round before the add.
 fn residual(ctx: &Context, x: &Tensor, y: &Tensor) -> Result<Tensor> {
-    backend::add(ctx, x, &backend::cast(ctx, y, DType::F32)?)
+    compute::add(ctx, x, &cast(ctx, y, DType::F32)?)
 }
 fn norm(ctx: &Context, x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
     let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
@@ -16,7 +24,7 @@ fn norm(ctx: &Context, x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Ten
         ctx,
         ops::LayerNormArgs::new(x, weight, bias, &mut out, 1e-6),
     )?;
-    backend::cast(ctx, &out, DType::BF16)
+    cast(ctx, &out, DType::BF16)
 }
 fn rms(ctx: &Context, x: &Tensor, weight: &Tensor) -> Result<Tensor> {
     let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
@@ -30,9 +38,9 @@ fn attend(
     v: &Tensor,
     policy: &ops::AttentionPolicy,
 ) -> Result<Tensor> {
-    let q = backend::cast(ctx, q, DType::F32)?;
-    let k = backend::cast(ctx, k, DType::F32)?;
-    let v = backend::cast(ctx, v, DType::F32)?;
+    let q = cast(ctx, q, DType::F32)?;
+    let k = cast(ctx, k, DType::F32)?;
+    let v = cast(ctx, v, DType::F32)?;
     let (t, s) = (q.shape().dims()[0], k.shape().dims()[0]);
     let q = q.reshape(vec![1, t, 24, 128])?;
     let k = k.reshape(vec![1, s, 24, 128])?;
@@ -53,11 +61,11 @@ impl Projections {
     }
 }
 
-pub(super) struct Kv {
+pub(in crate::fastwam) struct Kv {
     key: Tensor,
     value: Tensor,
 }
-pub(super) struct ContextCache {
+pub(in crate::fastwam) struct ContextCache {
     kv: Vec<Kv>,
 }
 
@@ -65,16 +73,17 @@ impl Expert {
     /// Conservative sum of transient tensors for this fixed expert profile.
     /// Repeated action-step budgets also reserve context space, a safe overestimate.
     /// Native execution-owned scratch is separate from the tensor arena.
-    pub(super) fn workspace_bytes(&self) -> usize {
-        let tokens = if self.video { 98 } else { 32 };
-        let prefix = if self.video { 0 } else { 98 };
-        let hidden = self.input.weight.shape().dims()[1];
+    pub(in crate::fastwam) fn workspace_bytes(&self) -> usize {
+        let tokens = if self.weights.video { 98 } else { 32 };
+        let prefix = if self.weights.video { 0 } else { 98 };
+        let hidden = self.weights.input.weight.shape().dims()[1];
         let attention_width = 24 * 128;
         let context = 129;
         // Text projection/activation and per-layer K, normalized K and V.
-        let context_bytes =
-            context * hidden * 6 + self.blocks.len() * (context * attention_width * 6 + 3 * 256);
+        let context_bytes = context * hidden * 6
+            + self.weights.blocks.len() * (context * attention_width * 6 + 3 * 256);
         let layer_bytes: usize = self
+            .weights
             .blocks
             .iter()
             .map(|b| {
@@ -90,30 +99,31 @@ impl Expert {
                 2 * (hidden_bytes + attention_bytes + 48 * 256)
             })
             .sum();
-        let input_bytes = tokens * hidden * self.input.weight.dtype().size_in_bytes()
+        let input_bytes = tokens * hidden * self.weights.input.weight.dtype().size_in_bytes()
             + 392 * 48 * 2
             + 98 * 192 * 2
-            + if self.video {
+            + if self.weights.video {
                 tokens * hidden * 2 + 256
             } else {
                 0
             }; // convolution bias add
-        let head_bytes = self.head.as_ref().map_or(0, |h| {
+        let head_bytes = self.weights.head.as_ref().map_or(0, |h| {
             tokens * h.weight.shape().dims()[1] * h.weight.dtype().size_in_bytes()
         });
         context_bytes + layer_bytes + input_bytes + head_bytes + 16 * 256
     }
 
-    pub(super) fn context(
+    pub(in crate::fastwam) fn context(
         &self,
         ctx: &Context,
         context: &Tensor,
         policy: &ops::GemmPolicy,
     ) -> Result<ContextCache> {
-        let x = self.text0.forward(ctx, context, policy)?;
-        let x = backend::activation(ctx, &x, ops::PointwiseActivation::Gelu)?;
-        let x = self.text2.forward(ctx, &x, policy)?;
+        let x = self.weights.text0.forward(ctx, context, policy)?;
+        let x = compute::activation(ctx, &x, ops::PointwiseActivation::Gelu)?;
+        let x = self.weights.text2.forward(ctx, &x, policy)?;
         let kv = self
+            .weights
             .blocks
             .iter()
             .map(|b| {
@@ -126,20 +136,24 @@ impl Expert {
     fn rotate(&self, ctx: &Context, x: &Tensor) -> Result<Tensor> {
         let mut out = ctx.allocate_output(
             x.shape().clone(),
-            if self.video { DType::F32 } else { DType::BF16 },
+            if self.weights.video {
+                DType::F32
+            } else {
+                DType::BF16
+            },
         )?;
         ops::pairwise_rope(
             ctx,
             ops::PairwiseRopeArgs {
                 input: x,
-                table: &self.rope,
+                table: &self.weights.rope,
                 output: &mut out,
                 heads: 24,
             },
         )?;
         Ok(out)
     }
-    pub(super) fn forward(
+    pub(in crate::fastwam) fn forward(
         &self,
         ctx: &Context,
         input: &Tensor,
@@ -149,24 +163,24 @@ impl Expert {
         gemm: &ops::GemmPolicy,
         attention: &ops::AttentionPolicy,
     ) -> Result<(Tensor, Vec<Kv>)> {
-        let input = if self.video {
-            let input = backend::cast(ctx, input, DType::BF16)?;
+        let input = if self.weights.video {
+            let input = cast(ctx, input, DType::BF16)?;
             let mut patches = ctx.allocate_output(Shape::new(vec![98, 192]), DType::BF16)?;
             ops::image_im2col(ctx, &input, &mut patches, 14, 28, 2, 2, 0, 7, 14)?;
             patches
         } else {
             input.clone()
         };
-        let x = if self.video {
-            self.input.forward_conv(ctx, &input, gemm)?
+        let x = if self.weights.video {
+            self.weights.input.forward_conv(ctx, &input, gemm)?
         } else {
-            self.input.forward(ctx, &input, gemm)?
+            self.weights.input.forward(ctx, &input, gemm)?
         };
-        let mut x = backend::cast(ctx, &x, DType::F32)?;
+        let mut x = cast(ctx, &x, DType::F32)?;
         let mut cache = Vec::new();
-        for (i, b) in self.blocks.iter().enumerate() {
+        for (i, b) in self.weights.blocks.iter().enumerate() {
             let m = &self.modulations[step][i];
-            let u = norm(ctx, &x, &self.one, &self.zero)?;
+            let u = norm(ctx, &x, &self.weights.one, &self.weights.zero)?;
             let u = binary(ctx, &u, &m[1], ops::PointwiseSemantic::BroadcastMultiply)?;
             let u = binary(ctx, &u, &m[0], ops::PointwiseSemantic::BroadcastAdd)?;
             let q = self.rotate(ctx, &rms(ctx, &b.sa.q.forward(ctx, &u, gemm)?, &b.sa.nq)?)?;
@@ -174,7 +188,7 @@ impl Expert {
             let v = b.sa.v.forward(ctx, &u, gemm)?;
             let (k, v) = if let Some(prefix) = video_cache {
                 (
-                    ops::concat_rows(ctx, &prefix[i].key, &backend::cast(ctx, &k, DType::F32)?)?,
+                    ops::concat_rows(ctx, &prefix[i].key, &cast(ctx, &k, DType::F32)?)?,
                     ops::concat_rows(ctx, &prefix[i].value, &v)?,
                 )
             } else {
@@ -192,22 +206,22 @@ impl Expert {
             let q = rms(ctx, &b.ca.q.forward(ctx, &u, gemm)?, &b.ca.nq)?;
             let y = attend(ctx, &q, &context.kv[i].key, &context.kv[i].value, attention)?;
             x = residual(ctx, &x, &b.ca.o.forward(ctx, &y, gemm)?)?;
-            let u = norm(ctx, &x, &self.one, &self.zero)?;
+            let u = norm(ctx, &x, &self.weights.one, &self.weights.zero)?;
             let u = binary(ctx, &u, &m[4], ops::PointwiseSemantic::BroadcastMultiply)?;
             let u = binary(ctx, &u, &m[3], ops::PointwiseSemantic::BroadcastAdd)?;
             let u = b.ff0.forward(ctx, &u, gemm)?;
-            let u = backend::activation(ctx, &u, ops::PointwiseActivation::Gelu)?;
+            let u = compute::activation(ctx, &u, ops::PointwiseActivation::Gelu)?;
             let u = b.ff2.forward(ctx, &u, gemm)?;
             let u = binary(ctx, &u, &m[5], ops::PointwiseSemantic::BroadcastMultiply)?;
             x = residual(ctx, &x, &u)?;
         }
-        if let Some(head) = &self.head {
+        if let Some(head) = &self.weights.head {
             x = head.forward(ctx, &x, gemm)?;
         }
         Ok((x, cache))
     }
 }
-pub(super) fn sigma(step: usize) -> f64 {
+pub(in crate::fastwam) fn sigma(step: usize) -> f64 {
     let u = 1. - step as f64 / 10.;
     5. * u / (1. + 4. * u)
 }

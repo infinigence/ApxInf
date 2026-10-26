@@ -1,7 +1,6 @@
 use super::{
     backend::{ops, Context},
     config::Config,
-    model::Model,
     model_runner::ModelRunner,
 };
 use crate::auto::{cuda_recipe_options, LoadOptions, LoadedModel, ModelPrecision};
@@ -73,45 +72,4 @@ pub(crate) fn load_with_cuda_new(
     Ok(LoadedModel::Vla(Box::new(ModelRunner::new(ctx, model))))
 }
 
-use super::backend::{self, host_tensor};
-use super::weights::{dit::Expert, text::TextEncoder, vae::Vae, Bias, Store};
-use apxinf_core::DType;
-pub(super) fn build_model(
-    ctx: &Context,
-    path: &Path,
-    text_path: &Path,
-    vae_path: &Path,
-    gemm: ops::GemmPolicy,
-    attention: ops::AttentionPolicy,
-) -> Result<Model> {
-    let mut store = Store::load(path)?;
-    let video = Expert::load(&mut store, ctx, true, &gemm, &[0.])?;
-    let action = Expert::load(
-        &mut store,
-        ctx,
-        false,
-        &gemm,
-        &(0..10)
-            .map(|step| (super::dit::sigma(step) * 1000.) as f32)
-            .collect::<Vec<_>>(),
-    )?;
-    let proprio = store.linear(ctx, "model.proprio_encoder", Bias::Required)?;
-    proprio.validate("proprio encoder", 8, 4096)?;
-    drop(store);
-    let rgb = (0..256)
-        .map(|v| {
-            let unit = half::bf16::from_f32(v as f32 / 255.).to_f32();
-            half::bf16::from_f32(half::bf16::from_f32(unit * 2.).to_f32() - 1.).to_f32()
-        })
-        .collect::<Vec<_>>();
-    Ok(Model {
-        video,
-        action,
-        proprio,
-        text: TextEncoder::load(ctx, text_path)?,
-        vae: Vae::load(ctx, vae_path, DType::BF16)?,
-        rgb_table: backend::upload(ctx, &host_tensor(vec![256, 1], &rgb, DType::BF16)?)?,
-        gemm,
-        attention,
-    })
-}
+pub(super) use super::model::build_model;

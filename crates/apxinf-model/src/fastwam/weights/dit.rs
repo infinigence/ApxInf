@@ -1,7 +1,8 @@
 //! Immutable checkpoint mapping and prepared weight data.
+use super::cast;
 use super::{host_tensor, validate_tensor, Bias, Linear, Store};
-use crate::fastwam::backend::{self, binary, ops, Context};
-use apxinf_core::{DType, Error, Result, Shape, Tensor};
+use crate::fastwam::backend::{self, ops, Context};
+use apxinf_core::{DType, Error, Result, Tensor};
 pub(in crate::fastwam) struct Projections {
     pub(in crate::fastwam) q: Linear,
     pub(in crate::fastwam) k: Linear,
@@ -44,8 +45,6 @@ pub(in crate::fastwam) struct Expert {
     pub(in crate::fastwam) zero: Tensor,
     pub(in crate::fastwam) rope: ops::PairwiseRopeTable,
     pub(in crate::fastwam) video: bool,
-    /// [step][block][shift/scale/gate]. Immutable schedule prepared at load.
-    pub(in crate::fastwam) modulations: Vec<Vec<Vec<Tensor>>>,
 }
 
 impl Expert {
@@ -53,9 +52,7 @@ impl Expert {
         s: &mut Store,
         ctx: &Context,
         video: bool,
-        gemm: &ops::GemmPolicy,
-        timesteps: &[f32],
-    ) -> Result<Self> {
+    ) -> Result<(Self, TimeWeights)> {
         let name = if video { "video" } else { "action" };
         let p = format!("model.mot.mixtures.{name}");
         let width = if video { 3072 } else { 1024 };
@@ -94,8 +91,8 @@ impl Expert {
         // Keep immutable affine data in the residual state's dtype. This avoids
         // repeating weight conversions inside every captured denoising step.
         for b in &mut blocks {
-            b.norm3w = backend::cast(ctx, &b.norm3w, DType::F32)?;
-            b.norm3b = backend::cast(ctx, &b.norm3b, DType::F32)?;
+            b.norm3w = cast(ctx, &b.norm3w, DType::F32)?;
+            b.norm3b = cast(ctx, &b.norm3b, DType::F32)?;
         }
         let mut input = if video {
             let raw = s.take(&format!("{p}.patch_embedding.weight"))?;
@@ -133,11 +130,11 @@ impl Expert {
         if !video {
             // Keep Euler state in F32 through its small input projection.
             // Validate the original BF16 checkpoint before exact promotion.
-            input.weight = backend::cast(ctx, &input.weight, DType::F32)?;
+            input.weight = cast(ctx, &input.weight, DType::F32)?;
             input.bias = input
                 .bias
                 .as_ref()
-                .map(|bias| backend::cast(ctx, bias, DType::F32))
+                .map(|bias| cast(ctx, bias, DType::F32))
                 .transpose()?;
         }
         time0.validate("Wan time input", 256, width)?;
@@ -145,66 +142,16 @@ impl Expert {
         timeproj.validate("Wan time modulation", width, 6 * width)?;
         if video {
             for projection in [&mut time0, &mut time2, &mut timeproj] {
-                projection.weight = backend::cast(ctx, &projection.weight, DType::F32)?;
+                projection.weight = cast(ctx, &projection.weight, DType::F32)?;
                 projection.bias = projection
                     .bias
                     .as_ref()
-                    .map(|b| backend::cast(ctx, b, DType::F32))
+                    .map(|b| cast(ctx, b, DType::F32))
                     .transpose()?;
             }
         }
         let one = vector(ctx, &vec![1.; width], DType::F32)?;
         let zero = vector(ctx, &vec![0.; width], DType::F32)?;
-        let modulation_one = vector(ctx, &vec![1.; width], DType::BF16)?;
-        let mut modulations = Vec::new();
-        for step in 0..if video { 1 } else { 10 } {
-            let t = if video {
-                0.
-            } else {
-                half::bf16::from_f32(timesteps[step]).to_f32() as f64
-            };
-            let mut embedding = Vec::with_capacity(256);
-            for trig in 0..2 {
-                for i in 0..128 {
-                    let phase = t * 10000f64.powf(-(i as f64) / 128.);
-                    embedding.push(if trig == 0 {
-                        phase.cos() as f32
-                    } else {
-                        phase.sin() as f32
-                    });
-                }
-            }
-            let emb = backend::upload(
-                ctx,
-                &host_tensor(vec![1, 256], &embedding, time0.weight.dtype())?,
-            )?;
-            let t = time0.forward(ctx, &emb, gemm)?;
-            let t = backend::activation(ctx, &t, ops::PointwiseActivation::Silu)?;
-            let t = time2.forward(ctx, &t, gemm)?;
-            let t = backend::activation(ctx, &t, ops::PointwiseActivation::Silu)?;
-            let t = backend::cast(ctx, &timeproj.forward(ctx, &t, gemm)?, DType::BF16)?;
-            let mut layers = Vec::new();
-            for b in &blocks {
-                let sum = binary(ctx, &b.modulation, &t, ops::PointwiseSemantic::Add)?;
-                let mut parts = Vec::new();
-                for j in 0..6 {
-                    let part = slice(&sum, j * width, width)?;
-                    parts.push(if j == 1 || j == 4 {
-                        binary(
-                            ctx,
-                            &part.reshape(vec![1, width])?,
-                            &modulation_one,
-                            ops::PointwiseSemantic::BroadcastAdd,
-                        )?
-                        .reshape(vec![width])?
-                    } else {
-                        part
-                    });
-                }
-                layers.push(parts);
-            }
-            modulations.push(layers);
-        }
         let tokens = if video { 98 } else { 32 };
         let mut coefficients = Vec::new();
         for pos in 0..tokens {
@@ -235,25 +182,31 @@ impl Expert {
             head.validate("Wan action output", width, 7)?;
             // Preserve the F32 residual through the small velocity projection.
             // Checkpoint values are BF16; their F32 promotion is exact.
-            head.weight = backend::cast(ctx, &head.weight, DType::F32)?;
+            head.weight = cast(ctx, &head.weight, DType::F32)?;
             head.bias = head
                 .bias
                 .as_ref()
-                .map(|bias| backend::cast(ctx, bias, DType::F32))
+                .map(|bias| cast(ctx, bias, DType::F32))
                 .transpose()?;
         }
-        Ok(Self {
-            blocks,
-            text0,
-            text2,
-            input,
-            head,
-            one,
-            zero,
-            rope: ops::PairwiseRopeTable::new(ctx, tokens, 128, &coefficients)?,
-            video,
-            modulations,
-        })
+        Ok((
+            Self {
+                blocks,
+                text0,
+                text2,
+                input,
+                head,
+                one,
+                zero,
+                rope: ops::PairwiseRopeTable::new(ctx, tokens, 128, &coefficients)?,
+                video,
+            },
+            TimeWeights {
+                time0,
+                time2,
+                timeproj,
+            },
+        ))
     }
 }
 
@@ -261,14 +214,8 @@ fn vector(ctx: &Context, values: &[f32], dtype: DType) -> Result<Tensor> {
     backend::upload(ctx, &host_tensor(vec![values.len()], values, dtype)?)
 }
 
-fn slice(x: &Tensor, start: usize, count: usize) -> Result<Tensor> {
-    backend::DeviceBuffer::from_tensor(x)
-        .and_then(|b| {
-            b.view(
-                start * x.dtype().size_in_bytes(),
-                count * x.dtype().size_in_bytes(),
-            )
-        })
-        .and_then(|b| b.as_tensor(Shape::new(vec![count]), x.dtype()))
-        .map_err(Error::Cuda)
+pub(in crate::fastwam) struct TimeWeights {
+    pub time0: Linear,
+    pub time2: Linear,
+    pub timeproj: Linear,
 }

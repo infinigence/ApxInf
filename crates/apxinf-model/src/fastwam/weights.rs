@@ -1,5 +1,5 @@
 //! Checkpoint mapping and immutable device weights, independent of the runner.
-use super::backend::{self, host_tensor, ops, Context};
+use super::backend::{self, ops, Context};
 use apxinf_core::{DType, Error, Result, Tensor};
 use std::{collections::HashMap, path::Path};
 
@@ -107,29 +107,46 @@ impl Linear {
         }
         Ok(())
     }
-
-    pub(super) fn forward_conv(
-        &self,
-        ctx: &Context,
-        x: &Tensor,
-        policy: &ops::GemmPolicy,
-    ) -> Result<Tensor> {
-        backend::convolution_projection(ctx, x, &self.weight, self.bias.as_ref(), policy)
-    }
-
-    pub(super) fn forward(
-        &self,
-        ctx: &Context,
-        x: &Tensor,
-        policy: &ops::GemmPolicy,
-    ) -> Result<Tensor> {
-        backend::linear(ctx, x, &self.weight, self.bias.as_ref(), policy)
-    }
 }
 
 pub(super) mod dit;
 pub(super) mod text;
 pub(super) mod vae;
+
+pub(super) fn cast(ctx: &Context, x: &Tensor, dtype: DType) -> Result<Tensor> {
+    if x.dtype() == dtype {
+        return Ok(x.clone());
+    }
+    let semantic = match (x.dtype(), dtype) {
+        (DType::BF16, DType::F32) => ops::QuantizationSemantic::CastBf16ToF32,
+        (DType::F32, DType::BF16) => ops::QuantizationSemantic::CastF32ToBf16,
+        _ => {
+            return Err(Error::Other(
+                "Fast-WAM supports BF16/F32 conversion only".into(),
+            ))
+        }
+    };
+    let mut out = ctx.allocate_output(x.shape().clone(), dtype)?;
+    ops::quantization(ctx, ops::QuantizationArgs::new(semantic, x, &mut out))?;
+    Ok(out)
+}
+
+pub(super) fn host_tensor(shape: Vec<usize>, values: &[f32], dtype: DType) -> Result<Tensor> {
+    match dtype {
+        DType::F32 => Tensor::from_f32(shape, values),
+        DType::BF16 => Tensor::from_bf16(
+            shape,
+            &values
+                .iter()
+                .copied()
+                .map(half::bf16::from_f32)
+                .collect::<Vec<_>>(),
+        ),
+        _ => Err(Error::Other(
+            "Fast-WAM checkpoint expects BF16 or F32 weights".into(),
+        )),
+    }
+}
 
 #[cfg(test)]
 mod tests {

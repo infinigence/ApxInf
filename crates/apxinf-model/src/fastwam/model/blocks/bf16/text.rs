@@ -1,7 +1,8 @@
 //! UMT5 encoder: bidirectional relative bias, rounded RMS normalization and
 //! gated GELU. Zero padding is applied after encoding, as in Fast-WAM.
-use super::backend::{self, ops, Context};
-use super::weights::text::TextEncoder;
+use super::ops as compute;
+use crate::fastwam::backend::{ops, Context};
+use crate::fastwam::weights::text::TextEncoder;
 use apxinf_core::{DType, Result, Shape, Tensor};
 
 fn rms(ctx: &Context, x: &Tensor, w: &Tensor) -> Result<Tensor> {
@@ -11,7 +12,7 @@ fn rms(ctx: &Context, x: &Tensor, w: &Tensor) -> Result<Tensor> {
 }
 impl TextEncoder {
     /// Monotonic graph arena: all layer outputs remain allocated until replay ends.
-    pub(super) fn workspace_bytes(&self) -> usize {
+    pub(in crate::fastwam) fn workspace_bytes(&self) -> usize {
         let tokens = 128;
         let hidden = self.embedding.shape().dims()[1];
         let layers: usize = self
@@ -27,7 +28,7 @@ impl TextEncoder {
         layers + 3 * (tokens * hidden * 2 + 256)
     }
 
-    pub(super) fn forward(
+    pub(in crate::fastwam) fn forward(
         &self,
         ctx: &Context,
         ids: &Tensor,
@@ -69,7 +70,7 @@ impl TextEncoder {
             observe(index, "layer.0.SelfAttention.q.out", &q)?;
             observe(index, "layer.0.SelfAttention.k.out", &k)?;
             observe(index, "layer.0.SelfAttention.v.out", &v)?;
-            let bias = backend::binary(
+            let bias = compute::binary(
                 ctx,
                 &b.bias,
                 padding_bias,
@@ -91,33 +92,34 @@ impl TextEncoder {
             observe(index, "layer.0.SelfAttention.o.in", &y)?;
             let y = b.o.forward(ctx, &y.reshape(vec![128, 4096])?, gemm)?;
             observe(index, "layer.0.SelfAttention.o.out", &y)?;
-            x = backend::add(ctx, &x, &y)?;
+            x = compute::add(ctx, &x, &y)?;
             observe(index, "layer.1.layer_norm.in", &x)?;
             let u = rms(ctx, &x, &b.norm1)?;
             observe(index, "layer.1.layer_norm.out", &u)?;
             let gate = b.wi0.forward(ctx, &u, gemm)?;
             observe(index, "layer.1.DenseReluDense.act.in", &gate)?;
-            let gate = backend::activation(ctx, &gate, ops::PointwiseActivation::GeluRounded)?;
+            let gate = compute::activation(ctx, &gate, ops::PointwiseActivation::GeluRounded)?;
             observe(index, "layer.1.DenseReluDense.act.out", &gate)?;
             let up = b.wi1.forward(ctx, &u, gemm)?;
             observe(index, "layer.1.DenseReluDense.wi_1.out", &up)?;
-            let y = backend::binary(ctx, &gate, &up, ops::PointwiseSemantic::Multiply)?;
+            let y = compute::binary(ctx, &gate, &up, ops::PointwiseSemantic::Multiply)?;
             observe(index, "layer.1.DenseReluDense.wo.in", &y)?;
             let y = b.wo.forward(ctx, &y, gemm)?;
             observe(index, "layer.1.DenseReluDense.wo.out", &y)?;
-            x = backend::add(ctx, &x, &y)?;
+            x = compute::add(ctx, &x, &y)?;
         }
         observe(self.blocks.len(), "final_layer_norm.in", &x)?;
         let x = rms(ctx, &x, &self.norm)?;
         observe(self.blocks.len(), "final_layer_norm.out", &x)?;
-        backend::binary(ctx, &x, row_mask, ops::PointwiseSemantic::RowMultiply)
+        compute::binary(ctx, &x, row_mask, ops::PointwiseSemantic::RowMultiply)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fastwam::backend::host_tensor;
+    use crate::fastwam::backend;
+    use crate::fastwam::weights::host_tensor;
     use std::collections::HashMap;
 
     // Use a captured input for each operation so an earlier approximation cannot
@@ -187,13 +189,13 @@ mod tests {
             let name = format!("{ff_prefix}.act");
             let input = captured_input(ctx, golden, &format!("{name}.in"));
             let actual =
-                backend::activation(ctx, &input, ops::PointwiseActivation::GeluRounded).unwrap();
+                compute::activation(ctx, &input, ops::PointwiseActivation::GeluRounded).unwrap();
             print_operator_error(&name, &actual, &golden[&format!("{name}.out")]);
 
             let gate = captured_input(ctx, golden, &format!("{name}.out"));
             let up = captured_input(ctx, golden, &format!("{ff_prefix}.wi_1.out"));
             let actual =
-                backend::binary(ctx, &gate, &up, ops::PointwiseSemantic::Multiply).unwrap();
+                compute::binary(ctx, &gate, &up, ops::PointwiseSemantic::Multiply).unwrap();
             print_operator_error(
                 &format!("{ff_prefix}.gated_multiply"),
                 &actual,
@@ -205,7 +207,7 @@ mod tests {
                     .reshape(vec![1, 128, 64, 64])
                     .unwrap()
             });
-            let bias = backend::binary(
+            let bias = compute::binary(
                 ctx,
                 &block.bias,
                 padding,

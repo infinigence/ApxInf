@@ -1,9 +1,9 @@
 //! Fixed buffers, explicit request binding, RNG, and whole-model CUDA Graph
 //! ownership. Forward computation is exclusively in Model.
+use super::weights::host_tensor;
 use super::{
     backend::{
-        self, host_tensor, ops, sampling, transfers, Context, DeviceBuffer, ExecutionSession,
-        PreparedPhase,
+        self, ops, sampling, transfers, Context, DeviceBuffer, ExecutionSession, PreparedPhase,
     },
     model::{Inputs, Model},
 };

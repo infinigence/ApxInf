@@ -75,8 +75,19 @@ actions. Direct native callers must provide the same preprocessing. Optional
 ## Execution ownership
 
 `config.rs` and `load.rs` validate the supported architecture and resolve assets.
-`weights/` maps and packs checkpoint tensors, including fixed time and position
-tables. `model.rs`, `text.rs`, `vae.rs` and `dit.rs` compose the computation.
+Absent `num_inference_steps` defaults to 10; any explicit value must be 10.
+Absent/null `sigma_shift` uses the scheduler shift of 5; an explicit override
+must equal 5. Other values are rejected before device weights are loaded.
+`weights/` maps and packs checkpoint tensors, including time-projection weights
+and fixed position tables. `model/mod.rs` owns model construction, modality connections and the
+flow schedule. `model/blocks/bf16/` owns UMT5, VAE and DiT composition,
+projection/bias rounding and fixed time-modulation preparation. Its BF16
+implementation includes the declared F32 residual and action-projection paths.
+Temporary time-projection weights are released after modulation preparation.
+`backend.rs` only imports safe CUDA resources/operators and adapts host uploads;
+weights never call model forward methods.
+The [family boundary guard](../scripts/check_fastwam_module_boundaries.py)
+checks these owners recursively; it does not replace numerical validation.
 `model_runner.rs` owns request validation, input/RNG binding, workspace and CUDA
 Graph preparation. There are no imports from another model family.
 

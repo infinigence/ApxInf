@@ -1,10 +1,13 @@
 //! Native computation only; request binding and capture live in model_runner.
+pub(super) mod blocks;
+
 use super::{
     backend::{self, ops, Context, DeviceBuffer},
-    dit::sigma,
-    weights::{dit::Expert, text::TextEncoder, vae::Vae, Linear},
+    weights::{cast, host_tensor, text::TextEncoder, vae::Vae, Linear},
 };
 use apxinf_core::{DType, Result, Shape, Tensor};
+
+use blocks::bf16::Expert;
 
 pub(super) struct Inputs {
     pub rgb: DeviceBuffer,
@@ -99,7 +102,7 @@ impl Model {
         let action_context = self.action.context(ctx, &context, gemm)?;
         // Keep iterative state, action input projection and head velocity in F32.
         // Schedule deltas retain BF16 rounding.
-        let mut x = backend::cast(ctx, &inputs.noise, DType::F32)?;
+        let mut x = cast(ctx, &inputs.noise, DType::F32)?;
         for step in 0..10 {
             let (velocity, _) = self.action.forward(
                 ctx,
@@ -110,15 +113,66 @@ impl Model {
                 gemm,
                 attention,
             )?;
-            let velocity = backend::cast(ctx, &velocity, x.dtype())?;
+            let velocity = cast(ctx, &velocity, x.dtype())?;
             let mut next = ctx.allocate_output(x.shape().clone(), x.dtype())?;
             let mut args =
                 ops::PointwiseArgs::new(ops::PointwiseSemantic::EulerUpdateRounded, &x, &mut next);
             args.secondary = Some(&velocity);
-            args.dt = half::bf16::from_f32(sigma(step + 1) as f32 - sigma(step) as f32).to_f32();
+            args.dt = half::bf16::from_f32(
+                blocks::bf16::sigma(step + 1) as f32 - blocks::bf16::sigma(step) as f32,
+            )
+            .to_f32();
             ops::pointwise(ctx, args)?;
             x = next;
         }
-        backend::cast(ctx, &x, DType::F32)
+        cast(ctx, &x, DType::F32)
     }
+}
+
+use std::path::Path;
+
+use super::weights::{dit::Expert as ExpertWeights, Bias, Store};
+
+pub(super) fn build_model(
+    ctx: &Context,
+    path: &Path,
+    text_path: &Path,
+    vae_path: &Path,
+    gemm: ops::GemmPolicy,
+    attention: ops::AttentionPolicy,
+) -> Result<Model> {
+    let mut store = Store::load(path)?;
+    let video = blocks::bf16::Expert::new(
+        ctx,
+        ExpertWeights::load(&mut store, ctx, true)?,
+        &gemm,
+        &[0.],
+    )?;
+    let action = blocks::bf16::Expert::new(
+        ctx,
+        ExpertWeights::load(&mut store, ctx, false)?,
+        &gemm,
+        &(0..10)
+            .map(|step| (blocks::bf16::sigma(step) * 1000.) as f32)
+            .collect::<Vec<_>>(),
+    )?;
+    let proprio = store.linear(ctx, "model.proprio_encoder", Bias::Required)?;
+    proprio.validate("proprio encoder", 8, 4096)?;
+    drop(store);
+    let rgb = (0..256)
+        .map(|v| {
+            let unit = half::bf16::from_f32(v as f32 / 255.).to_f32();
+            half::bf16::from_f32(half::bf16::from_f32(unit * 2.).to_f32() - 1.).to_f32()
+        })
+        .collect::<Vec<_>>();
+    Ok(Model {
+        video,
+        action,
+        proprio,
+        text: TextEncoder::load(ctx, text_path)?,
+        vae: Vae::load(ctx, vae_path, DType::BF16)?,
+        rgb_table: backend::upload(ctx, &host_tensor(vec![256, 1], &rgb, DType::BF16)?)?,
+        gemm,
+        attention,
+    })
 }
