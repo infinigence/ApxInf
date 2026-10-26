@@ -184,6 +184,8 @@ impl<'a> GemmArgs<'a> {
 
     /// Assert that `b` is immutable for the lifetime of prepared executions
     /// created from these arguments and attach its caller-managed version.
+    /// This does not permit packing in place; use `with_repacked_weight` to opt
+    /// into implementations requiring a prepared physical weight layout.
     pub fn with_immutable_weight(mut self, version: WeightVersion) -> Self {
         self.weight_version = Some(version);
         self
@@ -650,7 +652,7 @@ fn normalize_fused<'a>(
 
     Ok(Normalized {
         spec: abi::Spec {
-            version: 7,
+            version: 8,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,
@@ -658,7 +660,7 @@ fn normalize_fused<'a>(
             output_dtype: dtype(args.out.dtype())?,
             quantization,
             b_is_immutable: bindings.b_is_immutable,
-            b_layout: 0,
+            b_layout: if args.repacked_weight.is_some() { 0 } else { 4 },
             a_alignment: alignment_class(bindings.a),
             b_alignment: alignment_class(bindings.b),
             bias_alignment: alignment_class(bindings.bias),

@@ -53,6 +53,8 @@ pub(crate) struct Bindings {
     pub output_scale: f32,
 }
 
+pub(crate) const WEIGHT_LAYOUT_INVALID: u32 = 5;
+
 pub(crate) type Execution = *mut c_void;
 
 unsafe extern "C" {
@@ -62,9 +64,9 @@ unsafe extern "C" {
         policy: *const Policy,
         bindings: *const Bindings,
         execution: *mut Execution,
+        weight_layout: *mut u32,
     ) -> i32;
     pub(crate) fn apxinf_gemm_enqueue(execution: Execution) -> i32;
-    pub(crate) fn apxinf_gemm_commit_weight(execution: Execution, layout: *mut u32) -> i32;
     pub(crate) fn apxinf_gemm_destroy(execution: Execution);
     pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(
         rows: i64,
@@ -132,7 +134,6 @@ unsafe extern "C" {
     #[cfg(test)]
     pub(crate) fn apxinf_gemm_summary(execution: Execution) -> *const c_char;
     #[cfg(test)]
-    pub(crate) fn apxinf_gemm_execution_weight_prepack_count(execution: Execution) -> u64;
 
     #[cfg(test)]
     pub(crate) fn apxinf_gemm_test_validate_candidates(

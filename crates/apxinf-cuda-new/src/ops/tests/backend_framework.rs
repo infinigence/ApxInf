@@ -108,8 +108,8 @@ fn merged_gemm_contract_rejects_pre_merge_spec_version() {
     let args = GemmArgs::new(&activation, &weight, &mut output);
     let mut normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
-    assert_eq!(normalized.spec.version, 6);
-    normalized.spec.version = 5;
+    assert_eq!(normalized.spec.version, 8);
+    normalized.spec.version = 7;
     let error = match super::execution::prepare(&ctx, normalized) {
         Ok(_) => panic!("pre-merge GEMM spec must be rejected"),
         Err(error) => error,
@@ -242,16 +242,6 @@ fn prepare_test_gemm(
     super::execution::prepare(
         ctx,
         super::contracts::normalize(ctx, args, super::contracts::Semantic::Gemm, None)?,
-    )
-}
-
-fn prepare_test_geglu(
-    ctx: &CudaContext,
-    args: GemmGegluArgs<'_>,
-) -> apxinf_core::Result<std::rc::Rc<super::execution::Execution>> {
-    super::execution::prepare(
-        ctx,
-        super::contracts::normalize(ctx, args.gemm, super::contracts::Semantic::GemmGeglu, None)?,
     )
 }
 
@@ -1128,8 +1118,9 @@ fn w8a8_orin_shape_uses_direct_cutlass_candidate() {
     let row_scales = scales(0, &row_scale_values);
     let channel_scales = scales(0, &channel_scale_values);
     let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let weight = crate::ops::RepackedWeight::new(&b).unwrap();
     let mut args = GemmArgs::w8a8(&a, &row_scales, &b, &channel_scales, &mut out)
-        .with_immutable_weight(WeightVersion::new(1));
+        .with_repacked_weight(&weight);
     args.policy.online_tune = false;
     args.policy.allow_fallback = ctx.caps().sm != 87;
     let cache_dir = scratch_cache_dir("w8a8-sm87-cutlass");
@@ -1373,136 +1364,43 @@ fn gpu_e2e_three_view_split_geglu_recipe_resources_and_replay() {
 }
 
 #[test]
-fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
+fn gpu_canonical_weight_does_not_opt_into_inplace_packing() {
     let ctx = CudaContext::new(0).unwrap();
-    let (m, k, n) = (522, 2048, 32768);
-    let a = zeros_tensor(0, vec![m, k], DType::F8E4M3);
-    let b = zeros_tensor(0, vec![k, n], DType::F8E4M3);
-    let mut out = zeros_tensor(0, vec![m, n / 2], DType::F8E4M3);
-    let cache_dir = std::env::temp_dir().join(format!(
-        "apxinf-geglu-prepack-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&cache_dir).unwrap();
-    let cache_dir_string = cache_dir.to_string_lossy().into_owned();
-
-    let normalized = {
-        let mut args = GemmArgs::new(&a, &b, &mut out).with_immutable_weight(WeightVersion::new(7));
-        args.quantization = GemmQuantization::Fp8UnitScale;
-        args.policy.online_tune = false;
-        args.policy.allow_fallback = false;
-        args.policy.cache_dir = Some(cache_dir_string.clone());
-        super::contracts::normalize(&ctx, args, super::contracts::Semantic::GemmGeglu, None)
-            .unwrap()
-    };
-    // Provider 3, implementation 2, version 2 is the FP8 CUTLASS GeGLU
-    // candidate. Seeding avoids an enormous CPU-reference autotune while
-    // keeping execution construction and public enqueue/capture paths real.
-    super::execution::seed_recipe(&ctx, &normalized, 3, 2, 2, 0).unwrap();
-    drop(normalized);
-
-    let session = ExecutionSession::with_capacity(1, 0).unwrap();
-    super::execution::reset_execution_create_count();
-    let (first, same_version, changed_version) = prepare_with_session(&session, || {
-        let first = {
-            let mut args =
-                GemmArgs::new(&a, &b, &mut out).with_immutable_weight(WeightVersion::new(7));
-            args.quantization = GemmQuantization::Fp8UnitScale;
-            args.policy.online_tune = false;
-            args.policy.allow_fallback = false;
-            args.policy.cache_dir = Some(cache_dir_string.clone());
-            prepare_test_geglu(&ctx, GemmGegluArgs { gemm: args })?
-        };
-
-        let same = {
-            let mut args =
-                GemmArgs::new(&a, &b, &mut out).with_immutable_weight(WeightVersion::new(7));
-            args.quantization = GemmQuantization::Fp8UnitScale;
-            args.policy.online_tune = false;
-            args.policy.allow_fallback = false;
-            args.policy.cache_dir = Some(cache_dir_string.clone());
-            prepare_test_geglu(&ctx, GemmGegluArgs { gemm: args })?
-        };
-        let changed = {
-            let mut args =
-                GemmArgs::new(&a, &b, &mut out).with_immutable_weight(WeightVersion::new(8));
-            args.quantization = GemmQuantization::Fp8UnitScale;
-            args.policy.online_tune = false;
-            args.policy.allow_fallback = false;
-            args.policy.cache_dir = Some(cache_dir_string.clone());
-            prepare_test_geglu(&ctx, GemmGegluArgs { gemm: args })?
-        };
-        Ok((first, same, changed))
-    })
-    .unwrap();
-
-    assert_eq!(super::execution::execution_create_count(), 2);
-    assert_eq!(first.weight_prepack_count(), 1);
-    assert_eq!(same_version.weight_prepack_count(), 1);
-    assert_eq!(changed_version.weight_prepack_count(), 1);
-
-    first.enqueue().unwrap();
-    first.enqueue().unwrap();
+    if ctx.caps().sm != 87 {
+        return;
+    }
+    let (m, k, n) = (8, 256, 128);
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &vec![1; m * k]);
+    let source = (0..k * n).map(|i| (i % 7) as u8).collect::<Vec<_>>();
+    let b = bytes_tensor(0, vec![k, n], DType::I8, &source);
+    let rows = scales(0, &vec![1.0; m]);
+    let channels = scales(0, &vec![1.0; n]);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let cache = scratch_cache_dir("canonical-weight");
+    let mut args = GemmArgs::w8a8(&a, &rows, &b, &channels, &mut out)
+        .with_immutable_weight(WeightVersion::new(7));
+    args.policy.online_tune = false;
+    args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    // An immutable Tensor is still canonical; only RepackedWeight permits mutation.
+    assert!(super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).is_err());
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    execution.enqueue().unwrap();
     ctx.synchronize().unwrap();
-    assert_eq!(first.weight_prepack_count(), 1);
-
-    let graph = crate::capture(&ctx, || first.enqueue()).unwrap();
-    graph.replay().unwrap();
-    graph.replay().unwrap();
-    ctx.synchronize().unwrap();
-    assert_eq!(first.weight_prepack_count(), 1);
-
-    drop((graph, first, same_version, changed_version));
-    drop(session);
-
-    // Without the explicit immutability/version contract, each launch must
-    // conservatively repack because the caller may have changed B in place.
-    // That different steady-state cost must use a separate Recipe key.
-    let mutable_miss = {
-        let mut args = GemmArgs::new(&a, &b, &mut out);
-        args.quantization = GemmQuantization::Fp8UnitScale;
-        args.policy.online_tune = false;
-        args.policy.allow_fallback = false;
-        args.policy.cache_dir = Some(cache_dir_string.clone());
-        let normalized =
-            super::contracts::normalize(&ctx, args, super::contracts::Semantic::GemmGeglu, None)
-                .unwrap();
-        match super::execution::prepare(&ctx, normalized) {
-            Ok(_) => panic!("mutable weights reused an immutable-weight Recipe"),
-            Err(error) => error,
-        }
-    };
-    assert!(mutable_miss.to_string().contains("recipe miss"));
-
-    let mutable_normalized = {
-        let mut args = GemmArgs::new(&a, &b, &mut out);
-        args.quantization = GemmQuantization::Fp8UnitScale;
-        args.policy.online_tune = false;
-        args.policy.allow_fallback = false;
-        args.policy.cache_dir = Some(cache_dir_string.clone());
-        super::contracts::normalize(&ctx, args, super::contracts::Semantic::GemmGeglu, None)
-            .unwrap()
-    };
-    super::execution::seed_recipe(&ctx, &mutable_normalized, 3, 2, 2, 0).unwrap();
-    drop(mutable_normalized);
-
-    let mut mutable_args = GemmArgs::new(&a, &b, &mut out);
-    mutable_args.quantization = GemmQuantization::Fp8UnitScale;
-    mutable_args.policy.online_tune = false;
-    mutable_args.policy.allow_fallback = false;
-    mutable_args.policy.cache_dir = Some(cache_dir_string);
-    let mutable = prepare_test_geglu(&ctx, GemmGegluArgs { gemm: mutable_args }).unwrap();
-    assert_eq!(mutable.weight_prepack_count(), 0);
-    mutable.enqueue().unwrap();
-    ctx.synchronize().unwrap();
-    assert_eq!(mutable.weight_prepack_count(), 1);
-
-    drop(mutable);
-    std::fs::remove_dir_all(cache_dir).unwrap();
+    let mut actual = vec![0; source.len()];
+    CudaBuffer::from_tensor(&b)
+        .unwrap()
+        .copy_to_host(&mut actual)
+        .unwrap();
+    assert_eq!(actual, source);
+    for (i, value) in values(&out).into_iter().enumerate() {
+        let expected = (0..k)
+            .map(|row| source[row * n + i % n] as f32)
+            .sum::<f32>();
+        assert_eq!(value, bf16::from_f32(expected).to_f32());
+    }
+    std::fs::remove_dir_all(cache).unwrap();
 }
 
 #[test]
@@ -1539,9 +1437,24 @@ fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
             super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
                 .unwrap();
         normalized.spec.b_layout = layout.state.lock().unwrap().layout;
+        if run == 0 {
+            let expected = (0..m * n)
+                .map(|i| source[(i / n) % k * n + i % n] as f32)
+                .collect::<Vec<_>>();
+            super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
+            let mut unchanged = vec![0; source.len()];
+            CudaBuffer::from_tensor(&b)
+                .unwrap()
+                .copy_to_host(&mut unchanged)
+                .unwrap();
+            assert_eq!(
+                unchanged, source,
+                "candidate trials must not rewrite model weights"
+            );
+        }
         super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
         let execution = super::execution::prepare(&ctx, normalized).unwrap();
-        assert_eq!(execution.weight_prepack_count(), u64::from(run == 0));
+        assert!(execution.summary().contains("workspace=0 "));
         execution.enqueue().unwrap();
         ctx.synchronize().unwrap();
         for (index, actual) in values(&output).into_iter().enumerate() {
@@ -1634,7 +1547,9 @@ fn gpu_repacked_geglu_preserves_old_graph_and_generic_shape() {
                 .unwrap();
         }
         let execution = super::execution::prepare(&ctx, normalized).unwrap();
-        assert_eq!(execution.weight_prepack_count(), u64::from(run == 0));
+        if rows != 1 {
+            assert!(execution.summary().contains("workspace=0 "));
+        }
         execution.enqueue().unwrap();
         ctx.synchronize().unwrap();
         let check = |out: &Tensor| {
@@ -1706,7 +1621,7 @@ fn gpu_repacked_fp8_crosses_geglu_and_plain_gemm() {
             }
             args.quantization = GemmQuantization::Fp8UnitScale;
             args.policy.online_tune = false;
-            args.policy.allow_fallback = !fused;
+            args.policy.allow_fallback = !fused || state.is_none();
             args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
             let semantic = if fused {
                 super::contracts::Semantic::GemmGeglu
@@ -1717,7 +1632,7 @@ fn gpu_repacked_fp8_crosses_geglu_and_plain_gemm() {
             if let Some(state) = state {
                 normalized.spec.b_layout = state.state.lock().unwrap().layout;
             }
-            if fused {
+            if fused && state.is_some() {
                 super::execution::seed_recipe(&ctx, &normalized, 3, 2, 2, 0).unwrap();
             }
             let execution = super::execution::prepare(&ctx, normalized).unwrap();
@@ -1731,6 +1646,11 @@ fn gpu_repacked_fp8_crosses_geglu_and_plain_gemm() {
             bytes
         };
         assert_eq!(read(&actual), read(&expected), "M={m}");
+        assert_eq!(
+            read(&canonical),
+            bytes,
+            "reference weights remain canonical"
+        );
     }
     std::fs::remove_dir_all(cache_dir).unwrap();
 }

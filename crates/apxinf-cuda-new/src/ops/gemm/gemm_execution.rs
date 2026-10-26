@@ -92,11 +92,6 @@ impl Execution {
         crate::workspace::retain_resource(self);
         unsafe { status::check(abi::apxinf_gemm_enqueue(self.raw)) }
     }
-
-    #[cfg(test)]
-    pub(crate) fn weight_prepack_count(&self) -> u64 {
-        unsafe { abi::apxinf_gemm_execution_weight_prepack_count(self.raw) }
-    }
 }
 
 impl Drop for Execution {
@@ -125,9 +120,11 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
         .transpose()?;
     if let Some(weight) = weight_guard.as_ref() {
         if bindings.b_is_immutable == 0 {
-            return Err(invalid("repacked weights must be immutable after preparation"));
+            return Err(invalid(
+                "repacked weights must be immutable after preparation",
+            ));
         }
-        if weight.poisoned {
+        if weight.layout == abi::WEIGHT_LAYOUT_INVALID {
             return Err(invalid("weight layout commit failed; reload the model"));
         }
         if weight.buffer.ptr().cast_const() != bindings.b
@@ -181,24 +178,16 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
             &policy,
             &bindings,
             &mut raw,
+            weight_guard
+                .as_mut()
+                .map_or(std::ptr::null_mut(), |weight| &mut weight.layout),
         ))?;
     }
     if raw.is_null() {
         return Err(invalid("native GEMM prepare returned a null execution"));
     }
-    if let Some(weight) = weight_guard.as_mut() {
-        if weight.layout == 0 {
-            // A failed writeback may have changed bytes. Never retry them as canonical.
-            weight.poisoned = true;
-            let result =
-                unsafe { status::check(abi::apxinf_gemm_commit_weight(raw, &mut weight.layout)) };
-            if let Err(error) = result {
-                unsafe { abi::apxinf_gemm_destroy(raw) };
-                return Err(error);
-            }
-            weight.poisoned = false;
-            spec.b_layout = weight.layout;
-        }
+    if let Some(weight) = weight_guard.as_ref() {
+        spec.b_layout = weight.layout;
     }
     let key = ExecutionKey::new(ctx, spec, bindings, &options);
     #[cfg(test)]

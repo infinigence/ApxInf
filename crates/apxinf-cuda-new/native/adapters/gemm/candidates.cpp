@@ -527,6 +527,9 @@ std::unique_ptr<Execution> prepare(
                   "candidate is not deterministic");
   }
 
+  if (spec.b_layout == 0 && weight_layout(implementation) != 4) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "prepare weight before binding execution");
+  }
   const size_t required = implementation.resource_requirements(spec);
   if (required > policy.workspace_limit) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
@@ -547,6 +550,36 @@ std::unique_ptr<Execution> prepare(
     throw Failure(APXINF_STATUS_UNSUPPORTED, "workspace policy exceeded");
   }
   return execution;
+}
+
+std::unique_ptr<CandidateTrial> prepare_trial(
+    const Implementation& implementation, int configuration, const Spec& spec,
+    const apxinf_gemm_policy_t& policy,
+    const apxinf_gemm_bindings_t& bindings, int device) {
+  check_cuda(cudaSetDevice(device));
+  const auto layout = weight_layout(implementation);
+  const bool pack = spec.b_layout == 0 && layout != 4;
+  const size_t bytes = pack
+      ? static_cast<size_t>(spec.k * spec.n) * dtype_bytes(spec.b_dtype) : 0;
+  if (bytes > policy.workspace_limit) {
+    throw Failure(APXINF_STATUS_UNSUPPORTED, "trial packing exceeds workspace limit");
+  }
+  auto trial = std::make_unique<CandidateTrial>(bytes);
+  auto trial_spec = spec;
+  auto trial_bindings = bindings;
+  if (pack) {
+    pack_weight(spec, bindings, trial->weight.pointer, layout);
+    check_cuda(cudaStreamSynchronize(static_cast<cudaStream_t>(bindings.stream)));
+    trial_spec.b_layout = layout;
+    trial_bindings.b = trial->weight.pointer;
+  }
+  auto execution_policy = policy;
+  execution_policy.workspace_limit -= bytes;
+  trial->execution = prepare(implementation, configuration, trial_spec,
+                             execution_policy, trial_bindings, device);
+  trial->implementation = &implementation;
+  trial->configuration = configuration;
+  return trial;
 }
 
 }  // namespace apxinf::gemm

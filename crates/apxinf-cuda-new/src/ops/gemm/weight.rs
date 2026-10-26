@@ -22,7 +22,6 @@ pub(crate) struct WeightState {
     pub shape: Vec<usize>,
     pub dtype: apxinf_core::DType,
     pub layout: u32,
-    pub poisoned: bool,
 }
 
 impl std::fmt::Debug for RepackedWeight {
@@ -41,7 +40,6 @@ impl RepackedWeight {
                 shape: weight.shape().dims().to_vec(),
                 dtype: weight.dtype(),
                 layout: 0,
-                poisoned: false,
             })),
         })
     }

@@ -50,7 +50,7 @@ std::string common_key(const Spec& spec,
                        int driver_version,
                        const cudaDeviceProp& properties) {
   std::ostringstream key;
-  key << "gemm-recipe-v9|ns|" << APXINF_GEMM_BUILD_ID << '|'
+  key << "gemm-recipe-v10|ns|" << APXINF_GEMM_BUILD_ID << '|'
       << "toolkit=" << CUDART_VERSION << '|'
       << "cc=" << properties.major * 10 + properties.minor
       << "|sms=" << properties.multiProcessorCount

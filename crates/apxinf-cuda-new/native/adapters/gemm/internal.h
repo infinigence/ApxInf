@@ -90,7 +90,19 @@ struct Implementation {
 
 uint32_t weight_layout(const Implementation& implementation);
 bool supports_weight_layout(const Implementation& implementation, const Spec& spec);
-uint32_t commit_cutlass_weight(Execution& execution);
+struct TemporaryWeight {
+  void* pointer = nullptr;
+  explicit TemporaryWeight(size_t bytes) {
+    if (bytes != 0) check_cuda(cudaMalloc(&pointer, bytes));
+  }
+  ~TemporaryWeight() { if (pointer != nullptr) cudaFree(pointer); }
+  TemporaryWeight(const TemporaryWeight&) = delete;
+  TemporaryWeight& operator=(const TemporaryWeight&) = delete;
+};
+
+void pack_weight(const Spec&, const apxinf_gemm_bindings_t&, void*, uint32_t);
+void repack_weight_inplace(const Spec&, const apxinf_gemm_bindings_t&,
+                          uint32_t target_layout, uint32_t& layout);
 
 bool supports_device(const Implementation& implementation,
                      int device,
@@ -157,6 +169,19 @@ struct Execution {
   ~Execution();
 };
 
+// Only the autotuner/validator owns a private packed trial weight.
+// Member order destroys the execution before its temporary input allocation.
+struct CandidateTrial {
+  TemporaryWeight weight;
+  std::unique_ptr<Execution> execution;
+  const Implementation* implementation;
+  int configuration;
+  explicit CandidateTrial(size_t bytes) : weight(bytes) {}
+};
+std::unique_ptr<CandidateTrial> prepare_trial(
+    const Implementation&, int configuration, const Spec&,
+    const apxinf_gemm_policy_t&, const apxinf_gemm_bindings_t&, int device);
+
 using ImplementationRegistry = apxinf::framework::Registry<Implementation>;
 const ImplementationRegistry& registry(uint32_t semantic);
 void prepare_cublas(Execution& execution);
@@ -192,7 +217,7 @@ void prepare_cutlass_nvfp4(Execution& execution);
 size_t cutlass_nvfp4_resource_requirements(const Spec& spec);
 cudaError_t launch_cutlass_nvfp4(Execution& execution);
 cudaError_t launch_cutlass_bf16_geglu_sm89(Execution& execution);
-uint64_t cutlass_weight_prepack_count(const Execution& execution);
+
 
 TuningKeys tuning_keys(const Spec& spec,
                        const apxinf_gemm_policy_t& policy,

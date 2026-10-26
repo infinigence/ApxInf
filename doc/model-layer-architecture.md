@@ -116,19 +116,27 @@ wrapper merely to reproduce the names in this table.
 ### Repacked GEMM weight ownership
 
 PI0.5 device linear weights retain cuda-new `RepackedWeight` layout state next
-to their allocation. First GEMM preparation tunes against canonical bytes, then
-commits the selected equal-size packing back to the original address. Temporary
-packing storage is released before the execution is published. Canonical choices
-are committed too: later shapes cannot change a layout that an existing graph
-reads. Every consumer of a repackable allocation must use the same state.
+to their allocation. Loading only uploads canonical bytes and creates this state.
+The first native GEMM preparation selects a recipe, then repacks through a local
+RAII temporary, copies back to the original weight address, and frees the temporary
+before returning. There is no separate commit call and no packed-weight buffer,
+borrowed packed pointer, or ownership flag in the W8A8/GeGLU Execution. Its kernel
+reads `bindings.b` directly. Autotuning and candidate validation own isolated
+trial weights; they never rewrite model weights while evaluating candidates.
 
-Layout participates in recipe and execution keys. Subsequent executions borrow
-the committed allocation; the cuBLAS baseline interprets its layout when an
-optimized implementation does not support a new shape. A failed commit poisons
-the state and requires reloading the weight. Weight replacement requires retiring
-its readers and constructing new storage/state, rather than incrementing an
-Execution-local version over changed bytes. This change does not introduce a
-model-wide weight arena or alter activation workspace ownership.
+Layout participates in recipe and execution keys. Every consumer of a repackable
+allocation must use the same state. Later IO addresses and shapes may create new
+Executions and select different kernels, but only implementations compatible with
+the prepared layout are eligible. Canonical choices are fixed too, protecting
+existing graph readers. The cuBLAS baseline can read prepared layouts for shape
+or semantic changes. A failed writeback invalidates the weight; reload it rather
+than retrying partially overwritten bytes. Weight replacement requires new
+storage/state and retiring the old graph readers.
+
+Ordinary Tensor/`WeightVersion` arguments stay canonical: they do not authorize
+in-place packing and cannot select kernels requiring packed weights. Callers
+wanting these kernels must attach `RepackedWeight`. This change does not move
+computation scratch out of provider state or change activation workspace ownership.
 
 ### Dependency direction within a family
 

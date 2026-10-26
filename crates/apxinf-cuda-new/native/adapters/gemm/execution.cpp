@@ -30,7 +30,7 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 }
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
-  if (spec.version != 7 ||
+  if (spec.version != 8 ||
       spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL ||
       spec.a_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.b_dtype > APXINF_DTYPE_E2M1_PAIR ||
@@ -41,7 +41,7 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
       spec.n > INT32_MAX || spec.k > INT32_MAX ||
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
       spec.b_is_immutable > 1 || spec.b_layout > 4 ||
-      (spec.b_layout != 0 && spec.b_is_immutable == 0)) {
+      (spec.b_layout > 0 && spec.b_layout < 4 && spec.b_is_immutable == 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec");
   }
   if ((spec.b_layout == 1 && spec.b_dtype != APXINF_DTYPE_I8) ||
@@ -282,7 +282,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     const apxinf_gemm_spec_t* spec,
     const apxinf_gemm_policy_t* policy,
     const apxinf_gemm_bindings_t* bindings,
-    apxinf_gemm_execution_t* output) {
+    apxinf_gemm_execution_t* output, uint32_t* weight_layout) {
   if (output != nullptr) {
     *output = nullptr;
   }
@@ -295,6 +295,10 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     apxinf::gemm::Spec normalized_spec{};
     static_cast<apxinf_gemm_spec_t&>(normalized_spec) = *spec;
     validate_spec(normalized_spec);
+    if (normalized_spec.b_layout == 0 &&
+        (weight_layout == nullptr || bindings->b_is_immutable == 0)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "unprepared weight requires model-owned layout");
+    }
     validate_policy(*policy);
     validate_bindings(normalized_spec, *bindings, true);
     cudaStreamCaptureStatus capture_status;
@@ -335,14 +339,33 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     }
     }
 
+    // Bind the selected layout, but do not modify model bytes until selection
+    // and provider preparation have succeeded. Nothing is enqueued here.
+    auto prepare_selected = [&](const apxinf::gemm::Implementation& implementation,
+                                int configuration) {
+      auto prepared_spec = normalized_spec;
+      if (prepared_spec.b_layout == 0) {
+        prepared_spec.b_layout = apxinf::gemm::weight_layout(implementation);
+      }
+      const size_t packing_bytes =
+          normalized_spec.b_layout == 0 && prepared_spec.b_layout != 4
+              ? static_cast<size_t>(normalized_spec.k * normalized_spec.n) *
+                    apxinf::gemm::dtype_bytes(normalized_spec.b_dtype)
+              : 0;
+      if (packing_bytes > policy->workspace_limit) {
+        throw Failure(APXINF_STATUS_UNSUPPORTED, "weight packing exceeds workspace limit");
+      }
+      auto execution_policy = *policy;
+      execution_policy.workspace_limit -= packing_bytes;
+      return apxinf::gemm::prepare(implementation, configuration, prepared_spec,
+                                  execution_policy, *bindings, runtime->device);
+    };
     std::unique_ptr<Execution> execution;
     if (recipe_found) {
       if (const auto* implementation =
               find_implementation(recipe, normalized_spec, runtime->device)) {
         try {
-          execution = apxinf::gemm::prepare(
-              *implementation, recipe.configuration, normalized_spec, *policy,
-              *bindings, runtime->device);
+          execution = prepare_selected(*implementation, recipe.configuration);
         } catch (const Failure&) {
           execution.reset();
           cudaGetLastError();
@@ -366,9 +389,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
                         "tuned GEMM Recipe is not restorable");
         }
         try {
-          execution = apxinf::gemm::prepare(
-              *implementation, tuned_recipe.configuration, normalized_spec,
-              *policy, *bindings, runtime->device);
+          execution = prepare_selected(*implementation, tuned_recipe.configuration);
           recipe = tuned_recipe;
           persist_recipe = true;
         } catch (const Failure&) {
@@ -407,6 +428,13 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
       }
     }
 
+    if (normalized_spec.b_layout == 0) {
+      apxinf::gemm::repack_weight_inplace(
+          normalized_spec, *bindings,
+          apxinf::gemm::weight_layout(*execution->implementation), *weight_layout);
+      execution->spec.b_layout = *weight_layout;
+    }
+
     execution->summary =
         std::string(execution->implementation->name) +
         " config=" + std::to_string(execution->configuration) +
@@ -432,20 +460,6 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     *output = reinterpret_cast<apxinf_gemm_execution_t>(execution.release());
   });
 }
-extern "C" apxinf_status_t apxinf_gemm_commit_weight(
-    apxinf_gemm_execution_t handle, uint32_t* layout) {
-  return apxinf::gemm::abi_boundary([&] {
-    auto* execution = reinterpret_cast<Execution*>(handle);
-    if (execution == nullptr || layout == nullptr ||
-        execution->bindings.b_is_immutable == 0) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid weight commit");
-    }
-    apxinf::gemm::check_cuda(cudaSetDevice(execution->device));
-    const auto selected = apxinf::gemm::weight_layout(*execution->implementation);
-    *layout = selected == 4 ? 4 : apxinf::gemm::commit_cutlass_weight(*execution);
-  });
-}
-
 extern "C" apxinf_status_t apxinf_gemm_enqueue(
     apxinf_gemm_execution_t handle) {
   return apxinf::gemm::abi_boundary([&] {
@@ -655,15 +669,6 @@ extern "C" apxinf_status_t apxinf_gemm_nvfp4_swiglu(
   (void)rows; (void)n; (void)k; (void)stream;
   return APXINF_STATUS_UNSUPPORTED;
 #endif
-}
-
-extern "C" uint64_t apxinf_gemm_execution_weight_prepack_count(
-    apxinf_gemm_execution_t handle) {
-  const auto* execution = reinterpret_cast<const Execution*>(handle);
-  if (execution == nullptr || execution->implementation->provider_id != 3) {
-    return 0;
-  }
-  return apxinf::gemm::cutlass_weight_prepack_count(*execution);
 }
 
 extern "C" apxinf_status_t apxinf_gemm_test_validate_candidates(
