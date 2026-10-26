@@ -110,6 +110,10 @@ HF tokenizer, state/action normalization, two-camera resize-with-padding, and
 action unnormalization. Its maintained latency and LIBERO entry points are
 `scripts/bench_smolvla.py` and `scripts/eval_smolvla_libero.py`.
 
+PI0.5 also has a [CPU FP32 reference](pi05-cpu-reference.md) sharing its model
+dataflow; CPU Blocks use host token IDs and an eager runner. CUDA preparation
+contracts are isolated in `pi05/model/cuda.rs`.
+
 Inspect or copy PI0.5's model/Blocks and runner
 structure when semantics fit; use `<Family>Model` and `<Family>ModelRunner` for
 those roles. Preserve static precision specialization and keep one owner of
