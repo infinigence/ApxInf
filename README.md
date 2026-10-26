@@ -343,7 +343,7 @@ The build queries the visible GPU for its compute capability and compiles the
 kernels for exactly that architecture, so build on the machine you deploy to;
 cross-compiling fails unless `APXINF_CUDA_ARCH` names the target. Per-platform
 presets (arch, nvcc parallelism) live in
-[configs/platforms/](configs/platforms/) and are selected with
+[configs/platforms.tsv](configs/platforms.tsv) and are selected with
 `APXINF_PLATFORM=<name> just build-py` (`thor`, `thor-u`, `orin`, `rtx4090`,
 `gb10`).
 

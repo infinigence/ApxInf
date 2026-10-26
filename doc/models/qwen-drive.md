@@ -28,7 +28,7 @@ APXINF_CUDA_AOT_MANIFEST=/path/to/artifacts/manifest.json \
   just build-py
 ```
 
-The preset (`configs/platforms/thor.env`) supplies `APXINF_CUDA_ARCH=sm_110`.
+The preset (`configs/platforms.tsv`) supplies `APXINF_CUDA_ARCH=sm_110`.
 For `--compatibility linux` wheels invoke `maturin` directly — see
 doc/guides/building.md. The checkpoint, planner, tokenizer and test fixtures
 are external assets.

@@ -15,7 +15,7 @@ this list is not a supported knob — inspect the source before using it.
 
 | Name | Where read |
 |---|---|
-| `APXINF_PLATFORM` | justfile; selects a preset from configs/platforms/ |
+| `APXINF_PLATFORM` | justfile; selects a preset from configs/platforms.tsv |
 | `APXINF_CUDA_AOT_MANIFEST` | crates/apxinf-cuda-new/native/kernels/cutlass/ops/gemm/gemm_nvfp4_swiglu_aot_sm100.cu, cra |
 | `APXINF_CUDA_ARCH` | crates/apxinf-cuda-new/native/adapters/runtime.cpp, crates/apxinf-cuda-new/build.rs, crate |
 | `APXINF_CUDA_ARCH_CUTLASS` | crates/apxinf-cuda-new/build.rs, crates/apxinf-cuda-new/build_support/cuda_arch.rs, crates |

@@ -37,7 +37,8 @@ class ToolingTests(unittest.TestCase):
         self.bin.mkdir()
         self.log = self.root / "calls.jsonl"
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", TOOL_LOG=str(self.log))
-        self.env.pop("APXINF_PLATFORM", None)
+        for name in ("APXINF_PLATFORM", "APXINF_CUDA_ARCH", "APXINF_NVCC_PARALLELISM"):
+            self.env.pop(name, None)
 
     def stub(self, name):
         script = self.bin / name
@@ -46,6 +47,7 @@ class ToolingTests(unittest.TestCase):
             "import json, os, sys\n"
             "with open(os.environ['TOOL_LOG'], 'a') as f:\n"
             "    f.write(json.dumps({'args': sys.argv, 'arch': os.getenv('APXINF_CUDA_ARCH'), "
+            "'parallelism': os.getenv('APXINF_NVCC_PARALLELISM'), "
             "'repo': os.getenv('GH_REPO'), 'cwd': os.getcwd()}) + '\\n')\n"
             "sys.exit(int(os.getenv('TOOL_EXIT', '0')))\n"
         )
@@ -82,6 +84,76 @@ class ToolingTests(unittest.TestCase):
         call = self.calls()[0]
         self.assertEqual(call["args"][1:], ["test", "-p", "apxinf-cuda-new", "--lib", "a test name", "--", "--nocapture"])
         self.assertEqual(call["arch"], "sm_89")
+
+    def test_platform_table_reaches_build_and_l3_commands(self):
+        for tool in ("maturin", "pip", "cargo"):
+            self.stub(tool)
+        for platform, arch, parallelism in (("thor", "sm_110", "4"),
+                                           ("thor-u", "sm_101", "4"),
+                                           ("orin", "sm_87", "4"),
+                                           ("rtx4090", "sm_89", "9"),
+                                           ("gb10", "sm_120", "9")):
+            for recipe in ("build-py", "test-l3"):
+                with self.subTest(platform=platform, recipe=recipe):
+                    self.log.unlink(missing_ok=True)
+                    self.env.update(APXINF_PLATFORM=platform, APXINF_CUDA_ARCH="sm_80",
+                                    APXINF_NVCC_PARALLELISM="9")
+                    args = ["--lib", "test name", "--", "--nocapture"] if recipe == "test-l3" else []
+                    result = self.run_command(["just", recipe, *args])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    calls = self.calls()
+                    self.assertEqual(len(calls), 1 if recipe == "test-l3" else 3)
+                    for call in calls:
+                        self.assertEqual(call["arch"], arch)
+                        self.assertEqual(call["parallelism"], parallelism)
+                    if args:
+                        self.assertEqual(calls[0]["args"][-len(args):], args)
+
+    def test_platform_unset_preserves_environment_and_defaults(self):
+        for tool in ("maturin", "pip", "cargo"):
+            self.stub(tool)
+        for recipe, default_arch in (("build-py", None), ("test-l3", "sm_110")):
+            for inherited in (False, True):
+                with self.subTest(recipe=recipe, inherited=inherited):
+                    self.log.unlink(missing_ok=True)
+                    for key in ("APXINF_CUDA_ARCH", "APXINF_NVCC_PARALLELISM"):
+                        self.env.pop(key, None)
+                    if inherited:
+                        self.env.update(APXINF_CUDA_ARCH="sm_89", APXINF_NVCC_PARALLELISM="2")
+                    result = self.run_command(["just", recipe])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.calls()[0]["arch"], "sm_89" if inherited else default_arch)
+                    self.assertEqual(self.calls()[0]["parallelism"], "2" if inherited else None)
+
+    def test_platform_errors_stop_before_build_or_install(self):
+        for tool in ("maturin", "pip", "cargo"):
+            self.stub(tool)
+        for recipe in ("build-py", "test-l3"):
+            with self.subTest(recipe=recipe):
+                self.env["APXINF_PLATFORM"] = "unknown; exit 0"
+                result = self.run_command(["just", recipe])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Unknown APXINF_PLATFORM", result.stderr)
+                self.assertEqual(self.calls(), [])
+                self.env.update(APXINF_PLATFORM="thor", TOOL_EXIT="7")
+                result = self.run_command(["just", recipe])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(self.calls()), 1, "failed build must not install a wheel")
+                self.log.unlink()
+                self.env.pop("TOOL_EXIT")
+
+    def test_malformed_platform_row_fails_before_export(self):
+        (self.root / "scripts").mkdir()
+        (self.root / "configs").mkdir()
+        script = self.root / "scripts/load_platform.sh"
+        shutil.copy(REPO / "scripts/load_platform.sh", script)
+        self.env["APXINF_PLATFORM"] = "thor"
+        for row in ("thor invalid 4", "thor sm_110 0", "thor sm_110 4 extra"):
+            with self.subTest(row=row):
+                (self.root / "configs/platforms.tsv").write_text(row + "\n")
+                result = self.run_command(["bash", "-eu", "-c", 'source "$1"', "test", str(script)])
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid build preset", result.stderr)
 
     def test_legacy_l3_shim_consumes_cargo_subcommand(self):
         self.stub("cargo")

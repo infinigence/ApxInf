@@ -33,7 +33,7 @@ Build and install the binding plus the frontend from the repository root:
 just build-py            # or: APXINF_PLATFORM=thor just build-py
 ```
 
-On Thor the platform preset (`configs/platforms/thor.env`) already sets
+On Thor the platform preset (`configs/platforms.tsv`) already sets
 `APXINF_CUDA_ARCH=sm_110` and the nvcc parallelism cap; set `CUDA_PATH` only if
 CUDA is not at `/usr/local/cuda`.
 

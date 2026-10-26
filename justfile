@@ -6,12 +6,9 @@
 #
 # Docs reference recipes by name only (see doc/README.md#how-docs-are-organized).
 #
-# Platform presets (arch, CUDA path, nvcc parallelism) live in
-# configs/platforms/<name>.env — see doc/ARCHITECTURE.md.
-
-# Load a platform preset: APXINF_PLATFORM=thor just build-py
-# (vars only export to child processes when the recipe itself uses them;
-# for other tools use `set -a; source configs/platforms/$APXINF_PLATFORM.env; set +a`.)
+# Platform build settings live in configs/platforms.tsv.
+# Only build-py and test-l3 load APXINF_PLATFORM automatically.
+# Other Bash callers can source scripts/load_platform.sh before their command.
 export APXINF_PLATFORM := env("APXINF_PLATFORM", "")
 
 # List all recipes.
@@ -22,9 +19,7 @@ default:
 build-py:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -n "{{ APXINF_PLATFORM }}" ]; then
-      set -a; source "configs/platforms/{{ APXINF_PLATFORM }}.env"; set +a
-    fi
+    source scripts/load_platform.sh
     CARGO_TARGET_DIR=target/wheel \
       maturin build --release --features cuda --auditwheel skip \
       -m crates/apxinf-py/Cargo.toml
@@ -106,9 +101,7 @@ test-gpu family *args:
 test-l3 *args:
     #!/usr/bin/env bash
     set -euo pipefail
-    if [ -n "{{ APXINF_PLATFORM }}" ]; then
-      set -a; source "configs/platforms/{{ APXINF_PLATFORM }}.env"; set +a
-    fi
+    source scripts/load_platform.sh
     : "${CUDA_PATH:=/usr/local/cuda}"
     : "${APXINF_CUDA_ARCH:=sm_110}"
     : "${CARGO_TARGET_DIR:=$PWD/target-gemm-pilot}"

@@ -46,7 +46,7 @@ doc/reference/model-layer-architecture.md and model-organization.md.
 justfile is the single source for build/test/bench commands; docs name
 recipes, never full invocations (doc/README.md#how-docs-are-organized).
 Platform build presets (arch, nvcc parallelism) live in
-configs/platforms/.
+configs/platforms.tsv.
 
 ## Documentation map
 

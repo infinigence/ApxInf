@@ -48,16 +48,26 @@ and model numerical acceptance are separate checks.
 
 ## Platform presets
 
-Per-platform build variables live in `configs/platforms/<name>.env`
+Per-platform build variables live in `configs/platforms.tsv`
 (`thor`, `thor-u`, `orin`, `rtx4090`, `gb10`) and are selected with:
 
 ```bash
 APXINF_PLATFORM=thor just build-py
 ```
 
-Each preset sets `APXINF_CUDA_ARCH` and, on Jetson, caps
+`build-py` and `test-l3` load the table through `scripts/load_platform.sh`.
+Other recipes do not automatically load it. Bash callers can source that script
+before invoking their own build command. With no platform selected, inherited
+variables and existing command defaults are unchanged; unknown names fail before
+any build or installation.
+
+A selected preset overrides `APXINF_CUDA_ARCH` and, on Jetson, caps
 `APXINF_NVCC_PARALLELISM` to avoid OOM during parallel nvcc compiles. Set
 `CUDA_PATH`/`CUDA_HOME` only if CUDA is not at `/usr/local/cuda`.
+The table's `-` leaves the inherited parallelism or build default unchanged.
+To choose custom architecture or Jetson parallelism, leave `APXINF_PLATFORM`
+unset and set those variables explicitly. These settings affect compilation,
+not inference parallelism or speed. Device builds for all presets are not verified.
 
 ## Build the CLI
 

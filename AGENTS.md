@@ -23,7 +23,7 @@ Pitfalls:
 - `cargo check` WITHOUT `--features cuda` passes while skipping ~230
   cfg(cuda) sites — that is not a real check. Use `just check`.
 - Jetson builds OOM unless nvcc parallelism is capped; the platform
-  presets in `configs/platforms/` (selected via
+  presets in `configs/platforms.tsv` (selected via
   `APXINF_PLATFORM=<name> just build-py`) already set it.
 - When no CUDA toolkit is found, build.rs skips kernel compilation
   silently — a "successful" build may still lack GPU kernels.

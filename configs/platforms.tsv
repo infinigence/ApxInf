@@ -1,0 +1,9 @@
+# platform  cuda_arch  nvcc_parallelism
+# '-' preserves the caller's value or the build system default.
+# Jetson presets cap compile concurrency to reduce build memory pressure.
+# These are build settings, not a record of device validation.
+thor	sm_110	4
+thor-u	sm_101	4
+orin	sm_87	4
+rtx4090	sm_89	-
+gb10	sm_120	-
