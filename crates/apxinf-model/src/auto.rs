@@ -547,6 +547,7 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
         model_name,
         "pi05"
             | "pi05-cuda"
+            | "pi05-hip"
             | "qwen_drive"
             | "qwen_drive-cuda"
             | "d3"
@@ -689,10 +690,17 @@ mod tests {
         };
         let config = hip_pi05_config(&frontend);
         assert_eq!(
-            (config.num_views, config.action_horizon, config.flow_start_time),
+            (
+                config.num_views,
+                config.action_horizon,
+                config.flow_start_time
+            ),
             (2, 10, 0.5)
         );
-        assert_eq!(config.language, crate::hip_pi05::config::GemmaConfig::GEMMA_2B);
+        assert_eq!(
+            config.language,
+            crate::hip_pi05::config::GemmaConfig::GEMMA_2B
+        );
         assert_eq!(config.vocab_size, frontend.vocab_size);
         config.validate().unwrap();
     }
@@ -714,9 +722,35 @@ mod tests {
         assert!(!supports_model_variant("llama", Device::Metal(0)));
         assert!(!supports_model_variant("qwen3_vl", Device::Metal(0)));
         assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
+        assert!(supports_model_variant("pi05-hip", Device::Hip(0)));
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
         assert!(supports_model_variant("smolvla", Device::Cuda(0)));
         assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
+    }
+
+    /// `Pi05Policy.from_pretrained(model_name="pi05-hip")` always sends a
+    /// model_variant (`"auto"` by default). Both must pass admission and reach
+    /// the PI0.5 loader; here that loader then fails for lack of a device or a
+    /// checkpoint, which is fine — only the admission rejection is the bug.
+    #[test]
+    fn pi05_hip_alias_admits_auto_and_bf16_model_variants() {
+        let path = temporary_directory("pi05-hip-admission");
+        for variant in ["auto", "bf16"] {
+            let options = LoadOptions {
+                model_name: Some("pi05-hip".into()),
+                model_variant: Some(variant.into()),
+                ..LoadOptions::default()
+            };
+            let error = match AutoModel::load_model(Device::Hip(0), &path, &options) {
+                Ok(_) => panic!("an empty directory cannot load as PI0.5"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                !error.contains("does not yet support model_variant"),
+                "model_variant={variant} was rejected before the PI0.5 loader: {error}"
+            );
+        }
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
