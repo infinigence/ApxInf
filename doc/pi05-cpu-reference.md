@@ -155,3 +155,10 @@ existing policy uses identity passthrough for them; this validates integration,
 not embodiment normalization accuracy. Linux OpenBLAS core/storage tests
 (33 tests) and the four regular CPU public-contract tests also passed. The
 CPU extension links OpenBLAS without CUDA or OpenMP runtime dependencies.
+
+
+Native CUDA compilation and a BF16 regression on Thor also passed. The same
+four full-size inputs produced bitwise-identical outputs between this change
+and main baseline `e9da4bd3967e18331cf13ffc44bded61a6b32075`; both builds were
+bitwise stable across consecutive repeats. This checks that the shared model
+refactor preserves the existing CUDA path, independently of FP32 CPU parity.
