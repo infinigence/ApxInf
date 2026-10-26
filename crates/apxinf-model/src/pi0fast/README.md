@@ -297,3 +297,18 @@ A new board stays on the cuBLAS default until it runs its own autotune
 The FP8-to-BF16 projections have their own records (`op=fp8_bf16`) in the same
 database and likewise ship only a Thor entry: on another board FP8 keeps the
 cuBLASLt default until that board runs its own autotune.
+
+
+### Per-request token limits
+
+The discrete-token entry point accepts an optional `max_new_tokens` within
+`1..=config.max_action_tokens`. Omission preserves existing behavior. A supplied
+`stop_token` still ends generation early; without one, the runtime generates
+exactly the requested count. BF16 and FP8 use the same limit semantics, retain
+the checkpoint-sized KV/workspace allocation, and terminate the native loop
+before any extra decode step. Python exposes this through
+`infer_action_tokens_rgb(..., stop_token=None, max_new_tokens=N)`.
+
+The [controlled benchmark](../../../../doc/pi0-fast-benchmark.md#controlled-token-length-benchmark-no-frame-file)
+uses this interface to time a grid derived from recorded natural-stop lengths.
+It neither changes deployed policy stopping nor evaluates action quality.

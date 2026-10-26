@@ -122,3 +122,41 @@ def test_gr00t_cli_passes_variant_unchanged_to_rust(tmp_path, monkeypatch, varia
     monkeypatch.setattr(bench.subprocess, 'run', run)
     monkeypatch.setattr(bench, 'provenance', lambda *a, **kw: {})
     bench.main()
+
+
+def test_fixed_decode_times_requested_prefixes_and_interleaves(monkeypatch):
+    bench = load('bench_pi0_fast')
+    clock = [0.0]
+    calls = []
+    def call(payload, length):
+        assert payload == 'same-input'
+        calls.append(length)
+        clock[0] += (25 + 7 * length) / 1000
+        return np.arange(length, dtype=np.uint32)
+    monkeypatch.setattr(bench.time, 'perf_counter', lambda: clock[0])
+    result = bench._run_fixed(call, 'same-input', [12, 20, 40], samples=2, warmup=1)
+    assert calls == [40, 12, 20, 40, 12, 20, 40, 40, 20, 12]
+    assert result['fit']['fixed_ms'] == pytest.approx(25)
+    assert result['fit']['per_step_ms'] == pytest.approx(7)
+    assert result['prefix_equal'] is True
+    assert all(len(values) == 2 for values in result['raw_ms'].values())
+
+
+@pytest.mark.parametrize('failure', ['length', 'prefix'])
+def test_fixed_decode_rejects_early_stop_or_changed_tokens(failure):
+    bench = load('bench_pi0_fast')
+    def call(_, length):
+        if length == 40:
+            return np.arange(length, dtype=np.uint32)
+        return np.arange(length - (failure == 'length'), dtype=np.uint32) + (failure == 'prefix')
+    with pytest.raises(RuntimeError, match='requested|changed'):
+        bench._run_fixed(call, None, [12, 40], samples=1, warmup=0)
+
+
+@pytest.mark.parametrize('lengths', [['0','12'], ['12','12']])
+def test_fixed_decode_rejects_invalid_cli_counts(monkeypatch, lengths):
+    bench = load('bench_pi0_fast')
+    monkeypatch.setattr(sys, 'argv', ['bench', '--model-dir', '/unused', '--layer', 'l1',
+                                   '--mode', 'fixed', '--decode-lengths', *lengths])
+    with pytest.raises(SystemExit):
+        bench.parse_args()

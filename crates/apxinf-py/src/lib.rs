@@ -1677,9 +1677,13 @@ impl ModelRunner {
     ///   and stops, returning a shorter array. Pass the FAST `|` terminator to
     ///   skip the ~90% of `max_action_tokens` that the detokenizer discards.
     ///
+    /// * `max_new_tokens` — optional per-call limit in `1..=max_action_tokens`.
+    ///   With `stop_token=None`, emit exactly this many ids (including any `|`).
+    ///   This bounds the actual decode loop, not a slice of a longer result.
+    ///
     /// Returns `uint32` `[1..=max_action_tokens]`, including `stop_token` when
     /// it was hit.
-    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None, *, max_new_tokens=None))]
     fn infer_action_tokens_rgb<'py>(
         &self,
         py: Python<'py>,
@@ -1687,6 +1691,7 @@ impl ModelRunner {
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
         stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
         let token_shape = self.action_tokens.ok_or_else(|| {
             PyValueError::new_err(
@@ -1694,6 +1699,13 @@ impl ModelRunner {
                  discrete action tokens (it is a continuous-action runtime)",
             )
         })?;
+        if let Some(limit) = max_new_tokens {
+            if limit == 0 || limit > token_shape[1] {
+                return Err(PyValueError::new_err(format!(
+                    "max_new_tokens must be in 1..={}, got {limit}", token_shape[1]
+                )));
+            }
+        }
         let (observation, _) =
             self.rgb_observation("infer_action_tokens_rgb", rgb_u8, layout, token_ids, None)?;
         // Token VLAs condition on the observation alone; the request still
@@ -1702,7 +1714,7 @@ impl ModelRunner {
         let request = VlaRequest::provided(&observation, &unused_latent);
         let decoded = self
             .model
-            .infer_action_tokens(&request, stop_token)
+            .infer_action_tokens_with_limit(&request, stop_token, max_new_tokens)
             .map_err(runtime_err)?;
         let values = decoded.to_f32_vec().map_err(runtime_err)?;
         if values.is_empty() || values.len() > token_shape[1] {

@@ -260,6 +260,17 @@ impl LoadedModel {
         self.vla()?.infer_action_tokens(request, stop_token)
     }
 
+    /// Token-only inference with a request limit bounded by model capacity.
+    pub fn infer_action_tokens_with_limit(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        self.vla()?
+            .infer_action_tokens_with_limit(request, stop_token, max_new_tokens)
+    }
+
     pub fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
         self.vla()?.calibration_amax(request)
     }
@@ -508,11 +519,22 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "qwen_drive-cuda"
             | "d3"
             | "d3-cuda"
-            | "walloss" | "walloss-cuda" | "wall-oss" | "wall-oss-cuda"
-            | "wall_oss_05" | "wall_oss_05-cuda"
-            | "gr00t" | "gr00t-cuda" | "gr00t_n1_7" | "gr00t_n1_7-cuda"
-            | "Gr00tN1d7" | "Gr00tN1d7-cuda"
-            | "pi0_fast" | "pi0_fast-cuda" | "pi0fast" | "pi0fast-cuda"
+            | "walloss"
+            | "walloss-cuda"
+            | "wall-oss"
+            | "wall-oss-cuda"
+            | "wall_oss_05"
+            | "wall_oss_05-cuda"
+            | "gr00t"
+            | "gr00t-cuda"
+            | "gr00t_n1_7"
+            | "gr00t_n1_7-cuda"
+            | "Gr00tN1d7"
+            | "Gr00tN1d7-cuda"
+            | "pi0_fast"
+            | "pi0_fast-cuda"
+            | "pi0fast"
+            | "pi0fast-cuda"
             | "smolvla"
             | "smolvla_libero"
     ) || (matches!(device, Device::Metal(_))
@@ -660,9 +682,20 @@ mod tests {
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
         assert!(supports_model_variant("smolvla", Device::Cuda(0)));
         assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
-        for name in ["walloss", "walloss-cuda", "wall-oss", "wall_oss_05-cuda",
-                     "gr00t", "gr00t-cuda", "Gr00tN1d7", "gr00t_n1_7-cuda",
-                     "pi0_fast", "pi0_fast-cuda", "pi0fast", "pi0fast-cuda"] {
+        for name in [
+            "walloss",
+            "walloss-cuda",
+            "wall-oss",
+            "wall_oss_05-cuda",
+            "gr00t",
+            "gr00t-cuda",
+            "Gr00tN1d7",
+            "gr00t_n1_7-cuda",
+            "pi0_fast",
+            "pi0_fast-cuda",
+            "pi0fast",
+            "pi0fast-cuda",
+        ] {
             assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
         }
     }

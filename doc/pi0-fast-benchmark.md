@@ -17,6 +17,64 @@ Record the exact downloaded revisions and checkpoint/calibration hashes for a
 reproduction campaign. Access to the checkpoint's declared tokenizer may require
 accepting its upstream access terms. Benchmarking never downloads resources.
 
+## Controlled token-length benchmark (no frame file)
+
+Use a real checkpoint with constructed images/state to measure exact decode
+lengths. This requires a native binding built with `max_new_tokens` support:
+
+```sh
+python scripts/bench_pi0_fast.py \
+  --model-dir /models/pi0fast-libero-v044 --model-variant bf16 \
+  --state-key observation/state --layer l1 --mode fixed \
+  --warmup 10 --samples 30 \
+  --out devlocal/model-bench-inputs/pi0fast/fixed-bf16.json
+```
+
+No LIBERO installation, dataset, simulator, or `.npz` input is required for this
+command. The checkpoint and its tokenizer/normalization assets are still needed.
+For FP8, select `fp8_static` and supply matching calibration. Reuse the same
+explicit `--tactics` database when comparing implementations.
+
+The default lengths are **12, 16, 20, 28, 32, 40** generated tokens. They were
+selected from the retained 2026-10-22 natural-stop measurements at source
+`08f72843`, using the same ten recorded LIBERO frames across three configurations:
+
+| Configuration | Natural generated lengths, frame order |
+|---|---|
+| Orin BF16 | 28, 27, 16, 28, 17, 20, 17, 21, 21, 37 |
+| Thor BF16 | 28, 27, 15, 28, 17, 21, 17, 21, 21, 37 |
+| Thor FP8 | 21, 27, 15, 22, 21, 17, 18, 21, 23, 32 |
+
+Counts include any generated `Action:` preamble and the terminator. This is ten unique observations, **not thirty
+independent scenes**; repeated runs and baseline copies were excluded. The
+pooled min/P25/P50/P75/P90/max are 15/17.25/21/27/28.4/37 (linear quantiles).
+Round the minimum down to a multiple of four, P25/P50/P75 to the nearest four,
+and P90/maximum up: 12/16/20/28/32/40. Four is just a convenient measurement grid,
+not an alignment requirement. The range brackets these observations; it is not
+a claim about all tasks/checkpoints. Use `--decode-lengths N ...` to override it
+when a broader survey supports different lengths. At least two distinct positive
+counts are required, all within the checkpoint's `max_action_tokens` capacity.
+
+Fixed mode uses only the **first** prepared input for every length. Each call
+runs exactly N generated tokens, ignoring `|`; N includes the first token from
+prefill, so there are N-1 subsequent autoregressive forwards. The native loop
+actually ends at N; it does not decode 256 tokens and truncate. KV/workspace
+capacity stays checkpoint-sized. Timings include the native call and final token
+return, exclude input construction and prefix comparisons, and omit per-token
+EOS readbacks. Lengths are interleaved in ascending/descending rounds after
+warming up each length. Every returned sequence must equal the prefix of the
+longest decode on that input.
+
+JSON `fixed_decode` stores prepared-input hashes and prompt length, the stop policy, requested counts, all samples,
+per-length P50/P95, and a fit `T(N) = fixed_ms + N * per_step_ms` over medians.
+The intercept is a regression coefficient; `fixed_ms + per_step_ms` estimates
+the cost through the first generated token. This is a controlled compute
+measurement, not the natural action latency or an action-quality evaluation.
+In particular, the natural-stop path performs an EOS readback per token and
+uses different observations. **Do not substitute these fitted values for the
+historical README Prefix/Per Token numbers without remeasurement and explicit
+labeling.** Natural-stop comparisons remain available below.
+
 ## Latency
 
 By default, the script constructs inputs deterministically from the checkpoint's

@@ -241,6 +241,10 @@ Two views, 224x224 NHWC `uint8`, batch 1.
 | RTX 4090 | BF16 | 20.9 ms | 5.24 ms |
 
 [Benchmark and task evaluation commands](doc/pi0-fast-benchmark.md).
+For a benchmark without recorded inputs, use `--layer l1 --mode fixed` with the
+survey-derived 12/16/20/28/32/40-token grid described there. It measures controlled
+decode lengths; the historical table above uses the natural-stop measurement
+and has not been replaced by results from this new mode.
 
 ### GR00T N1.7
 

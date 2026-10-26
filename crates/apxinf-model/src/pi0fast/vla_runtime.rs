@@ -15,8 +15,8 @@ use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
-    Action, InferenceSpec, Observation, PreparedInference, VlaContract, VlaRequest,
-    VisionObservation, VlaRuntime,
+    Action, InferenceSpec, Observation, PreparedInference, VisionObservation, VlaContract,
+    VlaRequest, VlaRuntime,
 };
 
 use super::backend::{
@@ -24,8 +24,8 @@ use super::backend::{
 };
 use super::fp8_calibration::{checkpoint_identity, Pi0FastFp8Calibration};
 use super::{
-    Pi0FastBf16Runtime, Pi0FastCalibrationPlan, Pi0FastConfig, Pi0FastFp8Runtime,
-    Pi0FastFp8Scales, Pi0FastWeights, StaticBf16Pi0FastWeights, StaticFp8Pi0FastWeights,
+    Pi0FastBf16Runtime, Pi0FastCalibrationPlan, Pi0FastConfig, Pi0FastFp8Runtime, Pi0FastFp8Scales,
+    Pi0FastWeights, StaticBf16Pi0FastWeights, StaticFp8Pi0FastWeights,
 };
 
 /// Explicit opt-in for an uncalibrated FP8 bring-up, in the form
@@ -52,7 +52,9 @@ fn artifact_root(path: &Path) -> PathBuf {
     if path.is_dir() {
         path.to_path_buf()
     } else {
-        path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
     }
 }
 
@@ -71,10 +73,23 @@ impl RuntimeVariant {
         token_ids: &CudaBuffer,
         token_count: usize,
         stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
     ) -> Result<Vec<u32>> {
         match self {
-            Self::Bf16(runtime) => runtime.infer(patches, token_ids, token_count, stop_token),
-            Self::Fp8(runtime) => runtime.infer(patches, token_ids, token_count, stop_token),
+            Self::Bf16(runtime) => runtime.infer_with_limit(
+                patches,
+                token_ids,
+                token_count,
+                stop_token,
+                max_new_tokens,
+            ),
+            Self::Fp8(runtime) => runtime.infer_with_limit(
+                patches,
+                token_ids,
+                token_count,
+                stop_token,
+                max_new_tokens,
+            ),
         }
     }
 
@@ -119,8 +134,8 @@ impl Pi0FastVlaRuntime {
 
     fn device_tokens(&self, tokens: &[u32]) -> Result<CudaBuffer> {
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_ne_bytes()).collect();
-        let buffer = CudaBuffer::alloc(bytes.len(), self.backend.device_id())
-            .map_err(Error::Cuda)?;
+        let buffer =
+            CudaBuffer::alloc(bytes.len(), self.backend.device_id()).map_err(Error::Cuda)?;
         buffer.copy_from_host(&bytes).map_err(Error::Cuda)?;
         Ok(buffer)
     }
@@ -142,9 +157,9 @@ impl Pi0FastVlaRuntime {
             }
             VisionObservation::RgbU8 { bytes, layout } => {
                 let config = &self.config;
-                let patches =
-                    self.backend
-                        .to_device(&Tensor::zeros(self.patch_shape().to_vec(), DType::F32))?;
+                let patches = self
+                    .backend
+                    .to_device(&Tensor::zeros(self.patch_shape().to_vec(), DType::F32))?;
                 let images = CudaBuffer::alloc(bytes.len(), self.backend.device_id())
                     .map_err(Error::Cuda)?;
                 images.copy_from_host(bytes).map_err(Error::Cuda)?;
@@ -179,8 +194,13 @@ impl Pi0FastVlaRuntime {
 
     fn run(&self, observation: &Observation, stop_token: Option<u32>) -> Result<Vec<u32>> {
         let (patches, tokens) = self.device_inputs(observation)?;
-        self.runtime
-            .infer(&patches, &tokens, observation.token_ids.len(), stop_token)
+        self.runtime.infer(
+            &patches,
+            &tokens,
+            observation.token_ids.len(),
+            stop_token,
+            None,
+        )
     }
 
     /// Collect one Observation's BF16 activation maxima for FP8 calibration.
@@ -244,6 +264,25 @@ impl VlaRuntime for Pi0FastVlaRuntime {
         self.token_tensor(&tokens)
     }
 
+    fn infer_action_tokens_with_limit(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        self.config.decode_token_limit(max_new_tokens)?;
+        let observation = request.observation;
+        let (patches, ids) = self.device_inputs(observation)?;
+        let tokens = self.runtime.infer(
+            &patches,
+            &ids,
+            observation.token_ids.len(),
+            stop_token,
+            max_new_tokens,
+        )?;
+        self.token_tensor(&tokens)
+    }
+
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
         let tokens = self.run(request.observation, None)?;
         Ok(tokens.iter().map(|token| *token as f32).collect())
@@ -297,7 +336,9 @@ fn fp8_activation_scale() -> Result<Option<f32>> {
         Err(_) => return Ok(None),
     };
     let scale = raw.parse::<f32>().map_err(|error| {
-        Error::Other(format!("{FP8_ACTIVATION_SCALE_ENV} must be a float: {error}"))
+        Error::Other(format!(
+            "{FP8_ACTIVATION_SCALE_ENV} must be a float: {error}"
+        ))
     })?;
     if !scale.is_finite() || scale <= 0.0 {
         return Err(Error::Other(format!(

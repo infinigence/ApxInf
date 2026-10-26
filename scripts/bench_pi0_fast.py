@@ -27,6 +27,10 @@ RGB) and no L3 (the websocket server is the PI0.5 stack).
 By default, inputs are deterministic synthetic images and state sized by the
 checkpoint. ``--frames`` optionally supplies recorded LIBERO observations for
 the original prefix/per-token fit, which needs distinct decode lengths.
+``--layer l1 --mode fixed`` needs no frame file: it measures exact generated
+lengths 12/16/20/28/32/40 on the first constructed input, ignoring EOS. These
+counts bracket the natural lengths from a ten-frame, three-configuration survey.
+Its fitted intercept/slope describe this controlled workload, not task latency.
 
     python scripts/bench_pi0_fast.py --model-dir /path/to/pi0fast-libero \
         --state-key observation/state
@@ -39,6 +43,7 @@ the original prefix/per-token fit, which needs distinct decode lengths.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pathlib
 import statistics
@@ -56,6 +61,10 @@ if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
 
 #: π0-FAST's layer set. L0/L3 belong to other families (see the module docstring).
 ALL_LAYERS = ("l1", "l2")
+
+# Ten held-out frames, Thor BF16/FP8 and Orin BF16: natural lengths 15..37.
+# Rounded min/P25/P50/P75/P90/max; see doc/pi0-fast-benchmark.md.
+DEFAULT_DECODE_LENGTHS = (12, 16, 20, 28, 32, 40)
 
 #: A LIBERO-scale instruction, used only by the synthetic-frame default.
 DEFAULT_PROMPT = "put both the alphabet soup and the tomato sauce in the basket"
@@ -152,7 +161,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=0, help="synthetic frame seed")
 
     # Measurement.
-    p.add_argument("--mode", choices=("latency", "ar", "all"), default="latency")
+    p.add_argument("--mode", choices=("latency", "ar", "all", "fixed"), default="latency")
+    p.add_argument(
+        "--decode-lengths", type=int, nargs="+", default=None, metavar="N",
+        help="fixed mode only: exact generated token counts (default: 12 16 20 28 32 40)",
+    )
     p.add_argument("--samples", type=int, default=30)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument(
@@ -175,6 +188,18 @@ def parse_args() -> argparse.Namespace:
         p.error("--autotune requires an explicit --tactics output path")
     if args.survey < 1 or (args.frames_limit is not None and args.frames_limit < 1):
         p.error("survey and frames-limit must be positive")
+    if args.mode == "fixed":
+        if _parse_layers(args.layer) != ["l1"]:
+            p.error("--mode fixed requires --layer l1 (raw token timing)")
+        if args.full_decode:
+            p.error("--full-decode is separate from --mode fixed")
+        args.decode_lengths = sorted(set(
+            args.decode_lengths if args.decode_lengths is not None else DEFAULT_DECODE_LENGTHS
+        ))
+        if len(args.decode_lengths) < 2 or min(args.decode_lengths) < 1:
+            p.error("--decode-lengths needs at least two distinct positive counts")
+    elif args.decode_lengths is not None:
+        p.error("--decode-lengths requires --mode fixed")
     return args
 
 
@@ -320,6 +345,47 @@ def _run_ar(call, observations, survey: int, repeats: int) -> dict:
     return {"survey": table, "fit": fit}
 
 
+def _run_fixed(call, payload, lengths, samples: int, warmup: int) -> dict:
+    """Time exact decode prefixes on one input, interleaving lengths to limit drift.
+
+    The reference prefix check is outside timing. It detects fake implementations
+    that change the decode trajectory when a smaller budget is requested.
+    """
+    lengths = sorted(set(lengths))
+    reference = np.asarray(call(payload, max(lengths)), dtype=np.uint32)
+    if reference.size != max(lengths):
+        raise RuntimeError("fixed decode did not return the requested maximum length")
+
+    def checked(length):
+        started = time.perf_counter()
+        tokens = np.asarray(call(payload, length), dtype=np.uint32)
+        elapsed = (time.perf_counter() - started) * 1000.0
+        if tokens.size != length:
+            raise RuntimeError(f"fixed decode requested {length} tokens, got {tokens.size}")
+        if not np.array_equal(tokens, reference[:length]):
+            raise RuntimeError(f"fixed decode at {length} changed the generated prefix")
+        return elapsed
+
+    for length in lengths:
+        for _ in range(warmup):
+            checked(length)
+    raw = {length: [] for length in lengths}
+    for repeat in range(samples):
+        order = lengths if repeat % 2 == 0 else list(reversed(lengths))
+        for length in order:
+            raw[length].append(checked(length))
+    points = [(length, statistics.median(raw[length])) for length in lengths]
+    return {
+        "layer": "l1", "stop_policy": "exact_length_ignore_eos",
+        "input_index": 0, "decode_lengths": lengths,
+        "samples_per_length": samples, "warmup_per_length": warmup,
+        "prefix_equal": True,
+        "raw_ms": {str(n): values for n, values in raw.items()},
+        "latency_ms": {str(n): _stats(values) for n, values in raw.items()},
+        "fit": _fit(points),
+    }
+
+
 def main(policy_loader=None) -> None:
     args = parse_args()
     layers = _parse_layers(args.layer)
@@ -393,6 +459,32 @@ def main(policy_loader=None) -> None:
             "prompt": observations[0][policy.prompt_key],
         },
     }
+
+    if args.mode == "fixed":
+        budget = int(policy.metadata["max_action_tokens"])
+        if max(args.decode_lengths) > budget:
+            raise ValueError(f"decode lengths exceed checkpoint token capacity {budget}")
+
+        def fixed(payload, length):
+            rgb, token_ids = payload
+            return handle.infer_action_tokens_rgb(
+                rgb, "nhwc", token_ids, stop_token=None, max_new_tokens=length
+            )
+
+        result["fixed_decode"] = _run_fixed(
+            fixed, prepared[0], args.decode_lengths, args.samples, args.warmup
+        )
+        rgb, token_ids = prepared[0]
+        result["fixed_decode"]["prepared_input"] = {
+            "rgb_shape": list(rgb.shape),
+            "rgb_sha256": hashlib.sha256(np.ascontiguousarray(rgb).tobytes()).hexdigest(),
+            "prompt_tokens": int(token_ids.size),
+            "prompt_ids_sha256": hashlib.sha256(token_ids.tobytes()).hexdigest(),
+        }
+        fit = result["fixed_decode"]["fit"]
+        print(f"fixed decode: {args.decode_lengths}; "
+              f"intercept={fit['fixed_ms']:.2f} ms, slope={fit['per_step_ms']:.2f} ms/token, "
+              f"r2={fit['r2']:.6f}")
 
     if args.mode in ("latency", "all"):
         layers_ms, raw_ms, tokens_seen = {}, {}, {}

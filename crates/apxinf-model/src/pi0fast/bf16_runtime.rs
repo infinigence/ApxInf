@@ -160,10 +160,7 @@ impl Pi0FastBf16Runtime {
         {
             *arena = Some(GraphWorkspace::new(capacity, self.ctx().device_id())?);
         }
-        kernels::with_workspace_eager(
-            arena.as_ref().expect("arena is populated above"),
-            operation,
-        )
+        kernels::with_workspace_eager(arena.as_ref().expect("arena is populated above"), operation)
     }
 
     /// Bytes of the arena the last call used.
@@ -185,7 +182,7 @@ impl Pi0FastBf16Runtime {
     ///
     /// `patches` is the FP32 patch-major tensor PaliGemma's SigLIP tower
     /// consumes; the BF16 encoder input is produced inside the patch embedding.
-    
+
     fn embed_images(&self, patches: &Tensor) -> Result<Tensor> {
         let config = &self.config;
         let weights = &self.weights;
@@ -231,8 +228,21 @@ impl Pi0FastBf16Runtime {
         token_count: usize,
         stop_token: Option<u32>,
     ) -> Result<Vec<u32>> {
+        self.infer_with_limit(patches, token_ids, token_count, stop_token, None)
+    }
+
+    /// Limit generation while retaining the checkpoint-sized workspace and KV cache.
+    pub fn infer_with_limit(
+        &self,
+        patches: &Tensor,
+        token_ids: &CudaBuffer,
+        token_count: usize,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Vec<u32>> {
+        let limit = self.config.decode_token_limit(max_new_tokens)?;
         self.with_arena(token_count, || {
-            self.infer_arena(patches, token_ids, token_count, stop_token)
+            self.infer_arena(patches, token_ids, token_count, stop_token, limit)
         })
     }
 
@@ -255,8 +265,7 @@ impl Pi0FastBf16Runtime {
             &self.config,
             &self.weights,
         )?);
-        let _guard =
-            kernels::gemm::install_bf16_observer(observer.clone())?;
+        let _guard = kernels::gemm::install_bf16_observer(observer.clone())?;
         let _ = self.infer(patches, token_ids, token_count, stop_token)?;
         self.backend.synchronize()?;
         observer.records()
@@ -269,6 +278,7 @@ impl Pi0FastBf16Runtime {
         token_ids: &CudaBuffer,
         token_count: usize,
         stop_token: Option<u32>,
+        limit: usize,
     ) -> Result<Vec<u32>> {
         let config = &self.config;
         if token_count == 0 || token_count > config.max_token_len + 1 {
@@ -287,9 +297,11 @@ impl Pi0FastBf16Runtime {
         let prefix_len = token_count + config.patch_tokens();
 
         let step_bytes = std::mem::size_of::<u32>();
-        let tokens =
-            CudaBuffer::alloc(config.max_action_tokens * step_bytes, self.ctx().device_id())
-                .map_err(Error::Cuda)?;
+        let tokens = CudaBuffer::alloc(
+            config.max_action_tokens * step_bytes,
+            self.ctx().device_id(),
+        )
+        .map_err(Error::Cuda)?;
         let mut logits = self.lm_head(&hidden)?;
 
         // One generated token per step: argmax on device, feed the id straight
@@ -297,17 +309,12 @@ impl Pi0FastBf16Runtime {
         // the loop ends. `stop_token` (the `|` terminator) ends the stream one
         // step after it is emitted; the detokenizer truncates there regardless,
         // so the decoded chunk is unchanged and the remaining steps are skipped.
-        let mut produced = config.max_action_tokens;
-        for step in 0..config.max_action_tokens {
+        let mut produced = limit;
+        for step in 0..limit {
             let slot = tokens
                 .view(step * step_bytes, step_bytes)
                 .map_err(Error::Cuda)?;
-            sampling::argmax_bf16_remapped_into(
-                self.ctx(),
-                &logits,
-                &self.lm_head_remap,
-                &slot,
-            )?;
+            sampling::argmax_bf16_remapped_into(self.ctx(), &logits, &self.lm_head_remap, &slot)?;
             if let Some(stop) = stop_token {
                 let mut raw = [0u8; 4];
                 slot.copy_to_host(&mut raw).map_err(Error::Cuda)?;
@@ -316,7 +323,7 @@ impl Pi0FastBf16Runtime {
                     break;
                 }
             }
-            if step + 1 == config.max_action_tokens {
+            if step + 1 == limit {
                 break;
             }
             let mut step_hidden = self.embed_tokens(&slot, 1)?;
@@ -394,7 +401,11 @@ impl Pi0FastBf16Runtime {
             &self.weights.language_final_norm_scale,
             self.config.rms_norm_eps,
         )?;
-        super::bf16_executor::decode_projection(self.ctx(), &normalized, &self.weights.lm_head.weight)
+        super::bf16_executor::decode_projection(
+            self.ctx(),
+            &normalized,
+            &self.weights.lm_head.weight,
+        )
     }
 
     /// Look up `token_count` ids and scale by PaliGemma's `sqrt(width)`.
@@ -405,7 +416,8 @@ impl Pi0FastBf16Runtime {
     /// action token, and the autoregressive feedback loop all share this path.
     fn embed_tokens(&self, ids: &CudaBuffer, token_count: usize) -> Result<Tensor> {
         let width = self.config.language.width;
-        let tensor = embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
+        let tensor =
+            embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
         elementwise::scale(self.ctx(), &tensor, (width as f32).sqrt())
     }
 }
