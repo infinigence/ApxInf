@@ -122,7 +122,26 @@ Generated checkpoints, independent reference code and results stay under
 The Rust fallback, Apple Accelerate, and pthreads OpenBLAS (1 and 4 threads)
 were locally checked on macOS arm64 with a small independent PyTorch
 implementation using unchanged norm/RoPE helpers from OpenPI revision
-`215abfb217dbac7d5f1273282331b9b1866c0479`. This evidence does not establish parity
-for a trained full-size checkpoint, a particular robot policy, quantized CUDA
-execution or GPU performance. Those need the intended checkpoint/reference
-inputs and the relevant execution host.
+`215abfb217dbac7d5f1273282331b9b1866c0479`.
+
+Full-checkpoint verification on Linux aarch64 (Thor CPU) also compared the public
+native RGB binding against that revision's unchanged `PI0Pytorch`, configured
+with `dtype="float32"` and running on CPU. Both loaded the PI0.5 LIBERO checkpoint
+with SHA256 `21b8711787c4a75861b02cff6aa81675a3a943d32b435a68262ac4461e476ba4`.
+The reference used PyTorch 2.9.1 and Transformers 4.53.2; native GEMM used
+OpenBLAS 0.3.26 pthreads with four threads. Each case used two 224x224 views,
+50x32 FP32 initial noise, and ten flow steps. The predetermined elementwise
+criterion was `atol=rtol=2e-4`.
+
+| Input | Tokens | Maximum absolute error | Relative L2 error |
+| --- | ---: | ---: | ---: |
+| Gradient images, first prompt | 10 | 6.03e-6 | 3.96e-6 |
+| Gradient images, second prompt | 21 | 1.02e-5 | 7.15e-6 |
+| Recorded DROID images, first frame | 8 | 1.40e-4 | 1.82e-5 |
+| Recorded DROID images, later frame | 8 | 3.04e-6 | 1.61e-6 |
+
+All four cases passed. Replaying the first input after the other cases was
+bitwise stable in both implementations. The DROID images are numerical input
+coverage for this LIBERO checkpoint, not a matched robot-policy evaluation.
+These results do not measure LIBERO task success, quantized CUDA equivalence,
+or production CPU latency.
