@@ -20,4 +20,11 @@ int embedding_gather(const void* table, const int32_t* ids, void* output,
 int argmax_bf16(const void* logits, int32_t* index, int count,
                 cudaStream_t stream);
 
+// Bilinearly interpolate a square learned BF16 position table and write both
+// embeddings and axial IDs in spatial-merge order in one launch.
+int vision_position_bf16(const void* table, void* embeddings,
+                         int32_t* position_ids, int source_side, int height,
+                         int width, int hidden, int merge_size,
+                         cudaStream_t stream);
+
 }  // namespace apxinf::cuda_new::model_ops

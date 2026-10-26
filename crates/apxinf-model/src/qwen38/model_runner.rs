@@ -350,7 +350,19 @@ pub(crate) fn decode_step_with_phases(
 
 /// Upload the prompt into the prefill token buffer.
 pub(crate) fn write_tokens(ctx: &CudaContext, prefill: &PrefillScratch, ids: &[u32]) {
+    let positions: Vec<[u32; 3]> = (0..ids.len()).map(|index| [index as u32; 3]).collect();
+    write_tokens_with_positions(ctx, prefill, ids, &positions);
+}
+
+/// Upload a prompt and its multimodal temporal/height/width positions.
+pub(crate) fn write_tokens_with_positions(
+    ctx: &CudaContext,
+    prefill: &PrefillScratch,
+    ids: &[u32],
+    positions: &[[u32; 3]],
+) {
     let _ = ctx;
+    assert_eq!(ids.len(), positions.len(), "one mRoPE position per token");
     let mut raw = Vec::with_capacity(ids.len() * 4);
     for &id in ids {
         raw.extend_from_slice(&(id as i32).to_le_bytes());
@@ -359,14 +371,15 @@ pub(crate) fn write_tokens(ctx: &CudaContext, prefill: &PrefillScratch, ids: &[u
         .unwrap()
         .copy_from_host(&raw)
         .unwrap();
-    // Positions are simply 0..tokens for a fresh prompt.
-    let mut positions = Vec::with_capacity(ids.len() * 4);
-    for index in 0..ids.len() {
-        positions.extend_from_slice(&(index as i32).to_le_bytes());
+    let mut position_bytes = Vec::with_capacity(ids.len() * 3 * 4);
+    for position in positions {
+        for axis in position {
+            position_bytes.extend_from_slice(&(*axis as i32).to_le_bytes());
+        }
     }
     CudaBuffer::from_tensor(&prefill.positions)
         .unwrap()
-        .copy_from_host(&positions)
+        .copy_from_host(&position_bytes)
         .unwrap();
 }
 
@@ -381,9 +394,17 @@ pub(crate) fn set_token(scratch: &Scratch, id: i32) {
 }
 
 pub(crate) fn set_position(scratch: &Scratch, pos: usize) {
+    set_mrope_position(scratch, [pos as u32; 3]);
+}
+
+pub(crate) fn set_mrope_position(scratch: &Scratch, position: [u32; 3]) {
+    let bytes: Vec<u8> = position
+        .into_iter()
+        .flat_map(|axis| (axis as i32).to_le_bytes())
+        .collect();
     CudaBuffer::from_tensor(&scratch.positions)
         .unwrap()
-        .copy_from_host(&(pos as i32).to_le_bytes())
+        .copy_from_host(&bytes)
         .unwrap();
 }
 

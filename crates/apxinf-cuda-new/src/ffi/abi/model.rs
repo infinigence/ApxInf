@@ -18,4 +18,15 @@ unsafe extern "C" {
         count: i64,
         stream: CudaStream,
     ) -> i32;
+    pub(crate) fn apxinf_model_vision_position_bf16(
+        table: *const c_void,
+        embeddings: *mut c_void,
+        position_ids: *mut c_void,
+        source_side: i64,
+        height: i64,
+        width: i64,
+        hidden: i64,
+        merge_size: i64,
+        stream: CudaStream,
+    ) -> i32;
 }

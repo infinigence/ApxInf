@@ -1,11 +1,16 @@
 # Qwen3.8-27B-NVFP4
 
-Text LLM with 64 layers — 48 Gated DeltaNet (linear attention) + 16 full
+Text and image model with 64 language layers — 48 Gated DeltaNet (linear attention) + 16 full
 attention — quantized to mixed NVFP4/FP8 by NVIDIA ModelOpt. ApxInf runs it
 on Jetson AGX Thor (sm_110): batch 1, BF16 KV cache, CUDA-graph decode.
 
 Implementation: `crates/apxinf-model/src/qwen38/`, organized per
 [Model Layer Architecture](../reference/model-layer-architecture.md).
+
+Image inference uses the family-owned `vision.rs` and `vision_weights.rs`
+through the same backend seam; the CLI preprocesses images with a Python helper.
+The latency examples below describe the recorded text workload, not a new
+image-inference measurement.
 
 ## Optimizations are always on
 

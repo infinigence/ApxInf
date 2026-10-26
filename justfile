@@ -31,6 +31,16 @@ build-py:
     pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
     pip install -e "python/apxinf[serving]"
 
+# Build the HIP Python extension in the active environment (pass --uv for a uv venv).
+[positional-arguments]
+build-py-hip *args:
+    maturin develop --release --features hip,extension-module -m crates/apxinf-py/Cargo.toml "$@"
+
+# Run the native HIP PI0.5 fixture benchmark (requires ROCm and a checkpoint).
+[positional-arguments]
+bench-pi05-hip *args:
+    cargo run --release -p apxinf-model --features hip --example pi05_hip_bench -- "$@"
+
 # Build the apxinf CLI binary.
 build-cli:
     cargo build --release --features cuda --bin apxinf

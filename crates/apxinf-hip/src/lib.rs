@@ -26,13 +26,22 @@
 //! `concat_2d`) and graph capture. Nothing is fused or tuned; this milestone is
 //! about correctness, and the performance work comes after a model runs.
 //!
-//! Reachable models are those that compose through `dyn Backend` — Qwen3VL and
-//! llama. PI0.5, pi0-fast, GR00T and Qwen-Drive downcast to a concrete CUDA
-//! backend and call its kernels directly, so they cannot reach any non-CUDA
-//! backend until they are composed through the trait.
+//! Models reachable through `Backend` are those that compose through
+//! `dyn Backend` — Qwen3VL and llama. pi0-fast, GR00T and Qwen-Drive downcast
+//! to a concrete CUDA backend and call its kernels directly, so they cannot
+//! reach any non-CUDA backend until they are composed through the trait.
+//!
+//! # Native models
+//!
+//! [`native`] is a second, separate surface for models written directly
+//! against HIP, the way pi05 is written against `apxinf-cuda-new`: operators
+//! that write into caller-provided tensors from a [`native::HipArena`], with no
+//! hidden synchronization, so an inference can later be captured as one HIP
+//! graph. PI0.5 runs on it (`apxinf_model::hip_pi05`).
 
 mod ffi;
 mod kv_cache;
+pub mod native;
 mod ops;
 mod runtime;
 mod sampling;

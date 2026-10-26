@@ -1,5 +1,6 @@
 /target
 models/
+!/doc/models/
 nsys/
 *.nsys-rep
 

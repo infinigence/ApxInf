@@ -34,7 +34,7 @@ pub use attention::{
 pub use attn_ops::{
     apply_output_gate, head_rms_norm, partial_rope, rotary_dim, split_query_and_gate,
 };
-pub use cache::{concat_rows, reserve_prefix};
+pub use cache::{concat_rows, copy_tensor, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
 pub use gdn::{
     gdn_causal_conv_forward, gdn_causal_conv_step, gdn_decay_and_beta,
@@ -52,7 +52,7 @@ pub use gemm::{
     ScaleLayout, WeightVersion,
 };
 pub use mlp::{add_into, fp8_gemv, nvfp4_gemv, quantize_fp8_per_tensor, swiglu};
-pub use model::{argmax, embedding_gather};
+pub use model::{argmax, embedding_gather, vision_position, VisionPositionArgs};
 pub use norm::{
     ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm, bias_residual,
     bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual, layer_norm, rms_norm,

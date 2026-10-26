@@ -25,7 +25,7 @@ code, the code wins and this file must be fixed in the same PR.
 
 Under crates/apxinf-model/src/: shared contracts live at the root
 (lib.rs, auto.rs, registry.rs, llm_trait.rs, vla/); each family
-(pi05, walloss, gr00t, llama, qwen38, qwen3vl, qwen_drive, smolvla,
+(pi05, hip_pi05, walloss, gr00t, llama, qwen38, qwen3vl, qwen_drive, smolvla,
 pi0fast, d3, metal_qwen3, metal_minicpm5) is self-contained — no family imports another family's private
 model, weights, runner, graph, or backbone. New VLA code names forward
 computation Model and execution ownership ModelRunner; those are roles,

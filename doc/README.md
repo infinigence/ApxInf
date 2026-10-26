@@ -42,19 +42,21 @@ relative to the source skill directory; Claude's symlinks share that source.
 | Mapping model computation to device operations and required capture | [Model Execution Wiring](reference/model-execution-wiring.md) |
 | Gathering references and completing independent acceptance evidence | [Porting Workflow](guides/porting-workflow.md) |
 | A required safe device operation is missing | [Adding New Kernels](guides/adding-new-kernels.md) |
+| Running PI0.5 on AMD (HIP), comparing it with CUDA, or extending it | [PI0.5 on HIP](models/hip-pi05.md) — layout, entry points, validation and status |
 | Designing the native MLX backend or migrating a qualified Mac model | [MLX Backend](design/mlx-backend.md) — ownership, supported selections and execution contracts |
 
 PI0.5 currently separates model/, model_runner/ and weights/. Its
 [component view](archive/model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)
 and [callable preparation contract](archive/model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
-describe implemented code. WallOSS/GR00T and LLM/VLM retain their own organization;
+describe implemented code. WallOSS uses the same split with per-request image
+grids ([WallOSS](models/walloss.md)); GR00T and LLM/VLM retain their own organization;
 read the coverage table before assuming identical readiness or config support.
 
 Qwen-Drive follows the same model/ / model_runner/ / weights/ separation as a
 planning-only VLA runtime. Its [benchmark and validation guide](models/qwen-drive.md)
 records measured performance, accuracy, reproduction steps and runtime limits.
 
-Qwen3.8-27B-NVFP4 is a text LLM behind LlmTrait with the same weights/model/
+Qwen3.8-27B-NVFP4 supports text and image inference behind LlmTrait with the same weights/model/
 model_runner owners as single files. [CLI inference, benchmarking and limits](models/qwen38.md)
 cover Jetson Thor.
 
@@ -93,6 +95,8 @@ ignored devlocal/<feat-name>/ according to [AGENTS.md](../AGENTS.md).
 ## Model operation
 
 - [PI0.5](models/pi05.md) — including the CUDA regression protocol.
+- [WallOSS](models/walloss.md)
+- [PI0.5 on HIP](models/hip-pi05.md)
 - [GR00T N1.7](models/gr00t.md)
 - [Qwen-Drive](models/qwen-drive.md)
 - [Qwen3.8 NVFP4](models/qwen38.md)

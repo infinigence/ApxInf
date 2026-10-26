@@ -33,6 +33,8 @@ this list is not a supported knob — inspect the source before using it.
 | `APXINF_CUDA_ALLOC_CACHE` | crates/apxinf-cuda/src/buffer.rs |
 | `APXINF_DISABLE_FA2_SPLITKV` | crates/apxinf-cuda/src/kernels/attention.rs |
 | `APXINF_FAST_TOKENIZER` | python/apxinf/apxinf/policies/impls/pi0fast.py |
+| `APXINF_PYTHON` | src/main.rs; Python executable for Qwen3.8 image preprocessing (default python3) |
+| `APXINF_WALLOSS_TEST_MODEL` | crates/apxinf-model/src/walloss/model_runner/runner.rs; checkpoint path for opt-in CUDA runner tests |
 | `APXINF_PALIGEMMA_TOKENIZER` | python/apxinf/apxinf/policies/impls/pi0fast.py |
 | `APXINF_PI05_CALIBRATION` | crates/apxinf-py/tests/conftest.py |
 | `APXINF_PI05_CHECKPOINT` | crates/apxinf-py/tests/conftest.py |
@@ -62,6 +64,8 @@ this list is not a supported knob — inspect the source before using it.
 
 | Name | Where read |
 |---|---|
+| `APXINF_QWEN38_VISION_DUMP` | crates/apxinf-model/src/qwen38/vision.rs; path for the final vision output as little-endian F32 bytes |
+| `APXINF_QWEN38_VISION_DUMP_DIR` | crates/apxinf-model/src/qwen38/vision.rs; directory for per-stage vision tensor dumps |
 | `APXINF_ATTENTION_BUILD_ID` | crates/apxinf-cuda-new/native/adapters/attention/tuning_key.cpp, crates/apxinf-cuda-new/bu |
 | `APXINF_ATTENTION_CUTLASS` | crates/apxinf-cuda-new/native/adapters/attention/internal.h, crates/apxinf-cuda-new/native |
 | `APXINF_ATTENTION_FA2` | crates/apxinf-cuda-new/native/adapters/attention/internal.h, crates/apxinf-cuda-new/native |
