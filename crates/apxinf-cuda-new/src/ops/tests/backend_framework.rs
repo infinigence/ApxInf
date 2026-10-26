@@ -245,16 +245,6 @@ fn prepare_test_gemm(
     )
 }
 
-fn prepare_test_geglu(
-    ctx: &CudaContext,
-    args: GemmGegluArgs<'_>,
-) -> apxinf_core::Result<std::rc::Rc<super::execution::Execution>> {
-    super::execution::prepare(
-        ctx,
-        super::contracts::normalize(ctx, args.gemm, super::contracts::Semantic::GemmGeglu, None)?,
-    )
-}
-
 #[test]
 fn gemm_rejects_partially_overlapping_output_storage() {
     let ctx = CudaContext::new(0).unwrap();
@@ -1708,6 +1698,46 @@ fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
 }
 
 #[test]
+fn gpu_canonical_weight_does_not_opt_into_inplace_packing() {
+    let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 87 {
+        return;
+    }
+    let (m, k, n) = (8, 256, 128);
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &vec![1; m * k]);
+    let source = (0..k * n).map(|i| (i % 7) as u8).collect::<Vec<_>>();
+    let b = bytes_tensor(0, vec![k, n], DType::I8, &source);
+    let rows = scales(0, &vec![1.0; m]);
+    let channels = scales(0, &vec![1.0; n]);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let cache = scratch_cache_dir("canonical-weight");
+    let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut out)
+        .with_immutable_weight(WeightVersion::new(7));
+    args.policy.online_tune = false;
+    args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    // An immutable Tensor is still canonical; only RepackedWeight permits mutation.
+    assert!(super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).is_err());
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    execution.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    let mut actual = vec![0; source.len()];
+    CudaBuffer::from_tensor(&b)
+        .unwrap()
+        .copy_to_host(&mut actual)
+        .unwrap();
+    assert_eq!(actual, source);
+    for (i, value) in values(&out).into_iter().enumerate() {
+        let expected = (0..k)
+            .map(|row| source[row * n + i % n] as f32)
+            .sum::<f32>();
+        assert_eq!(value, bf16::from_f32(expected).to_f32());
+    }
+    std::fs::remove_dir_all(cache).unwrap();
+}
+
+#[test]
 fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
     let ctx = CudaContext::new(0).unwrap();
     if ctx.caps().sm != 87 {
@@ -1741,9 +1771,24 @@ fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
             super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
                 .unwrap();
         normalized.spec.b_layout = layout.state.lock().unwrap().layout;
+        if run == 0 {
+            let expected = (0..m * n)
+                .map(|i| source[(i / n) % k * n + i % n] as f32)
+                .collect::<Vec<_>>();
+            super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
+            let mut unchanged = vec![0; source.len()];
+            CudaBuffer::from_tensor(&b)
+                .unwrap()
+                .copy_to_host(&mut unchanged)
+                .unwrap();
+            assert_eq!(
+                unchanged, source,
+                "candidate trials must not rewrite model weights"
+            );
+        }
         super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
         let execution = super::execution::prepare(&ctx, normalized).unwrap();
-        assert_eq!(execution.weight_prepack_count(), u64::from(run == 0));
+        assert!(execution.summary().contains("workspace=0 "));
         execution.enqueue().unwrap();
         ctx.synchronize().unwrap();
         for (index, actual) in values(&output).into_iter().enumerate() {
@@ -1836,7 +1881,9 @@ fn gpu_repacked_geglu_preserves_old_graph_and_generic_shape() {
                 .unwrap();
         }
         let execution = super::execution::prepare(&ctx, normalized).unwrap();
-        assert_eq!(execution.weight_prepack_count(), u64::from(run == 0));
+        if rows != 1 {
+            assert!(execution.summary().contains("workspace=0 "));
+        }
         execution.enqueue().unwrap();
         ctx.synchronize().unwrap();
         let check = |out: &Tensor| {
@@ -1908,7 +1955,7 @@ fn gpu_repacked_fp8_crosses_geglu_and_plain_gemm() {
             }
             args.quantization = GemmQuantization::Fp8UnitScale;
             args.policy.online_tune = false;
-            args.policy.allow_fallback = !fused;
+            args.policy.allow_fallback = !fused || state.is_none();
             args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
             let semantic = if fused {
                 super::contracts::Semantic::GemmGeglu
@@ -1919,7 +1966,7 @@ fn gpu_repacked_fp8_crosses_geglu_and_plain_gemm() {
             if let Some(state) = state {
                 normalized.spec.b_layout = state.state.lock().unwrap().layout;
             }
-            if fused {
+            if fused && state.is_some() {
                 super::execution::seed_recipe(&ctx, &normalized, 3, 2, 2, 0).unwrap();
             }
             let execution = super::execution::prepare(&ctx, normalized).unwrap();
@@ -1933,6 +1980,11 @@ fn gpu_repacked_fp8_crosses_geglu_and_plain_gemm() {
             bytes
         };
         assert_eq!(read(&actual), read(&expected), "M={m}");
+        assert_eq!(
+            read(&canonical),
+            bytes,
+            "reference weights remain canonical"
+        );
     }
     std::fs::remove_dir_all(cache_dir).unwrap();
 }

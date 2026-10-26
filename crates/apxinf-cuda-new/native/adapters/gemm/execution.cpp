@@ -43,7 +43,7 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
       spec.n > INT32_MAX || spec.k > INT32_MAX ||
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
       spec.b_is_immutable > 1 || spec.b_layout > 4 ||
-      (spec.b_layout != 0 && spec.b_is_immutable == 0)) {
+      (spec.b_layout > 0 && spec.b_layout < 4 && spec.b_is_immutable == 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec");
   }
   if ((spec.b_layout == 1 && spec.b_dtype != APXINF_DTYPE_I8) ||
@@ -94,7 +94,9 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_SWIGLU;
   const bool gate_up_pairs =
       spec.b_layout == APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256;
-  if (swiglu != gate_up_pairs) {
+  // Layout 0 is an unprepared canonical weight; preparation selects and
+  // commits the required encoding before the execution is bound.
+  if (spec.b_layout != 0 && swiglu != gate_up_pairs) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "GEMM+SwiGLU requires the gate/up-pair B layout");
   }
@@ -106,7 +108,7 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
   if (spec.numerics == APXINF_GEMM_NUMERICS_LEGACY_CUBLAS &&
       (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM ||
        spec.quantization != APXINF_GEMM_QUANT_NONE ||
-       spec.b_layout != APXINF_GEMM_LAYOUT_KN ||
+       (spec.b_layout != 0 && spec.b_layout != APXINF_GEMM_LAYOUT_KN) ||
        spec.a_dtype != APXINF_DTYPE_BF16 ||
        spec.b_dtype != APXINF_DTYPE_BF16 ||
        spec.output_dtype != APXINF_DTYPE_BF16 ||
@@ -133,7 +135,8 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
     if (spec.a_dtype != APXINF_DTYPE_E2M1_PAIR ||
         spec.b_dtype != APXINF_DTYPE_E2M1_PAIR ||
         spec.semantic != APXINF_GEMM_SEMANTIC_GEMM ||
-        spec.b_layout != APXINF_GEMM_LAYOUT_NK) {
+        (spec.b_layout != 0 &&
+         spec.b_layout != APXINF_GEMM_LAYOUT_NK)) {
       throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                     "NVFP4 quantization requires two packed E2M1 inputs");
     }
@@ -293,7 +296,7 @@ const apxinf::gemm::Implementation* find_implementation(const Recipe& recipe,
 
 std::unique_ptr<Execution> fallback(
     const apxinf::gemm::Spec& spec, const apxinf_gemm_policy_t& policy,
-    const apxinf_gemm_bindings_t& bindings, int device) {
+    const apxinf_gemm_bindings_t& bindings, int device, bool select_layout) {
   constexpr uint32_t kProviderCublasLt = 2;
   constexpr uint32_t kProviderCutlass = 3;
   const auto& implementations = apxinf::gemm::registry(spec.semantic);
@@ -305,18 +308,27 @@ std::unique_ptr<Execution> fallback(
           (!designated_only && implementation.fallback) ||
           (provider_id != 0 && implementation.provider_id != provider_id) ||
           !apxinf::gemm::supports_device(implementation, device) ||
-          !implementation.supports(spec) ||
-          !apxinf::gemm::supports_weight_layout(implementation, spec) ||
           (policy.graph_safe && !implementation.graph_safe) ||
           (policy.deterministic && !implementation.deterministic)) {
         continue;
       }
+      auto prepared_spec = spec;
+      if (select_layout && prepared_spec.b_layout == 0) {
+        prepared_spec.b_layout =
+            apxinf::gemm::weight_layout(implementation);
+      }
+      if (!implementation.supports(prepared_spec) ||
+          !apxinf::gemm::supports_weight_layout(implementation,
+                                                prepared_spec)) {
+        continue;
+      }
       std::vector<int> configurations;
-      implementation.enumerate_configs(spec, configurations);
+      implementation.enumerate_configs(prepared_spec, configurations);
       for (int configuration : configurations) {
         try {
           return apxinf::gemm::prepare(
-              implementation, configuration, spec, policy, bindings, device);
+              implementation, configuration, prepared_spec, policy, bindings,
+              device);
         } catch (const Failure&) {
           cudaGetLastError();
         }
@@ -372,7 +384,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     const apxinf_gemm_spec_t* spec,
     const apxinf_gemm_policy_t* policy,
     const apxinf_gemm_bindings_t* bindings,
-    apxinf_gemm_execution_t* output) {
+    apxinf_gemm_execution_t* output, uint32_t* weight_layout) {
   if (output != nullptr) {
     *output = nullptr;
   }
@@ -385,6 +397,11 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     apxinf::gemm::Spec normalized_spec{};
     static_cast<apxinf_gemm_spec_t&>(normalized_spec) = *spec;
     validate_spec(normalized_spec);
+    if (normalized_spec.b_layout == 0 && weight_layout != nullptr &&
+        bindings->b_is_immutable == 0) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "in-place weight preparation requires an immutable weight");
+    }
     validate_policy(*policy);
     validate_bindings(normalized_spec, *bindings, true);
     cudaStreamCaptureStatus capture_status;
@@ -425,14 +442,34 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     }
     }
 
+    // Bind the selected layout, but do not modify model bytes until selection
+    // and provider preparation have succeeded. Nothing is enqueued here.
+    auto prepare_selected = [&](const apxinf::gemm::Implementation& implementation,
+                                int configuration) {
+      auto prepared_spec = normalized_spec;
+      if (prepared_spec.b_layout == 0 && weight_layout != nullptr) {
+        prepared_spec.b_layout = apxinf::gemm::weight_layout(implementation);
+      }
+      const size_t packing_bytes =
+          normalized_spec.b_layout == 0 && weight_layout != nullptr &&
+                  prepared_spec.b_layout != APXINF_GEMM_LAYOUT_CANONICAL
+              ? static_cast<size_t>(normalized_spec.k * normalized_spec.n) *
+                    apxinf::gemm::dtype_bytes(normalized_spec.b_dtype)
+              : 0;
+      if (packing_bytes > policy->workspace_limit) {
+        throw Failure(APXINF_STATUS_UNSUPPORTED, "weight packing exceeds workspace limit");
+      }
+      auto execution_policy = *policy;
+      execution_policy.workspace_limit -= packing_bytes;
+      return apxinf::gemm::prepare(implementation, configuration, prepared_spec,
+                                  execution_policy, *bindings, runtime->device);
+    };
     std::unique_ptr<Execution> execution;
     if (recipe_found) {
       if (const auto* implementation =
               find_implementation(recipe, normalized_spec, runtime->device)) {
         try {
-          execution = apxinf::gemm::prepare(
-              *implementation, recipe.configuration, normalized_spec, *policy,
-              *bindings, runtime->device);
+          execution = prepare_selected(*implementation, recipe.configuration);
         } catch (const Failure&) {
           execution.reset();
           cudaGetLastError();
@@ -456,9 +493,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
                         "tuned GEMM Recipe is not restorable");
         }
         try {
-          execution = apxinf::gemm::prepare(
-              *implementation, tuned_recipe.configuration, normalized_spec,
-              *policy, *bindings, runtime->device);
+          execution = prepare_selected(*implementation, tuned_recipe.configuration);
           recipe = tuned_recipe;
           persist_recipe = true;
         } catch (const Failure&) {
@@ -468,12 +503,12 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
             throw;
           }
           execution = fallback(normalized_spec, *policy, *bindings,
-                               runtime->device);
+                               runtime->device, weight_layout != nullptr);
           source = "fallback-after-tune";
         }
       } else if (policy->allow_fallback) {
         execution = fallback(normalized_spec, *policy, *bindings,
-                             runtime->device);
+                             runtime->device, weight_layout != nullptr);
         source = "fallback";
       } else {
         throw Failure(APXINF_STATUS_CACHE_MISS,
@@ -495,6 +530,13 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
         apxinf::gemm::write_recipe(
             cache_dir, key, serialized.str());
       }
+    }
+
+    if (normalized_spec.b_layout == 0 && weight_layout != nullptr) {
+      apxinf::gemm::repack_weight_inplace(
+          normalized_spec, *bindings,
+          apxinf::gemm::weight_layout(*execution->implementation), *weight_layout);
+      execution->spec.b_layout = *weight_layout;
     }
 
     execution->summary =
@@ -522,20 +564,6 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     *output = reinterpret_cast<apxinf_gemm_execution_t>(execution.release());
   });
 }
-extern "C" apxinf_status_t apxinf_gemm_commit_weight(
-    apxinf_gemm_execution_t handle, uint32_t* layout) {
-  return apxinf::gemm::abi_boundary([&] {
-    auto* execution = reinterpret_cast<Execution*>(handle);
-    if (execution == nullptr || layout == nullptr ||
-        execution->bindings.b_is_immutable == 0) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid weight commit");
-    }
-    apxinf::gemm::check_cuda(cudaSetDevice(execution->device));
-    const auto selected = apxinf::gemm::weight_layout(*execution->implementation);
-    *layout = selected == 4 ? 4 : apxinf::gemm::commit_cutlass_weight(*execution);
-  });
-}
-
 extern "C" apxinf_status_t apxinf_gemm_enqueue(
     apxinf_gemm_execution_t handle) {
   return apxinf::gemm::abi_boundary([&] {

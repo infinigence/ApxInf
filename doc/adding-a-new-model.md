@@ -154,7 +154,8 @@ separate concepts when their lifecycles differ. Perform stable transformations
 once during load, not in every inference.
 For cuda-new GEMMs that may repack, retain `RepackedWeight` beside the model's
 weight allocation and attach it to every GEMM consumer. The first preparation
-commits one physical layout in place; later executions reuse that layout across
+selects a kernel, repacks through a local temporary, writes back to the same
+allocation, and releases the temporary; later executions reuse that layout across
 IO addresses and shapes. Do not read committed bytes as a canonical tensor or
 create independent layout states for aliases of the same allocation. Reload
 weights after a failed layout commit, and retire old graph readers before

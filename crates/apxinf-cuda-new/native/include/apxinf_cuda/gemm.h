@@ -16,14 +16,16 @@ apxinf_status_t apxinf_gemm_nvfp4_gemv(
 
 typedef struct apxinf_gemm_execution* apxinf_gemm_execution_t;
 
+/* weight_layout is model-owned state for an initially unprepared B (layout 0).
+   Prepare selects a kernel, packs through a local temporary, and writes back
+   before returning an execution. On writeback failure it becomes INVALID.
+   Canonical callers use layout 4 and may pass nullptr; their B is never changed. */
 apxinf_status_t apxinf_gemm_prepare(
     apxinf_runtime_t runtime, const apxinf_gemm_spec_t* spec,
     const apxinf_gemm_policy_t* policy,
     const apxinf_gemm_bindings_t* bindings,
-    apxinf_gemm_execution_t* execution);
+    apxinf_gemm_execution_t* execution, uint32_t* weight_layout);
 apxinf_status_t apxinf_gemm_enqueue(apxinf_gemm_execution_t execution);
-apxinf_status_t apxinf_gemm_commit_weight(apxinf_gemm_execution_t execution,
-                                        uint32_t* layout);
 void apxinf_gemm_destroy(apxinf_gemm_execution_t execution);
 const char* apxinf_gemm_summary(apxinf_gemm_execution_t execution);
 

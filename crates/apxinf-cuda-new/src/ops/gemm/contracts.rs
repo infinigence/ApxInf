@@ -205,6 +205,8 @@ impl<'a> GemmArgs<'a> {
 
     /// Assert that `b` is immutable for the lifetime of prepared executions
     /// created from these arguments and attach its caller-managed version.
+    /// This does not permit packing in place; use `with_repacked_weight` to opt
+    /// into implementations requiring a prepared physical weight layout.
     pub fn with_immutable_weight(mut self, version: WeightVersion) -> Self {
         self.weight_version = Some(version);
         self
@@ -735,10 +737,16 @@ fn normalize_fused<'a>(
             accumulation_dtype: dtype(args.policy.accumulation_dtype)?,
             output_dtype: dtype(args.out.dtype())?,
             quantization,
-            b_layout: match args.weight_layout {
-                GemmWeightLayout::Kn => 0,
-                GemmWeightLayout::OutputMajor => 1,
-                GemmWeightLayout::GateUpPairs { .. } => 2,
+            b_layout: if args.repacked_weight.is_some() {
+                // Model-owned state starts canonical and is committed in place
+                // during the first preparation.
+                0
+            } else {
+                match args.weight_layout {
+                    GemmWeightLayout::Kn => 0,
+                    GemmWeightLayout::OutputMajor => 1,
+                    GemmWeightLayout::GateUpPairs { .. } => 2,
+                }
             },
             numerics: match args.policy.numerics {
                 GemmNumerics::Default => 0,

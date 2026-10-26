@@ -27,6 +27,9 @@ typedef enum {
   /* Canonical B whose inline packing is disabled; the caller owns the
      physical layout and no candidate declares this layout. */
   APXINF_GEMM_LAYOUT_CANONICAL = 4,
+  /* Returned to the model only after a failed in-place writeback; not a valid
+     Spec layout. */
+  APXINF_GEMM_LAYOUT_INVALID = 5,
 } apxinf_gemm_layout_t;
 
 typedef enum {
@@ -73,7 +76,8 @@ typedef struct {
   /* Provider-neutral numerical constraint. LEGACY_CUBLAS preserves the
      established BF16 reduction path while dispatch remains inside GEMM. */
   uint32_t numerics;
-  /* Changes whether candidate preparation may hoist weight preprocessing. */
+  /* Changes whether candidate preparation may hoist weight preprocessing.
+     In-place weight preparation requires immutable B after preparation. */
   uint32_t b_is_immutable;
   /* Largest guaranteed power-of-two byte alignment, capped at 256. */
   uint32_t a_alignment;
@@ -107,7 +111,7 @@ typedef apxinf_tuning_policy_t apxinf_gemm_policy_t;
 typedef struct {
   const void* a;
   const void* b;
-  /* A prepared-weight identity is (b allocation address, b_version). */
+  /* Canonical callers may version their B allocation for execution caching. */
   uint64_t b_version;
   uint32_t b_is_immutable;
   const void* bias;
