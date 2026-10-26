@@ -108,11 +108,44 @@ impl Drop for Execution {
 
 pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Execution>> {
     let Normalized {
-        spec,
+        mut spec,
         policy: options,
         bindings,
         storage,
+        repacked_weight,
     } = normalized;
+    let mut weight_guard = repacked_weight
+        .as_ref()
+        .map(|weight| {
+            weight
+                .state
+                .lock()
+                .map_err(|_| invalid("weight state lock poisoned"))
+        })
+        .transpose()?;
+    if let Some(weight) = weight_guard.as_ref() {
+        if bindings.b_is_immutable == 0 {
+            return Err(invalid("repacked weights must be immutable after preparation"));
+        }
+        if weight.poisoned {
+            return Err(invalid("weight layout commit failed; reload the model"));
+        }
+        if weight.buffer.ptr().cast_const() != bindings.b
+            || weight.buffer.device() != ctx.device_id()
+        {
+            return Err(invalid(
+                "weight layout state belongs to a different allocation",
+            ));
+        }
+        if weight.shape != [spec.k as usize, spec.n as usize]
+            || super::contracts::dtype(weight.dtype)? != spec.b_dtype
+        {
+            return Err(invalid(
+                "weight layout state has different geometry or dtype",
+            ));
+        }
+        spec.b_layout = weight.layout;
+    }
     let key = ExecutionKey::new(ctx, spec, bindings, &options);
     if let Some(execution) = crate::workspace::lookup_execution(&key) {
         crate::workspace::use_execution(&execution)?;
@@ -153,6 +186,21 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
     if raw.is_null() {
         return Err(invalid("native GEMM prepare returned a null execution"));
     }
+    if let Some(weight) = weight_guard.as_mut() {
+        if weight.layout == 0 {
+            // A failed writeback may have changed bytes. Never retry them as canonical.
+            weight.poisoned = true;
+            let result =
+                unsafe { status::check(abi::apxinf_gemm_commit_weight(raw, &mut weight.layout)) };
+            if let Err(error) = result {
+                unsafe { abi::apxinf_gemm_destroy(raw) };
+                return Err(error);
+            }
+            weight.poisoned = false;
+            spec.b_layout = weight.layout;
+        }
+    }
+    let key = ExecutionKey::new(ctx, spec, bindings, &options);
     #[cfg(test)]
     let summary = unsafe { CStr::from_ptr(abi::apxinf_gemm_summary(raw)) }
         .to_string_lossy()

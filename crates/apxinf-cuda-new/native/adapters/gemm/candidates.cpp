@@ -287,6 +287,23 @@ bool supports_cutlass_bf16_geglu_sm89(const Spec& spec) {
 
 }  // namespace
 
+uint32_t weight_layout(const Implementation& implementation) {
+  if (implementation.provider_id != 3) return 4;
+  switch (implementation.implementation_id) {
+    case 2: case 3: return 2;
+    case 4: return 3;
+    case 6: return 1;
+    default: return 4;
+  }
+}
+
+bool supports_weight_layout(const Implementation& implementation, const Spec& spec) {
+  if (spec.b_layout == 0) return true;
+  // cuBLAS is the layout-aware baseline for shape/semantic changes.
+  if (implementation.provider_id == 1) return true;
+  return weight_layout(implementation) == spec.b_layout;
+}
+
 bool supports_device(const Implementation& implementation,
                      int device,
                      std::string* reason) {
@@ -494,7 +511,7 @@ std::unique_ptr<Execution> prepare(
                   "candidate is incompatible with this device: " +
                       device_reason);
   }
-  if (!implementation.supports(spec)) {
+  if (!implementation.supports(spec) || !supports_weight_layout(implementation, spec)) {
     throw Failure(APXINF_STATUS_UNSUPPORTED, "candidate contract mismatch");
   }
   if (!supports_alignment(implementation, spec)) {

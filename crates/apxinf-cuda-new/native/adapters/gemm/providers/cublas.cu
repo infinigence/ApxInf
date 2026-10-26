@@ -38,6 +38,10 @@ bool needs_safe_dequantization(const Spec& spec) {
 
 Spec cublas_compute_spec(const Spec& spec) {
   Spec compute = spec;
+  // FP8 unpack and INT8 dequantization restore canonical logical columns.
+  if (spec.a_dtype == APXINF_DTYPE_E4M3 || needs_safe_dequantization(spec)) {
+    compute.b_layout = 0;
+  }
   if (needs_safe_dequantization(spec)) {
     // Some devices accept an INT8 cuBLAS plan but reject this row/channel
     // scaled W8A8 combination at enqueue. BF16 is the portable cuBLAS
@@ -105,7 +109,7 @@ cudaError_t launch_cublas(Execution& state) {
         true, stream));
     check_cuda(apxinf::cuda_new::custom::dequantize_i8_gemm(
         weight, resources.dequant_b, bindings.b_scales, spec.k, spec.n, false,
-        stream));
+        stream, spec.b_layout));
     activation = resources.dequant_a;
     weight = resources.dequant_b;
   } else if (resources.common.unpack_a != nullptr) {
@@ -116,7 +120,7 @@ cudaError_t launch_cublas(Execution& state) {
     check_cuda(apxinf::cuda_new::custom::unpack_gemm(
         weight, resources.common.unpack_b,
         resources.common.projection_dtype, compute_spec.b_dtype, compute_spec.k,
-        compute_spec.n, APXINF_GEMM_LAYOUT_KN, stream));
+        compute_spec.n, spec.b_layout, stream));
     activation = resources.common.unpack_a;
     weight = resources.common.unpack_b;
   }

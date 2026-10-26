@@ -41,7 +41,7 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Inputs | `A=[M,K]`, `B=[K,N]`; supports `None`, `Fp8UnitScale`, `Fp8`, `W8A8`, and `Nvfp4` (whose operands are stored `A=[M,K/2]`, `B=[N,K/2]`) |
 | Output | `Y=[M,N]` |
 | Mathematical semantic | `Y = alpha * projection(A,B) / output_scale` |
-| Constraints | W8A8 and NVFP4 output must be BF16; `WeightVersion` may declare immutable weights and allow prepare to cache an internal prepacked copy |
+| Constraints | W8A8 and NVFP4 output must be BF16; `RepackedWeight` commits a model-owned layout in place and reuses it across executions; legacy `WeightVersion` retains the canonical-input contract |
 | Reference test | `gemm_all_candidates_match_torch`, `nvfp4_all_candidates_match_reference` |
 
 <!-- l3-operator:gemm_bias -->

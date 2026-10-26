@@ -30,7 +30,7 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 }
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
-  if (spec.version != 6 ||
+  if (spec.version != 7 ||
       spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL ||
       spec.a_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.b_dtype > APXINF_DTYPE_E2M1_PAIR ||
@@ -40,8 +40,17 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
       spec.n <= 0 || spec.k <= 0 || spec.m > INT32_MAX ||
       spec.n > INT32_MAX || spec.k > INT32_MAX ||
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
-      spec.b_is_immutable > 1) {
+      spec.b_is_immutable > 1 || spec.b_layout > 4 ||
+      (spec.b_layout != 0 && spec.b_is_immutable == 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec");
+  }
+  if ((spec.b_layout == 1 && spec.b_dtype != APXINF_DTYPE_I8) ||
+      (spec.b_layout == 2 &&
+       (spec.n % 512 != 0 ||
+        (spec.b_dtype != APXINF_DTYPE_BF16 && spec.b_dtype != APXINF_DTYPE_E4M3))) ||
+      (spec.b_layout == 3 &&
+       (spec.n % 2 != 0 || spec.b_dtype != APXINF_DTYPE_BF16))) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid committed GEMM weight layout");
   }
   for (uint32_t alignment : {
            spec.a_alignment, spec.b_alignment, spec.bias_alignment,
@@ -225,7 +234,8 @@ const apxinf::gemm::Implementation* find_implementation(const Recipe& recipe,
         implementation.implementation_version ==
             recipe.implementation_version &&
         apxinf::gemm::supports_device(implementation, device) &&
-        implementation.supports(spec)) {
+        implementation.supports(spec) &&
+        apxinf::gemm::supports_weight_layout(implementation, spec)) {
       std::vector<int> configurations;
       implementation.enumerate_configs(spec, configurations);
       if (std::find(configurations.begin(), configurations.end(),
@@ -245,6 +255,7 @@ std::unique_ptr<Execution> fallback(
     if (!implementation.fallback ||
         !apxinf::gemm::supports_device(implementation, device) ||
         !implementation.supports(spec) ||
+        !apxinf::gemm::supports_weight_layout(implementation, spec) ||
         (policy.graph_safe && !implementation.graph_safe) ||
         (policy.deterministic && !implementation.deterministic)) {
       continue;
@@ -421,6 +432,20 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     *output = reinterpret_cast<apxinf_gemm_execution_t>(execution.release());
   });
 }
+extern "C" apxinf_status_t apxinf_gemm_commit_weight(
+    apxinf_gemm_execution_t handle, uint32_t* layout) {
+  return apxinf::gemm::abi_boundary([&] {
+    auto* execution = reinterpret_cast<Execution*>(handle);
+    if (execution == nullptr || layout == nullptr ||
+        execution->bindings.b_is_immutable == 0) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid weight commit");
+    }
+    apxinf::gemm::check_cuda(cudaSetDevice(execution->device));
+    const auto selected = apxinf::gemm::weight_layout(*execution->implementation);
+    *layout = selected == 4 ? 4 : apxinf::gemm::commit_cutlass_weight(*execution);
+  });
+}
+
 extern "C" apxinf_status_t apxinf_gemm_enqueue(
     apxinf_gemm_execution_t handle) {
   return apxinf::gemm::abi_boundary([&] {

@@ -58,7 +58,8 @@ bool fp8_f32_projection_forced() {
 }  // namespace
 
 uint32_t common_projection_dtype(const Spec& spec) {
-  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
+  if ((spec.b_layout == 0 || spec.b_layout == 4) &&
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
       spec.output_dtype == APXINF_DTYPE_E4M3) {
     return APXINF_DTYPE_F16;
@@ -128,6 +129,7 @@ void allocate_common_resources(const Spec& spec,
       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
       spec.output_scale_is_unit != 0;
   const bool needs_postprocess =
+      (spec.b_layout == 2 || spec.b_layout == 3) ||
       (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM && !native_bias) ||
       has_row_channel_scales(spec) ||
       spec.output_dtype != resources.projection_dtype ||
@@ -162,6 +164,7 @@ size_t common_resource_requirements(const Spec& spec, bool native_fp8) {
       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
       spec.output_scale_is_unit != 0;
   const bool needs_postprocess =
+      (spec.b_layout == 2 || spec.b_layout == 3) ||
       (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM && !native_bias) ||
       has_row_channel_scales(spec) || spec.output_dtype != projection_dtype ||
       spec.output_scale_is_unit == 0;
@@ -179,7 +182,8 @@ cudaError_t launch_postprocess(const Spec& spec,
   if (resources.projection == nullptr) {
     return cudaSuccess;
   }
-  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
+  if ((spec.b_layout == 0 || spec.b_layout == 4) &&
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
       resources.projection_dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3 && spec.n % 16 == 0 &&
       spec.m * (spec.n / 16) <= INT32_MAX &&
@@ -195,7 +199,8 @@ cudaError_t launch_postprocess(const Spec& spec,
         1.0F / bindings.output_scale);
     return cudaGetLastError();
   }
-  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
+  if ((spec.b_layout == 0 || spec.b_layout == 4) &&
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
       spec.quantization == APXINF_GEMM_QUANT_NONE &&
       resources.projection_dtype == APXINF_DTYPE_BF16 &&
       spec.output_dtype == APXINF_DTYPE_BF16 && spec.alpha_is_unit != 0 &&
@@ -228,7 +233,7 @@ cudaError_t launch_postprocess(const Spec& spec,
       static_cast<int>(spec.semantic),
       has_row_channel_scales(spec) ? 1 : 0,
       has_row_channel_scales(spec) ? bindings.alpha : 1.0F,
-      bindings.output_scale);
+      bindings.output_scale, spec.b_layout);
   return cudaGetLastError();
 }
 

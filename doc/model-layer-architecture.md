@@ -113,6 +113,23 @@ selects a policy; that policy calls the binding, which invokes Rust `AutoModel`.
 Reuse these entry points for a new family instead of adding a factory/runner
 wrapper merely to reproduce the names in this table.
 
+### Repacked GEMM weight ownership
+
+PI0.5 device linear weights retain cuda-new `RepackedWeight` layout state next
+to their allocation. First GEMM preparation tunes against canonical bytes, then
+commits the selected equal-size packing back to the original address. Temporary
+packing storage is released before the execution is published. Canonical choices
+are committed too: later shapes cannot change a layout that an existing graph
+reads. Every consumer of a repackable allocation must use the same state.
+
+Layout participates in recipe and execution keys. Subsequent executions borrow
+the committed allocation; the cuBLAS baseline interprets its layout when an
+optimized implementation does not support a new shape. A failed commit poisons
+the state and requires reloading the weight. Weight replacement requires retiring
+its readers and constructing new storage/state, rather than incrementing an
+Execution-local version over changed bytes. This change does not introduce a
+model-wide weight arena or alter activation workspace ownership.
+
 ### Dependency direction within a family
 
 ```text

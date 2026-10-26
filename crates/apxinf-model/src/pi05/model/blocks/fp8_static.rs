@@ -79,7 +79,7 @@ fn fp8_gemm(
     }
     let mut out = output(ctx, vec![dims[0], weight_dims[1]], DType::F16)?;
     let mut args = ops::GemmArgs::new(input, &weights.weight, &mut out)
-        .with_immutable_weight(ops::WeightVersion::new(1));
+        .with_repacked_weight(&weights.layout);
     args.quantization = ops::GemmQuantization::Fp8UnitScale;
     args.alpha = input_scale * weights.weight_scale;
     args.policy = policies.gemm.clone();
@@ -102,7 +102,7 @@ fn fp8_gemm_bias(
     let weight_dims = weights.weight.shape().dims();
     let mut out = output(ctx, vec![dims[0], weight_dims[1]], DType::F16)?;
     let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
-        .with_immutable_weight(ops::WeightVersion::new(1));
+        .with_repacked_weight(&weights.layout);
     gemm.quantization = ops::GemmQuantization::Fp8UnitScale;
     gemm.alpha = input_scale * weights.weight_scale;
     gemm.policy = policies.gemm.clone();
@@ -129,7 +129,7 @@ fn fp8_gemm_bias_gelu_quant(
     }
     let mut out = output(ctx, vec![dims[0], weight_dims[1]], DType::F8E4M3)?;
     let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
-        .with_immutable_weight(ops::WeightVersion::new(1));
+        .with_repacked_weight(&weights.layout);
     gemm.quantization = ops::GemmQuantization::Fp8UnitScale;
     gemm.alpha = input_scale * weights.weight_scale;
     gemm.output_scale = output_scale;
@@ -155,7 +155,7 @@ fn fp8_gemm_bias_residual(
     }
     let mut out = output(ctx, vec![dims[0], weight_dims[1]], DType::F16)?;
     let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
-        .with_immutable_weight(ops::WeightVersion::new(1));
+        .with_repacked_weight(&weights.layout);
     gemm.quantization = ops::GemmQuantization::Fp8UnitScale;
     gemm.alpha = input_scale * weights.weight_scale;
     gemm.policy = policies.gemm.clone();
@@ -189,7 +189,7 @@ fn fp8_gemm_geglu(
     if fused_shape {
         let mut out = output(ctx, vec![dims[0], weight_dims[1] / 2], DType::F8E4M3)?;
         let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
-            .with_immutable_weight(ops::WeightVersion::new(1));
+            .with_repacked_weight(&weights.layout);
         gemm.quantization = ops::GemmQuantization::Fp8UnitScale;
         gemm.alpha = input_scale * weights.weight_scale;
         gemm.output_scale = output_scale;

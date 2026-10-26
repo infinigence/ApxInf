@@ -43,7 +43,7 @@ class GemmTuningProblem {
       reason = "device";
       return false;
     }
-    if (!implementation.supports(spec_)) {
+    if (!implementation.supports(spec_) || !supports_weight_layout(implementation, spec_)) {
       reason = "contract";
       return false;
     }

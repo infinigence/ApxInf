@@ -12,7 +12,7 @@ use crate::pi05::backend::{
         AdaptiveRmsNormArgs, BiasResidualArgs, BiasResidualLayerNormArgs,
         BiasResidualRmsNormArgs, GatherPatchGeometry, GatherSemantic, GemmArgs, GemmGegluArgs,
         LayerNormArgs, PointwiseActivation, PointwiseArgs, PointwiseSemantic, RmsNormArgs,
-        RopeArgs, RopeSemantic, WeightVersion,
+        RopeArgs, RopeSemantic,
     },
     Context, DeviceBuffer as CudaBuffer,
 };
@@ -164,8 +164,9 @@ fn gemm_geglu_bf16(
     ctx: &Context,
     policies: &L3Policies,
     activation: &Tensor,
-    canonical_weight: &Tensor,
+    weights: &Bf16LinearWeights,
 ) -> Result<Tensor> {
+    let canonical_weight = &weights.weight;
     let a = activation.shape().dims();
     let b = canonical_weight.shape().dims();
     if activation.dtype() != DType::BF16
@@ -187,7 +188,7 @@ fn gemm_geglu_bf16(
     )?;
     let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1] / 2]), DType::BF16)?;
     let mut gemm = GemmArgs::new(activation, canonical_weight, &mut output)
-        .with_immutable_weight(WeightVersion::new(1));
+        .with_repacked_weight(&weights.layout);
     gemm.policy = policies.gemm.clone();
     l3_gemm_geglu(ctx, GemmGegluArgs { gemm })?;
     Ok(output)
@@ -595,7 +596,7 @@ fn language_layer_bf16_with_policies(
         &weights.post_attention_norm_scale,
         rms_eps,
     )?;
-    let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up.weight)?;
+    let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up)?;
     let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
     let hidden =
         bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
@@ -696,7 +697,7 @@ fn action_layer_bf16_with_policies(
         mlp_modulation,
         rms_eps,
     )?;
-    let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up.weight)?;
+    let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up)?;
     let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
     let fused = adaptive_gate_residual_rms_bf16(
         ctx,

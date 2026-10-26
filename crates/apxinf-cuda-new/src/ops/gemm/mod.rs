@@ -6,6 +6,8 @@ pub(crate) mod gemm_execution;
 mod gemm_geglu;
 mod gemm_gelu;
 mod nvfp4_scales;
+mod weight;
+pub use weight::RepackedWeight;
 
 pub use contracts::{GemmArgs, GemmPolicy, GemmQuantization, WeightVersion};
 pub use gemm::gemm;

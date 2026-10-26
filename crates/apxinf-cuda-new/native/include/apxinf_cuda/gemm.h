@@ -14,6 +14,8 @@ apxinf_status_t apxinf_gemm_prepare(
     const apxinf_gemm_bindings_t* bindings,
     apxinf_gemm_execution_t* execution);
 apxinf_status_t apxinf_gemm_enqueue(apxinf_gemm_execution_t execution);
+apxinf_status_t apxinf_gemm_commit_weight(apxinf_gemm_execution_t execution,
+                                        uint32_t* layout);
 void apxinf_gemm_destroy(apxinf_gemm_execution_t execution);
 const char* apxinf_gemm_summary(apxinf_gemm_execution_t execution);
 

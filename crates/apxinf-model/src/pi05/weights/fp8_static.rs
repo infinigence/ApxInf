@@ -10,8 +10,9 @@ mod linear {
 
     #[derive(Debug)]
     pub struct Fp8StaticLinearWeights {
-        /// `[input, output]` CUDA E4M3 matrix.
+        /// Logical `[input, output]` E4M3 matrix; `layout` tracks physical packing.
         pub weight: Tensor,
+        pub layout: crate::pi05::backend::ops::RepackedWeight,
         pub weight_scale: f32,
         /// Bias stays FP16 and is fused into the consumer kernel.
         pub bias: Option<Tensor>,
@@ -44,6 +45,7 @@ mod linear {
                 .map(|bias| backend::to_device(context, bias))
                 .transpose()?;
             Ok(Self {
+                layout: crate::pi05::backend::ops::RepackedWeight::new(&weight)?,
                 weight,
                 weight_scale,
                 bias,

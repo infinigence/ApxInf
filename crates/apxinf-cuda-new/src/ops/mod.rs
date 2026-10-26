@@ -49,7 +49,7 @@ pub use gemm::{
     nvfp4_pack_block_scales, nvfp4_quantize_activation, nvfp4_quantize_rms_norm,
     nvfp4_quantize_swiglu, nvfp4_scale_buffer_bytes, GemmArgs, GemmBiasArgs,
     GemmBiasGeluArgs, GemmBiasResidualArgs, GemmGegluArgs, GemmPolicy, GemmQuantization,
-    ScaleLayout, WeightVersion,
+    ScaleLayout, WeightVersion, RepackedWeight,
 };
 pub use mlp::{add_into, fp8_gemv, nvfp4_gemv, quantize_fp8_per_tensor, swiglu};
 pub use model::{argmax, embedding_gather, vision_position, VisionPositionArgs};

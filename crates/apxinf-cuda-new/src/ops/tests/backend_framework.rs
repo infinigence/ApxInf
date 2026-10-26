@@ -471,8 +471,12 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // A spread of finite E4M3 codes. Constant operands would hide an indexing
     // fault, because every element of the result would be identical.
     const CODES: [u8; 8] = [0x38, 0x3c, 0x34, 0x40, 0xb8, 0x30, 0x44, 0xbc];
-    let a_codes: Vec<u8> = (0..m * k).map(|i| CODES[(i * 7 + 1) % CODES.len()]).collect();
-    let b_codes: Vec<u8> = (0..k * n).map(|i| CODES[(i * 5 + 3) % CODES.len()]).collect();
+    let a_codes: Vec<u8> = (0..m * k)
+        .map(|i| CODES[(i * 7 + 1) % CODES.len()])
+        .collect();
+    let b_codes: Vec<u8> = (0..k * n)
+        .map(|i| CODES[(i * 5 + 3) % CODES.len()])
+        .collect();
     let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &a_codes);
     let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &b_codes);
     let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
@@ -484,8 +488,8 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
         for column in 0..n {
             let mut accumulator = 0.0f32;
             for index in 0..k {
-                accumulator += e4m3_value(a_codes[row * k + index])
-                    * e4m3_value(b_codes[index * n + column]);
+                accumulator +=
+                    e4m3_value(a_codes[row * k + index]) * e4m3_value(b_codes[index * n + column]);
             }
             expected[row * n + column] = accumulator * alpha;
         }
@@ -493,7 +497,10 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // Guard the magnitude as well as the direction: a candidate that is the
     // right shape and the wrong scale scores near-perfect cosine.
     let peak = expected.iter().fold(0.0f32, |best, v| best.max(v.abs()));
-    assert!(peak > 0.1 && peak < 1.0e4, "degenerate reference peak {peak}");
+    assert!(
+        peak > 0.1 && peak < 1.0e4,
+        "degenerate reference peak {peak}"
+    );
 
     let mut args = GemmArgs::new(&a, &b, &mut out);
     args.quantization = GemmQuantization::Fp8UnitScale;
@@ -526,7 +533,10 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     eprintln!("GPU_BF16_FP8_RELATIVE_L2 {relative_l2:.6}");
     // BF16 carries 8 mantissa bits, so a correct kernel lands near 1e-3. The
     // bound is deliberately far above that and far below any real fault.
-    assert!(relative_l2 < 0.01, "winner drifted by relative L2 {relative_l2}");
+    assert!(
+        relative_l2 < 0.01,
+        "winner drifted by relative L2 {relative_l2}"
+    );
 }
 
 #[test]
@@ -1492,5 +1502,235 @@ fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
     assert_eq!(mutable.weight_prepack_count(), 1);
 
     drop(mutable);
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
+    let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 87 {
+        eprintln!("W8A8 inplace lifecycle regression requires SM87");
+        return;
+    }
+    let (k, n) = (64, 128);
+    let source = (0..k * n)
+        .map(|i| ((i / n + 3 * (i % n)) % 7) as u8)
+        .collect::<Vec<_>>();
+    let b = bytes_tensor(0, vec![k, n], DType::I8, &source);
+    let layout = crate::ops::RepackedWeight::new(&b).unwrap();
+    let channels = scales(0, &vec![1.0; n]);
+    let cache_dir = scratch_cache_dir("inplace-weight-lifecycle");
+    let mut retained_graph = None;
+    let mut retained_output = None;
+    for (run, m) in [8, 17, 8].into_iter().enumerate() {
+        let mut input = vec![0; m * k];
+        for row in 0..m {
+            input[row * k + row % k] = 1;
+        }
+        let a = bytes_tensor(0, vec![m, k], DType::I8, &input);
+        let rows = scales(0, &vec![1.0; m]);
+        let mut output = zeros_tensor(0, vec![m, n], DType::BF16);
+        let mut args =
+            GemmArgs::w8a8(&a, &rows, &b, &channels, &mut output).with_repacked_weight(&layout);
+        args.policy.online_tune = false;
+        args.policy.allow_fallback = false;
+        args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        let mut normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        normalized.spec.b_layout = layout.state.lock().unwrap().layout;
+        super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        assert_eq!(execution.weight_prepack_count(), u64::from(run == 0));
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        for (index, actual) in values(&output).into_iter().enumerate() {
+            assert_eq!(actual, source[(index / n) % k * n + index % n] as f32);
+        }
+        if run == 0 {
+            let mut packed = vec![0; k * n];
+            CudaBuffer::from_tensor(&b)
+                .unwrap()
+                .copy_to_host(&mut packed)
+                .unwrap();
+            for row in 0..k {
+                for col in 0..n {
+                    assert_eq!(packed[col * k + row], source[row * n + col]);
+                }
+            }
+            retained_graph = Some(crate::capture(&ctx, || execution.enqueue()).unwrap());
+            retained_output = Some(output);
+        }
+        // No session or execution cache remains for the next set of IO.
+    }
+    retained_graph.as_ref().unwrap().replay().unwrap();
+    ctx.synchronize().unwrap();
+    for (index, actual) in values(retained_output.as_ref().unwrap())
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(actual, source[(index / n) % k * n + index % n] as f32);
+    }
+    // A shape/semantic change may use the layout-aware portable baseline.
+    let a = bytes_tensor(0, vec![1, k], DType::I8, &vec![1; k]);
+    let rows = scales(0, &[1.0]);
+    let mut output = zeros_tensor(0, vec![1, n], DType::BF16);
+    let mut args =
+        GemmArgs::w8a8(&a, &rows, &b, &channels, &mut output).with_repacked_weight(&layout);
+    args.policy.online_tune = false;
+    args.policy.cache_dir = Some(String::new());
+    crate::ops::gemm(&ctx, args).unwrap();
+    for (col, actual) in values(&output).into_iter().enumerate() {
+        let sum = (0..k).map(|row| source[row * n + col] as f32).sum::<f32>();
+        assert_eq!(actual, bf16::from_f32(sum).to_f32());
+    }
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn gpu_repacked_geglu_preserves_old_graph_and_generic_shape() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n, implementation, version) = match ctx.caps().sm {
+        89 => (10, 1024, 8192, 4, 1),
+        100 | 101 | 110 => (522, 2048, 32768, 3, 2),
+        _ => {
+            eprintln!("GeGLU packing regression requires SM89 or SM100-family");
+            return;
+        }
+    };
+    let b_data = (0..k * n)
+        .map(|i| ((i / n + 3 * (i % n)) % 17) as f32 / 16.0 - 0.5)
+        .collect::<Vec<_>>();
+    let bytes = b_data
+        .iter()
+        .flat_map(|&v| bf16::from_f32(v).to_bits().to_ne_bytes())
+        .collect::<Vec<_>>();
+    let b = bytes_tensor(0, vec![k, n], DType::BF16, &bytes);
+    let layout = crate::ops::RepackedWeight::new(&b).unwrap();
+    let cache_dir = scratch_cache_dir("inplace-geglu-lifecycle");
+    let mut graph = None;
+    let mut graph_output = None;
+    for (run, rows) in [m, 1, m].into_iter().enumerate() {
+        let mut input = vec![bf16::ZERO; rows * k];
+        for row in 0..rows {
+            input[row * k + row % k] = bf16::ONE;
+        }
+        let input_bytes = input
+            .iter()
+            .flat_map(|v| v.to_bits().to_ne_bytes())
+            .collect::<Vec<_>>();
+        let a = bytes_tensor(0, vec![rows, k], DType::BF16, &input_bytes);
+        let mut out = zeros_tensor(0, vec![rows, n / 2], DType::BF16);
+        let mut args = GemmArgs::new(&a, &b, &mut out).with_repacked_weight(&layout);
+        args.policy.online_tune = false;
+        args.policy.allow_fallback = rows == 1;
+        args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        let mut normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::GemmGeglu, None)
+                .unwrap();
+        normalized.spec.b_layout = layout.state.lock().unwrap().layout;
+        if rows != 1 {
+            super::execution::seed_recipe(&ctx, &normalized, 3, implementation, version, 0)
+                .unwrap();
+        }
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        assert_eq!(execution.weight_prepack_count(), u64::from(run == 0));
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        let check = |out: &Tensor| {
+            for (i, actual) in values(out).into_iter().enumerate() {
+                let row = i / (n / 2);
+                let col = i % (n / 2);
+                let gate = b_data[(row % k) * n + col];
+                let up = b_data[(row % k) * n + col + n / 2];
+                let expected = 0.5
+                    * gate
+                    * (1.0 + (0.7978845608 * (gate + 0.044715 * gate.powi(3))).tanh())
+                    * up;
+                assert!(
+                    (actual - expected).abs() < 0.003,
+                    "{i}: {actual} vs {expected}"
+                );
+            }
+        };
+        check(&out);
+        if run == 0 {
+            graph = Some(crate::capture(&ctx, || execution.enqueue()).unwrap());
+            graph_output = Some(out);
+        } else {
+            graph.as_ref().unwrap().replay().unwrap();
+            ctx.synchronize().unwrap();
+            check(graph_output.as_ref().unwrap());
+        }
+    }
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn gpu_repacked_fp8_crosses_geglu_and_plain_gemm() {
+    let ctx = CudaContext::new(0).unwrap();
+    if !matches!(ctx.caps().sm, 100 | 101 | 110) {
+        eprintln!("FP8 packing regression requires SM100-family");
+        return;
+    }
+    let (k, n) = (2048, 32768);
+    let codes = [0x20, 0x28, 0x30, 0x38];
+    let bytes = (0..k * n)
+        .map(|i| {
+            let (r, c) = (i / n, i % n);
+            codes[(r + c / 128 + c + usize::from(c >= n / 2)) % codes.len()]
+        })
+        .collect::<Vec<_>>();
+    let canonical = bytes_tensor(0, vec![k, n], DType::F8E4M3, &bytes);
+    let committed = bytes_tensor(0, vec![k, n], DType::F8E4M3, &bytes);
+    let layout = crate::ops::RepackedWeight::new(&committed).unwrap();
+    let cache_dir = scratch_cache_dir("inplace-fp8-cross-semantic");
+    for m in [522, 1, 522] {
+        let fused = m != 1;
+        let mut a_bytes = vec![0; m * k];
+        for row in 0..m {
+            a_bytes[row * k + row % k] = 0x38;
+        }
+        let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &a_bytes);
+        let dtype = if fused { DType::F8E4M3 } else { DType::F16 };
+        let width = if fused { n / 2 } else { n };
+        let mut expected = zeros_tensor(0, vec![m, width], dtype);
+        let mut actual = zeros_tensor(0, vec![m, width], dtype);
+        for (b, out, state) in [
+            (&canonical, &mut expected, None),
+            (&committed, &mut actual, Some(&layout)),
+        ] {
+            let mut args = GemmArgs::new(&a, b, out).with_immutable_weight(WeightVersion::new(0));
+            if let Some(state) = state {
+                args = args.with_repacked_weight(state);
+            }
+            args.quantization = GemmQuantization::Fp8UnitScale;
+            args.policy.online_tune = false;
+            args.policy.allow_fallback = !fused;
+            args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+            let semantic = if fused {
+                super::contracts::Semantic::GemmGeglu
+            } else {
+                super::contracts::Semantic::Gemm
+            };
+            let mut normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
+            if let Some(state) = state {
+                normalized.spec.b_layout = state.state.lock().unwrap().layout;
+            }
+            if fused {
+                super::execution::seed_recipe(&ctx, &normalized, 3, 2, 2, 0).unwrap();
+            }
+            let execution = super::execution::prepare(&ctx, normalized).unwrap();
+            execution.enqueue().unwrap();
+        }
+        ctx.synchronize().unwrap();
+        let read = |tensor: &Tensor| {
+            let buffer = CudaBuffer::from_tensor(tensor).unwrap();
+            let mut bytes = vec![0; buffer.len()];
+            buffer.copy_to_host(&mut bytes).unwrap();
+            bytes
+        };
+        assert_eq!(read(&actual), read(&expected), "M={m}");
+    }
     std::fs::remove_dir_all(cache_dir).unwrap();
 }

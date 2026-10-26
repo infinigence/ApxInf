@@ -14,6 +14,7 @@ pub(crate) struct Spec {
     pub output_dtype: u32,
     pub quantization: u32,
     pub b_is_immutable: u32,
+    pub b_layout: u32,
     pub a_alignment: u32,
     pub b_alignment: u32,
     pub bias_alignment: u32,
@@ -63,6 +64,7 @@ unsafe extern "C" {
         execution: *mut Execution,
     ) -> i32;
     pub(crate) fn apxinf_gemm_enqueue(execution: Execution) -> i32;
+    pub(crate) fn apxinf_gemm_commit_weight(execution: Execution, layout: *mut u32) -> i32;
     pub(crate) fn apxinf_gemm_destroy(execution: Execution);
     pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(
         rows: i64,

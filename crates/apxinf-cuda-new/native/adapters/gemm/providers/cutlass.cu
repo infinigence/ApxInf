@@ -20,6 +20,7 @@ struct CutlassGegluState {
 #ifdef APXINF_GEMM_CUTLASS
   apxinf::cuda_new::cutlass_ops::Nvfp4GemmExecution* nvfp4_execution = nullptr;
 #endif
+  bool owns_packed_weight = true;
   void* packed_weight = nullptr;
   size_t packed_weight_bytes = 0;
   const void* packed_weight_source = nullptr;
@@ -36,7 +37,7 @@ struct CutlassGegluState {
     }
     nvfp4_execution = nullptr;
 #endif
-    if (packed_weight != nullptr) cudaFree(packed_weight);
+    if (owns_packed_weight && packed_weight != nullptr) cudaFree(packed_weight);
     packed_weight = nullptr;
     packed_weight_source = nullptr;
     packed_weight_version = 0;
@@ -122,6 +123,19 @@ void pack_w8a8_weight(Execution& state,
 }
 #endif
 
+bool bind_committed_weight(Execution& state) {
+  if (state.spec.b_layout == 0) return false;
+  auto resources = std::make_unique<CutlassGegluState>();
+  resources->owns_packed_weight = false;
+  resources->packed_weight = const_cast<void*>(state.bindings.b);
+  resources->packed_weight_source = state.bindings.b;
+  resources->packed_weight_version = state.bindings.b_version;
+  resources->packed_weight_ready = true;
+  state.provider_state = resources.release();
+  state.resource_bytes = 0;
+  return true;
+}
+
 void check_cutlass_status(int status) {
   if (status != 0) {
     throw Failure(APXINF_STATUS_PROVIDER_ERROR,
@@ -134,16 +148,19 @@ void check_cutlass_status(int status) {
 size_t cutlass_fp8_resource_requirements(const Spec&) { return 0; }
 
 size_t cutlass_w8a8_resource_requirements(const Spec& spec) {
+  if (spec.b_layout != 0) return 0;
   return static_cast<size_t>(spec.k * spec.n) * dtype_bytes(spec.b_dtype);
 }
 
 size_t cutlass_geglu_resource_requirements(const Spec& spec) {
+  if (spec.b_layout != 0) return 0;
   return static_cast<size_t>(spec.k * spec.n) * dtype_bytes(spec.b_dtype);
 }
 
 void prepare_cutlass_fp8_gemm(Execution&) {}
 
 void prepare_cutlass_w8a8(Execution& state) {
+  if (bind_committed_weight(state)) return;
 #ifdef APXINF_GEMM_CUTLASS_SM87_W8A8
   auto owned_resources = std::make_unique<CutlassGegluState>();
   owned_resources->packed_weight_bytes =
@@ -168,6 +185,7 @@ void prepare_cutlass_w8a8(Execution& state) {
 }
 
 void prepare_cutlass_geglu(Execution& state) {
+  if (bind_committed_weight(state)) return;
   auto owned_resources = std::make_unique<CutlassGegluState>();
   owned_resources->packed_weight_bytes =
       state.spec.k * state.spec.n * dtype_bytes(state.spec.b_dtype);
@@ -193,6 +211,7 @@ void prepare_cutlass_geglu(Execution& state) {
 }
 
 void prepare_cutlass_geglu_sm89(Execution& state) {
+  if (bind_committed_weight(state)) return;
 #ifdef APXINF_GEMM_CUTLASS_SM89
   auto owned_resources = std::make_unique<CutlassGegluState>();
   owned_resources->packed_weight_bytes =
@@ -211,6 +230,25 @@ void prepare_cutlass_geglu_sm89(Execution& state) {
 #else
   (void)state;
 #endif
+}
+
+uint32_t commit_cutlass_weight(Execution& state) {
+  auto& resources = provider(state);
+  const auto layout = weight_layout(*state.implementation);
+  if (!resources.packed_weight_ready || !resources.owns_packed_weight) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "weight is not a commit candidate");
+  }
+  const auto stream = static_cast<cudaStream_t>(state.bindings.stream);
+  check_cuda(cudaMemcpyAsync(const_cast<void*>(state.bindings.b),
+                            resources.packed_weight, resources.packed_weight_bytes,
+                            cudaMemcpyDeviceToDevice, stream));
+  check_cuda(cudaStreamSynchronize(stream));
+  check_cuda(cudaFree(resources.packed_weight));
+  resources.packed_weight = const_cast<void*>(state.bindings.b);
+  resources.owns_packed_weight = false;
+  resources.packed_weight_bytes = 0;
+  state.resource_bytes = 0;
+  return layout;
 }
 
 void destroy_cutlass(Execution& state) noexcept {

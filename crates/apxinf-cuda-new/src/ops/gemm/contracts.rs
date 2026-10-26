@@ -70,6 +70,7 @@ pub struct GemmArgs<'a> {
     /// identity: both the tensor address and this version identify a prepared
     /// weight.
     pub weight_version: Option<WeightVersion>,
+    pub repacked_weight: Option<&'a super::RepackedWeight>,
 }
 
 /// Quantization contract for the operands supplied to one GEMM call.
@@ -127,6 +128,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            repacked_weight: None,
         }
     }
 
@@ -149,6 +151,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            repacked_weight: None,
         }
     }
 
@@ -175,6 +178,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy,
             weight_version: None,
+            repacked_weight: None,
         }
     }
 
@@ -182,6 +186,13 @@ impl<'a> GemmArgs<'a> {
     /// created from these arguments and attach its caller-managed version.
     pub fn with_immutable_weight(mut self, version: WeightVersion) -> Self {
         self.weight_version = Some(version);
+        self
+    }
+
+    /// Use model-owned layout state. All consumers of B must use this state.
+    pub fn with_repacked_weight(mut self, weight: &'a super::RepackedWeight) -> Self {
+        self.repacked_weight = Some(weight);
+        self.weight_version = Some(WeightVersion::new(0));
         self
     }
 
@@ -211,6 +222,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            repacked_weight: None,
         }
     }
 }
@@ -255,6 +267,7 @@ pub(crate) struct Normalized {
     pub policy: GemmPolicy,
     pub bindings: abi::Bindings,
     pub storage: Vec<CudaBuffer>,
+    pub repacked_weight: Option<super::RepackedWeight>,
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
@@ -637,7 +650,7 @@ fn normalize_fused<'a>(
 
     Ok(Normalized {
         spec: abi::Spec {
-            version: 6,
+            version: 7,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,
@@ -645,6 +658,7 @@ fn normalize_fused<'a>(
             output_dtype: dtype(args.out.dtype())?,
             quantization,
             b_is_immutable: bindings.b_is_immutable,
+            b_layout: 0,
             a_alignment: alignment_class(bindings.a),
             b_alignment: alignment_class(bindings.b),
             bias_alignment: alignment_class(bindings.bias),
@@ -663,6 +677,7 @@ fn normalize_fused<'a>(
             alpha_is_unit: u32::from(args.alpha == 1.0),
             output_scale_is_unit: u32::from(args.output_scale == 1.0),
         },
+        repacked_weight: args.repacked_weight.cloned(),
         policy: args.policy,
         bindings,
         storage,

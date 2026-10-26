@@ -55,6 +55,9 @@ typedef struct {
   uint32_t quantization;
   /* Changes whether candidate preparation may hoist weight preprocessing. */
   uint32_t b_is_immutable;
+  /* 0: canonical candidate input; 1: NK; 2: interleave-256;
+     3: adjacent interleave; 4: committed canonical. */
+  uint32_t b_layout;
   /* Largest guaranteed power-of-two byte alignment, capped at 256. */
   uint32_t a_alignment;
   uint32_t b_alignment;
