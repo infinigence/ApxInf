@@ -145,3 +145,13 @@ bitwise stable in both implementations. The DROID images are numerical input
 coverage for this LIBERO checkpoint, not a matched robot-policy evaluation.
 These results do not measure LIBERO task success, quantized CUDA equivalence,
 or production CPU latency.
+
+
+The CPU Python `AutoPolicy.from_pretrained` path was exercised with two fixed
+observations through preprocessing and normalized/returned action outputs.
+Provided-noise repeats, seeded inference repeats, invalid-RGB rejection and
+recovery passed. This checkpoint lacks statistics for some transforms, so the
+existing policy uses identity passthrough for them; this validates integration,
+not embodiment normalization accuracy. Linux OpenBLAS core/storage tests
+(33 tests) and the four regular CPU public-contract tests also passed. The
+CPU extension links OpenBLAS without CUDA or OpenMP runtime dependencies.
