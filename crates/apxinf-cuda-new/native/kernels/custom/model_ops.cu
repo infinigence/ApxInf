@@ -66,6 +66,67 @@ __global__ void argmax_kernel(const __nv_bfloat16* __restrict__ logits,
   }
 }
 
+__global__ void vision_position_kernel(
+    const __nv_bfloat16* __restrict__ table,
+    __nv_bfloat16* __restrict__ embeddings,
+    int32_t* __restrict__ position_ids, int source_side, int height, int width,
+    int hidden, int merge_size) {
+  const int token = static_cast<int>(blockIdx.x);
+  const int merge_area = merge_size * merge_size;
+  const int merged_index = token / merge_area;
+  const int inner_index = token % merge_area;
+  const int merged_width = width / merge_size;
+  const int row = (merged_index / merged_width) * merge_size +
+                  inner_index / merge_size;
+  const int column = (merged_index % merged_width) * merge_size +
+                     inner_index % merge_size;
+
+  if (threadIdx.x == 0) {
+    position_ids[2LL * token] = row;
+    position_ids[2LL * token + 1] = column;
+  }
+
+  const float row_position =
+      height > 1 ? static_cast<float>(row) * static_cast<float>(source_side - 1) /
+                       static_cast<float>(height - 1)
+                 : 0.0f;
+  const float column_position =
+      width > 1 ? static_cast<float>(column) *
+                          static_cast<float>(source_side - 1) /
+                      static_cast<float>(width - 1)
+                : 0.0f;
+  const int row0 = static_cast<int>(floorf(row_position));
+  const int column0 = static_cast<int>(floorf(column_position));
+  const int row1 = min(row0 + 1, source_side - 1);
+  const int column1 = min(column0 + 1, source_side - 1);
+  const float row_weight = row_position - static_cast<float>(row0);
+  const float column_weight = column_position - static_cast<float>(column0);
+  const float row_weight0 = 1.0f - row_weight;
+  const float column_weight0 = 1.0f - column_weight;
+
+  for (int channel = threadIdx.x; channel < hidden; channel += blockDim.x) {
+    const long long offset00 =
+        (static_cast<long long>(row0) * source_side + column0) * hidden +
+        channel;
+    const long long offset01 =
+        (static_cast<long long>(row0) * source_side + column1) * hidden +
+        channel;
+    const long long offset10 =
+        (static_cast<long long>(row1) * source_side + column0) * hidden +
+        channel;
+    const long long offset11 =
+        (static_cast<long long>(row1) * source_side + column1) * hidden +
+        channel;
+    const float value =
+        row_weight0 * column_weight0 * __bfloat162float(table[offset00]) +
+        row_weight0 * column_weight * __bfloat162float(table[offset01]) +
+        row_weight * column_weight0 * __bfloat162float(table[offset10]) +
+        row_weight * column_weight * __bfloat162float(table[offset11]);
+    embeddings[static_cast<long long>(token) * hidden + channel] =
+        __float2bfloat16(value);
+  }
+}
+
 }  // namespace
 
 int embedding_gather(const void* table, const int32_t* ids, void* output,
@@ -85,6 +146,18 @@ int argmax_bf16(const void* logits, int32_t* index, int count,
   if (count <= 0) return -1;
   argmax_kernel<<<1, 1024, 0, stream>>>(
       static_cast<const __nv_bfloat16*>(logits), index, count);
+  return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+int vision_position_bf16(const void* table, void* embeddings,
+                         int32_t* position_ids, int source_side, int height,
+                         int width, int hidden, int merge_size,
+                         cudaStream_t stream) {
+  const int tokens = height * width;
+  vision_position_kernel<<<tokens, 256, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(table),
+      static_cast<__nv_bfloat16*>(embeddings), position_ids, source_side,
+      height, width, hidden, merge_size);
   return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 

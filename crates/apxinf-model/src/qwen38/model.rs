@@ -91,7 +91,7 @@ impl Scratch {
             direct_fa2_decode: apxinf_cuda_new::FA2_DECODE,
             attention_fp8: zeros(ctx, vec![1, HEADS * HEAD_DIM], DType::F8E4M3),
             projected: zeros(ctx, vec![1, HIDDEN], DType::BF16),
-            positions: zeros(ctx, vec![1], DType::I32),
+            positions: zeros(ctx, vec![1, 3], DType::I32),
             gdn_qkv: zeros(ctx, vec![1, QKV_WIDTH], DType::BF16),
             gdn_conv: zeros(ctx, vec![QKV_WIDTH], DType::BF16),
             gdn_z: zeros(ctx, vec![1, Z_WIDTH], DType::BF16),
@@ -511,10 +511,31 @@ pub(crate) fn decode_step_inner(
                 ops::head_rms_norm(ctx, &query_heads, &attention.q_norm, EPSILON).unwrap();
                 ops::head_rms_norm(ctx, &key_heads, &attention.k_norm, EPSILON).unwrap();
 
-                let query_tokens = view(&scratch.query, vec![1, HEADS, HEAD_DIM], DType::BF16);
-                let key_tokens = cache_slot(&cache.keys, position, vec![1, KV_HEADS, HEAD_DIM]);
-                ops::partial_rope(ctx, &query_tokens, &scratch.positions, rotary, ROPE_THETA).unwrap();
-                ops::partial_rope(ctx, &key_tokens, &scratch.positions, rotary, ROPE_THETA).unwrap();
+                let mut query_tokens = view(&scratch.query, vec![1, HEADS, HEAD_DIM], DType::BF16);
+                let mut key_tokens =
+                    cache_slot(&cache.keys, position, vec![1, KV_HEADS, HEAD_DIM]);
+                ops::multimodal_rope(
+                    ctx,
+                    ops::MultimodalRopeArgs {
+                        data: &mut query_tokens,
+                        positions: &scratch.positions,
+                        rotary_dim: rotary,
+                        sections: MROPE_SECTION,
+                        theta: ROPE_THETA,
+                    },
+                )
+                .unwrap();
+                ops::multimodal_rope(
+                    ctx,
+                    ops::MultimodalRopeArgs {
+                        data: &mut key_tokens,
+                        positions: &scratch.positions,
+                        rotary_dim: rotary,
+                        sections: MROPE_SECTION,
+                        theta: ROPE_THETA,
+                    },
+                )
+                .unwrap();
 
                 // The cache is allocated at full capacity; attention reads only
                 // the tokens written so far.
@@ -719,6 +740,11 @@ impl PrefillScratch {
         self.capacity
     }
 
+    pub(crate) fn hidden_rows(&self, rows: usize) -> Tensor {
+        assert!(rows <= self.capacity, "prefill embedding rows exceed capacity");
+        prefix(&self.hidden, vec![rows, HIDDEN], DType::BF16)
+    }
+
     pub(crate) fn new(ctx: &CudaContext, capacity: usize) -> PrefillScratch {
         assert_eq!(capacity % CHUNK, 0, "prefill capacity must be a multiple of {CHUNK}");
         let scale_bytes =
@@ -745,7 +771,7 @@ impl PrefillScratch {
             attention_out: zeros(ctx, vec![t, HEADS * HEAD_DIM], DType::BF16),
             attention_fp8: zeros(ctx, vec![t, HEADS * HEAD_DIM], DType::F8E4M3),
             projected: zeros(ctx, vec![t, HIDDEN], DType::BF16),
-            positions: zeros(ctx, vec![t], DType::I32),
+            positions: zeros(ctx, vec![t, 3], DType::I32),
             gdn_qkv: zeros(ctx, vec![t, QKV_WIDTH], DType::BF16),
             gdn_conv: zeros(ctx, vec![t, QKV_WIDTH], DType::BF16),
             gdn_z: zeros(ctx, vec![t, Z_WIDTH], DType::BF16),
@@ -906,13 +932,16 @@ pub(crate) fn prefill_step(
     gdn_states: &mut [GdnState],
     kv_caches: &mut [KvCache],
     tokens: usize,
+    gather_embeddings: bool,
 ) {
     assert!(tokens > 0 && tokens <= scratch.capacity, "prompt exceeds prefill capacity");
     let seq_padded = tokens.div_ceil(CHUNK) * CHUNK;
 
-    let token_ids = prefix(&scratch.tokens, vec![tokens], DType::I32);
     let hidden_rows = prefix(&scratch.hidden, vec![tokens, HIDDEN], DType::BF16);
-    ops::embedding_gather(ctx, &model.embedding, &token_ids, &hidden_rows).unwrap();
+    if gather_embeddings {
+        let token_ids = prefix(&scratch.tokens, vec![tokens], DType::I32);
+        ops::embedding_gather(ctx, &model.embedding, &token_ids, &hidden_rows).unwrap();
+    }
 
     let rotary = ops::rotary_dim(HEAD_DIM, PARTIAL_ROTARY);
     let mut gdn_index = 0usize;
@@ -988,13 +1017,35 @@ pub(crate) fn prefill_step(
                 ops::head_rms_norm(ctx, &query_heads, &attention.q_norm, EPSILON).unwrap();
                 ops::head_rms_norm(ctx, &key_heads, &attention.k_norm, EPSILON).unwrap();
 
-                let positions = prefix(&scratch.positions, vec![tokens], DType::I32);
+                let positions = prefix(&scratch.positions, vec![tokens, 3], DType::I32);
                 // RoPE takes [tokens, heads, head_dim]; the batch axis the
                 // attention call wants is added separately below.
-                let query_tokens = prefix(&scratch.query, vec![tokens, HEADS, HEAD_DIM], DType::BF16);
-                let key_tokens = cache_rows(&cache.keys, tokens, vec![tokens, KV_HEADS, HEAD_DIM]);
-                ops::partial_rope(ctx, &query_tokens, &positions, rotary, ROPE_THETA).unwrap();
-                ops::partial_rope(ctx, &key_tokens, &positions, rotary, ROPE_THETA).unwrap();
+                let mut query_tokens =
+                    prefix(&scratch.query, vec![tokens, HEADS, HEAD_DIM], DType::BF16);
+                let mut key_tokens =
+                    cache_rows(&cache.keys, tokens, vec![tokens, KV_HEADS, HEAD_DIM]);
+                ops::multimodal_rope(
+                    ctx,
+                    ops::MultimodalRopeArgs {
+                        data: &mut query_tokens,
+                        positions: &positions,
+                        rotary_dim: rotary,
+                        sections: MROPE_SECTION,
+                        theta: ROPE_THETA,
+                    },
+                )
+                .unwrap();
+                ops::multimodal_rope(
+                    ctx,
+                    ops::MultimodalRopeArgs {
+                        data: &mut key_tokens,
+                        positions: &positions,
+                        rotary_dim: rotary,
+                        sections: MROPE_SECTION,
+                        theta: ROPE_THETA,
+                    },
+                )
+                .unwrap();
                 verify_finite_bf16(ctx, &format!("layer{layer_index}/query"), &query_tokens);
                 verify_finite_bf16(ctx, &format!("layer{layer_index}/key"), &key_tokens);
                 verify_finite_bf16(ctx, &format!("layer{layer_index}/value"), &value_rows);

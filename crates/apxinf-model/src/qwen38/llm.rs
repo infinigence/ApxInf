@@ -4,18 +4,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use apxinf_core::{Backend, Device, DType, Error, Result, Shape, Tensor};
+use apxinf_core::{Backend, DType, Device, Error, Result, Shape, Tensor};
 use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
 use apxinf_loader::ModelConfig;
 
 use crate::accelerator::create_backend;
-use crate::llm_trait::LlmTrait;
+use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
 
-use super::config::{CHUNK, CONV_WIDTH, FULL_ATTENTION_INTERVAL, GDN_HEAD_DIM,
-    GDN_V_HEADS, HEAD_DIM, KV_HEADS, LAYERS, QKV_WIDTH, VOCAB};
-use super::{backend, model, model_runner, weights};
+use super::config::{
+    CHUNK, CONV_WIDTH, FULL_ATTENTION_INTERVAL, GDN_HEAD_DIM, GDN_V_HEADS, HEAD_DIM, KV_HEADS,
+    LAYERS, MIN_KV_CAPACITY, QKV_WIDTH, VOCAB,
+};
+use super::vision_weights::VisionWeights;
+use super::{backend, model, model_runner, vision, weights};
 
-/// Qwen3.8-27B-NVFP4. Batch 1, text only, BF16 KV cache.
+/// Qwen3.8-27B-NVFP4. Batch 1, text and optional image input, BF16 KV cache.
 ///
 /// Execution policy is fixed: batched FlashInfer-GDN prefill, CUDA-graph
 /// decode (one phase per layer -- MLP only for a full-attention layer, mixer
@@ -24,8 +27,17 @@ use super::{backend, model, model_runner, weights};
 /// comparison.
 pub struct Qwen38 {
     ctx: CudaContext,
+    /// Existing model-neutral sampling backend. Vision and language compute
+    /// remain on `ctx`; this field is used only by `LlmTrait` token sampling.
     backend: Arc<dyn Backend>,
     model: weights::Model,
+    /// Some text-only checkpoints intentionally omit the visual tower.
+    vision: Option<VisionWeights>,
+    /// Stable per-shape vision buffers and the session owning that traversal's
+    /// prepared executions. `ExecutionKey` includes binding pointers, so the
+    /// cache only hits while the scratch addresses stay put; a new patch count
+    /// replaces both together.
+    vision_session: Option<(vision::VisionScratch, ops::ExecutionSession)>,
     scratch: model::Scratch,
     prefill: Option<model::PrefillScratch>,
     /// The prepared prefill session, with the token count it was prepared for.
@@ -36,6 +48,8 @@ pub struct Qwen38 {
     kv_caches: Vec<model::KvCache>,
     decode_phases: Option<Vec<PreparedPhase>>,
     position: usize,
+    /// Difference between linear cache positions and compressed image mRoPE.
+    rope_delta: i64,
     kv_capacity: usize,
 }
 
@@ -63,6 +77,10 @@ impl Qwen38 {
 
         let ctx = CudaContext::new(ordinal).map_err(Error::Cuda)?;
         let backend = create_backend(device)?;
+        let vision = weights
+            .contains_key("model.visual.patch_embed.proj.weight")
+            .then(|| VisionWeights::load(&weights, &ctx))
+            .transpose()?;
         let model = weights::load_model(&ctx, &weights, true);
         ctx.synchronize().map_err(Error::Cuda)?;
         drop(weights);
@@ -80,6 +98,8 @@ impl Qwen38 {
             ctx,
             backend,
             model,
+            vision,
+            vision_session: None,
             scratch,
             prefill: None,
             prefill_session: None,
@@ -87,6 +107,7 @@ impl Qwen38 {
             kv_caches,
             decode_phases: None,
             position: 0,
+            rope_delta: 0,
             kv_capacity: capacity,
         })
     }
@@ -136,11 +157,175 @@ impl Qwen38 {
             .as_tensor(Shape::new(vec![1, VOCAB]), DType::BF16)
             .unwrap()
     }
+
+    fn run_prefill(
+        &mut self,
+        token_ids: &[u32],
+        positions: Option<&[[u32; 3]]>,
+        prepared_embeddings: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        validate_kv_capacity(0, token_ids.len(), self.kv_capacity)?;
+        self.ensure_prefill_scratch(token_ids.len());
+        self.ensure_graphs();
+        let prefill = self.prefill.as_mut().unwrap();
+        match positions {
+            Some(positions) => {
+                if positions.len() != token_ids.len() {
+                    return Err(Error::Other(format!(
+                        "qwen38 received {} mRoPE positions for {} tokens",
+                        positions.len(),
+                        token_ids.len()
+                    )));
+                }
+                model_runner::write_tokens_with_positions(&self.ctx, prefill, token_ids, positions);
+            }
+            None => model_runner::write_tokens(&self.ctx, prefill, token_ids),
+        }
+
+        if let Some(source) = prepared_embeddings {
+            if source.dtype() != DType::BF16
+                || source.shape().dims() != [token_ids.len(), super::config::HIDDEN]
+            {
+                return Err(Error::Other(format!(
+                    "qwen38 prepared embeddings must be BF16 [{}, {}], got {} {:?}",
+                    token_ids.len(),
+                    super::config::HIDDEN,
+                    source.dtype(),
+                    source.shape().dims()
+                )));
+            }
+            let destination = prefill.hidden_rows(token_ids.len());
+            ops::copy_tensor(&self.ctx, source, &destination)?;
+        }
+
+        let count = token_ids.len();
+        let gather_embeddings = prepared_embeddings.is_none();
+        let forward = |ctx: &CudaContext,
+                       model: &weights::Model,
+                       prefill: &mut model::PrefillScratch,
+                       gdn_states: &mut Vec<model::GdnState>,
+                       kv_caches: &mut Vec<model::KvCache>,
+                       scratch: &model::Scratch| {
+            model::prefill_step(
+                ctx,
+                model,
+                prefill,
+                gdn_states,
+                kv_caches,
+                count,
+                gather_embeddings,
+            );
+            model::prefill_logits(ctx, model, prefill, scratch, count);
+            Ok(())
+        };
+        if let Some((_, session)) = self.prefill_session.as_ref() {
+            ops::with_session(session, || {
+                forward(
+                    &self.ctx,
+                    &self.model,
+                    prefill,
+                    &mut self.gdn_states,
+                    &mut self.kv_caches,
+                    &self.scratch,
+                )
+            })?;
+        } else {
+            let session =
+                ops::ExecutionSession::with_capacity(64 * 1024 * 1024, self.ctx.device_id())?;
+            ops::prepare_with_session(&session, || {
+                forward(
+                    &self.ctx,
+                    &self.model,
+                    prefill,
+                    &mut self.gdn_states,
+                    &mut self.kv_caches,
+                    &self.scratch,
+                )
+            })?;
+            model_runner::report_session("prefill", &session);
+            self.prefill_session = Some((count, session));
+        }
+        self.ctx.synchronize().map_err(Error::Cuda)?;
+        self.position = token_ids.len();
+        Ok(self.logits_view())
+    }
+
+    fn prefill_with_image(
+        &mut self,
+        token_ids: &[u32],
+        pixel_values: &Tensor,
+        grid_thw: &[[u32; 3]],
+    ) -> Result<Tensor> {
+        // Reject oversized multimodal prompts before running the expensive
+        // vision tower. `run_prefill` repeats this guard so every prefill
+        // caller shares the cache-boundary invariant.
+        validate_kv_capacity(0, token_ids.len(), self.kv_capacity)?;
+        if token_ids.len() <= 1 {
+            return Err(Error::Other(
+                "qwen38 image prefill requires a complete multimodal prompt".into(),
+            ));
+        }
+        let (positions, embeddings, rope_delta) = {
+            let vision_weights = self.vision.as_ref().ok_or_else(|| {
+                Error::Other(
+                    "qwen38 checkpoint does not contain model.visual weights required for image input"
+                        .into(),
+                )
+            })?;
+            let positions = vision::rope_positions(token_ids, grid_thw)?;
+            let pixels = vision::upload_pixels(&self.ctx, pixel_values)?;
+            // Reuse the scratch and its prepared executions when the patch
+            // count repeats; a different shape needs both rebuilt, since the
+            // prepared traversal binds this scratch's addresses and GEMM
+            // shapes. The first traversal on a fresh pair must prepare.
+            let patches = pixels.shape().dims()[0];
+            let reuse = self
+                .vision_session
+                .as_ref()
+                .is_some_and(|(scratch, _)| scratch.patches() == patches);
+            if !reuse {
+                let scratch = vision::VisionScratch::new(&self.ctx, patches)?;
+                let session = ops::ExecutionSession::with_capacity(
+                    VISION_SESSION_ARENA,
+                    self.ctx.device_id(),
+                )?;
+                self.vision_session = Some((scratch, session));
+            }
+            let (scratch, session) = self
+                .vision_session
+                .as_ref()
+                .expect("vision session installed above");
+            let visual = vision::forward(
+                vision_weights,
+                &self.ctx,
+                scratch,
+                session,
+                reuse,
+                &pixels,
+                grid_thw,
+            )?;
+            if !reuse {
+                model_runner::report_session("vision", session);
+            }
+            let embeddings =
+                vision::embed_and_replace(&self.ctx, &self.model.embedding, token_ids, &visual)?;
+            let max_position = positions
+                .iter()
+                .flat_map(|position| position.iter())
+                .copied()
+                .max()
+                .unwrap_or(0) as i64;
+            let rope_delta = max_position + 1 - token_ids.len() as i64;
+            (positions, embeddings, rope_delta)
+        };
+        self.rope_delta = rope_delta;
+        self.run_prefill(token_ids, Some(&positions), Some(&embeddings))
+    }
 }
 
 impl LlmTrait for Qwen38 {
     fn load(config: ModelConfig, weights: HashMap<String, Tensor>, device: Device) -> Result<Self> {
-        let capacity = config.max_seq_len.max(4096);
+        let capacity = config.max_seq_len.max(MIN_KV_CAPACITY);
         Self::new(weights, device, capacity)
     }
 
@@ -154,69 +339,11 @@ impl LlmTrait for Qwen38 {
             return Err(Error::Other("forward: empty token_ids".into()));
         }
         let start = start_pos as usize;
-        if start + token_ids.len() > self.kv_capacity {
-            return Err(Error::Other(format!(
-                "sequence {} exceeds the KV capacity {} fixed at load",
-                start + token_ids.len(),
-                self.kv_capacity
-            )));
-        }
+        validate_kv_capacity(start, token_ids.len(), self.kv_capacity)?;
 
         if start == 0 && token_ids.len() > 1 {
-            self.ensure_prefill_scratch(token_ids.len());
-            self.ensure_graphs();
-            let prefill = self.prefill.as_mut().unwrap();
-            model_runner::write_tokens(&self.ctx, prefill, token_ids);
-            // First pass on a fresh scratch prepares (tunes, allocates) inside
-            // a session arena; every later prefill replays those executions
-            // without allocation. Same-address rebinding is what makes the
-            // replay valid: scratch, weights, states and caches are stable
-            // between calls, and a scratch reallocation clears the session.
-            let count = token_ids.len();
-            let forward = |ctx: &CudaContext,
-                           model: &weights::Model,
-                           prefill: &mut model::PrefillScratch,
-                           gdn_states: &mut Vec<model::GdnState>,
-                           kv_caches: &mut Vec<model::KvCache>,
-                           scratch: &model::Scratch| {
-                model::prefill_step(ctx, model, prefill, gdn_states, kv_caches, count);
-                model::prefill_logits(ctx, model, prefill, scratch, count);
-                Ok(())
-            };
-            if let Some((_, session)) = self.prefill_session.as_ref() {
-                ops::with_session(session, || {
-                    forward(
-                        &self.ctx,
-                        &self.model,
-                        prefill,
-                        &mut self.gdn_states,
-                        &mut self.kv_caches,
-                        &self.scratch,
-                    )
-                })?;
-            } else {
-                let session =
-                    ops::ExecutionSession::with_capacity(64 * 1024 * 1024, self.ctx.device_id())?;
-                ops::prepare_with_session(&session, || {
-                    forward(
-                        &self.ctx,
-                        &self.model,
-                        prefill,
-                        &mut self.gdn_states,
-                        &mut self.kv_caches,
-                        &self.scratch,
-                    )
-                })?;
-                // Reported here, not after the branch: the preparation
-                // traversal is the one that sub-allocates, and every later
-                // `with_session` resets the arena offset without the cached
-                // executions re-allocating, so the figure would read as zero.
-                model_runner::report_session("prefill", &session);
-                self.prefill_session = Some((count, session));
-            }
-            self.ctx.synchronize().map_err(Error::Cuda)?;
-            self.position = token_ids.len();
-            return Ok(self.logits_view());
+            self.rope_delta = 0;
+            return self.run_prefill(token_ids, None, None);
         }
 
         // Token-by-token: the harness decode path, graphs captured lazily on
@@ -225,7 +352,13 @@ impl LlmTrait for Qwen38 {
         for (offset, &token) in token_ids.iter().enumerate() {
             let position = start + offset;
             model_runner::set_token(&self.scratch, token as i32);
-            model_runner::set_position(&self.scratch, position);
+            let mrope_position = position as i64 + self.rope_delta;
+            if mrope_position < 0 || mrope_position > u32::MAX as i64 {
+                return Err(Error::Other(format!(
+                    "qwen38 mRoPE position {mrope_position} is out of range"
+                )));
+            }
+            model_runner::set_mrope_position(&self.scratch, [mrope_position as u32; 3]);
             model_runner::decode_step_with_phases(
                 &self.ctx,
                 &self.model,
@@ -245,9 +378,27 @@ impl LlmTrait for Qwen38 {
         &*self.backend
     }
 
+    fn capabilities(&self) -> LlmCapabilities {
+        if self.vision.is_some() {
+            LlmCapabilities::VISION
+        } else {
+            LlmCapabilities::TEXT_ONLY
+        }
+    }
+
+    fn prefill(&mut self, input: LlmInput<'_>) -> Result<Tensor> {
+        match input.image {
+            Some(image) => {
+                self.prefill_with_image(input.token_ids, image.pixel_values, image.grid_thw)
+            }
+            None => self.forward(input.token_ids, 0),
+        }
+    }
+
     fn reset(&mut self) {
         model_runner::reset_state(&self.ctx, &mut self.gdn_states, &mut self.kv_caches);
         self.position = 0;
+        self.rope_delta = 0;
     }
 
     fn vocab_size(&self) -> usize {
@@ -255,11 +406,35 @@ impl LlmTrait for Qwen38 {
     }
 }
 
+/// Vision session arena. The tower's own activations live in `VisionScratch`,
+/// so this covers only what the GEMM and Attention providers sub-allocate for
+/// their own workspaces. Both this and the prefill session currently report
+/// 0.00 MiB used under `APXINF_QWEN38_GRAPH_REPORT=1`; the reservation matches
+/// the prefill session's rather than being tuned down, so a candidate that
+/// does want a workspace is not the one to discover the limit.
+const VISION_SESSION_ARENA: usize = 64 * 1024 * 1024;
+
+fn validate_kv_capacity(start: usize, len: usize, capacity: usize) -> Result<()> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| Error::Other("qwen38 sequence length overflow".into()))?;
+    if end > capacity {
+        return Err(Error::Other(format!(
+            "sequence {end} exceeds the KV capacity {capacity} fixed at load"
+        )));
+    }
+    Ok(())
+}
+
 // Constructors the wrapper needs for state it owns per generation session.
 impl model::GdnState {
     pub(crate) fn new(ctx: &CudaContext) -> Self {
         model::GdnState {
-            recurrent: backend::zeros(ctx, vec![GDN_V_HEADS, GDN_HEAD_DIM, GDN_HEAD_DIM], DType::F32),
+            recurrent: backend::zeros(
+                ctx,
+                vec![GDN_V_HEADS, GDN_HEAD_DIM, GDN_HEAD_DIM],
+                DType::F32,
+            ),
             conv_window: backend::zeros(ctx, vec![QKV_WIDTH, CONV_WIDTH], DType::F32),
         }
     }
@@ -277,3 +452,24 @@ impl model::KvCache {
 // Unused-import silencer for non-graph builds of ops.
 #[allow(unused_imports)]
 use ops as _ops_used;
+
+#[cfg(test)]
+mod tests {
+    use super::validate_kv_capacity;
+
+    #[test]
+    fn kv_capacity_accepts_boundary_and_rejects_oversized_prefill() {
+        assert!(validate_kv_capacity(0, 8192, 8192).is_ok());
+        let error = validate_kv_capacity(0, 8193, 8192).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("sequence 8193 exceeds the KV capacity 8192"));
+    }
+
+    #[test]
+    fn kv_capacity_accounts_for_decode_start() {
+        assert!(validate_kv_capacity(8191, 1, 8192).is_ok());
+        assert!(validate_kv_capacity(8192, 1, 8192).is_err());
+        assert!(validate_kv_capacity(usize::MAX, 1, usize::MAX).is_err());
+    }
+}

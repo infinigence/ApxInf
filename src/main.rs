@@ -52,9 +52,9 @@ enum Commands {
         #[arg(short, long)]
         prompt: String,
 
-        /// Path to an image file (for Qwen3-VL multimodal). When set, the
+        /// Path to an image file (for Qwen3-VL/Qwen3.5 multimodal). When set, the
         /// image is preprocessed by a Python helper and fed alongside the
-        /// prompt. Only for qwen3_vl models.
+        /// prompt.
         #[arg(long)]
         image: Option<PathBuf>,
 
@@ -300,6 +300,50 @@ fn parse_device(spec: &str) -> Result<Device, String> {
     }
 }
 
+/// Whether generation ended because it ran out of budget rather than because
+/// it produced a stop token.
+///
+/// The generated count includes EOS: the streaming loop pushes the sampled
+/// token and fires the callback before the next iteration's EOS check, so a
+/// stop token occupying the final budgeted slot still makes the count reach
+/// the budget. Testing the count alone therefore reports a complete answer as
+/// truncated. `resolved_eos` is empty when `--no-eos-stop` suppresses stopping,
+/// in which case reaching the budget is always real truncation.
+fn truncated_at_budget(generated: &[u32], budget: usize, resolved_eos: &[u32]) -> bool {
+    generated.len() >= budget
+        && !generated
+            .last()
+            .is_some_and(|last| resolved_eos.contains(last))
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::truncated_at_budget;
+
+    #[test]
+    fn a_stop_token_on_the_last_budgeted_slot_is_not_truncation() {
+        // --max-tokens 1 with an immediate configured EOS: the count reaches
+        // the budget, but generation finished.
+        assert!(!truncated_at_budget(&[2], 1, &[2]));
+        assert!(!truncated_at_budget(&[7, 8, 2], 3, &[2]));
+        // Several configured stop tokens, any of which completes generation.
+        assert!(!truncated_at_budget(&[7, 3], 2, &[2, 3]));
+    }
+
+    #[test]
+    fn reaching_the_budget_without_a_stop_token_is_truncation() {
+        assert!(truncated_at_budget(&[7, 8], 2, &[2]));
+        // --no-eos-stop leaves the set empty, so the budget is the only end.
+        assert!(truncated_at_budget(&[7, 2], 2, &[]));
+    }
+
+    #[test]
+    fn stopping_under_budget_is_never_truncation() {
+        assert!(!truncated_at_budget(&[7, 2], 50, &[2]));
+        assert!(!truncated_at_budget(&[], 50, &[2]));
+    }
+}
+
 #[cfg(test)]
 mod device_tests {
     use super::{parse_device, Cli, Commands};
@@ -395,9 +439,6 @@ fn run_generate(
             return Err(format!("duplicate auxiliary asset: {name}"));
         }
     }
-    if image_path.is_some() && chat_options.is_some() {
-        return Err("--chat-options currently supports text prompts only".into());
-    }
     let template_options = chat_options
         .map(|raw| {
             serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw)
@@ -413,7 +454,12 @@ fn run_generate(
         None => AutoModel::detect_model_name(model_dir)
             .map_err(|error| format!("Failed to detect model type: {error}"))?,
     };
-    if image_path.is_some() && !matches!(model_name.as_str(), "qwen3_vl" | "qwen3vl") {
+    if image_path.is_some()
+        && !matches!(
+            model_name.as_str(),
+            "qwen3_vl" | "qwen3vl" | "qwen38" | "qwen3_8" | "qwen3_5" | "qwen3_5_text"
+        )
+    {
         return Err(format!("Model `{model_name}` does not support image input"));
     }
 
@@ -432,9 +478,14 @@ fn run_generate(
     // itself always receives the model-neutral LlmInput request.
     let (tokens, prepared_image) = if let Some(image_path) = image_path {
         println!("Preprocessing image via the Hugging Face processor...");
-        let (data, shape, grid, tokens) =
-            preprocess_image(model_dir, image_path, prompt, system_prompt)
-                .map_err(|error| format!("Preprocessing failed: {error}"))?;
+        let (data, shape, grid, tokens) = preprocess_image(
+            model_dir,
+            image_path,
+            prompt,
+            system_prompt,
+            template_options.as_ref(),
+        )
+        .map_err(|error| format!("Preprocessing failed: {error}"))?;
         println!(
             "pixel_values: {:?}, grid_thw: {:?}, prompt tokens: {}",
             shape,
@@ -505,9 +556,40 @@ fn run_generate(
             .ok()
             .and_then(|defaults| defaults.max_new_tokens))
         .unwrap_or(GenerationOptions::DEFAULT_MAX_NEW_TOKENS);
+    // Resolved the same way as `generation_options.eos_token_ids` below, so the
+    // truncation note can tell budget exhaustion from a stop token. The
+    // generated count includes EOS -- the loop pushes the sampled token and
+    // fires the callback before the next iteration's EOS check -- so a stop
+    // token landing on the final budgeted slot reaches `effective_max_tokens`
+    // and a count-only test would call that truncated.
+    let resolved_eos: Vec<u32> = if !eos_stop {
+        Vec::new()
+    } else if configured_eos {
+        model
+            .generation_defaults()
+            .ok()
+            .and_then(|defaults| defaults.eos_token_ids.clone())
+            .unwrap_or_default()
+    } else {
+        eos_token_id.map(|id| vec![id]).unwrap_or_default()
+    };
 
     println!();
     println!("Generating up to {effective_max_tokens} tokens...");
+    // A Qwen-style template that opens a reasoning block leaves `<think>`
+    // unterminated in the prompt. If the budget runs out before the model
+    // closes it the visible output is reasoning with no answer, which reads as
+    // a broken model rather than a truncated one, so say which it was.
+    let prompt_opens_reasoning = tok
+        .decode_with_options(&tokens, false)
+        .map(
+            |text| match (text.rfind("<think>"), text.rfind("</think>")) {
+                (Some(open), Some(close)) => close < open,
+                (Some(_), None) => true,
+                _ => false,
+            },
+        )
+        .unwrap_or(false);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut all_tokens = tokens.clone();
@@ -554,6 +636,27 @@ fn run_generate(
 
     println!();
     println!();
+    // Hitting the budget is not the same as finishing, and the difference is
+    // invisible in the printed text. Say which one happened, and when the
+    // reasoning block is what consumed the budget, say that too.
+    let generated = &all_tokens[tokens.len()..];
+    if truncated_at_budget(generated, effective_max_tokens, &resolved_eos) {
+        let closed_reasoning = tok
+            .decode_with_options(generated, false)
+            .map(|text| text.contains("</think>"))
+            .unwrap_or(true);
+        println!(
+            "note: generation stopped at the {effective_max_tokens}-token budget rather than at \
+             a stop token, so the output above is truncated. Raise --max-tokens."
+        );
+        if prompt_opens_reasoning && !closed_reasoning {
+            println!(
+                "      the budget ran out inside the reasoning block, so no answer was reached \
+                 at all; --chat-options '{{\"enable_thinking\": false}}' answers directly."
+            );
+        }
+        println!();
+    }
     println!("{}", output.profile.summary());
     Ok(())
 }
@@ -674,11 +777,16 @@ fn encode_prompt(
 /// Preprocess an image with the model's Hugging Face processor. Raw image
 /// decoding and chat templating stay outside the model runtime; the resulting
 /// borrowed tensor is attached to LlmInput for unified generation.
+///
+/// `template_options` are the `--chat-options` entries. They reach the
+/// processor's own `apply_chat_template`, so template variables such as
+/// `enable_thinking` and `tools` behave the same here as on the text path.
 fn preprocess_image(
     model_dir: &PathBuf,
     image_path: &PathBuf,
     prompt: &str,
     system_prompt: Option<&str>,
+    template_options: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<(Vec<half::bf16>, Vec<usize>, [u32; 3], Vec<u32>), String> {
     use std::process::Command;
 
@@ -692,7 +800,7 @@ import numpy as np
 from transformers import AutoProcessor
 from PIL import Image
 
-model_dir, image_path, prompt, system, pixel_path, metadata_path = sys.argv[1:]
+model_dir, image_path, prompt, system, options_raw, pixel_path, metadata_path = sys.argv[1:]
 processor = AutoProcessor.from_pretrained(model_dir, local_files_only=True)
 image = Image.open(image_path).convert("RGB")
 messages = []
@@ -708,12 +816,20 @@ messages.append({
         {"type": "text", "text": prompt},
     ],
 })
+# Template variables only. The call's own structural arguments stay fixed,
+# because this script depends on their exact values to read the outputs back.
+options = json.loads(options_raw) if options_raw else {}
+reserved = {"add_generation_prompt", "tokenize", "return_dict", "return_tensors"}
+conflicts = sorted(reserved & set(options))
+if conflicts:
+    raise SystemExit(f"--chat-options cannot override {conflicts}")
 inputs = processor.apply_chat_template(
     messages,
     add_generation_prompt=True,
     tokenize=True,
     return_dict=True,
     return_tensors="pt",
+    **options,
 )
 pixels = inputs["pixel_values"].cpu().numpy().astype(np.float32)
 grid = inputs["image_grid_thw"][0].cpu().numpy().tolist()
@@ -722,17 +838,24 @@ np.save(pixel_path, pixels)
 with open(metadata_path, "w") as output:
     json.dump({"grid": grid, "tokens": tokens}, output)
 "#;
-    let output = Command::new("python3")
+    let options_raw = match template_options {
+        Some(options) => serde_json::to_string(options)
+            .map_err(|error| format!("serialize chat options: {error}"))?,
+        None => String::new(),
+    };
+    let python = std::env::var("APXINF_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let output = Command::new(&python)
         .arg("-c")
         .arg(script)
         .arg(model_dir)
         .arg(image_path)
         .arg(prompt)
         .arg(system_prompt.unwrap_or(""))
+        .arg(&options_raw)
         .arg(&pixel_path)
         .arg(&metadata_path)
         .output()
-        .map_err(|error| format!("python3: {error}"))?;
+        .map_err(|error| format!("{python}: {error}"))?;
     if !output.status.success() {
         return Err(format!(
             "python preprocessing failed: {}",
