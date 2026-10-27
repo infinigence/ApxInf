@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apxinf"
-version = "0.1.0"
+version = "0.2.0"
 description = "ApxInf Python frontend: processors, VLA policies, and serving."
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
@@ -18,8 +18,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# A live Pi05Policy binds the PyO3 model handle (Phase 1).
-policy = ["apxinf-py>=0.1.0"]
+# Compatibility extra; the release wheel already includes the native backend.
+policy = []
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
 serving = ["msgpack>=1.0.5", "websockets>=14.0"]
 # SentencePiece remains a test-only reference for native differential checks.
@@ -27,4 +27,4 @@ test = ["pytest>=7", "sentencepiece>=0.1.99"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["apxinf*"]
+include = ["apxinf", "apxinf.*"]

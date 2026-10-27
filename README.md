@@ -334,11 +334,19 @@ git clone <repo-url> && cd ApxInf
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
 CARGO_TARGET_DIR=target/wheel maturin build --release --features cuda --auditwheel skip -m crates/apxinf-py/Cargo.toml
-pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
-pip install -e "python/apxinf[serving]"
+pip install --find-links target/wheel/wheels "apxinf[serving]==0.2.0"
 ```
 
-Activate a venv or conda env before installing. The `serving` extra adds msgpack/websockets.
+Activate a venv or conda env before installing. The wheel contains both the
+`apxinf` Python frontend and the `apxinf_py` native backend from the same source
+revision. The `serving` extra adds msgpack/websockets. When upgrading an existing
+split installation, run `pip uninstall apxinf-py` before installing this wheel
+to avoid overlapping ownership of the native module.
+
+For CPU-only packaging and processor tests, omit `--features cuda`. Such a wheel
+does not provide CUDA inference. The source-only editable frontend under
+`python/apxinf` remains available for development; do not publish it as the
+runtime wheel or install it over a combined runtime installation.
 
 `--features cuda` is a Cargo feature, not a CUDA installation: it compiles the
 CUDA backend into the binding, and it is required — the PI0.5 runtime is only
@@ -621,9 +629,8 @@ read from the assets the checkpoint names (`text_tokenizer_name`,
 ### Run
 
 ```bash
-# the native binding then the frontend, as in "Build ApxInf" - no extra of its own
-pip install --force-reinstall target/wheel/wheels/apxinf_py-*.whl
-pip install -e python/apxinf
+# Install the combined runtime wheel built above.
+pip install --find-links target/wheel/wheels "apxinf==0.2.0"
 huggingface-cli download lerobot/pi0fast-libero-v044 --local-dir <path-to-model>
 
 python scripts/eval_libero.py --backend in-process --model-dir <path-to-model> \

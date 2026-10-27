@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "apxinf"
+version = "0.2.0"
+description = "ApxInf inference runtime and Python policies."
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21", "Pillow>=9.0.0", "PyYAML>=6"]
+
+[project.optional-dependencies]
+policy = []  # Compatibility extra: the backend is already included.
+serving = ["msgpack>=1.0.5", "websockets>=14.0"]
+test = ["pytest>=7", "ml_dtypes>=0.2", "sentencepiece>=0.1.99"]
+
+[tool.maturin]
+module-name = "apxinf_py.apxinf_py"
+python-source = "python/apxinf"
+manifest-path = "crates/apxinf-py/Cargo.toml"
+python-packages = ["apxinf", "apxinf_py"]
+# `extension-module` keeps the cdylib from linking libpython. CUDA builds add
+# the model runtime with `maturin develop --features cuda` (additive), which is
+# required for the pi05 runtime to be registered.
+features = ["extension-module"]

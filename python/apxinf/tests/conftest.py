@@ -19,7 +19,7 @@ import pytest
 
 # Make ``import apxinf`` work from a source checkout without installation.
 _PACKAGE_ROOT = Path(__file__).resolve().parent.parent
-if str(_PACKAGE_ROOT) not in sys.path:
+if os.environ.get("APXINF_TEST_INSTALLED") != "1" and str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
 
