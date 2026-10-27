@@ -16,5 +16,3 @@ pub use fp8_static_calibration::*;
 pub use host::*;
 #[cfg(feature = "cuda")]
 pub use int8_dynamic::*;
-
-mod cpu;

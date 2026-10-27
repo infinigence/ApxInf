@@ -2,40 +2,26 @@
 //! Blocks own precision/layout/fusion details and fixed weights. They do not
 //! capture graphs, cache requests, or run the complete model schedule.
 
-#[cfg(feature = "cuda")]
 pub(super) mod bf16;
-#[cfg(feature = "cuda")]
 pub(super) mod fp8_static;
-#[cfg(feature = "cuda")]
 pub(super) mod int8_dynamic;
 
-#[cfg(feature = "cuda")]
 pub(super) use bf16::backbone::Bf16Blocks;
-#[cfg(feature = "cuda")]
 pub use bf16::backbone::Bf16PrefixKvCache;
-#[cfg(feature = "cuda")]
 pub(super) use fp8_static::backbone::Fp8StaticBlocks;
-#[cfg(feature = "cuda")]
 pub use fp8_static::backbone::Fp8StaticPrefixKvCache;
-#[cfg(feature = "cuda")]
 pub(super) use int8_dynamic::backbone::Int8DynamicBlocks;
-#[cfg(feature = "cuda")]
 pub use int8_dynamic::backbone::Int8DynamicPrefixKvCache;
 
-#[cfg(feature = "cuda")]
-use crate::pi05::backend;
-use crate::pi05::Pi05Config;
-pub(in crate::pi05) mod cpu;
+use crate::pi05::{backend, backend::DeviceBuffer, Pi05Config};
 use apxinf_core::{Result, Tensor};
 
-#[cfg(feature = "cuda")]
 #[derive(Clone, Default)]
 pub(in crate::pi05) struct L3Policies {
     pub gemm: backend::ops::GemmPolicy,
     pub attention: backend::ops::AttentionPolicy,
 }
 
-#[cfg(feature = "cuda")]
 impl L3Policies {
     pub(in crate::pi05) fn for_recipe(cache_dir: Option<String>, online_tune: bool) -> Self {
         Self {
@@ -63,7 +49,7 @@ impl L3Policies {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::pi05) struct L3PolicySnapshot {
     pub gemm_cache_dir: Option<String>,
@@ -75,7 +61,6 @@ pub(in crate::pi05) struct L3PolicySnapshot {
 /// Internal, statically dispatched seam. The associated state types retain
 /// each Block's physical representation without exposing dtype tests to Model.
 pub trait Blocks {
-    type TokenIds: ?Sized;
     type Prefix;
     /// Per-timestep, per-layer adaptive RMSNorm and residual modulation tensors,
     /// derived from the time conditioning rather than the request observation.
@@ -83,7 +68,7 @@ pub trait Blocks {
     fn config(&self) -> &Pi05Config;
     /// `native` denotes the Block's already materialized input representation.
     fn vision(&self, patches: &Tensor, native: bool) -> Result<Tensor>;
-    fn embed_prefix(&self, vision: &Tensor, ids: &Self::TokenIds, count: usize) -> Result<Tensor>;
+    fn embed_prefix(&self, vision: &Tensor, ids: &DeviceBuffer, count: usize) -> Result<Tensor>;
     fn prefix(&self, input: &Tensor) -> Result<Self::Prefix>;
     fn prepare_modulation(&self, embeddings: &[Tensor]) -> Result<Vec<Self::StepModulation>>;
     /// Preserve execution ordering: BF16/dynamic INT8 precompute eager modulation; FP8
