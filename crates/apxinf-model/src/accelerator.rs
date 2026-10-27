@@ -8,7 +8,7 @@ use apxinf_core::Error;
 
 pub(crate) fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
     match device {
-        Device::Cpu => Ok(Arc::new(apxinf_core::CpuBackend)),
+        Device::Cpu => Ok(Arc::new(apxinf_cpu::CpuBackend)),
         #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
         Device::Metal(id) => Ok(Arc::new(apxinf_mlx::MlxBackend::new(id)?)),
         #[cfg(not(all(feature = "mlx", target_os = "macos", target_arch = "aarch64")))]

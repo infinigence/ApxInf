@@ -1,11 +1,12 @@
 //! CPU backend implementation.
 
-use crate::{
-    Backend, Device, Error, Graph, NormalGenerator, Result, SamplingBackend,
-    Tensor, TokenSampler, TokenSamplingSpec,
-};
-use crate::kv_cache::{CpuKVCache, KvCache};
+use crate::kv_cache::CpuKVCache;
 use crate::sampling::{CpuNormalGenerator, CpuTokenSampler};
+use apxinf_core::KvCache;
+use apxinf_core::{
+    Backend, Device, Error, Graph, NormalGenerator, Result, SamplingBackend, Tensor, TokenSampler,
+    TokenSamplingSpec,
+};
 
 /// CPU backend — all ops execute synchronously on the host.
 pub struct CpuBackend;
@@ -21,14 +22,20 @@ impl SamplingBackend for CpuBackend {
 }
 
 impl Backend for CpuBackend {
-    fn layer_norm(&self, input: &Tensor, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
-        super::cpu_dense::layer_norm(input, weight, bias, eps)
+    fn layer_norm(
+        &self,
+        input: &Tensor,
+        weight: &Tensor,
+        bias: &Tensor,
+        eps: f32,
+    ) -> Result<Tensor> {
+        crate::dense::layer_norm(input, weight, bias, eps)
     }
     fn gelu_tanh(&self, input: &Tensor) -> Result<Tensor> {
-        super::cpu_dense::gelu(input)
+        crate::dense::gelu(input)
     }
     fn add_bias(&self, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
-        super::cpu_dense::add_bias(input, bias)
+        crate::dense::add_bias(input, bias)
     }
 
     fn rms_norm(&self, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
@@ -60,14 +67,22 @@ impl Backend for CpuBackend {
     fn add(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         let a_data = a.as_f32()?;
         let b_data = b.as_f32()?;
-        let out: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(a, b)| a + b).collect();
+        let out: Vec<f32> = a_data
+            .iter()
+            .zip(b_data.iter())
+            .map(|(a, b)| a + b)
+            .collect();
         Tensor::from_f32(a.shape().dims().to_vec(), &out)
     }
 
     fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         let a_data = a.as_f32()?;
         let b_data = b.as_f32()?;
-        let out: Vec<f32> = a_data.iter().zip(b_data.iter()).map(|(a, b)| a * b).collect();
+        let out: Vec<f32> = a_data
+            .iter()
+            .zip(b_data.iter())
+            .map(|(a, b)| a * b)
+            .collect();
         Tensor::from_f32(a.shape().dims().to_vec(), &out)
     }
 
@@ -78,11 +93,17 @@ impl Backend for CpuBackend {
     }
 
     fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        a.matmul_cpu(b)
+        crate::gemm::matmul(a, b)
     }
 
-    fn rope(&self, input: &Tensor, n_heads: usize, head_dim: usize,
-            theta: f32, pos_offset: u32) -> Result<Tensor> {
+    fn rope(
+        &self,
+        input: &Tensor,
+        n_heads: usize,
+        head_dim: usize,
+        theta: f32,
+        pos_offset: u32,
+    ) -> Result<Tensor> {
         let data = input.as_f32()?;
         let dims = input.shape().dims();
         let seq_len = if dims.len() == 2 { 1 } else { dims[0] };
@@ -126,12 +147,22 @@ impl Backend for CpuBackend {
         Tensor::from_f32(vec![seq_len, embed_dim], &out)
     }
 
-    fn sdpa_decode(&self, q: &Tensor, kv: &mut dyn KvCache,
-                   layer_idx: usize, n_heads: usize, n_kv_heads: usize,
-                   head_dim: usize, kv_len: usize, max_seq_len: usize) -> Result<Tensor> {
+    fn sdpa_decode(
+        &self,
+        q: &Tensor,
+        kv: &mut dyn KvCache,
+        layer_idx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_len: usize,
+        max_seq_len: usize,
+    ) -> Result<Tensor> {
         let _ = max_seq_len;
         let q_data = q.as_f32()?;
-        let cache = kv.as_any_mut().downcast_mut::<CpuKVCache>()
+        let cache = kv
+            .as_any_mut()
+            .downcast_mut::<CpuKVCache>()
             .ok_or_else(|| Error::Other("expected CpuKVCache".into()))?;
         let (k_cached, v_cached) = cache.get_kv(layer_idx);
 
@@ -161,13 +192,23 @@ impl Backend for CpuBackend {
         Tensor::from_f32(vec![1, n_heads * head_dim], &output)
     }
 
-    fn sdpa_prefill(&self, q: &Tensor, kv: &mut dyn KvCache,
-                    layer_idx: usize, n_heads: usize, n_kv_heads: usize,
-                    head_dim: usize, kv_len: usize, max_seq_len: usize) -> Result<Tensor> {
+    fn sdpa_prefill(
+        &self,
+        q: &Tensor,
+        kv: &mut dyn KvCache,
+        layer_idx: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_len: usize,
+        max_seq_len: usize,
+    ) -> Result<Tensor> {
         let _ = max_seq_len;
         let q_data = q.as_f32()?;
         let seq_len = q.shape().dims()[0];
-        let cache = kv.as_any_mut().downcast_mut::<CpuKVCache>()
+        let cache = kv
+            .as_any_mut()
+            .downcast_mut::<CpuKVCache>()
             .ok_or_else(|| Error::Other("expected CpuKVCache".into()))?;
         let (k_cached, v_cached) = cache.get_kv(layer_idx);
 
@@ -186,15 +227,21 @@ impl Backend for CpuBackend {
                     }
                     scores[t] *= scale;
                 }
-                let max_score = scores[..valid_len].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let exp_sum: f32 = scores[..valid_len].iter().map(|&s| (s - max_score).exp()).sum();
+                let max_score = scores[..valid_len]
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = scores[..valid_len]
+                    .iter()
+                    .map(|&s| (s - max_score).exp())
+                    .sum();
                 for t in 0..valid_len {
                     scores[t] = (scores[t] - max_score).exp() / exp_sum;
                 }
                 for t in 0..valid_len {
                     for d in 0..head_dim {
-                        output[s * n_heads * head_dim + h * head_dim + d]
-                            += scores[t] * v_cached[kv_h][t][d];
+                        output[s * n_heads * head_dim + h * head_dim + d] +=
+                            scores[t] * v_cached[kv_h][t][d];
                     }
                 }
             }
@@ -202,25 +249,42 @@ impl Backend for CpuBackend {
         Tensor::from_f32(vec![seq_len, n_heads * head_dim], &output)
     }
 
-    fn create_kv_cache(&self, n_layers: usize, n_kv_heads: usize,
-                       head_dim: usize, max_seq_len: usize) -> Box<dyn KvCache> {
+    fn create_kv_cache(
+        &self,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Box<dyn KvCache> {
         Box::new(CpuKVCache::new(n_layers, n_kv_heads, head_dim, max_seq_len))
     }
 
-    fn kv_append(&self, kv: &mut dyn KvCache, layer_idx: usize,
-                 k: &Tensor, v: &Tensor, append_len: usize) -> Result<()> {
+    fn kv_append(
+        &self,
+        kv: &mut dyn KvCache,
+        layer_idx: usize,
+        k: &Tensor,
+        v: &Tensor,
+        append_len: usize,
+    ) -> Result<()> {
         kv.append(layer_idx, k, v, append_len)
     }
 
-    fn synchronize(&self) -> Result<()> { Ok(()) }
+    fn synchronize(&self) -> Result<()> {
+        Ok(())
+    }
 
-    fn begin_capture(&self) -> Result<()> { Ok(()) }
+    fn begin_capture(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn end_capture(&self) -> Result<Box<dyn Graph>> {
         Ok(Box::new(NoopGraph))
     }
 
-    fn device(&self) -> Device { Device::Cpu }
+    fn device(&self) -> Device {
+        Device::Cpu
+    }
 
     fn to_device(&self, tensor: &Tensor) -> Result<Tensor> {
         Ok(tensor.clone())
@@ -230,12 +294,16 @@ impl Backend for CpuBackend {
         Ok(tensor.clone())
     }
 
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// No-op graph (CPU has nothing to capture).
 struct NoopGraph;
 
 impl Graph for NoopGraph {
-    fn replay(&self) -> Result<()> { Ok(()) }
+    fn replay(&self) -> Result<()> {
+        Ok(())
+    }
 }

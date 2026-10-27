@@ -1,10 +1,4 @@
 fn main() {
-    // When the `accelerate` feature is enabled, link Apple's Accelerate framework
-    // which provides the CBLAS implementation on macOS.
-    if std::env::var("CARGO_FEATURE_ACCELERATE").is_ok() {
-        println!("cargo:rustc-link-lib=framework=Accelerate");
-    }
-
     // When the `openblas` feature is enabled, link the system OpenBLAS library.
     // Requires libopenblas-dev (or equivalent) to be installed.
     if std::env::var("CARGO_FEATURE_OPENBLAS").is_ok() {

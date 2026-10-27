@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use apxinf_core::{Backend, CpuBackend, Device, Result, Tensor};
+use apxinf_core::{Backend, Device, Result, Tensor};
+use apxinf_cpu::CpuBackend;
 use apxinf_loader::ModelConfig;
 use apxinf_model::{
     register, Action, AutoModel, GenerationOptions, GenerationRequest, ImageInput, InferenceSpec,

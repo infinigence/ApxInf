@@ -44,7 +44,7 @@ fn gpu_greedy_uses_multiblock_reduction_and_lowest_tie() {
 #[test]
 fn gpu_greedy_logprob_matches_cpu_for_large_tied_logits() {
     let backend = CudaBackend::new(0).expect("CUDA device required");
-    let cpu = apxinf_core::CpuBackend;
+    let cpu = apxinf_cpu::CpuBackend;
     let cpu_logits = Tensor::from_f32(vec![1, 3], &[f32::MAX, f32::MAX, 0.0]).unwrap();
     let gpu_logits = backend.to_device(&cpu_logits).unwrap();
     let params = TokenSamplingParams {
@@ -78,7 +78,7 @@ fn gpu_greedy_logprob_matches_cpu_for_large_tied_logits() {
 #[test]
 fn gpu_penalties_and_random_sampling_match_cpu_reference() {
     let backend = CudaBackend::new(0).expect("CUDA device required");
-    let cpu = apxinf_core::CpuBackend;
+    let cpu = apxinf_cpu::CpuBackend;
     let vocab = 257;
     let values = (0..vocab)
         .map(|index| ((index * 37 % 101) as f32 - 50.0) * 0.07)

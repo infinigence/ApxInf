@@ -1,5 +1,6 @@
 //! FP32 dense CPU operations. Heads are scheduled serially; BLAS owns GEMM threading.
-use crate::{CpuBackend, Error, Result, Tensor};
+use crate::CpuBackend;
+use apxinf_core::{Error, Result, Tensor};
 
 impl CpuBackend {
     /// Non-causal GQA/MHA: Q [queries, heads, dim], K/V [keys, kv_heads, dim].
@@ -39,7 +40,7 @@ impl CpuBackend {
                 value[t * d..(t + 1) * d]
                     .copy_from_slice(&v[(t * nkh + kh) * d..(t * nkh + kh + 1) * d]);
             }
-            crate::ops::sgemm(nq, d, nk, &query, &key_t, &mut scores);
+            crate::gemm::sgemm(nq, d, nk, &query, &key_t, &mut scores);
             for row in scores.chunks_exact_mut(nk) {
                 for x in row.iter_mut() {
                     *x /= (d as f32).sqrt();
@@ -54,7 +55,7 @@ impl CpuBackend {
                     *x /= sum;
                 }
             }
-            crate::ops::sgemm(nq, nk, d, &scores, &value, &mut head_out);
+            crate::gemm::sgemm(nq, nk, d, &scores, &value, &mut head_out);
             for t in 0..nq {
                 output[(t * nh + h) * d..(t * nh + h + 1) * d]
                     .copy_from_slice(&head_out[t * d..(t + 1) * d]);
@@ -125,7 +126,7 @@ pub(super) fn add_bias(input: &Tensor, bias: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Backend;
+    use apxinf_core::Backend;
     #[test]
     fn gqa_matches_scalar_f64_attention() {
         let (nq, nk, nh, nkh, d) = (3, 5, 4, 2, 4);

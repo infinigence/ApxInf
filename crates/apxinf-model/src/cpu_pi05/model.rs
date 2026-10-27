@@ -3,7 +3,8 @@ use crate::cpu_pi05::weights::{
     GemmaAttentionWeights, GemmaMlpWeights, LayerNormWeights, LinearWeights, Weights,
 };
 use crate::cpu_pi05::{Config, GemmaConfig};
-use apxinf_core::{Backend, CpuBackend, Error, Result, Tensor};
+use apxinf_core::{Backend, Error, Result, Tensor};
+use apxinf_cpu::CpuBackend;
 
 pub(in crate::cpu_pi05) struct CpuPi05Model {
     config: Config,

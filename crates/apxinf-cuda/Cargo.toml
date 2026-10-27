@@ -25,3 +25,6 @@ path = "aot/build.rs"
 [build-dependencies]
 cc = "1"
 serde_json = "1"
+
+[dev-dependencies]
+apxinf-cpu = { path = "../apxinf-cpu" }

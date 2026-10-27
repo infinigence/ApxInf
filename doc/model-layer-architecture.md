@@ -32,8 +32,12 @@ apxinf-model
   architecture, weights, schedules and execution orchestration
                          |
                          v
-apxinf-core / apxinf-cuda / apxinf-mlx
-  tensors, devices, model-neutral operators, kernel APIs
+apxinf-cpu / apxinf-cuda / apxinf-hip / apxinf-mlx
+  model-neutral operators, kernel APIs
+                         |
+                         v
+apxinf-core
+  tensors, devices, backend and sampling contracts
 ```
 
 Dependencies flow downward. Backend crates never import model concepts.
@@ -95,6 +99,8 @@ not a port requirement.
 | `weights/` | Checkpoint mapping, model-local packing, device weight trees and fixed calibration scales; fixed weight operations stay with their physical representation | [weights/mod.rs](../crates/apxinf-model/src/pi05/weights/mod.rs) |
 | `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
+| `apxinf-core` | Tensor/storage data and backend, KV cache and sampling contracts; no concrete CPU operators or BLAS linking | [Core crate](../crates/apxinf-core/src/lib.rs) |
+| `apxinf-cpu` | Synchronous CPU operators, concrete KV storage and sampling; owns optional OpenBLAS calls and linking | [CPU crate](../crates/apxinf-cpu/README.md) |
 | `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda/src/lib.rs) |
 | `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
 

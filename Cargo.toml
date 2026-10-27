@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/apxinf-core",
+    "crates/apxinf-cpu",
     "crates/apxinf-cuda",
     "crates/apxinf-cuda-new",
     "crates/apxinf-hip",
@@ -36,13 +37,13 @@ cuda-new = ["cuda", "apxinf-model/cuda-new"]
 # AMD ROCm/HIP inference. Independent of `cuda`: both may be enabled, and
 # a process can then hold a CUDA and a HIP backend at once.
 hip = ["dep:apxinf-hip", "apxinf-model/hip"]
-# CPU-only BLAS backend for the non-GPU matmul fallback. Combine with `cuda`
-# if you want the CPU path to use OpenBLAS. Drive OS aarch64 doesn't ship
-# libopenblas — leave this off on Thor.
-openblas = ["apxinf-core/openblas"]
+# Optional CPU GEMM acceleration. Requires an installed OpenBLAS library.
+# May be combined with GPU features; OpenBLAS only affects the CPU backend.
+openblas = ["apxinf-cpu/openblas"]
 
 [dependencies]
 apxinf-core = { path = "crates/apxinf-core" }
+apxinf-cpu = { path = "crates/apxinf-cpu" }
 apxinf-mlx = { path = "crates/apxinf-mlx", optional = true }
 apxinf-cuda = { path = "crates/apxinf-cuda", optional = true, default-features = false }
 apxinf-hip = { path = "crates/apxinf-hip", optional = true }

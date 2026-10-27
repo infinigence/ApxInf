@@ -10,9 +10,10 @@
 use std::sync::Arc;
 
 use apxinf_core::{
-    CpuBackend, Device, Error, NextTokenLogits, NormalGenerator, Result, RngKey, SamplingBackend,
+    Device, Error, NextTokenLogits, NormalGenerator, Result, RngKey, SamplingBackend,
     Shape, Tensor, TokenSample, TokenSampler, TokenSamplingInit, TokenSamplingSpec,
 };
+use apxinf_cpu::CpuBackend;
 
 use crate::runtime::HipContext;
 

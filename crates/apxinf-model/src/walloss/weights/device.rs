@@ -120,7 +120,8 @@ fn quantize_rows_host(weight: &Tensor, backend: &dyn Backend) -> Result<(Tensor,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apxinf_core::{CpuBackend, DType};
+    use apxinf_core::{DType};
+use apxinf_cpu::CpuBackend;
 
     #[test]
     fn dynamic_fp8_weights_use_independent_output_channel_scales() {
