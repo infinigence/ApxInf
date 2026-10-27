@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 use apxinf_core::{DType, Tensor};
 use apxinf_hip::native::{
-    self, Activation, AttentionGeometry, HipArena, HipDeviceBytes, ImageLayout, QkvRope,
+    self, Activation, AttentionGeometry, AttentionKernel, HipArena, HipDeviceBytes, ImageLayout,
+    QkvRope,
 };
 use apxinf_hip::HipContext;
 use half::bf16;
@@ -737,20 +738,29 @@ fn attention_matches_the_reference_for_every_pi05_shape() {
             60 + index as u64,
             1.0,
         );
-        let out = arena
-            .tensor(
-                vec![g.batch, g.q_tokens, g.q_heads, g.head_dim],
-                DType::BF16,
-            )
-            .unwrap();
-        native::attention(&ctx, &q, &k, &v, g, &out).unwrap();
         let want = attention_reference(&qh, &kh, &vh, g, *rows);
-        assert_close(
-            &host(&ctx, &out),
-            &want,
-            ACCUMULATE_TOL,
-            &format!("attention case {index} {g:?}"),
-        );
+        // Every kernel that can run this shape, against the same F32 reference.
+        let mut kernels = vec![AttentionKernel::Reference, AttentionKernel::Ck];
+        if g.head_dim == 256 {
+            kernels.push(AttentionKernel::CkSplitKv { splits: 4 });
+        }
+        for kernel in kernels {
+            let out = arena
+                .tensor(
+                    vec![g.batch, g.q_tokens, g.q_heads, g.head_dim],
+                    DType::BF16,
+                )
+                .unwrap();
+            let elements = native::attention_scratch_elements(g, kernel);
+            let scratch = (elements > 0).then(|| arena.tensor(vec![elements], DType::F32).unwrap());
+            native::attention(&ctx, &q, &k, &v, g, kernel, scratch.as_ref(), &out).unwrap();
+            assert_close(
+                &host(&ctx, &out),
+                &want,
+                ACCUMULATE_TOL,
+                &format!("attention case {index} {kernel:?} {g:?}"),
+            );
+        }
     }
     let g = AttentionGeometry {
         batch: 1,
@@ -764,8 +774,52 @@ fn attention_matches_the_reference_for_every_pi05_shape() {
     let (k, _) = input(&ctx, &[540, 1, 256], 2, 1.0);
     let out = arena.tensor(vec![1, 10, 8, 256], DType::BF16).unwrap();
     assert!(
-        native::attention(&ctx, &q, &k, &k, &g, &out).is_err(),
+        native::attention(&ctx, &q, &k, &k, &g, AttentionKernel::Ck, None, &out).is_err(),
         "more keys than the cache holds"
+    );
+    let split = AttentionKernel::CkSplitKv { splits: 4 };
+    let g = AttentionGeometry {
+        kv_tokens: 540,
+        ..g
+    };
+    assert!(
+        native::attention(&ctx, &q, &k, &k, &g, split, None, &out).is_err(),
+        "split-KV without scratch"
+    );
+}
+
+#[test]
+fn default_attention_kernels_for_pi05() {
+    let g = |batch, q_tokens, q_heads, kv_heads, head_dim, kv_tokens| AttentionGeometry {
+        batch,
+        q_tokens,
+        q_heads,
+        kv_heads,
+        head_dim,
+        kv_tokens,
+    };
+    // Vision and prefix: CK flash-attention forward.
+    assert_eq!(
+        native::attention_kernel(&g(2, 256, 16, 16, 72, 256)),
+        AttentionKernel::Ck
+    );
+    assert_eq!(
+        native::attention_kernel(&g(1, 522, 8, 1, 256, 522)),
+        AttentionKernel::Ck
+    );
+    // Action expert: 10 queries over the prefix plus its own rows, split-KV.
+    assert_eq!(
+        native::attention_kernel(&g(1, 10, 8, 1, 256, 532)),
+        AttentionKernel::CkSplitKv { splits: 4 }
+    );
+    // Head dims CK's vendored instances cannot run fall back to apxinf's kernel.
+    assert_eq!(
+        native::attention_kernel(&g(1, 10, 8, 1, 512, 64)),
+        AttentionKernel::Reference
+    );
+    assert_eq!(
+        native::attention_kernel(&g(1, 10, 8, 1, 60, 64)),
+        AttentionKernel::Reference
     );
 }
 

@@ -375,7 +375,9 @@ extern "C" int apxinf_hip_memcpy_dtod(void* dst, const void* src, uint64_t bytes
 
 extern "C" int apxinf_hip_error_string(int code, char* buf, int len) {
   const char* message;
-  if (code >= kInvalidArgument) {
+  if (code == kNoCkInstance) {
+    message = "no Composable Kernel attention instance matches these arguments";
+  } else if (code >= kInvalidArgument) {
     message = "argument rejected by the apxinf-hip shim";
   } else if (code >= kBlasStatusBase) {
     message = hipblasStatusToString(static_cast<hipblasStatus_t>(code - kBlasStatusBase));

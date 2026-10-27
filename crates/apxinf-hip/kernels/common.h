@@ -23,6 +23,8 @@ constexpr int kDTypeBF16 = 1;
 
 constexpr int kBlasStatusBase = 100000;
 constexpr int kInvalidArgument = 200000;
+// A Composable Kernel dispatcher found no instance for the arguments.
+constexpr int kNoCkInstance = 200001;
 
 constexpr int kElementwiseBlock = 256;
 constexpr int kReduceBlock = 256;

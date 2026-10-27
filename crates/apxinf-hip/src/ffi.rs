@@ -278,6 +278,25 @@ hip_abi! {
         width: i32,
         stream: *mut c_void,
     );
+    fn apxinf_hip_ck_attention(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        out: *mut c_void,
+        batch: i32,
+        q_tokens: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        kv_tokens: i32,
+        kv_batch_stride: i64,
+        kv_token_stride: i64,
+        num_splits: i32,
+        lse_acc: *mut c_void,
+        o_acc: *mut c_void,
+        scale: f32,
+        stream: *mut c_void,
+    );
     fn apxinf_hip_native_attention(
         q: *const c_void,
         k: *const c_void,
