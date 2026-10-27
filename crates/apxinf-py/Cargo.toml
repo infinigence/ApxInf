@@ -27,7 +27,7 @@ mlx = ["apxinf-model/mlx"]
 # `cargo test`, which needs to link a Python interpreter for the harness.
 extension-module = ["pyo3/extension-module"]
 # Optional CPU GEMM library. Without OpenBLAS, use the Rust fallback.
-openblas = ["apxinf-core/openblas"]
+openblas = ["apxinf-model/openblas"]
 # Forward CUDA support to the model crate. CPU PI0.5 needs no CUDA feature.
 cuda = ["apxinf-model/cuda"]
 # Forward HIP support to the model crate, so `device="hip:N"` reaches the HIP

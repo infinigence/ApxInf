@@ -112,7 +112,9 @@ action unnormalization. Its maintained latency and LIBERO entry points are
 
 The [PI0.5 CPU reference](pi05-cpu-reference.md) is an independent
 `cpu_pi05/` port with its own config, weights, concrete model and eager runner.
-It shares public contracts and reference fixtures with other ports.
+It shares public contracts and reference fixtures with other ports. CPU operator
+implementation and BLAS linking belong to `apxinf-cpu`; see the
+[CPU backend contract](../crates/apxinf-cpu/README.md).
 
 Inspect or copy PI0.5's model/Blocks and runner
 structure when semantics fit; use `<Family>Model` and `<Family>ModelRunner` for

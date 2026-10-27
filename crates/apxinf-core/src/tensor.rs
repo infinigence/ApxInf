@@ -243,16 +243,20 @@ impl Tensor {
         &self.storage
     }
 
-    pub(crate) fn storage_mut(&mut self) -> &mut Storage {
-        &mut self.storage
-    }
-
     /// Total bytes used by this tensor's data.
     pub fn size_in_bytes(&self) -> usize {
         self.numel() * self.dtype.size_in_bytes()
     }
 
     // ── CPU data access ─────────────────────────────────────────────
+
+    /// Mutably borrow CPU data without changing the tensor's shape, dtype or storage.
+    pub fn as_cpu_bytes_mut(&mut self) -> Result<&mut [u8]> {
+        self.ensure_cpu()?;
+        self.storage
+            .as_cpu_mut()
+            .ok_or_else(|| Error::Other("CPU tensor does not contain host storage".into()))
+    }
 
     /// View the data as f32 slice (panics if dtype != F32 or not on CPU).
     pub fn as_f32(&self) -> Result<&[f32]> {
@@ -412,50 +416,6 @@ impl Tensor {
         Tensor::from_f32(new_shape, &dst)
     }
 
-    // ── CPU math operations ─────────────────────────────────────────
-
-    /// CPU-side matrix multiplication.
-    ///
-    /// When a BLAS feature (`accelerate` or `openblas`) is enabled, this
-    /// dispatches to the vendor BLAS library. Otherwise a naive Rust
-    /// fallback is used.
-    pub fn matmul_cpu(&self, other: &Tensor) -> Result<Self> {
-        self.ensure_cpu()?;
-        other.ensure_cpu()?;
-        self.ensure_dtype(other.dtype())?;
-
-        let out_shape = self.shape.matmul_shape(other.shape())?;
-
-        let a = if self.dtype() == DType::F32 {
-            std::borrow::Cow::Borrowed(self.as_f32()?)
-        } else {
-            std::borrow::Cow::Owned(self.to_f32_vec()?)
-        };
-        let b = if other.dtype() == DType::F32 {
-            std::borrow::Cow::Borrowed(other.as_f32()?)
-        } else {
-            std::borrow::Cow::Owned(other.to_f32_vec()?)
-        };
-
-        let m = self.shape.dims()[self.ndim() - 2];
-        let k = self.shape.dims()[self.ndim() - 1];
-        let n = other.shape().dims()[other.ndim() - 1];
-        let batch: usize = self.shape.dims()[..self.ndim() - 2]
-            .iter()
-            .product::<usize>()
-            .max(1);
-
-        let mut out = vec![0.0f32; out_shape.numel()];
-        for batch_idx in 0..batch {
-            let a_off = batch_idx * m * k;
-            let b_off = batch_idx * k * n;
-            let o_off = batch_idx * m * n;
-            crate::ops::sgemm(m, k, n, &a[a_off..], &b[b_off..], &mut out[o_off..]);
-        }
-
-        Tensor::from_f32(out_shape, &out)
-    }
-
     // ── Internal helpers ────────────────────────────────────────────
 
     fn ensure_cpu(&self) -> Result<()> {
@@ -568,19 +528,6 @@ mod tests {
     fn test_reshape_mismatch() {
         let t = Tensor::zeros(vec![2, 3], DType::F32);
         assert!(t.reshape(vec![2, 4]).is_err());
-    }
-
-    #[test]
-    fn test_matmul_cpu() {
-        // [2, 3] @ [3, 2] = [2, 2]
-        let a = Tensor::from_f32(vec![2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
-        let b = Tensor::from_f32(vec![3, 2], &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
-        let c = a.matmul_cpu(&b).unwrap();
-        assert_eq!(c.shape(), &Shape::new(vec![2, 2]));
-        let data = c.as_f32().unwrap();
-        // Row 0: 1*7+2*9+3*11=58, 1*8+2*10+3*12=64
-        // Row 1: 4*7+5*9+6*11=139, 4*8+5*10+6*12=154
-        assert_eq!(data, &[58.0, 64.0, 139.0, 154.0]);
     }
 
     #[test]
