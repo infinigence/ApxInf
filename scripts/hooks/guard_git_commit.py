@@ -2,8 +2,10 @@
 """Run quick checks before Claude invokes git commit; exit 2 blocks the tool."""
 
 import json
+import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 
@@ -36,8 +38,16 @@ def main():
             return 0
         if not may_commit(event["tool_input"]["command"]):
             return 0
+        if os.environ.get("APXINF_SKIP_COMMIT_GUARD") == "1":
+            print("Commit guard skipped by APXINF_SKIP_COMMIT_GUARD=1; checks not run.", file=sys.stderr)
+            return 0
+        just = shutil.which("just")
+        if just is None:
+            print("Commit guard skipped: just is not on PATH; checks not run. "
+                  "Install just and run just pre-commit before submission.", file=sys.stderr)
+            return 0
         result = subprocess.run(
-            ["just", "pre-commit"],
+            [just, "pre-commit"],
             cwd=Path(__file__).resolve().parents[2],
             # Hook stdout is a control channel; send check output to stderr.
             stdout=sys.stderr,

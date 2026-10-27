@@ -9,6 +9,7 @@ this list is not a supported knob — inspect the source before using it.
 
 | Name | Where read |
 |---|---|
+| `APXINF_SKIP_COMMIT_GUARD` | scripts/hooks/guard_git_commit.py; set to 1 in the Claude session environment to bypass only the Bash commit guard; Git hooks and CI remain active |
 | `APXINF_AGENT_ACCEPTANCE_PLAN` | scripts/hooks/guard_agent_stop.py; opt-in absolute path to a task acceptance JSON under devlocal; see [agent acceptance](../guides/agent-acceptance.md) |
 
 ## Build-time (read in build.rs / build_support)

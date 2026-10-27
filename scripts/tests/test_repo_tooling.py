@@ -37,7 +37,8 @@ class ToolingTests(unittest.TestCase):
         self.bin.mkdir()
         self.log = self.root / "calls.jsonl"
         self.env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", TOOL_LOG=str(self.log))
-        for name in ("APXINF_PLATFORM", "APXINF_CUDA_ARCH", "APXINF_NVCC_PARALLELISM"):
+        for name in ("APXINF_PLATFORM", "APXINF_CUDA_ARCH", "APXINF_NVCC_PARALLELISM",
+                     "APXINF_SKIP_COMMIT_GUARD"):
             self.env.pop(name, None)
 
     def stub(self, name):
@@ -196,6 +197,31 @@ class ToolingTests(unittest.TestCase):
         self.env["TOOL_EXIT"] = "0"
         result = self.run_command(["bash", "-c", command], input=event)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_commit_guard_missing_just_warns_and_allows_commit(self):
+        # Invoke real Python directly with an empty PATH: no mocked which/run.
+        self.env["PATH"] = str(self.bin)
+        event = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git commit -m test"}})
+        result = self.run_command([sys.executable, str(REPO / "scripts/hooks/guard_git_commit.py")], input=event)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("just is not on PATH; checks not run", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_commit_guard_explicit_bypass_is_separate_from_git_no_verify(self):
+        self.stub("just")
+        self.env["TOOL_EXIT"] = "1"
+        event = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git commit --no-verify -m test"}})
+        command = [sys.executable, str(REPO / "scripts/hooks/guard_git_commit.py")]
+        for value in ("0", "true", "1"):
+            with self.subTest(value=value):
+                self.log.unlink(missing_ok=True)
+                self.env["APXINF_SKIP_COMMIT_GUARD"] = value
+                result = self.run_command(command, input=event)
+                self.assertEqual(result.returncode, 0 if value == "1" else 2, result.stderr)
+                self.assertEqual(len(self.calls()), 0 if value == "1" else 1)
+                if value == "1":
+                    self.assertIn("checks not run", result.stderr)
+                self.assertEqual(result.stdout, "")
 
     def test_workflow_yaml_has_unique_keys_and_missing_key_skips_ai(self):
         workflows = {}

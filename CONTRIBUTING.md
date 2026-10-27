@@ -70,14 +70,27 @@ thumb:
 
 ## Review
 
-- `just pre-commit` runs on every commit locally; CI runs `just pre-pr`.
+- With the Git hook enabled above, `just pre-commit` runs on local commits;
+  CI runs `just pre-pr`.
 - `just test-tooling` tests recipe dispatch, documentation links and anchors,
   the Claude commit guard, and workflow configuration without a GPU or API key.
   `just workflow-lint` validates workflows with actionlint. Both run in
   `just pre-pr` and CI.
-- The Claude Bash hook runs the quick check when a command may invoke
-  `git commit`, returning exit code 2 on failure. Enable the Git hook above
-  for commits through aliases, other tools, and human shells as well.
+- The committed `.claude/settings.json` automatically installs a Bash
+  `PreToolUse` commit guard for Claude Code users of this checkout. It runs
+  the quick check when a command may invoke `git commit`: failed checks block
+  the tool (exit 2); missing `just` emits a warning and allows the tool without
+  claiming checks passed. The separate Stop hook only enforces acceptance when
+  `APXINF_AGENT_ACCEPTANCE_PLAN` is set.
+- To bypass only the Claude commit guard, start a session with
+  `APXINF_SKIP_COMMIT_GUARD=1 claude`; remove that variable and restart to restore
+  it. This does not disable the Git hook or CI. Document the reason for bypassing
+  and run the checks before submission.
+- The optional Git hook covers aliases, other clients and human shells.
+  `git commit --no-verify` skips that Git hook for one commit;
+  `git config --local --unset core.hooksPath` removes this checkout's explicit
+  hook-path setting. Neither bypasses Claude's PreToolUse guard. Unsetting
+  `APXINF_AGENT_ACCEPTANCE_PLAN` disables only the Stop acceptance guard.
 - Maintainers can additionally request an AI review by commenting
   `/ai-review` on a PR (see `.github/workflows/ai-review.yml`). Its output
   is advisory, like any other review; a human still approves.
