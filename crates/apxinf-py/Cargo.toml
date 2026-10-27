@@ -26,9 +26,8 @@ mlx = ["apxinf-model/mlx"]
 # Enabled by maturin so the cdylib does not link libpython. Left off for
 # `cargo test`, which needs to link a Python interpreter for the harness.
 extension-module = ["pyo3/extension-module"]
-# CPU reference GEMM providers; choose one. With neither, use the Rust fallback.
+# Optional CPU GEMM library. Without OpenBLAS, use the Rust fallback.
 openblas = ["apxinf-core/openblas"]
-accelerate = ["apxinf-core/accelerate"]
 # Forward CUDA support to the model crate. CPU PI0.5 needs no CUDA feature.
 cuda = ["apxinf-model/cuda"]
 # Forward HIP support to the model crate, so `device="hip:N"` reaches the HIP
