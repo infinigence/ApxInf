@@ -28,10 +28,9 @@ CUDA machine (e.g. Thor). Without CUDA the module still imports and reports its
 shape contract, but model loading errors.
 
 ```sh
-# In this crate directory. --features cuda is additive to pyproject's
-# extension-module feature.
-CARGO_TARGET_DIR=../../target/wheel maturin build --release --features cuda --auditwheel skip
-pip install --force-reinstall ../../target/wheel/wheels/apxinf_py-*.whl
+# From the repository root; the wheel includes the Python frontend.
+CARGO_TARGET_DIR=target/wheel maturin build --release --features cuda --auditwheel skip
+pip install --find-links target/wheel/wheels "apxinf==0.2.0"
 ```
 
 On Thor set the usual environment (see repo memory): `APXINF_CUDA_ARCH=sm_110`,

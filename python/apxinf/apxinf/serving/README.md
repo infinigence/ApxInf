@@ -16,10 +16,8 @@ Rust/CUDA build (`APXINF_CUDA_ARCH=sm_87` for Orin, `sm_110` for Thor).
 ## 1. Environment
 
 ```bash
-# engine binding (architecture-specific wheel built from crates/apxinf-py)
-pip install apxinf_py-*.whl
-# numpy frontend: processors + L2 policy + serving
-pip install -e "python/apxinf[serving]"
+# Combined runtime wheel built with the root README instructions
+pip install --find-links target/wheel/wheels "apxinf[serving]==0.2.0"
 # upstream client (for §3)
 pip install openpi-client
 ```
