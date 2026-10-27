@@ -379,7 +379,8 @@ impl AutoModel {
 
         if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip") {
             if device == Device::Cpu && model_name == "pi05" {
-                return crate::pi05::cpu_load::load(path, options);
+                let config = options.config.as_ref().map(cpu_pi05_config);
+                return crate::cpu_pi05::load(path, options, config);
             }
             #[cfg(feature = "hip")]
             if matches!(device, Device::Hip(_)) {
@@ -503,6 +504,43 @@ fn metal_registry_name(model_name: &str) -> String {
             "metal_{}",
             model_name.strip_suffix("-mlx").unwrap_or(model_name)
         )
+    }
+}
+
+/// A frontend's PI0.5 overrides (`LoadOptions::config`, the CUDA family's
+/// type) as the CPU port's own config. Lives here, outside both families, so
+/// neither imports the other.
+fn cpu_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::cpu_pi05::Config {
+    let gemma = |g: &crate::pi05::GemmaVariantConfig| crate::cpu_pi05::config::GemmaConfig {
+        width: g.width,
+        depth: g.depth,
+        mlp_dim: g.mlp_dim,
+        num_heads: g.num_heads,
+        num_kv_heads: g.num_kv_heads,
+        head_dim: g.head_dim,
+    };
+    crate::cpu_pi05::Config {
+        action_dim: frontend.action_dim,
+        action_horizon: frontend.action_horizon,
+        max_token_len: frontend.max_token_len,
+        num_flow_steps: frontend.num_flow_steps,
+        flow_start_time: frontend.flow_start_time,
+        num_views: frontend.num_views,
+        image_size: frontend.image_size,
+        patch_size: frontend.patch_size,
+        vision_width: frontend.vision_width,
+        vision_depth: frontend.vision_depth,
+        vision_mlp_dim: frontend.vision_mlp_dim,
+        vision_heads: frontend.vision_heads,
+        vision_head_dim: frontend.vision_head_dim,
+        vocab_size: frontend.vocab_size,
+        rms_norm_eps: frontend.rms_norm_eps,
+        layer_norm_eps: frontend.layer_norm_eps,
+        rope_theta: frontend.rope_theta,
+        time_min_period: frontend.time_min_period,
+        time_max_period: frontend.time_max_period,
+        language: gemma(&frontend.language),
+        action_expert: gemma(&frontend.action_expert),
     }
 }
 

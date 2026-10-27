@@ -1,21 +1,20 @@
 //! Unfused FP32 PI0.5 reference blocks. BLAS owns projection/attention parallelism.
-use super::Blocks;
-use crate::pi05::weights::{
-    GemmaAttentionWeights, GemmaMlpWeights, LayerNormWeights, LinearWeights, Pi05Weights,
+use crate::cpu_pi05::weights::{
+    GemmaAttentionWeights, GemmaMlpWeights, LayerNormWeights, LinearWeights, Weights,
 };
-use crate::pi05::{GemmaVariantConfig, Pi05Config};
+use crate::cpu_pi05::{Config, GemmaConfig};
 use apxinf_core::{Backend, CpuBackend, Error, Result, Tensor};
 
-pub(in crate::pi05) struct CpuBlocks {
-    config: Pi05Config,
-    weights: Pi05Weights,
+pub(in crate::cpu_pi05) struct CpuPi05Model {
+    config: Config,
+    weights: Weights,
 }
-pub struct CpuPrefix {
+pub struct PrefixKvCache {
     keys: Vec<Tensor>,
     values: Vec<Tensor>,
     tokens: usize,
 }
-pub struct CpuModulation {
+pub struct StepModulation {
     attention: Vec<Tensor>,
     mlp: Vec<Tensor>,
     final_norm: Tensor,
@@ -48,7 +47,7 @@ fn concat(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 fn qkv(
     x: &Tensor,
     w: &GemmaAttentionWeights,
-    c: GemmaVariantConfig,
+    c: GemmaConfig,
     offset: usize,
     theta: f32,
 ) -> Result<(Tensor, Tensor, Tensor)> {
@@ -96,17 +95,17 @@ fn gated_residual(x: &Tensor, update: &Tensor, modulation: &Tensor) -> Result<Te
         .collect();
     Tensor::from_f32(x.shape().clone(), &out)
 }
-impl CpuBlocks {
-    pub(in crate::pi05) fn new(config: Pi05Config, weights: Pi05Weights) -> Result<Self> {
+impl CpuPi05Model {
+    pub(in crate::cpu_pi05) fn new(config: Config, weights: Weights) -> Result<Self> {
         config.validate()?;
-        let weights = weights.into_cpu_f32(&config)?;
+        let weights = weights.into_f32(&config)?;
         Ok(Self { config, weights })
     }
-    fn modulation(&self, time: &Tensor) -> Result<CpuModulation> {
+    fn modulation(&self, time: &Tensor) -> Result<StepModulation> {
         let w = &self.weights;
         let cond = CpuBackend.silu(&linear(time, &w.time_mlp_in)?)?;
         let cond = CpuBackend.silu(&linear(&cond, &w.time_mlp_out)?)?;
-        Ok(CpuModulation {
+        Ok(StepModulation {
             attention: w
                 .action_layers
                 .iter()
@@ -121,14 +120,8 @@ impl CpuBlocks {
         })
     }
 }
-impl Blocks for CpuBlocks {
-    type TokenIds = [u32];
-    type Prefix = CpuPrefix;
-    type StepModulation = CpuModulation;
-    fn config(&self) -> &Pi05Config {
-        &self.config
-    }
-    fn vision(&self, patches: &Tensor, _native: bool) -> Result<Tensor> {
+impl CpuPi05Model {
+    fn vision(&self, patches: &Tensor) -> Result<Tensor> {
         let c = &self.config;
         let w = &self.weights.vision;
         let n = c.patches_per_view();
@@ -195,7 +188,7 @@ impl Blocks for CpuBlocks {
             &CpuBackend.scale(&lang, (self.config.language.width as f32).sqrt())?,
         )
     }
-    fn prefix(&self, input: &Tensor) -> Result<CpuPrefix> {
+    fn prefix(&self, input: &Tensor) -> Result<PrefixKvCache> {
         let c = &self.config;
         let mut hidden = input.clone();
         let mut keys = Vec::new();
@@ -216,29 +209,36 @@ impl Blocks for CpuBlocks {
             keys.push(k);
             values.push(v);
         }
-        Ok(CpuPrefix {
+        Ok(PrefixKvCache {
             keys,
             values,
             tokens: input.shape().dims()[0],
         })
     }
-    fn prepare_modulation(&self, embeddings: &[Tensor]) -> Result<Vec<CpuModulation>> {
+    pub(super) fn prepare_all_modulation(
+        &self,
+        embeddings: &[Tensor],
+    ) -> Result<Vec<StepModulation>> {
         if embeddings.len() != self.config.num_flow_steps {
             return Err(Error::Other("PI0.5 CPU timestep count mismatch".into()));
         }
         embeddings.iter().map(|e| self.modulation(e)).collect()
     }
-    fn eager_modulation(&self, e: &[Tensor]) -> Result<Option<Vec<CpuModulation>>> {
-        self.prepare_modulation(e).map(Some)
-    }
-    fn step(&self, state: &Tensor, time: &Tensor, prefix: &CpuPrefix, dt: f32) -> Result<Tensor> {
+    #[cfg(test)]
+    fn step(
+        &self,
+        state: &Tensor,
+        time: &Tensor,
+        prefix: &PrefixKvCache,
+        dt: f32,
+    ) -> Result<Tensor> {
         self.step_with_modulation(state, &self.modulation(time)?, prefix, dt)
     }
     fn step_with_modulation(
         &self,
         state: &Tensor,
-        m: &CpuModulation,
-        prefix: &CpuPrefix,
+        m: &StepModulation,
+        prefix: &PrefixKvCache,
         dt: f32,
     ) -> Result<Tensor> {
         let c = &self.config;
@@ -271,6 +271,30 @@ impl Blocks for CpuBlocks {
     }
 }
 
+impl CpuPi05Model {
+    /// CPU-owned forward order and Euler schedule. No CUDA model dependency.
+    pub(super) fn infer_with_modulation(
+        &self,
+        patches: &Tensor,
+        ids: &[u32],
+        noise: &Tensor,
+        modulation: &[StepModulation],
+    ) -> Result<Tensor> {
+        if modulation.len() != self.config.num_flow_steps {
+            return Err(Error::Other("PI0.5 CPU modulation count mismatch".into()));
+        }
+        let vision = self.vision(patches)?;
+        let prefix = self.embed_prefix(&vision, ids, ids.len())?;
+        let prefix = self.prefix(&prefix)?;
+        let dt = -self.config.flow_start_time / self.config.num_flow_steps as f32;
+        let mut state = noise.clone();
+        for m in modulation {
+            state = self.step_with_modulation(&state, m, &prefix, dt)?;
+        }
+        Ok(state)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,7 +304,7 @@ mod tests {
         let dir = std::path::PathBuf::from(
             std::env::var("APXINF_PI05_CPU_REFERENCE").expect("fixture directory"),
         );
-        let lang = GemmaVariantConfig {
+        let lang = GemmaConfig {
             width: 8,
             depth: 2,
             mlp_dim: 12,
@@ -288,7 +312,7 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 4,
         };
-        let c = Pi05Config {
+        let c = Config {
             action_dim: 3,
             action_horizon: 3,
             max_token_len: 4,
@@ -303,14 +327,10 @@ mod tests {
             vision_head_dim: 4,
             vocab_size: 16,
             language: lang,
-            action_expert: GemmaVariantConfig { width: 6, ..lang },
-            ..Pi05Config::default()
+            action_expert: GemmaConfig { width: 6, ..lang },
+            ..Config::default()
         };
-        let b = CpuBlocks::new(
-            c.clone(),
-            Pi05Weights::from_safetensors_cpu(&c, &dir).unwrap(),
-        )
-        .unwrap();
+        let b = CpuPi05Model::new(c.clone(), Weights::from_safetensors(&c, &dir).unwrap()).unwrap();
         let cases: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("cases.json")).unwrap())
                 .unwrap();
@@ -350,7 +370,7 @@ mod tests {
                 }
             }
             let vision = b
-                .vision(&Tensor::from_f32(vec![8, 12], &patches).unwrap(), false)
+                .vision(&Tensor::from_f32(vec![8, 12], &patches).unwrap())
                 .unwrap();
             check(&vision, &case["vision"]);
             let ids: Vec<u32> = serde_json::from_value(case["tokens"].clone()).unwrap();
@@ -364,7 +384,7 @@ mod tests {
             let noise: Vec<f32> = serde_json::from_value(case["noise"].clone()).unwrap();
             let mut state = Tensor::from_f32(vec![3, 3], &noise).unwrap();
             for step in 0..3 {
-                let time = crate::pi05::sinusoidal_time_embedding(
+                let time = crate::cpu_pi05::config::sinusoidal_time_embedding(
                     1. - step as f32 / 3.,
                     6,
                     c.time_min_period,

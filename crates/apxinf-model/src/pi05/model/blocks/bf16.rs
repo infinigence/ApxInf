@@ -1141,7 +1141,6 @@ pub(in crate::pi05::model) mod backbone {
     }
 
     impl super::super::Blocks for Bf16Blocks {
-        type TokenIds = CudaBuffer;
         type Prefix = Bf16PrefixKvCache;
         type StepModulation = Bf16StepModulation;
         fn config(&self) -> &Pi05Config {

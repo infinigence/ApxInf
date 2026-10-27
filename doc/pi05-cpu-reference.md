@@ -1,8 +1,8 @@
 # PI0.5 CPU reference
 
 PI0.5 supports `Device::Cpu` with `model_variant="fp32_reference"` (also selected
-by `auto` on CPU). It executes the existing `Pi05Model` dataflow with unfused
-FP32 Blocks, without a CUDA toolkit or GPU. This is a numerical reference path;
+by `auto` on CPU). Its self-contained `cpu_pi05` implementation executes unfused
+FP32 operations, without a CUDA toolkit or GPU. This is a numerical reference path;
 it does not emulate BF16/FP8/INT8 rounding or promise production CPU latency.
 
 ## Build and run
@@ -68,18 +68,22 @@ policy responsibilities. `pi05-cuda` continues to require CUDA.
 
 ## Contract and ownership
 
-- `cpu_load.rs` selects CPU assets and assembles the model and runner. CUDA
-  variant resolution remains in `load.rs`.
-- `weights/cpu.rs` converts unquantized F32/F16/BF16 checkpoint tensors to FP32
-  **before** host checkpoint transformations, preserving the FP32 Gemma norm
-  offset and scale-folding calculation. It validates CPU-consumed weight shapes.
-- `model/blocks/cpu.rs` implements vision, prefix KV, adaptive normalization,
-  attention, gated MLP and Euler updates. The shared `model/mod.rs` retains
-  forward order and the flow loop. `Blocks::TokenIds` is `[u32]` on CPU and a
-  device buffer on CUDA; `model/cuda.rs` contains CUDA preparation contracts.
-- `model_runner/cpu.rs` owns fixed timestep modulation, request validation,
-  host RGB patchification, noise generation and explicit eager plans. Output
-  storage is newly allocated per call and remains valid after subsequent calls.
+The `cpu_pi05/` port owns its implementation independently of `pi05/` (CUDA)
+and `hip_pi05/`. It does not import their configuration, weights or model code.
+The existing CUDA directory is unchanged. Copies are intentional; independent
+reference fixtures establish agreement between ports.
+
+- `config.rs` owns CPU geometry, checkpoint configuration and timestep math.
+  `AutoModel` converts the historical `LoadOptions.config` into this local type
+  outside both model directories, just as it does for HIP.
+- `load.rs` selects CPU assets and assembles the concrete model and runner.
+- `weights.rs` owns checkpoint mapping and converts F32/F16/BF16 tensors to FP32
+  before norm offset and scale-folding transformations. It validates consumed shapes.
+- `model.rs` owns vision, prefix KV, adaptive normalization, attention, gated MLP,
+  forward order and the Euler flow loop in `CpuPi05Model`. There is no generic
+  Blocks trait or precision-dispatch enum for this single implementation.
+- `runner.rs` owns `CpuPi05Runner`: request validation, RGB patchification,
+  fixed timestep modulation, noise generation and explicit eager plans.
 - `apxinf-core` owns generic FP32 math. Dense GQA/MHA packs one head at a time
   and uses BLAS GEMM for both QK-transpose and probability-times-V, with a stable
   Rust softmax. It is non-causal; image views are independent batches, prefix
@@ -110,7 +114,7 @@ roughly four bytes per parameter, plus loading temporaries and activations.
 The maintained CPU tests cover public loading, RGB/patch layout equivalence,
 changed RNG inputs, retained outputs/plans, eager readiness, graph rejection and
 invalid requests. Core tests compare dense grouped attention to scalar FP64
-arithmetic. The original shared-flow tests now run without CUDA.
+arithmetic. CPU intermediate-stage tests exercise the port's own model.
 
 An ignored end-to-end test accepts a private tiny-model checkpoint/fixture via
 `APXINF_PI05_CPU_REFERENCE`; a companion ignored unit test compares vision,
@@ -157,8 +161,8 @@ not embodiment normalization accuracy. Linux OpenBLAS core/storage tests
 CPU extension links OpenBLAS without CUDA or OpenMP runtime dependencies.
 
 
-Native CUDA compilation and a BF16 regression on Thor also passed. The same
+Before backend isolation, native CUDA compilation and a BF16 regression on Thor passed. The same
 four full-size inputs produced bitwise-identical outputs between this change
 and main baseline `e9da4bd3967e18331cf13ffc44bded61a6b32075`; both builds were
-bitwise stable across consecutive repeats. This checks that the shared model
-refactor preserves the existing CUDA path, independently of FP32 CPU parity.
+bitwise stable across consecutive repeats. This is historical evidence for the earlier revision; the isolated CPU port
+restores the CUDA model directory exactly to main.

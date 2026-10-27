@@ -1,6 +1,6 @@
 //! Synchronous CPU execution. Explicit plans retain the model and never claim graph readiness.
-use crate::pi05::model::{CpuModel, CpuStepModulation};
-use crate::pi05::{sinusoidal_time_embedding, Pi05Config};
+use super::config::{sinusoidal_time_embedding, Config};
+use crate::cpu_pi05::model::{CpuPi05Model, StepModulation};
 use crate::vla::{
     Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent,
     PreparationStatus, PreparedInference, VisionObservation, VlaContract, VlaRequest, VlaRuntime,
@@ -9,13 +9,13 @@ use apxinf_core::{standard_normal_f32, DType, Device, Error, Result, Tensor};
 use std::rc::Rc;
 
 #[derive(Clone)]
-pub(in crate::pi05) struct CpuModelRunner {
-    config: Pi05Config,
-    model: Rc<CpuModel>,
-    modulation: Rc<Vec<CpuStepModulation>>,
+pub(in crate::cpu_pi05) struct CpuPi05Runner {
+    config: Config,
+    model: Rc<CpuPi05Model>,
+    modulation: Rc<Vec<StepModulation>>,
 }
-impl CpuModelRunner {
-    pub(in crate::pi05) fn new(config: Pi05Config, model: Rc<CpuModel>) -> Result<Self> {
+impl CpuPi05Runner {
+    pub(in crate::cpu_pi05) fn new(config: Config, model: Rc<CpuPi05Model>) -> Result<Self> {
         let embeddings = (0..config.num_flow_steps)
             .map(|i| {
                 let t = config.flow_start_time * (1. - i as f32 / config.num_flow_steps as f32);
@@ -140,12 +140,12 @@ fn host_f32(t: &Tensor, shape: [usize; 2], name: &str) -> Result<Tensor> {
         Tensor::from_f32(shape.to_vec(), &values)
     }
 }
-struct CpuPrepared {
-    runner: CpuModelRunner,
+struct CpuPi05Prepared {
+    runner: CpuPi05Runner,
     spec: InferenceSpec,
     fallback: bool,
 }
-impl PreparedInference for CpuPrepared {
+impl PreparedInference for CpuPi05Prepared {
     fn spec(&self) -> &InferenceSpec {
         &self.spec
     }
@@ -166,7 +166,7 @@ impl PreparedInference for CpuPrepared {
         self.runner.infer(request)
     }
 }
-impl VlaRuntime for CpuModelRunner {
+impl VlaRuntime for CpuPi05Runner {
     fn model_variant(&self) -> Option<&'static str> {
         Some("fp32_reference")
     }
@@ -198,7 +198,6 @@ impl VlaRuntime for CpuModelRunner {
         let out = self.model.infer_with_modulation(
             &patches,
             &request.observation.token_ids,
-            request.observation.token_ids.len(),
             &noise,
             &self.modulation,
         )?;
@@ -246,7 +245,7 @@ impl VlaRuntime for CpuModelRunner {
         };
         let noise = Tensor::zeros(self.action_shape().to_vec(), DType::F32);
         self.infer(&VlaRequest::provided(&observation, &noise))?;
-        Ok(Box::new(CpuPrepared {
+        Ok(Box::new(CpuPi05Prepared {
             runner: self.clone(),
             spec: *spec,
             fallback: policy == ExecutionPolicy::PreferGraph,
@@ -264,7 +263,7 @@ impl VlaRuntime for CpuModelRunner {
             ));
         }
         self.infer(sample)?;
-        Ok(Box::new(CpuPrepared {
+        Ok(Box::new(CpuPi05Prepared {
             runner: self.clone(),
             spec: sample.observation.inference_spec(),
             fallback: policy == ExecutionPolicy::PreferGraph,

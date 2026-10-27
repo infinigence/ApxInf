@@ -1177,7 +1177,6 @@ pub(in crate::pi05::model) mod backbone {
     }
 
     impl super::super::Blocks for Int8DynamicBlocks {
-        type TokenIds = CudaBuffer;
         type Prefix = Int8DynamicPrefixKvCache;
         type StepModulation = Int8DynamicStepModulation;
         fn config(&self) -> &Pi05Config {

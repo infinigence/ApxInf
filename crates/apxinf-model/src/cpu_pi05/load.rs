@@ -1,13 +1,18 @@
 //! CPU asset selection and assembly; no CUDA context is created.
-use super::model::{CpuBlocks, CpuModel};
-use super::model_runner::cpu::CpuModelRunner;
-use super::{Pi05Config, Pi05Weights};
+use super::config::Config;
+use super::model::CpuPi05Model;
+use super::runner::CpuPi05Runner;
+use super::weights::Weights;
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Error, Result};
 use std::path::Path;
 use std::rc::Rc;
 
-pub(crate) fn load(path: &Path, options: &LoadOptions) -> Result<LoadedModel> {
+pub(crate) fn load(
+    path: &Path,
+    options: &LoadOptions,
+    config: Option<Config>,
+) -> Result<LoadedModel> {
     if options.precision != ModelPrecision::Auto {
         return Err(Error::Other(
             "PI0.5 CPU uses model_variant=fp32_reference instead of precision".into(),
@@ -35,12 +40,12 @@ pub(crate) fn load(path: &Path, options: &LoadOptions) -> Result<LoadedModel> {
     } else {
         path.parent().unwrap_or(Path::new("."))
     };
-    let mut config = if let Some(c) = &options.config {
-        c.clone()
+    let mut config = if let Some(c) = config {
+        c
     } else if root.join("config.json").is_file() {
-        Pi05Config::from_json_file(&root.join("config.json"))?
+        Config::from_json_file(&root.join("config.json"))?
     } else {
-        Pi05Config::default()
+        Config::default()
     };
     if let Some(views) = options.num_views {
         if views == 0 || views > config.num_views {
@@ -52,14 +57,11 @@ pub(crate) fn load(path: &Path, options: &LoadOptions) -> Result<LoadedModel> {
     }
     config.validate()?;
     let weights = match options.synthetic {
-        Some(s) => Pi05Weights::synthetic(&config, s.seed)?,
-        None => Pi05Weights::from_safetensors_cpu(&config, path)?,
+        Some(s) => Weights::synthetic(&config, s.seed)?,
+        None => Weights::from_safetensors(&config, path)?,
     };
-    let model = Rc::new(CpuModel::from_blocks(CpuBlocks::new(
-        config.clone(),
-        weights,
-    )?));
-    Ok(LoadedModel::Vla(Box::new(CpuModelRunner::new(
+    let model = Rc::new(CpuPi05Model::new(config.clone(), weights)?);
+    Ok(LoadedModel::Vla(Box::new(CpuPi05Runner::new(
         config, model,
     )?)))
 }
