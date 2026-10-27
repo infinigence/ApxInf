@@ -17,6 +17,7 @@ assert runtime.version == apxinf.__version__ == apxinf_py.__version__
 owned = {Path(runtime.locate_file(file)).resolve() for file in runtime.files}
 assert Path(apxinf.__file__).resolve() in owned
 assert Path(apxinf_py.__file__).resolve() in owned
+assert Path(apxinf_py.__file__).with_name("apxinf_py.pyi").is_file()
 assert ModelRunner is apxinf_py.ModelRunner
 assert callable(ModelRunner.load)
 assert callable(AutoPolicy.from_pretrained)
