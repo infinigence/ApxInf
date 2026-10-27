@@ -166,3 +166,14 @@ four full-size inputs produced bitwise-identical outputs between this change
 and main baseline `e9da4bd3967e18331cf13ffc44bded61a6b32075`; both builds were
 bitwise stable across consecutive repeats. This is historical evidence for the earlier revision; the isolated CPU port
 restores the CUDA model directory exactly to main.
+
+
+After isolating the implementation in `cpu_pi05/`, the four full-checkpoint
+inputs were replayed against the frozen OpenPI outputs above and the previous
+CPU outputs. All reference comparisons still pass, and pre/post-isolation CPU
+outputs are bitwise identical. Both public Python policy cases also passed
+again, with identical normalized actions, returned actions and seeded outputs.
+The isolated port passes 12 module tests (including intermediate-stage parity),
+five public integration tests (including checkpoint parity), the model-family
+boundary checks, and combined `cuda,hip` feature compilation. Neither `pi05/`
+nor `hip_pi05/` differs from main revision `01232a9a`.
