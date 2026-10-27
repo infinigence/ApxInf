@@ -87,8 +87,8 @@ cargo test -p apxinf-py
 
 ## PI0.5 CPU reference
 
-Build with `maturin develop --features openblas` (Linux/system OpenBLAS) or
-`--features accelerate` (macOS), and load PI0.5 with `device="cpu"`,
+Build with `maturin develop --features openblas` on Linux or macOS with
+OpenBLAS installed, and load PI0.5 with `device="cpu"`,
 `model_variant="fp32_reference"`. This FP32 path is eager-only and requires no
 CUDA toolkit. See the [CPU contract](../../doc/pi05-cpu-reference.md) for input
 limitations, threading, and verification scope.

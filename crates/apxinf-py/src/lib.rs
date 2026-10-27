@@ -23,7 +23,7 @@
 //! lives here.
 //!
 //! PI0.5 supports CPU inference with its FP32 reference variant and optional
-//! OpenBLAS or Accelerate GEMM. CUDA model variants require the `cuda` feature
+//! OpenBLAS GEMM. CUDA model variants require the `cuda` feature
 //! and a CUDA device.
 //!
 
