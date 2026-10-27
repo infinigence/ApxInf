@@ -7,23 +7,18 @@ it does not emulate BF16/FP8/INT8 rounding or promise production CPU latency.
 
 ## Build and run
 
-Linux with a system multithreaded OpenBLAS installation:
+Linux and macOS use the same CPU backend with an installed multithreaded
+OpenBLAS library:
 
 ```bash
 cargo test -p apxinf-model --features apxinf-core/openblas --test cpu_pi05
 ```
 
-macOS with Apple Accelerate:
-
-```bash
-cargo test -p apxinf-model --features apxinf-core/accelerate --test cpu_pi05
-```
-
-Choose one BLAS feature. Without either feature, GEMM uses the serial Rust
+Without the `openblas` feature, GEMM uses the serial Rust
 fallback, useful for small tests but very slow for full PI0.5. For OpenBLAS
 outside the system library search path, set `OPENBLAS_LIB_DIR` to its library
 directory; runtime dynamic-library lookup must also be configured appropriately.
-The root crate and Python extension expose `openblas` and `accelerate` features.
+The root crate and Python extension expose the `openblas` feature.
 
 A pthreads OpenBLAS build manages its threads internally; for example,
 `OPENBLAS_NUM_THREADS=8`. An OpenMP OpenBLAS build instead uses
@@ -123,7 +118,7 @@ the fixed small geometry in the tests and are not production checkpoints.
 Generated checkpoints, independent reference code and results stay under
 `devlocal/pi05-cpu-reference/`, outside Git.
 
-The Rust fallback, Apple Accelerate, and pthreads OpenBLAS (1 and 4 threads)
+The Rust fallback and pthreads OpenBLAS (1 and 4 threads)
 were locally checked on macOS arm64 with a small independent PyTorch
 implementation using unchanged norm/RoPE helpers from OpenPI revision
 `215abfb217dbac7d5f1273282331b9b1866c0479`.
