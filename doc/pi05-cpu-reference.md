@@ -11,7 +11,7 @@ Linux and macOS use the same CPU backend with an installed multithreaded
 OpenBLAS library:
 
 ```bash
-cargo test -p apxinf-model --features apxinf-core/openblas --test cpu_pi05
+cargo test -p apxinf-model --features openblas --test cpu_pi05
 ```
 
 Without the `openblas` feature, GEMM uses the serial Rust
@@ -79,11 +79,22 @@ reference fixtures establish agreement between ports.
   Blocks trait or precision-dispatch enum for this single implementation.
 - `runner.rs` owns `CpuPi05Runner`: request validation, RGB patchification,
   fixed timestep modulation, noise generation and explicit eager plans.
-- `apxinf-core` owns generic FP32 math. Dense GQA/MHA packs one head at a time
+- `apxinf-cpu` owns generic FP32 math. Dense GQA/MHA packs one head at a time
   and uses BLAS GEMM for both QK-transpose and probability-times-V, with a stable
   Rust softmax. It is non-causal; image views are independent batches, prefix
   queries see the whole prefix, and action queries see prefix plus all action
   tokens. No prefix query sees action tokens.
+
+`apxinf-cpu` is a separate backend crate, depending on `apxinf-core` for
+`Backend`, `Tensor`, `KvCache` and sampling contracts. CPU operators, concrete
+KV storage, samplers and OpenBLAS linking live in the CPU crate. Core has no BLAS
+features or dependency on a backend. The CPU crate exposes only `openblas` for
+BLAS selection; no Apple-specific accelerator feature is introduced.
+
+Rust callers import `CpuBackend` and `CpuKVCache` from `apxinf_cpu`.
+`Tensor::matmul_cpu` is replaced by `CpuBackend.matmul(&a, &b)` with the
+`apxinf_core::Backend` trait in scope. HIP's existing host sampling fallback
+explicitly depends on the CPU crate; CUDA uses it only in comparison tests.
 
 Inputs are normalized patch rows or already resized RGB `u8` in NHWC/NCHW.
 Patch flattening is channel, patch-y, patch-x. Host FP32/F16/BF16 patches and
@@ -108,7 +119,7 @@ roughly four bytes per parameter, plus loading temporaries and activations.
 
 The maintained CPU tests cover public loading, RGB/patch layout equivalence,
 changed RNG inputs, retained outputs/plans, eager readiness, graph rejection and
-invalid requests. Core tests compare dense grouped attention to scalar FP64
+invalid requests. CPU backend tests compare dense grouped attention to scalar FP64
 arithmetic. CPU intermediate-stage tests exercise the port's own model.
 
 An ignored end-to-end test accepts a private tiny-model checkpoint/fixture via
@@ -172,3 +183,14 @@ The isolated port passes 12 module tests (including intermediate-stage parity),
 five public integration tests (including checkpoint parity), the model-family
 boundary checks, and combined `cuda,hip` feature compilation. Neither `pi05/`
 nor `hip_pi05/` differs from main revision `01232a9a`.
+
+After extracting `apxinf-cpu`, the same four full-checkpoint cases and two public
+Python policy cases were replayed on Linux OpenBLAS. All outputs remain bitwise
+identical to the prior CPU implementation, including normalized actions and
+seeded outputs; all four frozen OpenPI comparisons still pass. The CPU backend's
+15 tests pass with Rust GEMM and OpenBLAS on macOS; Linux OpenBLAS backend/core
+and storage tests also pass. The 17 PI0.5 module/integration checks pass, as do
+CUDA/HIP feature compilation and workspace library/binary compilation.
+Workspace-wide test compilation still fails in the existing CUDA-new
+`qwen38_gdn_batched_ops` FlashInfer symbols on macOS; the same failure was
+reproduced at pre-extraction commit `1a470986`.
