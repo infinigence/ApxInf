@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1] / "crates/apxinf-model/src/pi05"
 RULES = {
     "model": r"\b(model_runner|Pi05ModelRunner|Pi05PreparedInference|ExecStrategy|CapturedGraph|ExecutionPolicy|VlaRequest|InferenceSpec)\b",
     "weights": r"\b(Pi05Model|ModelVariant|Pi05ModelRunner|Pi05PreparedInference)\b|\b(model_runner|model)\s*::|::(?:model_runner|model)\b|\buse\s+[^;]*\{[^;]*\b(?:model_runner|model)\b",
-    "model_runner": r"\b(Bf16Blocks|Fp8StaticBlocks|Int8DynamicBlocks|CpuBlocks)\b|ModelVariant\s*::",
+    "model_runner": r"\b(Bf16Blocks|Fp8StaticBlocks|Int8DynamicBlocks)\b|ModelVariant\s*::",
 }
 
 def source(path):

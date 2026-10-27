@@ -216,9 +216,14 @@ fn cpu_rejects_invalid_variants_and_requests() {
     assert!(vla.infer(&VlaRequest::provided(&obs, &nan)).is_err());
     obs.state = Some(noise.clone());
     assert!(vla.infer(&VlaRequest::provided(&obs, &noise)).is_err());
-    let mut c = config();
-    c.patch_size = 0;
-    assert!(c.validate().is_err());
+    // Frontend overrides are converted at AutoModel's boundary; validation
+    // belongs to the independent CPU config, not the CUDA config type.
+    let mut opts = options();
+    opts.config.as_mut().unwrap().patch_size = 0;
+    assert!(AutoModel::load_model(Device::Cpu, ".", &opts).is_err());
+    opts.config = Some(config());
+    opts.config.as_mut().unwrap().language.num_kv_heads = 0;
+    assert!(AutoModel::load_model(Device::Cpu, ".", &opts).is_err());
 }
 
 /// Private fixtures: raw HF-layout checkpoint + cases.json with RGB, tokens, latent, expected.
