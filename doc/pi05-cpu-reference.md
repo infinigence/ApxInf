@@ -10,13 +10,13 @@ it does not emulate BF16/FP8/INT8 rounding or promise production CPU latency.
 Linux with a system multithreaded OpenBLAS installation:
 
 ```bash
-cargo test -p apxinf-model --features apxinf-core/openblas --test pi05_cpu
+cargo test -p apxinf-model --features apxinf-core/openblas --test cpu_pi05
 ```
 
 macOS with Apple Accelerate:
 
 ```bash
-cargo test -p apxinf-model --features apxinf-core/accelerate --test pi05_cpu
+cargo test -p apxinf-model --features apxinf-core/accelerate --test cpu_pi05
 ```
 
 Choose one BLAS feature. Without either feature, GEMM uses the serial Rust
