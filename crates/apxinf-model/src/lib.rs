@@ -27,6 +27,7 @@ pub mod registry;
 pub mod smolvla;
 pub mod vla;
 mod walloss;
+pub mod cuda_xvla;
 
 pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWeights};
 pub use builtin::register_builtin_models;

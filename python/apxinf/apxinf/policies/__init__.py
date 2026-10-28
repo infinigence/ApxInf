@@ -46,6 +46,7 @@ from .impls import (
     QwenDrivePolicy,
     SmolVlaPolicy,
     WallossPolicy,
+    XvlaPolicy,
 )
 
 __all__ = [
@@ -66,4 +67,5 @@ __all__ = [
     "QwenDrivePolicy",
     "SmolVlaPolicy",
     "WallossPolicy",
+    "XvlaPolicy",
 ]

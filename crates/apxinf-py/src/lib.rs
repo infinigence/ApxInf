@@ -388,6 +388,20 @@ struct PreprocessedVlaInput {
 }
 
 impl ModelRunner {
+    fn require_rgb_contract(&self, method: &str) -> PyResult<VlaContract> {
+        if !self.contract.accepts_rgb_u8 {
+            Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: loaded model accepts preprocessed patches, not RGB"
+            )))
+        } else if self.contract.num_views == 0 || self.contract.image_size == 0 {
+            Err(PyValueError::new_err(format!(
+                "apxinf_py.{method}: variable-grid RGB requires the model policy bridge"
+            )))
+        } else {
+            Ok(self.contract)
+        }
+    }
+
     /// Shared front half of every RGB entry point. Bytes are checked against
     /// the request grids when given (one still frame per view, any patch
     /// grid), otherwise against the fixed `num_views x image_size` contract.
@@ -1618,6 +1632,100 @@ impl ModelRunner {
             None => {
                 let rng = self.next_sampling_rng()?;
                 self.run_generated(py, observation, rng, grids.as_deref())
+            }
+        }
+    }
+
+    /// **L1** raw-RGB inference for stateful, fixed-view VLA runtimes.
+    ///
+    /// X-VLA consumes camera frames, a proprioceptive vector, an instruction
+    /// token sequence and a domain id. `rgb_u8` carries one complete frame per
+    /// supplied camera in view order (`1..=num_views` frames); the runtime pads
+    /// the missing views exactly as the reference processor does. `state` is a
+    /// `float32` `[proprio_dim]` vector and `embodiment_id` selects the domain
+    /// row of the checkpoint's domain-aware projections.
+    #[pyo3(name = "infer_rgb_state", signature = (rgb_u8, layout, token_ids, state, embodiment_id, noise=None))]
+    fn infer_rgb_state<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArray1<'py, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        state: PyReadonlyArray1<'py, f32>,
+        embodiment_id: usize,
+        noise: Option<PyReadonlyArray2<'py, f32>>,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let contract = self.require_rgb_contract("infer_rgb_state")?;
+        let layout = parse_layout(layout)?;
+        let frame_bytes = contract.image_size * contract.image_size * 3;
+        let bytes = rgb_u8
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_state: rgb_u8 must be C-contiguous uint8",
+                )
+            })?
+            .to_vec();
+        if bytes.is_empty() || bytes.len() % frame_bytes != 0 {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.infer_rgb_state: rgb_u8 must contain whole {}x{}x3 frames, got {} bytes",
+                contract.image_size,
+                contract.image_size,
+                bytes.len()
+            )));
+        }
+        let views = bytes.len() / frame_bytes;
+        if views > contract.num_views {
+            return Err(PyValueError::new_err(format!(
+                "apxinf_py.infer_rgb_state: got {views} camera views, model accepts at most {}",
+                contract.num_views
+            )));
+        }
+        let tokens = token_ids
+            .as_slice()
+            .map_err(|_| {
+                PyValueError::new_err(
+                    "apxinf_py.infer_rgb_state: token_ids must be C-contiguous uint32",
+                )
+            })?
+            .to_vec();
+        self.validate_tokens(&tokens)?;
+        let state_data = state.as_slice().map_err(|_| {
+            PyValueError::new_err("apxinf_py.infer_rgb_state: state must be C-contiguous float32")
+        })?;
+        if state_data.is_empty() {
+            return Err(PyValueError::new_err(
+                "apxinf_py.infer_rgb_state: state must be non-empty",
+            ));
+        }
+        let state = Tensor::from_f32(Shape::new(vec![state_data.len()]), state_data)
+            .map_err(runtime_err)?;
+        let observation = Observation {
+            vision: VisionObservation::RgbU8 { bytes, layout },
+            token_ids: tokens,
+            state: Some(state),
+            action_mask: None,
+        };
+        let metadata = VlaMetadata {
+            embodiment_id: Some(embodiment_id),
+            ..VlaMetadata::default()
+        };
+        match noise {
+            Some(noise) => {
+                let noise_tensor = self.noise_tensor(noise)?;
+                let request =
+                    VlaRequest::provided_with_metadata(&observation, &noise_tensor, metadata);
+                let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+                self.action_array(py, flat)
+            }
+            None => {
+                let request = VlaRequest::generated_with_metadata(
+                    &observation,
+                    self.next_sampling_rng()?,
+                    metadata,
+                );
+                let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+                self.action_array(py, flat)
             }
         }
     }

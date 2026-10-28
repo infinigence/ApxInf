@@ -1276,7 +1276,7 @@ pub fn softmax(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     let cols = *dims.last().unwrap();
 
     let out_bytes = input.size_in_bytes();
-    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let out_buf = crate::workspace::output_buffer(ctx, out_bytes)?;
 
     unsafe {
         let res = match input.dtype() {

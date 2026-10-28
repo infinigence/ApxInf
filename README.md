@@ -169,6 +169,43 @@ and that model's tokenizer/normalizer assets); none ships with this package.
 Resize, tokenization, normalization, and the flow sampler all run inside `infer`
 — pass raw frames.
 
+### Run X-VLA
+
+X-VLA checkpoints dispatch through the same `AutoPolicy` entry point
+(`config.json` declares `model_type: "xvla"`).
+
+```python
+import numpy as np
+from apxinf import AutoPolicy
+
+policy = AutoPolicy.from_pretrained("<path-to-X-VLA-Libero>")
+
+observation = {
+    "image0": np.zeros((224, 224, 3), np.uint8),      # base camera, RGB
+    "image1": np.zeros((224, 224, 3), np.uint8),      # wrist camera, RGB
+    "proprio": np.zeros(20, np.float32),              # optional, zero-padded
+    "language_instruction": "put both moka pots on the stove",
+}
+
+result = policy.infer(observation)
+result["actions"]   # (30, 20) float32 ee6d chunk, raw model output
+policy.close()
+```
+
+The checkpoint directory needs `model.safetensors`, `config.json`, `tokenizer.json`
+(BART) and `preprocessor_config.json` (CLIPImageProcessor, bicubic 224); none ships
+with this package. Pass raw `uint8` RGB frames: the policy resizes them to 224 with
+PIL bicubic, and the runtime normalizes and patchifies on device.
+
+- `image_keys` defaults to `("image0", "image1")`; one to three views are accepted.
+  Views that are not supplied are zero-padded by the model.
+- `proprio` is the end-effector state (20 values for LIBERO); shorter vectors are
+  zero-padded.
+- `domain_id` defaults to `3` (LIBERO); set it for another embodiment.
+- The first call captures the vision tower, the language encoder and the 10-step
+  flow loop into CUDA graphs; later calls replay them. If capture is unavailable
+  the runtime reports the reason and runs eagerly.
+
 ### Serve it with OpenPI compatible websocket server
 
 ```bash
@@ -292,6 +329,18 @@ Two views, 512x512 NHWC `uint8`, batch 1.
 | Jetson AGX Orin | BF16 | 67.4 ms | 14.8 Hz |
 | Jetson Xavier NX | FP16 | 312.38 ms | 3.2 Hz |
 | RTX 4090 | BF16 | 13.47 ms | 74.2 Hz |
+
+### X-VLA
+
+Two views, 224x224 NHWC `uint8`, batch 1, `X-VLA-Libero` checkpoint. Latency is
+steady-state CUDA-graph replay P50 over 30 samples after 10 warm-ups (3 runs);
+the cold first inference, including eager warm-up and graph capture, is 482 ms.
+The Python surface always selects `PreferGraph`. Reproduce with
+`scripts/bench_xvla.py`; parity method and limits in [doc/xvla.md](doc/xvla.md).
+
+| Hardware | Precision | Latency | Throughput |
+|---|---|---:|---:|
+| RTX 4090 | BF16 | 39.95 ms | 25.0 Hz |
 
 
 ## Port a new model with an agent

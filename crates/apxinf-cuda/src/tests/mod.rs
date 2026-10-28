@@ -3,6 +3,7 @@ mod fp8;
 mod operators;
 mod sampling;
 mod w8a8;
+mod xvla;
 
 /// Serializes tests that configure large dynamic shared memory on the GPU.
 ///

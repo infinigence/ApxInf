@@ -1785,3 +1785,83 @@ extern "C" {
         stream: cudaStream_t,
     ) -> cudaError_t;
 }
+
+extern "C" {
+    pub fn apxinf_xvla_rgb_u8_to_normalized_tokens_bf16(
+        rgb: *const c_void,
+        output: *mut c_void,
+        height: i32,
+        width: i32,
+        mean: *const f32,
+        std: *const f32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_xvla_im2col_bf16(
+        input: *const c_void,
+        columns: *mut c_void,
+        channels: i32,
+        height: i32,
+        width: i32,
+        kh: i32,
+        kw: i32,
+        stride_h: i32,
+        stride_w: i32,
+        pad_h: i32,
+        pad_w: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_xvla_dwconv3x3_bf16(
+        input: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        channels: i32,
+        height: i32,
+        width: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_xvla_gelu_erf_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_xvla_sigmoid_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+}
+
+extern "C" {
+    pub fn apxinf_xvla_pack_action_tokens_bf16(
+        action: *const c_void,
+        proprio: *const c_void,
+        time: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        dim_action: i32,
+        dim_time: i32,
+        gripper0: i32,
+        gripper1: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_xvla_sigmoid_columns_bf16(
+        input: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        columns: i32,
+        index0: i32,
+        index1: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn apxinf_xvla_gather_rows_bf16(
+        input: *const c_void,
+        indices: *const c_void,
+        output: *mut c_void,
+        out_rows: i64,
+        columns: i32,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+}

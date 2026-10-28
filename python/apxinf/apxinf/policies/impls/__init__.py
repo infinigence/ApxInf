@@ -26,6 +26,7 @@ from .pi0fast import Pi0FastPolicy
 from .qwen_drive import QwenDrivePolicy
 from .smolvla import SmolVlaPolicy
 from .walloss import WallossPolicy
+from .xvla import XvlaPolicy
 
 __all__ = [
     "Pi05Policy",
@@ -34,4 +35,5 @@ __all__ = [
     "QwenDrivePolicy",
     "SmolVlaPolicy",
     "WallossPolicy",
+    "XvlaPolicy",
 ]
