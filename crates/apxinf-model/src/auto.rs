@@ -43,8 +43,8 @@ pub struct LoadOptions {
     /// `config.json:model_type`.
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
-    /// auto, bf16, fp8_static and int8_dynamic. Native Metal Qwen3/MiniCPM5
-    /// variants are parsed by their family loader. Other families migrate separately.
+    /// auto, bf16, fp8_static and int8_dynamic. Native Metal families parse
+    /// their own variants. Other families migrate separately.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
@@ -541,7 +541,8 @@ fn hip_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::hip_pi05::Confi
 }
 
 // Admission only: supported variant names and precision semantics are owned by
-// each family loader, not a second central implementation registry.
+// each family loader, not a second central implementation registry. A Metal
+// request reaches only a registered `metal_` factory, which parses its variant.
 fn supports_model_variant(model_name: &str, device: Device) -> bool {
     matches!(
         model_name,
@@ -554,11 +555,7 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "d3-cuda"
             | "smolvla"
             | "smolvla_libero"
-    ) || (matches!(device, Device::Metal(_))
-        && matches!(
-            model_name,
-            "qwen3" | "metal_qwen3" | "qwen3-mlx" | "minicpm5" | "metal_minicpm5" | "minicpm5-mlx"
-        ))
+    ) || matches!(device, Device::Metal(_))
 }
 
 #[cfg(feature = "cuda")]
@@ -677,6 +674,21 @@ mod tests {
                 "accepted {name}"
             );
         }
+        // A variant neither bypasses the family requirement nor reaches a device.
+        for name in ["llama", "qwen3_vl"] {
+            let options = LoadOptions {
+                model_name: Some(name.into()),
+                model_variant: Some("bf16-compiled".into()),
+                ..LoadOptions::default()
+            };
+            assert!(
+                matches!(
+                    AutoModel::load_model(Device::Metal(0), path, &options),
+                    Err(Error::UnsupportedDevice(Device::Metal(0)))
+                ),
+                "accepted {name} with a variant"
+            );
+        }
     }
 
     #[cfg(feature = "hip")]
@@ -707,6 +719,7 @@ mod tests {
 
     #[test]
     fn metal_variant_admission_is_family_and_device_specific() {
+        // Metal defers to the registered family factory; other devices keep the list.
         for name in [
             "qwen3",
             "metal_qwen3",
@@ -714,13 +727,13 @@ mod tests {
             "minicpm5",
             "metal_minicpm5",
             "minicpm5-mlx",
+            "llama",
+            "qwen3_vl",
         ] {
             assert!(supports_model_variant(name, Device::Metal(0)));
             assert!(!supports_model_variant(name, Device::Cpu));
             assert!(!supports_model_variant(name, Device::Cuda(0)));
         }
-        assert!(!supports_model_variant("llama", Device::Metal(0)));
-        assert!(!supports_model_variant("qwen3_vl", Device::Metal(0)));
         assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
         assert!(supports_model_variant("pi05-hip", Device::Hip(0)));
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
