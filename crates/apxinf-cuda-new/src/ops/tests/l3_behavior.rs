@@ -106,6 +106,46 @@ fn quantization_casts_f32_to_bf16_with_rounding() {
     assert_eq!(values(&output), expected);
 }
 
+#[test]
+fn quantization_bf16_f32_preserves_all_values_and_unaligned_tails() {
+    use apxinf_core::{DType, Shape};
+
+    let ctx = CudaContext::new(0).unwrap();
+    for count in [1, 3, 4, 5, 1023, 1024, 1025, 65536] {
+        let source: Vec<u8> = (0..count).flat_map(|i| (i as u16).to_ne_bytes()).collect();
+        for (input_offset, output_offset) in [(0, 0), (2, 0), (0, 4), (2, 4)] {
+            let src = crate::CudaBuffer::alloc(input_offset + count * 2, 0).unwrap();
+            let src = src.view(input_offset, count * 2).unwrap();
+            src.copy_from_host(&source).unwrap();
+            let input = src.as_tensor(Shape::new(vec![count]), DType::BF16).unwrap();
+            let dst = crate::CudaBuffer::alloc(output_offset + count * 4, 0).unwrap();
+            let dst = dst.view(output_offset, count * 4).unwrap();
+            let mut output = dst.as_tensor(Shape::new(vec![count]), DType::F32).unwrap();
+            quantization(
+                &ctx,
+                QuantizationArgs::new(QuantizationSemantic::CastBf16ToF32, &input, &mut output),
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            let mut bytes = vec![0; count * 4];
+            dst.copy_to_host(&mut bytes).unwrap();
+            for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+                let actual = f32::from_ne_bytes(chunk.try_into().unwrap());
+                let expected = f32::from_bits((i as u32) << 16);
+                if expected.is_nan() {
+                    assert!(actual.is_nan());
+                } else {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "index {i}, offsets {input_offset}/{output_offset}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn u32_buffer(device: usize, values: &[u32]) -> crate::CudaBuffer {
     let bytes: Vec<_> = values
         .iter()

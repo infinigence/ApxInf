@@ -14,6 +14,11 @@ signature and is used by the Qwen integration tests.
 Attention Spec version 5 adds additive bias bindings and explicit intermediate
 precision. Dense attention also accepts F32 inputs and output; KV-cache and
 segmented contracts retain F16/BF16. Prior attention specs are rejected.
+Dense F32 MHA with at most 1024 keys has a pedantic cuBLAS candidate using
+interleaved head strides and fused mask/softmax. It preserves F32 products
+without TF32 conversion, prepares all scratch before capture, and participates
+in the existing resource-budget, fallback and exact-recipe lifecycle. GQA and
+longer sequences retain the custom candidates.
 
 GEMM Spec version 6 combines NVFP4 block-scale bindings with the
 `GEMM_BIAS_RESIDUAL` semantic. Version 5 specs are rejected rather than reused
@@ -189,6 +194,15 @@ when online tuning is disabled. Other arithmetic and GQA use the custom
 candidates. Provider scratch contains the score/probability matrix plus the
 shared 4 MiB cuBLAS workspace. Attention recipe namespace v7 includes the
 runtime cuBLAS version and the softmax source fingerprint.
+
+Dense F32 MHA also has a fused short-sequence candidate: B1, Q16–128,
+K1–160, D128, no mask, at most 65535 heads and 16-byte-aligned bindings.
+Four queries reuse vectorized K/V loads, eight-lane groups compute QK, and
+four warps reduce PV. Scores and probabilities stay in shared memory;
+there is no global workspace and all arithmetic stays F32. This candidate
+precedes cuBLAS in fallback order. Batched/causal and other shapes retain
+the pedantic F32 cuBLAS or general custom paths. Its source is included in
+the Attention build fingerprint, invalidating incompatible cached recipes.
 
 ## Session / CUDA Graph State Machine
 

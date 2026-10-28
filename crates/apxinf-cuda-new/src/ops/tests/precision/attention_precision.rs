@@ -181,6 +181,21 @@ fn attention_f32_real_shapes_all_candidates_match_reference() {
     // and a small causal GQA shape. D640 intentionally exceeds FA2's domain.
     for (b, tq, tk, hq, hk, d, causal) in [
         (1, 98, 98, 24, 24, 128, false),
+        (1, 98, 129, 24, 24, 128, false),
+        (1, 16, 1, 2, 2, 128, false),
+        (1, 17, 7, 2, 2, 128, false),
+        (1, 31, 31, 2, 2, 128, false),
+        (1, 33, 33, 2, 2, 128, false),
+        (1, 127, 159, 2, 2, 128, false),
+        (1, 128, 160, 2, 2, 128, false),
+        (1, 129, 160, 2, 2, 128, false),
+        (1, 32, 161, 2, 2, 128, false),
+        (1, 32, 130, 2, 2, 128, true),
+        (2, 32, 130, 2, 2, 128, false),
+        (2, 3, 7, 4, 4, 9, true),
+        (2, 3, 7, 4, 4, 9, false),
+        (1, 1, 1024, 1, 1, 7, false),
+        (1, 1, 1025, 1, 1, 7, false),
         (1, 32, 130, 24, 24, 128, false),
         (1, 32, 129, 24, 24, 128, false),
         (1, 392, 392, 1, 1, 640, false),
@@ -217,6 +232,134 @@ fn attention_f32_real_shapes_all_candidates_match_reference() {
         let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
         super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
         report_real_shape_timing(&ctx, norm);
+    }
+}
+
+#[test]
+fn attention_f32_cublas_respects_scratch_budget() {
+    let ctx = CudaContext::new(0).unwrap();
+    // D64 stays outside the zero-workspace short-D128 candidate's domain.
+    let (tq, tk, h, d) = (32, 130, 24, 64);
+    let q = input(
+        vec![1, tq, h, d],
+        &data(tq * h * d, 1, DType::F32),
+        DType::F32,
+    );
+    let k = input(
+        vec![1, tk, h, d],
+        &data(tk * h * d, 7, DType::F32),
+        DType::F32,
+    );
+    let v = input(
+        vec![1, tk, h, d],
+        &data(tk * h * d, 19, DType::F32),
+        DType::F32,
+    );
+    let mut out = zeros_tensor(0, vec![1, tq, h, d], DType::F32);
+    // The provider reserves the shared handle's 4 MiB workspace plus F32 P.
+    let required = 4 * 1024 * 1024 + h * tq * tk * 4;
+    for (budget, expected) in [
+        (required, "cublas-f32-attention"),
+        (required - 1, "custom-warp-attention"),
+    ] {
+        let mut args = AttentionArgs::new(&q, &k, &v, &mut out);
+        args.policy.workspace_limit = budget;
+        args.policy.cache_dir = Some(String::new());
+        args.policy.online_tune = false;
+        let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
+        let execution = super::super::attention_execution::prepare(&ctx, norm).unwrap();
+        assert!(
+            execution.summary().contains(expected),
+            "{}",
+            execution.summary()
+        );
+        execution.enqueue_for_test().unwrap();
+        ctx.synchronize().unwrap();
+    }
+}
+
+#[test]
+fn attention_short_f32_needs_no_global_workspace() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (tq, tk, h, d) = (32, 130, 2, 128);
+    let qv = data(tq * h * d, 1, DType::F32);
+    let kv = data(tk * h * d, 7, DType::F32);
+    let vv = data(tk * h * d, 19, DType::F32);
+    let q = input(vec![1, tq, h, d], &qv, DType::F32);
+    let k = input(vec![1, tk, h, d], &kv, DType::F32);
+    let v = input(vec![1, tk, h, d], &vv, DType::F32);
+    let mut out = zeros_tensor(0, vec![1, tq, h, d], DType::F32);
+    let mut args = AttentionArgs::new(&q, &k, &v, &mut out);
+    let expected = reference(
+        &qv,
+        &kv,
+        &vv,
+        None,
+        1,
+        tq,
+        tk,
+        h,
+        h,
+        d,
+        args.scale,
+        false,
+        DType::F32,
+        AttentionPrecision::F32,
+        false,
+    );
+    args.policy.workspace_limit = 0;
+    args.policy.cache_dir = Some(String::new());
+    args.policy.online_tune = false;
+    let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
+    let execution = super::super::attention_execution::prepare(&ctx, norm).unwrap();
+    assert!(execution.summary().contains("custom-short-f32-attention"));
+    execution.enqueue_for_test().unwrap();
+    ctx.synchronize().unwrap();
+    let buffer = crate::CudaBuffer::from_tensor(&out).unwrap();
+    let mut bytes = vec![0; expected.len() * 4];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    for (chunk, expected) in bytes.chunks_exact(4).zip(expected) {
+        let actual = f32::from_ne_bytes(chunk.try_into().unwrap());
+        assert!(actual.is_finite() && (actual - expected).abs() < 2e-6);
+    }
+}
+
+#[test]
+fn attention_short_f32_unaligned_bindings_fall_back() {
+    use apxinf_core::Shape;
+
+    let ctx = CudaContext::new(0).unwrap();
+    let make = |tokens: usize, offset: usize| {
+        let count = tokens * 128;
+        let buffer = crate::CudaBuffer::alloc(offset + count * 4, 0).unwrap();
+        let view = buffer.view(offset, count * 4).unwrap();
+        let bytes: Vec<u8> = (0..count).flat_map(|_| 0.25f32.to_ne_bytes()).collect();
+        view.copy_from_host(&bytes).unwrap();
+        view.as_tensor(Shape::new(vec![1, tokens, 1, 128]), DType::F32)
+            .unwrap()
+    };
+    for shifted in 0..4 {
+        let q = make(17, if shifted == 0 { 4 } else { 0 });
+        let k = make(7, if shifted == 1 { 4 } else { 0 });
+        let v = make(7, if shifted == 2 { 4 } else { 0 });
+        let mut out = make(17, if shifted == 3 { 4 } else { 0 });
+        let mut args = AttentionArgs::new(&q, &k, &v, &mut out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
+        let execution = super::super::attention_execution::prepare(&ctx, norm).unwrap();
+        assert!(execution.summary().contains("cublas-f32-attention"));
+        execution.enqueue_for_test().unwrap();
+        ctx.synchronize().unwrap();
+        let mut bytes = vec![0; 17 * 128 * 4];
+        crate::CudaBuffer::from_tensor(&out)
+            .unwrap()
+            .copy_to_host(&mut bytes)
+            .unwrap();
+        for chunk in bytes.chunks_exact(4) {
+            let actual = f32::from_ne_bytes(chunk.try_into().unwrap());
+            assert!(actual.is_finite() && (actual - 0.25).abs() < 2e-6);
+        }
     }
 }
 

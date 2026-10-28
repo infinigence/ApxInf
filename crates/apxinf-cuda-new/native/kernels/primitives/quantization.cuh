@@ -534,6 +534,24 @@ __global__ void silu_mul_quantize_rows_bf16_int8_kernel(
   }
 }
 
+// Aligned groups of four reduce memory instructions and block count without
+// changing conversion semantics. The adapter handles tails/misaligned views
+// through the scalar path.
+__global__ void cast_bf16_f32_vec4_kernel(
+    const __nv_bfloat16* input, float* output, int64_t groups) {
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < groups;
+       index += static_cast<int64_t>(blockDim.x) * gridDim.x) {
+    const uint2 packed = reinterpret_cast<const uint2*>(input)[index];
+    const float4 converted = make_float4(
+        __bfloat162float(__ushort_as_bfloat16(packed.x & 0xffffu)),
+        __bfloat162float(__ushort_as_bfloat16(packed.x >> 16)),
+        __bfloat162float(__ushort_as_bfloat16(packed.y & 0xffffu)),
+        __bfloat162float(__ushort_as_bfloat16(packed.y >> 16)));
+    reinterpret_cast<float4*>(output)[index] = converted;
+  }
+}
+
 __global__ void dequantize_int32_bf16_kernel(
     const int32_t* accumulators, const float* row_scales,
     const float* column_scales, __nv_bfloat16* output,

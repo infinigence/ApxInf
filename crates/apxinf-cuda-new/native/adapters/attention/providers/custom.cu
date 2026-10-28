@@ -1,5 +1,6 @@
 #include "../internal.h"
 #include "../../../kernels/custom/attention.cuh"
+#include "../../../kernels/custom/attention_short_f32.cuh"
 
 namespace apxinf::attention {
 namespace {
@@ -159,6 +160,14 @@ cudaError_t launch_parallel_custom(Execution& execution) {
 
 cudaError_t launch_cooperative_custom(Execution& execution) {
   return launch_parallel_impl<true>(execution);
+}
+
+cudaError_t launch_short_f32_custom(Execution& execution) {
+  const auto& s = execution.spec;
+  const auto& b = execution.bindings;
+  return kernels::launch_attention_short_f32(
+      b.query, b.key, b.value, b.output, s.query_tokens, s.key_tokens,
+      s.query_heads, b.scale, static_cast<cudaStream_t>(b.stream));
 }
 
 void destroy_custom(Execution& execution) noexcept {

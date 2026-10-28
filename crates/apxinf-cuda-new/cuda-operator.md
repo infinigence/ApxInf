@@ -16,6 +16,13 @@ This document describes only public contracts and does not promise a specific pr
 
 `ops::quantization(ctx, QuantizationArgs)` also owns shape-preserving representation conversions used between L3 operators. `CastF16ToBf16` converts F16 to BF16 and `CastBf16ToF32` converts BF16 to F32; both require identical nonempty input/output shapes and distinct device buffers. The latter is the standard boundary for a BF16 backbone feeding an FP32 readout GEMM.
 
+`CastBf16ToF32` uses vectorized groups of four when the element count is
+divisible by four, input alignment is at least eight bytes and output alignment
+is at least sixteen bytes. Other lengths and views retain scalar conversion.
+The conversion intrinsics are unchanged; tests cover all BF16 bit patterns
+(exact finite values, signed zero and infinities; NaN classification), tails
+and unaligned views.
+
 ## Shared GEMM Contract
 
 GEMM uses `A=[M,K]` and `B=[K,N]`. `alpha` applies to the projection, and the final result is divided by a finite positive `output_scale`. `projection(A,B)` interprets inputs according to the following quantization contract:
@@ -107,7 +114,20 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Output | `Y=[B,Tq,Hq,D]`; ordinary output uses the input dtype, and F16 input may also be written as E4M3 |
 | Mathematical semantic | dense scaled dot-product attention |
 | Constraints | Causal requires `Tk>=Tq`, with queries aligned to the final positions of the key sequence; ordinary output requires `output_scale=1`; E4M3 stores `round_to_e4m3(attention/output_scale)` |
-| Reference tests | `attention_all_candidates_match_reference`, `attention_f32_real_shapes_all_candidates_match_reference`, `attention_f32_reduction_all_candidates_match_reference`, `attention_bf16_vae_all_candidates_match_reference` |
+| Reference tests | `attention_all_candidates_match_reference`, `attention_f32_real_shapes_all_candidates_match_reference`, `attention_f32_reduction_all_candidates_match_reference`, `attention_f32_cublas_respects_scratch_budget`, `attention_bf16_vae_all_candidates_match_reference` |
+
+The dense F32 MHA cuBLAS candidate covers up to 1024 keys, including batched
+and causal inputs. QK and PV use pedantic F32 GEMMs; masking and softmax share
+one device kernel. The existing custom candidates cover GQA and longer keys.
+Selection remains native and obeys the workspace/recipe policy.
+
+An additional fused F32 candidate handles B1, Q16–128, K1–160, D128,
+equal Q/KV heads (at most 65535), no mask and 16-byte-aligned bindings.
+It keeps QK, softmax and PV in one kernel with no global scratch. It is the
+first eligible fallback in this domain and preserves the F32 contract.
+Boundary cases and `attention_short_f32_needs_no_global_workspace` verify
+the candidate and the zero-workspace policy; other shapes retain existing
+providers.
 
 <!-- l3-operator:additive_attention -->
 ### `additive_attention`

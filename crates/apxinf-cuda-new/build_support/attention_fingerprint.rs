@@ -29,6 +29,7 @@ const INPUT_FILES: &[&str] = &[
     "adapters/cublas_resources.h",
     "kernels/custom/attention.cuh",
     "kernels/custom/attention_softmax.cuh",
+    "kernels/custom/attention_short_f32.cuh",
 ];
 
 fn hash_bytes(hash: &mut u128, bytes: &[u8]) {
