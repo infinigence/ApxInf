@@ -1972,6 +1972,342 @@ fn bias_gelu_quant_matches_tanh_reference() {
 }
 
 #[test]
+fn bias_residual_and_concat_quantize_packed8_match_references_bitwise() {
+    // Pure elementwise vectorization: the packed-8 kernels must be
+    // bitwise equal to the scalar contract. Vision shapes plus a width that is
+    // not a multiple of 8 (scalar fallback).
+    let backend = CudaBackend::new(0).unwrap();
+    for &(rows, cols) in &[(512usize, 1024usize), (256, 1024), (5, 1020)] {
+        let mut state = 0x853c_49e6_748f_ea9bu64 ^ ((rows as u64) << 32) ^ cols as u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
+        };
+        let projection = (0..rows * cols).map(|_| bf16::from_f32(next() * 3.0)).collect::<Vec<_>>();
+        let residual = (0..rows * cols).map(|_| bf16::from_f32(next() * 4.0)).collect::<Vec<_>>();
+        let bias = (0..cols).map(|_| bf16::from_f32(next() * 0.9)).collect::<Vec<_>>();
+        let device = |shape: Vec<usize>, values: &[bf16]| {
+            backend.to_device(&Tensor::from_bf16(shape, values).unwrap()).unwrap()
+        };
+        let projection_gpu = device(vec![rows, cols], &projection);
+        let residual_gpu = device(vec![rows, cols], &residual);
+        let bias_gpu = device(vec![cols], &bias);
+        let actual = sm110_or_fallback(
+            backend.context(),
+            cols % 8 == 0,
+            crate::kernels::sm110::try_bias_residual_bf16_sm110(
+                backend.context(),
+                &projection_gpu,
+                Some(&bias_gpu),
+                &residual_gpu,
+            )
+            .unwrap(),
+            || {
+                bias_residual_bf16(
+                    backend.context(),
+                    &projection_gpu,
+                    Some(&bias_gpu),
+                    &residual_gpu,
+                )
+            },
+        )
+        .unwrap();
+        backend.synchronize().unwrap();
+        let actual = backend.to_cpu(&actual).unwrap();
+        let actual = actual.as_bf16().unwrap();
+        for row in 0..rows {
+            for col in 0..cols {
+                let index = row * cols + col;
+                // Same order as the kernel: (projection + residual) then bias.
+                let expected = bf16::from_f32(
+                    projection[index].to_f32() + residual[index].to_f32() + bias[col].to_f32(),
+                );
+                assert_eq!(
+                    actual[index].to_bits(),
+                    expected.to_bits(),
+                    "bias_residual [{rows},{cols}] differs at row {row} col {col}"
+                );
+            }
+        }
+
+        // Concat+quantize must equal a host concatenation quantized by the
+        // established packed-8 quantize kernel (identical per-element math).
+        const SCALE: f32 = 0.0173;
+        let split = rows / 2 + 1;
+        let first = device(vec![split, cols], &projection[..split * cols]);
+        let second = device(vec![rows - split, cols], &projection[split * cols..]);
+        let fused = sm110_or_fallback(
+            backend.context(),
+            cols % 8 == 0,
+            crate::kernels::sm110::try_concat_rows_quantize_bf16_e4m3_sm110(
+                backend.context(),
+                &first,
+                &second,
+                SCALE,
+            )
+            .unwrap(),
+            || concat_rows_quantize_bf16_e4m3(backend.context(), &first, &second, SCALE),
+        )
+        .unwrap();
+        let reference = quantize_bf16_e4m3_packed8(backend.context(), &projection_gpu, SCALE)
+            .or_else(|_| quantize_bf16_e4m3(backend.context(), &projection_gpu, SCALE))
+            .unwrap();
+        backend.synchronize().unwrap();
+        let fused = backend.to_cpu(&fused).unwrap();
+        let reference = backend.to_cpu(&reference).unwrap();
+        assert_eq!(
+            fused.as_f8_e4m3().unwrap(),
+            reference.as_f8_e4m3().unwrap(),
+            "concat_rows_quantize [{rows},{cols}] split {split} differs from the quantize kernel"
+        );
+    }
+}
+
+// Pin the full fused mainloop schedule, independent of vendor heuristics and
+// external tuning databases: M64/N128/K128, cluster 1, three stages, one SM.
+#[cfg(apxinf_cutlass_gemm)]
+fn m41_fixed_schedule_reference(
+    backend: &CudaBackend,
+    activation: &Tensor,
+    weight: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+) -> Tensor {
+    let output = CudaBuffer::alloc(m * n * 2, backend.device_id()).unwrap();
+    let status = unsafe {
+        ffi::reference::apxinf_reference_cutlass_fp8_gemm_bf16_m41(
+            gpu_ptr(activation).unwrap(),
+            gpu_ptr(weight).unwrap(),
+            output.ptr(),
+            m as i32,
+            n as i32,
+            k as i32,
+            alpha,
+            backend.context().stream().handle(),
+        )
+    };
+    assert_eq!(status, 0, "fixed M41 reference rejected");
+    make_gpu_tensor(
+        Shape::new(vec![m, n]),
+        DType::BF16,
+        backend.device_id(),
+        output,
+    )
+}
+
+#[cfg(apxinf_cutlass_gemm)]
+#[test]
+fn self_qkv_m41_matches_three_gemms_and_bias_bitwise() {
+    // Thor-only exact-shape GR00T DiT self-attention QKV fusion: compare
+    // bitwise against a fixed-schedule reference (three FP8 GEMMs, then the in-place
+    // Q/K/V bias kernel).
+    let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().sm != 110 {
+        return;
+    }
+    const M: usize = 41;
+    const H: usize = 1536;
+    const ACT_SCALE: f32 = 0.0137;
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
+    };
+    let activation = (0..M * H)
+        .map(|_| bf16::from_f32(next() * 2.0))
+        .collect::<Vec<_>>();
+    let activation = backend
+        .to_device(&Tensor::from_bf16(vec![M, H], &activation).unwrap())
+        .unwrap();
+    let activation_fp8 = quantize_bf16_e4m3(backend.context(), &activation, ACT_SCALE).unwrap();
+    let weight_scales = [0.061f32 / 448.0, 0.047 / 448.0, 0.083 / 448.0];
+    let mut weights_fp8 = Vec::new();
+    let mut biases = Vec::new();
+    for (index, scale) in weight_scales.iter().enumerate() {
+        let amplitude = [0.06f32, 0.045, 0.08][index];
+        let weight = (0..H * H)
+            .map(|_| bf16::from_f32(next() * amplitude))
+            .collect::<Vec<_>>();
+        let weight = backend
+            .to_device(&Tensor::from_bf16(vec![H, H], &weight).unwrap())
+            .unwrap();
+        weights_fp8.push(quantize_bf16_e4m3(backend.context(), &weight, *scale).unwrap());
+        let bias = (0..H)
+            .map(|_| bf16::from_f32(next() * 0.7))
+            .collect::<Vec<_>>();
+        biases.push(
+            backend
+                .to_device(&Tensor::from_bf16(vec![H], &bias).unwrap())
+                .unwrap(),
+        );
+    }
+    let project = |index: usize| {
+        m41_fixed_schedule_reference(
+            &backend,
+            &activation_fp8,
+            &weights_fp8[index],
+            M,
+            H,
+            H,
+            ACT_SCALE * weight_scales[index],
+        )
+    };
+    let (query, key, value) = bias_qkv_in_place_bf16(
+        backend.context(),
+        project(0),
+        project(1),
+        project(2),
+        &biases[0],
+        &biases[1],
+        &biases[2],
+    )
+    .unwrap();
+
+    let host_weights = weights_fp8
+        .iter()
+        .map(|weight| backend.to_cpu(weight).unwrap())
+        .collect::<Vec<_>>();
+    let mut concat = Vec::with_capacity(H * 3 * H);
+    for row in 0..H {
+        for weight in &host_weights {
+            concat.extend_from_slice(&weight.as_f8_e4m3().unwrap()[row * H..(row + 1) * H]);
+        }
+    }
+    let mut alpha = Vec::with_capacity(3 * H);
+    let mut bias = Vec::with_capacity(3 * H);
+    for index in 0..3 {
+        alpha.extend(std::iter::repeat(ACT_SCALE * weight_scales[index]).take(H));
+        bias.extend_from_slice(backend.to_cpu(&biases[index]).unwrap().as_bf16().unwrap());
+    }
+    let concat = backend
+        .to_device(&Tensor::from_f8_e4m3(vec![H, 3 * H], &concat).unwrap())
+        .unwrap();
+    let alpha = backend
+        .to_device(&Tensor::from_f32(vec![3 * H], &alpha).unwrap())
+        .unwrap();
+    let bias = backend
+        .to_device(&Tensor::from_bf16(vec![3 * H], &bias).unwrap())
+        .unwrap();
+    let fused = crate::kernels::gemm::fp8_self_qkv_bf16_m41(
+        backend.context(),
+        &activation_fp8,
+        &concat,
+        &alpha,
+        &bias,
+    )
+    .unwrap();
+    backend.synchronize().unwrap();
+    let fused = backend.to_cpu(&fused).unwrap();
+    let fused = fused.as_bf16().unwrap();
+    let references = [query, key, value]
+        .iter()
+        .map(|tensor| backend.to_cpu(tensor).unwrap())
+        .collect::<Vec<_>>();
+    let mut mismatches = 0usize;
+    let mut first = None;
+    for row in 0..M {
+        for (part, reference) in references.iter().enumerate() {
+            let reference = reference.as_bf16().unwrap();
+            for col in 0..H {
+                let actual = fused[row * 3 * H + part * H + col];
+                let expected = reference[row * H + col];
+                if actual.to_bits() != expected.to_bits() {
+                    mismatches += 1;
+                    first.get_or_insert((row, part, col, actual, expected));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "fused self-QKV differs from the three-GEMM reference in {mismatches} elements; first {first:?}"
+    );
+}
+
+#[cfg(apxinf_cutlass_gemm)]
+#[test]
+fn fc1_bias_gelu_quant_m41_matches_gemm_then_pointwise_reference() {
+    // Thor-only exact-shape GR00T DiT FC1 fusion: compare against the
+    // fixed-schedule two-kernel reference (BF16 GEMM, then bias+GELU+quantize).
+    let backend = CudaBackend::new(0).unwrap();
+    if backend.context().caps().sm != 110 {
+        return;
+    }
+    const M: usize = 41;
+    const K: usize = 1536;
+    const N: usize = 6144;
+    const ACT_SCALE: f32 = 0.0125;
+    const OUT_SCALE: f32 = 0.02;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 11) as f64 / (1u64 << 53) as f64) as f32 * 2.0 - 1.0
+    };
+    let activation = (0..M * K)
+        .map(|_| bf16::from_f32(next() * 1.5))
+        .collect::<Vec<_>>();
+    let weight = (0..K * N)
+        .map(|_| bf16::from_f32(next() * 0.05))
+        .collect::<Vec<_>>();
+    let bias = (0..N)
+        .map(|_| bf16::from_f32(next() * 0.5))
+        .collect::<Vec<_>>();
+    let activation = backend
+        .to_device(&Tensor::from_bf16(vec![M, K], &activation).unwrap())
+        .unwrap();
+    let weight = backend
+        .to_device(&Tensor::from_bf16(vec![K, N], &weight).unwrap())
+        .unwrap();
+    let bias = backend
+        .to_device(&Tensor::from_bf16(vec![N], &bias).unwrap())
+        .unwrap();
+    let weight_scale = 0.05f32 / 448.0;
+    let activation_fp8 = quantize_bf16_e4m3(backend.context(), &activation, ACT_SCALE).unwrap();
+    let weight_fp8 = quantize_bf16_e4m3(backend.context(), &weight, weight_scale).unwrap();
+    let reference_bf16 = m41_fixed_schedule_reference(
+        &backend,
+        &activation_fp8,
+        &weight_fp8,
+        M,
+        N,
+        K,
+        ACT_SCALE * weight_scale,
+    );
+    let reference =
+        bias_gelu_quant_bf16_e4m3(backend.context(), &reference_bf16, &bias, OUT_SCALE).unwrap();
+    let fused = crate::kernels::fused::try_fp8_bias_gelu_quant_e4m3_m41(
+        backend.context(),
+        &activation_fp8,
+        &weight_fp8,
+        &bias,
+        ACT_SCALE,
+        weight_scale,
+        OUT_SCALE,
+    )
+    .unwrap()
+    .expect("Thor M41 FC1 specialization");
+    backend.synchronize().unwrap();
+    let reference = backend.to_cpu(&reference).unwrap();
+    let fused = backend.to_cpu(&fused).unwrap();
+    let reference = reference.as_f8_e4m3().unwrap();
+    let fused = fused.as_f8_e4m3().unwrap();
+    assert_eq!(reference.len(), M * N);
+    assert_eq!(fused.len(), M * N);
+    assert_eq!(
+        fused, reference,
+        "FC1 FP8 bytes differ with the same mainloop schedule"
+    );
+}
+
+#[test]
 fn mqa_flash_uniform_scores_average_values() {
     const PREFIX: usize = 16;
     const SUFFIX: usize = 4;
@@ -2632,4 +2968,578 @@ fn workspace_recycles_non_overlapping_lifetimes() {
     drop((retained, replacement));
 
     with_workspace(&workspace, || Ok(())).unwrap();
+}
+
+/// Deterministic BF16 test rows covering the LayerNorm hazards that matter for
+/// bitwise equivalence: ordinary values, a large common offset with tiny
+/// variance (cancellation), signed zeros mixed with tiny values, values that
+/// saturate E4M3 after scaling, a coarse BF16 grid that produces ties, and
+/// (family 5) rows whose per-thread column groups are [A, -A, a, a] with
+/// A = 2^20, a = 0.01, so the per-thread FP32 summation order decides whether
+/// 2a survives and therefore the row mean.
+fn layer_norm_test_values(count: usize, seed: u64, family: usize) -> Vec<bf16> {
+    let mut state = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let mut uniform = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    };
+    (0..count)
+        .map(|index| {
+            let u = uniform();
+            let value = match family {
+                0 => u * 3.0,
+                1 => 1000.0 + 0.01 * u,
+                2 if index % 7 == 0 => -0.0,
+                2 => 1.0e-3 * u,
+                3 => 300.0 * u,
+                4 => (1.0 + (u * 64.0).floor() / 64.0) * 2f32.powi((index % 5) as i32 - 2),
+                // Column c belongs to thread c % 256 at position c / 256 (for widths of 4 * 256).
+                _ => match (index % 1024) / 256 {
+                    0 => 1048576.0,
+                    1 => -1048576.0,
+                    _ => 0.01 + 0.001 * u,
+                },
+            };
+            bf16::from_f32(value)
+        })
+        .collect()
+}
+
+fn bf16_bits(tensor: &Tensor) -> Vec<u16> {
+    tensor
+        .as_bf16()
+        .unwrap()
+        .iter()
+        .map(|value| value.to_bits())
+        .collect()
+}
+
+#[test]
+fn fixed_width_layer_norm_quant_matches_generic_kernel_bitwise() {
+    const SCALE: f32 = 0.0371;
+    let backend = CudaBackend::new(0).unwrap();
+    // 1024 takes the fixed-width kernel; 1536 and 768 exercise the generic fallback.
+    for cols in [1024usize, 1536, 768] {
+        for rows in [256usize, 512, 1, 3, 255] {
+            for family in 0..6 {
+                let seed = (rows * 31 + family * 7 + cols) as u64;
+                let upload = |count: usize, seed: u64, family: usize, shape: Vec<usize>| {
+                    backend
+                        .to_device(
+                            &Tensor::from_bf16(shape, &layer_norm_test_values(count, seed, family))
+                                .unwrap(),
+                        )
+                        .unwrap()
+                };
+                let input = upload(rows * cols, seed, family, vec![rows, cols]);
+                let weight = upload(cols, seed + 1, 0, vec![cols]);
+                let bias = upload(cols, seed + 2, 0, vec![cols]);
+                let production = sm110_or_fallback(
+                    backend.context(),
+                    cols == 1024,
+                    crate::kernels::sm110::try_layer_quant_bf16_e4m3_sm110(
+                        backend.context(),
+                        &input,
+                        &weight,
+                        &bias,
+                        1.0e-6,
+                        SCALE,
+                    )
+                    .unwrap(),
+                    || {
+                        layer_quant_bf16_e4m3(
+                            backend.context(),
+                            &input,
+                            &weight,
+                            &bias,
+                            1.0e-6,
+                            SCALE,
+                        )
+                    },
+                )
+                .unwrap();
+                let reference = CudaBuffer::alloc(rows * cols, backend.device_id()).unwrap();
+                unsafe {
+                    ffi::check_cuda(ffi::reference::apxinf_reference_layer_norm_quant_bf16_e4m3(
+                        gpu_ptr(&input).unwrap(),
+                        gpu_ptr(&weight).unwrap(),
+                        gpu_ptr(&bias).unwrap(),
+                        reference.ptr(),
+                        rows as i32,
+                        cols as i32,
+                        1.0e-6,
+                        SCALE,
+                        backend.context().stream().handle(),
+                    ))
+                    .unwrap();
+                }
+                let reference =
+                    make_gpu_tensor(Shape::new(vec![rows, cols]), DType::F8E4M3, 0, reference);
+                backend.synchronize().unwrap();
+                assert_eq!(
+                    backend.to_cpu(&production).unwrap().as_f8_e4m3().unwrap(),
+                    backend.to_cpu(&reference).unwrap().as_f8_e4m3().unwrap(),
+                    "LayerNorm FP8 bytes differ: cols={cols} rows={rows} family={family}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_width_residual_layer_norm_quant_matches_generic_kernel_bitwise() {
+    const SCALE: f32 = 0.0371;
+    let backend = CudaBackend::new(0).unwrap();
+    for cols in [1024usize, 1536] {
+        for rows in [256usize, 512, 1, 3, 255] {
+            for family in 0..6 {
+                for with_bias in [false, true] {
+                    let seed = (rows * 17 + family * 5 + cols) as u64;
+                    let upload = |count: usize, seed: u64, family: usize, shape: Vec<usize>| {
+                        backend
+                            .to_device(
+                                &Tensor::from_bf16(
+                                    shape,
+                                    &layer_norm_test_values(count, seed, family),
+                                )
+                                .unwrap(),
+                            )
+                            .unwrap()
+                    };
+                    let projection = upload(rows * cols, seed, family, vec![rows, cols]);
+                    let residual = upload(
+                        rows * cols,
+                        seed + 1,
+                        if family == 1 { 0 } else { family },
+                        vec![rows, cols],
+                    );
+                    let projection_bias =
+                        upload(cols, seed + 2, if family == 2 { 2 } else { 0 }, vec![cols]);
+                    let norm_weight = upload(cols, seed + 3, 0, vec![cols]);
+                    let norm_bias = upload(cols, seed + 4, 0, vec![cols]);
+                    let bias = with_bias.then_some(&projection_bias);
+                    let production = sm110_or_fallback(
+                        backend.context(),
+                        cols == 1024,
+                        crate::kernels::sm110::try_bias_residual_layer_quant_bf16_e4m3_sm110(
+                            backend.context(),
+                            &projection,
+                            bias,
+                            &residual,
+                            &norm_weight,
+                            &norm_bias,
+                            1.0e-6,
+                            SCALE,
+                        )
+                        .unwrap(),
+                        || {
+                            bias_residual_layer_quant_bf16_e4m3(
+                                backend.context(),
+                                &projection,
+                                bias,
+                                &residual,
+                                &norm_weight,
+                                &norm_bias,
+                                1.0e-6,
+                                SCALE,
+                            )
+                        },
+                    )
+                    .unwrap();
+                    let hidden = CudaBuffer::alloc(rows * cols * 2, backend.device_id()).unwrap();
+                    let normalized = CudaBuffer::alloc(rows * cols, backend.device_id()).unwrap();
+                    unsafe {
+                        ffi::check_cuda(
+                            ffi::reference::apxinf_reference_bias_residual_layer_norm_quant_bf16_e4m3(
+                                gpu_ptr(&projection).unwrap(),
+                                if with_bias {
+                                    gpu_ptr(&projection_bias).unwrap()
+                                } else {
+                                    std::ptr::null_mut()
+                                },
+                                gpu_ptr(&residual).unwrap(),
+                                gpu_ptr(&norm_weight).unwrap(),
+                                gpu_ptr(&norm_bias).unwrap(),
+                                hidden.ptr(),
+                                normalized.ptr(),
+                                rows as i32,
+                                cols as i32,
+                                1.0e-6,
+                                SCALE,
+                                backend.context().stream().handle(),
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    let hidden =
+                        make_gpu_tensor(Shape::new(vec![rows, cols]), DType::BF16, 0, hidden);
+                    let normalized =
+                        make_gpu_tensor(Shape::new(vec![rows, cols]), DType::F8E4M3, 0, normalized);
+                    backend.synchronize().unwrap();
+                    let context =
+                        format!("cols={cols} rows={rows} family={family} bias={with_bias}");
+                    assert_eq!(
+                        bf16_bits(&backend.to_cpu(&production.hidden).unwrap()),
+                        bf16_bits(&backend.to_cpu(&hidden).unwrap()),
+                        "residual hidden bits differ: {context}"
+                    );
+                    assert_eq!(
+                        backend
+                            .to_cpu(&production.normalized)
+                            .unwrap()
+                            .as_f8_e4m3()
+                            .unwrap(),
+                        backend.to_cpu(&normalized).unwrap().as_f8_e4m3().unwrap(),
+                        "residual LayerNorm FP8 bytes differ: {context}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn vectorized_vision_qkv_rope_matches_scalar_kernel_bitwise() {
+    use crate::kernels::rope::{
+        prepare_vision_2d_rotation_table, split_qkv_bias_apply_vision_2d_precomputed,
+    };
+    const HEADS: usize = 16;
+    const DIM: usize = 64;
+    const WIDTH: usize = 3 * HEADS * DIM;
+    let backend = CudaBackend::new(0).unwrap();
+    for seq in [256usize, 512] {
+        let positions: Vec<u32> = (0..seq as u32).flat_map(|s| [s / 16, s % 16]).collect();
+        let pos_ids = upload_u32(&backend, &positions);
+        let table =
+            prepare_vision_2d_rotation_table(backend.context(), seq, DIM, 10000.0, &pos_ids)
+                .unwrap();
+        for family in [0usize, 2, 3, 4] {
+            let seed = (seq * 5 + family) as u64;
+            let qkv = backend
+                .to_device(
+                    &Tensor::from_bf16(
+                        vec![seq, WIDTH],
+                        &layer_norm_test_values(seq * WIDTH, seed, family),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let bias = backend
+                .to_device(
+                    &Tensor::from_bf16(vec![WIDTH], &layer_norm_test_values(WIDTH, seed + 1, 0))
+                        .unwrap(),
+                )
+                .unwrap();
+            let production = sm110_or_fallback(
+                backend.context(),
+                true,
+                crate::kernels::sm110::try_split_qkv_bias_apply_vision_2d_precomputed_sm110(
+                    backend.context(),
+                    &qkv,
+                    &bias,
+                    HEADS,
+                    DIM,
+                    &table,
+                )
+                .unwrap(),
+                || {
+                    split_qkv_bias_apply_vision_2d_precomputed(
+                        backend.context(),
+                        &qkv,
+                        &bias,
+                        HEADS,
+                        DIM,
+                        &table,
+                    )
+                },
+            )
+            .unwrap();
+            let bytes = seq * HEADS * DIM * 2;
+            let reference: Vec<CudaBuffer> = (0..3)
+                .map(|_| CudaBuffer::alloc(bytes, backend.device_id()).unwrap())
+                .collect();
+            unsafe {
+                ffi::check_cuda(
+                    ffi::reference::apxinf_reference_qkv_split_bias_vision_rope_precomputed_bf16(
+                        gpu_ptr(&qkv).unwrap(),
+                        gpu_ptr(&bias).unwrap(),
+                        reference[0].ptr(),
+                        reference[1].ptr(),
+                        reference[2].ptr(),
+                        DIM as u32,
+                        HEADS as u32,
+                        seq as u32,
+                        table.ptr(),
+                        backend.context().stream().handle(),
+                    ),
+                )
+                .unwrap();
+            }
+            backend.synchronize().unwrap();
+            for (name, tensor, buffer) in [
+                ("q", &production.q, &reference[0]),
+                ("k", &production.k, &reference[1]),
+                ("v", &production.v, &reference[2]),
+            ] {
+                let mut expected = vec![0u8; bytes];
+                buffer.copy_to_host(&mut expected).unwrap();
+                let actual: Vec<u8> = bf16_bits(&backend.to_cpu(tensor).unwrap())
+                    .iter()
+                    .flat_map(|bits| bits.to_le_bytes())
+                    .collect();
+                assert_eq!(
+                    actual, expected,
+                    "{name} bits differ: seq={seq} family={family}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn vec8_bias_gelu_quant_matches_packed4_kernel_bitwise() {
+    let backend = CudaBackend::new(0).unwrap();
+    // Every finite BF16 bit pattern as input, rotated per case so each pattern
+    // meets several bias values; FP8 bytes must equal the packed-4 kernel's.
+    let finite = |bits: u16| if bits & 0x7f80 == 0x7f80 { 0 } else { bits };
+    for (case, (rows, cols, scale)) in [
+        (256usize, 4096usize, 0.0417f32),
+        (512, 4096, 0.0417),
+        (64, 4096, 1.0),
+        (41, 1536, 0.0123),
+        (3, 8, 0.5),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let count = rows * cols;
+        let input: Vec<bf16> = (0..count)
+            .map(|i| bf16::from_bits(finite(((i * 7 + case * 9973) % 65536) as u16)))
+            .collect();
+        let input = backend
+            .to_device(&Tensor::from_bf16(vec![rows, cols], &input).unwrap())
+            .unwrap();
+        let bias = backend
+            .to_device(
+                &Tensor::from_bf16(
+                    vec![cols],
+                    &layer_norm_test_values(cols, case as u64 + 17, 0),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let production = sm110_or_fallback(
+            backend.context(),
+            true,
+            crate::kernels::sm110::try_bias_gelu_quant_bf16_e4m3_sm110(
+                backend.context(),
+                &input,
+                &bias,
+                scale,
+            )
+            .unwrap(),
+            || bias_gelu_quant_bf16_e4m3(backend.context(), &input, &bias, scale),
+        )
+        .unwrap();
+        let reference = CudaBuffer::alloc(count, backend.device_id()).unwrap();
+        unsafe {
+            ffi::check_cuda(ffi::reference::apxinf_reference_bias_gelu_quant_bf16_e4m3(
+                gpu_ptr(&input).unwrap(),
+                gpu_ptr(&bias).unwrap(),
+                reference.ptr(),
+                rows as i32,
+                cols as i32,
+                scale,
+                backend.context().stream().handle(),
+            ))
+            .unwrap();
+        }
+        backend.synchronize().unwrap();
+        let mut expected = vec![0u8; count];
+        reference.copy_to_host(&mut expected).unwrap();
+        let actual = backend.to_cpu(&production).unwrap();
+        let actual = actual.as_f8_e4m3().unwrap().to_vec();
+        assert_eq!(
+            actual, expected,
+            "FP8 bytes differ: rows={rows} cols={cols} scale={scale}"
+        );
+    }
+}
+
+fn upload_u32(backend: &CudaBackend, values: &[u32]) -> CudaBuffer {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect::<Vec<_>>();
+    let buffer = CudaBuffer::alloc(bytes.len(), backend.device_id()).unwrap();
+    buffer.copy_from_host(&bytes).unwrap();
+    buffer
+}
+
+#[test]
+fn sm110_specializations_decline_unsupported_inputs() {
+    use crate::kernels::sm110::*;
+    let backend = CudaBackend::new(0).unwrap();
+    let ctx = backend.context();
+    let cpu = Tensor::from_bf16(vec![1, 8], &[bf16::ZERO; 8]).unwrap();
+    let bias = Tensor::from_bf16(vec![8], &[bf16::ZERO; 8]).unwrap();
+    assert!(
+        try_layer_quant_bf16_e4m3_sm110(ctx, &cpu, &bias, &bias, 1e-6, 1.0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(try_bias_gelu_quant_bf16_e4m3_sm110(ctx, &cpu, &bias, 1.0)
+        .unwrap()
+        .is_none());
+    assert!(
+        try_concat_rows_quantize_bf16_e4m3_sm110(ctx, &cpu, &cpu, 1.0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(try_bias_residual_bf16_sm110(ctx, &cpu, Some(&bias), &cpu)
+        .unwrap()
+        .is_none());
+    assert!(try_bias_residual_layer_quant_bf16_e4m3_sm110(
+        ctx,
+        &cpu,
+        Some(&bias),
+        &cpu,
+        &bias,
+        &bias,
+        1e-6,
+        1.0
+    )
+    .unwrap()
+    .is_none());
+    let rotation = CudaBuffer::alloc(256, backend.device_id()).unwrap();
+    assert!(try_split_qkv_bias_apply_vision_2d_precomputed_sm110(
+        ctx, &cpu, &bias, 16, 64, &rotation
+    )
+    .unwrap()
+    .is_none());
+    let allocation = CudaBuffer::alloc(2050, backend.device_id()).unwrap();
+    let misaligned = make_gpu_tensor(
+        Shape::new(vec![1, 1024]),
+        DType::BF16,
+        backend.device_id(),
+        allocation.view(2, 2048).unwrap(),
+    );
+    let affine_bf16 = backend
+        .to_device(&Tensor::from_bf16(vec![1024], &vec![bf16::ZERO; 1024]).unwrap())
+        .unwrap();
+    assert!(try_layer_quant_bf16_e4m3_sm110(
+        ctx,
+        &misaligned,
+        &affine_bf16,
+        &affine_bf16,
+        1e-6,
+        1.0
+    )
+    .unwrap()
+    .is_none());
+    assert!(
+        try_bias_gelu_quant_bf16_e4m3_sm110(ctx, &misaligned, &affine_bf16, 1.0)
+            .unwrap()
+            .is_none()
+    );
+    let wrong_dtype = backend
+        .to_device(&Tensor::from_f32(vec![1, 1024], &vec![0.0; 1024]).unwrap())
+        .unwrap();
+    let affine = backend
+        .to_device(&Tensor::from_bf16(vec![1024], &vec![bf16::ZERO; 1024]).unwrap())
+        .unwrap();
+    assert!(
+        try_layer_quant_bf16_e4m3_sm110(ctx, &wrong_dtype, &affine, &affine, 1e-6, 1.0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        try_bias_gelu_quant_bf16_e4m3_sm110(ctx, &wrong_dtype, &affine, 1.0)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+#[ignore = "diagnostic on Thor; optional APXINF_REVIEW_TACTICS database"]
+fn gr00t_fp8_reference_tactics() {
+    use crate::tuning::*;
+    let backend = CudaBackend::new(0).unwrap();
+    let ctx = backend.context();
+    assert_eq!(ctx.caps().sm, 110);
+    if let Ok(path) = std::env::var("APXINF_REVIEW_TACTICS") {
+        let db = TuningDb::from_json_file(std::path::Path::new(&path)).unwrap();
+        let store = db.build_store(ctx.caps(), ctx.library_versions()).unwrap();
+        ctx.install_tuning(TuningSession::inference(store)).unwrap();
+        println!("database={path}");
+    } else {
+        println!("database=none");
+    }
+    for n in [1536, 6144] {
+        let key = GemmTuningKey {
+            op: GemmOp::Fp8Bf16,
+            device: DeviceFingerprint::from(ctx.caps()),
+            m: 41,
+            n,
+            k: 1536,
+            activation_dtype: TuningDType::F8E4M3,
+            weight_dtype: TuningDType::F8E4M3,
+            output_dtype: TuningDType::Bf16,
+            layout: GemmLayout::RowMajor,
+            scale_mode: ScaleMode::PerTensor,
+            epilogue: Epilogue::None,
+            workspace_limit: usize::MAX,
+        };
+        let plan = ctx
+            .gemm_plans()
+            .resolve(
+                ctx,
+                &key,
+                TacticId {
+                    backend: TacticBackend::Vendor,
+                    value: 0,
+                },
+            )
+            .unwrap();
+        println!(
+            "M41/N{n}/K1536 resolved={:?} source={:?}",
+            plan.tactic, plan.source
+        );
+    }
+}
+
+#[cfg(apxinf_cutlass_gemm)]
+#[test]
+fn m41_reference_is_not_a_production_tactic() {
+    let status = unsafe {
+        ffi::apxinf_static_cutlass_fp8_gemm_bf16(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            41,
+            1536,
+            1536,
+            1.0,
+            8,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, -5, "reference must not be a production tactic");
+}
+
+fn sm110_or_fallback<T>(
+    ctx: &crate::CudaContext,
+    supported_shape: bool,
+    selected: Option<T>,
+    fallback: impl FnOnce() -> apxinf_core::Result<T>,
+) -> apxinf_core::Result<T> {
+    assert_eq!(selected.is_some(), ctx.caps().sm == 110 && supported_shape);
+    match selected {
+        Some(output) => Ok(output),
+        None => fallback(),
+    }
 }
