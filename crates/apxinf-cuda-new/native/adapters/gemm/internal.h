@@ -70,11 +70,19 @@ struct AlignmentRequirements {
 using AlignmentFn = AlignmentRequirements (*)(const Spec&);
 using ResourceRequirementsFn = size_t (*)(const Spec&);
 
+enum class WeightLayout : uint32_t {
+  Canonical = APXINF_GEMM_LAYOUT_CANONICAL,
+  NK = APXINF_GEMM_LAYOUT_NK,
+  GateUpInterleaved256 = APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256,
+  GateUpAdjacent = APXINF_GEMM_LAYOUT_GATE_UP_ADJACENT,
+};
+
 struct Implementation {
   uint32_t provider_id;
   uint32_t implementation_id;
   uint32_t implementation_version;
   const char* name;
+  WeightLayout weight_layout;
   uint64_t required_device_features;
   bool graph_safe;
   bool deterministic;
@@ -88,7 +96,6 @@ struct Implementation {
   DestroyExecutionFn destroy;
 };
 
-uint32_t weight_layout(const Implementation& implementation);
 bool supports_weight_layout(const Implementation& implementation, const Spec& spec);
 struct TemporaryWeight {
   void* pointer = nullptr;
