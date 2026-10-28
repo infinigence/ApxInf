@@ -135,7 +135,7 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | Family / contract | Current organization and limits |
 | --- | --- |
 | PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
-| Fast-WAM / `VlaRuntime` | `fastwam/model/blocks/bf16/` owns layer composition and fixed modulation preparation; `model/` connects modalities and the schedule, `weights/` maps checkpoint data, `model_runner.rs` owns execution; CUDA BF16 action-only fixed profile with native Wan VAE/UMT5, two resized RGB views and ten flow steps; [qualification and limits](fastwam.md) |
+| Fast-WAM / `VlaRuntime` | `cuda_fastwam/model/blocks/bf16.rs` owns layer composition and fixed modulation preparation; `model/` connects modalities and the schedule, `weights/host.rs` reads checkpoint data, `weights/bf16/` prepares device representations, and `model_runner/{runner,prepare}.rs` owns execution; CUDA BF16 action-only fixed profile with native Wan VAE/UMT5, two resized RGB views and ten flow steps; [qualification and limits](fastwam.md) |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
@@ -377,3 +377,11 @@ See the [implemented component view](model-lifecycle/architecture.md#implemented
 [callable lifecycle contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
 and [migration tracker](model-lifecycle/migration.md) for qualification and scope.
 WallOSS and GR00T retain their previous implementations pending their own stages.
+
+### Backend-native family modules
+
+A new implementation written directly against a backend native API lives in
+`<backend>_<family>/` (`cuda_`, `metal_`, or `hip_`). Fast-WAM uses
+`cuda_fastwam/`; its public policy name remains `fastwam`. Keep each backend
+implementation self-contained and preserve the model/blocks, weights and runner
+ownership boundaries within it.

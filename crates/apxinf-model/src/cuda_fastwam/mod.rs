@@ -5,6 +5,7 @@ pub(crate) mod load;
 mod model;
 mod model_runner;
 mod weights;
-pub(super) fn register_builtin() {
+pub(crate) fn register_builtin() {
+    crate::registry::register("cuda_fastwam", load::load_registered);
     crate::registry::register("fastwam", load::load_registered);
 }

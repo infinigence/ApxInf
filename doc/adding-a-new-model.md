@@ -166,7 +166,8 @@ specialized fast path may recover a concrete backend for capabilities that do
 not belong on the portable trait. Trait is the floor; concrete types are the
 ceiling.
 
-For Metal, use a `metal_<family>` module and registration for native composition;
+For native backend composition, use a `<backend>_<family>` module (`cuda_`,
+`metal_`, or `hip_`) and registration;
 the provisional cross-backend design is not a prerequisite. Preserve measured
 performance and reference semantics when choosing the boundary.
 

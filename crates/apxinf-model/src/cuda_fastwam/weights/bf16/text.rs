@@ -1,29 +1,29 @@
 //! Immutable checkpoint mapping and prepared weight data.
 use super::{host_tensor, validate_tensor, Bias, Linear, Store};
-use crate::fastwam::backend::{self, Context};
+use crate::cuda_fastwam::backend::{self, Context};
 use apxinf_core::{DType, Error, Result, Tensor};
 use std::path::Path;
-pub(in crate::fastwam) struct Block {
-    pub(in crate::fastwam) norm0: Tensor,
-    pub(in crate::fastwam) q: Linear,
-    pub(in crate::fastwam) k: Linear,
-    pub(in crate::fastwam) v: Linear,
-    pub(in crate::fastwam) o: Linear,
-    pub(in crate::fastwam) bias: Tensor,
-    pub(in crate::fastwam) norm1: Tensor,
-    pub(in crate::fastwam) wi0: Linear,
-    pub(in crate::fastwam) wi1: Linear,
-    pub(in crate::fastwam) wo: Linear,
+pub(in crate::cuda_fastwam) struct Block {
+    pub(in crate::cuda_fastwam) norm0: Tensor,
+    pub(in crate::cuda_fastwam) q: Linear,
+    pub(in crate::cuda_fastwam) k: Linear,
+    pub(in crate::cuda_fastwam) v: Linear,
+    pub(in crate::cuda_fastwam) o: Linear,
+    pub(in crate::cuda_fastwam) bias: Tensor,
+    pub(in crate::cuda_fastwam) norm1: Tensor,
+    pub(in crate::cuda_fastwam) wi0: Linear,
+    pub(in crate::cuda_fastwam) wi1: Linear,
+    pub(in crate::cuda_fastwam) wo: Linear,
 }
 
-pub(in crate::fastwam) struct TextEncoder {
-    pub(in crate::fastwam) embedding: Tensor,
-    pub(in crate::fastwam) blocks: Vec<Block>,
-    pub(in crate::fastwam) norm: Tensor,
+pub(in crate::cuda_fastwam) struct TextEncoder {
+    pub(in crate::cuda_fastwam) embedding: Tensor,
+    pub(in crate::cuda_fastwam) blocks: Vec<Block>,
+    pub(in crate::cuda_fastwam) norm: Tensor,
 }
 
 impl TextEncoder {
-    pub(in crate::fastwam) fn load(ctx: &Context, path: &Path) -> Result<Self> {
+    pub(in crate::cuda_fastwam) fn load(ctx: &Context, path: &Path) -> Result<Self> {
         let v: serde_json::Value = serde_json::from_slice(
             &std::fs::read(path.join("config.json")).map_err(|e| Error::Other(e.to_string()))?,
         )

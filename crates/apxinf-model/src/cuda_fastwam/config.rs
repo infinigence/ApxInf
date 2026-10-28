@@ -3,11 +3,11 @@
 use apxinf_core::{Error, Result};
 use std::path::Path;
 #[derive(Clone)]
-pub(super) struct Config {
+pub(in crate::cuda_fastwam) struct Config {
     pub steps: usize,
 }
 impl Config {
-    pub(super) fn load(path: &Path) -> Result<Self> {
+    pub(in crate::cuda_fastwam) fn load(path: &Path) -> Result<Self> {
         let v: serde_json::Value = serde_json::from_slice(
             &std::fs::read(path.join("config.json")).map_err(|e| Error::Other(e.to_string()))?,
         )

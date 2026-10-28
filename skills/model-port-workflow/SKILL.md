@@ -103,7 +103,10 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    identify explicit dynamic state, prepared shapes and bounded lazy outputs.
    Inspect the safe array/fusion seam in `apxinf-mlx`; keep raw FFI and unsafe
    custom kernels there, without a universal model/runtime wrapper. Use
-   `metal_<family>` for native Metal composition and registration. The evolving
+   `<backend>_<family>` (`cuda_`, `metal_`, `hip_`) for native backend
+   composition and registration, following the model-layer architecture naming
+   rules. Keep host checkpoint storage, device weights, model/blocks computation
+   and runner preparation under their declared owners. The evolving
    cross-backend contract is not a prerequisite: preserve the model's numerical
    recipe and measured performance without introducing per-op trait wrappers.
 5. Classify fused and primitive coverage. If a real gap exists, follow

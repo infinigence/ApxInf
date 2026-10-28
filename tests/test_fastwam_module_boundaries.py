@@ -21,9 +21,11 @@ def test_current_fastwam_ownership():
     "path, code, expected",
     [
         ("backend.rs", "fn projection() { ops::gemm(); }", "operator composition"),
-        ("weights/dit.rs", "fn prepare() { time.forward(); }", "weights invoke"),
+        ("weights/host.rs", "use crate::cuda_fastwam::backend::Context;", "host checkpoint storage"),
+        ("weights/bf16/dit.rs", "fn prepare() { time.forward(); }", "weights invoke"),
         ("text.rs", "fn forward() {}", "belongs under model/blocks/bf16"),
-        ("model/blocks/bf16/extra.rs", "use crate::vla::VlaRequest;", "execution ownership"),
+        ("model/blocks/bf16.rs", "use crate::vla::VlaRequest;", "execution ownership"),
+        ("model/mod.rs", "fn leak() { ops::pointwise(); }", "precision and subnetwork"),
         ("load.rs", "use super::model::blocks::bf16;", "concrete block construction"),
     ],
 )

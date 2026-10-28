@@ -1,15 +1,15 @@
 //! Immutable checkpoint mapping and prepared weight data.
 use super::cast;
 use super::{host_tensor, validate_tensor, Bias, Linear, Store};
-use crate::fastwam::backend::{self, ops, Context};
+use crate::cuda_fastwam::backend::{self, ops, Context};
 use apxinf_core::{DType, Error, Result, Tensor};
-pub(in crate::fastwam) struct Projections {
-    pub(in crate::fastwam) q: Linear,
-    pub(in crate::fastwam) k: Linear,
-    pub(in crate::fastwam) v: Linear,
-    pub(in crate::fastwam) o: Linear,
-    pub(in crate::fastwam) nq: Tensor,
-    pub(in crate::fastwam) nk: Tensor,
+pub(in crate::cuda_fastwam) struct Projections {
+    pub(in crate::cuda_fastwam) q: Linear,
+    pub(in crate::cuda_fastwam) k: Linear,
+    pub(in crate::cuda_fastwam) v: Linear,
+    pub(in crate::cuda_fastwam) o: Linear,
+    pub(in crate::cuda_fastwam) nq: Tensor,
+    pub(in crate::cuda_fastwam) nk: Tensor,
 }
 
 impl Projections {
@@ -25,30 +25,30 @@ impl Projections {
     }
 }
 
-pub(in crate::fastwam) struct Block {
-    pub(in crate::fastwam) sa: Projections,
-    pub(in crate::fastwam) ca: Projections,
-    pub(in crate::fastwam) norm3w: Tensor,
-    pub(in crate::fastwam) norm3b: Tensor,
-    pub(in crate::fastwam) ff0: Linear,
-    pub(in crate::fastwam) ff2: Linear,
-    pub(in crate::fastwam) modulation: Tensor,
+pub(in crate::cuda_fastwam) struct Block {
+    pub(in crate::cuda_fastwam) sa: Projections,
+    pub(in crate::cuda_fastwam) ca: Projections,
+    pub(in crate::cuda_fastwam) norm3w: Tensor,
+    pub(in crate::cuda_fastwam) norm3b: Tensor,
+    pub(in crate::cuda_fastwam) ff0: Linear,
+    pub(in crate::cuda_fastwam) ff2: Linear,
+    pub(in crate::cuda_fastwam) modulation: Tensor,
 }
 
-pub(in crate::fastwam) struct Expert {
-    pub(in crate::fastwam) blocks: Vec<Block>,
-    pub(in crate::fastwam) text0: Linear,
-    pub(in crate::fastwam) text2: Linear,
-    pub(in crate::fastwam) input: Linear,
-    pub(in crate::fastwam) head: Option<Linear>,
-    pub(in crate::fastwam) one: Tensor,
-    pub(in crate::fastwam) zero: Tensor,
-    pub(in crate::fastwam) rope: ops::PairwiseRopeTable,
-    pub(in crate::fastwam) video: bool,
+pub(in crate::cuda_fastwam) struct Expert {
+    pub(in crate::cuda_fastwam) blocks: Vec<Block>,
+    pub(in crate::cuda_fastwam) text0: Linear,
+    pub(in crate::cuda_fastwam) text2: Linear,
+    pub(in crate::cuda_fastwam) input: Linear,
+    pub(in crate::cuda_fastwam) head: Option<Linear>,
+    pub(in crate::cuda_fastwam) one: Tensor,
+    pub(in crate::cuda_fastwam) zero: Tensor,
+    pub(in crate::cuda_fastwam) rope: ops::PairwiseRopeTable,
+    pub(in crate::cuda_fastwam) video: bool,
 }
 
 impl Expert {
-    pub(in crate::fastwam) fn load(
+    pub(in crate::cuda_fastwam) fn load(
         s: &mut Store,
         ctx: &Context,
         video: bool,
@@ -214,7 +214,7 @@ fn vector(ctx: &Context, values: &[f32], dtype: DType) -> Result<Tensor> {
     backend::upload(ctx, &host_tensor(vec![values.len()], values, dtype)?)
 }
 
-pub(in crate::fastwam) struct TimeWeights {
+pub(in crate::cuda_fastwam) struct TimeWeights {
     pub time0: Linear,
     pub time2: Linear,
     pub timeproj: Linear,

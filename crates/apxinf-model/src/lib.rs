@@ -6,7 +6,7 @@ pub mod builtin;
 pub mod d3;
 pub mod debug;
 #[cfg(feature = "cuda")]
-pub mod fastwam;
+pub mod cuda_fastwam;
 mod generation_config;
 pub mod gr00t;
 pub mod llama;

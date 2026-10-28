@@ -1,12 +1,12 @@
 use super::{
     backend::{ops, Context},
     config::Config,
-    model_runner::ModelRunner,
+    model_runner::FastWamModelRunner,
 };
 use crate::auto::{cuda_recipe_options, LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Device, Error, Result};
 use std::{path::Path, rc::Rc, sync::Arc};
-pub(super) fn load_registered(
+pub(in crate::cuda_fastwam) fn load_registered(
     path: &Path,
     device: Device,
     _backend: Arc<dyn Backend>,
@@ -69,7 +69,9 @@ pub(crate) fn load_with_cuda_new(
     attention.cache_dir = recipe.cache_dir;
     attention.online_tune = recipe.online_tune;
     let model = build_model(&ctx, path, &text, &vae, gemm, attention)?;
-    Ok(LoadedModel::Vla(Box::new(ModelRunner::new(ctx, model))))
+    Ok(LoadedModel::Vla(Box::new(FastWamModelRunner::new(
+        ctx, model,
+    ))))
 }
 
-pub(super) use super::model::build_model;
+pub(in crate::cuda_fastwam) use super::model::build_model;

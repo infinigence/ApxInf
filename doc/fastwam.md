@@ -80,7 +80,7 @@ Absent/null `sigma_shift` uses the scheduler shift of 5; an explicit override
 must equal 5. Other values are rejected before device weights are loaded.
 `weights/` maps and packs checkpoint tensors, including time-projection weights
 and fixed position tables. `model/mod.rs` owns model construction, modality connections and the
-flow schedule. `model/blocks/bf16/` owns UMT5, VAE and DiT composition,
+flow schedule. `model/blocks/bf16.rs` owns UMT5, VAE and DiT composition,
 projection/bias rounding and fixed time-modulation preparation. Its BF16
 implementation includes the declared F32 residual and action-projection paths.
 Temporary time-projection weights are released after modulation preparation.
@@ -106,7 +106,8 @@ the same prepared object when a snapshot is needed.
 
 ## Validation
 
-The opt-in checkpoint tests in `fastwam/{vae,text,model_runner}.rs` require local
+The opt-in checkpoint tests in `cuda_fastwam/model/blocks/bf16.rs` and
+`cuda_fastwam/model_runner/runner.rs` require local
 assets and independent reference captures. They cover encoder boundaries,
 canonical action outputs, complete graph parity, changed image/text/state/noise,
 keyed RNG, invalid specifications and output ownership. The CUDA backend tests
@@ -206,3 +207,121 @@ number is a measured allocation peak. Further work should profile first-call
 resource/graph preparation and reuse intermediates between action steps to
 reduce the monotonic arena. The required encoders, ten-step loop and graph
 replay already execute on the GPU without intermediate host round trips.
+
+### FP32 attention optimization (2026-10-26)
+
+A subsequent Thor measurement identified the default FP32 attention provider as
+24.4% of traced kernel time: 660 calls and approximately 104 ms per request.
+The CUDA backend now supplies a pedantic FP32 cuBLAS candidate for dense MHA
+with at most 1024 keys. QK and PV operate directly on interleaved head strides;
+masking and softmax share one kernel. TF32 conversion is disabled. The model's
+precision boundaries, public interfaces and ten-step schedule are unchanged.
+Resource limits, graph preparation and exact recipe selection remain native
+operator responsibilities; GQA and longer keys retain the existing candidates.
+
+Twenty alternating baseline/optimized pairs measured default AutoPolicy with
+autotuning disabled, host RGB/state/task inputs, supplied canonical noise and
+host action outputs. Both models remained resident. Three joint warmup pairs
+followed loading and graph preparation; pair order alternated, and GPU process
+checks before, during and after timing detected only the two benchmark workers.
+
+| Native implementation | Median | p95 |
+| --- | ---: | ---: |
+| Before FP32 attention optimization | 390.64 ms | 395.09 ms |
+| With FP32 cuBLAS attention | 321.85 ms | 322.34 ms |
+
+Median paired speedup is 1.214×, with a 17.6% reduction in median latency.
+These paired results are separate from the earlier shared-device comparison
+against official LeRobot. Loading and first-call setup remain excluded.
+
+Native eager/graph lifecycle, default AutoPolicy, cold tuning and a separate
+warm-cache process each pass all twelve frozen FP32 noninferiority cases without
+using the comparison allowance. Eager, graph and public default outputs agree
+exactly. Cold/warm actions and all error metrics agree exactly, and all 45 recipe
+files retain identical contents and modification times. Backend validation passes
+112 library tests and eight public integration tests; two unrelated opt-in tests
+remain ignored. This optimization did not rerun the LIBERO rollout pilot.
+
+Roofline analysis uses measured streaming-copy bandwidth (231.38 GB/s), pedantic
+SGEMM throughput (6.18 TFLOP/s), actual attention shapes and Nsight Systems
+latencies. Arithmetic intensity uses ideal minimum Q/K/V/output traffic, omitting
+scratch and repeated reads. NCU counter collection was denied by device permissions,
+so these are analytical roofline estimates, not measured DRAM utilization or
+stall attribution. Shared-score-memory, split-value-reduction and static-unrolling
+experiments did not improve all representative shapes and were not adopted.
+
+### Fused attention and conversion reuse (2026-10-27)
+
+The next iteration adds a short dense F32 attention candidate that fuses QK,
+softmax and PV. Four queries reuse vectorized K/V loads, eight-lane groups
+reduce QK and four warps reduce PV; scores stay in shared memory. It needs no
+global score workspace. The provider checks B1, Q16–128, K1–160, D128, equal
+heads, no mask and 16-byte binding alignment; other cases retain existing
+providers. Products and accumulators remain F32, with a different reduction
+order. The model schedule and checkpoint precision boundaries are unchanged.
+
+BF16-to-F32 conversion now uses aligned four-element vectors with scalar
+fallback for tails and unaligned views. Each request also promotes its rounded
+cross-attention context K/V once, then reuses those exact F32 values across the
+ten action steps. This is not a cross-request text cache: changed observations,
+state and prompts still recompute their context on every graph replay.
+
+Two separate twenty-pair, alternating-order experiments on Thor use the same
+default AutoPolicy boundary and GPU-exclusivity checks described above:
+
+| Experiment | Previous cuBLAS median / p95 | Candidate median / p95 |
+| --- | ---: | ---: |
+| Fused attention only | 322.16 / 334.08 ms | 307.88 / 318.82 ms |
+| Fused attention + vector conversion + context promotion reuse | 322.42 / 322.63 ms | 294.05 / 294.62 ms |
+
+The combined change reduces median latency by 8.8% (1.096×); do not combine
+ratios from different experiments. Under separate Nsight Systems tracing,
+F32 attention kernel time falls from 35.49 to 23.79 ms/request and BF16-to-F32
+conversion from 24.11 to 5.79 ms/request. There are 540 fewer conversions and
+1,860 fewer total kernel nodes per request. Trace timings are diagnostic, not
+the unprofiled end-to-end benchmark.
+
+All twelve original FP32 noninferiority cases pass for default, native
+eager/graph, cold tuning and a separate warm-cache process without using the
+comparison allowance. The conversion/reuse changes preserve the fused-only
+canonical actions and all twelve error metrics exactly. Cold/warm actions,
+error metrics and recipe contents/mtimes agree. Backend validation passes
+114 library tests, an additional focused attention-alignment fallback test and
+eight public integration tests; two unrelated opt-in tests remain ignored.
+Compute Sanitizer memcheck and synccheck pass the fused kernel's boundary
+shapes. No additional LIBERO rollouts were performed for this iteration.
+
+The roofline interpretation now distinguishes cache-resident and streaming
+workloads. Thor reports 32 MiB L2; empirical copy throughput is 933–1090 GB/s
+for 4–16 MiB working sets, versus approximately 231 GB/s for streaming data.
+Warm attention microbenchmarks reach 29–33% of the measured 6.18 TFLOP/s F32
+compute ceiling; actual full-model attention reaches about 23–30%. The larger
+32–64% fractions against ideal minimum DRAM traffic are not measured hardware
+utilization. Actual cache/DRAM traffic and stalls remain unknown without NCU
+counters. Larger tiles, register/shared-memory variants and pedantic cuBLASLt
+heuristics were evaluated; none beat the selected candidate across this work.
+
+### Source ownership and capture boundary
+
+The native implementation is `crates/apxinf-model/src/cuda_fastwam/`.
+`model/` connects modalities and owns the fixed flow schedule;
+`model/blocks/bf16.rs` composes DiT, UMT5 and VAE operators. Private inline modules hold the subnetwork implementations; only `Bf16Blocks`
+is exposed to the model. It owns physical conditioning caches, dtype boundaries
+and workspace requirements. `weights/host.rs` owns
+checkpoint storage and source validation; `weights/bf16/` owns device weight
+representations and upload/packing, including explicitly F32 tensors used by
+this implementation. Text and VAE computation objects retain their weight trees.
+`model_runner/runner.rs` validates requests and owns the plan cache;
+`model_runner/prepare.rs` owns stable buffers, preparation, capture and replay.
+`backend.rs` remains a safe CUDA import/transfer seam.
+
+The captured graph covers the complete model forward from already bound device
+inputs: RGB canonicalization, VAE, UMT5, video conditioning, all ten action steps
+and the device output copy. Request validation, CPU token/mask construction,
+state/provided-noise conversion and uploads are outside capture. Generated noise
+uses a GPU RNG launch before replay. Python resize/tokenization, policy
+normalization and action postprocessing, and host output download are also
+outside this graph. Whole-model capture does not mean whole-request capture.
+
+The native loader accepts `cuda_fastwam`; existing `fastwam` and `fastwam-cuda`
+selection spellings remain compatible. The Python policy name stays `fastwam`.

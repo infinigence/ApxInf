@@ -1,13 +1,13 @@
 //! Immutable checkpoint mapping and prepared weight data.
 use super::{host_tensor, Linear, Store};
-use crate::fastwam::backend::{self, Context};
+use crate::cuda_fastwam::backend::{self, Context};
 use apxinf_core::{DType, Error, Result, Tensor};
 use std::path::Path;
-pub(in crate::fastwam) struct Conv {
-    pub(in crate::fastwam) projection: Linear,
-    pub(in crate::fastwam) kernel: usize,
-    pub(in crate::fastwam) stride: usize,
-    pub(in crate::fastwam) padding: usize,
+pub(in crate::cuda_fastwam) struct Conv {
+    pub(in crate::cuda_fastwam) projection: Linear,
+    pub(in crate::cuda_fastwam) kernel: usize,
+    pub(in crate::cuda_fastwam) stride: usize,
+    pub(in crate::cuda_fastwam) padding: usize,
 }
 
 impl Conv {
@@ -73,8 +73,8 @@ fn validate_conv_shapes(
     Ok(())
 }
 
-pub(in crate::fastwam) struct Norm {
-    pub(in crate::fastwam) gamma: Tensor,
+pub(in crate::cuda_fastwam) struct Norm {
+    pub(in crate::cuda_fastwam) gamma: Tensor,
 }
 
 impl Norm {
@@ -101,12 +101,12 @@ impl Norm {
     }
 }
 
-pub(in crate::fastwam) struct Residual {
-    pub(in crate::fastwam) norm1: Norm,
-    pub(in crate::fastwam) conv1: Conv,
-    pub(in crate::fastwam) norm2: Norm,
-    pub(in crate::fastwam) conv2: Conv,
-    pub(in crate::fastwam) shortcut: Option<Conv>,
+pub(in crate::cuda_fastwam) struct Residual {
+    pub(in crate::cuda_fastwam) norm1: Norm,
+    pub(in crate::cuda_fastwam) conv1: Conv,
+    pub(in crate::cuda_fastwam) norm2: Norm,
+    pub(in crate::cuda_fastwam) conv2: Conv,
+    pub(in crate::cuda_fastwam) shortcut: Option<Conv>,
 }
 
 impl Residual {
@@ -177,18 +177,18 @@ impl Residual {
     }
 }
 
-pub(in crate::fastwam) struct DownBlock {
-    pub(in crate::fastwam) residuals: Vec<Residual>,
-    pub(in crate::fastwam) downsample: Option<Conv>,
-    pub(in crate::fastwam) temporal_factor: usize,
+pub(in crate::cuda_fastwam) struct DownBlock {
+    pub(in crate::cuda_fastwam) residuals: Vec<Residual>,
+    pub(in crate::cuda_fastwam) downsample: Option<Conv>,
+    pub(in crate::cuda_fastwam) temporal_factor: usize,
 }
 
-pub(in crate::fastwam) struct Attention {
-    pub(in crate::fastwam) norm: Norm,
-    pub(in crate::fastwam) q: Linear,
-    pub(in crate::fastwam) k: Linear,
-    pub(in crate::fastwam) v: Linear,
-    pub(in crate::fastwam) projection: Conv,
+pub(in crate::cuda_fastwam) struct Attention {
+    pub(in crate::cuda_fastwam) norm: Norm,
+    pub(in crate::cuda_fastwam) q: Linear,
+    pub(in crate::cuda_fastwam) k: Linear,
+    pub(in crate::cuda_fastwam) v: Linear,
+    pub(in crate::cuda_fastwam) projection: Conv,
 }
 
 impl Attention {
@@ -292,22 +292,22 @@ mod tests {
     }
 }
 
-pub(in crate::fastwam) struct Vae {
-    pub(in crate::fastwam) input: Conv,
-    pub(in crate::fastwam) down: Vec<DownBlock>,
-    pub(in crate::fastwam) mid0: Residual,
-    pub(in crate::fastwam) attention: Attention,
-    pub(in crate::fastwam) mid1: Residual,
-    pub(in crate::fastwam) norm: Norm,
-    pub(in crate::fastwam) output: Conv,
-    pub(in crate::fastwam) quant: Conv,
-    pub(in crate::fastwam) mean: Tensor,
-    pub(in crate::fastwam) std: Tensor,
-    pub(in crate::fastwam) dtype: DType,
+pub(in crate::cuda_fastwam) struct Vae {
+    pub(in crate::cuda_fastwam) input: Conv,
+    pub(in crate::cuda_fastwam) down: Vec<DownBlock>,
+    pub(in crate::cuda_fastwam) mid0: Residual,
+    pub(in crate::cuda_fastwam) attention: Attention,
+    pub(in crate::cuda_fastwam) mid1: Residual,
+    pub(in crate::cuda_fastwam) norm: Norm,
+    pub(in crate::cuda_fastwam) output: Conv,
+    pub(in crate::cuda_fastwam) quant: Conv,
+    pub(in crate::cuda_fastwam) mean: Tensor,
+    pub(in crate::cuda_fastwam) std: Tensor,
+    pub(in crate::cuda_fastwam) dtype: DType,
 }
 
 impl Vae {
-    pub(in crate::fastwam) fn load(ctx: &Context, path: &Path, dtype: DType) -> Result<Self> {
+    pub(in crate::cuda_fastwam) fn load(ctx: &Context, path: &Path, dtype: DType) -> Result<Self> {
         let config: serde_json::Value = serde_json::from_slice(
             &std::fs::read(path.join("config.json")).map_err(|e| Error::Other(e.to_string()))?,
         )

@@ -1,36 +1,36 @@
-//! Checkpoint mapping and immutable device weights, independent of the runner.
-use super::backend::{self, ops, Context};
+//! Host checkpoint storage, source validation and host tensor construction.
 use apxinf_core::{DType, Error, Result, Tensor};
 use std::{collections::HashMap, path::Path};
 
-pub(super) struct Store {
+pub(in crate::cuda_fastwam) struct Store {
     tensors: HashMap<String, Tensor>,
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Bias {
+pub(in crate::cuda_fastwam) enum Bias {
     Required,
     Forbidden,
 }
 
 impl Store {
-    pub(super) fn load(path: &Path) -> Result<Self> {
+    pub(in crate::cuda_fastwam) fn load(path: &Path) -> Result<Self> {
         let (tensors, _) =
             apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
         Ok(Self { tensors })
     }
-    pub(super) fn take(&mut self, name: &str) -> Result<Tensor> {
+    pub(in crate::cuda_fastwam) fn take(&mut self, name: &str) -> Result<Tensor> {
         self.tensors
             .remove(name)
             .ok_or_else(|| Error::Other(format!("Fast-WAM checkpoint missing {name}")))
     }
-    pub(super) fn contains(&self, name: &str) -> bool {
+    pub(in crate::cuda_fastwam) fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }
-    pub(super) fn upload(&mut self, ctx: &Context, name: &str) -> Result<Tensor> {
-        backend::upload(ctx, &self.take(name)?)
-    }
-    fn take_linear(&mut self, prefix: &str, bias: Bias) -> Result<(Tensor, Option<Tensor>)> {
+    pub(super) fn take_linear(
+        &mut self,
+        prefix: &str,
+        bias: Bias,
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let raw = self.take(&format!("{prefix}.weight"))?;
         let dims = raw.shape().dims();
         if dims.len() != 2 || dims.contains(&0) || raw.dtype() != DType::BF16 {
@@ -59,31 +59,9 @@ impl Store {
         };
         Ok((raw, bias))
     }
-    pub(super) fn linear(&mut self, ctx: &Context, prefix: &str, bias: Bias) -> Result<Linear> {
-        // Validate checkpoint semantics before allocating device weights.
-        let (raw, bias) = self.take_linear(prefix, bias)?;
-        let (n, k) = (raw.shape().dims()[0], raw.shape().dims()[1]);
-        let src = raw.to_f32_vec()?;
-        let mut dst = vec![0.; src.len()];
-        for j in 0..n {
-            for i in 0..k {
-                dst[i * n + j] = src[j * k + i];
-            }
-        }
-        let weight = backend::upload(ctx, &host_tensor(vec![k, n], &dst, raw.dtype())?)?;
-        let bias = bias
-            .as_ref()
-            .map(|bias| backend::upload(ctx, bias))
-            .transpose()?;
-        Ok(Linear { weight, bias })
-    }
 }
 
-pub(super) struct Linear {
-    pub weight: Tensor,
-    pub bias: Option<Tensor>,
-}
-pub(super) fn validate_tensor(
+pub(in crate::cuda_fastwam) fn validate_tensor(
     name: &str,
     tensor: &Tensor,
     dims: &[usize],
@@ -99,39 +77,11 @@ pub(super) fn validate_tensor(
     Ok(())
 }
 
-impl Linear {
-    pub(super) fn validate(&self, name: &str, input: usize, output: usize) -> Result<()> {
-        validate_tensor(name, &self.weight, &[input, output], DType::BF16)?;
-        if let Some(bias) = &self.bias {
-            validate_tensor(name, bias, &[output], DType::BF16)?;
-        }
-        Ok(())
-    }
-}
-
-pub(super) mod dit;
-pub(super) mod text;
-pub(super) mod vae;
-
-pub(super) fn cast(ctx: &Context, x: &Tensor, dtype: DType) -> Result<Tensor> {
-    if x.dtype() == dtype {
-        return Ok(x.clone());
-    }
-    let semantic = match (x.dtype(), dtype) {
-        (DType::BF16, DType::F32) => ops::QuantizationSemantic::CastBf16ToF32,
-        (DType::F32, DType::BF16) => ops::QuantizationSemantic::CastF32ToBf16,
-        _ => {
-            return Err(Error::Other(
-                "Fast-WAM supports BF16/F32 conversion only".into(),
-            ))
-        }
-    };
-    let mut out = ctx.allocate_output(x.shape().clone(), dtype)?;
-    ops::quantization(ctx, ops::QuantizationArgs::new(semantic, x, &mut out))?;
-    Ok(out)
-}
-
-pub(super) fn host_tensor(shape: Vec<usize>, values: &[f32], dtype: DType) -> Result<Tensor> {
+pub(in crate::cuda_fastwam) fn host_tensor(
+    shape: Vec<usize>,
+    values: &[f32],
+    dtype: DType,
+) -> Result<Tensor> {
     match dtype {
         DType::F32 => Tensor::from_f32(shape, values),
         DType::BF16 => Tensor::from_bf16(
