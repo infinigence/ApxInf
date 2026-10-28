@@ -153,7 +153,12 @@ different implementations for GEMM and GeGLU.
 The current first-prepare layout decision is a compatibility mechanism, not a
 global performance plan. PI0.5 FP8 gate/up weights can serve interleaved dual
 GeGLU at M=522/533 and canonical split GeGLU at M=778/789. A compatible baseline
-does not prove equivalent latency. Cross-profile users must measure both prepare
+does not prove equivalent latency. Camera count is fixed when a runner is
+loaded; switching two/three cameras is not a same-instance transition. Token
+count can change on the same runner: for two 224px views, T=10 gives M=522
+(fused GeGLU), while T=11 gives M=523 (plain GEMM plus pointwise). Those calls
+share the same weight allocation and can require different preferred layouts.
+Cross-profile users must measure both prepare
 orders and end-to-end latency; no claim of order-independent optimal selection
 is made. A future explicit weight preparation plan must gather consumer profiles
 before committing bytes, compare compatible recipes per layout, and choose a
