@@ -22,7 +22,6 @@ bool valid_alignment(uint32_t alignment) {
 
 bool writes_hidden(uint32_t semantic) {
   return semantic != APXINF_NORM_SEMANTIC_RMS &&
-         semantic != APXINF_NORM_SEMANTIC_RMS_ROUNDED &&
          semantic != APXINF_NORM_SEMANTIC_LAYER &&
          semantic != APXINF_NORM_SEMANTIC_ADAPTIVE_RMS;
 }
@@ -37,7 +36,6 @@ bool reads_residual(uint32_t semantic) { return writes_hidden(semantic); }
 
 bool reads_weight(uint32_t semantic) {
   return semantic == APXINF_NORM_SEMANTIC_RMS ||
-         semantic == APXINF_NORM_SEMANTIC_RMS_ROUNDED ||
          semantic == APXINF_NORM_SEMANTIC_LAYER ||
          semantic == APXINF_NORM_SEMANTIC_BIAS_RESIDUAL_RMS ||
          semantic == APXINF_NORM_SEMANTIC_BIAS_RESIDUAL_LAYER;
@@ -71,8 +69,7 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
       spec.output_dtype == APXINF_DTYPE_E4M3 &&
       writes_normalized(spec.semantic);
   if (spec.version != APXINF_NORM_SPEC_VERSION ||
-      spec.semantic > APXINF_NORM_SEMANTIC_RMS_ROUNDED ||
-      (spec.semantic == APXINF_NORM_SEMANTIC_RMS_ROUNDED && spec.dtype != spec.output_dtype) ||
+      spec.semantic > APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16 &&
        !(spec.dtype == APXINF_DTYPE_F32 && spec.semantic == APXINF_NORM_SEMANTIC_LAYER)) ||
       (spec.output_dtype != spec.dtype && !quantized_output) ||
@@ -239,10 +236,6 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
   auto stream = static_cast<cudaStream_t>(bindings.stream);
 
   switch (spec.semantic) {
-    case APXINF_NORM_SEMANTIC_RMS_ROUNDED:
-      kernels::rms_norm<T, true><<<rows, kThreads, 0, stream>>>(
-          input, weight, normalized, rows, cols, bindings.eps);
-      break;
     case APXINF_NORM_SEMANTIC_RMS:
       kernels::rms_norm<T><<<rows, kThreads, 0, stream>>>(
           input, weight, normalized, rows, cols, bindings.eps);

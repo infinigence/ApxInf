@@ -1,7 +1,9 @@
 use super::{
     backend::{ops, Context},
     config::Config,
+    model::build_model,
     model_runner::FastWamModelRunner,
+    weights::bf16::Bf16Weights,
 };
 use crate::auto::{cuda_recipe_options, LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Device, Error, Result};
@@ -68,10 +70,9 @@ pub(crate) fn load_with_cuda_new(
     let mut attention = ops::AttentionPolicy::default();
     attention.cache_dir = recipe.cache_dir;
     attention.online_tune = recipe.online_tune;
-    let model = build_model(&ctx, path, &text, &vae, gemm, attention)?;
+    let weights = Bf16Weights::load(&ctx, path, &text, &vae)?;
+    let model = build_model(&ctx, weights, gemm, attention)?;
     Ok(LoadedModel::Vla(Box::new(FastWamModelRunner::new(
         ctx, model,
     ))))
 }
-
-pub(in crate::cuda_fastwam) use super::model::build_model;

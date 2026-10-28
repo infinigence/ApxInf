@@ -44,38 +44,14 @@ fn quantization_rejects_packed_fp4_input() {
         (QuantizationSemantic::RowwiseI8, DType::I8),
     ] {
         let mut output = zeros_tensor(0, vec![1, 16], dtype);
-        let error = quantization(&ctx, QuantizationArgs::new(semantic, &input, &mut output))
-            .unwrap_err();
+        let error =
+            quantization(&ctx, QuantizationArgs::new(semantic, &input, &mut output)).unwrap_err();
         assert!(
             error.to_string().contains("requires F16 or BF16")
                 || error.to_string().contains("dtype disagrees"),
             "{semantic:?}: {error}"
         );
     }
-}
-
-#[test]
-fn quantization_casts_bf16_to_f32_exactly() {
-    use apxinf_core::DType;
-
-    let ctx = CudaContext::new(0).unwrap();
-    let source = [1.0, -2.5, 0.125, 65_536.0];
-    let input = tensor(0, vec![1, source.len()], &source);
-    let mut output = zeros_tensor(0, vec![1, source.len()], DType::F32);
-    quantization(
-        &ctx,
-        QuantizationArgs::new(QuantizationSemantic::CastBf16ToF32, &input, &mut output),
-    )
-    .unwrap();
-    ctx.synchronize().unwrap();
-    let buffer = crate::CudaBuffer::from_tensor(&output).unwrap();
-    let mut bytes = vec![0u8; source.len() * 4];
-    buffer.copy_to_host(&mut bytes).unwrap();
-    let actual = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    assert_eq!(actual, source);
 }
 
 #[test]
@@ -428,23 +404,24 @@ fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
                         packed_values.push(match plane {
                             0 => 0.25,
                             1 => 0.5,
-                            _ => (batch_index * 8 + token % 8 + head + dimension % 4) as f32
-                                / 32.0,
+                            _ => (batch_index * 8 + token % 8 + head + dimension % 4) as f32 / 32.0,
                         });
                     }
                 }
             }
             for head in 0..heads {
                 for dimension in 0..head_dim {
-                    expected.push(
-                        ((batch_index * 8 + head + dimension % 4) as f32 + 3.5) / 32.0,
-                    );
+                    expected.push(((batch_index * 8 + head + dimension % 4) as f32 + 3.5) / 32.0);
                 }
             }
         }
     }
     let qkv = f16_tensor(0, vec![batch, tokens, 3, heads, head_dim], &packed_values);
-    let mut out = f16_tensor(0, vec![batch, tokens, heads, head_dim], &vec![0.0; elements]);
+    let mut out = f16_tensor(
+        0,
+        vec![batch, tokens, heads, head_dim],
+        &vec![0.0; elements],
+    );
     let normalized = super::attention_contracts::normalize_packed_qkv(
         &ctx,
         PackedQkvAttentionArgs::new(&qkv, &mut out),
@@ -461,9 +438,15 @@ fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
         packed_qkv_attention(&ctx, args)
     })
     .unwrap();
-    let eager = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+    let eager = crate::transfers::to_cpu(&out)
+        .unwrap()
+        .to_f32_vec()
+        .unwrap();
     for (actual, reference) in eager.iter().zip(&expected) {
-        assert!((actual - reference).abs() < 0.002, "{actual} != {reference}");
+        assert!(
+            (actual - reference).abs() < 0.002,
+            "{actual} != {reference}"
+        );
     }
     let graph = crate::capture(&ctx, || {
         with_session(&session, || {
@@ -482,7 +465,10 @@ fn packed_qkv_attention_uses_static_metadata_and_replays_numeric_output() {
         output.copy_from_host(&sentinel).unwrap();
         graph.replay().unwrap();
         ctx.synchronize().unwrap();
-        let replayed = crate::transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
+        let replayed = crate::transfers::to_cpu(&out)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
         assert_eq!(replayed, eager);
     }
 }
@@ -1016,29 +1002,47 @@ fn rounded_primitives_and_pairwise_rope_capture_contract() {
     };
     apply(&mut output).unwrap();
     ctx.synchronize().unwrap();
-    assert_eq!(values(&output), vec![0.5,-4.0,-3.0,0.0,-0.5,1.0,-8.0,0.0]);
+    assert_eq!(
+        values(&output),
+        vec![0.5, -4.0, -3.0, 0.0, -0.5, 1.0, -8.0, 0.0]
+    );
     let graph = crate::capture(&ctx, || apply(&mut output)).unwrap();
     graph.replay().unwrap();
     ctx.synchronize().unwrap();
-    assert_eq!(values(&output), vec![0.5,-4.0,-3.0,0.0,-0.5,1.0,-8.0,0.0]);
-    let bad = tensor(0, vec![3], &[1.0;3]);
+    assert_eq!(
+        values(&output),
+        vec![0.5, -4.0, -3.0, 0.0, -0.5, 1.0, -8.0, 0.0]
+    );
+    let bad = tensor(0, vec![3], &[1.0; 3]);
     let mut args = PointwiseArgs::new(PointwiseSemantic::BroadcastMultiply, &input, &mut output);
     args.secondary = Some(&bad);
     assert!(pointwise(&ctx, args).is_err());
-    let table = PairwiseRopeTable::new(&ctx, 2, 4, &[(0.0,1.0);4]).unwrap();
-    let mut rotated = zeros_tensor(0, vec![2,4], DType::F32);
-    let graph = crate::capture(&ctx, || pairwise_rope(&ctx, PairwiseRopeArgs {
-        input: &input, table: &table, output: &mut rotated, heads: 1,
-    })).unwrap();
+    let table = PairwiseRopeTable::new(&ctx, 2, 4, &[(0.0, 1.0); 4]).unwrap();
+    let mut rotated = zeros_tensor(0, vec![2, 4], DType::F32);
+    let graph = crate::capture(&ctx, || {
+        pairwise_rope(
+            &ctx,
+            PairwiseRopeArgs {
+                input: &input,
+                table: &table,
+                output: &mut rotated,
+                heads: 1,
+            },
+        )
+    })
+    .unwrap();
     graph.replay().unwrap();
     ctx.synchronize().unwrap();
     let buffer = crate::CudaBuffer::from_tensor(&rotated).unwrap();
     let mut bytes = vec![0; 8 * 4];
     buffer.copy_to_host(&mut bytes).unwrap();
-    let actual: Vec<f32> = bytes.chunks_exact(4).map(|v| f32::from_ne_bytes(v.try_into().unwrap())).collect();
-    assert_eq!(actual, vec![2.0,1.0,-4.0,3.0,-0.5,-1.0,4.0,8.0]);
-    assert!(PairwiseRopeTable::new(&ctx, 2, 3, &[(0.0,1.0);3]).is_err());
-    assert!(PairwiseRopeTable::new(&ctx, 2, 4, &[(f64::NAN,1.0);4]).is_err());
+    let actual: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+        .collect();
+    assert_eq!(actual, vec![2.0, 1.0, -4.0, 3.0, -0.5, -1.0, 4.0, 8.0]);
+    assert!(PairwiseRopeTable::new(&ctx, 2, 3, &[(0.0, 1.0); 3]).is_err());
+    assert!(PairwiseRopeTable::new(&ctx, 2, 4, &[(f64::NAN, 1.0); 4]).is_err());
 }
 
 #[test]
@@ -1051,29 +1055,55 @@ fn additive_attention_validates_bias_and_replays_changed_bias() {
     let bias = f32_tensor(0, vec![1, 1, 1, 2], &[0.0, f32::NEG_INFINITY]);
     let bad_bias = f32_tensor(0, vec![1, 1, 2, 1], &[0.0; 2]);
     let mut out = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
-    let args = AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bad_bias);
-    assert!(additive_attention(&ctx, args).unwrap_err().to_string().contains("bias must be"));
+    let args = AttentionBiasArgs::new(
+        AttentionArgs::new(&query, &key, &value, &mut out),
+        &bad_bias,
+    );
+    assert!(additive_attention(&ctx, args)
+        .unwrap_err()
+        .to_string()
+        .contains("bias must be"));
     let session = ExecutionSession::with_capacity(4096, 0).unwrap();
     prepare_with_session(&session, || {
-        let mut args = AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
+        let mut args =
+            AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
         args.attention.policy.online_tune = false;
         additive_attention(&ctx, args)
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(values(&out), [1.0, 2.0]);
-    let graph = crate::capture(&ctx, || with_session(&session, || {
-        let mut args = AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
-        args.attention.policy.online_tune = false;
-        additive_attention(&ctx, args)
-    })).unwrap();
-    let changed: Vec<_> = [f32::NEG_INFINITY, 0.0].iter().flat_map(|x| x.to_ne_bytes()).collect();
-    crate::CudaBuffer::from_tensor(&bias).unwrap().copy_from_host(&changed).unwrap();
+    let graph = crate::capture(&ctx, || {
+        with_session(&session, || {
+            let mut args =
+                AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
+            args.attention.policy.online_tune = false;
+            additive_attention(&ctx, args)
+        })
+    })
+    .unwrap();
+    let changed: Vec<_> = [f32::NEG_INFINITY, 0.0]
+        .iter()
+        .flat_map(|x| x.to_ne_bytes())
+        .collect();
+    crate::CudaBuffer::from_tensor(&bias)
+        .unwrap()
+        .copy_from_host(&changed)
+        .unwrap();
     graph.replay().unwrap();
     ctx.synchronize().unwrap();
     assert_eq!(values(&out), [3.0, 4.0]);
     // Addresses must be retained by the prepared session, and replacing a bias
     // allocation must miss even when the structural recipe is equivalent.
     let replacement = f32_tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
-    let err = with_session(&session, || additive_attention(&ctx,
-        AttentionBiasArgs::new(AttentionArgs::new(&query,&key,&value,&mut out),&replacement))).unwrap_err();
+    let err = with_session(&session, || {
+        additive_attention(
+            &ctx,
+            AttentionBiasArgs::new(
+                AttentionArgs::new(&query, &key, &value, &mut out),
+                &replacement,
+            ),
+        )
+    })
+    .unwrap_err();
     assert!(err.to_string().contains("cache miss"), "{err}");
 }

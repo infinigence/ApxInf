@@ -26,6 +26,11 @@ def test_current_fastwam_ownership():
         ("text.rs", "fn forward() {}", "belongs under model/blocks/bf16"),
         ("model/blocks/bf16.rs", "use crate::vla::VlaRequest;", "execution ownership"),
         ("model/mod.rs", "fn leak() { ops::pointwise(); }", "precision and subnetwork"),
+        ("model/blocks/bf16.rs", "impl LinearWeights {}", "inherent methods"),
+        ("model/blocks/bf16.rs", "fn load() { Store::load(); }", "checkpoint loading"),
+        ("model/blocks/bf16.rs", "use crate::cuda_fastwam::weights::cast_weight;", "activation conversion"),
+        ("weights/bf16/mod.rs", "impl Store {}", "consume the host store"),
+        ("weights/bf16/mod.rs", "fn cast() {}", "activation computation"),
         ("load.rs", "use super::model::blocks::bf16;", "concrete block construction"),
     ],
 )

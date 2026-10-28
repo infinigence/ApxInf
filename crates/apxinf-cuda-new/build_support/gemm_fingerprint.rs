@@ -20,7 +20,6 @@ const GEMM_INPUT_FILES: &[&str] = &[
     "include/apxinf_cuda/status.h",
     "include/apxinf_cuda/tuning_types.h",
     "include/apxinf_cuda/types.h",
-    "adapters/cublas_resources.h",
     "kernels/custom/gemm.cuh",
 ];
 

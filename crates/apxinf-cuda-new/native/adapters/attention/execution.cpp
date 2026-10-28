@@ -65,7 +65,7 @@ void validate_spec(const Spec& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid dense Attention semantic fields");
   }
-  if (spec.reserved != 0 || spec.input_precision > 1 ||
+  if (spec.reserved != 0 || spec.input_precision != 0 ||
       spec.bias_broadcast_batch > 1 ||
       (spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE
            ? (!valid_alignment(spec.bias_alignment) || spec.bias_alignment < 4 ||

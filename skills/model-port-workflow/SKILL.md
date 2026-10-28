@@ -53,7 +53,11 @@ remains the common loader result. `StepModulation` names computed per-step
 scale/shift/gate tensors. Use current source symbols for unmigrated families.
 A single-implementation model does not need a variant enum, generic Blocks or
 additional wrapper just to match PI0.5. Keep model and weights independent of
-runner/capture types; keep concrete precision dispatch out of the runner.
+runner/capture types. For Fast-WAM, load constructs `Bf16Weights`; `*Weights`
+types describe immutable device data, and Blocks functions consume them without
+adding inherent computation methods. Activation conversion belongs to Blocks;
+fixed weight promotion belongs to loading. Keep concrete precision dispatch out
+of the runner.
 
 New accelerator ports must satisfy
 `doc/model-execution-wiring.md#accelerator-port-acceptance`: ApxInf-native GPU

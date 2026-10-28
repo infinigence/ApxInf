@@ -350,9 +350,11 @@ mod tests {
         attention.cache_dir = Some(String::new());
         eprintln!("loading native Fast-WAM");
         let load_start = Instant::now();
-        let model =
-            crate::cuda_fastwam::load::build_model(&ctx, &checkpoint, &text, &vae, gemm, attention)
+        let weights =
+            crate::cuda_fastwam::weights::bf16::Bf16Weights::load(&ctx, &checkpoint, &text, &vae)
                 .unwrap();
+        let model =
+            crate::cuda_fastwam::model::build_model(&ctx, weights, gemm, attention).unwrap();
         let load_ms = load_start.elapsed().as_secs_f64() * 1000.;
         let arena_capacity = model.workspace_bytes();
         let runner = FastWamModelRunner::new(ctx, model);

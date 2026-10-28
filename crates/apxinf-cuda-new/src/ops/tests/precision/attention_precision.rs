@@ -26,7 +26,6 @@ fn reference(
     scale: f32,
     broadcast: bool,
     dtype: DType,
-    precision: AttentionPrecision,
     causal: bool,
 ) -> Vec<f32> {
     let mut out = vec![0.; b * tq * hq * d];
@@ -45,17 +44,12 @@ fn reference(
                         .map(|i| q[qoffset + i] as f64 * k[koff + i] as f64)
                         .sum();
                     let mut score = (dot * scale as f64) as f32;
-                    if precision == AttentionPrecision::Input {
-                        score = rounded(score, dtype);
-                    }
+
                     if let Some(bias) = bias {
                         score += bias[(((if broadcast { 0 } else { batch }) * hq + head) * tq
                             + row)
                             * tk
                             + col];
-                        if precision == AttentionPrecision::Input {
-                            score = rounded(score, dtype);
-                        }
                     }
                     scores[col] = score as f64;
                 }
@@ -69,11 +63,7 @@ fn reference(
                     .iter()
                     .map(|p| {
                         let p = (p / sum) as f32;
-                        if precision == AttentionPrecision::Input {
-                            rounded(p, dtype)
-                        } else {
-                            p
-                        }
+                        p
                     })
                     .collect();
                 for dim in 0..d {
@@ -166,7 +156,6 @@ fn attention_f32_reduction_all_candidates_match_reference() {
             args.scale,
             false,
             DType::F32,
-            AttentionPrecision::F32,
             false,
         );
         let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
@@ -226,7 +215,6 @@ fn attention_f32_real_shapes_all_candidates_match_reference() {
             args.scale,
             false,
             DType::F32,
-            AttentionPrecision::F32,
             causal,
         );
         let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
@@ -304,7 +292,6 @@ fn attention_short_f32_needs_no_global_workspace() {
         args.scale,
         false,
         DType::F32,
-        AttentionPrecision::F32,
         false,
     );
     args.policy.workspace_limit = 0;
@@ -364,232 +351,6 @@ fn attention_short_f32_unaligned_bindings_fall_back() {
 }
 
 #[test]
-fn additive_attention_all_candidates_match_reference() {
-    let ctx = CudaContext::new(0).unwrap();
-    for dtype in [DType::F32, DType::F16, DType::BF16] {
-        for precision in [AttentionPrecision::F32, AttentionPrecision::Input] {
-            for broadcast in [true, false] {
-                let (b, tq, tk, hq, hk, d) = (2, 3, 7, 4, 2, 9);
-                let qv = data(b * tq * hq * d, 1, dtype);
-                let kv = data(b * tk * hk * d, 7, dtype);
-                let vv = data(b * tk * hk * d, 19, dtype);
-                let mut bv = data(
-                    (if broadcast { 1 } else { b }) * hq * tq * tk,
-                    3,
-                    DType::F32,
-                );
-                // Finite positional bias plus padding, and an entirely masked row.
-                for row in bv.chunks_mut(tk) {
-                    row[tk - 1] = f32::NEG_INFINITY;
-                }
-                bv[..tk].fill(f32::NEG_INFINITY);
-                let q = input(vec![b, tq, hq, d], &qv, dtype);
-                let k = input(vec![b, tk, hk, d], &kv, dtype);
-                let v = input(vec![b, tk, hk, d], &vv, dtype);
-                let bias = f32_tensor(0, vec![if broadcast { 1 } else { b }, hq, tq, tk], &bv);
-                let mut out = zeros_tensor(0, vec![b, tq, hq, d], dtype);
-                let mut attention = AttentionArgs::new(&q, &k, &v, &mut out).causal();
-                attention.scale = 1.0;
-                let expected = reference(
-                    &qv,
-                    &kv,
-                    &vv,
-                    Some(&bv),
-                    b,
-                    tq,
-                    tk,
-                    hq,
-                    hk,
-                    d,
-                    1.0,
-                    broadcast,
-                    dtype,
-                    precision,
-                    true,
-                );
-                let norm = normalize_additive(
-                    &ctx,
-                    AttentionBiasArgs {
-                        attention,
-                        bias: &bias,
-                        precision,
-                    },
-                )
-                .unwrap();
-                super::super::attention_execution::validate_candidates(&ctx, &norm, &expected)
-                    .unwrap();
-            }
-        }
-    }
-    // Real UMT5-XXL encoder shape, eager BF16 intermediate rounding.
-    let (t, h, d) = (128, 64, 64);
-    let qv = data(t * h * d, 1, DType::BF16);
-    let kv = data(t * h * d, 7, DType::BF16);
-    let vv = data(t * h * d, 19, DType::BF16);
-    let bv = data(h * t * t, 3, DType::F32);
-    let q = input(vec![1, t, h, d], &qv, DType::BF16);
-    let k = input(vec![1, t, h, d], &kv, DType::BF16);
-    let v = input(vec![1, t, h, d], &vv, DType::BF16);
-    let bias = f32_tensor(0, vec![1, h, t, t], &bv);
-    let mut out = zeros_tensor(0, vec![1, t, h, d], DType::BF16);
-    let mut attention = AttentionArgs::new(&q, &k, &v, &mut out);
-    attention.scale = 1.0;
-    let expected = reference(
-        &qv,
-        &kv,
-        &vv,
-        Some(&bv),
-        1,
-        t,
-        t,
-        h,
-        h,
-        d,
-        1.0,
-        true,
-        DType::BF16,
-        AttentionPrecision::Input,
-        false,
-    );
-    let norm = normalize_additive(
-        &ctx,
-        AttentionBiasArgs {
-            attention,
-            bias: &bias,
-            precision: AttentionPrecision::Input,
-        },
-    )
-    .unwrap();
-    super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
-    report_real_shape_timing(&ctx, norm);
-}
-
-#[path = "torch_attention_fixtures.rs"]
-mod golden;
-
-#[test]
-fn additive_attention_bf16_mha_batched_candidates_match_reference() {
-    let ctx = CudaContext::new(0).unwrap();
-    for (broadcast, b, tq, tk, h, d) in [
-        (false, 2, 5, 9, 2, 17),
-        (true, 2, 5, 9, 2, 17),
-        (false, 1, 2, 257, 2, 17),
-        (true, 1, 2, 1024, 2, 17),
-    ] {
-        let qv = data(b * tq * h * d, 1, DType::BF16);
-        let kv = data(b * tk * h * d, 7, DType::BF16);
-        let vv = data(b * tk * h * d, 19, DType::BF16);
-        let mut bv = data((if broadcast { 1 } else { b }) * h * tq * tk, 3, DType::F32);
-        bv[..tk].fill(f32::NEG_INFINITY);
-        let q = input(vec![b, tq, h, d], &qv, DType::BF16);
-        let k = input(vec![b, tk, h, d], &kv, DType::BF16);
-        let v = input(vec![b, tk, h, d], &vv, DType::BF16);
-        let bias = f32_tensor(0, vec![if broadcast { 1 } else { b }, h, tq, tk], &bv);
-        let mut out = zeros_tensor(0, vec![b, tq, h, d], DType::BF16);
-        let mut args = AttentionArgs::new(&q, &k, &v, &mut out).causal();
-        args.policy.online_tune = false;
-        args.policy.cache_dir = Some(String::new());
-        let expected = reference(
-            &qv,
-            &kv,
-            &vv,
-            Some(&bv),
-            b,
-            tq,
-            tk,
-            h,
-            h,
-            d,
-            args.scale,
-            broadcast,
-            DType::BF16,
-            AttentionPrecision::Input,
-            true,
-        );
-        let norm = normalize_additive(
-            &ctx,
-            AttentionBiasArgs {
-                attention: args,
-                bias: &bias,
-                precision: AttentionPrecision::Input,
-            },
-        )
-        .unwrap();
-        super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
-        let execution = super::super::attention_execution::prepare(&ctx, norm).unwrap();
-        assert!(
-            execution.summary().contains("source=fallback"),
-            "{}",
-            execution.summary()
-        );
-        assert!(
-            execution.summary().contains("cublas-input-attention"),
-            "{}",
-            execution.summary()
-        );
-    }
-}
-
-#[test]
-fn additive_attention_all_candidates_match_torch() {
-    let ctx = CudaContext::new(0).unwrap();
-    for (dtype, precision, expected) in [
-        (
-            DType::F32,
-            AttentionPrecision::F32,
-            golden::ATTENTION_F32_F32,
-        ),
-        (
-            DType::F32,
-            AttentionPrecision::Input,
-            golden::ATTENTION_F32_INPUT,
-        ),
-        (
-            DType::F16,
-            AttentionPrecision::F32,
-            golden::ATTENTION_F16_F32,
-        ),
-        (
-            DType::F16,
-            AttentionPrecision::Input,
-            golden::ATTENTION_F16_INPUT,
-        ),
-        (
-            DType::BF16,
-            AttentionPrecision::F32,
-            golden::ATTENTION_BF16_F32,
-        ),
-        (
-            DType::BF16,
-            AttentionPrecision::Input,
-            golden::ATTENTION_BF16_INPUT,
-        ),
-    ] {
-        let q = input(vec![1, 2, 2, 4], &data(16, 1, dtype), dtype);
-        let k = input(vec![1, 3, 1, 4], &data(12, 7, dtype), dtype);
-        let v = input(vec![1, 3, 1, 4], &data(12, 19, dtype), dtype);
-        let mut bv = data(12, 3, DType::F32);
-        for row in bv.chunks_mut(3) {
-            row[2] = f32::NEG_INFINITY;
-        }
-        let bias = f32_tensor(0, vec![1, 2, 2, 3], &bv);
-        let mut out = zeros_tensor(0, vec![1, 2, 2, 4], dtype);
-        let mut attention = AttentionArgs::new(&q, &k, &v, &mut out);
-        attention.scale = 1.0;
-        let norm = normalize_additive(
-            &ctx,
-            AttentionBiasArgs {
-                attention,
-                bias: &bias,
-                precision,
-            },
-        )
-        .unwrap();
-        super::super::attention_execution::validate_candidates(&ctx, &norm, expected).unwrap();
-    }
-}
-
-#[test]
 fn attention_bf16_vae_all_candidates_match_reference() {
     let ctx = CudaContext::new(0).unwrap();
     let (t, d) = (392, 640);
@@ -615,77 +376,11 @@ fn attention_bf16_vae_all_candidates_match_reference() {
         args.scale,
         false,
         DType::BF16,
-        AttentionPrecision::F32,
         false,
     );
     let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
     super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
     report_real_shape_timing(&ctx, norm);
-}
-
-#[test]
-fn additive_attention_recipe_precision_and_workspace_contract() {
-    let ctx = CudaContext::new(0).unwrap();
-    let q = input(vec![1, 2, 2, 4], &data(16, 1, DType::BF16), DType::BF16);
-    let k = input(vec![1, 3, 1, 4], &data(12, 7, DType::BF16), DType::BF16);
-    let v = input(vec![1, 3, 1, 4], &data(12, 19, DType::BF16), DType::BF16);
-    let bias = f32_tensor(0, vec![1, 2, 2, 3], &data(12, 3, DType::F32));
-    let mut out = zeros_tensor(0, vec![1, 2, 2, 4], DType::BF16);
-    let build = |out: &mut Tensor, precision, tune, fallback, workspace| {
-        let mut attention = AttentionArgs::new(&q, &k, &v, out);
-        attention.policy.cache_dir = Some(String::new());
-        attention.policy.online_tune = tune;
-        attention.policy.allow_fallback = fallback;
-        attention.policy.workspace_limit = workspace;
-        normalize_additive(
-            &ctx,
-            AttentionBiasArgs {
-                attention,
-                bias: &bias,
-                precision,
-            },
-        )
-        .unwrap()
-    };
-    let miss = super::super::attention_execution::prepare(
-        &ctx,
-        build(&mut out, AttentionPrecision::F32, false, false, 4096),
-    );
-    assert!(miss.is_err());
-    let tuned = super::super::attention_execution::prepare(
-        &ctx,
-        build(&mut out, AttentionPrecision::F32, true, false, 4096),
-    )
-    .unwrap();
-    eprintln!("additive cold: {}", tuned.summary());
-    let warm = super::super::attention_execution::prepare(
-        &ctx,
-        build(&mut out, AttentionPrecision::F32, false, false, 4096),
-    )
-    .unwrap();
-    assert!(
-        warm.summary().contains("source=memory-recipe"),
-        "{}",
-        warm.summary()
-    );
-    // Explicit rounding mode is a distinct semantic recipe, not a dynamic value.
-    let other = super::super::attention_execution::prepare(
-        &ctx,
-        build(&mut out, AttentionPrecision::Input, false, false, 4096),
-    );
-    assert!(other.is_err());
-    let fallback = super::super::attention_execution::prepare(
-        &ctx,
-        build(&mut out, AttentionPrecision::Input, false, true, 4096),
-    )
-    .unwrap();
-    assert!(fallback.summary().contains("source=fallback"));
-    assert!(fallback.summary().contains("custom-warp"));
-    let limited = super::super::attention_execution::prepare(
-        &ctx,
-        build(&mut out, AttentionPrecision::Input, false, true, 0),
-    );
-    assert!(limited.is_err());
 }
 
 #[test]
@@ -709,7 +404,6 @@ fn additive_attention_persisted_recipe_restores_in_new_process() {
             AttentionBiasArgs {
                 attention,
                 bias: &bias,
-                precision: AttentionPrecision::Input,
             },
         )
         .unwrap();
@@ -759,4 +453,101 @@ fn additive_attention_persisted_recipe_restores_in_new_process() {
     invoke("invalid");
     invoke("repair");
     invoke("warm");
+}
+
+#[test]
+fn additive_attention_all_candidates_match_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    for dtype in [DType::F32, DType::F16, DType::BF16] {
+        {
+            for broadcast in [true, false] {
+                let (b, tq, tk, hq, hk, d) = (2, 3, 7, 4, 2, 9);
+                let qv = data(b * tq * hq * d, 1, dtype);
+                let kv = data(b * tk * hk * d, 7, dtype);
+                let vv = data(b * tk * hk * d, 19, dtype);
+                let mut bv = data(
+                    (if broadcast { 1 } else { b }) * hq * tq * tk,
+                    3,
+                    DType::F32,
+                );
+                // Finite positional bias plus padding, and an entirely masked row.
+                for row in bv.chunks_mut(tk) {
+                    row[tk - 1] = f32::NEG_INFINITY;
+                }
+                bv[..tk].fill(f32::NEG_INFINITY);
+                let q = input(vec![b, tq, hq, d], &qv, dtype);
+                let k = input(vec![b, tk, hk, d], &kv, dtype);
+                let v = input(vec![b, tk, hk, d], &vv, dtype);
+                let bias = f32_tensor(0, vec![if broadcast { 1 } else { b }, hq, tq, tk], &bv);
+                let mut out = zeros_tensor(0, vec![b, tq, hq, d], dtype);
+                let mut attention = AttentionArgs::new(&q, &k, &v, &mut out).causal();
+                attention.scale = 1.0;
+                let expected = reference(
+                    &qv,
+                    &kv,
+                    &vv,
+                    Some(&bv),
+                    b,
+                    tq,
+                    tk,
+                    hq,
+                    hk,
+                    d,
+                    1.0,
+                    broadcast,
+                    dtype,
+                    true,
+                );
+                let norm = normalize_additive(
+                    &ctx,
+                    AttentionBiasArgs {
+                        attention,
+                        bias: &bias,
+                    },
+                )
+                .unwrap();
+                super::super::attention_execution::validate_candidates(&ctx, &norm, &expected)
+                    .unwrap();
+            }
+        }
+    }
+    // Real UMT5-XXL encoder shape, F32 score/probability arithmetic.
+    let (t, h, d) = (128, 64, 64);
+    let qv = data(t * h * d, 1, DType::BF16);
+    let kv = data(t * h * d, 7, DType::BF16);
+    let vv = data(t * h * d, 19, DType::BF16);
+    let bv = data(h * t * t, 3, DType::F32);
+    let q = input(vec![1, t, h, d], &qv, DType::BF16);
+    let k = input(vec![1, t, h, d], &kv, DType::BF16);
+    let v = input(vec![1, t, h, d], &vv, DType::BF16);
+    let bias = f32_tensor(0, vec![1, h, t, t], &bv);
+    let mut out = zeros_tensor(0, vec![1, t, h, d], DType::BF16);
+    let mut attention = AttentionArgs::new(&q, &k, &v, &mut out);
+    attention.scale = 1.0;
+    let expected = reference(
+        &qv,
+        &kv,
+        &vv,
+        Some(&bv),
+        1,
+        t,
+        t,
+        h,
+        h,
+        d,
+        1.0,
+        true,
+        DType::BF16,
+        false,
+    );
+    let norm = normalize_additive(
+        &ctx,
+        AttentionBiasArgs {
+            attention,
+            bias: &bias,
+        },
+    )
+    .unwrap();
+    super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
+    report_real_shape_timing(&ctx, norm);
 }

@@ -107,7 +107,7 @@ cudaError_t launch_custom(Execution& execution) {
         spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
         static_cast<int>(spec.query_start), bindings.decode_meta,
         bindings.scale, stream, static_cast<const float*>(bindings.bias),
-        spec.bias_broadcast_batch != 0, spec.input_precision != 0);
+        spec.bias_broadcast_batch != 0);
   }
   if (spec.dtype == APXINF_DTYPE_F16) {
     return kernels::launch_attention<__half>(
@@ -120,7 +120,7 @@ cudaError_t launch_custom(Execution& execution) {
         spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
         static_cast<int>(spec.query_start), bindings.decode_meta,
         bindings.scale, stream, static_cast<const float*>(bindings.bias),
-        spec.bias_broadcast_batch != 0, spec.input_precision != 0);
+        spec.bias_broadcast_batch != 0);
   }
   return kernels::launch_attention<__nv_bfloat16>(
       bindings.query, bindings.key, bindings.value, bindings.output,
@@ -132,7 +132,7 @@ cudaError_t launch_custom(Execution& execution) {
       spec.mask == APXINF_ATTENTION_MASK_CAUSAL,
       static_cast<int>(spec.query_start), bindings.decode_meta,
       bindings.scale, stream, static_cast<const float*>(bindings.bias),
-        spec.bias_broadcast_batch != 0, spec.input_precision != 0);
+        spec.bias_broadcast_batch != 0);
 }
 
 template <bool Cooperative>
@@ -147,7 +147,7 @@ cudaError_t launch_parallel_impl(Execution& execution) {
       static_cast<int>(spec.kv_heads), static_cast<int>(spec.head_dim), b.scale, \
       spec.mask == APXINF_ATTENTION_MASK_CAUSAL, static_cast<int>(spec.query_start), \
       static_cast<const float*>(b.bias), spec.bias_broadcast_batch != 0, \
-      spec.input_precision != 0, static_cast<cudaStream_t>(b.stream))
+      static_cast<cudaStream_t>(b.stream))
   if (spec.dtype == APXINF_DTYPE_F32) return APXINF_LAUNCH_PARALLEL(float);
   if (spec.dtype == APXINF_DTYPE_F16) return APXINF_LAUNCH_PARALLEL(__half);
   return APXINF_LAUNCH_PARALLEL(__nv_bfloat16);

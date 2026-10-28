@@ -2,8 +2,29 @@
 mod ops {
     //! Precision-specific projection, activation and rounding composition.
     use crate::cuda_fastwam::backend::{ops, Context};
-    use crate::cuda_fastwam::weights::{cast, Linear};
-    use apxinf_core::{Error, Result, Shape, Tensor};
+    use crate::cuda_fastwam::weights::LinearWeights;
+    use apxinf_core::{DType, Error, Result, Shape, Tensor};
+    pub(in crate::cuda_fastwam::model::blocks::bf16) fn cast(
+        ctx: &Context,
+        x: &Tensor,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        if x.dtype() == dtype {
+            return Ok(x.clone());
+        }
+        let semantic = match (x.dtype(), dtype) {
+            (DType::BF16, DType::F32) => ops::QuantizationSemantic::CastBf16ToF32,
+            (DType::F32, DType::BF16) => ops::QuantizationSemantic::CastF32ToBf16,
+            _ => {
+                return Err(Error::Other(
+                    "Fast-WAM supports BF16/F32 conversion only".into(),
+                ))
+            }
+        };
+        let mut out = ctx.allocate_output(x.shape().clone(), dtype)?;
+        ops::quantization(ctx, ops::QuantizationArgs::new(semantic, x, &mut out))?;
+        Ok(out)
+    }
 
     pub(in crate::cuda_fastwam::model::blocks::bf16) fn reshape(
         x: &Tensor,
@@ -46,7 +67,7 @@ mod ops {
     }
 
     /// PyTorch's cuDNN convolution materializes the projection in its output
-    /// dtype before adding bias. This differs from the Linear GEMM epilogue.
+    /// dtype before adding bias. Keep this rounding explicit in convolution composition.
     pub(in crate::cuda_fastwam::model::blocks::bf16) fn convolution_projection(
         ctx: &Context,
         x: &Tensor,
@@ -87,8 +108,21 @@ mod ops {
         y: &Tensor,
     ) -> Result<Tensor> {
         let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
-        let mut args = ops::PointwiseArgs::new(ops::PointwiseSemantic::Add, x, &mut out);
+        let mut args = ops::PointwiseArgs::new(ops::PointwiseSemantic::EulerUpdate, x, &mut out);
         args.secondary = Some(y);
+        args.dt = 1.0;
+        ops::pointwise(ctx, args)?;
+        Ok(out)
+    }
+
+    pub(in crate::cuda_fastwam::model::blocks::bf16) fn bias_add(
+        ctx: &Context,
+        x: &Tensor,
+        bias: &Tensor,
+    ) -> Result<Tensor> {
+        let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
+        let mut args = ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, x, &mut out);
+        args.bias = Some(bias);
         ops::pointwise(ctx, args)?;
         Ok(out)
     }
@@ -106,25 +140,24 @@ mod ops {
         Ok(out)
     }
 
-    impl Linear {
-        pub(in crate::cuda_fastwam::model::blocks::bf16) fn forward_conv(
-            &self,
-            ctx: &Context,
-            x: &Tensor,
-            policy: &ops::GemmPolicy,
-        ) -> Result<Tensor> {
-            convolution_projection(ctx, x, &self.weight, self.bias.as_ref(), policy)
-        }
-
-        pub(in crate::cuda_fastwam::model::blocks::bf16) fn forward(
-            &self,
-            ctx: &Context,
-            x: &Tensor,
-            policy: &ops::GemmPolicy,
-        ) -> Result<Tensor> {
-            linear(ctx, x, &self.weight, self.bias.as_ref(), policy)
-        }
+    pub(in crate::cuda_fastwam::model::blocks::bf16) fn project_conv(
+        weights: &LinearWeights,
+        ctx: &Context,
+        x: &Tensor,
+        policy: &ops::GemmPolicy,
+    ) -> Result<Tensor> {
+        convolution_projection(ctx, x, &weights.weight, weights.bias.as_ref(), policy)
     }
+
+    pub(in crate::cuda_fastwam::model::blocks::bf16) fn project(
+        weights: &LinearWeights,
+        ctx: &Context,
+        x: &Tensor,
+        policy: &ops::GemmPolicy,
+    ) -> Result<Tensor> {
+        linear(ctx, x, &weights.weight, weights.bias.as_ref(), policy)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -134,7 +167,7 @@ mod ops {
 
         #[test]
         #[ignore = "requires CUDA"]
-        fn fastwam_convolution_rounds_before_bias() {
+        fn fastwam_convolution_matches_baseline_bias_rounding() {
             let ctx = Context::new(0).unwrap();
             let upload_values = |shape, values: &[f32]| {
                 upload(&ctx, &host_tensor(shape, values, DType::BF16).unwrap()).unwrap()
@@ -144,7 +177,7 @@ mod ops {
             let bias = upload_values(vec![1], &[-1.]);
             let policy = ops::GemmPolicy::default();
             // 1 + 2^-8 is the BF16 halfway point: convolution rounds it to 1
-            // before cancellation, whereas Linear retains 2^-8 after adding -1.
+            // before cancellation, matching the baseline GemmBias path.
             let conv = convolution_projection(&ctx, &input, &weight, Some(&bias), &policy).unwrap();
             let linear = linear(&ctx, &input, &weight, Some(&bias), &policy).unwrap();
             ctx.synchronize().unwrap();
@@ -154,7 +187,7 @@ mod ops {
             );
             assert_eq!(
                 transfers::to_cpu(&linear).unwrap().to_f32_vec().unwrap(),
-                vec![0.00390625]
+                vec![0.]
             );
         }
     }
@@ -163,10 +196,10 @@ mod dit {
     //! Wan video prefill and action denoising. Weights and cached text projections
     //! are family local; backend calls express only mathematical operations.
     use super::ops as compute;
-    use super::ops::binary;
+    use super::ops::cast;
+    use super::ops::{bias_add, binary};
     use crate::cuda_fastwam::backend::{ops, Context};
-    use crate::cuda_fastwam::weights::bf16::dit::{Expert as ExpertWeights, Projections};
-    use crate::cuda_fastwam::weights::cast;
+    use crate::cuda_fastwam::weights::bf16::dit::{ExpertWeights, ProjectionWeights};
     pub(in crate::cuda_fastwam::model::blocks::bf16) struct Expert {
         pub weights: ExpertWeights,
         /// [step][block][shift/scale/gate], computed once during construction.
@@ -190,7 +223,7 @@ mod dit {
     }
     fn rms(ctx: &Context, x: &Tensor, weight: &Tensor) -> Result<Tensor> {
         let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
-        ops::rms_norm_rounded(ctx, ops::RmsNormArgs::new(x, weight, &mut out, 1e-6))?;
+        ops::rms_norm(ctx, ops::RmsNormArgs::new(x, weight, &mut out, 1e-6))?;
         Ok(out)
     }
     fn attend(
@@ -214,18 +247,20 @@ mod dit {
         out.reshape(vec![t, 3072])
     }
 
-    impl Projections {
-        fn kv(
-            &self,
-            ctx: &Context,
-            x: &Tensor,
-            policy: &ops::GemmPolicy,
-        ) -> Result<(Tensor, Tensor)> {
-            Ok((
-                rms(ctx, &self.k.forward(ctx, x, policy)?, &self.nk)?,
-                self.v.forward(ctx, x, policy)?,
-            ))
-        }
+    fn project_kv(
+        weights: &ProjectionWeights,
+        ctx: &Context,
+        x: &Tensor,
+        policy: &ops::GemmPolicy,
+    ) -> Result<(Tensor, Tensor)> {
+        Ok((
+            rms(
+                ctx,
+                &compute::project(&weights.k, ctx, x, policy)?,
+                &weights.nk,
+            )?,
+            compute::project(&weights.v, ctx, x, policy)?,
+        ))
     }
 
     pub(in crate::cuda_fastwam::model::blocks::bf16) struct Kv {
@@ -288,15 +323,15 @@ mod dit {
             context: &Tensor,
             policy: &ops::GemmPolicy,
         ) -> Result<ContextCache> {
-            let x = self.weights.text0.forward(ctx, context, policy)?;
+            let x = compute::project(&self.weights.text0, ctx, context, policy)?;
             let x = compute::activation(ctx, &x, ops::PointwiseActivation::Gelu)?;
-            let x = self.weights.text2.forward(ctx, &x, policy)?;
+            let x = compute::project(&self.weights.text2, ctx, &x, policy)?;
             let kv = self
                 .weights
                 .blocks
                 .iter()
                 .map(|b| {
-                    let (key, value) = b.ca.kv(ctx, &x, policy)?;
+                    let (key, value) = project_kv(&b.ca, ctx, &x, policy)?;
                     Ok(Kv {
                         key: cast(ctx, &key, DType::F32)?,
                         value: cast(ctx, &value, DType::F32)?,
@@ -344,9 +379,9 @@ mod dit {
                 input.clone()
             };
             let x = if self.weights.video {
-                self.weights.input.forward_conv(ctx, &input, gemm)?
+                compute::project_conv(&self.weights.input, ctx, &input, gemm)?
             } else {
-                self.weights.input.forward(ctx, &input, gemm)?
+                compute::project(&self.weights.input, ctx, &input, gemm)?
             };
             let mut x = cast(ctx, &x, DType::F32)?;
             let mut cache = Vec::new();
@@ -354,10 +389,16 @@ mod dit {
                 let m = &self.modulations[step][i];
                 let u = norm(ctx, &x, &self.weights.one, &self.weights.zero)?;
                 let u = binary(ctx, &u, &m[1], ops::PointwiseSemantic::BroadcastMultiply)?;
-                let u = binary(ctx, &u, &m[0], ops::PointwiseSemantic::BroadcastAdd)?;
-                let q = self.rotate(ctx, &rms(ctx, &b.sa.q.forward(ctx, &u, gemm)?, &b.sa.nq)?)?;
-                let k = self.rotate(ctx, &rms(ctx, &b.sa.k.forward(ctx, &u, gemm)?, &b.sa.nk)?)?;
-                let v = b.sa.v.forward(ctx, &u, gemm)?;
+                let u = bias_add(ctx, &u, &m[0])?;
+                let q = self.rotate(
+                    ctx,
+                    &rms(ctx, &compute::project(&b.sa.q, ctx, &u, gemm)?, &b.sa.nq)?,
+                )?;
+                let k = self.rotate(
+                    ctx,
+                    &rms(ctx, &compute::project(&b.sa.k, ctx, &u, gemm)?, &b.sa.nk)?,
+                )?;
+                let v = compute::project(&b.sa.v, ctx, &u, gemm)?;
                 let (k, v) = if let Some(prefix) = video_cache {
                     (
                         ops::concat_rows(ctx, &prefix[i].key, &cast(ctx, &k, DType::F32)?)?,
@@ -371,24 +412,24 @@ mod dit {
                     (k, v)
                 };
                 let y = attend(ctx, &q, &k, &v, attention)?;
-                let y = b.sa.o.forward(ctx, &y, gemm)?;
+                let y = compute::project(&b.sa.o, ctx, &y, gemm)?;
                 let y = binary(ctx, &y, &m[2], ops::PointwiseSemantic::BroadcastMultiply)?;
                 x = residual(ctx, &x, &y)?;
                 let u = norm(ctx, &x, &b.norm3w, &b.norm3b)?;
-                let q = rms(ctx, &b.ca.q.forward(ctx, &u, gemm)?, &b.ca.nq)?;
+                let q = rms(ctx, &compute::project(&b.ca.q, ctx, &u, gemm)?, &b.ca.nq)?;
                 let y = attend(ctx, &q, &context.kv[i].key, &context.kv[i].value, attention)?;
-                x = residual(ctx, &x, &b.ca.o.forward(ctx, &y, gemm)?)?;
+                x = residual(ctx, &x, &compute::project(&b.ca.o, ctx, &y, gemm)?)?;
                 let u = norm(ctx, &x, &self.weights.one, &self.weights.zero)?;
                 let u = binary(ctx, &u, &m[4], ops::PointwiseSemantic::BroadcastMultiply)?;
-                let u = binary(ctx, &u, &m[3], ops::PointwiseSemantic::BroadcastAdd)?;
-                let u = b.ff0.forward(ctx, &u, gemm)?;
+                let u = bias_add(ctx, &u, &m[3])?;
+                let u = compute::project(&b.ff0, ctx, &u, gemm)?;
                 let u = compute::activation(ctx, &u, ops::PointwiseActivation::Gelu)?;
-                let u = b.ff2.forward(ctx, &u, gemm)?;
+                let u = compute::project(&b.ff2, ctx, &u, gemm)?;
                 let u = binary(ctx, &u, &m[5], ops::PointwiseSemantic::BroadcastMultiply)?;
                 x = residual(ctx, &x, &u)?;
             }
             if let Some(head) = &self.weights.head {
-                x = head.forward(ctx, &x, gemm)?;
+                x = compute::project(head, ctx, &x, gemm)?;
             }
             Ok((x, cache))
         }
@@ -399,12 +440,12 @@ mod text {
     //! gated GELU. Zero padding is applied after encoding, as in Fast-WAM.
     use super::ops as compute;
     use crate::cuda_fastwam::backend::{ops, Context};
-    use crate::cuda_fastwam::weights::bf16::text::TextEncoder as TextWeights;
+    use crate::cuda_fastwam::weights::bf16::text::TextEncoderWeights as TextWeights;
     use apxinf_core::{DType, Result, Shape, Tensor};
 
     fn rms(ctx: &Context, x: &Tensor, w: &Tensor) -> Result<Tensor> {
         let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
-        ops::rms_norm_rounded(ctx, ops::RmsNormArgs::new(x, w, &mut out, 1e-6))?;
+        ops::rms_norm(ctx, ops::RmsNormArgs::new(x, w, &mut out, 1e-6))?;
         Ok(out)
     }
     pub(in crate::cuda_fastwam::model::blocks::bf16) struct TextEncoder {
@@ -469,19 +510,14 @@ mod text {
                 observe(index, "layer.0.layer_norm.in", &x)?;
                 let u = rms(ctx, &x, &b.norm0)?;
                 observe(index, "layer.0.layer_norm.out", &u)?;
-                let q = b.q.forward(ctx, &u, gemm)?.reshape(vec![1, 128, 64, 64])?;
-                let k = b.k.forward(ctx, &u, gemm)?.reshape(vec![1, 128, 64, 64])?;
-                let v = b.v.forward(ctx, &u, gemm)?.reshape(vec![1, 128, 64, 64])?;
+                let q = compute::project(&b.q, ctx, &u, gemm)?.reshape(vec![1, 128, 64, 64])?;
+                let k = compute::project(&b.k, ctx, &u, gemm)?.reshape(vec![1, 128, 64, 64])?;
+                let v = compute::project(&b.v, ctx, &u, gemm)?.reshape(vec![1, 128, 64, 64])?;
                 observe(index, "layer.0.SelfAttention.q.out", &q)?;
                 observe(index, "layer.0.SelfAttention.k.out", &k)?;
                 observe(index, "layer.0.SelfAttention.v.out", &v)?;
-                let bias = compute::binary(
-                    ctx,
-                    &b.bias,
-                    padding_bias,
-                    ops::PointwiseSemantic::BroadcastAdd,
-                )?
-                .reshape(vec![1, 64, 128, 128])?;
+                let bias = compute::bias_add(ctx, &b.bias, padding_bias)?
+                    .reshape(vec![1, 64, 128, 128])?;
                 let mut y = ctx.allocate_output(q.shape().clone(), DType::BF16)?;
                 let mut args = ops::AttentionArgs::new(&q, &k, &v, &mut y);
                 args.scale = 1.;
@@ -491,25 +527,24 @@ mod text {
                     ops::AttentionBiasArgs {
                         attention: args,
                         bias: &bias,
-                        precision: ops::AttentionPrecision::Input,
                     },
                 )?;
                 observe(index, "layer.0.SelfAttention.o.in", &y)?;
-                let y = b.o.forward(ctx, &y.reshape(vec![128, 4096])?, gemm)?;
+                let y = compute::project(&b.o, ctx, &y.reshape(vec![128, 4096])?, gemm)?;
                 observe(index, "layer.0.SelfAttention.o.out", &y)?;
                 x = compute::add(ctx, &x, &y)?;
                 observe(index, "layer.1.layer_norm.in", &x)?;
                 let u = rms(ctx, &x, &b.norm1)?;
                 observe(index, "layer.1.layer_norm.out", &u)?;
-                let gate = b.wi0.forward(ctx, &u, gemm)?;
+                let gate = compute::project(&b.wi0, ctx, &u, gemm)?;
                 observe(index, "layer.1.DenseReluDense.act.in", &gate)?;
-                let gate = compute::activation(ctx, &gate, ops::PointwiseActivation::GeluRounded)?;
+                let gate = compute::activation(ctx, &gate, ops::PointwiseActivation::Gelu)?;
                 observe(index, "layer.1.DenseReluDense.act.out", &gate)?;
-                let up = b.wi1.forward(ctx, &u, gemm)?;
+                let up = compute::project(&b.wi1, ctx, &u, gemm)?;
                 observe(index, "layer.1.DenseReluDense.wi_1.out", &up)?;
                 let y = compute::binary(ctx, &gate, &up, ops::PointwiseSemantic::Multiply)?;
                 observe(index, "layer.1.DenseReluDense.wo.in", &y)?;
-                let y = b.wo.forward(ctx, &y, gemm)?;
+                let y = compute::project(&b.wo, ctx, &y, gemm)?;
                 observe(index, "layer.1.DenseReluDense.wo.out", &y)?;
                 x = compute::add(ctx, &x, &y)?;
             }
@@ -588,14 +623,13 @@ mod text {
                     (format!("{ff_prefix}.wo"), &block.wo),
                 ] {
                     let input = captured_input(ctx, golden, &format!("{name}.in"));
-                    let actual = linear.forward(ctx, &input, gemm).unwrap();
+                    let actual = compute::project(linear, ctx, &input, gemm).unwrap();
                     print_operator_error(&name, &actual, &golden[&format!("{name}.out")]);
                 }
                 let name = format!("{ff_prefix}.act");
                 let input = captured_input(ctx, golden, &format!("{name}.in"));
                 let actual =
-                    compute::activation(ctx, &input, ops::PointwiseActivation::GeluRounded)
-                        .unwrap();
+                    compute::activation(ctx, &input, ops::PointwiseActivation::Gelu).unwrap();
                 print_operator_error(&name, &actual, &golden[&format!("{name}.out")]);
 
                 let gate = captured_input(ctx, golden, &format!("{name}.out"));
@@ -613,15 +647,10 @@ mod text {
                         .reshape(vec![1, 128, 64, 64])
                         .unwrap()
                 });
-                let bias = compute::binary(
-                    ctx,
-                    &block.bias,
-                    padding,
-                    ops::PointwiseSemantic::BroadcastAdd,
-                )
-                .unwrap()
-                .reshape(vec![1, 64, 128, 128])
-                .unwrap();
+                let bias = compute::bias_add(ctx, &block.bias, padding)
+                    .unwrap()
+                    .reshape(vec![1, 64, 128, 128])
+                    .unwrap();
                 let mut actual = ctx
                     .allocate_output(qkv[0].shape().clone(), DType::BF16)
                     .unwrap();
@@ -633,7 +662,6 @@ mod text {
                     ops::AttentionBiasArgs {
                         attention: args,
                         bias: &bias,
-                        precision: ops::AttentionPrecision::Input,
                     },
                 )
                 .unwrap();
@@ -728,15 +756,20 @@ mod text {
             }
             let mut square = 0f64;
             let mut norm = 0f64;
+            let mut actual_norm = 0f64;
+            let mut dot = 0f64;
             let mut max = 0f32;
             for (&a, &b) in actual.iter().zip(&expected) {
                 assert!(a.is_finite());
                 square += ((a - b) as f64).powi(2);
                 norm += (b as f64).powi(2);
+                actual_norm += (a as f64).powi(2);
+                dot += a as f64 * b as f64;
                 max = max.max((a - b).abs());
             }
             let relative = (square / norm).sqrt();
-            eprintln!("UMT5 final max_abs={max} relative_l2={relative}");
+            let cosine = dot / (actual_norm * norm).sqrt();
+            eprintln!("UMT5 final max_abs={max} relative_l2={relative} cosine_similarity={cosine}");
             assert!(relative < 0.01, "UMT5 native/reference mismatch");
         }
     }
@@ -746,11 +779,11 @@ mod vae {
     //! use their final temporal tap because the cache is empty for every request.
     //! This module never keeps a video cache or invokes a reference framework.
     use super::ops as compute;
+    use super::ops::cast;
     use crate::cuda_fastwam::backend::{ops, Context};
     use crate::cuda_fastwam::weights::bf16::vae::{
-        Attention, Conv, DownBlock, Norm, Residual, Vae as VaeWeights,
+        AttentionWeights, ConvWeights, DownBlockWeights, NormWeights, ResidualWeights, VaeWeights,
     };
-    use crate::cuda_fastwam::weights::cast;
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
     // Each arena allocation can consume at most 255 leading alignment bytes.
@@ -759,172 +792,177 @@ mod vae {
         elements * dtype.size_in_bytes() + 256
     }
 
-    impl Conv {
-        fn workspace_bytes(&self, h: usize, w: usize) -> usize {
-            let rows = (h / self.stride) * (w / self.stride);
-            let weight = self.projection.weight.shape().dims();
-            let projection = allocation_bytes(rows * weight[1], self.projection.weight.dtype());
-            2 * projection // dtype-rounded GEMM result plus separately rounded bias add
-            + if self.kernel == 1 && self.stride == 1 {
+    fn conv_workspace_bytes(weights: &ConvWeights, h: usize, w: usize) -> usize {
+        let rows = (h / weights.stride) * (w / weights.stride);
+        let weight = weights.projection.weight.shape().dims();
+        let projection = allocation_bytes(rows * weight[1], weights.projection.weight.dtype());
+        2 * projection // dtype-rounded GEMM result plus separately rounded bias add
+            + if weights.kernel == 1 && weights.stride == 1 {
                 0
             } else {
-                allocation_bytes(rows * weight[0], self.projection.weight.dtype())
+                allocation_bytes(rows * weight[0], weights.projection.weight.dtype())
             }
+    }
+    fn conv_forward(
+        weights: &ConvWeights,
+        ctx: &Context,
+        x: &Tensor,
+        h: usize,
+        w: usize,
+        policy: &ops::GemmPolicy,
+    ) -> Result<Tensor> {
+        if weights.kernel == 1 && weights.stride == 1 {
+            return compute::project_conv(&weights.projection, ctx, x, policy);
         }
-        fn forward(
-            &self,
-            ctx: &Context,
-            x: &Tensor,
-            h: usize,
-            w: usize,
-            policy: &ops::GemmPolicy,
-        ) -> Result<Tensor> {
-            if self.kernel == 1 && self.stride == 1 {
-                return self.projection.forward_conv(ctx, x, policy);
-            }
-            let (oh, ow) = (h / self.stride, w / self.stride);
-            let mut columns = ctx.allocate_output(
-                Shape::new(vec![oh * ow, self.projection.weight.shape().dims()[0]]),
-                x.dtype(),
-            )?;
-            ops::image_im2col(
-                ctx,
-                x,
-                &mut columns,
-                h,
-                w,
-                self.kernel,
-                self.stride,
-                self.padding,
-                oh,
-                ow,
-            )?;
-            self.projection.forward_conv(ctx, &columns, policy)
-        }
+        let (oh, ow) = (h / weights.stride, w / weights.stride);
+        let mut columns = ctx.allocate_output(
+            Shape::new(vec![oh * ow, weights.projection.weight.shape().dims()[0]]),
+            x.dtype(),
+        )?;
+        ops::image_im2col(
+            ctx,
+            x,
+            &mut columns,
+            h,
+            w,
+            weights.kernel,
+            weights.stride,
+            weights.padding,
+            oh,
+            ow,
+        )?;
+        compute::project_conv(&weights.projection, ctx, &columns, policy)
     }
 
-    impl Norm {
-        fn forward(&self, ctx: &Context, x: &Tensor) -> Result<Tensor> {
-            let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
-            ops::channel_l2_normalize(
-                ctx,
-                x,
-                &self.gamma,
-                &mut out,
-                (x.shape().dims()[1] as f32).sqrt(),
-                1e-12,
-            )?;
-            Ok(out)
-        }
-        fn activated(&self, ctx: &Context, x: &Tensor) -> Result<Tensor> {
-            compute::activation(ctx, &self.forward(ctx, x)?, ops::PointwiseActivation::Silu)
-        }
+    fn norm_forward(weights: &NormWeights, ctx: &Context, x: &Tensor) -> Result<Tensor> {
+        let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
+        ops::channel_l2_normalize(
+            ctx,
+            x,
+            &weights.gamma,
+            &mut out,
+            (x.shape().dims()[1] as f32).sqrt(),
+            1e-12,
+        )?;
+        Ok(out)
+    }
+    fn norm_activated(weights: &NormWeights, ctx: &Context, x: &Tensor) -> Result<Tensor> {
+        compute::activation(
+            ctx,
+            &norm_forward(weights, ctx, x)?,
+            ops::PointwiseActivation::Silu,
+        )
     }
 
-    impl Residual {
-        fn workspace_bytes(&self, h: usize, w: usize) -> usize {
-            let input_channels = self.conv1.projection.weight.shape().dims()[0]
-                / (self.conv1.kernel * self.conv1.kernel);
-            let output_channels = self.conv1.projection.weight.shape().dims()[1];
-            let dtype = self.conv1.projection.weight.dtype();
-            self.shortcut
-                .as_ref()
-                .map_or(0, |c| c.workspace_bytes(h, w))
-                + 2 * allocation_bytes(h * w * input_channels, dtype)
-                + self.conv1.workspace_bytes(h, w)
-                + 2 * allocation_bytes(h * w * output_channels, dtype)
-                + self.conv2.workspace_bytes(h, w)
-                + allocation_bytes(h * w * output_channels, dtype)
-        }
-        fn forward(
-            &self,
-            ctx: &Context,
-            x: &Tensor,
-            h: usize,
-            w: usize,
-            policy: &ops::GemmPolicy,
-        ) -> Result<Tensor> {
-            let residual = match &self.shortcut {
-                Some(conv) => conv.forward(ctx, x, h, w, policy)?,
-                None => x.clone(),
-            };
-            let x = self
-                .conv1
-                .forward(ctx, &self.norm1.activated(ctx, x)?, h, w, policy)?;
-            let x = self
-                .conv2
-                .forward(ctx, &self.norm2.activated(ctx, &x)?, h, w, policy)?;
-            compute::add(ctx, &x, &residual)
-        }
+    fn residual_workspace_bytes(weights: &ResidualWeights, h: usize, w: usize) -> usize {
+        let input_channels = weights.conv1.projection.weight.shape().dims()[0]
+            / (weights.conv1.kernel * weights.conv1.kernel);
+        let output_channels = weights.conv1.projection.weight.shape().dims()[1];
+        let dtype = weights.conv1.projection.weight.dtype();
+        weights
+            .shortcut
+            .as_ref()
+            .map_or(0, |c| conv_workspace_bytes(c, h, w))
+            + 2 * allocation_bytes(h * w * input_channels, dtype)
+            + conv_workspace_bytes(&weights.conv1, h, w)
+            + 2 * allocation_bytes(h * w * output_channels, dtype)
+            + conv_workspace_bytes(&weights.conv2, h, w)
+            + allocation_bytes(h * w * output_channels, dtype)
+    }
+    fn residual_forward(
+        weights: &ResidualWeights,
+        ctx: &Context,
+        x: &Tensor,
+        h: usize,
+        w: usize,
+        policy: &ops::GemmPolicy,
+    ) -> Result<Tensor> {
+        let residual = match &weights.shortcut {
+            Some(conv) => conv_forward(conv, ctx, x, h, w, policy)?,
+            None => x.clone(),
+        };
+        let x = conv_forward(
+            &weights.conv1,
+            ctx,
+            &norm_activated(&weights.norm1, ctx, x)?,
+            h,
+            w,
+            policy,
+        )?;
+        let x = conv_forward(
+            &weights.conv2,
+            ctx,
+            &norm_activated(&weights.norm2, ctx, &x)?,
+            h,
+            w,
+            policy,
+        )?;
+        compute::add(ctx, &x, &residual)
     }
 
-    impl DownBlock {
-        fn forward(
-            &self,
-            ctx: &Context,
-            x: &Tensor,
-            h: usize,
-            w: usize,
-            policy: &ops::GemmPolicy,
-        ) -> Result<Tensor> {
-            let mut y = x.clone();
-            for block in &self.residuals {
-                y = block.forward(ctx, &y, h, w, policy)?;
-            }
-            let fs = if self.downsample.is_some() { 2 } else { 1 };
-            if let Some(conv) = &self.downsample {
-                y = conv.forward(ctx, &y, h, w, policy)?;
-            }
-            let mut residual = ctx.allocate_output(y.shape().clone(), y.dtype())?;
-            ops::image_grouped_average(
-                ctx,
-                x,
-                &mut residual,
-                h,
-                w,
-                fs,
-                self.temporal_factor,
-                y.shape().dims()[1],
-            )?;
-            compute::add(ctx, &y, &residual)
+    fn down_forward(
+        weights: &DownBlockWeights,
+        ctx: &Context,
+        x: &Tensor,
+        h: usize,
+        w: usize,
+        policy: &ops::GemmPolicy,
+    ) -> Result<Tensor> {
+        let mut y = x.clone();
+        for block in &weights.residuals {
+            y = residual_forward(block, ctx, &y, h, w, policy)?;
         }
+        let fs = if weights.downsample.is_some() { 2 } else { 1 };
+        if let Some(conv) = &weights.downsample {
+            y = conv_forward(conv, ctx, &y, h, w, policy)?;
+        }
+        let mut residual = ctx.allocate_output(y.shape().clone(), y.dtype())?;
+        ops::image_grouped_average(
+            ctx,
+            x,
+            &mut residual,
+            h,
+            w,
+            fs,
+            weights.temporal_factor,
+            y.shape().dims()[1],
+        )?;
+        compute::add(ctx, &y, &residual)
     }
 
-    impl Attention {
-        fn forward(
-            &self,
-            ctx: &Context,
-            x: &Tensor,
-            h: usize,
-            w: usize,
-            policy: &ops::GemmPolicy,
-        ) -> Result<Tensor> {
-            let normalized = self.norm.forward(ctx, x)?;
-            let channels = x.shape().dims()[1];
-            let q = compute::reshape(
-                &self.q.forward_conv(ctx, &normalized, policy)?,
-                vec![1, h * w, 1, channels],
-            )?;
-            let k = compute::reshape(
-                &self.k.forward_conv(ctx, &normalized, policy)?,
-                vec![1, h * w, 1, channels],
-            )?;
-            let v = compute::reshape(
-                &self.v.forward_conv(ctx, &normalized, policy)?,
-                vec![1, h * w, 1, channels],
-            )?;
-            let mut output = ctx.allocate_output(q.shape().clone(), q.dtype())?;
-            let mut args = ops::AttentionArgs::new(&q, &k, &v, &mut output);
-            args.policy.online_tune = policy.online_tune;
-            args.policy.cache_dir = policy.cache_dir.clone();
-            ops::attention(ctx, args)?;
-            let output = compute::reshape(&output, vec![h * w, channels])?;
-            compute::add(
-                ctx,
-                &self.projection.forward(ctx, &output, h, w, policy)?,
-                x,
-            )
-        }
+    fn attention_forward(
+        weights: &AttentionWeights,
+        ctx: &Context,
+        x: &Tensor,
+        h: usize,
+        w: usize,
+        policy: &ops::GemmPolicy,
+    ) -> Result<Tensor> {
+        let normalized = norm_forward(&weights.norm, ctx, x)?;
+        let channels = x.shape().dims()[1];
+        let q = compute::reshape(
+            &compute::project_conv(&weights.q, ctx, &normalized, policy)?,
+            vec![1, h * w, 1, channels],
+        )?;
+        let k = compute::reshape(
+            &compute::project_conv(&weights.k, ctx, &normalized, policy)?,
+            vec![1, h * w, 1, channels],
+        )?;
+        let v = compute::reshape(
+            &compute::project_conv(&weights.v, ctx, &normalized, policy)?,
+            vec![1, h * w, 1, channels],
+        )?;
+        let mut output = ctx.allocate_output(q.shape().clone(), q.dtype())?;
+        let mut args = ops::AttentionArgs::new(&q, &k, &v, &mut output);
+        args.policy.online_tune = policy.online_tune;
+        args.policy.cache_dir = policy.cache_dir.clone();
+        ops::attention(ctx, args)?;
+        let output = compute::reshape(&output, vec![h * w, channels])?;
+        compute::add(
+            ctx,
+            &conv_forward(&weights.projection, ctx, &output, h, w, policy)?,
+            x,
+        )
     }
 
     pub(in crate::cuda_fastwam::model::blocks::bf16) struct Vae {
@@ -941,13 +979,13 @@ mod vae {
             let mut bytes = allocation_bytes(224*448*3,self.weights.dtype) // possible input cast
             +allocation_bytes(112*224*12,self.weights.dtype); // width-first patchify
             let (mut h, mut w) = (112, 224);
-            bytes += self.weights.input.workspace_bytes(h, w);
+            bytes += conv_workspace_bytes(&self.weights.input, h, w);
             for block in &self.weights.down {
                 for residual in &block.residuals {
-                    bytes += residual.workspace_bytes(h, w);
+                    bytes += residual_workspace_bytes(residual, h, w);
                 }
                 if let Some(conv) = &block.downsample {
-                    bytes += conv.workspace_bytes(h, w);
+                    bytes += conv_workspace_bytes(conv, h, w);
                     h /= 2;
                     w /= 2;
                 }
@@ -963,13 +1001,13 @@ mod vae {
                 bytes += 2 * allocation_bytes(h * w * channels, self.weights.dtype);
                 // average shortcut + add
             }
-            bytes += self.weights.mid0.workspace_bytes(h, w);
+            bytes += residual_workspace_bytes(&self.weights.mid0, h, w);
             let channels = self.weights.attention.q.weight.shape().dims()[1];
             bytes += 11 * allocation_bytes(h * w * channels, self.weights.dtype); // norm,Q/K/V GEMM+bias,attention,projection GEMM+bias,add
-            bytes += self.weights.mid1.workspace_bytes(h, w);
+            bytes += residual_workspace_bytes(&self.weights.mid1, h, w);
             bytes += 2 * allocation_bytes(h * w * channels, self.weights.dtype); // final norm + SiLU
-            bytes += self.weights.output.workspace_bytes(h, w)
-                + self.weights.quant.workspace_bytes(h, w);
+            bytes += conv_workspace_bytes(&self.weights.output, h, w)
+                + conv_workspace_bytes(&self.weights.quant, h, w);
             bytes + allocation_bytes(h * w * 48, DType::F32)
         }
         /// One stitched HWC RGB frame in [-1,1], flattened `[224*448,3]`.
@@ -990,25 +1028,26 @@ mod vae {
                 ctx.allocate_output(Shape::new(vec![112 * 224, 12]), self.weights.dtype)?;
             ops::image_space_to_depth(ctx, &input, &mut packed, 224, 448, 2)?;
             let (mut h, mut w) = (112, 224);
-            let mut x = self.weights.input.forward(ctx, &packed, h, w, policy)?;
+            let mut x = conv_forward(&self.weights.input, ctx, &packed, h, w, policy)?;
             for block in &self.weights.down {
-                x = block.forward(ctx, &x, h, w, policy)?;
+                x = down_forward(block, ctx, &x, h, w, policy)?;
                 if block.downsample.is_some() {
                     h /= 2;
                     w /= 2;
                 }
             }
-            x = self.weights.mid0.forward(ctx, &x, h, w, policy)?;
-            x = self.weights.attention.forward(ctx, &x, h, w, policy)?;
-            x = self.weights.mid1.forward(ctx, &x, h, w, policy)?;
-            x = self.weights.output.forward(
+            x = residual_forward(&self.weights.mid0, ctx, &x, h, w, policy)?;
+            x = attention_forward(&self.weights.attention, ctx, &x, h, w, policy)?;
+            x = residual_forward(&self.weights.mid1, ctx, &x, h, w, policy)?;
+            x = conv_forward(
+                &self.weights.output,
                 ctx,
-                &self.weights.norm.activated(ctx, &x)?,
+                &norm_activated(&self.weights.norm, ctx, &x)?,
                 h,
                 w,
                 policy,
             )?;
-            x = self.weights.quant.forward(ctx, &x, h, w, policy)?;
+            x = conv_forward(&self.weights.quant, ctx, &x, h, w, policy)?;
             let mut out = ctx.allocate_output(Shape::new(vec![h * w, 48]), DType::F32)?;
             ops::channel_standardize(ctx, &x, &self.weights.mean, &self.weights.std, &mut out)?;
             Ok(out)
@@ -1081,47 +1120,34 @@ mod vae {
                     .unwrap();
                 ops::image_space_to_depth(&ctx, &input, &mut packed, 224, 448, 2).unwrap();
                 let (mut h, mut w) = (112, 224);
-                let mut x = model
-                    .weights
-                    .input
-                    .forward(&ctx, &packed, h, w, &policy)
-                    .unwrap();
+                let mut x =
+                    conv_forward(&model.weights.input, &ctx, &packed, h, w, &policy).unwrap();
                 compare("encoder.conv_in", &x, &fixtures, dtype);
                 for (i, block) in model.weights.down.iter().enumerate() {
-                    x = block.forward(&ctx, &x, h, w, &policy).unwrap();
+                    x = down_forward(block, &ctx, &x, h, w, &policy).unwrap();
                     if block.downsample.is_some() {
                         h /= 2;
                         w /= 2;
                     }
                     compare(&format!("encoder.down_blocks.{i}"), &x, &fixtures, dtype);
                 }
-                x = model.weights.mid0.forward(&ctx, &x, h, w, &policy).unwrap();
+                x = residual_forward(&model.weights.mid0, &ctx, &x, h, w, &policy).unwrap();
                 compare("encoder.mid_block.resnets.0", &x, &fixtures, dtype);
-                x = model
-                    .weights
-                    .attention
-                    .forward(&ctx, &x, h, w, &policy)
-                    .unwrap();
+                x = attention_forward(&model.weights.attention, &ctx, &x, h, w, &policy).unwrap();
                 compare("encoder.mid_block.attentions.0", &x, &fixtures, dtype);
-                x = model.weights.mid1.forward(&ctx, &x, h, w, &policy).unwrap();
+                x = residual_forward(&model.weights.mid1, &ctx, &x, h, w, &policy).unwrap();
                 compare("encoder.mid_block.resnets.1", &x, &fixtures, dtype);
-                x = model
-                    .weights
-                    .output
-                    .forward(
-                        &ctx,
-                        &model.weights.norm.activated(&ctx, &x).unwrap(),
-                        h,
-                        w,
-                        &policy,
-                    )
-                    .unwrap();
+                x = conv_forward(
+                    &model.weights.output,
+                    &ctx,
+                    &norm_activated(&model.weights.norm, &ctx, &x).unwrap(),
+                    h,
+                    w,
+                    &policy,
+                )
+                .unwrap();
                 compare("encoder.conv_out", &x, &fixtures, dtype);
-                x = model
-                    .weights
-                    .quant
-                    .forward(&ctx, &x, h, w, &policy)
-                    .unwrap();
+                x = conv_forward(&model.weights.quant, &ctx, &x, h, w, &policy).unwrap();
                 compare("quant_conv", &x, &fixtures, dtype);
                 let output = model.forward(&ctx, &input, &policy).unwrap();
                 compare("output", &output, &fixtures, dtype);
@@ -1210,13 +1236,13 @@ mod prepare {
     //! Prepare fixed time modulation through the same BF16 computation helpers.
     use super::{
         dit::Expert,
-        ops::{self as compute, binary},
+        ops::{self as compute, bias_add, cast},
     };
     use crate::cuda_fastwam::{
         backend::{self, ops, Context},
         weights::{
-            bf16::dit::{Expert as ExpertWeights, TimeWeights},
-            cast, host_tensor,
+            bf16::dit::{ExpertWeights, TimeWeights},
+            host_tensor,
         },
     };
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
@@ -1261,25 +1287,24 @@ mod prepare {
                     ctx,
                     &host_tensor(vec![1, 256], &embedding, time0.weight.dtype())?,
                 )?;
-                let t = time0.forward(ctx, &emb, gemm)?;
+                let t = compute::project(&time0, ctx, &emb, gemm)?;
                 let t = compute::activation(ctx, &t, ops::PointwiseActivation::Silu)?;
-                let t = time2.forward(ctx, &t, gemm)?;
+                let t = compute::project(&time2, ctx, &t, gemm)?;
                 let t = compute::activation(ctx, &t, ops::PointwiseActivation::Silu)?;
-                let t = cast(ctx, &timeproj.forward(ctx, &t, gemm)?, DType::BF16)?;
+                let t = cast(
+                    ctx,
+                    &compute::project(&timeproj, ctx, &t, gemm)?,
+                    DType::BF16,
+                )?;
                 let mut layers = Vec::new();
                 for b in blocks {
-                    let sum = binary(ctx, &b.modulation, &t, ops::PointwiseSemantic::Add)?;
+                    let sum = compute::add(ctx, &b.modulation, &t)?;
                     let mut parts = Vec::new();
                     for j in 0..6 {
                         let part = slice(&sum, j * width, width)?;
                         parts.push(if j == 1 || j == 4 {
-                            binary(
-                                ctx,
-                                &part.reshape(vec![1, width])?,
-                                &modulation_one,
-                                ops::PointwiseSemantic::BroadcastAdd,
-                            )?
-                            .reshape(vec![width])?
+                            bias_add(ctx, &part.reshape(vec![1, width])?, &modulation_one)?
+                                .reshape(vec![width])?
                         } else {
                             part
                         });
@@ -1311,14 +1336,14 @@ mod prepare {
     }
 }
 
+use self::ops::cast;
 use super::super::Inputs;
 use crate::cuda_fastwam::{
-    backend::{self, ops as cuda_ops, Context},
-    weights::{bf16::dit::Expert as ExpertWeights, cast, host_tensor, Bias, Linear, Store},
+    backend::{ops as cuda_ops, Context},
+    weights::{bf16::Bf16Weights, LinearWeights},
 };
 use apxinf_core::{DType, Result, Shape, Tensor};
 use dit::{ContextCache, Expert, Kv};
-use std::path::Path;
 use text::TextEncoder;
 use vae::Vae;
 
@@ -1339,7 +1364,7 @@ pub(in crate::cuda_fastwam::model) struct Bf16Blocks {
     vae: Vae,
     video: Expert,
     action: Expert,
-    proprio: Linear,
+    proprio: LinearWeights,
     rgb_table: Tensor,
     gemm: cuda_ops::GemmPolicy,
     attention: cuda_ops::AttentionPolicy,
@@ -1409,7 +1434,7 @@ impl Bf16Blocks {
         state: &Tensor,
         policies: &Policies,
     ) -> Result<Bf16Conditioning> {
-        let proprio = self.proprio.forward(ctx, state, &policies.gemm)?;
+        let proprio = ops::project(&self.proprio, ctx, state, &policies.gemm)?;
         let context = cuda_ops::concat_rows(ctx, text, &proprio)?;
         let video_context = self.video.context(ctx, &context, &policies.gemm)?;
         let (_, video) = self.video.forward(
@@ -1451,13 +1476,10 @@ impl Bf16Blocks {
         )?;
         let velocity = cast(ctx, &velocity, x.dtype())?;
         let mut next = ctx.allocate_output(x.shape().clone(), x.dtype())?;
-        let mut args = cuda_ops::PointwiseArgs::new(
-            cuda_ops::PointwiseSemantic::EulerUpdateRounded,
-            x,
-            &mut next,
-        );
+        let mut args =
+            cuda_ops::PointwiseArgs::new(cuda_ops::PointwiseSemantic::EulerUpdate, x, &mut next);
         args.secondary = Some(&velocity);
-        args.dt = half::bf16::from_f32(dt).to_f32();
+        args.dt = dt;
         cuda_ops::pointwise(ctx, args)?;
         Ok(next)
     }
@@ -1468,50 +1490,22 @@ impl Bf16Blocks {
     ) -> Result<Tensor> {
         cast(ctx, x, DType::F32)
     }
-    pub(in crate::cuda_fastwam::model) fn load(
+    pub(in crate::cuda_fastwam::model) fn new(
         ctx: &Context,
-        path: &Path,
-        text_path: &Path,
-        vae_path: &Path,
+        weights: Bf16Weights,
         gemm: cuda_ops::GemmPolicy,
         attention: cuda_ops::AttentionPolicy,
         timesteps: &[f32],
     ) -> Result<Self> {
-        let mut store = Store::load(path)?;
-        let video = Expert::new(
-            ctx,
-            ExpertWeights::load(&mut store, ctx, true)?,
-            &gemm,
-            &[0.],
-        )?;
-        let action = Expert::new(
-            ctx,
-            ExpertWeights::load(&mut store, ctx, false)?,
-            &gemm,
-            timesteps,
-        )?;
-        let proprio = store.linear(ctx, "model.proprio_encoder", Bias::Required)?;
-        proprio.validate("proprio encoder", 8, 4096)?;
-        drop(store);
-        let rgb = (0..256)
-            .map(|v| {
-                let unit = half::bf16::from_f32(v as f32 / 255.).to_f32();
-                half::bf16::from_f32(half::bf16::from_f32(unit * 2.).to_f32() - 1.).to_f32()
-            })
-            .collect::<Vec<_>>();
+        let video = Expert::new(ctx, weights.video, &gemm, &[0.])?;
+        let action = Expert::new(ctx, weights.action, &gemm, timesteps)?;
         Ok(Self {
             video,
             action,
-            proprio,
-            text: TextEncoder::new(crate::cuda_fastwam::weights::bf16::text::TextEncoder::load(
-                ctx, text_path,
-            )?),
-            vae: Vae::new(crate::cuda_fastwam::weights::bf16::vae::Vae::load(
-                ctx,
-                vae_path,
-                DType::BF16,
-            )?),
-            rgb_table: backend::upload(ctx, &host_tensor(vec![256, 1], &rgb, DType::BF16)?)?,
+            proprio: weights.proprio,
+            text: TextEncoder::new(weights.text),
+            vae: Vae::new(weights.vae),
+            rgb_table: weights.rgb_table,
             gemm,
             attention,
         })

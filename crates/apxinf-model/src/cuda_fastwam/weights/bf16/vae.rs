@@ -1,16 +1,16 @@
 //! Immutable checkpoint mapping and prepared weight data.
-use super::{host_tensor, Linear, Store};
+use super::{host_tensor, LinearWeights, Store};
 use crate::cuda_fastwam::backend::{self, Context};
 use apxinf_core::{DType, Error, Result, Tensor};
 use std::path::Path;
-pub(in crate::cuda_fastwam) struct Conv {
-    pub(in crate::cuda_fastwam) projection: Linear,
+pub(in crate::cuda_fastwam) struct ConvWeights {
+    pub(in crate::cuda_fastwam) projection: LinearWeights,
     pub(in crate::cuda_fastwam) kernel: usize,
     pub(in crate::cuda_fastwam) stride: usize,
     pub(in crate::cuda_fastwam) padding: usize,
 }
 
-impl Conv {
+impl ConvWeights {
     fn load(
         store: &mut Store,
         ctx: &Context,
@@ -45,7 +45,7 @@ impl Conv {
         let weight = backend::upload(ctx, &host_tensor(vec![k * k * c, n], &dst, dtype)?)?;
         let bias = backend::upload(ctx, &host_tensor(vec![n], &raw_bias.to_f32_vec()?, dtype)?)?;
         Ok(Self {
-            projection: Linear {
+            projection: LinearWeights {
                 weight,
                 bias: Some(bias),
             },
@@ -73,11 +73,11 @@ fn validate_conv_shapes(
     Ok(())
 }
 
-pub(in crate::cuda_fastwam) struct Norm {
+pub(in crate::cuda_fastwam) struct NormWeights {
     pub(in crate::cuda_fastwam) gamma: Tensor,
 }
 
-impl Norm {
+impl NormWeights {
     fn load(
         store: &mut Store,
         ctx: &Context,
@@ -101,15 +101,15 @@ impl Norm {
     }
 }
 
-pub(in crate::cuda_fastwam) struct Residual {
-    pub(in crate::cuda_fastwam) norm1: Norm,
-    pub(in crate::cuda_fastwam) conv1: Conv,
-    pub(in crate::cuda_fastwam) norm2: Norm,
-    pub(in crate::cuda_fastwam) conv2: Conv,
-    pub(in crate::cuda_fastwam) shortcut: Option<Conv>,
+pub(in crate::cuda_fastwam) struct ResidualWeights {
+    pub(in crate::cuda_fastwam) norm1: NormWeights,
+    pub(in crate::cuda_fastwam) conv1: ConvWeights,
+    pub(in crate::cuda_fastwam) norm2: NormWeights,
+    pub(in crate::cuda_fastwam) conv2: ConvWeights,
+    pub(in crate::cuda_fastwam) shortcut: Option<ConvWeights>,
 }
 
-impl Residual {
+impl ResidualWeights {
     fn load(
         store: &mut Store,
         ctx: &Context,
@@ -127,7 +127,7 @@ impl Residual {
             )));
         }
         let shortcut = if has_shortcut {
-            Some(Conv::load(
+            Some(ConvWeights::load(
                 store,
                 ctx,
                 &format!("{prefix}.conv_shortcut"),
@@ -140,14 +140,14 @@ impl Residual {
             None
         };
         Ok(Self {
-            norm1: Norm::load(
+            norm1: NormWeights::load(
                 store,
                 ctx,
                 &format!("{prefix}.norm1"),
                 dtype,
                 &[input, 1, 1, 1],
             )?,
-            conv1: Conv::load(
+            conv1: ConvWeights::load(
                 store,
                 ctx,
                 &format!("{prefix}.conv1"),
@@ -156,14 +156,14 @@ impl Residual {
                 1,
                 1,
             )?,
-            norm2: Norm::load(
+            norm2: NormWeights::load(
                 store,
                 ctx,
                 &format!("{prefix}.norm2"),
                 dtype,
                 &[output, 1, 1, 1],
             )?,
-            conv2: Conv::load(
+            conv2: ConvWeights::load(
                 store,
                 ctx,
                 &format!("{prefix}.conv2"),
@@ -177,21 +177,21 @@ impl Residual {
     }
 }
 
-pub(in crate::cuda_fastwam) struct DownBlock {
-    pub(in crate::cuda_fastwam) residuals: Vec<Residual>,
-    pub(in crate::cuda_fastwam) downsample: Option<Conv>,
+pub(in crate::cuda_fastwam) struct DownBlockWeights {
+    pub(in crate::cuda_fastwam) residuals: Vec<ResidualWeights>,
+    pub(in crate::cuda_fastwam) downsample: Option<ConvWeights>,
     pub(in crate::cuda_fastwam) temporal_factor: usize,
 }
 
-pub(in crate::cuda_fastwam) struct Attention {
-    pub(in crate::cuda_fastwam) norm: Norm,
-    pub(in crate::cuda_fastwam) q: Linear,
-    pub(in crate::cuda_fastwam) k: Linear,
-    pub(in crate::cuda_fastwam) v: Linear,
-    pub(in crate::cuda_fastwam) projection: Conv,
+pub(in crate::cuda_fastwam) struct AttentionWeights {
+    pub(in crate::cuda_fastwam) norm: NormWeights,
+    pub(in crate::cuda_fastwam) q: LinearWeights,
+    pub(in crate::cuda_fastwam) k: LinearWeights,
+    pub(in crate::cuda_fastwam) v: LinearWeights,
+    pub(in crate::cuda_fastwam) projection: ConvWeights,
 }
 
-impl Attention {
+impl AttentionWeights {
     fn load(store: &mut Store, ctx: &Context, prefix: &str, dtype: DType) -> Result<Self> {
         let raw = store.take(&format!("{prefix}.to_qkv.weight"))?;
         let raw_bias = store.take(&format!("{prefix}.to_qkv.bias"))?;
@@ -206,7 +206,7 @@ impl Attention {
                     transposed[k * c + n] = values[(part * c + n) * c + k];
                 }
             }
-            parts.push(Linear {
+            parts.push(LinearWeights {
                 weight: backend::upload(ctx, &host_tensor(vec![c, c], &transposed, dtype)?)?,
                 bias: Some(backend::upload(
                     ctx,
@@ -216,11 +216,11 @@ impl Attention {
         }
         let mut parts = parts.into_iter();
         Ok(Self {
-            norm: Norm::load(store, ctx, &format!("{prefix}.norm"), dtype, &[640, 1, 1])?,
+            norm: NormWeights::load(store, ctx, &format!("{prefix}.norm"), dtype, &[640, 1, 1])?,
             q: parts.next().unwrap(),
             k: parts.next().unwrap(),
             v: parts.next().unwrap(),
-            projection: Conv::load(
+            projection: ConvWeights::load(
                 store,
                 ctx,
                 &format!("{prefix}.proj"),
@@ -292,21 +292,21 @@ mod tests {
     }
 }
 
-pub(in crate::cuda_fastwam) struct Vae {
-    pub(in crate::cuda_fastwam) input: Conv,
-    pub(in crate::cuda_fastwam) down: Vec<DownBlock>,
-    pub(in crate::cuda_fastwam) mid0: Residual,
-    pub(in crate::cuda_fastwam) attention: Attention,
-    pub(in crate::cuda_fastwam) mid1: Residual,
-    pub(in crate::cuda_fastwam) norm: Norm,
-    pub(in crate::cuda_fastwam) output: Conv,
-    pub(in crate::cuda_fastwam) quant: Conv,
+pub(in crate::cuda_fastwam) struct VaeWeights {
+    pub(in crate::cuda_fastwam) input: ConvWeights,
+    pub(in crate::cuda_fastwam) down: Vec<DownBlockWeights>,
+    pub(in crate::cuda_fastwam) mid0: ResidualWeights,
+    pub(in crate::cuda_fastwam) attention: AttentionWeights,
+    pub(in crate::cuda_fastwam) mid1: ResidualWeights,
+    pub(in crate::cuda_fastwam) norm: NormWeights,
+    pub(in crate::cuda_fastwam) output: ConvWeights,
+    pub(in crate::cuda_fastwam) quant: ConvWeights,
     pub(in crate::cuda_fastwam) mean: Tensor,
     pub(in crate::cuda_fastwam) std: Tensor,
     pub(in crate::cuda_fastwam) dtype: DType,
 }
 
-impl Vae {
+impl VaeWeights {
     pub(in crate::cuda_fastwam) fn load(ctx: &Context, path: &Path, dtype: DType) -> Result<Self> {
         let config: serde_json::Value = serde_json::from_slice(
             &std::fs::read(path.join("config.json")).map_err(|e| Error::Other(e.to_string()))?,
@@ -336,7 +336,7 @@ impl Vae {
             let prefix = format!("encoder.down_blocks.{i}");
             let mut residuals = Vec::new();
             for j in 0..2 {
-                residuals.push(Residual::load(
+                residuals.push(ResidualWeights::load(
                     &mut store,
                     ctx,
                     &format!("{prefix}.resnets.{j}"),
@@ -347,7 +347,7 @@ impl Vae {
                 channels = output;
             }
             let downsample = if i < 3 {
-                Some(Conv::load(
+                Some(ConvWeights::load(
                     &mut store,
                     ctx,
                     &format!("{prefix}.downsampler.resample.1"),
@@ -359,7 +359,7 @@ impl Vae {
             } else {
                 None
             };
-            down.push(DownBlock {
+            down.push(DownBlockWeights {
                 residuals,
                 downsample,
                 temporal_factor: if i == 1 || i == 2 { 2 } else { 1 },
@@ -386,7 +386,7 @@ impl Vae {
             backend::upload(ctx, &host_tensor(vec![48], &values, DType::F32)?)
         };
         Ok(Self {
-            input: Conv::load(
+            input: ConvWeights::load(
                 &mut store,
                 ctx,
                 "encoder.conv_in",
@@ -396,7 +396,7 @@ impl Vae {
                 1,
             )?,
             down,
-            mid0: Residual::load(
+            mid0: ResidualWeights::load(
                 &mut store,
                 ctx,
                 "encoder.mid_block.resnets.0",
@@ -404,8 +404,13 @@ impl Vae {
                 640,
                 640,
             )?,
-            attention: Attention::load(&mut store, ctx, "encoder.mid_block.attentions.0", dtype)?,
-            mid1: Residual::load(
+            attention: AttentionWeights::load(
+                &mut store,
+                ctx,
+                "encoder.mid_block.attentions.0",
+                dtype,
+            )?,
+            mid1: ResidualWeights::load(
                 &mut store,
                 ctx,
                 "encoder.mid_block.resnets.1",
@@ -413,8 +418,8 @@ impl Vae {
                 640,
                 640,
             )?,
-            norm: Norm::load(&mut store, ctx, "encoder.norm_out", dtype, &[640, 1, 1, 1])?,
-            output: Conv::load(
+            norm: NormWeights::load(&mut store, ctx, "encoder.norm_out", dtype, &[640, 1, 1, 1])?,
+            output: ConvWeights::load(
                 &mut store,
                 ctx,
                 "encoder.conv_out",
@@ -423,7 +428,7 @@ impl Vae {
                 1,
                 1,
             )?,
-            quant: Conv::load(
+            quant: ConvWeights::load(
                 &mut store,
                 ctx,
                 "quant_conv",

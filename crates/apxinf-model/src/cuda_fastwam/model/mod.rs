@@ -1,9 +1,9 @@
 //! Model topology and fixed flow schedule. Precision details live in blocks.
 mod blocks;
 use super::backend::{ops, Context, DeviceBuffer};
+use super::weights::bf16::Bf16Weights;
 use apxinf_core::{Result, Tensor};
 use blocks::Bf16Blocks;
-use std::path::Path;
 
 pub(in crate::cuda_fastwam) struct Inputs {
     pub rgb: DeviceBuffer,
@@ -52,9 +52,7 @@ fn sigma(step: usize) -> f64 {
 
 pub(in crate::cuda_fastwam) fn build_model(
     ctx: &Context,
-    path: &Path,
-    text_path: &Path,
-    vae_path: &Path,
+    weights: Bf16Weights,
     gemm: ops::GemmPolicy,
     attention: ops::AttentionPolicy,
 ) -> Result<FastWamModel> {
@@ -62,6 +60,6 @@ pub(in crate::cuda_fastwam) fn build_model(
         .map(|step| (sigma(step) * 1000.) as f32)
         .collect::<Vec<_>>();
     Ok(FastWamModel {
-        blocks: Bf16Blocks::load(ctx, path, text_path, vae_path, gemm, attention, &timesteps)?,
+        blocks: Bf16Blocks::new(ctx, weights, gemm, attention, &timesteps)?,
     })
 }

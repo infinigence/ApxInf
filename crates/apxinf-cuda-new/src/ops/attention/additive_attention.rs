@@ -7,19 +7,6 @@ use super::contracts::{
 use super::execution;
 use crate::CudaContext;
 
-/// Arithmetic at the score/probability boundaries, independent of the provider.
-#[repr(u32)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum AttentionPrecision {
-    /// Accumulate QK, add the bias, softmax, and accumulate PV in F32.
-    #[default]
-    F32 = 0,
-    /// Round scaled QK to the input dtype; add bias and round again; compute
-    /// softmax in F32 and round its probabilities to the input dtype before PV.
-    /// This is the eager low-precision matmul/add/softmax/matmul contract.
-    Input = 1,
-}
-
 /// Dense attention with an additive F32 bias in `[B,Hq,Tq,Tk]` order.
 /// A leading dimension of one broadcasts the bias across the batch. Negative
 /// infinity masks a key; an entirely masked row produces zero output.
@@ -27,16 +14,11 @@ pub enum AttentionPrecision {
 pub struct AttentionBiasArgs<'a> {
     pub attention: AttentionArgs<'a>,
     pub bias: &'a Tensor,
-    pub precision: AttentionPrecision,
 }
 
 impl<'a> AttentionBiasArgs<'a> {
     pub fn new(attention: AttentionArgs<'a>, bias: &'a Tensor) -> Self {
-        Self {
-            attention,
-            bias,
-            precision: AttentionPrecision::F32,
-        }
+        Self { attention, bias }
     }
 }
 
@@ -82,7 +64,7 @@ pub(crate) fn normalize_additive(
     spec.semantic = Semantic::Additive.abi_value();
     spec.bias_alignment = alignment(bias.ptr());
     spec.bias_broadcast_batch = u32::from(shape[0] == 1);
-    spec.input_precision = args.precision as u32;
+    spec.input_precision = 0; // Reserved ABI slot; no alternate rounding mode.
     normalized.bindings.bias = bias.ptr();
     normalized.storage.push(bias);
     Ok(normalized)

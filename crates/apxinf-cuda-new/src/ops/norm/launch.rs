@@ -5,6 +5,7 @@ use crate::ffi::abi::{norm as abi, status};
 use crate::CudaContext;
 
 pub(crate) fn execute(ctx: &CudaContext, normalized: Normalized) -> Result<()> {
+    let _storage = &normalized.storage;
     crate::workspace::validate_capture_target(
         ctx.device_id(),
         normalized.bindings.stream as usize,
@@ -14,8 +15,6 @@ pub(crate) fn execute(ctx: &CudaContext, normalized: Normalized) -> Result<()> {
             ctx.runtime(),
             &normalized.spec,
             &normalized.bindings,
-        ))?;
+        ))
     }
-    crate::workspace::retain_resource(&std::rc::Rc::new(normalized.storage));
-    Ok(())
 }

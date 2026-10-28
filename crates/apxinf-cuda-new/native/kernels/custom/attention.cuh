@@ -68,8 +68,56 @@ __global__ void attention_scores_softmax(
     const T* query, const T* key, float* probabilities, int query_tokens,
     int key_tokens, int key_stride, int query_heads, int kv_heads,
     int head_dim, int batch_size, bool causal, int query_start,
+    const uint32_t* decode_meta, float scale) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t rows =
+      static_cast<int64_t>(batch_size) * query_tokens * query_heads;
+  if (row >= rows) return;
+
+  const int q_head = row % query_heads;
+  const int query_token = (row / query_heads) % query_tokens;
+  const int batch = row / (static_cast<int64_t>(query_heads) * query_tokens);
+  const int kv_head = q_head / (query_heads / kv_heads);
+  const int valid_keys = runtime_valid_keys(
+      key_tokens, causal, query_start, query_token, decode_meta);
+  const T* q = query +
+      ((static_cast<int64_t>(batch) * query_tokens + query_token) * query_heads +
+       q_head) * head_dim;
+  float* scores = probabilities + row * key_tokens;
+
+  float maximum = -CUDART_INF_F;
+  for (int key_token = 0; key_token < valid_keys; ++key_token) {
+    const T* k = key +
+        ((static_cast<int64_t>(batch) * key_stride + key_token) * kv_heads +
+         kv_head) * head_dim;
+    float dot = 0.0F;
+    for (int dimension = 0; dimension < head_dim; ++dimension) {
+      dot += to_float(q[dimension]) * to_float(k[dimension]);
+    }
+    scores[key_token] = dot * scale;
+    maximum = fmaxf(maximum, scores[key_token]);
+  }
+  float sum = 0.0F;
+  for (int key_token = 0; key_token < valid_keys; ++key_token) {
+    const float value = expf(scores[key_token] - maximum);
+    scores[key_token] = value;
+    sum += value;
+  }
+  for (int key_token = 0; key_token < valid_keys; ++key_token) {
+    scores[key_token] /= sum;
+  }
+  for (int key_token = valid_keys; key_token < key_tokens; ++key_token) {
+    scores[key_token] = 0.0F;
+  }
+}
+
+template <class T>
+__global__ void attention_scores_softmax_additive(
+    const T* query, const T* key, float* probabilities, int query_tokens,
+    int key_tokens, int key_stride, int query_heads, int kv_heads,
+    int head_dim, int batch_size, bool causal, int query_start,
     const uint32_t* decode_meta, float scale, const float* bias,
-    bool bias_broadcast_batch, bool input_precision) {
+    bool bias_broadcast_batch) {
   const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t rows =
       static_cast<int64_t>(batch_size) * query_tokens * query_heads;
@@ -96,12 +144,12 @@ __global__ void attention_scores_softmax(
       dot += to_float(q[dimension]) * to_float(k[dimension]);
     }
     float score = dot * scale;
-    if (input_precision) score = to_float(from_float<T>(score));
+
     if (bias != nullptr) {
       const int bias_batch = bias_broadcast_batch ? 0 : batch;
       score += bias[((static_cast<int64_t>(bias_batch) * query_heads + q_head) *
                      query_tokens + query_token) * key_tokens + key_token];
-      if (input_precision) score = to_float(from_float<T>(score));
+
     }
     scores[key_token] = score;
     maximum = fmaxf(maximum, scores[key_token]);
@@ -114,7 +162,7 @@ __global__ void attention_scores_softmax(
   }
   for (int key_token = 0; key_token < valid_keys; ++key_token) {
     scores[key_token] = sum == 0.0F ? 0.0F : scores[key_token] / sum;
-    if (input_precision) scores[key_token] = to_float(from_float<T>(scores[key_token]));
+
   }
   for (int key_token = valid_keys; key_token < key_tokens; ++key_token) {
     scores[key_token] = 0.0F;
@@ -166,17 +214,25 @@ cudaError_t launch_attention(const void* query, const void* key,
                              bool causal, int query_start,
                              const uint32_t* decode_meta, float scale,
                              cudaStream_t stream, const float* bias = nullptr,
-                             bool bias_broadcast_batch = false,
-                             bool input_precision = false) {
+                             bool bias_broadcast_batch = false) {
   constexpr int threads = 128;
   const int64_t rows =
       static_cast<int64_t>(batch) * query_tokens * query_heads;
+  if (bias == nullptr) {
   attention_scores_softmax<T><<<
       static_cast<unsigned>((rows + threads - 1) / threads), threads, 0,
       stream>>>(static_cast<const T*>(query), static_cast<const T*>(key),
                 probabilities, query_tokens, key_tokens, key_stride,
                 query_heads, kv_heads, head_dim, batch, causal, query_start,
-                decode_meta, scale, bias, bias_broadcast_batch, input_precision);
+                decode_meta, scale);
+  } else {
+  attention_scores_softmax_additive<T><<<
+      static_cast<unsigned>((rows + threads - 1) / threads), threads, 0,
+      stream>>>(static_cast<const T*>(query), static_cast<const T*>(key),
+                probabilities, query_tokens, key_tokens, key_stride,
+                query_heads, kv_heads, head_dim, batch, causal, query_start,
+                decode_meta, scale, bias, bias_broadcast_batch);
+  }
   auto status = cudaGetLastError();
   if (status != cudaSuccess) return status;
   const int64_t elements = rows * head_dim;
@@ -219,7 +275,7 @@ __global__ void attention_parallel_kernel(
     const T* query, const T* key, const T* value, T* output,
     float* probabilities, int query_tokens, int key_tokens, int query_heads,
     int kv_heads, int head_dim, float scale, bool causal, int query_start,
-    const float* bias, bool bias_broadcast_batch, bool input_precision) {
+    const float* bias, bool bias_broadcast_batch) {
   const int64_t row = blockIdx.x;
   const int q_head = row % query_heads;
   const int query_token = (row / query_heads) % query_tokens;
@@ -243,11 +299,11 @@ __global__ void attention_parallel_kernel(
           dot += __shfl_down_sync(0xffffffff, dot, offset);
       }
       score = dot * scale;
-      if (input_precision) score = to_float(from_float<T>(score));
+
       if (bias != nullptr) {
         const int bias_batch = bias_broadcast_batch ? 0 : batch;
         score += bias[((static_cast<int64_t>(bias_batch) * query_heads + q_head) * query_tokens + query_token) * key_tokens + token];
-        if (input_precision) score = to_float(from_float<T>(score));
+
       }
     }
     if (!Cooperative || lane == 0) scores[token] = score;
@@ -268,7 +324,7 @@ __global__ void attention_parallel_kernel(
     const float sum = attention_block_reduce<false>(local_sum, reduction);
     for (int token = threadIdx.x; token < key_tokens; token += blockDim.x) {
       float p = sum == 0.0F ? 0.0F : scores[token] / sum;
-      if (input_precision) p = to_float(from_float<T>(p));
+
       scores[token] = p;
     }
   } else if (threadIdx.x == 0) {
@@ -282,7 +338,7 @@ __global__ void attention_parallel_kernel(
     }
     for (int token = 0; token < key_tokens; ++token) {
       float p = sum == 0.0F ? 0.0F : scores[token] / sum;
-      if (input_precision) p = to_float(from_float<T>(p));
+
       scores[token] = p;
     }
   }
@@ -302,13 +358,13 @@ cudaError_t launch_parallel_attention(const void* query, const void* key,
     const void* value, void* output, float* probabilities, int batch,
     int query_tokens, int key_tokens, int query_heads, int kv_heads,
     int head_dim, float scale, bool causal, int query_start, const float* bias,
-    bool bias_broadcast_batch, bool input_precision, cudaStream_t stream) {
+    bool bias_broadcast_batch, cudaStream_t stream) {
   const uint64_t rows = static_cast<uint64_t>(batch) * query_tokens * query_heads;
   attention_parallel_kernel<T, Cooperative><<<static_cast<unsigned>(rows), 128, 0, stream>>>(
       static_cast<const T*>(query), static_cast<const T*>(key),
       static_cast<const T*>(value), static_cast<T*>(output), probabilities,
       query_tokens, key_tokens, query_heads, kv_heads, head_dim, scale, causal,
-      query_start, bias, bias_broadcast_batch, input_precision);
+      query_start, bias, bias_broadcast_batch);
   return cudaGetLastError();
 }
 

@@ -190,10 +190,8 @@ fn public_l3_capture_rejects_a_different_operator_order() {
 
 #[test]
 fn additive_attention_graph_retains_bias_and_tensor_storage() {
-    use apxinf_cuda_new::{
-        additive_attention, AttentionArgs, AttentionBiasArgs, AttentionPrecision,
-    };
-    for precision in [AttentionPrecision::F32, AttentionPrecision::Input] {
+    use apxinf_cuda_new::{additive_attention, AttentionArgs, AttentionBiasArgs};
+    {
         let ctx = CudaContext::new(0).unwrap();
         let query = bf16_tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
         let key = bf16_tensor(0, vec![1, 2, 1, 2], &[0.0; 4]);
@@ -213,7 +211,6 @@ fn additive_attention_graph_retains_bias_and_tensor_storage() {
         prepare_with_session(&session, || {
             let mut args =
                 AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
-            args.precision = precision;
             args.attention.policy.online_tune = false;
             additive_attention(&ctx, args)
         })
@@ -224,7 +221,6 @@ fn additive_attention_graph_retains_bias_and_tensor_storage() {
                     AttentionArgs::new(&query, &key, &value, &mut out),
                     &bias,
                 );
-                args.precision = precision;
                 args.attention.policy.online_tune = false;
                 additive_attention(&ctx, args)
             })
@@ -241,96 +237,4 @@ fn additive_attention_graph_retains_bias_and_tensor_storage() {
         ctx.synchronize().unwrap();
         assert_eq!(values(&observed), [1.0, 2.0]);
     }
-}
-
-#[test]
-fn synchronous_host_uploads_are_visible_to_nonblocking_graph_replay() {
-    use apxinf_cuda_new::transfers;
-
-    let ctx = CudaContext::new(0).unwrap();
-    // Use pageable host allocations large enough to exercise staged DMA.
-    let count = 1 << 20;
-    let source =
-        transfers::to_cuda(&Tensor::from_i32(vec![count], &vec![0; count]).unwrap(), 0).unwrap();
-    let source_buffer = CudaBuffer::from_tensor(&source).unwrap();
-    let output = ctx
-        .allocate_output(Shape::new(vec![count]), DType::I32)
-        .unwrap();
-    let graph = capture(&ctx, || {
-        transfers::copy_cuda_to_cuda(&ctx, &source, &output)
-    })
-    .unwrap();
-    let output_buffer = CudaBuffer::from_tensor(&output).unwrap();
-    let mut actual = vec![0; count * 4];
-
-    for iteration in 0..4 {
-        let values = (0..count)
-            .map(|i| (i as i32) ^ ((iteration + 1) << 20))
-            .collect::<Vec<_>>();
-        let host = Tensor::from_i32(vec![count], &values).unwrap();
-        let expected = host.storage().as_cpu().unwrap();
-        if iteration % 2 == 0 {
-            source_buffer.copy_from_host(expected).unwrap();
-        } else {
-            transfers::copy_cpu_to_cuda(&host, &source).unwrap();
-        }
-        // No caller-side synchronization between upload and launch: both
-        // synchronous upload APIs promise completion before they return.
-        graph.replay().unwrap();
-        ctx.synchronize().unwrap();
-        output_buffer.copy_to_host(&mut actual).unwrap();
-        assert_eq!(actual, expected, "upload/replay iteration {iteration}");
-    }
-}
-
-#[test]
-fn cublas_shared_stream_resources_survive_graph_owners_and_isolate_replay() {
-    use apxinf_cuda_new::{transfers, CapturedGraph};
-
-    fn make_graph(scale: f32) -> (CapturedGraph, Vec<Tensor>) {
-        let ctx = CudaContext::new_with_autotune(0, false).unwrap();
-        let inputs = (1..=32)
-            .map(|i| bf16_tensor(0, vec![4, 8], &[scale * i as f32 / 8.0; 32]))
-            .collect::<Vec<_>>();
-        let weight = bf16_tensor(0, vec![8, 6], &[0.25; 48]);
-        let mut outputs = (0..32)
-            .map(|_| bf16_tensor(0, vec![4, 6], &[0.; 24]))
-            .collect::<Vec<_>>();
-        let session = ExecutionSession::with_capacity(4096, 0).unwrap();
-        let mut operation = || {
-            for (input, output) in inputs.iter().zip(&mut outputs) {
-                let mut args = GemmArgs::new(input, &weight, output);
-                args.policy.online_tune = false;
-                args.policy.cache_dir = Some(String::new());
-                gemm(&ctx, args)?;
-            }
-            Ok(())
-        };
-        prepare_with_session(&session, &mut operation).unwrap();
-        let graph = capture(&ctx, || with_session(&session, &mut operation)).unwrap();
-        // The returned graph must retain the original execution, weights,
-        // inputs, shared cuBLAS state and stream after these owners disappear.
-        (graph, outputs)
-    }
-
-    let (first, first_outputs) = make_graph(1.0);
-    let (second, second_outputs) = make_graph(-2.0);
-    for _ in 0..8 {
-        first.replay().unwrap();
-        second.replay().unwrap();
-    }
-    for (scale, outputs) in [(1.0, &first_outputs), (-2.0, &second_outputs)] {
-        for (i, output) in outputs.iter().enumerate() {
-            let actual = transfers::to_cpu(output).unwrap().to_f32_vec().unwrap();
-            assert!(actual.iter().all(|&x| x == scale * (i + 1) as f32 / 4.0));
-        }
-    }
-    drop(first);
-    second.replay().unwrap();
-    assert!(transfers::to_cpu(&second_outputs[31])
-        .unwrap()
-        .to_f32_vec()
-        .unwrap()
-        .iter()
-        .all(|&x| x == -16.0));
 }

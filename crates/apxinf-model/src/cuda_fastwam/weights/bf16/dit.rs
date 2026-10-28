@@ -1,53 +1,54 @@
 //! Immutable checkpoint mapping and prepared weight data.
-use super::cast;
-use super::{host_tensor, validate_tensor, Bias, Linear, Store};
+use super::cast_weight;
+use super::{host_tensor, validate_tensor, Bias, LinearWeights, Store};
+use super::{load_linear, upload_tensor};
 use crate::cuda_fastwam::backend::{self, ops, Context};
 use apxinf_core::{DType, Error, Result, Tensor};
-pub(in crate::cuda_fastwam) struct Projections {
-    pub(in crate::cuda_fastwam) q: Linear,
-    pub(in crate::cuda_fastwam) k: Linear,
-    pub(in crate::cuda_fastwam) v: Linear,
-    pub(in crate::cuda_fastwam) o: Linear,
+pub(in crate::cuda_fastwam) struct ProjectionWeights {
+    pub(in crate::cuda_fastwam) q: LinearWeights,
+    pub(in crate::cuda_fastwam) k: LinearWeights,
+    pub(in crate::cuda_fastwam) v: LinearWeights,
+    pub(in crate::cuda_fastwam) o: LinearWeights,
     pub(in crate::cuda_fastwam) nq: Tensor,
     pub(in crate::cuda_fastwam) nk: Tensor,
 }
 
-impl Projections {
+impl ProjectionWeights {
     fn load(s: &mut Store, ctx: &Context, p: &str) -> Result<Self> {
         Ok(Self {
-            q: s.linear(ctx, &format!("{p}.q"), Bias::Required)?,
-            k: s.linear(ctx, &format!("{p}.k"), Bias::Required)?,
-            v: s.linear(ctx, &format!("{p}.v"), Bias::Required)?,
-            o: s.linear(ctx, &format!("{p}.o"), Bias::Required)?,
-            nq: s.upload(ctx, &format!("{p}.norm_q.weight"))?,
-            nk: s.upload(ctx, &format!("{p}.norm_k.weight"))?,
+            q: load_linear(&mut *s, ctx, &format!("{p}.q"), Bias::Required)?,
+            k: load_linear(&mut *s, ctx, &format!("{p}.k"), Bias::Required)?,
+            v: load_linear(&mut *s, ctx, &format!("{p}.v"), Bias::Required)?,
+            o: load_linear(&mut *s, ctx, &format!("{p}.o"), Bias::Required)?,
+            nq: upload_tensor(&mut *s, ctx, &format!("{p}.norm_q.weight"))?,
+            nk: upload_tensor(&mut *s, ctx, &format!("{p}.norm_k.weight"))?,
         })
     }
 }
 
-pub(in crate::cuda_fastwam) struct Block {
-    pub(in crate::cuda_fastwam) sa: Projections,
-    pub(in crate::cuda_fastwam) ca: Projections,
+pub(in crate::cuda_fastwam) struct BlockWeights {
+    pub(in crate::cuda_fastwam) sa: ProjectionWeights,
+    pub(in crate::cuda_fastwam) ca: ProjectionWeights,
     pub(in crate::cuda_fastwam) norm3w: Tensor,
     pub(in crate::cuda_fastwam) norm3b: Tensor,
-    pub(in crate::cuda_fastwam) ff0: Linear,
-    pub(in crate::cuda_fastwam) ff2: Linear,
+    pub(in crate::cuda_fastwam) ff0: LinearWeights,
+    pub(in crate::cuda_fastwam) ff2: LinearWeights,
     pub(in crate::cuda_fastwam) modulation: Tensor,
 }
 
-pub(in crate::cuda_fastwam) struct Expert {
-    pub(in crate::cuda_fastwam) blocks: Vec<Block>,
-    pub(in crate::cuda_fastwam) text0: Linear,
-    pub(in crate::cuda_fastwam) text2: Linear,
-    pub(in crate::cuda_fastwam) input: Linear,
-    pub(in crate::cuda_fastwam) head: Option<Linear>,
+pub(in crate::cuda_fastwam) struct ExpertWeights {
+    pub(in crate::cuda_fastwam) blocks: Vec<BlockWeights>,
+    pub(in crate::cuda_fastwam) text0: LinearWeights,
+    pub(in crate::cuda_fastwam) text2: LinearWeights,
+    pub(in crate::cuda_fastwam) input: LinearWeights,
+    pub(in crate::cuda_fastwam) head: Option<LinearWeights>,
     pub(in crate::cuda_fastwam) one: Tensor,
     pub(in crate::cuda_fastwam) zero: Tensor,
     pub(in crate::cuda_fastwam) rope: ops::PairwiseRopeTable,
     pub(in crate::cuda_fastwam) video: bool,
 }
 
-impl Expert {
+impl ExpertWeights {
     pub(in crate::cuda_fastwam) fn load(
         s: &mut Store,
         ctx: &Context,
@@ -59,15 +60,14 @@ impl Expert {
         let mut blocks = Vec::new();
         for i in 0..30 {
             let b = format!("{p}.blocks.{i}");
-            blocks.push(Block {
-                sa: Projections::load(s, ctx, &format!("{b}.self_attn"))?,
-                ca: Projections::load(s, ctx, &format!("{b}.cross_attn"))?,
-                norm3w: s.upload(ctx, &format!("{b}.norm3.weight"))?,
-                norm3b: s.upload(ctx, &format!("{b}.norm3.bias"))?,
-                ff0: s.linear(ctx, &format!("{b}.ffn.0"), Bias::Required)?,
-                ff2: s.linear(ctx, &format!("{b}.ffn.2"), Bias::Required)?,
-                modulation: s
-                    .upload(ctx, &format!("{b}.modulation"))?
+            blocks.push(BlockWeights {
+                sa: ProjectionWeights::load(s, ctx, &format!("{b}.self_attn"))?,
+                ca: ProjectionWeights::load(s, ctx, &format!("{b}.cross_attn"))?,
+                norm3w: upload_tensor(&mut *s, ctx, &format!("{b}.norm3.weight"))?,
+                norm3b: upload_tensor(&mut *s, ctx, &format!("{b}.norm3.bias"))?,
+                ff0: load_linear(&mut *s, ctx, &format!("{b}.ffn.0"), Bias::Required)?,
+                ff2: load_linear(&mut *s, ctx, &format!("{b}.ffn.2"), Bias::Required)?,
+                modulation: upload_tensor(&mut *s, ctx, &format!("{b}.modulation"))?
                     .reshape(vec![1, 6 * width])?,
             });
         }
@@ -91,8 +91,8 @@ impl Expert {
         // Keep immutable affine data in the residual state's dtype. This avoids
         // repeating weight conversions inside every captured denoising step.
         for b in &mut blocks {
-            b.norm3w = cast(ctx, &b.norm3w, DType::F32)?;
-            b.norm3b = cast(ctx, &b.norm3b, DType::F32)?;
+            b.norm3w = cast_weight(ctx, &b.norm3w, DType::F32)?;
+            b.norm3b = cast_weight(ctx, &b.norm3b, DType::F32)?;
         }
         let mut input = if video {
             let raw = s.take(&format!("{p}.patch_embedding.weight"))?;
@@ -113,28 +113,47 @@ impl Expert {
                     }
                 }
             }
-            Linear {
+            LinearWeights {
                 weight: backend::upload(
                     ctx,
                     &host_tensor(vec![192, width], &transposed, DType::BF16)?,
                 )?,
-                bias: Some(s.upload(ctx, &format!("{p}.patch_embedding.bias"))?),
+                bias: Some(upload_tensor(
+                    &mut *s,
+                    ctx,
+                    &format!("{p}.patch_embedding.bias"),
+                )?),
             }
         } else {
-            s.linear(ctx, &format!("{p}.action_encoder"), Bias::Required)?
+            load_linear(&mut *s, ctx, &format!("{p}.action_encoder"), Bias::Required)?
         };
-        let mut time0 = s.linear(ctx, &format!("{p}.time_embedding.0"), Bias::Required)?;
-        let mut time2 = s.linear(ctx, &format!("{p}.time_embedding.2"), Bias::Required)?;
-        let mut timeproj = s.linear(ctx, &format!("{p}.time_projection.1"), Bias::Required)?;
+        let mut time0 = load_linear(
+            &mut *s,
+            ctx,
+            &format!("{p}.time_embedding.0"),
+            Bias::Required,
+        )?;
+        let mut time2 = load_linear(
+            &mut *s,
+            ctx,
+            &format!("{p}.time_embedding.2"),
+            Bias::Required,
+        )?;
+        let mut timeproj = load_linear(
+            &mut *s,
+            ctx,
+            &format!("{p}.time_projection.1"),
+            Bias::Required,
+        )?;
         input.validate("Wan input", if video { 192 } else { 7 }, width)?;
         if !video {
             // Keep Euler state in F32 through its small input projection.
             // Validate the original BF16 checkpoint before exact promotion.
-            input.weight = cast(ctx, &input.weight, DType::F32)?;
+            input.weight = cast_weight(ctx, &input.weight, DType::F32)?;
             input.bias = input
                 .bias
                 .as_ref()
-                .map(|bias| cast(ctx, bias, DType::F32))
+                .map(|bias| cast_weight(ctx, bias, DType::F32))
                 .transpose()?;
         }
         time0.validate("Wan time input", 256, width)?;
@@ -142,11 +161,11 @@ impl Expert {
         timeproj.validate("Wan time modulation", width, 6 * width)?;
         if video {
             for projection in [&mut time0, &mut time2, &mut timeproj] {
-                projection.weight = cast(ctx, &projection.weight, DType::F32)?;
+                projection.weight = cast_weight(ctx, &projection.weight, DType::F32)?;
                 projection.bias = projection
                     .bias
                     .as_ref()
-                    .map(|b| cast(ctx, b, DType::F32))
+                    .map(|b| cast_weight(ctx, b, DType::F32))
                     .transpose()?;
             }
         }
@@ -169,24 +188,39 @@ impl Expert {
                 }
             }
         }
-        let text0 = s.linear(ctx, &format!("{p}.text_embedding.0"), Bias::Required)?;
-        let text2 = s.linear(ctx, &format!("{p}.text_embedding.2"), Bias::Required)?;
+        let text0 = load_linear(
+            &mut *s,
+            ctx,
+            &format!("{p}.text_embedding.0"),
+            Bias::Required,
+        )?;
+        let text2 = load_linear(
+            &mut *s,
+            ctx,
+            &format!("{p}.text_embedding.2"),
+            Bias::Required,
+        )?;
         text0.validate("Wan text input", 4096, width)?;
         text2.validate("Wan text hidden", width, width)?;
         let mut head = if video {
             None
         } else {
-            Some(s.linear(ctx, &format!("{p}.head"), Bias::Required)?)
+            Some(load_linear(
+                &mut *s,
+                ctx,
+                &format!("{p}.head"),
+                Bias::Required,
+            )?)
         };
         if let Some(head) = &mut head {
             head.validate("Wan action output", width, 7)?;
             // Preserve the F32 residual through the small velocity projection.
             // Checkpoint values are BF16; their F32 promotion is exact.
-            head.weight = cast(ctx, &head.weight, DType::F32)?;
+            head.weight = cast_weight(ctx, &head.weight, DType::F32)?;
             head.bias = head
                 .bias
                 .as_ref()
-                .map(|bias| cast(ctx, bias, DType::F32))
+                .map(|bias| cast_weight(ctx, bias, DType::F32))
                 .transpose()?;
         }
         Ok((
@@ -215,7 +249,7 @@ fn vector(ctx: &Context, values: &[f32], dtype: DType) -> Result<Tensor> {
 }
 
 pub(in crate::cuda_fastwam) struct TimeWeights {
-    pub time0: Linear,
-    pub time2: Linear,
-    pub timeproj: Linear,
+    pub time0: LinearWeights,
+    pub time2: LinearWeights,
+    pub timeproj: LinearWeights,
 }

@@ -2,7 +2,6 @@
 #include "../framework/runtime_internal.h"
 
 #include <climits>
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -117,14 +116,6 @@ cudaError_t launch_cast_bf16_f32(
     const void* input, void* output, int64_t count, cudaStream_t stream) {
   if (input == nullptr || output == nullptr || count <= 0)
     return cudaErrorInvalidValue;
-  if (count % 4 == 0 && reinterpret_cast<uintptr_t>(input) % 8 == 0 &&
-      reinterpret_cast<uintptr_t>(output) % 16 == 0) {
-    const int64_t groups = count / 4;
-    const int blocks = static_cast<int>(std::min<int64_t>((groups + 255) / 256, 4096));
-    cast_bf16_f32_vec4_kernel<<<blocks, 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(input), static_cast<float*>(output), groups);
-    return cudaGetLastError();
-  }
   int blocks = static_cast<int>((count + 255) / 256);
   blocks = blocks > 4096 ? 4096 : blocks;
   cast_bf16_f32_kernel<<<blocks, 256, 0, stream>>>(

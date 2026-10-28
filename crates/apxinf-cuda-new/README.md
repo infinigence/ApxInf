@@ -186,14 +186,11 @@ benchmark default to cache-only/fallback, not tuning. Tuning occurs at first eag
 execution or prepare, never inside graph capture or steady-state replay. A warm
 cache does not retune just because `--autotune` is present.
 
-BF16 additive attention with `Input` arithmetic, equal Q/KV head counts and
-at most 1024 keys has a cuBLAS candidate. It computes BF16 QK scores, rounds the
-bias addition, computes softmax in FP32 and rounds probabilities to BF16 before
-the final cuBLAS PV. It is the first eligible fallback for this domain, including
-when online tuning is disabled. Other arithmetic and GQA use the custom
-candidates. Provider scratch contains the score/probability matrix plus the
-shared 4 MiB cuBLAS workspace. Attention recipe namespace v7 includes the
-runtime cuBLAS version and the softmax source fingerprint.
+Additive attention uses F32 score/probability arithmetic through custom
+candidates. Dense F32 attention has a pedantic cuBLAS implementation with
+execution-local score/probability storage and 4 MiB workspace. Existing
+F16/BF16 dense candidates keep their original selection domain. Attention
+recipes include the runtime cuBLAS version and source fingerprint.
 
 Dense F32 MHA also has a fused short-sequence candidate: B1, Q16–128,
 K1–160, D128, no mask, at most 65535 heads and 16-byte-aligned bindings.
@@ -215,14 +212,10 @@ the Attention build fingerprint, invalidating incompatible cached recipes.
 
 The graph retains the executions and storage used during capture. The recipe key does not contain raw pointers; fixed addresses and the stream belong to the Rust execution cache key.
 
-The cuBLAS providers reuse an immutable handle and 4 MiB scratch allocation for
-executions on the same device and concrete stream. Executions hold strong
-ownership; the provider-private lookup table holds weak references only. A
-mutex serializes complete cuBLAS host calls, and stream order serializes scratch
-use on the device. Different streams keep separate resources. Projection and
-dequantization buffers remain per-execution; workspace policy accounting still
-charges the full 4 MiB to each execution conservatively. Resource lookup and
-creation occur only during prepare, never during capture or replay.
+cuBLAS resource ownership and host upload behavior retain the existing baseline.
+This model port does not introduce a shared-handle/workspace pool or change
+public transfer synchronization. The new F32 attention provider owns its own
+prepared handle and scratch allocation.
 
 ## Directory Responsibilities
 

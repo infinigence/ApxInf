@@ -8,7 +8,6 @@ use crate::{CudaBuffer, CudaContext};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Semantic {
     Rms,
-    RmsRounded,
     Layer,
     AdaptiveRms,
     BiasResidual,
@@ -26,7 +25,6 @@ impl Semantic {
     fn code(self) -> u32 {
         match self {
             Self::Rms => 0,
-            Self::RmsRounded => 9,
             Self::Layer => 1,
             Self::AdaptiveRms => 2,
             Self::BiasResidual => 3,
@@ -39,10 +37,7 @@ impl Semantic {
     }
 
     fn writes_hidden(self) -> bool {
-        !matches!(
-            self,
-            Self::Rms | Self::RmsRounded | Self::Layer | Self::AdaptiveRms
-        )
+        !matches!(self, Self::Rms | Self::Layer | Self::AdaptiveRms)
     }
 
     fn writes_normalized(self) -> bool {
@@ -59,11 +54,7 @@ impl Semantic {
     fn reads_weight(self) -> bool {
         matches!(
             self,
-            Self::Rms
-                | Self::RmsRounded
-                | Self::Layer
-                | Self::BiasResidualRms
-                | Self::BiasResidualLayer
+            Self::Rms | Self::Layer | Self::BiasResidualRms | Self::BiasResidualLayer
         )
     }
 
@@ -328,9 +319,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         .normalized
         .as_ref()
         .map_or(dtype, |tensor| tensor.dtype());
-    if semantic == Semantic::RmsRounded && output_dtype != dtype {
-        return Err(invalid("Rounded RMS normalization must preserve dtype"));
-    }
+
     if output_dtype == DType::F8E4M3 {
         if dtype != DType::F16 || !semantic.writes_normalized() {
             return Err(invalid(
@@ -350,33 +339,6 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         &mut storage,
     )?;
 
-    if semantic == Semantic::RmsRounded {
-        let bytes = count
-            .checked_mul(dtype.size_in_bytes())
-            .ok_or_else(|| invalid("Norm size overflow"))?;
-        let weight_bytes = cols
-            .checked_mul(dtype.size_in_bytes())
-            .ok_or_else(|| invalid("Norm size overflow"))?;
-        let input_start = input_pointer as usize;
-        let output_start = normalized as usize;
-        let weight_start = weight as usize;
-        let input_end = input_start
-            .checked_add(bytes)
-            .ok_or_else(|| invalid("Norm address overflow"))?;
-        let output_end = output_start
-            .checked_add(bytes)
-            .ok_or_else(|| invalid("Norm address overflow"))?;
-        let weight_end = weight_start
-            .checked_add(weight_bytes)
-            .ok_or_else(|| invalid("Norm address overflow"))?;
-        if (input_start != output_start && input_start < output_end && output_start < input_end)
-            || (weight_start < output_end && output_start < weight_end)
-        {
-            return Err(invalid(
-                "Rounded RMS input/output partially overlap or weight/output overlap",
-            ));
-        }
-    }
     if semantic == Semantic::Layer && dtype == DType::F32 {
         let output_start = normalized as usize;
         let output_end = output_start

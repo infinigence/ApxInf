@@ -36,10 +36,10 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
   if (spec.version != APXINF_POINTWISE_SPEC_VERSION ||
-      spec.semantic > APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY ||
+      spec.semantic > APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY || (spec.semantic == 5 || spec.semantic == 6 || spec.semantic == 7) ||
       (spec.dtype != APXINF_DTYPE_F32 && spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!quantized_geglu && spec.output_dtype != spec.dtype) ||
-      spec.activation > APXINF_POINTWISE_ACTIVATION_GELU_ROUNDED ||
+      spec.activation > APXINF_POINTWISE_ACTIVATION_GELU_EXACT ||
       spec.has_bias > 1 || spec.rows <= 0 || spec.cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
       spec.output_scale_is_unit > 1 ||
@@ -234,13 +234,10 @@ cudaError_t launch(const apxinf_pointwise_spec_t& spec,
       kernels::euler_update<T><<<grid, kDirectThreads, 0, stream>>>(
           input, secondary, output, count, bindings.dt);
       break;
-    case APXINF_POINTWISE_SEMANTIC_ADD:
     case APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY:
     case APXINF_POINTWISE_SEMANTIC_MULTIPLY:
     case APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY:
-    case APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD:
-    case APXINF_POINTWISE_SEMANTIC_EULER_UPDATE_ROUNDED:
-      kernels::binary_rounded<T><<<grid, kDirectThreads, 0, stream>>>(
+      kernels::binary<T><<<grid, kDirectThreads, 0, stream>>>(
           input, secondary, output, count, cols, spec.semantic, bindings.dt);
       break;
     default:
@@ -260,8 +257,7 @@ cudaError_t launch_bf16(const apxinf_pointwise_spec_t& spec,
   if (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU) {
     return launch_bf16_geglu(input, output, rows, cols, stream);
   }
-  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION &&
-      spec.activation != APXINF_POINTWISE_ACTIVATION_GELU_ROUNDED) {
+  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION) {
     return launch_bf16_bias_activation(
         input, bias, output, rows, cols, static_cast<int>(spec.activation),
         stream);

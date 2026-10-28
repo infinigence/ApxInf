@@ -1,5 +1,14 @@
 # Fast-WAM action inference
 
+> Current baseline-first revision: historical precision/performance results below
+> describe earlier snapshots. Public GEMM bias arithmetic, RMS/GELU/Euler,
+> cuBLAS resource ownership, quantization and H2D upload behavior have been
+> restored to the PR base. Redundant Add/BroadcastAdd, rounding-only RMS/GELU/Euler and Input-attention
+> variants were removed. Intermediate reference equality is diagnostic, not
+> proof of downstream task quality. This revision needs fresh numerical and
+> task-level qualification; no historical pass is inherited.
+
+
 The `fastwam` family implements the action-only profile of
 [`lerobot/fastwam_libero_uncond_2cam224`](https://huggingface.co/lerobot/fastwam_libero_uncond_2cam224)
 through the existing `VlaRuntime` and Python `AutoPolicy` interfaces. It does not
@@ -79,7 +88,8 @@ Absent `num_inference_steps` defaults to 10; any explicit value must be 10.
 Absent/null `sigma_shift` uses the scheduler shift of 5; an explicit override
 must equal 5. Other values are rejected before device weights are loaded.
 `weights/` maps and packs checkpoint tensors, including time-projection weights
-and fixed position tables. `model/mod.rs` owns model construction, modality connections and the
+and fixed position tables. The loader materializes the typed `Bf16Weights` device
+tree before model construction. `model/mod.rs` owns model construction, modality connections and the
 flow schedule. `model/blocks/bf16.rs` owns UMT5, VAE and DiT composition,
 projection/bias rounding and fixed time-modulation preparation. Its BF16
 implementation includes the declared F32 residual and action-projection paths.
@@ -88,8 +98,8 @@ Temporary time-projection weights are released after modulation preparation.
 weights never call model forward methods.
 The [family boundary guard](../scripts/check_fastwam_module_boundaries.py)
 checks these owners recursively; it does not replace numerical validation.
-`model_runner.rs` owns request validation, input/RNG binding, workspace and CUDA
-Graph preparation. There are no imports from another model family.
+`model_runner/runner.rs` owns request validation and the plan cache;
+`model_runner/prepare.rs` owns input/RNG binding, workspace and CUDA Graph preparation. There are no imports from another model family.
 
 Raw RGB bytes are uploaded unchanged; camera concatenation, layout conversion
 and pixel normalization execute on the device. Encoded conditioning and its
@@ -310,7 +320,12 @@ is exposed to the model. It owns physical conditioning caches, dtype boundaries
 and workspace requirements. `weights/host.rs` owns
 checkpoint storage and source validation; `weights/bf16/` owns device weight
 representations and upload/packing, including explicitly F32 tensors used by
-this implementation. Text and VAE computation objects retain their weight trees.
+this implementation. The loader materializes `Bf16Weights` before constructing
+the model. Weight data types use the `*Weights` suffix; Blocks functions consume
+them explicitly rather than adding computation methods to those types. Loading
+uses a consuming checkpoint store for this single implementation, without an
+additional persistent host weight tree. Load-time weight promotion stays in
+weights; activation conversion and layer composition stay in Blocks. Text and VAE computation objects retain their weight trees.
 `model_runner/runner.rs` validates requests and owns the plan cache;
 `model_runner/prepare.rs` owns stable buffers, preparation, capture and replay.
 `backend.rs` remains a safe CUDA import/transfer seam.
@@ -325,3 +340,31 @@ outside this graph. Whole-model capture does not mean whole-request capture.
 
 The native loader accepts `cuda_fastwam`; existing `fastwam` and `fastwam-cuda`
 selection spellings remain compatible. The Python policy name stays `fastwam`.
+
+### Baseline-first operator inventory
+
+The model uses existing GEMM/GEMM-bias, RMSNorm, GELU/SiLU, EulerUpdate,
+embedding gather, concatenation and BF16/F32 casts. Their baseline numerical,
+resource and transfer contracts are retained. Added dtype support does not
+change the existing F16/BF16 path.
+
+Remaining capability gaps have concrete call sites in `model/blocks/bf16.rs`:
+
+| Capability | Consumer |
+| --- | --- |
+| RGB layout indices | input canonicalization |
+| im2col | VAE convolutions and video patch projection |
+| space-to-depth | VAE patchification |
+| grouped average | VAE downsampling shortcut |
+| channel L2 normalization | VAE norm |
+| channel standardization | VAE latent output |
+| additive attention | UMT5 relative-position and padding bias |
+| F32 dense attention / LayerNorm | existing F32 DiT state representation |
+| adjacent-pair RoPE | DiT rotary layout |
+| elementwise multiply and row/column broadcast multiply | residuals, gates and masks |
+
+F32 attention alternatives remain in their new dtype domain; existing dense
+F16/BF16 default selection is not displaced. Memory-pool work is deferred to
+its separate owner. Any accuracy failure is reported before deciding whether
+an optional arithmetic variant is justified; reference-stage equality alone is
+not a reason to change an existing operator.

@@ -20,9 +20,6 @@ mod torch_fixture;
 #[path = "torch_split_geglu_fixtures.rs"]
 mod split_fixture;
 
-#[path = "gemm_bias_rounding_fixtures.rs"]
-mod bias_rounding_fixture;
-
 fn u32_buffer(device: usize, values: &[u32]) -> crate::CudaBuffer {
     let bytes: Vec<_> = values
         .iter()
@@ -286,8 +283,12 @@ fn attention_f16_action_cache_uses_fa2() {
     let normalized = super::normalize_kv_cache_attention(&ctx, args).unwrap();
     let execution = super::attention_execution::prepare(&ctx, normalized).unwrap();
     assert!(
-        execution.summary().starts_with("flash-attention-2-split-kv ")
-            || execution.summary().starts_with("flash-attention-2-kv-cache "),
+        execution
+            .summary()
+            .starts_with("flash-attention-2-split-kv ")
+            || execution
+                .summary()
+                .starts_with("flash-attention-2-kv-cache "),
         "unexpected F16 action KV-cache provider: {}",
         execution.summary()
     );
@@ -567,57 +568,6 @@ fn gemm_bias_all_candidates_match_torch() {
         f::W8A8_GEMM_BIAS,
     )
     .unwrap();
-}
-
-#[test]
-fn gemm_bias_preserves_accumulator_through_bias_all_candidates() {
-    use bias_rounding_fixture as f;
-
-    for (dtype, input, weight, bias_values, expected, double_rounded) in [
-        (
-            DType::BF16,
-            f::BF16_A,
-            f::BF16_B,
-            f::BF16_BIAS,
-            f::BF16_EXPECTED,
-            f::BF16_DOUBLE_ROUNDED,
-        ),
-        (
-            DType::F16,
-            f::F16_A,
-            f::F16_B,
-            f::F16_BIAS,
-            f::F16_EXPECTED,
-            f::F16_DOUBLE_ROUNDED,
-        ),
-    ] {
-        // Cancellation isolates the lost low bits: a premature dtype round
-        // produces zero everywhere, so relative-L2 candidate checks reject it.
-        assert!(expected.iter().all(|&value| value != 0.0));
-        assert!(double_rounded.iter().all(|&value| value == 0.0));
-        for output_dtype in [dtype, DType::F32] {
-            let ctx = CudaContext::new(0).unwrap();
-            let make_tensor = if dtype == DType::BF16 {
-                tensor
-            } else {
-                f16_tensor
-            };
-            let a = make_tensor(0, vec![f::M, f::K], input);
-            let b = make_tensor(0, vec![f::K, f::N], weight);
-            let bias = make_tensor(0, vec![f::N], bias_values);
-            let mut out = zeros_tensor(0, vec![f::M, f::N], output_dtype);
-            let mut args = GemmArgs::new(&a, &b, &mut out);
-            configure_torch_case(&mut args, 1.0, 1.0);
-            validate_all_candidates(
-                &ctx,
-                args,
-                super::contracts::Semantic::GemmBias,
-                Some(&bias),
-                expected,
-            )
-            .unwrap();
-        }
-    }
 }
 
 #[test]

@@ -13,16 +13,10 @@ pub enum PointwiseSemantic {
     EulerUpdate,
     /// Elementwise product of two equally sized tensors.
     Multiply,
-    /// Elementwise addition of equally sized tensors.
-    Add,
     /// Multiply each row by a secondary vector `[rows]`.
     RowMultiply,
     /// Multiply each row by a secondary vector `[cols]`.
     BroadcastMultiply,
-    /// Add a secondary vector `[cols]` to every row.
-    BroadcastAdd,
-    /// Round `dt` and `dt * velocity` to the input dtype before adding state.
-    EulerUpdateRounded,
 }
 
 impl PointwiseSemantic {
@@ -32,24 +26,15 @@ impl PointwiseSemantic {
             Self::BiasActivation => 1,
             Self::EulerUpdate => 2,
             Self::Multiply => 3,
-            Self::Add => 7,
             Self::RowMultiply => 8,
             Self::BroadcastMultiply => 4,
-            Self::BroadcastAdd => 5,
-            Self::EulerUpdateRounded => 6,
         }
     }
 
     fn reads_secondary(self) -> bool {
         matches!(
             self,
-            Self::EulerUpdate
-                | Self::Add
-                | Self::RowMultiply
-                | Self::Multiply
-                | Self::BroadcastMultiply
-                | Self::BroadcastAdd
-                | Self::EulerUpdateRounded
+            Self::EulerUpdate | Self::RowMultiply | Self::Multiply | Self::BroadcastMultiply
         )
     }
 
@@ -64,8 +49,6 @@ pub enum PointwiseActivation {
     Gelu,
     Silu,
     GeluExact,
-    /// Tanh GELU with input-dtype rounding after each scalar/tensor operation.
-    GeluRounded,
 }
 
 impl PointwiseActivation {
@@ -75,7 +58,6 @@ impl PointwiseActivation {
             Self::Gelu => 1,
             Self::Silu => 2,
             Self::GeluExact => 3,
-            Self::GeluRounded => 4,
         }
     }
 }
@@ -271,10 +253,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
 
     let (secondary, secondary_alignment) = match args.secondary {
         Some(tensor) => {
-            let secondary_count = if matches!(
-                semantic,
-                PointwiseSemantic::BroadcastMultiply | PointwiseSemantic::BroadcastAdd
-            ) {
+            let secondary_count = if matches!(semantic, PointwiseSemantic::BroadcastMultiply) {
                 cols
             } else if semantic == PointwiseSemantic::RowMultiply {
                 rows
@@ -333,11 +312,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     if matches!(
         semantic,
         PointwiseSemantic::Multiply
-            | PointwiseSemantic::Add
             | PointwiseSemantic::BroadcastMultiply
-            | PointwiseSemantic::BroadcastAdd
             | PointwiseSemantic::RowMultiply
-            | PointwiseSemantic::EulerUpdateRounded
     ) {
         if args.input.shape().dims() != dims {
             return Err(invalid("Pointwise binary input must have the output shape"));
@@ -352,9 +328,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         }
         let broadcast = matches!(
             semantic,
-            PointwiseSemantic::BroadcastMultiply
-                | PointwiseSemantic::BroadcastAdd
-                | PointwiseSemantic::RowMultiply
+            PointwiseSemantic::BroadcastMultiply | PointwiseSemantic::RowMultiply
         );
         let secondary_elements = if semantic == PointwiseSemantic::RowMultiply {
             rows

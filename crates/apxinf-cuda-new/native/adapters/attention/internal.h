@@ -100,7 +100,6 @@ cudaError_t launch_short_f32_custom(Execution& execution);
 void destroy_custom(Execution& execution) noexcept;
 size_t cublas_resource_requirements(const Spec& spec, int configuration);
 void prepare_cublas(Execution& execution);
-cudaError_t launch_cublas(Execution& execution);
 cudaError_t launch_f32_cublas(Execution& execution);
 void destroy_cublas(Execution& execution) noexcept;
 

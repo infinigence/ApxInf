@@ -18,4 +18,4 @@ pub(crate) use kv_cache_attention::normalize as normalize_kv_cache_attention;
 #[cfg(test)]
 pub(crate) use segmented_attention::normalize as normalize_segmented_attention;
 
-pub use additive_attention::{additive_attention, AttentionBiasArgs, AttentionPrecision};
+pub use additive_attention::{additive_attention, AttentionBiasArgs};

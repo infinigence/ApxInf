@@ -5,7 +5,7 @@ use apxinf_core::{Device, Error, Result, Storage, Tensor};
 use crate::ffi;
 use crate::CudaBuffer;
 
-/// Transfer a CPU tensor to a CUDA device, completing the upload before return.
+/// Transfer a CPU tensor to a CUDA device.
 pub fn to_cuda(tensor: &Tensor, device_id: usize) -> Result<Tensor> {
     if tensor.device() != Device::Cpu {
         return Err(Error::Other("tensor is already on GPU".into()));
@@ -20,8 +20,6 @@ pub fn to_cuda(tensor: &Tensor, device_id: usize) -> Result<Tensor> {
 }
 
 /// Copy a CPU tensor into shape-identical, stable-address CUDA storage.
-/// The upload finishes before return, including for pageable host memory.
-/// Callers must finish earlier device readers before overwriting the destination.
 pub fn copy_cpu_to_cuda(source: &Tensor, destination: &Tensor) -> Result<()> {
     if source.device() != Device::Cpu {
         return Err(Error::Other("copy source must be a CPU tensor".into()));
@@ -108,12 +106,7 @@ pub(crate) fn copy_host_to_device(
             source.as_ptr().cast(),
             source.len(),
             ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
-        ))?;
-        // cudaMemcpy uses the default stream and may return after staging
-        // pageable memory, before its device DMA finishes. A nonblocking
-        // consumer stream has no implicit dependency on that upload. Wait for
-        // this copy stream, not for unrelated work on the whole device.
-        ffi::check_cuda(ffi::cudaStreamSynchronize(std::ptr::null_mut()))
+        ))
     }
 }
 

@@ -43,12 +43,27 @@ def check(root):
         if re.search(execution_types, text):
             errors.append(f"{path.relative_to(root)}: computation depends on execution ownership")
     model = production_source(root / "model/mod.rs")
-    if re.search(r"\b(Expert|TextEncoder|Vae|DType|Shape|weights)\b|\ballocate_output\s*\(|\bops::[a-z]\w*\s*\(", model):
+    if re.search(r"\b(Expert|TextEncoder|Vae|DType|Shape)\b|\ballocate_output\s*\(|\bops::[a-z]\w*\s*\(", model):
         errors.append("model/mod.rs: precision and subnetwork details belong in Bf16Blocks")
+    weight_types = set()
+    for path in (root / "weights").rglob("*.rs"):
+        weight_types.update(re.findall(r"\bstruct\s+(\w+Weights)\b", source(path)))
+    for path in (root / "model").rglob("*.rs"):
+        text = production_source(path)
+        if re.search(r"\bimpl\s+(?:" + "|".join(sorted(weight_types)) + r")\b", text):
+            errors.append(f"{path.relative_to(root)}: computation adds inherent methods to weight data")
+        if re.search(r"\bStore\b|\b(?:Bf16Weights|\w+Weights)::load\s*\(", text):
+            errors.append(f"{path.relative_to(root)}: checkpoint loading belongs in weights and load")
+        if re.search(r"weights::(?:cast|cast_weight)\b", text):
+            errors.append(f"{path.relative_to(root)}: activation conversion belongs in Blocks")
     for path in sorted((root / "weights").rglob("*.rs")):
         text = source(path)
         if re.search(execution_types, text) or re.search(r"\b(model|blocks)\s*::", text):
             errors.append(f"{path.relative_to(root)}: weights depend on computation or runner")
+        if path.name != "host.rs" and re.search(r"\bimpl\s+Store\b", text):
+            errors.append(f"{path.relative_to(root)}: device preparation must consume the host store explicitly")
+        if re.search(r"\bfn\s+(?:forward|forward_conv|context|cast)\s*\(", text):
+            errors.append(f"{path.relative_to(root)}: activation computation belongs in Blocks")
         # Inherent methods implemented elsewhere evade import-only checks.
         if re.search(r"\.\s*(forward|forward_conv|context)\s*\(", text):
             errors.append(f"{path.relative_to(root)}: weights invoke model computation")

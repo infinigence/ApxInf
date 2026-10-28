@@ -1,28 +1,29 @@
 //! Immutable checkpoint mapping and prepared weight data.
-use super::{host_tensor, validate_tensor, Bias, Linear, Store};
+use super::{host_tensor, validate_tensor, Bias, LinearWeights, Store};
+use super::{load_linear, upload_tensor};
 use crate::cuda_fastwam::backend::{self, Context};
 use apxinf_core::{DType, Error, Result, Tensor};
 use std::path::Path;
-pub(in crate::cuda_fastwam) struct Block {
+pub(in crate::cuda_fastwam) struct BlockWeights {
     pub(in crate::cuda_fastwam) norm0: Tensor,
-    pub(in crate::cuda_fastwam) q: Linear,
-    pub(in crate::cuda_fastwam) k: Linear,
-    pub(in crate::cuda_fastwam) v: Linear,
-    pub(in crate::cuda_fastwam) o: Linear,
+    pub(in crate::cuda_fastwam) q: LinearWeights,
+    pub(in crate::cuda_fastwam) k: LinearWeights,
+    pub(in crate::cuda_fastwam) v: LinearWeights,
+    pub(in crate::cuda_fastwam) o: LinearWeights,
     pub(in crate::cuda_fastwam) bias: Tensor,
     pub(in crate::cuda_fastwam) norm1: Tensor,
-    pub(in crate::cuda_fastwam) wi0: Linear,
-    pub(in crate::cuda_fastwam) wi1: Linear,
-    pub(in crate::cuda_fastwam) wo: Linear,
+    pub(in crate::cuda_fastwam) wi0: LinearWeights,
+    pub(in crate::cuda_fastwam) wi1: LinearWeights,
+    pub(in crate::cuda_fastwam) wo: LinearWeights,
 }
 
-pub(in crate::cuda_fastwam) struct TextEncoder {
+pub(in crate::cuda_fastwam) struct TextEncoderWeights {
     pub(in crate::cuda_fastwam) embedding: Tensor,
-    pub(in crate::cuda_fastwam) blocks: Vec<Block>,
+    pub(in crate::cuda_fastwam) blocks: Vec<BlockWeights>,
     pub(in crate::cuda_fastwam) norm: Tensor,
 }
 
-impl TextEncoder {
+impl TextEncoderWeights {
     pub(in crate::cuda_fastwam) fn load(ctx: &Context, path: &Path) -> Result<Self> {
         let v: serde_json::Value = serde_json::from_slice(
             &std::fs::read(path.join("config.json")).map_err(|e| Error::Other(e.to_string()))?,
@@ -51,7 +52,7 @@ impl TextEncoder {
             ));
         }
         let mut store = Store::load(path)?;
-        let embedding = store.upload(ctx, "shared.weight")?;
+        let embedding = upload_tensor(&mut store, ctx, "shared.weight")?;
         validate_tensor("UMT5 embedding", &embedding, &[256384, 4096], DType::BF16)?;
         let mut blocks = Vec::new();
         for i in 0..24 {
@@ -79,23 +80,23 @@ impl TextEncoder {
                     }
                 }
             }
-            blocks.push(Block {
-                norm0: store.upload(ctx, &format!("{p}.layer.0.layer_norm.weight"))?,
-                q: store.linear(ctx, &format!("{a}.q"), Bias::Forbidden)?,
-                k: store.linear(ctx, &format!("{a}.k"), Bias::Forbidden)?,
-                v: store.linear(ctx, &format!("{a}.v"), Bias::Forbidden)?,
-                o: store.linear(ctx, &format!("{a}.o"), Bias::Forbidden)?,
+            blocks.push(BlockWeights {
+                norm0: upload_tensor(&mut store, ctx, &format!("{p}.layer.0.layer_norm.weight"))?,
+                q: load_linear(&mut store, ctx, &format!("{a}.q"), Bias::Forbidden)?,
+                k: load_linear(&mut store, ctx, &format!("{a}.k"), Bias::Forbidden)?,
+                v: load_linear(&mut store, ctx, &format!("{a}.v"), Bias::Forbidden)?,
+                o: load_linear(&mut store, ctx, &format!("{a}.o"), Bias::Forbidden)?,
                 bias: backend::upload(
                     ctx,
                     &host_tensor(vec![64 * 128, 128], &expanded, DType::F32)?,
                 )?,
-                norm1: store.upload(ctx, &format!("{p}.layer.1.layer_norm.weight"))?,
-                wi0: store.linear(ctx, &format!("{f}.wi_0"), Bias::Forbidden)?,
-                wi1: store.linear(ctx, &format!("{f}.wi_1"), Bias::Forbidden)?,
-                wo: store.linear(ctx, &format!("{f}.wo"), Bias::Forbidden)?,
+                norm1: upload_tensor(&mut store, ctx, &format!("{p}.layer.1.layer_norm.weight"))?,
+                wi0: load_linear(&mut store, ctx, &format!("{f}.wi_0"), Bias::Forbidden)?,
+                wi1: load_linear(&mut store, ctx, &format!("{f}.wi_1"), Bias::Forbidden)?,
+                wo: load_linear(&mut store, ctx, &format!("{f}.wo"), Bias::Forbidden)?,
             });
         }
-        let norm = store.upload(ctx, "encoder.final_layer_norm.weight")?;
+        let norm = upload_tensor(&mut store, ctx, "encoder.final_layer_norm.weight")?;
         validate_tensor("UMT5 final norm", &norm, &[4096], DType::BF16)?;
         for b in &blocks {
             for projection in [&b.q, &b.k, &b.v, &b.o] {

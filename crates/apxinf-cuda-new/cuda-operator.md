@@ -16,13 +16,6 @@ This document describes only public contracts and does not promise a specific pr
 
 `ops::quantization(ctx, QuantizationArgs)` also owns shape-preserving representation conversions used between L3 operators. `CastF16ToBf16` converts F16 to BF16 and `CastBf16ToF32` converts BF16 to F32; both require identical nonempty input/output shapes and distinct device buffers. The latter is the standard boundary for a BF16 backbone feeding an FP32 readout GEMM.
 
-`CastBf16ToF32` uses vectorized groups of four when the element count is
-divisible by four, input alignment is at least eight bytes and output alignment
-is at least sixteen bytes. Other lengths and views retain scalar conversion.
-The conversion intrinsics are unchanged; tests cover all BF16 bit patterns
-(exact finite values, signed zero and infinities; NaN classification), tails
-and unaligned views.
-
 ## Shared GEMM Contract
 
 GEMM uses `A=[M,K]` and `B=[K,N]`. `alpha` applies to the projection, and the final result is divided by a finite positive `output_scale`. `projection(A,B)` interprets inputs according to the following quantization contract:
@@ -60,8 +53,8 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Inputs | `A=[M,K]`, `B=[K,N]`, `bias=[N]`; supports all four GEMM quantization contracts |
 | Output | `Y=[M,N]` |
 | Mathematical semantic | `Y = (alpha * projection(A,B) + bias) / output_scale`, with bias broadcast across M |
-| Constraints | For `None`, bias dtype matches A/B; F16/BF16 operands retain the F32 accumulator through bias addition and convert only the final result. Quantized bias dtype follows the projection contract; W8A8 output must be BF16 |
-| Reference tests | `gemm_bias_all_candidates_match_torch`, `gemm_bias_preserves_accumulator_through_bias_all_candidates` (F16/BF16 cancellation fixtures, all eligible candidates, eager and graph) |
+| Constraints | bias dtype matches the projection dtype; W8A8 output must be BF16 |
+| Reference test | `gemm_bias_all_candidates_match_torch` |
 
 <!-- l3-operator:gemm_bias_residual -->
 ### `gemm_bias_residual`
@@ -134,14 +127,14 @@ providers.
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::additive_attention(ctx, AttentionBiasArgs { attention, bias, precision })` |
+| Rust API | `ops::additive_attention(ctx, AttentionBiasArgs { attention, bias })` |
 | Inputs | Dense Q/K/V as above, F16/BF16/F32; F32 `bias=[1 or B,Hq,Tq,Tk]`, broadcast across batch when its leading dimension is one |
 | Output | Same shape and dtype as Q; no E4M3 output |
 | Mathematical semantic | `softmax(mask(scale * QK^T + bias)) @ V`; negative infinity masks a key, and an entirely masked row produces zero |
-| Arithmetic | `AttentionPrecision::F32` accumulates scores, bias, probabilities and PV in F32. `Input` rounds scaled QK to input dtype, adds bias and rounds again, then rounds F32 softmax probabilities to input dtype before FP32-accumulated PV. The final output is rounded to input dtype in both modes. |
+| Arithmetic | Scores, additive bias, probabilities and PV use F32 arithmetic; the final output is converted to the input dtype. |
 | Constraints | Same masks and positive scale as dense attention; bias must not alias output. NaN and positive-infinity bias are outside the contract. |
-| Graph/tuning identity | Bias address belongs to the execution key; its values can change between replays. Broadcast and arithmetic precision belong to the exact recipe key. |
-| Reference tests | `additive_attention_all_candidates_match_torch`, `additive_attention_all_candidates_match_reference`, `additive_attention_bf16_mha_batched_candidates_match_reference`; `additive_attention_validates_bias_and_replays_changed_bias` |
+| Graph/tuning identity | Bias address belongs to the execution key; its values can change between replays. Broadcast belongs to the exact recipe key. |
+| Reference tests | `additive_attention_all_candidates_match_reference`; `additive_attention_validates_bias_and_replays_changed_bias` |
 
 <!-- l3-operator:kv_cache_attention -->
 ### `kv_cache_attention`
@@ -212,31 +205,26 @@ These fixed, single-implementation primitives perform no tuning, allocation or
 synchronization in enqueue. Callers supply non-aliasing device outputs; a CUDA
 Graph retains every binding. No recipe selection is involved.
 
-## Rounded arithmetic and adjacent-pair rotations
+## Elementwise arithmetic and adjacent-pair rotations
 
 These fixed primitives enqueue directly on the context stream, allocate no
 resources during enqueue, and are captured by the owning `PreparedPhase`.
 They have one native baseline, no autotuning or persisted recipe. Inputs and
 outputs are contiguous; arithmetic is deterministic for a fixed GPU build.
-Capture retains every input, output, weight, and coefficient binding needed
-by replay.
+Pointwise and ordinary norm retain their baseline storage-lifetime contract:
+callers keep operand storage alive through replay. Adjacent-pair RoPE retains
+its bindings.
 
 <!-- l3-operator:pointwise-multiply -->
-<!-- l3-operator:pointwise-add -->
 <!-- l3-operator:pointwise-broadcast-multiply -->
-<!-- l3-operator:pointwise-broadcast-add -->
 <!-- l3-operator:pointwise-row-multiply -->
-<!-- l3-operator:pointwise-euler-rounded -->
-<!-- l3-operator:pointwise-gelu-rounded -->
 `pointwise(ctx, PointwiseArgs)` extends the existing pointwise family with
-`Multiply`/`Add` (secondary `[rows, cols]`), `BroadcastMultiply`/`BroadcastAdd`
+`Multiply` (secondary `[rows, cols]`), `BroadcastMultiply`
 (secondary `[cols]`), and `RowMultiply` (secondary `[rows]`). Inputs and output
-share F32, F16, or BF16 dtype. `EulerUpdateRounded` first rounds the scalar step
-to the input dtype, rounds velocity times step, then adds state and rounds
-again. Existing `EulerUpdate` retains its single final rounding contract.
-`PointwiseActivation::GeluRounded` evaluates tanh GELU with dtype rounding after
-each arithmetic operation, including both multiplies in `x³`, scalar products, additions and tanh;
-this differs from `Gelu`, which evaluates the expression in FP32.
+share F32, F16, or BF16 dtype. Existing GELU and EulerUpdate arithmetic
+retain their baseline implementations. Broadcast addition uses the existing
+BiasActivation semantic with a bias and no activation; elementwise addition
+uses EulerUpdate with dt=1.
 
 ### Ordinary LayerNorm dtype extension
 
@@ -255,13 +243,6 @@ has no tuning recipe or workspace and retains operand owners during capture.
 `layer_norm_f32_real_shapes_match_independent_f64_eager_and_graph` covers
 1024/3072 columns, learned affine parameters, true F32 inputs, changed-input
 replay and dropped owners against an independent F64 Welford reference.
-
-<!-- l3-operator:rms-norm-rounded -->
-`rms_norm_rounded(ctx, RmsNormArgs)` uses FP32 square/reduction/inverse RMS,
-rounds the normalized activation to the input dtype, then multiplies the
-per-column weight and rounds again. F16/BF16 input and output share dtype;
-quantized output is rejected. The existing `rms_norm` remains a single final
-rounding operation.
 
 <!-- l3-operator:pairwise-rope -->
 `PairwiseRopeTable::new(ctx, tokens, head_dim, coefficients)` uploads immutable

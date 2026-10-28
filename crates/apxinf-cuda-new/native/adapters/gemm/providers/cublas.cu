@@ -1,5 +1,4 @@
 #include "vendor.h"
-#include "../../cublas_resources.h"
 #include "../../../kernels/custom/gemm.cuh"
 
 namespace apxinf::gemm {
@@ -7,17 +6,22 @@ namespace {
 
 struct CublasState {
   vendor::CommonResources common;
-  std::shared_ptr<providers::CublasStreamResources> shared;
+  cublasHandle_t handle = nullptr;
+  void* workspace = nullptr;
+  size_t workspace_bytes = 0;
   void* dequant_a = nullptr;
   void* dequant_b = nullptr;
 
   ~CublasState() {
     release_resources();
+    if (handle != nullptr) cublasDestroy(handle);
   }
 
   void release_resources() noexcept {
+    if (workspace != nullptr) cudaFree(workspace);
     if (dequant_a != nullptr) cudaFree(dequant_a);
     if (dequant_b != nullptr) cudaFree(dequant_b);
+    workspace = nullptr;
     dequant_a = nullptr;
     dequant_b = nullptr;
     common.release();
@@ -52,27 +56,18 @@ size_t dequantization_resource_requirements(const Spec& spec) {
          dtype_bytes(APXINF_DTYPE_BF16);
 }
 
-uint32_t cublas_projection_dtype(const Spec& spec) {
-  // W8A8's safe dequantization fallback retains its existing BF16 projection;
-  // converting its internal compute Spec to None must not widen its epilogue.
-  return needs_safe_dequantization(spec) ? APXINF_DTYPE_BF16
-                                        : vendor::common_projection_dtype(spec);
-}
-
 }  // namespace
 
 size_t cublas_resource_requirements(const Spec& spec) {
   return dequantization_resource_requirements(spec) +
-         vendor::common_resource_requirements(
-             cublas_compute_spec(spec), false, cublas_projection_dtype(spec)) +
-         providers::CublasStreamResources::workspace_bytes;
+         vendor::common_resource_requirements(cublas_compute_spec(spec), false) +
+         4 * 1024 * 1024;
 }
 
 void prepare_cublas(Execution& state) {
   auto resources = std::make_unique<CublasState>();
   const Spec compute_spec = cublas_compute_spec(state.spec);
-  vendor::allocate_common_resources(
-      compute_spec, resources->common, false, cublas_projection_dtype(state.spec));
+  vendor::allocate_common_resources(compute_spec, resources->common, false);
   if (needs_safe_dequantization(state.spec)) {
     const size_t a_bytes = static_cast<size_t>(state.spec.m * state.spec.k) *
                            dtype_bytes(APXINF_DTYPE_BF16);
@@ -81,10 +76,12 @@ void prepare_cublas(Execution& state) {
     check_cuda(cudaMalloc(&resources->dequant_a, a_bytes));
     check_cuda(cudaMalloc(&resources->dequant_b, b_bytes));
   }
-  resources->shared = providers::acquire_cublas_stream_resources(
-      state.device, static_cast<cudaStream_t>(state.bindings.stream));
+  check_cublas(cublasCreate(&resources->handle));
+  check_cublas(cublasSetMathMode(resources->handle, CUBLAS_PEDANTIC_MATH));
+  resources->workspace_bytes = 4 * 1024 * 1024;
+  check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
   state.resource_bytes =
-      resources->common.resource_bytes + resources->shared->workspace_bytes +
+      resources->common.resource_bytes + resources->workspace_bytes +
       dequantization_resource_requirements(state.spec);
   state.provider_state = resources.release();
 }
@@ -146,23 +143,16 @@ cudaError_t launch_cublas(Execution& state) {
                 : resources.common.projection_dtype == APXINF_DTYPE_F16
                       ? CUDA_R_16F
                       : CUDA_R_16BF;
-  const cudaDataType_t input_type =
-      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I
-      : compute_spec.quantization != APXINF_GEMM_QUANT_NONE ? data_type
-      : compute_spec.a_dtype == APXINF_DTYPE_F16 ? CUDA_R_16F
-      : compute_spec.a_dtype == APXINF_DTYPE_BF16 ? CUDA_R_16BF
-                                                : CUDA_R_32F;
-  // A cuBLAS call can enqueue multiple kernels using the shared workspace.
-  // Serialize the complete host call; stream ordering then serializes its GPU
-  // work with every other execution using these resources.
-  std::lock_guard<std::mutex> lock(resources.shared->enqueue_mutex);
+  check_cublas(cublasSetStream(resources.handle, stream));
+  check_cublas(cublasSetWorkspace(resources.handle, resources.workspace,
+                                  resources.workspace_bytes));
   check_cublas(cublasGemmEx(
-      resources.shared->handle, CUBLAS_OP_N, CUBLAS_OP_N, compute_spec.n,
+      resources.handle, CUBLAS_OP_N, CUBLAS_OP_N, compute_spec.n,
       compute_spec.m, compute_spec.k,
       alpha_pointer, weight,
-      input_type,
+      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : data_type,
       compute_spec.n, activation,
-      input_type,
+      compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : data_type,
       compute_spec.k, beta_pointer, projection, data_type, compute_spec.n,
       compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUBLAS_COMPUTE_32I
                                               : CUBLAS_COMPUTE_32F,
@@ -172,44 +162,3 @@ cudaError_t launch_cublas(Execution& state) {
 }
 
 }  // namespace apxinf::gemm
-
-// Internal resource regression entry point, following the framework contract
-// test helpers. It is not a model-visible operator or provider-selection API.
-extern "C" int apxinf_gemm_test_cublas_stream_resources(
-    int device, void* first_stream, void* second_stream, char* error,
-    size_t capacity) {
-  try {
-    using apxinf::providers::acquire_cublas_stream_resources;
-    if (first_stream == second_stream) throw std::runtime_error("test needs distinct streams");
-    std::weak_ptr<apxinf::providers::CublasStreamResources> first_lifetime;
-    std::weak_ptr<apxinf::providers::CublasStreamResources> second_lifetime;
-    {
-      auto first = acquire_cublas_stream_resources(device, static_cast<cudaStream_t>(first_stream));
-      auto second = acquire_cublas_stream_resources(device, static_cast<cudaStream_t>(second_stream));
-      first_lifetime = first;
-      second_lifetime = second;
-      if (first->handle == second->handle || first->workspace == second->workspace)
-        throw std::runtime_error("different streams share cuBLAS state");
-      std::vector<std::shared_ptr<apxinf::providers::CublasStreamResources>> retained;
-      for (int i = 0; i < 64; ++i) {
-        auto again = acquire_cublas_stream_resources(device, static_cast<cudaStream_t>(first_stream));
-        if (again.get() != first.get())
-          throw std::runtime_error("one stream allocated another cuBLAS pool");
-        retained.push_back(std::move(again));
-      }
-      first.reset();
-      if (first_lifetime.expired()) throw std::runtime_error("live executions lost shared resources");
-      second.reset();
-      if (!second_lifetime.expired()) throw std::runtime_error("weak cache kept unused resources alive");
-    }
-    if (!first_lifetime.expired()) throw std::runtime_error("last execution failed to release resources");
-    return 1;
-  } catch (const std::exception& failure) {
-    if (error != nullptr && capacity != 0) {
-      const size_t bytes = std::min(capacity - 1, std::strlen(failure.what()));
-      std::memcpy(error, failure.what(), bytes);
-      error[bytes] = '\0';
-    }
-    return 0;
-  }
-}

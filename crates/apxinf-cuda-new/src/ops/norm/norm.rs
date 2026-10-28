@@ -21,11 +21,6 @@ impl<'a> RmsNormArgs<'a> {
 }
 
 /// Inputs for ordinary layer normalization.
-///
-/// F16/BF16 inputs preserve dtype (or use the existing F16-to-E4M3 output
-/// form). F32 input, weight, bias and output are also supported together;
-/// F32 output must not overlap any read-only binding. Statistics and affine
-/// arithmetic use FP32. This F32 extension does not apply to other Norm ops.
 pub struct LayerNormArgs<'a> {
     pub input: &'a Tensor,
     pub weight: &'a Tensor,
@@ -196,26 +191,4 @@ pub fn ada_gate_residual_rms_norm(ctx: &CudaContext, args: AdaGateResidualRmsNor
 
 pub fn bias_then_residual(ctx: &CudaContext, args: BiasThenResidualArgs<'_>) -> Result<()> {
     execute(ctx, RawArgs { semantic: Semantic::BiasThenResidual, input: args.input, bias: args.bias, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
-}
-
-/// RMS normalization with a materialized input-dtype rounding before weight
-/// multiplication: `round(round(x * rsqrt(mean(x²) + eps)) * weight)`.
-pub fn rms_norm_rounded(ctx: &CudaContext, args: RmsNormArgs<'_>) -> Result<()> {
-    execute(
-        ctx,
-        RawArgs {
-            semantic: Semantic::RmsRounded,
-            input: args.input,
-            bias: None,
-            residual: None,
-            weight: Some(args.weight),
-            norm_bias: None,
-            norm_style: None,
-            gate_style: None,
-            hidden: None,
-            normalized: Some(args.normalized),
-            eps: args.eps,
-            output_scale: args.output_scale,
-        },
-    )
 }
