@@ -430,7 +430,7 @@ impl DSpark {
             .ok_or(Error::Contract("DSpark context overflow"))?;
         if prompt == 0 || output == 0 || output > 256 || total > CONTEXT_CAPACITY {
             return Err(Error::Contract(
-                "DSpark supports B1, 1..256 output tokens and at most 4096 positions",
+                "DSpark supports B1, 1..256 output tokens and at most 9216 positions",
             ));
         }
         if self.target.offset != 0 || self.draft_offset != 0 {
