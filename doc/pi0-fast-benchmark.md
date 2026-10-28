@@ -20,20 +20,46 @@ accepting its upstream access terms. Benchmarking never downloads resources.
 ## Controlled token-length benchmark (no frame file)
 
 Use a real checkpoint with constructed images/state to measure exact decode
-lengths. This requires a native binding built with `max_new_tokens` support:
+lengths. This requires a native binding built with `max_new_tokens` support.
+
+First prepare a device/precision-specific tactic database with the same input
+shapes. Run from the repository root. Keep `--seed 0` and the decode lengths
+unchanged between preparation and measurement:
 
 ```sh
+# Prepare tactics once; do not use this run as the reported performance result.
 python scripts/bench_pi0_fast.py \
   --model-dir /models/pi0fast-libero-v044 --model-variant bf16 \
-  --state-key observation/state --layer l1 --mode fixed \
+  --state-key observation/state --layer l1 --mode fixed --seed 0 \
   --warmup 10 --samples 30 \
+  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-tactics.json --autotune \
+  --out devlocal/model-bench-inputs/pi0fast/prepare-bf16.json
+
+# Measure in a new process with online tuning disabled, reusing that database.
+python scripts/bench_pi0_fast.py \
+  --model-dir /models/pi0fast-libero-v044 --model-variant bf16 \
+  --state-key observation/state --layer l1 --mode fixed --seed 0 \
+  --warmup 30 --samples 30 \
+  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-tactics.json \
   --out devlocal/model-bench-inputs/pi0fast/fixed-bf16.json
 ```
 
-No LIBERO installation, dataset, simulator, or `.npz` input is required for this
-command. The checkpoint and its tokenizer/normalization assets are still needed.
-For FP8, select `fp8_static` and supply matching calibration. Reuse the same
-explicit `--tactics` database when comparing implementations.
+No LIBERO installation, dataset, simulator, or `.npz` input is required for these
+commands. The checkpoint and its tokenizer/normalization assets are still needed.
+For FP8, use `--model-variant fp8_static --calibration /path/to/matching-calibration.json`
+in both commands, with separate FP8 tactic and output paths. Use separate tactic
+paths for each board, precision and compatible CUDA/cuBLAS version. Reuse a
+compatible prepared database directly when one is available.
+
+Omitting `--tactics` selects the runtime's default database or fallback algorithms;
+it does not reproduce this preparation step and can be substantially slower.
+Keep the database hash from the JSON report together with the timings. The seed
+is already 0 by default; spelling it out preserves the input contract in copied
+commands. A fixed seed stabilizes the input, but does not by itself stabilize
+machine load, clocks or kernel selection.
+The measurement command uses 30 warmups per length (the CLI default is 10).
+Inspect the saved raw samples for changes over time as well as the fit: a high
+R² alone does not establish stable performance.
 
 The default lengths are **12, 16, 20, 28, 32, 40** generated tokens. They were
 selected from the retained 2026-10-22 natural-stop measurements at source

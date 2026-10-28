@@ -260,6 +260,12 @@ The head read drops from 1.05 GB to 8.6 MB per step in BF16, and from 526 MB to
 
 ## Reproducing
 
+For a benchmark without a frame file, follow the maintained
+[fixed-length preparation and measurement commands](../../../../doc/pi0-fast-benchmark.md#controlled-token-length-benchmark-no-frame-file).
+They fix the seed, prepare a device/precision-specific tactic database once, and
+measure in a new process with online tuning disabled. The recorded-frame command
+below retains the historical natural-stop measurement.
+
 ```sh
 # LIBERO-10 accuracy
 MUJOCO_GL=egl python scripts/eval_libero.py --backend in-process \
@@ -276,23 +282,21 @@ MUJOCO_GL=egl python scripts/eval_libero.py --backend in-process \
   --action-dim 7 --suite libero_10 --trials-per-task 1 \
   --results-jsonl out/libero_10_fp8.jsonl --summary-json out/libero_10_fp8.summary.json
 
-# latency, and the fixed / per-step split
+# Historical natural-stop latency and fixed / per-step split
 python scripts/bench_pi0_fast.py --model-dir <checkpoint> \
   --state-key observation/state --mode all \
-  --frames devlocal/pi0-fast/results/raw/libero_frames.npz \
+  --frames /path/to/libero_frames.npz --tactics /path/to/compatible-tactics.json \
   --out devlocal/pi0-fast/results/bench_pi0_fast.json
-
-# what the tactic database is worth on this board: same script, same frames,
-# once against the pre-tuning database and once against the shipped one
-PI0FAST_TACTICS=<db> python devlocal/pi0-fast/scripts/bench_default_db.py  # omit to use the shipped db
 ```
 
 Tactics are device-specific: the algorithm ids in
 `configs/tuning/<vendor>/<family>-sm<version>/tactics.json` are only valid for
 that compatibility domain and are not portable between Orin and, say, RTX 4090.
 A new board stays on the cuBLAS default until it runs its own autotune
-(`Model.load(..., tactics=<db>, autotune=True)`, or
-`devlocal/pi0-fast/scripts/autotune_decode_gemv.py --phase tune`).
+with the maintained benchmark
+(`--tactics /path/to/device-precision-tactics.json --autotune`). Omit
+`--autotune` and reuse the same path for measurement; omitting both flags can
+select a different database or untuned algorithms.
 
 The FP8-to-BF16 projections have their own records (`op=fp8_bf16`) in the same
 database and likewise ship only a Thor entry: on another board FP8 keeps the
