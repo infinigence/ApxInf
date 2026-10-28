@@ -125,7 +125,14 @@ reads `bindings.b` directly. Autotuning and candidate validation own isolated
 trial weights; they never rewrite model weights while evaluating candidates.
 
 Layout participates in recipe and execution keys. Every consumer of a repackable
-allocation must use the same state. Later IO addresses and shapes may create new
+allocation must use the same state. cuda-new registers the allocation owner and
+address range when adopting it: a second independent state is rejected, as is a
+canonical GEMM binding to that allocation (including tensor/buffer views). Clone
+the existing state instead. Registration lasts until the allocation dies, even
+if the public state handle is dropped; it does not retain device memory. This
+check protects GEMM preparation, not arbitrary raw readback/export or other
+tensor operations, which must still respect the prepared representation.
+Later IO addresses and shapes may create new
 Executions and select different kernels, but only implementations compatible with
 the prepared layout are eligible. Canonical choices are fixed too, protecting
 existing graph readers. The cuBLAS baseline can read prepared layouts for shape
@@ -137,6 +144,22 @@ Ordinary Tensor/`WeightVersion` arguments stay canonical: they do not authorize
 in-place packing and cannot select kernels requiring packed weights. Callers
 wanting these kernels must attach `RepackedWeight`. This change does not move
 computation scratch out of provider state or change activation workspace ownership.
+
+Kernel weight layout is an explicit property of each native `Implementation`
+registry entry. Implementation IDs are local to a semantic registry and must
+not be used to infer layout across registries; in particular CUTLASS ID 4 means
+different implementations for GEMM and GeGLU.
+
+The current first-prepare layout decision is a compatibility mechanism, not a
+global performance plan. PI0.5 FP8 gate/up weights can serve interleaved dual
+GeGLU at M=522/533 and canonical split GeGLU at M=778/789. A compatible baseline
+does not prove equivalent latency. Cross-profile users must measure both prepare
+orders and end-to-end latency; no claim of order-independent optimal selection
+is made. A future explicit weight preparation plan must gather consumer profiles
+before committing bytes, compare compatible recipes per layout, and choose a
+single layout or budgeted shared copies. All required layouts need a canonical
+source during preparation; existing executions/graphs must retain immutable
+physical allocations throughout their lifetime.
 
 ### Dependency direction within a family
 

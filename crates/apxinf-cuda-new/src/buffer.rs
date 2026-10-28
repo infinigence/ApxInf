@@ -62,6 +62,15 @@ unsafe impl Send for CudaBuffer {}
 unsafe impl Sync for CudaBuffer {}
 
 impl CudaBuffer {
+    /// Stable allocation owner, including buffers wrapped into tensor handles.
+    pub(crate) fn allocation_owner(&self) -> &Arc<dyn std::any::Any + Send + Sync> {
+        let mut owner = &self.owner;
+        while let Some(buffer) = owner.downcast_ref::<CudaBuffer>() {
+            owner = &buffer.owner;
+        }
+        owner
+    }
+
     /// Allocate `num_bytes` of device memory.
     pub fn alloc(num_bytes: usize, device: usize) -> Result<Self, String> {
         unsafe {

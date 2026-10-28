@@ -1364,6 +1364,61 @@ fn gpu_e2e_three_view_split_geglu_recipe_resources_and_replay() {
 }
 
 #[test]
+fn gpu_repacked_weight_rejects_independent_state_and_canonical_alias() {
+    let ctx = CudaContext::new(0).unwrap();
+    let b = zeros_tensor(0, vec![16, 16], DType::BF16);
+    let alias = b.clone();
+    let state = crate::ops::RepackedWeight::new(&b).unwrap();
+    assert!(crate::ops::RepackedWeight::new(&alias).is_err());
+    let shared = state.clone();
+    assert!(std::sync::Arc::ptr_eq(&state.state, &shared.state));
+    let view = CudaBuffer::from_tensor(&b)
+        .unwrap()
+        .view(32, 256)
+        .unwrap()
+        .as_tensor(Shape::new(vec![8, 16]), DType::BF16)
+        .unwrap();
+    assert!(crate::ops::RepackedWeight::new(&view).is_err());
+    let independent = zeros_tensor(0, vec![16, 16], DType::BF16);
+    assert!(crate::ops::RepackedWeight::new(&independent).is_ok());
+    // Even after the public state is dropped, aliases must not become canonical.
+    drop(state);
+    drop(shared);
+    for (k, binding) in [(16, &alias), (8, &view)] {
+        let a = zeros_tensor(0, vec![1, k], DType::BF16);
+        let mut out = zeros_tensor(0, vec![1, 16], DType::BF16);
+        let normalized = super::contracts::normalize(
+            &ctx,
+            GemmArgs::new(&a, binding, &mut out),
+            super::contracts::Semantic::Gemm,
+            None,
+        )
+        .unwrap();
+        let error = super::execution::prepare(&ctx, normalized)
+            .err()
+            .expect("canonical alias must fail");
+        assert!(error.to_string().contains("layout state"), "{error}");
+    }
+}
+
+#[test]
+fn gpu_repacked_registration_does_not_retain_allocation() {
+    let _ctx = CudaContext::new(0).unwrap();
+    let b = zeros_tensor(0, vec![16, 16], DType::BF16);
+    let buffer = CudaBuffer::from_tensor(&b).unwrap();
+    let owner = std::sync::Arc::downgrade(buffer.allocation_owner());
+    let state = crate::ops::RepackedWeight::new(&b).unwrap();
+    drop(buffer);
+    drop(b);
+    assert!(owner.upgrade().is_some());
+    drop(state);
+    assert!(owner.upgrade().is_none(), "registry must not retain GPU memory");
+    // A new allocation (including an address reused by CUDA) can be adopted.
+    let next = zeros_tensor(0, vec![16, 16], DType::BF16);
+    assert!(crate::ops::RepackedWeight::new(&next).is_ok());
+}
+
+#[test]
 fn gpu_canonical_weight_does_not_opt_into_inplace_packing() {
     let ctx = CudaContext::new(0).unwrap();
     if ctx.caps().sm != 87 {
@@ -1471,6 +1526,15 @@ fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
                     assert_eq!(packed[col * k + row], source[row * n + col]);
                 }
             }
+            let mut canonical_output = zeros_tensor(0, vec![m, n], DType::BF16);
+            let args = GemmArgs::w8a8(&a, &rows, &b, &channels, &mut canonical_output);
+            let normalized =
+                super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                    .unwrap();
+            let error = super::execution::prepare(&ctx, normalized)
+                .err()
+                .expect("packed bytes cannot be consumed as canonical");
+            assert!(error.to_string().contains("layout state"), "{error}");
             retained_graph = Some(crate::capture(&ctx, || execution.enqueue()).unwrap());
             retained_output = Some(output);
         }

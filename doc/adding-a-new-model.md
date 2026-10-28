@@ -160,6 +160,13 @@ IO addresses and shapes. Do not read committed bytes as a canonical tensor or
 create independent layout states for aliases of the same allocation. Reload
 weights after a failed layout commit, and retire old graph readers before
 replacing storage.
+cuda-new rejects independent states for the same allocation and ordinary
+canonical GEMM bindings to adopted storage, including views. Dropping the state
+does not make its surviving tensor aliases canonical again. This enforcement
+does not make raw tensor readback/export layout-aware.
+For weights shared across shapes or semantics, benchmark every consumer after
+layout selection and test both preparation orders; a layout-aware fallback
+establishes correctness but not performance parity.
 
 
 ### Model mathematics

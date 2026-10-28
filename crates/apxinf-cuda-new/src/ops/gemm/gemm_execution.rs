@@ -109,6 +109,13 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
         storage,
         repacked_weight,
     } = normalized;
+    if repacked_weight.is_none() {
+        let buffer = storage
+            .iter()
+            .find(|buffer| buffer.ptr().cast_const() == bindings.b)
+            .ok_or_else(|| invalid("GEMM B has no retained storage"))?;
+        super::weight::reject_canonical_alias(buffer)?;
+    }
     let mut weight_guard = repacked_weight
         .as_ref()
         .map(|weight| {
