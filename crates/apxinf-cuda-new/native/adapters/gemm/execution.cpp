@@ -315,7 +315,7 @@ std::unique_ptr<Execution> fallback(
       auto prepared_spec = spec;
       if (select_layout && prepared_spec.b_layout == 0) {
         prepared_spec.b_layout =
-            apxinf::gemm::weight_layout(implementation);
+            static_cast<uint32_t>(implementation.weight_layout);
       }
       if (!implementation.supports(prepared_spec) ||
           !apxinf::gemm::supports_weight_layout(implementation,
@@ -448,7 +448,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
                                 int configuration) {
       auto prepared_spec = normalized_spec;
       if (prepared_spec.b_layout == 0 && weight_layout != nullptr) {
-        prepared_spec.b_layout = apxinf::gemm::weight_layout(implementation);
+        prepared_spec.b_layout = static_cast<uint32_t>(implementation.weight_layout);
       }
       const size_t packing_bytes =
           normalized_spec.b_layout == 0 && weight_layout != nullptr &&
@@ -535,7 +535,7 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     if (normalized_spec.b_layout == 0 && weight_layout != nullptr) {
       apxinf::gemm::repack_weight_inplace(
           normalized_spec, *bindings,
-          apxinf::gemm::weight_layout(*execution->implementation), *weight_layout);
+          static_cast<uint32_t>(execution->implementation->weight_layout), *weight_layout);
       execution->spec.b_layout = *weight_layout;
     }
 
