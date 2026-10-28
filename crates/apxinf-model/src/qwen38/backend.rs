@@ -1,9 +1,9 @@
 //! Device helpers: upload, zero-fill, readback and typed views.
 //!
 //! The model-family CUDA seam in the sense of
-//! `doc/model-layer-architecture.md`: every qwen38 compute path, including the
-//! vision tower, reaches device memory through these helpers or through
-//! `apxinf_cuda_new::ops`.
+//! `../../../../doc/reference/model-layer-architecture.md`: every qwen38 compute path,
+//! including the vision tower, reaches device memory through these helpers or
+//! through `apxinf_cuda_new::ops`.
 
 use apxinf_core::{DType, Shape, Tensor};
 use apxinf_cuda_new::{CudaBuffer, CudaContext};
