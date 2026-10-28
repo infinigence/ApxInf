@@ -120,7 +120,7 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
     }
     if !crate::workspace::may_prepare_native_resources() {
         return Err(invalid(
-            "GEMM execution cache miss during capture; prepare the same bindings first",
+            "GEMM execution cache miss in a prepared phase; prepare the same bindings first",
         ));
     }
 

@@ -181,12 +181,18 @@ cache does not retune just because `--autotune` is present.
 
 | Stage | Entry Point | Allowed | Forbidden/Failure Conditions | Result |
 | --- | --- | --- | --- | --- |
-| Prepare traversal | `prepare_with_session(&session, forward)` | recipe lookup, autotune, native prepare, provider resource creation, execute and record order | nested session | session typed execution cache + prepared sequence |
-| Capture traversal | `capture(&ctx, || with_session(&session, forward))` | Hit executions in the same order and enqueue | cache miss, order change, device/stream change, native prepare | `CapturedGraph` |
-| Eager reuse | `with_session(&session, forward)` | Reuse the same executions outside capture | cache miss or order change | asynchronous enqueue |
-| Replay | `CapturedGraph::replay()` | Launch the instantiated graph | changing the captured structure | GPU work |
+| Prepare traversal | `PreparedPhase::prepare(ctx, session, forward)` | recipe lookup, autotune, native prepare, provider resource creation, execute and record order | nested session | fixed workspace offsets + typed execution cache + prepared sequence |
+| Planned eager | `phase.run_eager(forward)` | Update fixed-address control-buffer contents and reuse the prepared traversal | cache miss, Spec/binding/order change | asynchronous kernel-by-kernel enqueue |
+| Optional capture | `phase.capture(ctx, forward)` | Reuse the same prepared traversal and fixed addresses | cache miss, Spec/binding/order change, device/stream change, native prepare | phase-owned `CapturedGraph` |
+| Graph replay | `phase.replay()` | Update fixed-address control-buffer contents, then launch the instantiated graph | changing the captured structure or addresses | GPU work |
 
 The graph retains the executions and storage used during capture. The recipe key does not contain raw pointers; fixed addresses and the stream belong to the Rust execution cache key.
+
+`PreparedPhase` is the common lifecycle for eager and graph modes. Dynamic
+decode state may change only through the contents of fixed-address control
+buffers; it must not change an operator `Spec`, binding address, traversal
+order, or workspace offset. A planned eager cache miss is therefore an error,
+not a request to grow the execution cache.
 
 ## Directory Responsibilities
 
