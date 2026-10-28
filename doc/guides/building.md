@@ -8,7 +8,9 @@ All commands go through the justfile; `just --list` shows the menu.
   deploy to: the build compiles kernels for the visible GPU's compute
   capability).
 - A stable Rust toolchain (`rustup default stable`) and
-  [just](https://just.systems) (`cargo install just`).
+  [just](https://just.systems) (`cargo install just`); verify `just --version`
+  in the same shell used for builds. It is needed for the repository commands,
+  not for running an already-installed inference package.
 - Python 3.10+ with a venv or conda env.
 - Install maturin in that environment with `python -m pip install maturin`.
 

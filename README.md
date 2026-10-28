@@ -331,6 +331,8 @@ toolchain ([NVIDIA build environment](#nvidia-build-environment),
 
 ```bash
 git clone <repo-url> && cd ApxInf
+cargo install just
+just --version
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin
 just build-py

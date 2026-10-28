@@ -5,8 +5,10 @@
 - Linux with an NVIDIA driver and CUDA toolkit (see the "NVIDIA build
   environment" table in the README), or macOS for CPU-only Rust work.
 - Rust stable via [rustup](https://rustup.rs).
-- [just](https://just.systems): `cargo install just`. All commands run
-  through the justfile — run `just --list` first.
+- [just](https://just.systems) is a required development-tool dependency, not
+  an inference runtime dependency. Install it with `cargo install just`, ensure
+  it is on PATH, then verify `just --version` and run `just --list`. The
+  documented build/test commands, CI and the opt-in Git hook depend on it.
 - [actionlint](https://github.com/rhysd/actionlint/blob/main/docs/install.md)
   for workflow validation (`brew install actionlint` on macOS).
   CI installs a pinned official release and verifies its SHA-256 checksum.
@@ -22,6 +24,12 @@ python -m pip install -e 'python/apxinf[test]'
 git config core.hooksPath .githooks   # commit-time quick checks
 just pre-pr                           # full local check; CI runs the same
 ```
+
+The documentation checker also queries `just --summary` to validate recipe
+references. Install `just` before running it directly; a missing recipe list
+is an environment/setup failure, not evidence that all documented commands are
+invalid. The Claude commit guard allowing a commit when `just` is missing does
+not waive these checks or mean that they passed.
 
 ## Development loop
 
