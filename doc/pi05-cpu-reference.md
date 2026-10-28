@@ -117,6 +117,17 @@ roughly four bytes per parameter, plus loading temporaries and activations.
 
 ## Verification
 
+Run the maintained CPU checks without external BLAS:
+
+```bash
+cargo test -p apxinf-cpu --lib
+cargo test -p apxinf-model --lib cpu_pi05::
+cargo test -p apxinf-model --test cpu_pi05
+```
+
+Add `--features openblas` to exercise the accelerated path. See the
+[CPU backend guide](../crates/apxinf-cpu/README.md) for linking and threading.
+
 The maintained CPU tests cover public loading, RGB/patch layout equivalence,
 changed RNG inputs, retained outputs/plans, eager readiness, graph rejection and
 invalid requests. CPU backend tests compare dense grouped attention to scalar FP64
@@ -128,6 +139,8 @@ embedded prefix, each prefix K/V layer and every flow step. These fixtures use
 the fixed small geometry in the tests and are not production checkpoints.
 Generated checkpoints, independent reference code and results stay under
 `devlocal/pi05-cpu-reference/`, outside Git.
+
+### Recorded numerical validation (2026-10-27)
 
 The Rust fallback and pthreads OpenBLAS (1 and 4 threads)
 were locally checked on macOS arm64 with a small independent PyTorch
@@ -166,31 +179,8 @@ not embodiment normalization accuracy. Linux OpenBLAS core/storage tests
 (33 tests) and the four regular CPU public-contract tests also passed. The
 CPU extension links OpenBLAS without CUDA or OpenMP runtime dependencies.
 
-
-Before backend isolation, native CUDA compilation and a BF16 regression on Thor passed. The same
-four full-size inputs produced bitwise-identical outputs between this change
-and main baseline `e9da4bd3967e18331cf13ffc44bded61a6b32075`; both builds were
-bitwise stable across consecutive repeats. This is historical evidence for the earlier revision; the isolated CPU port
-restores the CUDA model directory exactly to main.
-
-
-After isolating the implementation in `cpu_pi05/`, the four full-checkpoint
-inputs were replayed against the frozen OpenPI outputs above and the previous
-CPU outputs. All reference comparisons still pass, and pre/post-isolation CPU
-outputs are bitwise identical. Both public Python policy cases also passed
-again, with identical normalized actions, returned actions and seeded outputs.
-The isolated port passes 12 module tests (including intermediate-stage parity),
-five public integration tests (including checkpoint parity), the model-family
-boundary checks, and combined `cuda,hip` feature compilation. Neither `pi05/`
-nor `hip_pi05/` differs from main revision `01232a9a`.
-
-After extracting `apxinf-cpu`, the same four full-checkpoint cases and two public
-Python policy cases were replayed on Linux OpenBLAS. All outputs remain bitwise
-identical to the prior CPU implementation, including normalized actions and
-seeded outputs; all four frozen OpenPI comparisons still pass. The CPU backend's
-15 tests pass with Rust GEMM and OpenBLAS on macOS; Linux OpenBLAS backend/core
-and storage tests also pass. The 17 PI0.5 module/integration checks pass, as do
-CUDA/HIP feature compilation and workspace library/binary compilation.
-Workspace-wide test compilation still fails in the existing CUDA-new
-`qwen38_gdn_batched_ops` FlashInfer symbols on macOS; the same failure was
-reproduced at pre-extraction commit `1a470986`.
+The four full-checkpoint cases and two Python policy cases were rerun after
+CPU model isolation and backend extraction, with bitwise-identical outputs.
+GPU hardware execution was not repeated after backend extraction. These are
+recorded validation results; the commands above do not reproduce the private
+full-checkpoint fixtures.
