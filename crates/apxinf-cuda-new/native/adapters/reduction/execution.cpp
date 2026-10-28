@@ -1,4 +1,4 @@
-// Reduction / model-head kernels: embedding gather, argmax.
+// Fixed model helpers: embedding gather, argmax, vision position preparation.
 //
 // These ops have a single fixed implementation and no persisted selection,
 // so per doc/adding-new-kernels.md §6 they carry no candidate registry,
@@ -57,5 +57,27 @@ extern "C" apxinf_status_t apxinf_model_argmax_bf16(
               logits, static_cast<int32_t*>(index), static_cast<int>(count),
               static_cast<cudaStream_t>(stream)),
           "argmax");
+  });
+}
+
+extern "C" apxinf_status_t apxinf_model_vision_position_bf16(
+    const void* table, void* embeddings, void* position_ids,
+    int64_t source_side, int64_t height, int64_t width, int64_t hidden,
+    int64_t merge_size, apxinf_cuda_stream_t stream) {
+  return abi_boundary([&] {
+    if (table == nullptr || embeddings == nullptr || position_ids == nullptr ||
+        !extent(source_side) || !extent(height) || !extent(width) ||
+        !extent(hidden) || !extent(merge_size) ||
+        height % merge_size != 0 || width % merge_size != 0 ||
+        height > INT32_MAX / width) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "invalid vision position arguments");
+    }
+    check(apxinf::cuda_new::model_ops::vision_position_bf16(
+              table, embeddings, static_cast<int32_t*>(position_ids),
+              static_cast<int>(source_side), static_cast<int>(height),
+              static_cast<int>(width), static_cast<int>(hidden),
+              static_cast<int>(merge_size), static_cast<cudaStream_t>(stream)),
+          "vision position");
   });
 }

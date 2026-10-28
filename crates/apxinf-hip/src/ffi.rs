@@ -133,6 +133,167 @@ hip_abi! {
         scale: f32,
         stream: *mut c_void,
     );
+
+    // `native` operators: BF16 only, outputs written in place. `bias` and
+    // similar optional operands may be null.
+    fn apxinf_hip_native_layer_norm(
+        x: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        y: *mut c_void,
+        rows: i64,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_ada_rms_norm(
+        x: *const c_void,
+        style: *const c_void,
+        y: *mut c_void,
+        rows: i64,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_bias_residual(
+        projection: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        hidden: *mut c_void,
+        rows: i64,
+        cols: i32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_bias_residual_rms_norm(
+        projection: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        weight: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i64,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_bias_residual_layer_norm(
+        projection: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        norm_weight: *const c_void,
+        norm_bias: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i64,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_ada_gate_residual_rms_norm(
+        projection: *const c_void,
+        residual: *const c_void,
+        gate_style: *const c_void,
+        norm_style: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i64,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_bias_activation(
+        x: *const c_void,
+        bias: *const c_void,
+        y: *mut c_void,
+        rows: i64,
+        cols: i32,
+        activation: i32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_geglu(
+        gate_up: *const c_void,
+        y: *mut c_void,
+        rows: i64,
+        inner: i32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_euler_update(
+        state: *const c_void,
+        velocity: *const c_void,
+        y: *mut c_void,
+        count: i64,
+        dt: f32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_embedding(
+        table: *const c_void,
+        ids: *const c_void,
+        y: *mut c_void,
+        tokens: i32,
+        width: i32,
+        vocab: u32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_add_position(
+        projection: *const c_void,
+        bias: *const c_void,
+        position: *const c_void,
+        y: *mut c_void,
+        rows: i64,
+        cols: i32,
+        tokens_per_view: i32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_rgb_to_patches(
+        images: *const c_void,
+        patches: *mut c_void,
+        views: i32,
+        image_size: i32,
+        patch_size: i32,
+        nhwc: i32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_split_qkv_rope(
+        qkv: *const c_void,
+        bias: *const c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        tokens: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        theta: f32,
+        position_offset: i32,
+        kv_row_offset: i32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_split_qkv_bias(
+        qkv: *const c_void,
+        bias: *const c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        tokens: i32,
+        width: i32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_attention(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        out: *mut c_void,
+        batch: i32,
+        q_tokens: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        kv_tokens: i32,
+        kv_batch_stride: i64,
+        kv_token_stride: i64,
+        scale: f32,
+        stream: *mut c_void,
+    );
 }
 
 /// Turn a shim status into a `Result`, naming the operation that failed.

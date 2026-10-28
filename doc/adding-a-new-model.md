@@ -166,8 +166,12 @@ specialized fast path may recover a concrete backend for capabilities that do
 not belong on the portable trait. Trait is the floor; concrete types are the
 ceiling.
 
-For Metal, use a `metal_<family>` module and registration for native composition;
-the provisional cross-backend design is not a prerequisite. Preserve measured
+A port written directly against one backend's native API goes in a
+self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`) that
+copies, rather than imports, any config, checkpoint or math code it shares with
+another backend's port; see
+[where backend-native model code lives](model-layer-architecture.md#where-backend-native-model-code-lives).
+The provisional cross-backend design is not a prerequisite. Preserve measured
 performance and reference semantics when choosing the boundary.
 
 For MLX, the concrete safe seam is `MlxBackend` with `Array`, `Stream` and

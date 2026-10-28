@@ -130,6 +130,45 @@ formula. Config and resource descriptions are leaf data. PI0.5 enforces these
 directions with [check_pi05_module_boundaries.py](../scripts/check_pi05_module_boundaries.py).
 That guard checks PI0.5 only; a new family must enforce its own declared boundaries.
 
+### Where backend-native model code lives
+
+A model written directly against one backend's native API (cuda-new, MLX, HIP),
+rather than through `dyn Backend`, is a **port**. Ports follow one rule, whether
+or not another backend already implements the same family:
+
+1. **A port is a top-level module `<backend>_<family>/`** in `apxinf-model/src/`,
+   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`. For example
+   `metal_qwen3/` is the Metal port of Qwen3; a CUDA port of the same family would
+   be `cuda_qwen3/`, beside it rather than inside it.
+2. **A port is self-contained.** It depends only on the core crates
+   (`apxinf-core`, `apxinf-loader`), its backend crate, and the cross-model
+   interfaces (`vla`, `llm_trait`, `auto`/`registry`, `LoadOptions`). It never
+   imports another model module, including a port of the same family to another
+   backend.
+3. **Copy instead of sharing.** Config parsing, checkpoint interpretation,
+   weight packing and model math are duplicated into each port that needs them.
+   A copy belongs to its port, which may simplify or change it; there is no
+   obligation to keep copies in sync.
+4. **What ports of one family share is acceptance, not code**: the same accuracy
+   fixtures, independent reference outputs and gates. A copy is correct when it
+   passes them.
+5. **The user-facing contract is defined once**: registry and CLI names, the
+   meaning of shared load options, the Python policy and `VlaContract`. Ports
+   honor it; tests enforce it.
+
+The rule is what lets several agents work on different backends at once. Code
+shared between ports accumulates whatever its most active user needs — a
+checkpoint loader that folds norms "before FP8 quantization", a config that
+carries one backend's workspace sizing — and a change made for one backend then
+silently changes another's results. With one copy per port, a change stays in
+the port that made it, and the shared fixtures catch a copy that is wrong.
+Coding is cheap; redundancy here is a feature.
+
+Paths are independent of user-facing names: moving or adding a port never
+changes a registry name or CLI option. Existing CUDA families (`pi05/`,
+`gr00t/`, `walloss/`, …) predate the rule and keep their paths; they are not
+renamed as part of unrelated work.
+
 ### Current coverage and port decisions
 
 | Family / contract | Current organization and limits |
@@ -151,10 +190,12 @@ separately migrated; do not rename or import them as part of an unrelated port.
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
 The common loader accepts `model_variant` for all six built-in Python VLA
-families and D3, and for Qwen3/MiniCPM5 names when the device is Metal. Each MLX family
-parses its variants locally; the common loader does not infer quantization from
-a shared CUDA precision choice. Supporting it for a new family requires updating that admission check
-and implementing family-local parsing/validation; registration alone is not
+families and D3, and for every Metal request. Metal admission reaches only a
+registered `metal_` factory, and each MLX family parses its variants locally;
+the common loader does not infer quantization from a shared CUDA precision
+choice. A new Metal family needs no central admission edit. Supporting it for a
+new non-Metal family requires updating that admission check and implementing
+family-local parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and

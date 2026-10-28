@@ -10,6 +10,94 @@ use super::*;
 use crate::CudaContext;
 use half::bf16;
 
+fn i32_values(tensor: &apxinf_core::Tensor) -> Vec<i32> {
+    let buffer = crate::CudaBuffer::from_tensor(tensor).unwrap();
+    let mut bytes = vec![0u8; buffer.len()];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| i32::from_ne_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+#[test]
+fn vision_position_fuses_interpolation_merge_order_ids_and_graph_replay() {
+    use apxinf_core::DType;
+
+    let ctx = CudaContext::new(0).unwrap();
+    // A 2x2 learned table whose interpolation onto 4x4 is exactly
+    // [2 * row + column, 16 + 2 * row + column].
+    let table = tensor(0, vec![4, 2], &[0.0, 16.0, 3.0, 19.0, 6.0, 22.0, 9.0, 25.0]);
+    let mut embeddings = zeros_tensor(0, vec![16, 2], DType::BF16);
+    let mut position_ids = zeros_tensor(0, vec![16, 2], DType::I32);
+    let enqueue = |embeddings: &mut apxinf_core::Tensor, position_ids: &mut apxinf_core::Tensor| {
+        vision_position(
+            &ctx,
+            VisionPositionArgs {
+                table: &table,
+                embeddings,
+                position_ids,
+                height: 4,
+                width: 4,
+                merge_size: 2,
+            },
+        )
+    };
+    enqueue(&mut embeddings, &mut position_ids).unwrap();
+    ctx.synchronize().unwrap();
+
+    let expected_ids = vec![
+        0, 0, 0, 1, 1, 0, 1, 1, 0, 2, 0, 3, 1, 2, 1, 3, 2, 0, 2, 1, 3, 0, 3, 1, 2, 2, 2, 3, 3, 2,
+        3, 3,
+    ];
+    let expected_embeddings = expected_ids
+        .chunks_exact(2)
+        .flat_map(|position| {
+            let value = (2 * position[0] + position[1]) as f32;
+            [value, 16.0 + value]
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(i32_values(&position_ids), expected_ids);
+    assert_eq!(values(&embeddings), expected_embeddings);
+
+    let graph = crate::capture(&ctx, || enqueue(&mut embeddings, &mut position_ids)).unwrap();
+    let embedding_buffer = crate::CudaBuffer::from_tensor(&embeddings).unwrap();
+    let id_buffer = crate::CudaBuffer::from_tensor(&position_ids).unwrap();
+    embedding_buffer
+        .copy_from_host(&vec![0xff; embedding_buffer.len()])
+        .unwrap();
+    id_buffer
+        .copy_from_host(&vec![0xff; id_buffer.len()])
+        .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(i32_values(&position_ids), expected_ids);
+    assert_eq!(values(&embeddings), expected_embeddings);
+}
+
+#[test]
+fn vision_position_rejects_non_square_tables() {
+    use apxinf_core::DType;
+
+    let ctx = CudaContext::new(0).unwrap();
+    let table = tensor(0, vec![3, 2], &[0.0; 6]);
+    let mut embeddings = zeros_tensor(0, vec![4, 2], DType::BF16);
+    let mut position_ids = zeros_tensor(0, vec![4, 2], DType::I32);
+    let error = vision_position(
+        &ctx,
+        VisionPositionArgs {
+            table: &table,
+            embeddings: &mut embeddings,
+            position_ids: &mut position_ids,
+            height: 2,
+            width: 2,
+            merge_size: 2,
+        },
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("square table"), "{error}");
+}
+
 #[test]
 fn pointwise_exact_gelu_runs_on_all_bf16_vector_paths() {
     let ctx = CudaContext::new(0).unwrap();

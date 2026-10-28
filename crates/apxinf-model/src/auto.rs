@@ -43,9 +43,9 @@ pub struct LoadOptions {
     /// `config.json:model_type`.
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
-    /// auto, bf16, fp8_static and int8_dynamic. Native Metal Qwen3/MiniCPM5
-    /// variants are parsed by their family loader. Every VLA family accepts this
-    /// option; legacy executors adapt it inside their own loader.
+    /// auto, bf16, fp8_static and int8_dynamic. Native Metal families parse
+    /// their own variants. Every VLA family accepts this option; legacy
+    /// executors adapt it inside their own loader.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
@@ -388,12 +388,18 @@ impl AutoModel {
             )));
         }
 
-        if matches!(model_name, "pi05" | "pi05-cuda") {
+        if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip") {
+            #[cfg(feature = "hip")]
+            if matches!(device, Device::Hip(_)) {
+                let config = options.config.as_ref().map(hip_pi05_config);
+                return crate::hip_pi05::load(path, device, options, config);
+            }
+
             #[cfg(feature = "cuda")]
             return crate::pi05::load_with_cuda_new(path, device, options);
 
             #[cfg(not(feature = "cuda"))]
-            return Err(Error::Other("PI0.5 requires CUDA support".into()));
+            return Err(Error::Other("PI0.5 requires CUDA or HIP support".into()));
         }
 
         if matches!(model_name, "d3" | "d3-cuda") {
@@ -508,13 +514,53 @@ fn metal_registry_name(model_name: &str) -> String {
     }
 }
 
+/// A frontend's PI0.5 overrides (`LoadOptions::config`, the CUDA family's
+/// type) as the HIP port's own config. Lives here, outside both families, so
+/// neither imports the other.
+#[cfg(feature = "hip")]
+fn hip_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::hip_pi05::Config {
+    let gemma = |g: &crate::pi05::GemmaVariantConfig| crate::hip_pi05::config::GemmaConfig {
+        width: g.width,
+        depth: g.depth,
+        mlp_dim: g.mlp_dim,
+        num_heads: g.num_heads,
+        num_kv_heads: g.num_kv_heads,
+        head_dim: g.head_dim,
+    };
+    crate::hip_pi05::Config {
+        action_dim: frontend.action_dim,
+        action_horizon: frontend.action_horizon,
+        max_token_len: frontend.max_token_len,
+        num_flow_steps: frontend.num_flow_steps,
+        flow_start_time: frontend.flow_start_time,
+        num_views: frontend.num_views,
+        image_size: frontend.image_size,
+        patch_size: frontend.patch_size,
+        vision_width: frontend.vision_width,
+        vision_depth: frontend.vision_depth,
+        vision_mlp_dim: frontend.vision_mlp_dim,
+        vision_heads: frontend.vision_heads,
+        vision_head_dim: frontend.vision_head_dim,
+        vocab_size: frontend.vocab_size,
+        rms_norm_eps: frontend.rms_norm_eps,
+        layer_norm_eps: frontend.layer_norm_eps,
+        rope_theta: frontend.rope_theta,
+        time_min_period: frontend.time_min_period,
+        time_max_period: frontend.time_max_period,
+        language: gemma(&frontend.language),
+        action_expert: gemma(&frontend.action_expert),
+    }
+}
+
 // Admission only: supported variant names and precision semantics are owned by
-// each family loader, not a second central implementation registry.
+// each family loader, not a second central implementation registry. A Metal
+// request reaches only a registered `metal_` factory, which parses its variant.
 fn supports_model_variant(model_name: &str, device: Device) -> bool {
     matches!(
         model_name,
         "pi05"
             | "pi05-cuda"
+            | "pi05-hip"
             | "qwen_drive"
             | "qwen_drive-cuda"
             | "d3"
@@ -537,11 +583,7 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "pi0fast-cuda"
             | "smolvla"
             | "smolvla_libero"
-    ) || (matches!(device, Device::Metal(_))
-        && matches!(
-            model_name,
-            "qwen3" | "metal_qwen3" | "qwen3-mlx" | "minicpm5" | "metal_minicpm5" | "minicpm5-mlx"
-        ))
+    ) || matches!(device, Device::Metal(_))
 }
 
 #[cfg(feature = "cuda")]
@@ -660,10 +702,52 @@ mod tests {
                 "accepted {name}"
             );
         }
+        // A variant neither bypasses the family requirement nor reaches a device.
+        for name in ["llama", "qwen3_vl"] {
+            let options = LoadOptions {
+                model_name: Some(name.into()),
+                model_variant: Some("bf16-compiled".into()),
+                ..LoadOptions::default()
+            };
+            assert!(
+                matches!(
+                    AutoModel::load_model(Device::Metal(0), path, &options),
+                    Err(Error::UnsupportedDevice(Device::Metal(0)))
+                ),
+                "accepted {name} with a variant"
+            );
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_pi05_config_converts_frontend_overrides_field_for_field() {
+        let frontend = crate::pi05::Pi05Config {
+            num_views: 2,
+            action_horizon: 10,
+            flow_start_time: 0.5,
+            ..crate::pi05::Pi05Config::default()
+        };
+        let config = hip_pi05_config(&frontend);
+        assert_eq!(
+            (
+                config.num_views,
+                config.action_horizon,
+                config.flow_start_time
+            ),
+            (2, 10, 0.5)
+        );
+        assert_eq!(
+            config.language,
+            crate::hip_pi05::config::GemmaConfig::GEMMA_2B
+        );
+        assert_eq!(config.vocab_size, frontend.vocab_size);
+        config.validate().unwrap();
     }
 
     #[test]
     fn metal_variant_admission_is_family_and_device_specific() {
+        // Metal defers to the registered family factory; other devices keep the list.
         for name in [
             "qwen3",
             "metal_qwen3",
@@ -671,14 +755,15 @@ mod tests {
             "minicpm5",
             "metal_minicpm5",
             "minicpm5-mlx",
+            "llama",
+            "qwen3_vl",
         ] {
             assert!(supports_model_variant(name, Device::Metal(0)));
             assert!(!supports_model_variant(name, Device::Cpu));
             assert!(!supports_model_variant(name, Device::Cuda(0)));
         }
-        assert!(!supports_model_variant("llama", Device::Metal(0)));
-        assert!(!supports_model_variant("qwen3_vl", Device::Metal(0)));
         assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
+        assert!(supports_model_variant("pi05-hip", Device::Hip(0)));
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
         assert!(supports_model_variant("smolvla", Device::Cuda(0)));
         assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
@@ -698,6 +783,31 @@ mod tests {
         ] {
             assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
         }
+    }
+
+    /// `Pi05Policy.from_pretrained(model_name="pi05-hip")` always sends a
+    /// model_variant (`"auto"` by default). Both must pass admission and reach
+    /// the PI0.5 loader; here that loader then fails for lack of a device or a
+    /// checkpoint, which is fine — only the admission rejection is the bug.
+    #[test]
+    fn pi05_hip_alias_admits_auto_and_bf16_model_variants() {
+        let path = temporary_directory("pi05-hip-admission");
+        for variant in ["auto", "bf16"] {
+            let options = LoadOptions {
+                model_name: Some("pi05-hip".into()),
+                model_variant: Some(variant.into()),
+                ..LoadOptions::default()
+            };
+            let error = match AutoModel::load_model(Device::Hip(0), &path, &options) {
+                Ok(_) => panic!("an empty directory cannot load as PI0.5"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                !error.contains("does not yet support model_variant"),
+                "model_variant={variant} was rejected before the PI0.5 loader: {error}"
+            );
+        }
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
