@@ -49,7 +49,11 @@ int apx_mlx_array_info(const void* p,int32_t* dims,size_t capacity,size_t* rank,
  const auto& a=*static_cast<const A*>(p);*rank=a.ndim();*dt=dtype_code(a.dtype());if(capacity<a.ndim())throw std::invalid_argument("shape output too short");for(size_t i=0;i<a.ndim();++i)dims[i]=a.shape(i);CATCH}
 int apx_mlx_array_read(void* s,const void* p,uint8_t* bytes,size_t len){TRY
  auto a=mx::contiguous(*static_cast<const A*>(p),false,*static_cast<S*>(s));if(a.nbytes()!=len)throw std::invalid_argument("download byte length mismatch");mx::eval(a);mx::synchronize(*static_cast<S*>(s));if(len)std::memcpy(bytes,a.data<uint8_t>(),len);CATCH}
+int apx_mlx_array_read_ready(const void* p,uint8_t* bytes,size_t len){TRY
+ auto a=*static_cast<const A*>(p);mx::eval(a);if(!a.flags().row_contiguous||a.nbytes()!=len)throw std::invalid_argument("ready download needs a row-contiguous array of the requested length");if(len)std::memcpy(bytes,a.data<uint8_t>(),len);CATCH}
 int apx_mlx_eval(void* s,const void* const* p,size_t n){TRY mx::eval(arrays(p,n));mx::synchronize(*static_cast<S*>(s));CATCH}
+// Enqueues evaluation and returns; a later eval or read of the same arrays waits for it.
+int apx_mlx_async_eval(const void* const* p,size_t n){TRY mx::async_eval(arrays(p,n));CATCH}
 int apx_mlx_op(void* stream,int32_t op,const void* const* inputs,size_t count,const int32_t* ints,size_t nints,const float* floats,size_t nfloats,void** out){TRY
  auto s=*static_cast<S*>(stream);auto a=arrays(inputs,count);std::vector<int> iv(ints,ints+nints);
  auto i=[&](size_t n){if(n>=nints)throw std::invalid_argument("missing integer argument");return ints[n];};
@@ -111,8 +115,9 @@ int apx_mlx_quantize(void* s,const void* input,int32_t group,int32_t bits,void**
 int apx_mlx_metal_new(const char* name,const char* source,const char* header,const char* const* ins,size_t ni,const char* const* outs,size_t no,void** out){TRY
  std::vector<std::string> input_names,output_names;for(size_t i=0;i<ni;++i)input_names.emplace_back(ins[i]);for(size_t i=0;i<no;++i)output_names.emplace_back(outs[i]);*out=new K(mx::fast::metal_kernel(name,input_names,output_names,source,header,true,false));CATCH}
 void apx_mlx_metal_free(void* p){delete static_cast<K*>(p);}
-int apx_mlx_metal_call(void* stream,void* kernel,const void* const* inputs,size_t ni,const int32_t* dims,const size_t* ranks,const int32_t* dtypes,size_t no,const int32_t* grid,const int32_t* group,int32_t templ,void** outputs){TRY
+int apx_mlx_metal_call(void* stream,void* kernel,const void* const* inputs,size_t ni,const int32_t* dims,const size_t* ranks,const int32_t* dtypes,size_t no,const int32_t* grid,const int32_t* group,const char* const* tnames,const int32_t* tkinds,const int32_t* tvalues,size_t nt,void** outputs){TRY
  std::vector<mx::Shape> shapes;std::vector<mx::Dtype> types;size_t offset=0;for(size_t j=0;j<no;++j){shapes.push_back(shape(dims+offset,ranks[j]));offset+=ranks[j];types.push_back(dtype(dtypes[j]));}
- std::vector<std::pair<std::string,mx::fast::TemplateArg>> templates;if(templ>=0)templates.push_back({"T",dtype(templ)});
+ // Template kinds: 0 dtype code, 1 int, 2 bool.
+ std::vector<std::pair<std::string,mx::fast::TemplateArg>> templates;for(size_t j=0;j<nt;++j){switch(tkinds[j]){case 0:templates.push_back({tnames[j],dtype(tvalues[j])});break;case 1:templates.push_back({tnames[j],int(tvalues[j])});break;case 2:templates.push_back({tnames[j],tvalues[j]!=0});break;default:throw std::invalid_argument("unknown Metal template kind");}}
  auto result=(*static_cast<K*>(kernel))(arrays(inputs,ni),shapes,types,{grid[0],grid[1],grid[2]},{group[0],group[1],group[2]},templates,std::nullopt,false,*static_cast<S*>(stream));publish(result,outputs,no);CATCH}
 }

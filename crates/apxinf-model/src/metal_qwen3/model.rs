@@ -5,7 +5,7 @@
 //! enginetailor/models/mlx/m4/kernels.py. See README.md and LICENSE.engine-tailor.
 
 use super::{
-    config::{Qwen3Config, Variant, MAX_CONTEXT},
+    config::{attention_width, PrefillChunk, PrefillPlan, Qwen3Config, Variant},
     weights::{LayerWeights, Weights},
 };
 use crate::llm_trait::{
@@ -13,7 +13,7 @@ use crate::llm_trait::{
 };
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
-use apxinf_mlx::fusions::QkNormRope;
+use apxinf_mlx::fusions::{Bf16QkTableRope, QkNormRope};
 use apxinf_mlx::{Array, Compiled, MlxBackend, MlxDType, Stream};
 use std::{
     collections::{HashMap, HashSet},
@@ -24,13 +24,19 @@ fn err(message: impl Into<String>) -> Error {
     Error::Other(message.into())
 }
 
-fn norm(x: &Array, weight_fp32: &Array, epsilon: f32) -> Result<Array> {
-    let f = x.cast(MlxDType::F32)?;
-    let variance = f.mul(&f)?.mean(&[-1], true)?;
-    let reciprocal = variance
-        .add(&Array::scalar(x.stream(), epsilon, MlxDType::F32)?)?
-        .rsqrt()?;
-    f.mul(&reciprocal)?.mul(weight_fp32)?.cast(x.dtype())
+fn norm(x: &Array, weight: &Array, epsilon: f32) -> Result<Array> {
+    match weight.dtype() {
+        MlxDType::BF16 if x.dtype() == MlxDType::BF16 => x.fast_rms_norm(weight, epsilon),
+        MlxDType::F32 => {
+            let f = x.cast(MlxDType::F32)?;
+            let variance = f.mul(&f)?.mean(&[-1], true)?;
+            let reciprocal = variance
+                .add(&Array::scalar(x.stream(), epsilon, MlxDType::F32)?)?
+                .rsqrt()?;
+            f.mul(&reciprocal)?.mul(weight)?.cast(x.dtype())
+        }
+        _ => Err(err("unsupported Qwen3 prepared norm dtype pair")),
+    }
 }
 
 fn rotate(x: &Array, cos: &Array, sin: &Array, dim: usize) -> Result<Array> {
@@ -47,6 +53,12 @@ fn rotate(x: &Array, cos: &Array, sin: &Array, dim: usize) -> Result<Array> {
 
 fn swiglu(gate: &Array, up: &Array) -> Result<Array> {
     gate.mul(&gate.sigmoid()?)?.mul(up)
+}
+
+fn decode_mask(positions: &Array, index: &Array) -> Result<Array> {
+    positions
+        .less_equal(index)?
+        .reshape(&[1, 1, 1, positions.shape()[0]])
 }
 
 #[derive(Clone)]
@@ -67,7 +79,7 @@ impl Seams {
         let dims = config.head_dim;
         let norm = Compiled::new(stream, 1, move |a| {
             if a.len() != 2 {
-                return Err(err("norm trace requires x and FP32 weight"));
+                return Err(err("norm trace requires x and prepared weight"));
             }
             Ok(vec![norm(&a[0], &a[1], eps)?])
         })?;
@@ -79,7 +91,10 @@ impl Seams {
         })?;
         let c = config.clone();
         let block = if decoder {
-            Some(Compiled::new(stream, 3, move |a| decoder_block(a, &c))?)
+            let table_rope = Bf16QkTableRope::new(stream)?;
+            Some(Compiled::new(stream, 3, move |a| {
+                decoder_block(a, &c, &table_rope)
+            })?)
         } else {
             None
         };
@@ -89,9 +104,9 @@ impl Seams {
 
 /// Pure B=1/L=1 block. Weights, index, table row and KV state are explicit inputs.
 /// No mutable request state, host readback, or model object is captured.
-fn decoder_block(a: &[Array], c: &Qwen3Config) -> Result<Vec<Array>> {
-    if a.len() != 17 {
-        return Err(err("Qwen3 decoder block expects 17 arrays"));
+fn decoder_block(a: &[Array], c: &Qwen3Config, table_rope: &Bf16QkTableRope) -> Result<Vec<Array>> {
+    if a.len() != 18 {
+        return Err(err("Qwen3 decoder block expects 18 arrays"));
     }
     let (x, keys, values, index, cos, sin) = (&a[0], &a[1], &a[2], &a[3], &a[4], &a[5]);
     if x.shape() != [1, 1, c.hidden_size] || x.dtype() != MlxDType::BF16 {
@@ -116,17 +131,15 @@ fn decoder_block(a: &[Array], c: &Qwen3Config) -> Result<Vec<Array>> {
         .matmul(&a[12])?
         .reshape(&[1, 1, c.num_key_value_heads, c.head_dim])?
         .transpose(&[0, 2, 1, 3])?;
-    let q = rotate(&q, cos, sin, c.head_dim)?;
-    let k = rotate(&k, cos, sin, c.head_dim)?;
+    let (q, k) = table_rope.call(&q, &k, cos, sin)?;
     let keys = keys.slice_update(&k, index, &[2])?;
     let values = values.slice_update(&v, index, &[2])?;
-    let mask = Array::arange(x.stream(), 0., keys.shape()[2] as f32, 1., MlxDType::I32)?
-        .less_equal(index)?
-        .reshape(&[1, 1, 1, keys.shape()[2]])?;
+    let width = a[17].shape()[0];
+    let mask = decode_mask(&a[17], index)?;
     let attention = q
         .sdpa(
-            &keys,
-            &values,
+            &keys.slice_axis(2, 0, width)?,
+            &values.slice_axis(2, 0, width)?,
             (c.head_dim as f64).powf(-0.5) as f32,
             false,
             Some(&mask),
@@ -143,6 +156,7 @@ fn decoder_block(a: &[Array], c: &Qwen3Config) -> Result<Vec<Array>> {
 pub struct Qwen3Model {
     config: Qwen3Config,
     variant: Variant,
+    prefill_chunk: Option<PrefillChunk>,
     backend: MlxBackend,
     weights: Weights,
     seams: Option<Seams>,
@@ -155,6 +169,7 @@ pub struct Qwen3Model {
     capacity: usize,
     position: usize,
     prepared_lengths: HashSet<usize>,
+    decode_positions: HashMap<usize, Array>,
     invalid: Option<String>,
 }
 
@@ -176,6 +191,7 @@ impl Qwen3Model {
         variant: Variant,
     ) -> Result<Self> {
         config.validate()?;
+        let prefill_chunk = PrefillChunk::from_env()?;
         if variant == Variant::MixedW8 {
             config.validate_checkpoint_scope()?;
         }
@@ -210,6 +226,7 @@ impl Qwen3Model {
         let mut model = Self {
             config,
             variant,
+            prefill_chunk,
             backend,
             weights,
             seams,
@@ -222,6 +239,7 @@ impl Qwen3Model {
             capacity: 0,
             position: 0,
             prepared_lengths: HashSet::new(),
+            decode_positions: HashMap::new(),
             invalid: None,
         };
         model.prepare(1, 0)?;
@@ -239,10 +257,11 @@ impl Qwen3Model {
     }
 
     /// Prepare a complete prompt and the requested decode capacity outside timing.
-    /// Growing capacity is only supported on a fresh/reset request.
+    /// Changing capacity is only supported on a fresh/reset request.
     pub fn prepare(&mut self, prompt_len: usize, max_new_tokens: usize) -> Result<()> {
         if let Err(error) = self.prepare_inner(prompt_len, max_new_tokens) {
             self.prepared_lengths.clear();
+            self.decode_positions.clear();
             self.invalid = Some(error.to_string());
             return Err(error);
         }
@@ -250,43 +269,34 @@ impl Qwen3Model {
     }
 
     fn prepare_inner(&mut self, prompt_len: usize, max_new_tokens: usize) -> Result<()> {
-        let requested = prompt_len
-            .checked_add(max_new_tokens)
-            .ok_or_else(|| err("Qwen3 context overflow"))?;
-        if prompt_len == 0 || requested > self.config.max_position_embeddings.min(MAX_CONTEXT) {
-            return Err(err(
-                "Qwen3 requested context is empty or exceeds its checkpoint/2048-token migration profile",
-            ));
-        }
+        let capacity = self.config.request_capacity(prompt_len, max_new_tokens)?;
         if let Some(reason) = &self.invalid {
             return Err(err(format!(
                 "Qwen3 session invalidated: {reason}; reset first"
             )));
         }
         let stream = self.backend.stream();
-        if requested > self.capacity {
+        if capacity != self.capacity || self.kv.is_empty() {
             if self.position != 0 {
-                return Err(err("reset Qwen3 before growing its prepared KV capacity"));
+                return Err(err("reset Qwen3 before changing its prepared KV capacity"));
             }
-            let capacity = requested
-                .checked_add(255)
-                .ok_or_else(|| err("KV capacity overflow"))?
-                / 256
-                * 256;
-            let capacity = capacity
-                .min(self.config.max_position_embeddings)
-                .min(MAX_CONTEXT);
+            self.kv.clear();
+            self.initial_kv.clear();
+            self.capacity = 0;
+            self.prepared_lengths.clear();
+            self.decode_positions.clear();
             let shape = [
                 1,
                 self.config.num_key_value_heads,
                 capacity,
                 self.config.head_dim,
             ];
+            let zero = Array::zeros(stream, &shape, MlxDType::BF16)?;
             let mut initial = Vec::with_capacity(self.config.num_hidden_layers);
             for _ in 0..self.config.num_hidden_layers {
                 initial.push(KvState {
-                    keys: Array::zeros(stream, &shape, MlxDType::BF16)?,
-                    values: Array::zeros(stream, &shape, MlxDType::BF16)?,
+                    keys: zero.clone(),
+                    values: zero.clone(),
                 });
             }
             let dim = self.config.head_dim;
@@ -322,18 +332,27 @@ impl Qwen3Model {
             self.prepared_lengths.clear();
         }
         self.warm_length(1)?;
-        self.warm_length(prompt_len)?;
-        // Source append_logits evaluates cache-only chunks, followed by one
-        // last-token forward. Register every prompt shape outside inference.
-        let prefix = prompt_len - 1;
-        if prefix >= 512 {
-            self.warm_length(512)?;
+        if prompt_len <= 2048 {
+            self.warm_length(prompt_len)?;
         }
-        if prefix % 512 != 0 {
-            self.warm_length(prefix % 512)?;
+        for rows in self.prefill_plan(prompt_len)?.required_rows() {
+            self.warm_length(rows)?;
         }
+        self.warm_decoder()?;
         self.backend.stream().synchronize()?;
         Ok(())
+    }
+
+    fn prefill_plan(&self, prompt: usize) -> Result<PrefillPlan> {
+        PrefillPlan::new(
+            prompt,
+            self.prefill_chunk
+                .unwrap_or(if self.variant == Variant::Bf16Compiled {
+                    PrefillChunk::Tokens2048
+                } else {
+                    PrefillChunk::Tokens512
+                }),
+        )
     }
 
     fn warm_length(&mut self, len: usize) -> Result<()> {
@@ -367,19 +386,6 @@ impl Qwen3Model {
                     sin.clone(),
                 ])?);
             }
-            if len == 1 && seams.block.is_some() {
-                let index = Array::from_i32(s, &[1], &[0])?;
-                let mut args = vec![
-                    x,
-                    self.initial_kv[0].keys.clone(),
-                    self.initial_kv[0].values.clone(),
-                    index,
-                    cos,
-                    sin,
-                ];
-                args.extend(layer.block_arrays()?);
-                warm.extend(seams.block.as_ref().unwrap().prepare(&args)?);
-            }
             if len == 1 {
                 if let Some(fusion) = &self.qk_fusion {
                     let q = Array::zeros(
@@ -406,6 +412,33 @@ impl Qwen3Model {
             s.eval(&warm)?;
         }
         self.prepared_lengths.insert(len);
+        Ok(())
+    }
+
+    fn warm_decoder(&mut self) -> Result<()> {
+        let Some(block) = self.seams.as_ref().and_then(|seams| seams.block.as_ref()) else {
+            return Ok(());
+        };
+        let stream = self.backend.stream();
+        for end in (1..=self.capacity).step_by(256) {
+            let width = attention_width(end, self.capacity);
+            if self.decode_positions.contains_key(&width) {
+                continue;
+            }
+            let positions = Array::arange(stream, 0., width as f32, 1., MlxDType::I32)?;
+            let mut args = vec![
+                Array::zeros(stream, &[1, 1, self.config.hidden_size], MlxDType::BF16)?,
+                self.initial_kv[0].keys.clone(),
+                self.initial_kv[0].values.clone(),
+                Array::from_i32(stream, &[1], &[0])?,
+                self.cos.as_ref().unwrap().slice_axis(2, 0, 1)?,
+                self.sin.as_ref().unwrap().slice_axis(2, 0, 1)?,
+            ];
+            args.extend(self.weights.layers[0].block_arrays()?);
+            args.push(positions.clone());
+            block.prepare(&args)?;
+            self.decode_positions.insert(width, positions);
+        }
         Ok(())
     }
 
@@ -484,7 +517,7 @@ impl Qwen3Model {
     }
 
     fn run(
-        &self,
+        &mut self,
         tokens: &[u32],
         end: usize,
         emit_logits: bool,
@@ -496,9 +529,34 @@ impl Qwen3Model {
             &[len],
             &tokens.iter().map(|&id| id as i32).collect::<Vec<_>>(),
         )?;
+        let (output, pending) = self.run_graph(&ids, end, emit_logits)?;
+        let output = output
+            .map(|array| self.backend.from_array(array))
+            .transpose()?;
+        let mut required = Vec::with_capacity(pending.len() * 2 + 1);
+        if let Some(output) = &output {
+            required.push(self.backend.array(output)?);
+        }
+        required.extend(
+            pending
+                .iter()
+                .flat_map(|kv| [kv.keys.clone(), kv.values.clone()]),
+        );
+        self.backend.stream().eval(&required)?;
+        Ok((output, pending))
+    }
+
+    fn run_graph(
+        &mut self,
+        ids: &Array,
+        end: usize,
+        emit_logits: bool,
+    ) -> Result<(Option<Array>, Vec<KvState>)> {
+        let s = self.backend.stream();
+        let len = ids.numel();
         let mut x = self
             .weights
-            .embed(&ids)?
+            .embed(ids)?
             .reshape(&[1, len, self.config.hidden_size])?;
         let index = Array::from_i32(s, &[1], &[self.position as i32])?;
         let cos = self
@@ -512,7 +570,8 @@ impl Qwen3Model {
             .unwrap()
             .slice_axis(2, self.position, end)?;
         let mut pending = Vec::with_capacity(self.kv.len());
-        for (layer, kv) in self.weights.layers.iter().zip(&self.kv) {
+        let previous = std::mem::take(&mut self.kv);
+        for (layer, kv) in self.weights.layers.iter().zip(previous) {
             // The inherited block replacement applies only after prefill has
             // established request KV. A fresh single-token prompt keeps the
             // public attention boundary, just like a source KVCache with no keys.
@@ -526,6 +585,7 @@ impl Qwen3Model {
                     sin.clone(),
                 ];
                 args.extend(layer.block_arrays()?);
+                args.push(self.decode_positions[&attention_width(end, self.capacity)].clone());
                 let mut values = self
                     .seams
                     .as_ref()
@@ -541,7 +601,7 @@ impl Qwen3Model {
                     values: values.next().unwrap(),
                 });
             } else {
-                let result = self.eager_layer(&x, layer, kv, &index, &cos, &sin, end)?;
+                let result = self.eager_layer(&x, layer, &kv, &index, &cos, &sin, end)?;
                 x = result.0;
                 pending.push(result.1);
             }
@@ -551,21 +611,10 @@ impl Qwen3Model {
                 .weights
                 .project(&self.normalized(&x, &self.weights.final_norm)?)?
                 .reshape(&[len, self.config.vocab_size])?;
-            Some(self.backend.from_array(logits)?)
+            Some(logits)
         } else {
             None
         };
-        let mut required = Vec::with_capacity(pending.len() * 2 + 1);
-        if let Some(output) = &output {
-            required.push(self.backend.array(output)?);
-        }
-        required.extend(
-            pending
-                .iter()
-                .flat_map(|kv| [kv.keys.clone(), kv.values.clone()]),
-        );
-        s.eval(&required)?;
-        // Stream::eval includes stream synchronization and exception checking.
         Ok((output, pending))
     }
 
@@ -615,7 +664,75 @@ impl Qwen3Model {
     }
 }
 
+impl crate::mlx_decode::DeviceDecode for Qwen3Model {
+    fn stream(&self) -> &Stream {
+        self.backend.stream()
+    }
+    fn decode(&mut self, token: &Array) -> Result<Array> {
+        if self.invalid.is_some() || self.position >= self.capacity {
+            return Err(err("Qwen3 decode requires valid prepared capacity"));
+        }
+        let end = self.position + 1;
+        match self.run_graph(token, end, true) {
+            Ok((Some(logits), pending)) => {
+                self.kv = pending;
+                self.position = end;
+                Ok(logits)
+            }
+            Ok(_) => Err(err("missing Qwen3 decode logits")),
+            Err(error) => {
+                self.invalid = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+    fn finish_decode(&mut self, outcome: crate::mlx_decode::DecodeFinish) -> Result<()> {
+        if let Err(error) = self.backend.stream().synchronize() {
+            self.invalid = Some(error.to_string());
+            return Err(error);
+        }
+        match outcome {
+            crate::mlx_decode::DecodeFinish::PublishedPosition(position)
+                if self.invalid.is_none()
+                    && position <= self.position
+                    && self.position - position <= 1 =>
+            {
+                self.position = position;
+                Ok(())
+            }
+            crate::mlx_decode::DecodeFinish::Invalidated => {
+                self.invalid
+                    .get_or_insert_with(|| "greedy request failed or was abandoned".into());
+                Ok(())
+            }
+            _ => {
+                self.invalid = Some("invalid greedy rollback position".into());
+                Err(err("invalid Qwen3 greedy rollback position"))
+            }
+        }
+    }
+}
+
 impl LlmTrait for Qwen3Model {
+    fn token_sequence<'a>(
+        &'a mut self,
+        first: Tensor,
+        sampler: Box<dyn apxinf_core::TokenSampler>,
+        params: &apxinf_core::TokenSamplingParams,
+        prompt_end: u32,
+    ) -> Result<Box<dyn crate::llm_trait::TokenSequence + 'a>> {
+        if self.variant == Variant::Bf16Compiled && crate::mlx_decode::enabled(params) {
+            let first = self.backend.array(&first)?;
+            Ok(Box::new(crate::mlx_decode::GreedySequence::new(
+                self, first, prompt_end,
+            )?))
+        } else {
+            Ok(Box::new(crate::llm_trait::SyncTokenSequence::new(
+                self, first, sampler, prompt_end,
+            )))
+        }
+    }
+
     fn preparation_status(&self) -> TextPreparationStatus {
         let implementation_ready = match self.variant {
             Variant::Bf16Public => true,
@@ -686,18 +803,19 @@ impl LlmTrait for Qwen3Model {
             return Err(err("Qwen3 does not support images"));
         }
         self.validate_input(input.token_ids, 0)?;
-        let prefix = input.token_ids.len() - 1;
+        let plan = self.prefill_plan(input.token_ids.len())?;
         // Check the entire schedule before consuming any part of the prompt.
-        if !self.prepared_lengths.contains(&1)
-            || (prefix >= 512 && !self.prepared_lengths.contains(&512))
-            || (prefix % 512 != 0 && !self.prepared_lengths.contains(&(prefix % 512)))
+        if !plan
+            .required_rows()
+            .iter()
+            .all(|rows| self.prepared_lengths.contains(rows))
         {
             return Err(err("Qwen3 prefill schedule was not prepared"));
         }
-        for chunk in input.token_ids[..prefix].chunks(512) {
-            self.execute(chunk, self.position, false)?;
+        for range in plan.chunks() {
+            self.execute(&input.token_ids[range], self.position, false)?;
         }
-        self.execute(&input.token_ids[prefix..], self.position, true)?
+        self.execute(&input.token_ids[plan.prefix_len..], self.position, true)?
             .ok_or_else(|| err("missing Qwen3 prefill logits"))
     }
 
@@ -721,15 +839,35 @@ impl LlmTrait for Qwen3Model {
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::MAX_CONTEXT;
     use super::*;
     use half::bf16;
+
+    #[test]
+    fn cpu_decode_mask_includes_current_position_and_excludes_padding() {
+        let stream = Stream::cpu().unwrap();
+        for (position, width) in [(0, 256), (255, 256), (256, 512), (40959, 40960)] {
+            let index = Array::from_i32(&stream, &[1], &[position]).unwrap();
+            let positions = Array::arange(&stream, 0., width as f32, 1., MlxDType::I32).unwrap();
+            let mask = decode_mask(&positions, &index).unwrap().to_bytes().unwrap();
+            assert!(mask[..=position as usize].iter().all(|&value| value == 1));
+            assert!(mask[position as usize + 1..]
+                .iter()
+                .all(|&value| value == 0));
+        }
+        assert_eq!(attention_width(1, 2048), 2048);
+        for end in 1..=40960 {
+            let width = attention_width(end, 40960);
+            assert!(width >= end && width - end < 256);
+        }
+    }
 
     fn tiny(variant: Variant) -> Qwen3Model {
         let config = Qwen3Config::from_json(
             r#"{
             "model_type":"qwen3", "hidden_size":8, "intermediate_size":16,
             "num_hidden_layers":2, "num_attention_heads":2, "num_key_value_heads":1,
-            "head_dim":8, "vocab_size":16, "max_position_embeddings":512,
+            "head_dim":8, "vocab_size":16, "max_position_embeddings":40960,
             "rms_norm_eps":0.000001, "rope_theta":1000000,
             "tie_word_embeddings":true, "hidden_act":"silu"}"#,
         )
@@ -782,6 +920,37 @@ mod tests {
 
     fn values(model: &Qwen3Model, tensor: &Tensor) -> Vec<f32> {
         model.backend.to_cpu(tensor).unwrap().to_f32_vec().unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Apple Silicon Metal test slot and pinned MLX SDK"]
+    fn capacity_growth_and_shrink_preserve_reset_outputs() {
+        let mut model = tiny(Variant::Bf16Compiled);
+        model.prepare(3, 1).unwrap();
+        let output = model.prefill(LlmInput::text(&[1, 7, 3])).unwrap();
+        let expected = values(&model, &output);
+        model.reset();
+        model.prepare(3, 4096).unwrap();
+        let traces = model.backend.stream().counters().trace_callbacks;
+        model.prefill(LlmInput::text(&[1, 7, 3])).unwrap();
+        model.forward(&[2], 3).unwrap();
+        assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+        model.reset();
+        model.prepare(5119, 128).unwrap();
+        assert_eq!(model.capacity(), 5376);
+        let long = vec![7; 5119];
+        let output = model.prefill(LlmInput::text(&long)).unwrap();
+        assert_eq!(output.shape().dims(), &[1, 16]);
+        assert_eq!(model.position(), 5119);
+        let traces = model.backend.stream().counters().trace_callbacks;
+        model.forward(&[2], 5119).unwrap();
+        model.forward(&[3], 5120).unwrap();
+        assert_eq!(model.backend.stream().counters().trace_callbacks, traces);
+        model.reset();
+        model.prepare(3, 1).unwrap();
+        assert_eq!(model.capacity(), 256);
+        let output = model.prefill(LlmInput::text(&[1, 7, 3])).unwrap();
+        assert_eq!(values(&model, &output), expected);
     }
 
     #[test]

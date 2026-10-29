@@ -536,13 +536,32 @@ impl TokenSampler for Greedy {
         })
     }
 }
-fn greedy_token(a: &Array) -> Result<u32> {
+/// Device-resident greedy ID and a checked ID (u32::MAX for invalid logits).
+/// The unchecked ID remains safe to feed to an embedding before host validation.
+pub fn greedy_token_arrays(logits: &Array) -> Result<(Array, Array)> {
+    let vocab = *logits
+        .shape()
+        .last()
+        .ok_or(Error::Contract("greedy logits require a vocabulary axis"))?;
+    if vocab == 0 || logits.numel() == 0 {
+        return Err(Error::Contract("greedy logits must not be empty"));
+    }
+    let rows = logits.numel() / vocab;
+    let a = logits
+        .reshape(&[rows, vocab])?
+        .slice_axis(0, rows - 1, rows)?
+        .cast(MlxDType::F32)?;
     let adjusted = a.nan_to_num(f32::NEG_INFINITY, f32::MAX, f32::NEG_INFINITY)?;
     let valid = adjusted.max(-1)?.isfinite()?.reshape(&[1])?;
     let invalid = Array::from_i32(a.stream(), &[1], &[-1])?.cast(MlxDType::U32)?;
-    let token = valid
-        .where_select(&adjusted.argmax(-1)?.reshape(&[1])?, &invalid)?
-        .to_u32_scalar()?;
+    let feed = adjusted.argmax(-1)?.reshape(&[1])?.cast(MlxDType::U32)?;
+    let checked = valid.where_select(&feed, &invalid)?.contiguous()?;
+    Ok((feed, checked))
+}
+
+fn greedy_token(a: &Array) -> Result<u32> {
+    let (_, checked) = greedy_token_arrays(a)?;
+    let token = checked.to_u32_scalar()?;
     if token == u32::MAX {
         return Err(err("all token logits are invalid"));
     }

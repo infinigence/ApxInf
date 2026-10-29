@@ -79,6 +79,29 @@ fn preparation_verifies_replay_once_per_profile() -> Result<()> {
 }
 
 #[test]
+fn trace_preparation_defers_evaluation_and_reuses_each_shape_with_changed_values() -> Result<()> {
+    let s = Stream::cpu()?;
+    let compiled = Compiled::new(&s, 1, |a| Ok(vec![a[0].add(&a[0])?]))?;
+    for values in [&[1., 2.][..], &[3., 4., 5.][..]] {
+        let input = Array::from_f32(&s, &[values.len()], values)?;
+        compiled.prepare_trace(&[input])?;
+    }
+    let prepared = s.counters();
+    assert_eq!(prepared.eval_calls, 0);
+    assert!(prepared.trace_callbacks > 0);
+    for values in [&[10., 20.][..], &[30., 40., 50.][..]] {
+        let input = Array::from_f32(&s, &[values.len()], values)?;
+        let output = compiled.call_and_eval(&[input])?;
+        assert_eq!(s.counters().trace_callbacks, prepared.trace_callbacks);
+        assert_eq!(
+            output[0].to_f32_vec()?,
+            values.iter().map(|x| 2. * x).collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn upload_views_dtype_and_owned_lifetime() -> Result<()> {
     let s = Stream::cpu()?;
     let a = Array::from_f32(&s, &[2, 3], &[1., 2., 3., 4., 5., 6.])?;
@@ -247,4 +270,38 @@ fn unsupported_metal_index_is_rejected_before_native_access() {
             Err(Error::UnsupportedDevice(apxinf_core::Device::Metal(id))) if id == index
         ));
     }
+}
+
+#[test]
+fn async_evaluation_completes_before_reads_and_checks_streams() -> Result<()> {
+    let s = Stream::cpu()?;
+    let a = Array::from_f32(&s, &[3], &[1., 2., 3.])?;
+    let b = a.mul(&a)?.add(&a)?;
+    let calls = s.counters().eval_calls;
+    s.async_eval(&[b.clone()])?;
+    assert_eq!(s.counters().eval_calls, calls + 1);
+    assert_eq!(b.to_f32_vec()?, [2., 6., 12.]);
+    // Separate logical streams do not mix, as for eval.
+    let foreign = Array::from_f32(&Stream::cpu()?, &[1], &[1.])?;
+    assert!(s.async_eval(&[foreign]).is_err());
+    Ok(())
+}
+
+#[test]
+fn ready_downloads_wait_for_their_own_array_and_need_row_contiguity() -> Result<()> {
+    let s = Stream::cpu()?;
+    let a = Array::from_f32(&s, &[2, 2], &[1., 2., 3., 4.])?;
+    let first = a.add(&a)?;
+    let later = first.mul(&a)?;
+    s.async_eval(&[first.clone()])?;
+    s.async_eval(&[later.clone()])?;
+    let bytes = first.to_bytes_ready()?;
+    let values: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+        .collect();
+    assert_eq!(values, [2., 4., 6., 8.]);
+    assert_eq!(later.to_f32_vec()?, [2., 8., 18., 32.]);
+    assert!(a.transpose(&[1, 0])?.to_bytes_ready().is_err());
+    Ok(())
 }
