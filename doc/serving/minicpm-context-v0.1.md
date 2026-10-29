@@ -32,8 +32,10 @@ The caller retains responsibility for request cleanup with device synchronizatio
 
 The model family selects the prepared prefill plan.
 Prompts of at most 4096 tokens use one complete-prompt chunk.
-Longer compiled prompts use 1024-token chunks by default; public mode uses 512-token chunks.
+Standalone compiled generation uses 1024-token long chunks by default; public mode uses 512-token long chunks.
 Construction-time chunk overrides remain part of the family plan.
+The native worker selects the 256-token override before loading the model.
+This override changes long-prompt chunks; prompts of at most 4096 tokens still use one complete-prompt chunk.
 Ordinary MiniCPM prefill executes the selected chunks in order.
 Each chunk uses absolute RoPE positions and a causal mask over prior and current positions.
 Each chunk evaluates its outputs before it publishes KV state, advances the offset, and reports progress.

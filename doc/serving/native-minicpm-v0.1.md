@@ -31,7 +31,8 @@ Its `memory_limit_bytes`, `max_context`, and `max_output_tokens` match the launc
 
 The capability fields retain their 2.0 meanings.
 The native worker declares `token_or_prefill_chunk` cancellation at the family plan's evaluated chunk boundaries.
-The shared `--prefill-step-size 256` launch value is retained for compatibility; it does not set native chunk lengths.
+The worker validates `--prefill-step-size 256` and selects the family 256-token override before model loading.
+Long prompts use that override; prompts of at most 4096 tokens still execute as one complete-prompt chunk.
 This candidate permits at most 16384 positions.
 Long-context acceptance requires the separate quality and memory gates in the context profile.
 Validators also accept earlier 2.1 workers with `end_prefill_or_token` and at most 4096 positions.
