@@ -15,8 +15,8 @@ use crate::vla::{
 
 use super::prepare::CapturedGraph;
 use crate::pi05::backend::{
-    self, ops, transfers, Context, DeviceBuffer, ExecutionSession,
-    ImageLayout as KernelImageLayout,
+    self, ops, transfers, Context, DeviceBuffer, ExecutionSession, GraphWorkspace,
+    ImageLayout as KernelImageLayout, ProviderWorkspace,
 };
 use crate::pi05::model::ModelVariant;
 use crate::pi05::Pi05Config;
@@ -270,6 +270,7 @@ impl Pi05PreparedInference {
 /// retains only the most recently used shape. Callers that need more than one
 /// simultaneously prepared shape can own those plans explicitly via `prepare`.
 pub struct Pi05ModelRunner {
+    provider_workspace: ProviderWorkspace,
     backend: Arc<Context>,
     config: Arc<Pi05Config>,
     model: ModelVariant,
@@ -324,6 +325,7 @@ impl Pi05ModelRunner {
             config,
             model,
             prepared: RefCell::new(None),
+            provider_workspace: ProviderWorkspace::default(),
         }
     }
 
@@ -343,10 +345,13 @@ impl Pi05ModelRunner {
         let cuda = &*self.backend;
         let dtype = self.model.input_dtype();
         let raw_rgb = spec.image_layout.is_some();
-        let patches = backend::to_device(&self.backend, &Tensor::zeros(
-            patch_shape(&self.config),
-            self.model.captured_patch_dtype(raw_rgb),
-        ))?;
+        let patches = backend::to_device(
+            &self.backend,
+            &Tensor::zeros(
+                patch_shape(&self.config),
+                self.model.captured_patch_dtype(raw_rgb),
+            ),
+        )?;
         let noise = backend::to_device(
             &self.backend,
             &Tensor::zeros(noise_shape(&self.config), dtype),
@@ -370,10 +375,13 @@ impl Pi05ModelRunner {
         token_ids: DeviceBuffer,
         raw_images: Option<DeviceBuffer>,
     ) -> Result<EagerInputs> {
-        let session = ExecutionSession::with_capacity(
-            self.model.workspace_requirements(spec.token_count)?.bytes,
-            self.backend.device_id(),
-        )?;
+        let session = ExecutionSession::with_provider_workspace(
+            GraphWorkspace::new(
+                self.model.workspace_requirements(spec.token_count)?.bytes,
+                self.backend.device_id(),
+            )?,
+            self.provider_workspace.clone(),
+        );
         let inputs = EagerInputs {
             patches,
             raw_images,
@@ -430,7 +438,14 @@ impl Pi05ModelRunner {
         policy: ExecutionPolicy,
     ) -> Result<Pi05PreparedInference> {
         self.build_prepared_using(spec, policy, |patches, tokens, noise| {
-            super::prepare::capture_loaded(&self.model, spec, patches, tokens, noise)
+            super::prepare::capture_loaded(
+                &self.model,
+                &self.provider_workspace,
+                spec,
+                patches,
+                tokens,
+                noise,
+            )
         })
     }
 
@@ -452,7 +467,8 @@ impl Pi05ModelRunner {
         let cuda = &*self.backend;
         let raw_rgb = spec.image_layout.is_some();
 
-        let (graph, fallback_reason) = select_graph(policy, || capture(&patches, &token_ids, &noise))?;
+        let (graph, fallback_reason) =
+            select_graph(policy, || capture(&patches, &token_ids, &noise))?;
         if let Some(reason) = &fallback_reason {
             eprintln!("[apxinf] PI0.5 graph capture unavailable, using eager: {reason}");
         }
