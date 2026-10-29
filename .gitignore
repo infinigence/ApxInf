@@ -18,8 +18,7 @@ target-gemm-pilot/
 target-p92i/
 .claude/
 
-/configs/tuning/**/*.recipe
-/configs/tuning/**/*.recipe.*.tmp
-
 # Local MLX toolchains and runtime state.
 .apxinf/
+/configs/tuning/**/*.recipe
+/configs/tuning/**/*.recipe.*.tmp
