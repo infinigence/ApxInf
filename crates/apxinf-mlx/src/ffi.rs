@@ -10,6 +10,12 @@ extern "C" {
     pub fn apx_mlx_memory_stats(active: *mut usize, cache: *mut usize, peak: *mut usize) -> i32;
     pub fn apx_mlx_reset_peak_memory() -> i32;
     pub fn apx_mlx_clear_cache() -> i32;
+    pub fn apx_mlx_set_cache_limit(limit: usize, previous: *mut usize) -> i32;
+    pub fn apx_mlx_device_info(
+        index: i32,
+        name: *mut *const c_char,
+        architecture: *mut *const c_char,
+    ) -> i32;
     pub fn apx_mlx_array_new(
         stream: Handle,
         shape: *const i32,
@@ -68,6 +74,18 @@ extern "C" {
         bits: i32,
         outputs: *mut Handle,
     ) -> i32;
+    pub fn apx_mlx_safetensors_load(
+        path: *const c_char,
+        out: *mut Handle,
+        count: *mut usize,
+    ) -> i32;
+    pub fn apx_mlx_safetensors_entry(
+        loaded: *const c_void,
+        index: usize,
+        name: *mut *const c_char,
+        array: *mut Handle,
+    ) -> i32;
+    pub fn apx_mlx_safetensors_free(loaded: Handle);
     pub fn apx_mlx_metal_new(
         name: *const c_char,
         source: *const c_char,
@@ -76,6 +94,7 @@ extern "C" {
         input_count: usize,
         outputs: *const *const c_char,
         output_count: usize,
+        row_contiguous: i32,
         out: *mut Handle,
     ) -> i32;
     pub fn apx_mlx_metal_free(kernel: Handle);
@@ -90,7 +109,10 @@ extern "C" {
         output_count: usize,
         grid: *const i32,
         group: *const i32,
-        template_dtype: i32,
+        template_names: *const *const c_char,
+        template_kinds: *const i32,
+        template_values: *const i32,
+        template_count: usize,
         outputs: *mut Handle,
     ) -> i32;
 }
