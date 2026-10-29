@@ -126,7 +126,11 @@ Process exit does not establish successful model execution or output coverage.
 Candidate margins require measured justification.
 This profile approves no numerical margin, memory reservation, or latency threshold.
 Exploratory inputs do not become independent validation after candidate fitting.
-The [independent input gate](memory-evidence-plan-20261010.md#independent-input-gate) also applies to stage 08.
+Reserved prose and code inputs run in separate probe processes.
+Results collected before candidate definition remain exploratory input coverage.
+Those results cannot become independent validation after fitting.
+Use new reserved inputs when validation results change the candidate.
+Two inputs do not establish coverage of all model inputs.
 
 Reserve the existing Metal device lock before model execution.
 Do not run competing GPU work during a measurement.
@@ -219,6 +223,3 @@ The operator retains shutdown and parent reaping evidence separately.
 - [Shutdown contract](local-service-v0.1.md#metrics-and-shutdown).
 - [Calibration acceptance boundary](memory-calibration-v0.1.md#acceptance-boundaries).
 - [P1 gates](implementation-plan.md#p1-serial-streaming-and-exact-session-append).
-
-This document applies structural ASD-STE100 principles.
-Structural checks do not establish full dictionary compliance or certification.

@@ -97,5 +97,3 @@ Check literal thinking delimiters in final tool parameters.
 Check hidden length completion, malformed EOS completion, cancellation, expiry, and cleanup.
 Run the pinned model and real Claude tools before claiming runtime acceptance.
 File creation does not establish visual task quality.
-
-Structural writing checks do not establish a complete dictionary review or certification.

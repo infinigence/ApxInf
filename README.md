@@ -150,8 +150,8 @@ One MLX worker executes one request at a time.
 
 Read the [startup guide](doc/serving/local-service-v0.1.md) for the pinned
 environment, deployment limits, and supported API fields.
-Read the [validation report](doc/serving/serving-validation-20261009.md) for
-Qwen3.5-2B measurements and actual Claude Code tasks.
+Read the [support overview](doc/serving/support-status.md) for
+provider boundaries and the scope of historical model and client observations.
 The [system design](doc/serving-system-design-20261009.md) defines the broader
 framework and staged extensions.
 The default text profile does not accept images.
@@ -159,7 +159,6 @@ The separate [MiniCPM-V profile](doc/serving/minicpm-vision-v0.1.md) accepts bou
 The separate [Clef text profile](doc/serving/clef-text-v0.1.md) exposes typed decisions through `POST /v1/systemone`.
 It returns `noul`, `choice`, and `score` probabilities from the joint schema head.
 The service does not provide persistent sessions, prefix reuse, or continuous batching.
-Read the [current update report](doc/serving/serving-update-20261023.md) for tested capabilities and remaining limits.
 
 ### Run a policy through Python API
 

@@ -99,6 +99,3 @@ Test identity digests and unchanged rejection behavior for earlier protocols.
 Check zero output, sampler initialization, EOS, and cancellation in the shared loop.
 Check actual HTTP parameter propagation and real Claude Code tool calls.
 EOS completion does not establish drawing quality or visual task acceptance.
-
-This document applies structural ASD-STE100 principles.
-It does not claim a complete dictionary review or certification.
