@@ -63,14 +63,15 @@ pub fn loaded_library_path() -> Result<std::path::PathBuf> {
 pub fn reset_peak_memory() -> Result<()> {
     check(unsafe { ffi::apx_mlx_reset_peak_memory() })
 }
-/// Release cached allocator buffers process-wide. Active arrays remain valid.
-/// Synchronize first when measuring release, and use an isolated test process.
+/// Set the process-wide MLX allocator cache limit and return the previous value.
 pub fn set_cache_limit(limit: usize) -> Result<usize> {
     let mut previous = 0;
     check(unsafe { ffi::apx_mlx_set_cache_limit(limit, &mut previous) })?;
     Ok(previous)
 }
 
+/// Release cached allocator buffers process-wide. Active arrays remain valid.
+/// Synchronize first when measuring release, and use an isolated test process.
 pub fn clear_cache() -> Result<()> {
     check(unsafe { ffi::apx_mlx_clear_cache() })
 }
