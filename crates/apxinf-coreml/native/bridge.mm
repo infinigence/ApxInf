@@ -321,12 +321,14 @@ int apx_coreml_predict(void* handle, const char* const* input_names, const uint1
         if (!result) return fail(error, "Core ML prediction failed");
         return copy_outputs(result, output_names, outputs, output_shapes, output_ranks, output_count);
     }
+    });
 }
 
 int apx_coreml_predict_batch(void* handle, size_t batch, const char* const* input_names, const uint16_t* const* inputs,
                              const int64_t* const* input_shapes, const size_t* input_ranks, size_t input_count,
                              const char* const* output_names, uint16_t* const* outputs,
                              const int64_t* const* output_shapes, const size_t* output_ranks, size_t output_count) {
+    return guarded([&]() -> int {
     @autoreleasepool {
         MLModel* model = (__bridge MLModel*)handle;
         NSMutableArray<id<MLFeatureProvider>>* items = [NSMutableArray arrayWithCapacity:batch];

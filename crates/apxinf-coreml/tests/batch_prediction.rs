@@ -30,6 +30,12 @@ fn batch_items_match_single_predictions() -> Result<()> {
     let shape: &[usize] = &[1, 8, 1, 16];
     let outputs: [(&str, &[usize]); 1] = [("y", &[1, 4, 1, 16])];
     let batch: Vec<Vec<&[f16]>> = items.iter().map(|v| vec![&v[..]]).collect();
+    assert!(model
+        .predict(&[("missing", &items[0], shape)], &outputs)
+        .is_err());
+    assert!(model
+        .predict_batch(&[("missing", shape)], &batch, &outputs)
+        .is_err());
     let together = model.predict_batch(&[("x", shape)], &batch, &outputs)?;
     assert_eq!(together.len(), items.len());
     for (item, result) in items.iter().zip(&together) {
