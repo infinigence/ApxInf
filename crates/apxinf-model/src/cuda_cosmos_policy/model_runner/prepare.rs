@@ -1,68 +1,30 @@
 //! Request binding and fixed-profile lifetime for the existing VLA interface.
-use super::{model::Model, weights::Weights};
+use crate::cuda_cosmos_policy::backend::ops::GemmPolicy;
+use crate::cuda_cosmos_policy::backend::{
+    AttentionPolicy, CapturedGraph, CudaBuffer, CudaContext, ExecutionSession,
+};
+use crate::cuda_cosmos_policy::model::{CosmosPolicyModel, Inputs};
 use crate::vla::*;
-use apxinf_core::{DType, Device, Error, NormalGenerator, Result, Tensor};
-use apxinf_cuda_new::ops::GemmPolicy;
-use apxinf_cuda_new::{AttentionPolicy, CapturedGraph, CudaBuffer, CudaContext, ExecutionSession};
+use apxinf_core::{DType, Error, NormalGenerator, Result, Tensor};
 use std::{cell::RefCell, rc::Rc};
 
-fn invalid(message: &str) -> Error {
-    Error::Other(format!("Cosmos Policy: {message}"))
-}
-fn validate_spec(spec: &InferenceSpec) -> Result<()> {
-    if spec.token_count != 1 || spec.image_layout != Some(ImageLayout::Nhwc) {
-        return Err(invalid(
-            "LIBERO direct requires one cached-task ID and NHWC RGB",
-        ));
+use super::runner::{invalid, validate_request, validate_spec, ModelRunner};
+impl Inputs {
+    fn allocate(ctx: &CudaContext) -> Result<Self> {
+        let tensor = |shape: Vec<usize>, dtype: DType| {
+            let bytes = shape.iter().product::<usize>() * dtype.size_in_bytes();
+            CudaBuffer::alloc(bytes, ctx.device_id())
+                .map_err(Error::Cuda)?
+                .as_tensor(shape.into(), dtype)
+                .map_err(Error::Cuda)
+        };
+        Ok(Self {
+            rgb: CudaBuffer::alloc(2 * 224 * 224 * 3, ctx.device_id()).map_err(Error::Cuda)?,
+            proprio: tensor(vec![1, 9], DType::F32)?,
+            task: tensor(vec![1], DType::I32)?,
+            noise: tensor(vec![1, 16 * 9 * 28 * 28], DType::F32)?,
+        })
     }
-    Ok(())
-}
-fn validate_request(request: &VlaRequest<'_>) -> Result<()> {
-    validate_spec(&request.observation.inference_spec())?;
-    let o = request.observation;
-    match &o.vision {
-        VisionObservation::RgbU8 {
-            bytes,
-            layout: ImageLayout::Nhwc,
-        } if bytes.len() == 2 * 224 * 224 * 3 => {}
-        _ => return Err(invalid("expected two 224x224 RGB images")),
-    }
-    if o.token_ids[0] >= 40 {
-        return Err(invalid("cached-task ID is outside the supported table"));
-    }
-    let state = o
-        .state
-        .as_ref()
-        .ok_or_else(|| invalid("normalized proprioception is required"))?;
-    if state.device() != Device::Cpu
-        || state.dtype() != DType::F32
-        || state.shape().dims() != [9]
-        || state.as_f32()?.iter().any(|v| !v.is_finite())
-    {
-        return Err(invalid("proprioception must be finite host FP32 [9]"));
-    }
-    if o.action_mask.is_some()
-        || request.metadata.attention_mask.is_some()
-        || request.metadata.image_grid_thw.is_some()
-        || request.metadata.embodiment_id.is_some()
-        || request.metadata.planning.is_some()
-    {
-        return Err(invalid(
-            "direct profile does not take masks, embodiment overrides or planning options",
-        ));
-    }
-    if let InitialLatent::Provided(noise) = request.initial_latent {
-        if noise.device() != Device::Cpu
-            || noise.dtype() != DType::F32
-            || noise.shape().dims() != [1, 16, 9, 28, 28]
-            || noise.as_f32()?.iter().any(|v| !v.is_finite())
-        {
-            return Err(invalid(
-                "supplied noise must be finite host FP32 [1,16,9,28,28]",
-            ));
-        }
-    }
-    Ok(())
 }
 fn upload_f32(t: &Tensor, values: &[f32]) -> Result<()> {
     let bytes: Vec<_> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
@@ -74,7 +36,9 @@ fn upload_f32(t: &Tensor, values: &[f32]) -> Result<()> {
 struct PlanState {
     // Graph is dropped before its model/session owners.
     graph: Option<CapturedGraph>,
-    model: Model,
+    model: CosmosPolicyModel,
+    ctx: Rc<CudaContext>,
+    inputs: Inputs,
     session: ExecutionSession,
     generator: Box<dyn NormalGenerator>,
     gemm: GemmPolicy,
@@ -83,20 +47,20 @@ struct PlanState {
 impl PlanState {
     fn bind(&mut self, request: &VlaRequest<'_>) -> Result<()> {
         validate_request(request)?;
-        self.model.ctx.synchronize().map_err(Error::Cuda)?;
+        self.ctx.synchronize().map_err(Error::Cuda)?;
         if let VisionObservation::RgbU8 { bytes, .. } = &request.observation.vision {
-            self.model.rgb.copy_from_host(bytes).map_err(Error::Cuda)?;
+            self.inputs.rgb.copy_from_host(bytes).map_err(Error::Cuda)?;
         }
         upload_f32(
-            &self.model.proprio,
+            &self.inputs.proprio,
             request.observation.state.as_ref().unwrap().as_f32()?,
         )?;
-        CudaBuffer::from_tensor(&self.model.task)
+        CudaBuffer::from_tensor(&self.inputs.task)
             .map_err(Error::Cuda)?
             .copy_from_host(&(request.observation.token_ids[0] as i32).to_ne_bytes())
             .map_err(Error::Cuda)?;
         match request.initial_latent {
-            InitialLatent::Provided(noise) => upload_f32(&self.model.noise, noise.as_f32()?)?,
+            InitialLatent::Provided(noise) => upload_f32(&self.inputs.noise, noise.as_f32()?)?,
             InitialLatent::Generate { rng } => {
                 self.generator.generate(rng)?;
             }
@@ -116,14 +80,14 @@ impl PlanState {
             } = self;
             session.run(|| model.forward(gemm, attention))?;
         }
-        self.model.ctx.synchronize().map_err(Error::Cuda)
+        self.ctx.synchronize().map_err(Error::Cuda)
     }
 }
 
 #[derive(Clone)]
-struct Plan {
+pub(super) struct Plan {
     spec: InferenceSpec,
-    status: PreparationStatus,
+    pub(super) status: PreparationStatus,
     state: Rc<RefCell<PlanState>>,
 }
 impl PreparedInference for Plan {
@@ -145,44 +109,22 @@ impl PreparedInference for Plan {
         state.compute()?;
         // Publish independent device storage. Retained actions survive replay,
         // plan eviction and runner destruction without exposing scratch buffers.
-        let buffer =
-            CudaBuffer::alloc(16 * 7 * 4, state.model.ctx.device_id()).map_err(Error::Cuda)?;
+        let buffer = CudaBuffer::alloc(16 * 7 * 4, state.ctx.device_id()).map_err(Error::Cuda)?;
         let output = buffer
-            .as_tensor(state.model.actions.shape().clone(), DType::F32)
+            .as_tensor(state.model.actions().shape().clone(), DType::F32)
             .map_err(Error::Cuda)?;
-        apxinf_cuda_new::transfers::copy_cuda_to_cuda(
-            &state.model.ctx,
-            &state.model.actions,
+        crate::cuda_cosmos_policy::backend::transfers::copy_cuda_to_cuda(
+            &state.ctx,
+            state.model.actions(),
             &output,
         )?;
-        state.model.ctx.synchronize().map_err(Error::Cuda)?;
+        state.ctx.synchronize().map_err(Error::Cuda)?;
         Ok(Action::new(output))
     }
 }
 
-pub(super) struct ModelRunner {
-    ctx: Rc<CudaContext>,
-    weights: Rc<Weights>,
-    gemm: GemmPolicy,
-    attention: AttentionPolicy,
-    implicit: RefCell<Option<Plan>>,
-}
 impl ModelRunner {
-    pub fn new(
-        ctx: Rc<CudaContext>,
-        weights: Rc<Weights>,
-        gemm: GemmPolicy,
-        attention: AttentionPolicy,
-    ) -> Self {
-        Self {
-            ctx,
-            weights,
-            gemm,
-            attention,
-            implicit: RefCell::new(None),
-        }
-    }
-    fn plan(
+    pub(super) fn plan(
         &self,
         spec: &InferenceSpec,
         policy: ExecutionPolicy,
@@ -195,9 +137,13 @@ impl ModelRunner {
                 return Err(invalid("sample/spec mismatch"));
             }
         }
-        let model = Model::new(self.ctx.clone(), self.weights.clone())?;
-        let generator =
-            apxinf_cuda_new::sampling::create_normal_generator(&self.ctx, model.noise.clone())?;
+        let inputs = Inputs::allocate(&self.ctx)?;
+        let model = CosmosPolicyModel::new(self.ctx.clone(), self.weights.clone(), &inputs)?;
+        let workspace_bytes = model.workspace_bytes();
+        let generator = crate::cuda_cosmos_policy::backend::sampling::create_normal_generator(
+            &self.ctx,
+            inputs.noise.clone(),
+        )?;
         let mut gemm = self.gemm.clone();
         let mut attention = self.attention.clone();
         if sample.is_none() {
@@ -207,7 +153,9 @@ impl ModelRunner {
         let mut state = PlanState {
             graph: None,
             model,
-            session: ExecutionSession::with_capacity(256 * 1024 * 1024, self.ctx.device_id())?,
+            ctx: self.ctx.clone(),
+            inputs,
+            session: ExecutionSession::with_capacity(workspace_bytes, self.ctx.device_id())?,
             generator,
             gemm,
             attention,
@@ -216,13 +164,13 @@ impl ModelRunner {
             state.bind(sample)?;
         } else {
             state
-                .model
+                .inputs
                 .rgb
                 .copy_from_host(&vec![0; 2 * 224 * 224 * 3])
                 .map_err(Error::Cuda)?;
-            upload_f32(&state.model.proprio, &[0.; 9])?;
-            upload_f32(&state.model.noise, &vec![0.; 16 * 9 * 28 * 28])?;
-            CudaBuffer::from_tensor(&state.model.task)
+            upload_f32(&state.inputs.proprio, &[0.; 9])?;
+            upload_f32(&state.inputs.noise, &vec![0.; 16 * 9 * 28 * 28])?;
+            CudaBuffer::from_tensor(&state.inputs.task)
                 .map_err(Error::Cuda)?
                 .copy_from_host(&0i32.to_ne_bytes())
                 .map_err(Error::Cuda)?;
@@ -250,7 +198,7 @@ impl ModelRunner {
                 attention,
                 ..
             } = &mut state;
-            match apxinf_cuda_new::capture(&self.ctx, || {
+            match crate::cuda_cosmos_policy::backend::capture(&self.ctx, || {
                 session.run(|| model.forward(gemm, attention))
             }) {
                 Ok(graph) => {
@@ -273,92 +221,10 @@ impl ModelRunner {
         })
     }
 }
-impl VlaRuntime for ModelRunner {
-    fn model_variant(&self) -> Option<&'static str> {
-        Some("bf16")
-    }
-    fn contract(&self) -> VlaContract {
-        VlaContract {
-            action_shape: [16, 7],
-            patch_shape: [224 * 224 * 2, 3],
-            max_token_len: 1,
-            num_views: 2,
-            image_size: 224,
-            patch_size: 1,
-            accepts_rgb_u8: true,
-        }
-    }
-    fn initial_latent_shape(&self) -> Vec<usize> {
-        vec![1, 16, 9, 28, 28]
-    }
-    fn infer(&self, request: &VlaRequest<'_>) -> Result<Action> {
-        validate_request(request)?;
-        if self.implicit.borrow().is_none() {
-            let plan = self.plan(
-                &request.observation.inference_spec(),
-                ExecutionPolicy::RequireGraph,
-                Some(request),
-            )?;
-            *self.implicit.borrow_mut() = Some(plan);
-        }
-        let plan = self.implicit.borrow().as_ref().unwrap().clone();
-        plan.run(request)
-    }
-    fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
-        self.prepare_with_policy(spec, ExecutionPolicy::RequireGraph)
-    }
-    fn prepare_with_policy(
-        &self,
-        spec: &InferenceSpec,
-        policy: ExecutionPolicy,
-    ) -> Result<Box<dyn PreparedInference>> {
-        Ok(Box::new(self.plan(spec, policy, None)?))
-    }
-    fn prepare_for(
-        &self,
-        sample: &VlaRequest<'_>,
-        policy: ExecutionPolicy,
-    ) -> Result<Box<dyn PreparedInference>> {
-        Ok(Box::new(self.plan(
-            &sample.observation.inference_spec(),
-            policy,
-            Some(sample),
-        )?))
-    }
-    fn clear_prepared(&self) -> Result<()> {
-        *self.implicit.borrow_mut() = None;
-        Ok(())
-    }
-    fn execution_mode(&self) -> &'static str {
-        match self.implicit.borrow().as_ref().map(|p| &p.status) {
-            Some(PreparationStatus::Ready {
-                mode: ExecutionMode::Graph,
-                ..
-            }) => "graph",
-            Some(PreparationStatus::Ready {
-                mode: ExecutionMode::Eager,
-                ..
-            }) => "eager",
-            _ => "unprepared",
-        }
-    }
-    fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
-        let action = self.infer(request)?;
-        let mut bytes = vec![0; 16 * 7 * 4];
-        CudaBuffer::from_tensor(action.tensor())
-            .map_err(Error::Cuda)?
-            .copy_to_host(&mut bytes)
-            .map_err(Error::Cuda)?;
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
-            .collect())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cuda_cosmos_policy::weights::Bf16Weights;
     use std::{path::PathBuf, time::Instant};
     fn host(t: &Tensor) -> Result<Vec<f32>> {
         let mut bytes = vec![0; t.size_in_bytes()];
@@ -427,7 +293,7 @@ mod tests {
         let tune = std::env::var("APXINF_COSMOS_TUNE").as_deref() == Ok("1");
         let ctx = Rc::new(CudaContext::new_with_autotune(0, tune).map_err(Error::Cuda)?);
         let cache_dir = Some(root.join("recipes").to_string_lossy().into_owned());
-        let weights = Rc::new(Weights::load(&root.join("native-assets"), 0)?);
+        let weights = Rc::new(Bf16Weights::load(&root.join("native-assets"), 0)?);
         let gemm = GemmPolicy {
             online_tune: tune,
             cache_dir: cache_dir.clone(),
@@ -456,7 +322,7 @@ mod tests {
         );
         let retained = eager.run(&request)?;
         let eager_action = host(retained.tensor())?;
-        let joint = host(&eager.state.borrow().model.joint)?;
+        let joint = host(eager.state.borrow().model.joint())?;
         std::fs::write(
             root.join("joint-native-output.f32"),
             joint

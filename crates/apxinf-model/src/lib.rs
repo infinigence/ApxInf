@@ -3,7 +3,7 @@
 mod accelerator;
 pub mod auto;
 pub mod builtin;
-pub mod cosmos_policy;
+pub mod cuda_cosmos_policy;
 pub mod d3;
 pub mod debug;
 mod generation_config;

@@ -120,7 +120,12 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    repeated hot-path scaffold with a safe device path; build cost and passing
    end-to-end values do not turn host round trips into deliverable performance
    debt.
-6. Create `crates/apxinf-model/src/<model>/`. Start with a self-contained
+6. Choose the native family name and single-precision layout from
+   `adding-a-new-model.md#start-with-a-separate-model-directory`. Verify that
+   `Bf16Blocks` encapsulates tensor representations and operator composition,
+   rather than only moving subnetwork files underneath a new directory. Keep
+   host/device weights separate from forward computation, and preparation
+   separate from runtime validation. Start with a self-contained
    implementation. Inspect and copy a close model when useful, but do not import
    or modify another model-family directory for the new architecture. Defer
    shared extraction to a separate review after repeated maintained

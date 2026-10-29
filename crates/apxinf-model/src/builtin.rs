@@ -43,7 +43,7 @@ pub fn register_builtin_models() {
     #[cfg(feature = "cuda")]
     crate::smolvla::register_builtin();
     #[cfg(feature = "cuda")]
-    crate::cosmos_policy::register_builtin();
+    crate::cuda_cosmos_policy::register_builtin();
 }
 fn load_llama(
     path: &Path,

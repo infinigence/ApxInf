@@ -392,9 +392,9 @@ impl AutoModel {
             return Err(Error::Other("d3-mini requires CUDA support".into()));
         }
 
-        if matches!(model_name, "cosmos-policy" | "cosmos-policy-cuda") {
+        if matches!(model_name, "cosmos-policy" | "cosmos-policy-cuda" | "cuda_cosmos_policy") {
             #[cfg(feature = "cuda")]
-            return crate::cosmos_policy::load::load_with_cuda_new(path, device, options);
+            return crate::cuda_cosmos_policy::load::load_with_cuda_new(path, device, options);
             #[cfg(not(feature = "cuda"))]
             return Err(Error::Other("Cosmos Policy requires CUDA support".into()));
         }
@@ -518,6 +518,7 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "smolvla_libero"
             | "cosmos-policy"
             | "cosmos-policy-cuda"
+            | "cuda_cosmos_policy"
     ) || (matches!(device, Device::Metal(_))
         && matches!(
             model_name,

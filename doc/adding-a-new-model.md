@@ -20,6 +20,18 @@ Every model implementation starts in its own directory:
 crates/apxinf-model/src/<model>/
 ```
 
+A new implementation that directly composes one backend's native APIs uses
+`<backend>_<family>/`, for example `cuda_cosmos_policy/`. Preserve existing
+public model names as loader aliases when renaming a native module.
+
+For a single BF16 VLA, follow the PI0.5 responsibility boundaries with one
+`model/blocks/bf16.rs` and one `weights/bf16.rs`, plus host checkpoint storage in
+`weights/host.rs`. A concrete `Bf16Blocks` encapsulates operator calls and
+intermediate representations; the model owns connectivity and the sampling
+schedule. Keep runtime validation/cache and preparation/resource ownership in
+`model_runner/{runner,prepare}.rs`. Split a precision file only for a demonstrated
+maintenance need; subnetwork count alone does not require extra files or traits.
+
 Do not add the new architecture to `llama/`, `qwen3vl/`, or `pi05/`, even when
 most code looks similar. Register the new directory from `lib.rs` and
 `builtin.rs`; keep model detection in the existing registry/`AutoModel` path.

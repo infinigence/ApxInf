@@ -1,24 +1,24 @@
 //! Source-key validation and one-time device packing. Linear matrices become
 //! [in,out]; convolution columns are kernel T/H/W/C to match native lowering.
-use std::collections::HashMap;
+use super::host::Store;
 use std::path::Path;
 
-use apxinf_core::{DType, Device, Error, Result, Shape, Tensor};
-use apxinf_cuda_new::CudaBuffer;
+use crate::cuda_cosmos_policy::backend::CudaBuffer;
+use apxinf_core::{Device, Error, Result, Shape, Tensor};
 
-pub(super) struct Linear {
+pub(in crate::cuda_cosmos_policy) struct Linear {
     pub weight: Tensor,
     pub bias: Option<Tensor>,
 }
 
-pub(super) struct Conv {
+pub(in crate::cuda_cosmos_policy) struct Conv {
     pub linear: Linear,
     pub kernel: [usize; 3],
     pub input_channels: usize,
     pub output_channels: usize,
 }
 
-pub(super) struct Attention {
+pub(in crate::cuda_cosmos_policy) struct Attention {
     pub q: Linear,
     pub k: Linear,
     pub v: Linear,
@@ -27,12 +27,12 @@ pub(super) struct Attention {
     pub k_norm: Tensor,
 }
 
-pub(super) struct Modulation {
+pub(in crate::cuda_cosmos_policy) struct Modulation {
     pub down: Linear,
     pub up: Linear,
 }
 
-pub(super) struct DitBlock {
+pub(in crate::cuda_cosmos_policy) struct DitBlock {
     pub self_attention: Attention,
     pub cross_attention: Attention,
     pub mlp_up: Linear,
@@ -42,7 +42,7 @@ pub(super) struct DitBlock {
     pub mlp_modulation: Modulation,
 }
 
-pub(super) struct DitWeights {
+pub(in crate::cuda_cosmos_policy) struct DitWeights {
     pub patch: Linear,
     pub time_in: Linear,
     pub time_out: Linear,
@@ -57,44 +57,25 @@ pub(super) struct DitWeights {
 }
 
 struct Reader {
-    tensors: HashMap<String, Tensor>,
+    host: Store,
     device: usize,
 }
-
 impl Reader {
     fn new(path: &Path, device: usize) -> Result<Self> {
-        let (tensors, _) = apxinf_loader::safetensors::load_native_path(path)
-            .map_err(|e| Error::Other(format!("load {}: {e}", path.display())))?;
-        Ok(Self { tensors, device })
+        Ok(Self {
+            host: Store::new(path)?,
+            device,
+        })
     }
-
-    fn take(&mut self, name: &str, shape: &[usize]) -> Result<Tensor> {
-        let tensor = self
-            .tensors
-            .remove(name)
-            .ok_or_else(|| Error::Other(format!("missing Cosmos Policy weight {name}")))?;
-        if tensor.dtype() != DType::BF16 || tensor.shape().dims() != shape {
-            return Err(Error::Other(format!(
-                "Cosmos Policy weight {name}: expected BF16 {shape:?}, got {} {:?}",
-                tensor.dtype(),
-                tensor.shape().dims()
-            )));
-        }
-        if tensor.as_bf16()?.iter().any(|x| !x.to_f32().is_finite()) {
-            return Err(Error::Other(format!(
-                "nonfinite Cosmos Policy weight {name}"
-            )));
-        }
-        Ok(tensor)
-    }
-
     fn vector(&mut self, name: &str, shape: &[usize]) -> Result<Tensor> {
-        let tensor = self.take(name, shape)?;
+        let tensor = self.host.take(name, shape)?;
         upload(&tensor.reshape(vec![tensor.numel()])?, self.device)
     }
 
     fn linear(&mut self, prefix: &str, output: usize, input: usize) -> Result<Linear> {
-        let tensor = self.take(&format!("{prefix}.weight"), &[output, input])?;
+        let tensor = self
+            .host
+            .take(&format!("{prefix}.weight"), &[output, input])?;
         Ok(Linear {
             weight: upload(&transpose_bf16(&tensor)?, self.device)?,
             bias: None,
@@ -130,7 +111,7 @@ impl Reader {
             .into_iter()
             .chain(kernel.iter().copied())
             .collect();
-        let tensor = self.take(&format!("{prefix}.weight"), &shape)?;
+        let tensor = self.host.take(&format!("{prefix}.weight"), &shape)?;
         let packed = pack_conv(&tensor)?;
         let mut k3 = [1, 1, 1];
         k3[3 - kernel.len()..].copy_from_slice(kernel);
@@ -157,17 +138,6 @@ impl Reader {
                 Some(self.conv(&format!("{prefix}.shortcut"), output, input, &[1, 1, 1])?)
             },
         })
-    }
-
-    fn finish(self) -> Result<()> {
-        if !self.tensors.is_empty() {
-            let mut names: Vec<_> = self.tensors.into_keys().collect();
-            names.sort();
-            return Err(Error::Other(format!(
-                "unexpected Cosmos Policy weights: {names:?}"
-            )));
-        }
-        Ok(())
     }
 }
 
@@ -196,16 +166,16 @@ impl DitWeights {
             blocks,
             final_modulation: r.modulation("final_layer.adaln_modulation", 4096)?,
             final_projection: r.linear("final_layer.linear", 64, 2048)?,
-            position_seq: r.take("pos_embedder.seq", &[128])?,
-            spatial_range: r.take("pos_embedder.dim_spatial_range", &[21])?,
-            temporal_range: r.take("pos_embedder.dim_temporal_range", &[22])?,
+            position_seq: r.host.take("pos_embedder.seq", &[128])?,
+            spatial_range: r.host.take("pos_embedder.dim_spatial_range", &[21])?,
+            temporal_range: r.host.take("pos_embedder.dim_temporal_range", &[22])?,
         };
-        r.finish()?;
+        r.host.finish()?;
         Ok(result)
     }
 }
 
-pub(super) struct VaeResidual {
+pub(in crate::cuda_cosmos_policy) struct VaeResidual {
     pub norm1: Tensor,
     pub conv1: Conv,
     pub norm2: Tensor,
@@ -213,12 +183,12 @@ pub(super) struct VaeResidual {
     pub shortcut: Option<Conv>,
 }
 
-pub(super) struct VaeDownsample {
+pub(in crate::cuda_cosmos_policy) struct VaeDownsample {
     pub spatial: Conv,
     pub temporal: Option<Conv>,
 }
 
-pub(super) struct VaeWeights {
+pub(in crate::cuda_cosmos_policy) struct VaeWeights {
     pub input: Conv,
     pub down_blocks: Vec<[VaeResidual; 2]>,
     pub downsample: Vec<VaeDownsample>,
@@ -277,12 +247,12 @@ impl VaeWeights {
             output: r.conv("encoder.head.2", 32, 384, &[3, 3, 3])?,
             mean_projection: r.conv("conv1", 32, 32, &[1, 1, 1])?,
         };
-        r.finish()?;
+        r.host.finish()?;
         Ok(result)
     }
 }
 
-pub(super) fn upload(tensor: &Tensor, device: usize) -> Result<Tensor> {
+pub(in crate::cuda_cosmos_policy) fn upload(tensor: &Tensor, device: usize) -> Result<Tensor> {
     if tensor.device() != Device::Cpu {
         return Err(Error::Other(
             "Cosmos Policy upload requires host weights".into(),
@@ -336,6 +306,7 @@ fn transpose_bf16(tensor: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apxinf_core::DType;
     #[test]
     fn linear_packing_preserves_bf16_bits() {
         let bits = [0x3f80, 0x8000, 0x3f81, 0xbf80, 0x0001, 0x4000];
@@ -377,22 +348,23 @@ mod tests {
     }
 }
 
-pub(super) struct Weights {
+pub(in crate::cuda_cosmos_policy) struct Bf16Weights {
     pub dit: DitWeights,
     pub vae: VaeWeights,
     pub text: Tensor,
 }
-impl Weights {
+impl Bf16Weights {
     pub fn load(path: &Path, device: usize) -> Result<Self> {
         let dit = DitWeights::load(&path.join("model.safetensors"), device)?;
         let vae = VaeWeights::load(&path.join("vae_encoder.safetensors"), device)?;
         let mut r = Reader::new(&path.join("text.safetensors"), device)?;
         let text = upload(
-            &r.take("embeddings", &[40, 512, 1024])?
+            &r.host
+                .take("embeddings", &[40, 512, 1024])?
                 .reshape(vec![40, 512 * 1024])?,
             device,
         )?;
-        r.finish()?;
+        r.host.finish()?;
         Ok(Self { dit, vae, text })
     }
 }

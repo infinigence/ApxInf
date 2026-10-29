@@ -1,8 +1,8 @@
-use super::{model_runner::ModelRunner, weights::Weights, CosmosPolicyConfig};
+use super::{model_runner::ModelRunner, weights::Bf16Weights, CosmosPolicyConfig};
 use crate::auto::{cuda_recipe_options, LoadOptions, LoadedModel, ModelPrecision};
+use crate::cuda_cosmos_policy::backend::ops::GemmPolicy;
+use crate::cuda_cosmos_policy::backend::{AttentionPolicy, CudaContext};
 use apxinf_core::{Backend, Device, Error, Result};
-use apxinf_cuda_new::ops::GemmPolicy;
-use apxinf_cuda_new::{AttentionPolicy, CudaContext};
 use std::{path::Path, rc::Rc, sync::Arc};
 
 pub(crate) fn load_with_cuda_new(
@@ -40,7 +40,7 @@ pub(crate) fn load_with_cuda_new(
     let recipe = cuda_recipe_options(options)?;
     let ctx =
         Rc::new(CudaContext::new_with_autotune(device, options.autotune).map_err(Error::Cuda)?);
-    let weights = Rc::new(Weights::load(path, device)?);
+    let weights = Rc::new(Bf16Weights::load(path, device)?);
     let gemm = GemmPolicy {
         online_tune: recipe.online_tune,
         cache_dir: recipe.cache_dir.clone(),

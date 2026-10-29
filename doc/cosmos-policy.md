@@ -66,12 +66,34 @@ joint-noise geometry independently of the action shape.
 
 ## Computation and ownership
 
-`cosmos_policy/config.rs` admits the fixed profile; `weights.rs` validates keys,
-shapes and dtypes and performs one-time BF16 packing. `model/` owns causal VAE
-encoding, full DiT forward, joint conditioning, sampling and action reduction.
-`model_runner.rs` binds observations/RNG to stable buffers and owns execution
-sessions, graph lifetime and preparation policy. There is no additional WAM
-runtime, and no import from another model family.
+The native family is `cuda_cosmos_policy/`; the existing public `cosmos-policy`
+selection and checkpoint metadata remain compatible. `cuda_cosmos_policy` is
+also an explicit native loader alias.
+
+```text
+cuda_cosmos_policy/
+  config.rs / load.rs          validation and construction
+  backend.rs                  safe CUDA API reexports only
+  weights/host.rs              host checkpoint storage and validation
+  weights/bf16.rs              BF16 device types, mapping, packing and upload
+  weights/mod.rs               deliberate weight exports
+  model/mod.rs                modality connection and five-step RF/2ab schedule
+  model/blocks/bf16.rs         Bf16Blocks, private VAE/DiT and tensor composition
+  model/blocks/mod.rs          one concrete precision implementation
+  model_runner/runner.rs       VlaRuntime, request validation and implicit cache
+  model_runner/prepare.rs      device inputs, binding/RNG, sessions and graph lifetime
+  model_runner/mod.rs          runtime export
+```
+
+`Bf16Blocks` owns intermediate representations and reports workspace requirements;
+the runner allocates canonical device inputs and execution resources. The model
+calls observation encoding, noise initialization, denoising steps and action
+readout through that boundary. Subnetworks remain private inside the single
+BF16 file. Host storage does not depend on CUDA; weights never execute model
+forward methods. There is no additional WAM runtime, variant abstraction or
+import from another model family. The maintained
+[`ownership guard`](../scripts/check_cosmos_policy_module_boundaries.py) checks
+these dependencies and file placement; numerical tests establish behavior.
 
 The latent has nine frames: blank, current proprioception, current wrist image,
 current primary image, action, future proprioception, future wrist image,
@@ -129,7 +151,7 @@ the first five latents of its complete 33-frame encoding. Changing the reference
 probe to contiguous NCTHW changed cuDNN rounding and was not used as the golden.
 The instantiated checkpoint uses spatial RoPE NTK `3^(42/40)` and temporal `1`.
 
-With two warmups and five timed calls, the native whole-model graph measured
+At initial port commit `544865c0`, with two warmups and five timed calls, the native whole-model graph measured
 **2455.89 ms median / 2502.46 ms p95**, including input binding, independent
 Action publication and synchronization. The Python policy measured a 2517.16 ms
 median including preprocessing and action unnormalization. The official direct
@@ -145,6 +167,14 @@ The reference reported 6,866,727,424 bytes peak PyTorch allocation; these two
 memory measurements have different scopes. The lifecycle test that temporarily held two plans reached 23,962 MiB in
 process GPU-memory samples. The initial per-tile GEMM binding memory growth was fixed
 by sharing tile bindings and retested successfully.
+
+The 2026-10-29 ownership refactor was rebuilt on Thor and explicitly reran all
+eight family tests, including the three fixture-dependent device tests: VAE,
+DiT, and full joint actions/preparation/lifetime. The VAE prefix and complete
+joint output are bitwise identical to the retained pre-refactor outputs. The
+11 Python policy tests and the module ownership guard also pass. These checks
+validate the new module/interface boundaries; the latency figures above remain
+labelled with their original measured revision.
 
 This establishes fixed-observation numerical/runtime acceptance, not a LIBERO
 simulation success-rate benchmark. The broad cuda-new integration-test build
