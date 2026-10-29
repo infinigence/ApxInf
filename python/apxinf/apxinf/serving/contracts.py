@@ -426,7 +426,8 @@ def validate_frame(frame: dict) -> None:
             _digest(frame["runtime"]["metal_library_sha256"])
             _require(type(frame["model_manifest"]) is dict, "model manifest must be an object")
             _require(frame["model_manifest"].get("runtime") == frame["runtime"], "native runtime mismatch")
-            _require(type(manifest.get("execution")) is dict, "expected native execution identity")
+            _require((not prepared and "execution" not in manifest)
+                     or type(manifest.get("execution")) is dict, "expected native execution identity")
             if prepared:
                 execution = manifest.get("execution")
                 _keys(execution, {"provider", "precision", "variant", "parser", "enable_thinking", "max_context",
