@@ -202,7 +202,6 @@ enum Commands {
         device: String,
     },
 
-
     /// Synthesize speech from text and write it as 32-bit float WAV
     Speak {
         /// Path to the speech model directory
