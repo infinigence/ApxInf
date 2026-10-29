@@ -45,6 +45,7 @@ struct Args {
     max_context: usize,
     #[arg(long, default_value_t = 2048)]
     max_output_tokens: usize,
+    /// Python prefill chunk size. Native profiles retain 256 for launch compatibility and use their family plan.
     #[arg(long, default_value_t = 256)]
     prefill_step_size: usize,
     #[arg(long, default_value_t = 1)]
