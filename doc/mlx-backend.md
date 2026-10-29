@@ -161,6 +161,15 @@ Use `--keep-special-tokens` when special-token text carries application meaning;
 chat options containing `tools` enable this behavior automatically. MiniCPM's
 `<function>`/`<param>` tags must survive decoding for valid tool XML.
 
+## Native serving preparation lifetime
+
+The opt-in [prepared-code profile](serving/native-prepared-v0.1.md) separates model-owned code from request KV.
+It retains one complete MiniCPM5 preparation key and reports memory after cleanup.
+The existing native profiles retain release-all settlement.
+This lifetime policy does not add a model arithmetic variant.
+Only the worker owner sets process-wide allocator cache limits.
+The ordinary public forward output contract remains unchanged.
+
 ## Native dependency and ABI
 
 The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.

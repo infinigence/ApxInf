@@ -36,6 +36,14 @@ decode with the fixed packed residual/norm kernel. Every new KV array and output
 is evaluated before the request state is published; failed preparation cannot
 be reported ready. Changing prepared capacity requires a reset.
 
+The explicit `release_request_state_retaining_preparation` operation supports ordinary compiled MiniCPM5 only.
+It synchronizes execution and releases request KV, taps and logical position.
+One model-owned compiled entry and immutable shape metadata can remain.
+Preparation status becomes `Unprepared` until fresh request KV exists.
+A changed complete preparation key replaces the entry and its local traces.
+The ordinary `release_request_state` operation still removes prepared code.
+The [native prepared profile](../../../../doc/serving/native-prepared-v0.1.md) defines its service accounting and opt-in selection.
+
 Initial allocation gives all 84 K/V slots one shared immutable BF16 zero array.
 This applies to Public, Compiled and DSpark. Each layer's functional update
 returns its own K/V values; compiled inputs and outputs keep separate slots.
