@@ -260,7 +260,7 @@ This operation returns success only after the coordinator reaps all owned worker
 The operation returns an error if the coordinator fails or cannot reap an owned worker process.
 The CLI awaits `Service::wait_stopped` after the HTTP server stops.
 
-## Handwritten validator interface
+## validator interface
 
 Rust exposes `decode_frame`, `validate_frame`, `encode_frame`, and `AttemptTracker`.
 Python exposes the same names and behavior.

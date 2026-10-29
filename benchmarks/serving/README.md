@@ -1,6 +1,6 @@
 # Serving measurements and client tasks
 
-These tools contain original, handwritten Python code and fixtures.
+These tools contain original, Python code and fixtures.
 They use Python standard library APIs. They add no runtime dependency.
 HTTP clients accept loopback endpoints only.
 

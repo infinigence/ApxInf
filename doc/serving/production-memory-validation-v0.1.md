@@ -219,6 +219,3 @@ The operator retains shutdown and parent reaping evidence separately.
 - [Shutdown contract](local-service-v0.1.md#metrics-and-shutdown).
 - [Calibration acceptance boundary](memory-calibration-v0.1.md#acceptance-boundaries).
 - [P1 gates](implementation-plan.md#p1-serial-streaming-and-exact-session-append).
-
-This document applies structural ASD-STE100 principles.
-Structural checks do not establish full dictionary compliance or certification.
