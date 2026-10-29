@@ -13,7 +13,8 @@ mod weights;
 pub use config::{Config, MAX_INPUT_TOKENS};
 
 use crate::decision::{
-    DecisionAnswer, DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema, DecisionScore,
+    DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema, SchemaDecisionAnswer,
+    SchemaDecisionOutput, SchemaDecisionScore,
 };
 use crate::llm_trait::LlmCapabilities;
 use crate::{LoadOptions, LoadedModel, ModelPrecision};
@@ -128,7 +129,7 @@ pub fn load(
 }
 
 impl ClefRunner {
-    fn decide_schema(&self, schema: &DecisionSchema) -> Result<DecisionOutput> {
+    fn score_schema(&self, schema: &DecisionSchema) -> Result<SchemaDecisionOutput> {
         let encoded = encode::encode(&self.tokenizer, schema)?;
         let logits = self.network.logits(&encoded)?;
         self.network.stream().eval(&logits)?;
@@ -155,22 +156,18 @@ impl ClefRunner {
                     selected_index = i;
                 }
             }
-            answers.push(DecisionAnswer {
-                question_id: Some(question.id),
+            answers.push(SchemaDecisionAnswer {
+                question_id: question.id,
                 selected_index,
                 scores: question
                     .option_ids
                     .into_iter()
                     .zip(row)
-                    .map(|(code, &probability)| DecisionScore {
-                        code,
-                        token_id: None,
-                        probability,
-                    })
+                    .map(|(code, &probability)| SchemaDecisionScore { code, probability })
                     .collect(),
             });
         }
-        Ok(DecisionOutput { answers })
+        Ok(SchemaDecisionOutput { answers })
     }
 }
 
@@ -179,13 +176,14 @@ impl DecisionRuntime for ClefRunner {
         LlmCapabilities::TEXT_ONLY
     }
 
-    fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
-        match input {
-            DecisionInput::Schema(schema) => self.decide_schema(schema),
-            DecisionInput::Encoded { .. } => Err(Error::Other(
-                "Clef encodes its own prompt; pass a schema request".into(),
-            )),
-        }
+    fn decide(&mut self, _input: DecisionInput<'_>) -> Result<DecisionOutput> {
+        Err(Error::Other(
+            "Clef encodes its own prompt; pass a schema request".into(),
+        ))
+    }
+
+    fn decide_schema(&mut self, schema: &DecisionSchema) -> Result<SchemaDecisionOutput> {
+        self.score_schema(schema)
     }
 
     fn code_names(&self) -> &[String] {

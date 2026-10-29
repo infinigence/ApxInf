@@ -7,7 +7,9 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 
 use crate::accelerator::create_backend_with_recipe_options;
 use crate::builtin::register_builtin_models;
-use crate::decision::{DecisionInput, DecisionOutput, DecisionRuntime};
+use crate::decision::{
+    DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema, SchemaDecisionOutput,
+};
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
@@ -130,6 +132,11 @@ impl LoadedModel {
 
     pub fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
         self.decision_mut()?.decide(input)
+    }
+
+    /// Score named schema questions without changing encoded decision requests.
+    pub fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
+        self.decision_mut()?.decide_schema(request)
     }
 
     pub fn decision_code_names(&self) -> Result<&[String]> {
