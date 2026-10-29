@@ -1,12 +1,15 @@
 # Core ML and Apple Neural Engine execution (proposal)
 
 Status: design under review; no Core ML code is merged. On 2026-10-19 the
-requesting Metal maintainer accepted the fixed-profile Clef host-handoff scope
+fork operator accepted the fixed-profile Clef host-handoff scope
 below, conditional on completing every qualification gate. This decision does
 not approve unrelated interfaces, qualify an implementation or merge a PR.
-The same maintainer subsequently accepted the finite placement-evidence policy
+The same operator subsequently accepted the finite placement-evidence policy
 below for these Clef compositions. Quality, performance, resource, lifetime and
 warm-readiness requirements are unchanged.
+
+These fork decisions do not establish upstream maintainer approval.
+The upstream host-handoff proposal remains under review.
 
 ## Motivation
 
@@ -161,7 +164,7 @@ The family must define a placement ledger for every admitted fixed profile:
 | --- | --- |
 | GPU share and remainder of the model | MLX GPU computation, including the merge of the two MLP shares. No new CPU layer mathematics. |
 | Core ML share | The declared fixed-profile column or neuron share above in each of 32 layers. All runtime tensor arithmetic, including projections, activation, reductions and arithmetic quantization operations inside the program, requires ANE placement evidence. |
-| Host boundary | Only the declared tile copies, stride-aware packing/unpacking and per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. The requesting Metal maintainer accepted this limited scope on 2026-10-19, not arbitrary CPU operators. |
+| Host boundary | Only the declared tile copies, stride-aware packing/unpacking and per-row symmetric int8 quantization with FP16 scales and round-half-even. Record exact formulas, extents and frequency. The fork operator accepted this limited scope on 2026-10-19, not arbitrary CPU operators. |
 | Preparation and orchestration | CPU weight conversion, constant materialization before readiness, static metadata, validation, scheduling and error handling are permitted. They do not authorize moving runtime layer mathematics to the CPU. |
 
 The ledger must map source operations to the compute-plan structure, including
@@ -188,7 +191,7 @@ CPU assignment leaves the path unqualified. `MLComputePlan` is available
 from macOS 14.4; the program format may require a newer deployment target.
 
 A compute plan describes anticipated placement, not an execution certificate.
-On 2026-10-19 the requesting Metal maintainer accepted the following combined,
+On 2026-10-19 the fork operator accepted the following combined,
 finite evidence for the fixed Clef compositions, instead of requiring a
 per-source-operation execution span:
 
@@ -230,7 +233,7 @@ The [MLX prepared execution contract](mlx-backend.md#prepared-compiled-execution
 also requires device-resident handoff. The GPU+ANE composition's native Core ML programs and host
 tile exchange do not satisfy those rules as written.
 
-The requesting Metal maintainer accepted only the fixed-profile
+The fork operator accepted only the fixed-profile
 `metal_clef` GPU+ANE compositions described here on 2026-10-19, in the
 EngineTailor-to-APXinf review session. The accepted boundary permits the
 native Core ML stage and the bounded host work in the placement
@@ -298,7 +301,7 @@ bit-equal to the GPU and can differ between ANE generations.
 
 ## Questions for maintainers
 
-- The requesting Metal maintainer accepted the narrowly scoped host-handoff
+- The fork operator accepted the narrowly scoped host-handoff
   boundary above. Upstream review must still assess the evidence and design;
   no unenforceable ANE-only promise is made.
 - Is the crate name `apxinf-coreml` and the feature name `coreml` acceptable?
