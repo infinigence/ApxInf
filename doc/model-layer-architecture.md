@@ -150,21 +150,46 @@ registry entry. Implementation IDs are local to a semantic registry and must
 not be used to infer layout across registries; in particular CUTLASS ID 4 means
 different implementations for GEMM and GeGLU.
 
-The current first-prepare layout decision is a compatibility mechanism, not a
-global performance plan. PI0.5 FP8 gate/up weights can serve interleaved dual
-GeGLU at M=522/533 and canonical split GeGLU at M=778/789. A compatible baseline
-does not prove equivalent latency. Camera count is fixed when a runner is
-loaded; switching two/three cameras is not a same-instance transition. Token
-count can change on the same runner: for two 224px views, T=10 gives M=522
-(fused GeGLU), while T=11 gives M=523 (plain GEMM plus pointwise). Those calls
-share the same weight allocation and can require different preferred layouts.
-Cross-profile users must measure both prepare
-orders and end-to-end latency; no claim of order-independent optimal selection
-is made. A future explicit weight preparation plan must gather consumer profiles
-before committing bytes, compare compatible recipes per layout, and choose a
-single layout or budgeted shared copies. All required layouts need a canonical
-source during preparation; existing executions/graphs must retain immutable
-physical allocations throughout their lifetime.
+### Shared layouts for heterogeneous consumers
+
+`RepackedWeight::new` commits one layout for consumers known to share a physical
+representation. `RepackedWeight::with_layout_cache` instead caches profile
+choices separately from physical layouts. PI0.5 BF16/FP8 language gate/up uses this
+mode: fixed two-view input with T=10 has M=522 (fused GeGLU), whereas T=11 has
+M=523 (plain GEMM plus pointwise). Camera count remains fixed per instance.
+
+The first selected layout can still replace the original allocation in place.
+Once exposed to an execution it is immutable. For a new shape/semantic/policy,
+preparation recovers canonical bytes into a private temporary with a bit-preserving
+permutation and selects a recipe independently of previous choices. A new physical
+layout is retained once per logical weight; another profile selecting the same
+layout reuses its allocation. The exact selected implementation/configuration is
+rebound to existing storage by rebuilding provider resources, without retuning
+or launch-time packing. Native operation descriptors must never retain pointers
+to discarded trials. Each Execution retains its actual physical buffer; captures
+can mix layouts and old graphs remain valid after preparing another profile.
+
+The weight owner retains the layout cache, while executions/graphs retain their
+own buffer references. No capture transition overwrites or forcibly frees a
+representation still in use. Releasing the last owner frees the allocation.
+The cache is bounded by layout count and bytes, not IO addresses or shape count;
+there is no automatic eviction of live graph storage.
+
+PI0.5 BF16/FP8 reserves at most one extra full-sized layout per language gate/up
+weight by default, allocated lazily only if selected. `LoadOptions` and native
+Python `ModelRunner.load` expose `weight_layout_budget_bytes`; the policy frontend
+forwards this load-time option. The budget covers additional persistent weight
+allocations, not graph arenas, provider workspace or prepare-local trial storage.
+A zero budget fixes canonical at adoption, eliminating first-call dependence
+without an extra copy, but may slow a fixed fused-GeGLU profile. Partial budgets
+are assigned deterministically in layer order, not by whichever request arrives
+first. INT8 and unrelated BF16/FP8 weights retain the single-layout path.
+
+Evaluate fixed profiles, mixed profiles, both prepare orders, prepare cost,
+steady latency, live/peak allocations and precision together. A per-kernel timing
+winner is not automatically an end-to-end memory/latency optimum. Benchmark
+shared layouts against canonical-only when choosing a deployment budget rather
+than embedding a universal speedup threshold in the backend.
 
 ### Dependency direction within a family
 

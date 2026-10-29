@@ -1412,7 +1412,10 @@ fn gpu_repacked_registration_does_not_retain_allocation() {
     drop(b);
     assert!(owner.upgrade().is_some());
     drop(state);
-    assert!(owner.upgrade().is_none(), "registry must not retain GPU memory");
+    assert!(
+        owner.upgrade().is_none(),
+        "registry must not retain GPU memory"
+    );
     // A new allocation (including an address reused by CUDA) can be adopted.
     let next = zeros_tensor(0, vec![16, 16], DType::BF16);
     assert!(crate::ops::RepackedWeight::new(&next).is_ok());
@@ -1717,4 +1720,219 @@ fn gpu_repacked_fp8_crosses_geglu_and_plain_gemm() {
         );
     }
     std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn gpu_shared_weight_layouts_are_deduplicated_and_graph_safe() {
+    let ctx = CudaContext::new(0).unwrap();
+    if !matches!(ctx.caps().sm, 100 | 101 | 110) {
+        return;
+    }
+    let (k, n) = (2048, 32768);
+    let codes = [0x20, 0x28, 0x30, 0x38];
+    let source = (0..k * n)
+        .map(|i| codes[(i / n + i % n + i / 128) % 4])
+        .collect::<Vec<_>>();
+    for order in [[522, 523, 533, 524], [523, 522, 524, 533]] {
+        let canonical = bytes_tensor(0, vec![k, n], DType::F8E4M3, &source);
+        let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &source);
+        let weight = crate::ops::RepackedWeight::with_layout_cache(&b, k * n).unwrap();
+        let cache = scratch_cache_dir("shared-layouts");
+        let mut executions = Vec::new();
+        let mut outputs = Vec::new();
+        let mut expected_bytes = Vec::new();
+        let mut original_graph = None;
+        let mut committed = None;
+        for m in order {
+            let fused = matches!(m, 522 | 533);
+            let mut data = vec![0; m * k];
+            for row in 0..m {
+                data[row * k + row % k] = 0x38;
+            }
+            let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &data);
+            let shape = vec![m, if fused { n / 2 } else { n }];
+            let dtype = if fused { DType::F8E4M3 } else { DType::F16 };
+            let semantic = if fused {
+                super::contracts::Semantic::GemmGeglu
+            } else {
+                super::contracts::Semantic::Gemm
+            };
+            let mut expected = zeros_tensor(0, shape.clone(), dtype);
+            let mut args = GemmArgs::new(&a, &canonical, &mut expected)
+                .with_immutable_weight(WeightVersion::new(0));
+            args.quantization = GemmQuantization::Fp8UnitScale;
+            args.policy.online_tune = false;
+            let normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
+            super::execution::prepare(&ctx, normalized)
+                .unwrap()
+                .enqueue()
+                .unwrap();
+            ctx.synchronize().unwrap();
+            let mut out = zeros_tensor(0, shape, dtype);
+            let mut args = GemmArgs::new(&a, &b, &mut out).with_repacked_weight(&weight);
+            args.quantization = GemmQuantization::Fp8UnitScale;
+            args.policy.online_tune = false;
+            args.policy.allow_fallback = false;
+            args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+            let normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
+            let (id, version) = if fused { (2, 2) } else { (1, 1) };
+            super::execution::seed_recipe(&ctx, &normalized, 3, id, version, 0).unwrap();
+            let execution = super::execution::prepare(&ctx, normalized).unwrap();
+            execution.enqueue().unwrap();
+            ctx.synchronize().unwrap();
+            let read = |t: &Tensor| {
+                let buffer = CudaBuffer::from_tensor(t).unwrap();
+                let mut bytes = vec![0; buffer.len()];
+                buffer.copy_to_host(&mut bytes).unwrap();
+                bytes
+            };
+            let expected = read(&expected);
+            assert_eq!(read(&out), expected, "M={m}");
+            let bytes = read(&b);
+            if let Some(ref old) = committed {
+                assert_eq!(&bytes, old, "base changed after first prepare");
+            } else {
+                committed = Some(bytes);
+            }
+            if original_graph.is_none() {
+                original_graph = Some(crate::capture(&ctx, || execution.enqueue()).unwrap());
+            }
+            executions.push(execution);
+            outputs.push(out);
+            expected_bytes.push(expected);
+        }
+        {
+            let state = weight.state.lock().unwrap();
+            let cache = state.cache.as_ref().unwrap();
+            assert_eq!(
+                cache.buffers.len(),
+                1,
+                "four profiles need only two physical layouts"
+            );
+            assert_eq!(
+                cache.buffers.values().map(CudaBuffer::len).sum::<usize>(),
+                k * n
+            );
+            assert_eq!(cache.choices.len(), 4);
+        }
+        // Both layouts coexist inside one graph, and an older graph remains valid.
+        let graph = crate::capture(&ctx, || {
+            for e in &executions {
+                e.enqueue()?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        drop(executions);
+        drop(weight);
+        drop(b);
+        graph.replay().unwrap();
+        original_graph.unwrap().replay().unwrap();
+        ctx.synchronize().unwrap();
+        for (out, expected) in outputs.iter().zip(expected_bytes) {
+            let buffer = CudaBuffer::from_tensor(out).unwrap();
+            let mut actual = vec![0; buffer.len()];
+            buffer.copy_to_host(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+}
+
+#[test]
+fn gpu_weight_relayout_is_bit_preserving() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (k, n) = (16, 512);
+    for (dtype, size) in [
+        (DType::F8E4M3, 1),
+        (DType::BF16, 2),
+        (DType::I8, 1),
+        (DType::F32, 4),
+    ] {
+        let bytes = (0..k * n * size)
+            .map(|i| (i * 37 % 256) as u8)
+            .collect::<Vec<_>>();
+        let source = bytes_tensor(0, vec![k, n], dtype, &bytes);
+        let a = CudaBuffer::from_tensor(&source).unwrap();
+        let b = CudaBuffer::alloc(bytes.len(), 0).unwrap();
+        let c = CudaBuffer::alloc(bytes.len(), 0).unwrap();
+        for layout in 1..=4 {
+            unsafe {
+                crate::ffi::abi::status::check(crate::ffi::abi::gemm::apxinf_gemm_relayout_weight(
+                    a.ptr(),
+                    b.ptr(),
+                    k as i64,
+                    n as i64,
+                    super::contracts::dtype(dtype).unwrap(),
+                    4,
+                    layout,
+                    ctx.stream().handle(),
+                ))
+                .unwrap();
+                crate::ffi::abi::status::check(crate::ffi::abi::gemm::apxinf_gemm_relayout_weight(
+                    b.ptr(),
+                    c.ptr(),
+                    k as i64,
+                    n as i64,
+                    super::contracts::dtype(dtype).unwrap(),
+                    layout,
+                    4,
+                    ctx.stream().handle(),
+                ))
+                .unwrap();
+            }
+            let mut actual = vec![0; bytes.len()];
+            c.copy_to_host(&mut actual).unwrap();
+            assert_eq!(actual, bytes);
+        }
+    }
+}
+
+#[test]
+fn gpu_shared_weight_zero_budget_stays_canonical() {
+    let ctx = CudaContext::new(0).unwrap();
+    let b = tensor(0, vec![16, 16], &vec![1.0; 256]);
+    let state = crate::ops::RepackedWeight::with_layout_cache(&b, 0).unwrap();
+    for m in [1, 2] {
+        let a = tensor(0, vec![m, 16], &vec![1.0; m * 16]);
+        let mut out = tensor(0, vec![m, 16], &vec![0.0; m * 16]);
+        let mut args = GemmArgs::new(&a, &b, &mut out).with_repacked_weight(&state);
+        args.policy.online_tune = false;
+        let normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        let e = super::execution::prepare(&ctx, normalized).unwrap();
+        e.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        assert!(values(&out).iter().all(|x| *x == 16.0));
+    }
+    let guard = state.state.lock().unwrap();
+    assert_eq!(guard.layout, 4);
+    assert!(guard.cache.as_ref().unwrap().buffers.is_empty());
+}
+
+#[test]
+fn execution_session_distinguishes_selection_policies() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = tensor(0, vec![2, 3], &[1.0; 6]);
+    let b = tensor(0, vec![3, 4], &[1.0; 12]);
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let mut out = tensor(0, vec![2, 4], &[0.0; 8]);
+    prepare_with_session(&session, || {
+        let mut create = |online_tune| {
+            let mut args = GemmArgs::new(&a, &b, &mut out);
+            args.policy.online_tune = online_tune;
+            args.policy.cache_dir = Some(String::new());
+            let normalized =
+                super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)?;
+            super::execution::prepare(&ctx, normalized)
+        };
+        let first = create(false)?;
+        let second = create(true)?;
+        let repeated = create(true)?;
+        assert!(!std::rc::Rc::ptr_eq(&first, &second));
+        assert!(std::rc::Rc::ptr_eq(&second, &repeated));
+        Ok(())
+    })
+    .unwrap();
 }

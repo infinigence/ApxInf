@@ -299,3 +299,42 @@ cudaError_t launch_cutlass_nvfp4(Execution& state) {
 }
 
 }  // namespace apxinf::gemm
+
+extern "C" apxinf_status_t apxinf_gemm_relayout_weight(
+    const void* source, void* destination, int64_t k, int64_t n,
+    uint32_t dtype, uint32_t from, uint32_t to, apxinf_cuda_stream_t handle) {
+  return apxinf::gemm::abi_boundary([&] {
+    if (source == nullptr || destination == nullptr || k <= 0 || n <= 0 ||
+        k > INT64_MAX / n / 4 || from < 1 || from > 4 || to < 1 || to > 4 ||
+        dtype > APXINF_DTYPE_I32 ||
+        ((from == 2 || to == 2) && n % 512 != 0) ||
+        ((from == 3 || to == 3) && n % 2 != 0)) {
+      throw apxinf::gemm::Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid weight relayout");
+    }
+    const size_t bytes = size_t(k*n) * apxinf::gemm::dtype_bytes(dtype);
+    const auto a = reinterpret_cast<uintptr_t>(source), b = reinterpret_cast<uintptr_t>(destination);
+    if (a > UINTPTR_MAX-bytes || b > UINTPTR_MAX-bytes || (a < b+bytes && b < a+bytes)) {
+      throw apxinf::gemm::Failure(APXINF_STATUS_INVALID_ARGUMENT, "weight relayout buffers overlap");
+    }
+    const auto stream = static_cast<cudaStream_t>(handle);
+    cudaStreamCaptureStatus capture;
+    apxinf::gemm::check_cuda(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+      throw apxinf::gemm::Failure(APXINF_STATUS_INVALID_ARGUMENT, "relayout weights before capture");
+    }
+    if (from == to) {
+      apxinf::gemm::check_cuda(cudaMemcpyAsync(
+          destination, source, bytes, cudaMemcpyDeviceToDevice, stream));
+      apxinf::gemm::check_cuda(cudaStreamSynchronize(stream));
+      return;
+    }
+    const int blocks = int(std::min<int64_t>((k*n+255)/256,4096));
+    switch (apxinf::gemm::dtype_bytes(dtype)) {
+      case 1: apxinf::cuda_new::custom::relayout_weight_bits<<<blocks,256,0,stream>>>(static_cast<const uint8_t*>(source),static_cast<uint8_t*>(destination),k,n,from,to); break;
+      case 2: apxinf::cuda_new::custom::relayout_weight_bits<<<blocks,256,0,stream>>>(static_cast<const uint16_t*>(source),static_cast<uint16_t*>(destination),k,n,from,to); break;
+      case 4: apxinf::cuda_new::custom::relayout_weight_bits<<<blocks,256,0,stream>>>(static_cast<const uint32_t*>(source),static_cast<uint32_t*>(destination),k,n,from,to); break;
+    }
+    apxinf::gemm::check_cuda(cudaGetLastError());
+    apxinf::gemm::check_cuda(cudaStreamSynchronize(stream));
+  });
+}

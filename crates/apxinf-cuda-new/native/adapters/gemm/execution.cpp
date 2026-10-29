@@ -460,6 +460,70 @@ extern "C" apxinf_status_t apxinf_gemm_prepare(
     *output = reinterpret_cast<apxinf_gemm_execution_t>(execution.release());
   });
 }
+
+extern "C" apxinf_status_t apxinf_gemm_candidate_layouts(
+    apxinf_runtime_t runtime, const apxinf_gemm_spec_t* spec,
+    const apxinf_gemm_policy_t* policy, uint32_t* layouts) {
+  if (layouts != nullptr) *layouts = 0;
+  return apxinf::gemm::abi_boundary([&] {
+    if (runtime == nullptr || spec == nullptr || policy == nullptr || layouts == nullptr) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid candidate layout query");
+    }
+    apxinf::gemm::Spec candidate_spec{};
+    static_cast<apxinf_gemm_spec_t&>(candidate_spec) = *spec;
+    candidate_spec.b_layout = 0;
+    validate_spec(candidate_spec);
+    validate_policy(*policy);
+    for (const auto& implementation : apxinf::gemm::registry(candidate_spec.semantic)) {
+      if (apxinf::gemm::supports_device(implementation, runtime->device) &&
+          implementation.supports(candidate_spec) &&
+          apxinf::gemm::supports_alignment(implementation, candidate_spec) &&
+          (!policy->graph_safe || implementation.graph_safe) &&
+          (!policy->deterministic || implementation.deterministic)) {
+        *layouts |= 1u << static_cast<uint32_t>(implementation.weight_layout);
+      }
+    }
+  });
+}
+
+extern "C" apxinf_status_t apxinf_gemm_rebind_weight(
+    apxinf_runtime_t runtime, apxinf_gemm_execution_t source,
+    const void* weight, const apxinf_gemm_policy_t* policy,
+    apxinf_gemm_execution_t* output) {
+  if (output != nullptr) *output = nullptr;
+  return apxinf::gemm::abi_boundary([&] {
+    const auto* original = reinterpret_cast<const Execution*>(source);
+    if (runtime == nullptr || original == nullptr || weight == nullptr ||
+        policy == nullptr || output == nullptr || runtime->device != original->device) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid shared weight binding");
+    }
+    validate_policy(*policy);
+    auto bindings = original->bindings;
+    bindings.b = weight;
+    validate_bindings(original->spec, bindings, true);
+    cudaStreamCaptureStatus capture;
+    apxinf::gemm::check_cuda(cudaStreamIsCapturing(
+        static_cast<cudaStream_t>(bindings.stream), &capture));
+    if (capture != cudaStreamCaptureStatusNone) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "bind shared weights before capture");
+    }
+    auto binding_policy = *policy;
+    binding_policy.workspace_limit = std::min<uint64_t>(
+        binding_policy.workspace_limit, original->resource_limit);
+    auto execution = apxinf::gemm::prepare(*original->implementation,
+        original->configuration, original->spec, binding_policy, bindings, original->device);
+    execution->summary = original->summary + " shared-layout";
+    const auto keys = apxinf::gemm::tuning_keys(execution->spec, binding_policy, runtime->device);
+    {
+      std::lock_guard<std::mutex> lock(runtime->gemm_mutex);
+      runtime->gemm_recipes[keys.key] = Recipe{execution->implementation->provider_id,
+          execution->implementation->implementation_id,
+          execution->implementation->implementation_version, execution->configuration};
+    }
+    *output = reinterpret_cast<apxinf_gemm_execution_t>(execution.release());
+  });
+}
+
 extern "C" apxinf_status_t apxinf_gemm_enqueue(
     apxinf_gemm_execution_t handle) {
   return apxinf::gemm::abi_boundary([&] {

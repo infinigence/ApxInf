@@ -18,6 +18,22 @@ __device__ inline void save(void* p,int type,int64_t i,float x) {
  else if(type==2) ((__nv_bfloat16*)p)[i]=__float2bfloat16_rn(x);
  else ((__nv_fp8_e4m3*)p)[i]=__nv_fp8_e4m3(x);
 }
+static __device__ inline int64_t weight_layout_index(int64_t row, int64_t col, int64_t k, int64_t n, uint32_t layout) {
+  if (layout == 1) return col * k + row;
+  const int64_t half = n / 2;
+  if (layout == 2) return row * n + (col % half / 256) * 512 + (col >= half ? 256 : 0) + col % 256;
+  if (layout == 3) return row * n + 2 * (col % half) + (col >= half);
+  return row * n + col;
+}
+template <typename Bits>
+static __global__ void relayout_weight_bits(const Bits* source, Bits* destination, int64_t k, int64_t n,
+                             uint32_t from, uint32_t to) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < k*n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    const auto row = i / n, col = i % n;
+    destination[weight_layout_index(row,col,k,n,to)] = source[weight_layout_index(row,col,k,n,from)];
+  }
+}
 static __global__ void unpack(const void* src,void* dst,int out_type,int type,int64_t rows,int64_t cols,int layout) {
  for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<rows*cols;i+=int64_t(gridDim.x)*blockDim.x) {
   int64_t r=i/cols,c=i%cols,j=i;

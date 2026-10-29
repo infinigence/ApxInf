@@ -18,6 +18,22 @@ apxinf_status_t apxinf_gemm_prepare(
     const apxinf_gemm_bindings_t* bindings,
     apxinf_gemm_execution_t* execution, uint32_t* weight_layout);
 apxinf_status_t apxinf_gemm_enqueue(apxinf_gemm_execution_t execution);
+/* Rebuild provider resources for the exact selected recipe with a different
+   immutable B allocation of the same physical layout. No tuning or repacking. */
+apxinf_status_t apxinf_gemm_rebind_weight(
+    apxinf_runtime_t runtime, apxinf_gemm_execution_t source, const void* weight,
+    const apxinf_gemm_policy_t* policy, apxinf_gemm_execution_t* output);
+/* Initial physical layouts of applicable candidates, as bits (1u << layout).
+   A capability query only: no tuning, allocation or weight modification. */
+apxinf_status_t apxinf_gemm_candidate_layouts(
+    apxinf_runtime_t runtime, const apxinf_gemm_spec_t* spec,
+    const apxinf_gemm_policy_t* policy, uint32_t* layouts);
+/* Prepare-local bit-preserving permutation; source and destination must not
+   overlap. Layouts 1..4 describe NK, interleave-256, adjacent, canonical. */
+apxinf_status_t apxinf_gemm_relayout_weight(
+    const void* source, void* destination, int64_t k, int64_t n,
+    uint32_t dtype, uint32_t source_layout, uint32_t target_layout,
+    apxinf_cuda_stream_t stream);
 void apxinf_gemm_destroy(apxinf_gemm_execution_t execution);
 const char* apxinf_gemm_summary(apxinf_gemm_execution_t execution);
 

@@ -32,6 +32,9 @@ struct ExecutionKey {
     workspace_limit: u64,
     graph_safe: bool,
     deterministic: bool,
+    online_tune: bool,
+    allow_fallback: bool,
+    cache_dir: Option<String>,
 }
 
 impl ExecutionKey {
@@ -61,6 +64,9 @@ impl ExecutionKey {
             workspace_limit: policy.workspace_limit as u64,
             graph_safe: policy.graph_safe,
             deterministic: policy.deterministic,
+            online_tune: policy.online_tune,
+            allow_fallback: policy.allow_fallback,
+            cache_dir: policy.cache_dir.clone(),
         }
     }
 }
@@ -101,12 +107,216 @@ impl Drop for Execution {
     }
 }
 
+// Own native trial resources across all failure paths. No trial execution is
+// enqueued after preparation; the selected execution retains its actual B below.
+struct NativeExecution(abi::Execution);
+impl Drop for NativeExecution {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { abi::apxinf_gemm_destroy(self.0) }
+        }
+    }
+}
+impl NativeExecution {
+    fn into_raw(mut self) -> abi::Execution {
+        let raw = self.0;
+        self.0 = std::ptr::null_mut();
+        raw
+    }
+}
+fn prepare_native(
+    ctx: &CudaContext,
+    spec: &abi::Spec,
+    policy: &abi::Policy,
+    bindings: &abi::Bindings,
+    layout: Option<&mut u32>,
+) -> Result<NativeExecution> {
+    let mut raw = std::ptr::null_mut();
+    unsafe {
+        status::check(abi::apxinf_gemm_prepare(
+            ctx.runtime(),
+            spec,
+            policy,
+            bindings,
+            &mut raw,
+            layout.map_or(std::ptr::null_mut(), |value| value),
+        ))?;
+    }
+    if raw.is_null() {
+        return Err(invalid("native GEMM prepare returned a null execution"));
+    }
+    Ok(NativeExecution(raw))
+}
+fn prepare_weight(
+    ctx: &CudaContext,
+    weight: &mut super::weight::WeightState,
+    choice: super::weight::LayoutChoiceKey,
+    spec: &mut abi::Spec,
+    policy: &abi::Policy,
+    bindings: &mut abi::Bindings,
+    storage: &mut Vec<CudaBuffer>,
+) -> Result<NativeExecution> {
+    let independent_trial = weight.layout != 0
+        && weight.cache.as_ref().is_some_and(|cache| {
+            !cache.choices.contains_key(&choice) && cache.budget >= weight.buffer.len()
+        });
+    if independent_trial {
+        let mut layouts = 0;
+        unsafe {
+            status::check(abi::apxinf_gemm_candidate_layouts(
+                ctx.runtime(),
+                spec,
+                policy,
+                &mut layouts,
+            ))?;
+        }
+        if layouts == (1u32 << 4) {
+            let existing = if weight.layout == 4 {
+                Some(weight.buffer.clone())
+            } else {
+                weight
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.buffers.get(&4))
+                    .cloned()
+            };
+            if let Some(buffer) = existing {
+                // All applicable candidates read canonical bytes, so selecting
+                // with layout 0 cannot repack this allocation. Keep the same
+                // unrestricted recipe key (including restored recipes) without
+                // allocating/copying a canonical trial unnecessarily.
+                bindings.b = buffer.ptr();
+                storage.push(buffer);
+                spec.b_layout = 0;
+                let mut selected_layout = 0;
+                let execution =
+                    prepare_native(ctx, spec, policy, bindings, Some(&mut selected_layout))?;
+                if selected_layout != 4 {
+                    return Err(invalid("canonical-only candidate query changed layout"));
+                }
+                spec.b_layout = 4;
+                weight
+                    .cache
+                    .as_mut()
+                    .expect("shared layout cache")
+                    .choices
+                    .insert(choice, 4);
+                return Ok(execution);
+            }
+        }
+    }
+
+    let execution = if independent_trial {
+        // Recover canonical bytes into a private trial even when the original
+        // allocation is packed. Existing graphs keep reading immutable storage.
+        let trial = CudaBuffer::alloc(weight.buffer.len(), ctx.device_id()).map_err(Error::Cuda)?;
+        let (source, source_layout) = weight
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.buffers.get(&4))
+            .map(|buffer| (buffer, 4))
+            .unwrap_or((&weight.buffer, weight.layout));
+        unsafe {
+            status::check(abi::apxinf_gemm_relayout_weight(
+                source.ptr(),
+                trial.ptr(),
+                spec.k,
+                spec.n,
+                spec.b_dtype,
+                source_layout,
+                4,
+                bindings.stream,
+            ))?;
+        }
+        let mut trial_spec = *spec;
+        trial_spec.b_layout = 0;
+        let mut trial_bindings = *bindings;
+        trial_bindings.b = trial.ptr();
+        let mut layout = 0;
+        let selected =
+            prepare_native(ctx, &trial_spec, policy, &trial_bindings, Some(&mut layout))?;
+        let cache = weight.cache.as_mut().expect("shared layout cache");
+        let existing = if layout == weight.layout {
+            Some(weight.buffer.clone())
+        } else {
+            cache.buffers.get(&layout).cloned()
+        };
+        if let Some(buffer) = existing {
+            let mut rebound = std::ptr::null_mut();
+            unsafe {
+                status::check(abi::apxinf_gemm_rebind_weight(
+                    ctx.runtime(),
+                    selected.0,
+                    buffer.ptr(),
+                    policy,
+                    &mut rebound,
+                ))?;
+            }
+            if rebound.is_null() {
+                return Err(invalid("shared weight binding returned null"));
+            }
+            spec.b_layout = layout;
+            bindings.b = buffer.ptr();
+            storage.push(buffer);
+            NativeExecution(rebound)
+        } else if cache
+            .buffers
+            .values()
+            .map(CudaBuffer::len)
+            .sum::<usize>()
+            .checked_add(trial.len())
+            .is_some_and(|bytes| bytes <= cache.budget)
+        {
+            spec.b_layout = layout;
+            bindings.b = trial.ptr();
+            cache.buffers.insert(layout, trial.clone());
+            if std::env::var_os("APXINF_GEMM_REPORT").is_some() {
+                eprintln!(
+                    "[apxinf-gemm-weight] k={} n={} layout={} extra_bytes={} cached_layouts={}",
+                    spec.k,
+                    spec.n,
+                    layout,
+                    cache.buffers.values().map(CudaBuffer::len).sum::<usize>(),
+                    cache.buffers.len()
+                );
+            }
+            storage.push(trial);
+            selected
+        } else {
+            // A caller-supplied budget is a hard constraint. Keep the base
+            // representation and tune compatible implementations without ever
+            // changing an allocation referenced by an older execution.
+            drop(selected);
+            spec.b_layout = weight.layout;
+            bindings.b = weight.buffer.ptr();
+            prepare_native(ctx, spec, policy, bindings, None)?
+        }
+    } else {
+        let unprepared = spec.b_layout == 0;
+        let execution = prepare_native(
+            ctx,
+            spec,
+            policy,
+            bindings,
+            unprepared.then_some(&mut weight.layout),
+        )?;
+        if unprepared {
+            spec.b_layout = weight.layout;
+        }
+        execution
+    };
+    if let Some(cache) = weight.cache.as_mut() {
+        cache.choices.insert(choice, spec.b_layout);
+    }
+    Ok(execution)
+}
+
 pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Execution>> {
     let Normalized {
         mut spec,
         policy: options,
-        bindings,
-        storage,
+        mut bindings,
+        mut storage,
         repacked_weight,
     } = normalized;
     if repacked_weight.is_none() {
@@ -116,6 +326,7 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
             .ok_or_else(|| invalid("GEMM B has no retained storage"))?;
         super::weight::reject_canonical_alias(buffer)?;
     }
+    let choice_key = super::weight::LayoutChoiceKey::new(spec, &options);
     let mut weight_guard = repacked_weight
         .as_ref()
         .map(|weight| {
@@ -148,7 +359,21 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
                 "weight layout state has different geometry or dtype",
             ));
         }
-        spec.b_layout = weight.layout;
+        spec.b_layout = weight
+            .cache
+            .as_ref()
+            .and_then(|cache| cache.choices.get(&choice_key).copied())
+            .unwrap_or(weight.layout);
+        if spec.b_layout != weight.layout {
+            let buffer = weight
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.buffers.get(&spec.b_layout))
+                .ok_or_else(|| invalid("selected shared weight layout is missing"))?
+                .clone();
+            bindings.b = buffer.ptr().cast_const();
+            storage.push(buffer);
+        }
     }
     let key = ExecutionKey::new(ctx, spec, bindings, &options);
     if let Some(execution) = crate::workspace::lookup_execution(&key) {
@@ -177,25 +402,20 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
             .as_ref()
             .map_or(std::ptr::null(), |path| path.as_ptr()),
     };
-    let mut raw = std::ptr::null_mut();
-    unsafe {
-        status::check(abi::apxinf_gemm_prepare(
-            ctx.runtime(),
-            &spec,
+    let native = if let Some(weight) = weight_guard.as_mut() {
+        prepare_weight(
+            ctx,
+            weight,
+            choice_key,
+            &mut spec,
             &policy,
-            &bindings,
-            &mut raw,
-            weight_guard
-                .as_mut()
-                .map_or(std::ptr::null_mut(), |weight| &mut weight.layout),
-        ))?;
-    }
-    if raw.is_null() {
-        return Err(invalid("native GEMM prepare returned a null execution"));
-    }
-    if let Some(weight) = weight_guard.as_ref() {
-        spec.b_layout = weight.layout;
-    }
+            &mut bindings,
+            &mut storage,
+        )?
+    } else {
+        prepare_native(ctx, &spec, &policy, &bindings, None)?
+    };
+    let raw = native.into_raw();
     let key = ExecutionKey::new(ctx, spec, bindings, &options);
     #[cfg(test)]
     let summary = unsafe { CStr::from_ptr(abi::apxinf_gemm_summary(raw)) }

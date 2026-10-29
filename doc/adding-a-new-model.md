@@ -164,8 +164,14 @@ cuda-new rejects independent states for the same allocation and ordinary
 canonical GEMM bindings to adopted storage, including views. Dropping the state
 does not make its surviving tensor aliases canonical again. This enforcement
 does not make raw tensor readback/export layout-aware.
-For weights shared across shapes or semantics, benchmark every consumer after
-layout selection and test both preparation orders; a layout-aware fallback
+For weights shared across shapes or semantics, use `with_layout_cache` with an
+explicit extra-weight budget when their optimal implementations require different
+physical layouts. It caches profile recipes separately and shares one immutable
+allocation per selected layout; executions retain the physical allocation they
+read. New layouts are prepared from a bit-preserving private canonical trial,
+never by overwriting a live graph's bytes. A zero budget fixes canonical before
+any execution. Benchmark every consumer and both preparation orders, including
+prepare time, live/peak allocations and steady replay; a layout-aware fallback
 establishes correctness but not performance parity.
 
 
