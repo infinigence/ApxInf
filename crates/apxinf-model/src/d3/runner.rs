@@ -9,15 +9,13 @@ use crate::d3::backend::read_f32;
 use crate::d3::model::{
     forward_multimodal_device, forward_text_device, write_text_inputs, D3Policies, D3TextScratch,
 };
-use crate::decision::{
-    DecisionAnswer, DecisionInput, DecisionOutput, DecisionRuntime, DecisionScore,
-};
 use crate::d3::vision::D3VisionScratch;
 use crate::d3::weights::bf16::D3DeviceWeights;
 use crate::d3::{
     D3DecisionConfig, D3PackageConfig, D3_DEFAULT_TEXT_PROFILE_LIMIT,
     D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
+use crate::decision::{DecisionInput, DecisionOutput, DecisionRuntime, DecisionScore};
 use crate::llm_trait::{ImageInput, LlmCapabilities};
 
 struct TextProfile {
@@ -141,7 +139,7 @@ impl D3Runner {
         Ok(())
     }
 
-    fn decide_text(&mut self, token_ids: &[u32], candidate_count: usize) -> Result<DecisionAnswer> {
+    fn decide_text(&mut self, token_ids: &[u32], candidate_count: usize) -> Result<DecisionOutput> {
         self.prepare_text_profile(token_ids)?;
         let profile = self
             .text_profiles
@@ -263,7 +261,7 @@ impl D3Runner {
         token_ids: &[u32],
         image: ImageInput<'_>,
         candidate_count: usize,
-    ) -> Result<DecisionAnswer> {
+    ) -> Result<DecisionOutput> {
         let key = self.vision_key(token_ids, image)?;
         self.prepare_vision_profile(&key, token_ids, image)?;
         let profile = self
@@ -310,23 +308,11 @@ impl DecisionRuntime for D3Runner {
     }
 
     fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
-        let DecisionInput::Encoded {
-            token_ids,
-            image,
-            candidate_count,
-        } = input
-        else {
-            return Err(Error::Other(
-                "d3 scores encoded prompts over its package code table".into(),
-            ));
-        };
-        let answer = match image {
-            Some(image) => self.decide_vision(token_ids, image, candidate_count)?,
-            None => self.decide_text(token_ids, candidate_count)?,
-        };
-        Ok(DecisionOutput {
-            answers: vec![answer],
-        })
+        if let Some(image) = input.image {
+            self.decide_vision(input.token_ids, image, input.candidate_count)
+        } else {
+            self.decide_text(input.token_ids, input.candidate_count)
+        }
     }
 
     fn code_names(&self) -> &[String] {
@@ -342,7 +328,7 @@ fn probabilities(
     config: &D3DecisionConfig,
     logits: &[f32],
     candidate_count: usize,
-) -> Result<DecisionAnswer> {
+) -> Result<DecisionOutput> {
     if logits.len() != config.codes.len() {
         return Err(Error::Other(format!(
             "d3 readout returned {} logits for {} codes",
@@ -389,12 +375,11 @@ fn probabilities(
         .enumerate()
         .map(|(index, probability)| DecisionScore {
             code: config.codes[index].clone(),
-            token_id: Some(config.token_ids[index]),
+            token_id: config.token_ids[index],
             probability,
         })
         .collect();
-    Ok(DecisionAnswer {
-        question_id: None,
+    Ok(DecisionOutput {
         selected_index,
         scores,
     })

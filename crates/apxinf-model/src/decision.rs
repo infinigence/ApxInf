@@ -8,26 +8,19 @@ use serde::Deserialize;
 
 use crate::llm_trait::{ImageInput, LlmCapabilities};
 
-/// One complete request. A runtime accepts the forms it documents and returns
-/// an error for the others.
+/// One complete prompt. Video uses the same processor tensor plus `grid_thw`
+/// contract as Qwen3.5 vision; callers concatenate temporal patches there.
 #[derive(Clone, Copy, Debug)]
-pub enum DecisionInput<'a> {
-    /// A prompt the caller already encoded, scored over the package code
-    /// table. Video uses the same processor tensor plus `grid_thw` contract as
-    /// Qwen3.5 vision; callers concatenate temporal patches there.
-    Encoded {
-        token_ids: &'a [u32],
-        image: Option<ImageInput<'a>>,
-        /// Number of valid answer codes at the start of the package code table.
-        candidate_count: usize,
-    },
-    /// A state with named, typed questions that the family encodes itself.
-    Schema(&'a DecisionSchema),
+pub struct DecisionInput<'a> {
+    pub token_ids: &'a [u32],
+    pub image: Option<ImageInput<'a>>,
+    /// Number of valid answer codes at the start of the package code table.
+    pub candidate_count: usize,
 }
 
 impl<'a> DecisionInput<'a> {
     pub const fn text(token_ids: &'a [u32], candidate_count: usize) -> Self {
-        Self::Encoded {
+        Self {
             token_ids,
             image: None,
             candidate_count,
@@ -39,7 +32,7 @@ impl<'a> DecisionInput<'a> {
         image: ImageInput<'a>,
         candidate_count: usize,
     ) -> Self {
-        Self::Encoded {
+        Self {
             token_ids,
             image: Some(image),
             candidate_count,
@@ -133,26 +126,50 @@ impl<'de> Deserialize<'de> for DecisionSchema {
     }
 }
 
-/// Probability assigned to one option. Package code tables (d3) also report
-/// the code's token; options of a schema question have none.
+/// Probability assigned to one package-defined d3 code.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecisionScore {
     pub code: String,
-    pub token_id: Option<u32>,
+    pub token_id: u32,
     pub probability: f32,
 }
 
-/// Scores of one question, in option order.
+/// Structured output; d3 never enters autoregressive token generation.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DecisionAnswer {
-    /// The schema question ID; `None` for an encoded prompt.
-    pub question_id: Option<String>,
+pub struct DecisionOutput {
     pub selected_index: usize,
     pub scores: Vec<DecisionScore>,
 }
 
-impl DecisionAnswer {
+impl DecisionOutput {
     pub fn selected(&self) -> Result<&DecisionScore> {
+        self.scores.get(self.selected_index).ok_or_else(|| {
+            Error::Other(format!(
+                "d3 decision output: selected index {} outside {} scores",
+                self.selected_index,
+                self.scores.len()
+            ))
+        })
+    }
+}
+
+/// Probability assigned to a named schema option, which has no package token ID.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SchemaDecisionScore {
+    pub code: String,
+    pub probability: f32,
+}
+
+/// Scores of one schema question, in option order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SchemaDecisionAnswer {
+    pub question_id: String,
+    pub selected_index: usize,
+    pub scores: Vec<SchemaDecisionScore>,
+}
+
+impl SchemaDecisionAnswer {
+    pub fn selected(&self) -> Result<&SchemaDecisionScore> {
         self.scores.get(self.selected_index).ok_or_else(|| {
             Error::Other(format!(
                 "decision output: selected index {} outside {} scores",
@@ -163,25 +180,10 @@ impl DecisionAnswer {
     }
 }
 
-/// Structured output; decision runtimes never enter autoregressive token
-/// generation. Answers follow request order; an encoded prompt has one.
+/// Schema answers follow request order. Scores follow each question's option order.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DecisionOutput {
-    pub answers: Vec<DecisionAnswer>,
-}
-
-impl DecisionOutput {
-    /// The answer of a single-question request, such as an encoded prompt.
-    pub fn into_single(self) -> Result<DecisionAnswer> {
-        let count = self.answers.len();
-        let mut answers = self.answers.into_iter();
-        match (answers.next(), answers.next()) {
-            (Some(answer), None) => Ok(answer),
-            _ => Err(Error::Other(format!(
-                "decision output has {count} answers, expected one"
-            ))),
-        }
-    }
+pub struct SchemaDecisionOutput {
+    pub answers: Vec<SchemaDecisionAnswer>,
 }
 
 /// Non-generative decision runtime. Implementations own their preparation
@@ -193,6 +195,13 @@ pub trait DecisionRuntime {
     fn code_names(&self) -> &[String];
     /// Token IDs for each package code; empty without a package code table.
     fn token_ids(&self) -> &[u32];
+
+    /// Score a named schema when the runtime supports this request form.
+    fn decide_schema(&mut self, _request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
+        Err(Error::Other(
+            "schema decisions are unsupported by this runtime".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -201,32 +210,21 @@ mod tests {
 
     #[test]
     fn selected_score_is_checked() {
-        let answer = DecisionAnswer {
-            question_id: None,
+        let output = DecisionOutput {
             selected_index: 0,
             scores: vec![DecisionScore {
                 code: "yes".into(),
-                token_id: Some(1),
+                token_id: 1,
                 probability: 1.0,
             }],
         };
-        assert_eq!(answer.selected().unwrap().code, "yes");
+        assert_eq!(output.selected().unwrap().code, "yes");
 
-        let invalid = DecisionAnswer {
+        let invalid = DecisionOutput {
             selected_index: 1,
-            ..answer.clone()
+            ..output
         };
         assert!(invalid.selected().is_err());
-
-        let output = DecisionOutput {
-            answers: vec![answer.clone()],
-        };
-        assert_eq!(output.into_single().unwrap(), answer);
-        let two = DecisionOutput {
-            answers: vec![answer.clone(), answer],
-        };
-        assert!(two.into_single().is_err());
-        assert!(DecisionOutput { answers: vec![] }.into_single().is_err());
     }
 
     #[test]
