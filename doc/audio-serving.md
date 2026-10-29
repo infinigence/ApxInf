@@ -100,7 +100,7 @@ The service does not increase wired limits or bypass pressure checks.
 
 ```sh
 cargo build -p apxinf-audio-serving --bin apxinf-audio-serve
-target/debug/apxinf-audio-serve --manifest /absolute/asr-manifest.json --python /absolute/audio-env/bin/python --metal-lock /Users/operator/.cache/enginetailor/metal-measure.lock --listen 127.0.0.1:8010
+target/debug/apxinf-audio-serve --manifest /absolute/asr-manifest.json --python /absolute/audio-env/bin/python --metal-lock /absolute/metal-measure.lock --listen 127.0.0.1:8010
 ```
 
 Use a separate deployment and port for TTS.
@@ -163,7 +163,8 @@ The hardware gate requires fixed runtime, model, voice, and frontend identities.
 The gate must measure ASR quality, TTS quality, peak allocation, pressure, cancellation, and cleanup.
 CPU fixture success cannot close that gate.
 No GPU inference or model-quality acceptance formed part of the CPU implementation checks.
-Separate [hardware observations](audio-serving-validation-20261025.md) record the selected local model profiles and remaining checks.
+Retain hardware observations, runtime snapshots, and complete outputs in the ignored development workspace.
+Historical observations do not qualify a later source, runtime, model, or frontend identity.
 
 The reusable qualification command records a real production observation without granting quality approval.
 Run this command only against the selected offline deployment.
@@ -178,6 +179,3 @@ The command checks service identity and completed output.
 Optional WER uses case-sensitive Unicode whitespace word splitting without other normalization.
 TTS waveform validity does not measure intelligibility, pronunciation, or voice consistency.
 The command leaves quality and device-allocation approval open in its report.
-
-This document follows ASD-STE100 structural principles.
-Structural checks do not establish full dictionary review or certification.

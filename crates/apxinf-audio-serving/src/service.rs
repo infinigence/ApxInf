@@ -460,7 +460,7 @@ async fn run_actor(
         {
             pressure_checked = now;
             if !normal_pressure() {
-                fault = Some("capacity_unavailable");
+                fault.get_or_insert("capacity_unavailable");
             }
         }
         if let Some(current) = active.as_mut() {
@@ -487,7 +487,7 @@ async fn run_actor(
                         },
                         &mut commands,
                     ) {
-                        fault = Some("worker_lost");
+                        fault.get_or_insert("worker_lost");
                     }
                 }
             }
@@ -511,12 +511,12 @@ async fn run_actor(
                 .cancellation_at
                 .is_some_and(|at| now.duration_since(at) >= Duration::from_secs(1))
             {
-                fault = Some("worker_lost");
+                fault.get_or_insert("worker_lost");
             } else if current
                 .terminal_at
                 .is_some_and(|at| now.duration_since(at) >= Duration::from_secs(1))
             {
-                fault = Some("protocol_fault");
+                fault.get_or_insert("protocol_fault");
             }
         }
         let mut kept = VecDeque::new();
@@ -608,7 +608,7 @@ async fn run_actor(
                 },
                 &mut commands,
             ) {
-                fault = Some("worker_lost");
+                fault.get_or_insert("worker_lost");
             }
         }
         if let Some(code) = fault {

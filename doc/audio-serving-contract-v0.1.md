@@ -130,6 +130,7 @@ An English-only model must declare only `en`.
 Kokoro readiness requires the public English frontend and phonemizer fallback constructors to succeed.
 File readers must reject nonregular descriptors without waiting for another process.
 Successful worker reaping must retain the recorded failure cause.
+The first worker fault remains the diagnostic cause when later cleanup or settlement also fails.
 
 ## Protocol envelope and primitives
 
@@ -261,6 +262,3 @@ CPU fixture tests do not establish speech quality or a hardware capacity profile
 
 These libraries do not own audio semantics or model scheduling.
 The provider dependency decision belongs to the separate operator guide.
-
-This document follows ASD-STE100 Issue 9 structural principles.
-Structural checks do not establish a complete dictionary review or certification.
