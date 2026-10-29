@@ -31,7 +31,6 @@ enum DecodeAttention {
 }
 
 enum DecodeAttentionPolicy {
-    Auto,
     Bucketed,
     Exact,
 }
@@ -39,21 +38,17 @@ enum DecodeAttentionPolicy {
 impl DecodeAttentionPolicy {
     fn from_override(value: Option<&std::ffi::OsStr>) -> Self {
         match value {
-            None => Self::Auto,
             Some(value) if value == "1" => Self::Exact,
-            Some(_) => Self::Bucketed,
+            _ => Self::Bucketed,
         }
     }
 
-    fn resolve(&self, variant: Variant, prompt: usize, output: usize) -> DecodeAttention {
+    fn resolve(&self, variant: Variant) -> DecodeAttention {
         if variant != Variant::Compiled {
             return DecodeAttention::Bucketed;
         }
         match self {
             Self::Exact => DecodeAttention::Exact,
-            Self::Auto if (16384..=65536).contains(&prompt) && (1..=128).contains(&output) => {
-                DecodeAttention::Exact
-            }
             _ => DecodeAttention::Bucketed,
         }
     }
@@ -65,24 +60,10 @@ mod attention_policy_tests {
     use std::ffi::OsStr;
 
     #[test]
-    fn automatic_attention_is_bounded_by_request_geometry_and_variant() {
+    fn default_attention_remains_bucketed_for_every_variant() {
         let policy = DecodeAttentionPolicy::from_override(None);
-        for (prompt, output, expected) in [
-            (16383, 128, DecodeAttention::Bucketed),
-            (16384, 0, DecodeAttention::Bucketed),
-            (16384, 1, DecodeAttention::Exact),
-            (16384, 128, DecodeAttention::Exact),
-            (16384, 129, DecodeAttention::Bucketed),
-            (65536, 128, DecodeAttention::Exact),
-            (65537, 128, DecodeAttention::Bucketed),
-        ] {
-            assert_eq!(policy.resolve(Variant::Compiled, prompt, output), expected);
-            for variant in [Variant::Public, Variant::DSpark] {
-                assert_eq!(
-                    policy.resolve(variant, prompt, output),
-                    DecodeAttention::Bucketed
-                );
-            }
+        for variant in [Variant::Compiled, Variant::Public, Variant::DSpark] {
+            assert_eq!(policy.resolve(variant), DecodeAttention::Bucketed);
         }
     }
 
@@ -90,21 +71,16 @@ mod attention_policy_tests {
     fn explicit_attention_override_preserves_existing_semantics() {
         let exact = DecodeAttentionPolicy::from_override(Some(OsStr::new("1")));
         assert_eq!(
-            exact.resolve(Variant::Compiled, 1, 0),
+            exact.resolve(Variant::Compiled),
             DecodeAttention::Exact
         );
-        assert_eq!(
-            exact.resolve(Variant::Compiled, 16384, 256),
-            DecodeAttention::Exact
-        );
-        assert_eq!(
-            exact.resolve(Variant::Public, 16384, 128),
-            DecodeAttention::Bucketed
-        );
+        for variant in [Variant::Public, Variant::DSpark] {
+            assert_eq!(exact.resolve(variant), DecodeAttention::Bucketed);
+        }
         for value in ["0", "", "true", "invalid"] {
             let policy = DecodeAttentionPolicy::from_override(Some(OsStr::new(value)));
             assert_eq!(
-                policy.resolve(Variant::Compiled, 16384, 128),
+                policy.resolve(Variant::Compiled),
                 DecodeAttention::Bucketed
             );
         }
@@ -116,7 +92,7 @@ mod attention_policy_tests {
         use std::os::unix::ffi::OsStrExt;
         let policy = DecodeAttentionPolicy::from_override(Some(OsStr::from_bytes(&[0xff])));
         assert_eq!(
-            policy.resolve(Variant::Compiled, 16384, 128),
+            policy.resolve(Variant::Compiled),
             DecodeAttention::Bucketed
         );
     }
@@ -231,7 +207,7 @@ impl MiniCpm5 {
 
     fn prepare_inner(&mut self, prompt: usize, output: usize) -> Result<()> {
         let capacity = self.config.request_capacity(self.variant, prompt, output)?;
-        let attention = self.attention_policy.resolve(self.variant, prompt, output);
+        let attention = self.attention_policy.resolve(self.variant);
         if self.capacity == capacity
             && self
                 .prepared
