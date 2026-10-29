@@ -11,7 +11,8 @@ Select `--provider native-minicpm5-thinking` before startup.
 The worker protocol is `apxinf-worker/2.3`.
 The public profile is `apxinf-native-thinking-v0.1`.
 The provider remains `metal_minicpm5`, with BF16 weights and variant `bf16-compiled`.
-The deployment retains one active sequence, 256-token prefill chunks, and at most 16384 positions.
+The deployment retains one active sequence and at most 16384 consumed positions.
+Prefill follows the [family-selected plan](minicpm-context-v0.1.md#model-execution).
 Use the [sampled profile](native-sampling-v0.1.md) request policy and seed derivation.
 The total output allowance includes reasoning tokens and final tokens.
 This profile adds no images, state reuse, or separate reasoning budget.
