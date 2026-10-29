@@ -613,8 +613,10 @@ where
     if !boundary(GenerationBoundary::PrefillStart)? {
         return Ok(empty_generation_output(prompt_tokens.len(), profile));
     }
+    let preparation_started = std::time::Instant::now();
     model.reset();
     model.prewarm_decode(prompt_tokens.len(), options.max_new_tokens);
+    profile.record_preparation(preparation_started.elapsed());
     let Some(logits) = model.prefill_controlled(input, &mut |event| {
         if matches!(event, GenerationBoundary::PrefillStart) { Ok(true) } else { boundary(event) }
     })? else {

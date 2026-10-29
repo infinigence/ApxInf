@@ -95,3 +95,7 @@ required-features = ["cuda"]
 [[example]]
 name = "d3_decision_index"
 required-features = ["cuda"]
+
+[[example]]
+name = "metal_text_probe"
+required-features = ["mlx"]

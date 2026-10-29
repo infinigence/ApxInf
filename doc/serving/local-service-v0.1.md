@@ -179,6 +179,34 @@ The original pelican output still fails visual acceptance.
 The [default-policy record](minicpm-default-context-validation-20261023.md) tests 4096 output tokens without the private blocking-limit override.
 Its isolated bare client completes the short tool cycle, but the drawing still fails visual acceptance.
 
+### Native prepared-code retention
+
+Select `--provider native-minicpm5-prepared` to retain one bounded compiled entry.
+This explicit profile uses worker protocol 2.7 and MLX 0.32.3.
+It releases request KV and keeps no session or prefix state.
+The [prepared-code contract](native-prepared-v0.1.md) defines settlement and admission.
+
+```sh
+DYLD_LIBRARY_PATH="$MLX_ROOT/lib" target/release/apxinf-serve \
+  --provider native-minicpm5-prepared \
+  --native-worker "$PWD/target/release/apxinf-native-worker" \
+  --metal-library "$MLX_ROOT/lib/libmlx.dylib" \
+  --model /absolute/path/to/MiniCPM5-2B --model-id minicpm5 \
+  --max-context 16384 --max-output-tokens 256 \
+  --allocator-cache-limit-bytes 2147483648
+```
+
+The default cache limit is 2 GiB for this profile only.
+The retained limit equals the process budget minus sequence reservation.
+The worker evicts prepared code if cleanup exceeds that allowance.
+Readiness reports checked resident memory after each settlement.
+The existing native providers retain their release-all behavior.
+
+Worker diagnostic stderr records preparation, text decoding and cleanup nanoseconds.
+Preparation includes reset, allocation and compile preparation, and remains part of TTFT.
+The terminal latency includes execution and output processing before cleanup.
+These diagnostics do not establish a performance gain.
+
 ### Python MLX-LM
 
 Run the following commands from the repository root on an Apple Silicon Mac.
