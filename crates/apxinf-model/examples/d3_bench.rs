@@ -56,13 +56,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = DecisionInput::text(&token_ids, candidate_count);
 
     let capture_started = Instant::now();
-    let first = model.decide(input)?.into_single()?;
+    let first = model.decide(input)?;
     let capture_ms = capture_started.elapsed().as_secs_f64() * 1_000.0;
 
     let mut milliseconds = Vec::with_capacity(iterations);
     for _ in 0..iterations {
         let started = Instant::now();
-        let output = model.decide(input)?.into_single()?;
+        let output = model.decide(input)?;
         milliseconds.push(started.elapsed().as_secs_f64() * 1_000.0);
         if output.selected_index != first.selected_index {
             return Err("d3 replay changed the selected answer".into());
@@ -85,9 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let selected = first.selected()?;
     println!(
         "selected={} token_id={} probability={:.8}",
-        selected.code,
-        selected.token_id.ok_or("d3 code has no token")?,
-        selected.probability
+        selected.code, selected.token_id, selected.probability
     );
     Ok(())
 }

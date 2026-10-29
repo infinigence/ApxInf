@@ -139,9 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut input_tokens = 0usize;
         for question in &record.questions {
             let candidate_count = question.candidate_keys.len();
-            let output = model
-                .decide(DecisionInput::text(&question.token_ids, candidate_count))?
-                .into_single()?;
+            let output = model.decide(DecisionInput::text(&question.token_ids, candidate_count))?;
             let total = output
                 .scores
                 .iter()

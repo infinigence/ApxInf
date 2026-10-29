@@ -455,14 +455,14 @@ mod schema_decision_tests {
     use super::*;
     use apxinf_core::{Error, Result};
     use apxinf_model::{
-        DecisionAnswer, DecisionOutput, DecisionRuntime, DecisionSchema, DecisionScore,
-        LlmCapabilities, LoadedModel,
+        DecisionOutput, DecisionRuntime, DecisionSchema, LlmCapabilities, LoadedModel,
+        SchemaDecisionAnswer, SchemaDecisionOutput, SchemaDecisionScore,
     };
 
     const REQUEST: &str = include_str!("../tests/fixtures/decision/schema.json");
 
     struct StubDecisionRuntime {
-        output: Option<Result<DecisionOutput>>,
+        output: Option<Result<SchemaDecisionOutput>>,
     }
 
     impl DecisionRuntime for StubDecisionRuntime {
@@ -470,10 +470,11 @@ mod schema_decision_tests {
             LlmCapabilities::TEXT_ONLY
         }
 
-        fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
-            let DecisionInput::Schema(schema) = input else {
-                panic!("expected schema dispatch");
-            };
+        fn decide(&mut self, _input: DecisionInput<'_>) -> Result<DecisionOutput> {
+            panic!("expected schema dispatch");
+        }
+
+        fn decide_schema(&mut self, schema: &DecisionSchema) -> Result<SchemaDecisionOutput> {
             assert_eq!(*schema, DecisionSchema::from_json(REQUEST).unwrap());
             assert_eq!(
                 schema
@@ -587,21 +588,20 @@ mod schema_decision_tests {
                 ),
             ]
             .into_iter()
-            .map(|(question_id, scores)| DecisionAnswer {
-                question_id: Some(question_id.into()),
+            .map(|(question_id, scores)| SchemaDecisionAnswer {
+                question_id: question_id.into(),
                 selected_index: 1,
                 scores: scores
                     .into_iter()
-                    .map(|(code, probability)| DecisionScore {
+                    .map(|(code, probability)| SchemaDecisionScore {
                         code: code.into(),
-                        token_id: None,
                         probability,
                     })
                     .collect(),
             })
             .collect();
             Ok(LoadedModel::Decision(Box::new(StubDecisionRuntime {
-                output: Some(Ok(DecisionOutput { answers })),
+                output: Some(Ok(SchemaDecisionOutput { answers })),
             })))
         });
         result.unwrap();
@@ -632,9 +632,9 @@ mod schema_decision_tests {
                 "Decision failed: schema unsupported by runtime",
             ),
             (
-                Ok(DecisionOutput {
-                    answers: vec![DecisionAnswer {
-                        question_id: Some("zeta".into()),
+                Ok(SchemaDecisionOutput {
+                    answers: vec![SchemaDecisionAnswer {
+                        question_id: "zeta".into(),
                         selected_index: 0,
                         scores: vec![],
                     }],
@@ -681,7 +681,7 @@ fn run_decide_schema(
         .map_err(|error| format!("Failed to load model: {error}"))?;
     writeln!(writer, "Model ready.\n").map_err(|error| error.to_string())?;
     let output = model
-        .decide(DecisionInput::Schema(&schema))
+        .decide_schema(&schema)
         .map_err(|error| format!("Decision failed: {error}"))?;
     for answer in &output.answers {
         let selected = answer
@@ -690,9 +690,7 @@ fn run_decide_schema(
         writeln!(
             writer,
             "{}: selected {}  probability {:.8}",
-            answer.question_id.as_deref().unwrap_or("-"),
-            selected.code,
-            selected.probability
+            answer.question_id, selected.code, selected.probability
         )
         .map_err(|error| error.to_string())?;
         for score in &answer.scores {
@@ -1023,22 +1021,14 @@ fn run_decide(
 
     let output = model
         .decide(DecisionInput::text(&tokens, candidate_count))
-        .and_then(|output| output.into_single())
         .map_err(|error| format!("Decision failed: {error}"))?;
 
     let selected = output
         .selected()
         .map_err(|error| format!("Invalid decision output: {error}"))?;
-    let token = |score: &apxinf_model::DecisionScore| {
-        score
-            .token_id
-            .map_or_else(|| "-".to_owned(), |id| id.to_string())
-    };
     println!(
         "selected: {}  token_id: {}  probability: {:.8}",
-        selected.code,
-        token(selected),
-        selected.probability
+        selected.code, selected.token_id, selected.probability
     );
     println!();
     println!("top-5:");
@@ -1047,9 +1037,7 @@ fn run_decide(
     for score in top.iter().take(5) {
         println!(
             "  {:<20}  token_id={:>6}  probability={:.8}",
-            score.code,
-            token(score),
-            score.probability
+            score.code, score.token_id, score.probability
         );
     }
     Ok(())
