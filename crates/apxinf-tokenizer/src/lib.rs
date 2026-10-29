@@ -238,19 +238,36 @@ pub struct Tokenizer {
     chat_template: Option<String>,
 }
 
-/// Decodes one request while preserving the dependency's stable text boundaries.
+/// Emits stable byte-level segments and checks contextual decoder prefixes.
 pub struct IncrementalDecoder<'a> {
     tokenizer: &'a Tokenizer,
-    step: Box<dyn FnMut(u32) -> Result<Option<String>> + 'a>,
     tokens: Vec<u32>,
+    pending: Vec<u32>,
     emitted: String,
     skip_special_tokens: bool,
+    byte_level: bool,
 }
 
 impl IncrementalDecoder<'_> {
     pub fn push(&mut self, token: u32) -> Result<String> {
-        let text = (self.step)(token)?.unwrap_or_default();
         self.tokens.push(token);
+        let text = if self.byte_level {
+            self.pending.push(token);
+            let decoded = self.tokenizer.decode_with_options(&self.pending, self.skip_special_tokens)?;
+            if decoded.ends_with('\u{fffd}') {
+                return Ok(String::new());
+            }
+            self.pending.clear();
+            decoded
+        } else {
+            let decoded = self.tokenizer.decode_with_options(&self.tokens, self.skip_special_tokens)?;
+            if decoded.ends_with('\u{fffd}') {
+                return Ok(String::new());
+            }
+            decoded.strip_prefix(&self.emitted)
+                .ok_or_else(|| Error::Other("tokenizer changed published text".into()))?
+                .to_owned()
+        };
         self.emitted.push_str(&text);
         Ok(text)
     }
@@ -339,14 +356,13 @@ impl Tokenizer {
     }
 
     pub fn incremental_decoder(&self, skip_special_tokens: bool) -> IncrementalDecoder<'_> {
-        let mut stream = self.inner.decode_stream(skip_special_tokens);
         IncrementalDecoder {
             tokenizer: self,
-            step: Box::new(move |token| stream.step(token)
-                .map_err(|error| Error::Other(format!("tokenizer stream decode: {error}")))),
             tokens: Vec::new(),
+            pending: Vec::new(),
             emitted: String::new(),
             skip_special_tokens,
+            byte_level: matches!(self.inner.get_decoder(), Some(tokenizers::decoders::DecoderWrapper::ByteLevel(_))),
         }
     }
 
@@ -793,6 +809,38 @@ mod tests {
         let mut decoder = tokenizer.incremental_decoder(false);
         assert_eq!(decoder.push(0).unwrap(), "");
         assert_eq!(decoder.finish().unwrap(), "�");
+    }
+
+    #[test]
+    fn incremental_byte_level_matches_full_decode_over_long_sequences() {
+        let mut tokenizer = special_token_template(&["A", "Ġcache", "Ġstores", "Ġdata", ".", "<function>", "</function>"]);
+        tokenizer.inner.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+        let ids = [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 6].repeat(20);
+        let mut decoder = tokenizer.incremental_decoder(false);
+        let mut actual = String::new();
+        for (index, &id) in ids.iter().enumerate() {
+            actual.push_str(&decoder.push(id).unwrap());
+            assert_eq!(actual, tokenizer.decode_with_options(&ids[..=index], false).unwrap());
+        }
+        actual.push_str(&decoder.finish().unwrap());
+        assert_eq!(actual, tokenizer.decode_with_options(&ids, false).unwrap());
+        assert!(actual.contains("<function>"));
+    }
+
+    #[test]
+    fn incremental_byte_level_preserves_split_utf8_and_literal_replacement() {
+        let mut tokenizer = special_token_template(&["ä", "¸", "Ń", "<function>", "ï", "¿", "½"]);
+        tokenizer.inner.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+        let mut decoder = tokenizer.incremental_decoder(false);
+        assert_eq!(decoder.push(0).unwrap(), "");
+        assert_eq!(decoder.push(1).unwrap(), "");
+        assert_eq!(decoder.push(2).unwrap(), "中");
+        assert_eq!(decoder.push(3).unwrap(), "<function>");
+        assert_eq!(decoder.push(4).unwrap(), "");
+        assert_eq!(decoder.push(5).unwrap(), "");
+        assert_eq!(decoder.push(6).unwrap(), "");
+        assert_eq!(decoder.finish().unwrap(), "�");
+        assert_eq!(tokenizer.decode_with_options(&[0, 1, 2, 3, 4, 5, 6], false).unwrap(), "中<function>�");
     }
 
     fn legacy_fallback_prompt(tokenizer: &Tokenizer) -> String {
