@@ -44,9 +44,9 @@ pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerW
 pub use llama::{GeneralLlama, KVCache, LlamaModel, LlamaWeights, TransformerLayer};
 pub use llm_trait::{
     generate_streaming, generate_streaming_controlled_with_sampler, generate_streaming_with_options,
-    GeneratedToken, GenerationBoundary, GenerationCancellation, GenerationOutput,
-    GenerationRequest, ImageInput, LlmCapabilities, LlmInput, LlmTrait, TextCompilationScope,
-    TextPreparationState, TextPreparationStatus,
+    GeneratedToken, GenerationBoundary, GenerationCancellation, GenerationOutput, GenerationRequest,
+    ImageInput, LlmCapabilities, LlmInput, LlmTrait, TextCompilationScope, TextPreparationState,
+    TextPreparationStatus,
 };
 pub use pi05::{Pi05Config, Pi05PerformanceProfile};
 pub use profiling::GenerationProfile;

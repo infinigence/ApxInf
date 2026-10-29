@@ -6,8 +6,7 @@ use super::{
     weights::Weights,
 };
 use crate::{
-    GenerationBoundary, LlmInput, LlmTrait, TextCompilationScope, TextPreparationState,
-    TextPreparationStatus,
+    GenerationBoundary, LlmInput, LlmTrait, TextCompilationScope, TextPreparationState, TextPreparationStatus,
 };
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
@@ -718,58 +717,6 @@ impl MiniCpm5 {
         self.offset = end;
     }
 
-    fn prefill_chunks(
-        &mut self,
-        input: LlmInput<'_>,
-        boundary: &mut dyn FnMut(GenerationBoundary) -> Result<bool>,
-    ) -> Result<Option<Tensor>> {
-        if input.image.is_some() {
-            return Err(Error::Contract("MiniCPM5 is text-only"));
-        }
-        let ids = input.token_ids;
-        if ids.is_empty()
-            || ids.iter().any(|&id| id >= self.config.vocab_size as u32)
-            || self.offset != 0
-            || self.prepared.as_ref().map(|p| p.prefill.prompt) != Some(ids.len())
-            || self.states.is_empty()
-            || self.failure.is_some()
-            || ids.len() > self.capacity
-            || ids.len() > self.variant.context_capacity()
-        {
-            return Err(Error::Contract(
-                "invalid or unprepared MiniCPM prefill input",
-            ));
-        }
-        if !boundary(GenerationBoundary::PrefillStart)? {
-            return Ok(None);
-        }
-        let plan = self.prepared.as_ref().unwrap().prefill;
-        for range in plan.chunks() {
-            let end = range.end;
-            let required = if self.variant == Variant::Compiled && end < plan.prompt {
-                RequiredOutput::CacheOnly
-            } else {
-                RequiredOutput::Logits { last_only: true }
-            };
-            let logits = self.execute_tokens(&ids[range], self.offset, required)?;
-            if !boundary(GenerationBoundary::PrefillProgress {
-                consumed_tokens: end,
-            })? {
-                return Ok(None);
-            }
-            if end == ids.len() {
-                let logits = logits.expect("the final prefill chunk requires logits");
-                return self
-                    .backend
-                    .from_array(logits.reshape(&[1, self.vocab_size()])?)
-                    .map(Some);
-            }
-        }
-        Err(Error::Contract(
-            "MiniCPM prefill did not consume its complete prompt",
-        ))
-    }
-
     pub(crate) fn trim_to(&mut self, position: usize) -> Result<()> {
         if position > self.offset {
             return Err(Error::Contract("MiniCPM rollback cannot advance state"));
@@ -937,23 +884,18 @@ impl LlmTrait for MiniCpm5 {
         self.last_taps = None;
         self.local = None;
         let stream = self.backend.stream();
-        self.swiglu =
-            Compiled::with_shapeless(stream, 1, true, |a| Ok(vec![math::swiglu(&a[0], &a[1])?]))?;
+        self.swiglu = Compiled::with_shapeless(stream, 1, true, |a| Ok(vec![math::swiglu(&a[0], &a[1])?]))?;
         if self.variant != Variant::Public {
             let eps = self.epsilon.clone();
             self.local = Some(LocalMath {
-                norm: Compiled::with_shapeless(stream, 1, true, move |a| {
-                    Ok(vec![math::norm(&a[0], &a[1], &eps)?])
-                })?,
+                norm: Compiled::with_shapeless(stream, 1, true, move |a| Ok(vec![math::norm(&a[0], &a[1], &eps)?]))?,
                 rope: Compiled::new(stream, 1, |a| Ok(vec![math::rotate(&a[0], &a[1], &a[2])?]))?,
             });
         }
         self.capacity = 0;
         self.offset = 0;
-        self.prepared = None;
-        stream.synchronize()?;
         self.failure = None;
-        Ok(())
+        stream.synchronize()
     }
     fn prewarm_decode(&mut self, prompt: usize, output: usize) {
         if let Err(e) = self.prepare(prompt, output) {
@@ -964,7 +906,7 @@ impl LlmTrait for MiniCpm5 {
         self.config.vocab_size
     }
     fn prefill(&mut self, input: LlmInput<'_>) -> Result<Tensor> {
-        self.prefill_chunks(input, &mut |_| Ok(true))?
+        self.prefill_controlled(input, &mut |_| Ok(true))?
             .ok_or(Error::Contract("uncontrolled MiniCPM prefill stopped"))
     }
     fn prefill_controlled(
@@ -972,6 +914,30 @@ impl LlmTrait for MiniCpm5 {
         input: LlmInput<'_>,
         boundary: &mut dyn FnMut(GenerationBoundary) -> Result<bool>,
     ) -> Result<Option<Tensor>> {
-        self.prefill_chunks(input, boundary)
+        if input.image.is_some() {
+            return Err(Error::Contract("MiniCPM5 is text-only"));
+        }
+        if self.offset != 0
+            || self.prepared.as_ref().map(|p| p.prefill.prompt) != Some(input.token_ids.len())
+            || input.token_ids.is_empty()
+            || input.token_ids.iter().any(|&id| id as usize >= self.config.vocab_size)
+        {
+            return Err(Error::Contract("MiniCPM prefill requires its prepared prompt and valid tokens"));
+        }
+        if !boundary(GenerationBoundary::PrefillStart)? { return Ok(None); }
+        let plan = self.prepared.as_ref().unwrap().prefill;
+        let mut logits = None;
+        for range in plan.chunks() {
+            let end = range.end;
+            let required = if self.variant == Variant::Compiled && end < plan.prompt {
+                RequiredOutput::CacheOnly
+            } else { RequiredOutput::Logits { last_only: true } };
+            logits = self.execute_tokens(&input.token_ids[range], self.offset, required)?;
+            if !boundary(GenerationBoundary::PrefillProgress { consumed_tokens: end })? {
+                return Ok(None);
+            }
+        }
+        let logits = logits.expect("final chunk produces logits");
+        self.backend.from_array(logits.reshape(&[1, self.vocab_size()])?).map(Some)
     }
 }

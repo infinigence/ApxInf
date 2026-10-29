@@ -112,14 +112,6 @@ policy; the model does not silently change it for other resident models.
 
 DSpark retains its separate 4096-total-token limit and 1–256 output-token
 budget. Requests beyond these limits fail with an explicit DSpark error.
-
-The shared controlled loop checks control before prefill and after each evaluated chunk and output token.
-Its initial control boundary does not report consumed positions.
-The native serving owner can stop at these boundaries.
-`release_request_state` checks device synchronization before it releases request KV and compiled traces.
-It preserves fixed weights and position tables.
-The existing `reset` operation retains prepared state and cannot establish resource release.
-
 Only greedy sampling without penalties/log-probability is currently implemented
 by the native backend. Unsupported sampling requests fail explicitly. DSpark is
 an explicit selection with a separately pinned drafter; it is never the default.

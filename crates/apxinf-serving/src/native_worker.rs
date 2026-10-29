@@ -501,6 +501,7 @@ fn run(args: Args) -> Result<()> {
         "max_output_tokens":args.max_output_tokens,"exact_append":false,"state_schema":"none"});
     let capability_revision =
         contracts::canonical_identity_digest("apxinf-capability-v1", &capabilities)?;
+    std::env::set_var("APXINF_MINICPM5_PREFILL_CHUNK", "256");
     apxinf_mlx::set_memory_limit(usize::try_from(args.memory_limit_bytes)?)?;
     if let Some(limit) = args.cache_limit_bytes { apxinf_mlx::set_cache_limit(usize::try_from(limit)?)?; }
     let mut model = AutoModel::load_model(
