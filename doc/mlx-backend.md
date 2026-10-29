@@ -281,6 +281,16 @@ separately check changed operands, unseen lengths, Metal parity, retained
 outputs and warm resources. The non-generative `SchemaDecisionRuntime` does not
 borrow the text runtime's readiness status or advertise a fabricated `Ready`.
 
+## Native serving preparation lifetime
+
+The opt-in [prepared-code profile](serving/native-prepared-v0.1.md) separates model-owned code from request KV.
+It retains one complete MiniCPM5 preparation key and reports memory after cleanup.
+The existing native profiles retain release-all settlement.
+This lifetime policy does not add a model arithmetic variant.
+Only the worker owner sets process-wide allocator cache limits.
+The ordinary public forward output contract remains unchanged.
+
+
 ## Native dependency and ABI
 
 The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.
