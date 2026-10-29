@@ -356,10 +356,12 @@ def run(config):
                               "HTTP observations cannot prove operating system process reaping or external pressure monitoring."]}
     save_report(path, report)
 
-    def observe(method, endpoint, body=None, budget=None):
-        timeout = config.request_timeout if budget is None else min(config.request_timeout, budget)
-        require(timeout > 0, "The settlement deadline expired.")
+    def observe(method, endpoint, body=None, deadline=None):
+        timeout = config.request_timeout if deadline is None else min(config.request_timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise TimeoutError("The settlement deadline expired.")
         result = exchange(config.base_url, method, endpoint, body, timeout)
+        observed_at = time.monotonic()
         index = len(report["exchanges"])
         filename = f"exchange-{index:04d}.body"
         (config.output_dir / filename).write_bytes(result.raw)
@@ -367,25 +369,27 @@ def run(config):
                                     "headers": [list(pair) for pair in result.headers],
                                     "raw_body": filename, "error": result.error})
         save_report(path, report)
+        if deadline is not None and observed_at >= deadline:
+            raise TimeoutError("The settlement deadline expired.")
         return result
 
     def snapshot(registered, previous=None, case=None, seen=()):
         deadline = time.monotonic() + config.settlement_timeout
         expected = (expected_metrics(previous.metrics, case, registered) if case else previous.metrics) if previous else None
         while time.monotonic() < deadline:
-            first = observe("GET", "/readyz", budget=deadline - time.monotonic())
+            first = observe("GET", "/readyz", deadline=deadline)
             require(first.error is None, first.error or "Readiness transport failed.")
             require(first.status in (200, 503), "The readiness HTTP status is unexpected.")
             if first.status == 200:
                 ready = json_response(first)
                 epoch = check_ready(ready, registered, config.diagnostic_disabled_pressure)
-                metrics_result = observe("GET", "/metrics", budget=deadline - time.monotonic())
+                metrics_result = observe("GET", "/metrics", deadline=deadline)
                 require(metrics_result.status == 200 and metrics_result.error is None, "Metrics observation failed.")
                 metrics = checked_metrics(metrics_result.raw)
                 if previous is not None:
                     require(all(previous.metrics[name] <= metrics[name] <= expected[name] for name in COUNTER_METRICS),
                             "An observed counter decreased or exceeded its expected delta.")
-                second = observe("GET", "/readyz", budget=deadline - time.monotonic())
+                second = observe("GET", "/readyz", deadline=deadline)
                 require(second.error is None, second.error or "Readiness transport failed.")
                 require(second.status in (200, 503), "The readiness HTTP status is unexpected.")
                 if second.status == 200:
@@ -395,6 +399,8 @@ def run(config):
                               and ready["host_pressure"]["policy"] == after["host_pressure"]["policy"])
                     epoch_ok = previous is None or (epoch not in seen if case and case.consumes_worker else epoch == previous.epoch)
                     if stable and settled(metrics) and epoch_ok and (expected is None or metrics == expected):
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("The settlement deadline expired.")
                         return Snapshot(after, metrics, epoch)
             time.sleep(min(0.05, max(0, deadline - time.monotonic())))
         raise TimeoutError("The joint readiness, identity, counters, epoch, and resource settlement did not converge.")
