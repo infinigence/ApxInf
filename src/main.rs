@@ -833,6 +833,13 @@ fn run_generate_image(
         model_variant: model_variant.map(str::to_owned),
         ..LoadOptions::default()
     };
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    if matches!(device, Device::Metal(_)) {
+        apxinf_mlx::set_cache_limit(1_000_000_000)
+            .map_err(|error| format!("Failed to set the image process cache limit: {error}"))?;
+        apxinf_mlx::clear_cache()
+            .map_err(|error| format!("Failed to clear the image process cache: {error}"))?;
+    }
     eprintln!("Loading {model_name} from {:?}...", model_dir);
     let started = std::time::Instant::now();
     let mut model = AutoModel::load_model(device, model_dir, &options)

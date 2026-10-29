@@ -27,8 +27,6 @@ use weights::{Decoder, TextEncoderFiles, Transformer, LATENT, MLP};
 
 /// The only schedule this family has validated: 40 linear steps, guidance 1.
 pub const STEPS: usize = 40;
-/// mflux `--low-ram` caps the process-wide MLX allocator cache at 1 GB.
-const CACHE_LIMIT_BYTES: usize = 1_000_000_000;
 /// Pixels per latent; the RoPE tables cover 2048 latent rows or columns.
 const SCALE: usize = 16;
 const MAX_SIDE: usize = 2048 * SCALE;
@@ -104,10 +102,6 @@ pub fn load(
         return Err(Error::Contract("Qwen-Image loads a checkpoint directory"));
     }
     let stream = native.stream().clone();
-    // As the mflux memory saver does when `--low-ram` registers it, before any
-    // weight is read. The limit is process-wide.
-    apxinf_mlx::set_cache_limit(CACHE_LIMIT_BYTES)?;
-    apxinf_mlx::clear_cache()?;
     let tokenizer = Tokenizer::from_file(path.join("processor/tokenizer.json"))?;
     let text = TextEncoderFiles::open(&path.join("text_encoder"))?;
     let transformer = Transformer::load(&stream, &path.join("transformer"))?;
