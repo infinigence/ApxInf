@@ -1,12 +1,15 @@
 # Core ML and Apple Neural Engine execution (proposal)
 
 Status: design under review; no Core ML code is merged. On 2026-10-19 the
-requesting Metal maintainer accepted the fixed-profile Clef host-handoff scope
+fork operator accepted the fixed-profile Clef host-handoff scope
 below, conditional on completing every qualification gate. This decision does
 not approve unrelated interfaces, qualify an implementation or merge a PR.
-The same maintainer subsequently accepted the finite placement-evidence policy
+The same operator subsequently accepted the finite placement-evidence policy
 below for these Clef compositions. Quality, performance, resource, lifetime and
 warm-readiness requirements are unchanged.
+
+These fork decisions do not establish upstream maintainer approval.
+The upstream host-handoff proposal remains under review.
 
 ## Motivation
 

@@ -34,20 +34,6 @@ pub struct ClefRunner {
 /// reference composition everywhere else.
 const GPU_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
 
-/// MLX architectures where the GPU composition with MLP columns on the Neural
-/// Engine passed its gates; `auto` prefers it there. None yet: its fidelity,
-/// quality, memory and paired latency gates on the M1 Pro are pending.
-#[cfg(feature = "coreml")]
-const GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES: &[&str] = &[];
-
-/// MLX architectures where the GPU composition with MLP neurons split onto the
-/// Neural Engine passed its gates; `auto` prefers it there: the M4 (2026-10-18;
-/// programs equal to the reference build, at-risk decisions bit-identical to
-/// it, quality against stock answers frozen on the M4, paired latency median
-/// 0.997x the reference implementation).
-#[cfg(feature = "coreml")]
-const GPU_ANE_NEURONS_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g16g"];
-
 /// Device-independent option admission, checked before the checkpoint is read.
 /// Returns the requested composition; `None` is `auto`, which picks the
 /// composition qualified on the device.
@@ -55,9 +41,13 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
     let requested = match options.model_variant.as_deref() {
         None | Some("auto") => None,
         Some("reference") => Some(Composition::Reference),
+        #[cfg(feature = "coreml")]
+        Some("gpu-ane-columns") => Some(Composition::GpuAneColumns),
+        #[cfg(feature = "coreml")]
+        Some("gpu-ane-neurons") => Some(Composition::GpuAneNeurons),
         Some(_) => {
             return Err(Error::Contract(
-                "Clef MLX supports the auto and reference variants",
+                "Clef MLX variant is unavailable in this build",
             ))
         }
     };
@@ -84,15 +74,6 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
 /// `auto` runs an optimized composition only on an architecture where it
 /// qualified.
 fn select(requested: Option<Composition>, architecture: &str) -> Composition {
-    #[cfg(feature = "coreml")]
-    if requested.is_none() {
-        if GPU_ANE_NEURONS_QUALIFIED_ARCHITECTURES.contains(&architecture) {
-            return Composition::GpuAneNeurons;
-        }
-        if GPU_ANE_COLUMNS_QUALIFIED_ARCHITECTURES.contains(&architecture) {
-            return Composition::GpuAneColumns;
-        }
-    }
     requested.unwrap_or(if GPU_QUALIFIED_ARCHITECTURES.contains(&architecture) {
         Composition::Gpu
     } else {
@@ -256,11 +237,34 @@ mod tests {
     }
 
     #[test]
+    fn coreml_requires_an_explicit_available_variant() {
+        let options = LoadOptions {
+            model_variant: Some("gpu-ane-columns".into()),
+            ..LoadOptions::default()
+        };
+        #[cfg(feature = "coreml")]
+        {
+            assert_eq!(admit(&options).unwrap(), Some(Composition::GpuAneColumns));
+            assert_eq!(select(admit(&options).unwrap(), ""), Composition::GpuAneColumns);
+        }
+        #[cfg(not(feature = "coreml"))]
+        assert!(admit(&options).is_err());
+        let options = LoadOptions {
+            model_variant: Some("gpu-ane-neurons".into()),
+            ..LoadOptions::default()
+        };
+        #[cfg(feature = "coreml")]
+        {
+            assert_eq!(admit(&options).unwrap(), Some(Composition::GpuAneNeurons));
+            assert_eq!(select(admit(&options).unwrap(), ""), Composition::GpuAneNeurons);
+        }
+        #[cfg(not(feature = "coreml"))]
+        assert!(admit(&options).is_err());
+    }
+
+    #[test]
     fn auto_runs_each_composition_only_on_its_qualified_architectures() {
         assert_eq!(select(None, "applegpu_g13s"), Composition::Gpu);
-        #[cfg(feature = "coreml")]
-        assert_eq!(select(None, "applegpu_g16g"), Composition::GpuAneNeurons);
-        #[cfg(not(feature = "coreml"))]
         assert_eq!(select(None, "applegpu_g16g"), Composition::Reference);
         for other in ["applegpu_g14g", "applegpu_g13g", ""] {
             assert_eq!(select(None, other), Composition::Reference, "{other}");
