@@ -78,6 +78,9 @@ class ServingContractTests(unittest.TestCase):
         for case in corpus["frame_cases"]:
             with self.subTest(case=case["name"]):
                 frame = fixture(case, corpus)
+                if case.get("refresh_identity"):
+                    frame["model_revision"] = contracts.canonical_identity_digest("apxinf-model-identity-v1", frame["model_manifest"])
+                    frame["capability_revision"] = contracts.canonical_identity_digest("apxinf-capability-v1", frame["capabilities"])
                 if case["valid"]:
                     contracts.validate_frame(frame)
                 else:
