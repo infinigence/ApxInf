@@ -425,3 +425,20 @@ and output lifetime checks pass. Canonical text cosine improves from 0.997469 to
 0.306641 to 0.0703125. The independent 0.01 text-output threshold still fails and
 has not been relaxed. Task 9 text cosine improves from 0.976986 to 0.999184, but
 improvement is not uniform across all prompts; task-level checks remain necessary.
+
+The new native text substitution passes all ten LIBERO-Spatial tasks (one bundled
+initial state per task), versus 9/10 before the precision change and 10/10 with
+reference text. Task 9 now succeeds in 122 steps. Initial-state, starting-observation,
+BDDL and initialization-file hashes match the reference arm. The native task-9
+embedding also matches the independent two-boundary intervention numerically;
+79 signed-zero bit differences remain. This controlled substitution establishes
+recovery of the diagnosed failure without changing GELU or replacing baseline
+operator defaults. It is a ten-episode pilot, not the full four-suite benchmark.
+
+The rebuilt Python AutoPolicy also passes all ten complete native LIBERO-Spatial
+episodes with the same protocol and matching initial-condition hashes. Task 9
+succeeds in 121 steps, matching the reference success length. This exercises the
+native VAE/text/action pipeline, not only substituted embeddings. The extension
+SHA-256 is `043fe0d3f1c3126969aba5dea48d3c185fa52de949c4498477d5577223991455`.
+These ten successful episodes do not establish statistical equivalence or replace
+the full multi-suite evaluation.
