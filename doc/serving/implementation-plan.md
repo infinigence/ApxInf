@@ -34,7 +34,7 @@ Every path in this table describes a future module. The first implementation cre
 | `crates/apxinf-serving/src/prompt_adapter.rs` | PromptAdapter owns templates, tokenization, media normalization, and effective input length. |
 | `crates/apxinf-serving/src/state_store.rs` | StateStore owns snapshot identity, references, byte accounting, and eviction policy. |
 | `crates/apxinf-serving/src/metrics.rs` | This module records contract events and separate latency intervals. |
-| `crates/apxinf-serving/src/workers/mod.rs` | This module defines handwritten interfaces for TextWorker and PolicyWorker. |
+| `crates/apxinf-serving/src/workers/mod.rs` | This module defines interfaces for TextWorker and PolicyWorker. |
 | `crates/apxinf-serving/src/workers/mlx.rs` | This adapter owns the new MLX protocol connection. |
 | `crates/apxinf-serving/src/workers/native.rs` | This adapter owns native model execution on its assigned thread. |
 | `python/apxinf/apxinf/serving/contracts.py` | These types represent the same contract in Python. |
