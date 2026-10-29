@@ -31,5 +31,3 @@ Specification checks do not establish backend compatibility.
 
 This interface introduces no dependency, worker adapter, or wire protocol change.
 CPU model tests check sampler selection, initialization, validation, zero output, cancellation, and EOS.
-Structural checks follow ASD-STE100 Issue 9 principles.
-These checks do not include a complete dictionary review or certification.

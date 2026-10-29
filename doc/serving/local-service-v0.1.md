@@ -92,7 +92,7 @@ Select the existing pinned Python environment and external loader explicitly.
 The [dependency record](dependencies.md#clef-text-runtime) lists their roles and versions.
 The model bundle must match the approved artifact digests.
 The external loader remains an installed dependency outside this repository.
-The [Clef validation report](clef-serving-validation-20261023.md) records successful diagnostic HTTP tests.
+The [support overview](support-status.md) separates diagnostic HTTP observations from default-pressure admission.
 Default host pressure checks can still prevent readiness on the tested machine.
 
 ```sh
@@ -128,8 +128,9 @@ Allocator limits do not guarantee a hard process memory limit.
 Build the native executable with the pinned MLX 0.32.3 C++ SDK.
 Select the provider and runtime files explicitly.
 The native provider does not fall back to Python.
-Its context limit permits 16384 positions with fixed 256-token prefill chunks.
-The [validation report](minicpm-native-validation-20261022.md) records measured deployment gates.
+Its deployment context limit permits 16384 positions.
+The model family selects and prepares the actual prefill chunk plan.
+The [support overview](support-status.md) describes historical verification and remaining limits.
 This limit includes the input and output reservation.
 
 ```sh
@@ -174,10 +175,8 @@ The closing token uses one position within the existing output allowance.
 Readiness reports `initial_reasoning_budget_tokens=512` under public capabilities.
 The profile retains exact usage, the 16K total limit, and the unsupported Anthropic extended-thinking boundary.
 The original thinking provider retains its behavior without a separate reasoning budget.
-The [validation record](native-bounded-thinking-validation-20261023.md) covers native controls and a completed real client tool cycle.
-The original pelican output still fails visual acceptance.
-The [default-policy record](minicpm-default-context-validation-20261023.md) tests 4096 output tokens without the private blocking-limit override.
-Its isolated bare client completes the short tool cycle, but the drawing still fails visual acceptance.
+The [support overview](support-status.md) separates budget-control observations from task-quality qualification.
+Historical tool-cycle completion did not establish successful drawing or image-driven revision.
 
 ### Native prepared-code retention
 
@@ -603,7 +602,7 @@ python3 -m pytest -q \
 ```
 
 Follow [the benchmark guide](../../benchmarks/serving/README.md) for real model and Claude Code tests.
-Follow [the Metal experiments](metal-experiments.md) for controlled parameter comparisons.
+Use `benchmarks/serving/metal_matrix.py` for controlled parameter comparisons.
 Tests must preserve raw failures and actual outputs.
 CPU test doubles cannot establish real inference or client compatibility.
-The [lifecycle report](lifecycle-hardening-20261009.md) separates the latest CPU checks from historical model measurements.
+The [support overview](support-status.md) separates CPU checks from historical model observations.

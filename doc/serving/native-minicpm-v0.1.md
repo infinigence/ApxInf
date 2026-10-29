@@ -61,6 +61,3 @@ Fixed weights and position tables remain resident model resources.
 The worker clears allocator cache before reporting `resources_released`.
 A failed synchronization or release closes the worker without releasing leases.
 The supervisor retains reservations until successful worker recovery.
-
-This document applies structural ASD-STE100 principles.
-It does not claim a complete dictionary review or certification.

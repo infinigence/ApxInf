@@ -1,6 +1,6 @@
 # Serving measurements and client tasks
 
-These tools contain original, handwritten Python code and fixtures.
+These tools check HTTP, lifecycle, client, and memory behavior.
 They use Python standard library APIs. They add no runtime dependency.
 HTTP clients accept loopback endpoints only.
 
@@ -107,11 +107,10 @@ The parent freezes the complete plan and seed messages before it starts the prob
 The probe checks that snapshot and never rereads the external source files.
 Both successful and blocked reports retain the frozen input identity.
 
-The [staged evidence plan](../../doc/serving/memory-evidence-plan-20261010.md) defines boundary, repetition, stopping, and independent input cases.
-Its fixtures define planned work and contain no measurement results.
-The [cache geometry analysis](../../doc/serving/qwen35-memory-geometry-20261010.md) explains the selected allocation boundaries.
-Those static calculations do not establish complete allocation peaks.
-The [measurement record](../../doc/serving/memory-evidence-20261010.md) separates completed short requests from blocked stages and unreached outputs.
+The files in `benchmarks/serving/plans/` provide reusable boundary, repetition, stopping, and independent input cases.
+They define planned work and contain no measurement results.
+Record the actual cache offsets and reached outputs for each execution.
+The [support overview](../../doc/serving/support-status.md) separates observations from unqualified capacity and memory claims.
 The [production validation profile](../../doc/serving/production-memory-validation-v0.1.md) defines checks without additional device sampling synchronization.
 
 ## Offline memory coverage
@@ -262,7 +261,7 @@ python3 benchmarks/serving/http_benchmark.py \
   --model qwen3.5-2b \
   --samples 32 --warmup 2 --concurrency 1 2 4 \
   --workload mixed --max-tokens 64 \
-  --metal-lock /Users/haiyan-mini/.cache/enginetailor/metal-measure.lock \
+  --metal-lock /absolute/path/to/metal-measure.lock \
   --output /tmp/apxinf-serving-benchmark.json
 ```
 
@@ -457,7 +456,8 @@ The report adds `calculation_receipt` and `tool_cycle_reason` to the existing ev
 
 Run these cases with `--tasks expenses-tools-cny expenses-tools-usd`.
 CPU tests verify calculator behavior and trace rejection. Actual model completion requires a separate captured client run.
-The [M4 expense trial report](../../doc/serving/expense-tools-validation-20261023.md) records six failed MiniCPM5-2B task attempts.
+Historical MiniCPM5-2B expense trials did not establish task completion.
+The [support overview](../../doc/serving/support-status.md) states the evidence boundaries.
 Successful HTTP requests and CPU arithmetic do not establish task completion.
 The evidence assumes trusted capture and no external writer. Tool permissions do not provide an operating-system sandbox.
 These cases do not establish long-context capacity or general financial quality.
@@ -471,7 +471,7 @@ python3 benchmarks/serving/claude_code_tasks.py \
   --base-url http://127.0.0.1:8080 \
   --model qwen3.5-2b \
   --tasks read edit check --repeats 1 \
-  --metal-lock /Users/haiyan-mini/.cache/enginetailor/metal-measure.lock \
+  --metal-lock /absolute/path/to/metal-measure.lock \
   --output-dir /tmp/apxinf-claude-tasks
 ```
 

@@ -5,7 +5,6 @@ Status: P0 interface for P1a. Date: 2026-10-09.
 This profile selects a stateless text subset of `apxinf-worker/2.0`.
 It does not complete P1 or add exact session append.
 The [main contract](contracts-v0.1.md) defines common ownership and result rules.
-All implementation code and fixtures for this profile are handwritten.
 
 ## Limits and ownership
 

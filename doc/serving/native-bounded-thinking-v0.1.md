@@ -123,5 +123,3 @@ Native execution checks the pinned tokenizer, constrained close, exact usage, an
 Real Claude Code execution checks actual tools and the rendered SVG.
 Structural SVG validity does not establish visual task quality.
 The scratch prototype uses a different post-close random stream and cannot qualify this production policy.
-
-Structural writing checks do not establish a complete dictionary review or certification.

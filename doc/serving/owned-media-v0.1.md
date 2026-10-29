@@ -101,5 +101,3 @@ The new profile still needs paired protocol validators, processor bindings, memo
 It must report unsupported exact positions and cancellation boundaries honestly.
 The [P2c exit checks](implementation-plan.md#p2c-serial-vision-requests) and real Claude drawing acceptance remain open.
 The current text protocols and public image capabilities retain their behavior.
-
-Structural writing checks do not establish a full dictionary review or certification.

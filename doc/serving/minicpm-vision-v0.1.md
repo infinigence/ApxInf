@@ -315,4 +315,3 @@ The worker must not return a capacity lease after uncertain device settlement.
 
 The P2c reference, shape, context, repeated-request, memory, and cancellation gates remain required.
 Real Claude tool execution and an inspected pelican riding a bicycle remain separate acceptance requirements.
-Structural writing checks do not establish a full dictionary review or certification.

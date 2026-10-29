@@ -1,6 +1,6 @@
 # Native MiniCPM5 context profile
 
-Status: implementation profile 0.1. Measured 16K factual, memory, cancellation, and fault gates passed.
+Status: implementation profile 0.1. Historical observations have their original source and runtime scope.
 Drawing quality and general long-context quality remain unverified.
 The [serving contract](contracts-v0.1.md) controls admission, cancellation, and resource settlement.
 This profile introduces no runtime dependency and changes no v1 protocol.
@@ -54,7 +54,7 @@ The initial equivalence gate passed with the existing 4096-position limit.
 The ordinary BF16 model permits a 16384-position profile.
 The limit applies to `bf16-public` and `bf16-compiled` only.
 Variant limits control RoPE table size, preparation, and token admission together.
-The [native validation report](minicpm-native-validation-20261022.md) records measured gates for the `bf16-compiled` deployment.
+The [support overview](support-status.md) separates historical observations from current qualification.
 These gates do not establish equivalent quality for every task or variant.
 A 32768-position profile remains deferred.
 
@@ -79,34 +79,4 @@ Release after device synchronization must permit a successful subsequent request
 CPU checks cover shape admission, context boundaries, overflow, and shared control behavior.
 
 Larger context acceptance additionally requires production HTTP quality, memory, cancellation, and recovery evidence.
-The root integration report records that separate gate.
-Structural writing checks do not establish a complete dictionary review or certification.
-
-## Verification record
-
-The 4096-position profile passed the real-checkpoint gate on 2026-10-22 with `bf16-compiled`.
-The checkpoint revision was `f97400052a43d642bbc6e9975e2397e3ae6a6b52`.
-The test used one model instance under the shared Metal lock.
-
-| Input tokens | Maximum absolute logit error | Matching greedy token |
-| --- | --- | --- |
-| 255 | 0.03125 | 285 |
-| 256 | 0.03125 | 17101 |
-| 257 | 0.25 | 16682 |
-| 513 | 0.21875 | 285 |
-
-All compared logits were finite.
-The invalid token at index 400 caused rejection before a callback or consumed position change.
-Cancellation before prefill consumed zero tokens.
-Cancellation after the first chunk consumed 256 tokens without sampling an output token.
-Release and subsequent prefill and generation succeeded on the same instance.
-The recovered 257-token request retained its original greedy token and emitted one progress boundary per chunk.
-
-The initial three CPU shape tests and 15 shared input tests passed.
-The four CPU shape tests passed after the 16384-position candidate change.
-These tests include variant limits and insufficient checkpoint positions.
-The structural document check reported zero findings.
-These results do not establish larger context quality, memory coverage, or latency acceptance.
-The separate validation report covers HTTP requests with 2040, 8190, and 15998 input tokens.
-It also records host memory, long-prefill cancellation, and fault settlement.
-No latency target or general quality claim follows from those measurements.
+Retain the exact candidate and complete result with each execution.

@@ -216,6 +216,3 @@ The source identity lacks an explicit operating-system build and device identity
 It also lacks an explicit environment policy and sampling-policy identity.
 Tool and adapter hashes retain the available implementation identity.
 These limitations remain explicit even when every planned case completes.
-
-This document applies structural ASD-STE100 principles.
-Structural checks do not establish full dictionary compliance or certification.
