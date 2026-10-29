@@ -1,18 +1,40 @@
 {
   "templates": {
+    "ready": {
+      "protocol": "apxinf-worker/2.7", "kind": "ready",
+      "worker_epoch": "10000000-0000-4000-8000-000000000001",
+      "model_revision": "0000000000000000000000000000000000000000000000000000000000000000",
+      "capability_revision": "0000000000000000000000000000000000000000000000000000000000000000",
+      "model_path": "/model", "eos_token_ids": [1, 130073], "vocab_size": 130074,
+      "runtime": {"kind": "native_minicpm5", "apxinf": "0.1.0", "mlx": "0.32.3", "executable_sha256": "1111111111111111111111111111111111111111111111111111111111111111", "metal_library_sha256": "2222222222222222222222222222222222222222222222222222222222222222"},
+      "model_manifest": {
+        "adapter_revision": "apxinf-native-minicpm5-prepared-v1",
+        "artifacts": [{"path": "config.json", "size_bytes": 2, "sha256": "3333333333333333333333333333333333333333333333333333333333333333"}],
+        "runtime": {"kind": "native_minicpm5", "apxinf": "0.1.0", "mlx": "0.32.3", "executable_sha256": "1111111111111111111111111111111111111111111111111111111111111111", "metal_library_sha256": "2222222222222222222222222222222222222222222222222222222222222222"},
+        "execution": {"provider": "metal_minicpm5", "precision": "bf16", "variant": "bf16-compiled", "parser": "minicpm5_xml", "enable_thinking": false, "max_context": 16384, "max_output_tokens": 128, "memory_limit_bytes": 9000000, "preparation_policy": "single-code-entry-v1", "allocator_cache_limit_bytes": 1000000, "retained_memory_limit_bytes": 8000000}
+      },
+      "capabilities": {"text": true, "image": false, "greedy": true, "sampling": false, "token_events": true, "cancel_granularity": "token_or_prefill_chunk", "max_active_sequences": 1, "max_context": 16384, "max_output_tokens": 128, "exact_append": false, "state_schema": "none"},
+      "limits": {"max_frame_bytes": 1048576, "max_depth": 16, "max_commands": 10000},
+      "memory": {"active_bytes": 4096, "cache_bytes": 0, "peak_bytes": 8192}
+    },
     "settled": {
-      "protocol": "apxinf-worker/2.7",
-      "kind": "resources_released",
+      "protocol": "apxinf-worker/2.7", "kind": "resources_released",
       "worker_epoch": "10000000-0000-4000-8000-000000000001",
       "request_id": "20000000-0000-4000-8000-000000000002",
-      "attempt": 1,
-      "event_seq": 3,
-      "released_lease_ids": ["30000000-0000-4000-8000-000000000003"],
-      "retained_lease_ids": [],
+      "attempt": 1, "event_seq": 3,
+      "released_lease_ids": ["30000000-0000-4000-8000-000000000003"], "retained_lease_ids": [],
       "memory": {"active_bytes": 4096, "cache_bytes": 1024, "peak_bytes": 8192}
     }
   },
   "frame_cases": [
+    {"name": "prepared_ready_identity", "template": "ready", "refresh_identity": true, "valid": true},
+    {"name": "context_is_not_boolean", "template": "ready", "set": {"/model_manifest/execution/max_context": false}, "refresh_identity": true, "valid": false},
+    {"name": "output_is_not_text", "template": "ready", "set": {"/model_manifest/execution/max_output_tokens": "invalid"}, "refresh_identity": true, "valid": false},
+    {"name": "context_matches_capabilities", "template": "ready", "set": {"/model_manifest/execution/max_context": 8192}, "refresh_identity": true, "valid": false},
+    {"name": "output_matches_capabilities", "template": "ready", "set": {"/model_manifest/execution/max_output_tokens": 129}, "refresh_identity": true, "valid": false},
+    {"name": "legacy_execution_is_an_object", "template": "ready", "set": {"/protocol": "apxinf-worker/2.1", "/model_manifest/adapter_revision": "apxinf-native-minicpm5-v1", "/model_manifest/execution": 17}, "refresh_identity": true, "valid": false},
+    {"name": "cache_limit_is_positive", "template": "ready", "set": {"/model_manifest/execution/allocator_cache_limit_bytes": 0}, "refresh_identity": true, "valid": false},
+    {"name": "retained_budget_fits_total", "template": "ready", "set": {"/model_manifest/execution/retained_memory_limit_bytes": 9000001}, "refresh_identity": true, "valid": false},
     {"name": "checked_post_cleanup_memory", "template": "settled", "valid": true},
     {"name": "legacy_rejects_settlement_extension", "template": "settled", "set": {"/protocol": "apxinf-worker/2.1"}, "valid": false},
     {"name": "legacy_cleanup_remains_valid", "template": "settled", "set": {"/protocol": "apxinf-worker/2.1"}, "remove": ["memory"], "valid": true},

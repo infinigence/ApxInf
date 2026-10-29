@@ -587,6 +587,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     frame["model_manifest"]["runtime"] == frame["runtime"],
                     "native runtime mismatch",
                 )?;
+                object(&manifest["execution"])?;
                 if prepared {
                     let execution = &manifest["execution"];
                     fields(execution, &[], &["provider", "precision", "variant", "parser", "enable_thinking",
@@ -598,6 +599,11 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                         && execution["enable_thinking"] == false
                         && execution["preparation_policy"] == "single-code-entry-v1"
                         && frame["runtime"]["mlx"] == "0.32.3", "unsupported prepared execution identity")?;
+                    integer(&execution["max_context"], 1, 16384)?;
+                    integer(&execution["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)?;
+                    require(execution["max_context"] == frame["capabilities"]["max_context"]
+                        && execution["max_output_tokens"] == frame["capabilities"]["max_output_tokens"],
+                        "prepared execution limits differ from capabilities")?;
                     let limit = integer(&execution["memory_limit_bytes"], 1, MAX_SAFE_INTEGER)?;
                     integer(&execution["allocator_cache_limit_bytes"], 1, limit)?;
                     integer(&execution["retained_memory_limit_bytes"], 1, limit)?;
@@ -1400,7 +1406,11 @@ mod tests {
         let corpus: Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/serving/native-prepared-v0.1.json")).unwrap();
         for case in corpus["frame_cases"].as_array().unwrap() {
-            let frame = fixture(&corpus, case);
+            let mut frame = fixture(&corpus, case);
+            if case["refresh_identity"] == true {
+                frame["model_revision"] = canonical_identity_digest("apxinf-model-identity-v1", &frame["model_manifest"]).unwrap().into();
+                frame["capability_revision"] = canonical_identity_digest("apxinf-capability-v1", &frame["capabilities"]).unwrap().into();
+            }
             assert_eq!(validate_frame(&frame).is_ok(), case["valid"].as_bool().unwrap(), "{}", case["name"]);
         }
     }

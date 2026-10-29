@@ -431,5 +431,10 @@ fn real_checkpoint_prepared_code_reuses_with_fresh_request_state() -> Result<()>
     assert_eq!(run(&mut model, 1)?, changed, "retained preparation leaked prior request state");
     model.release_request_state()?;
     assert_eq!(run(&mut model, 0)?, first, "changed profile altered the original output");
+    let old_capacity = model.preparation_status().kv_capacity.unwrap();
+    model.reset();
+    model.prepare(old_capacity + 1, 8)?;
+    assert!(model.preparation_status().kv_capacity.unwrap() > old_capacity);
+    assert_eq!(run(&mut model, 1)?, changed, "ordinary capacity change leaked prior state");
     Ok(())
 }

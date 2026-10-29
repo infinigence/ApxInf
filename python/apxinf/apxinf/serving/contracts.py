@@ -426,6 +426,7 @@ def validate_frame(frame: dict) -> None:
             _digest(frame["runtime"]["metal_library_sha256"])
             _require(type(frame["model_manifest"]) is dict, "model manifest must be an object")
             _require(frame["model_manifest"].get("runtime") == frame["runtime"], "native runtime mismatch")
+            _require(type(manifest.get("execution")) is dict, "expected native execution identity")
             if prepared:
                 execution = manifest.get("execution")
                 _keys(execution, {"provider", "precision", "variant", "parser", "enable_thinking", "max_context",
@@ -437,6 +438,11 @@ def validate_frame(frame: dict) -> None:
                          and execution["enable_thinking"] is False
                          and execution["preparation_policy"] == "single-code-entry-v1"
                          and frame["runtime"]["mlx"] == "0.32.3", "unsupported prepared execution identity")
+                _int(execution["max_context"], 1, 16384)
+                _int(execution["max_output_tokens"], 0, MAX_OUTPUT_TOKENS)
+                _require(execution["max_context"] == frame["capabilities"]["max_context"]
+                         and execution["max_output_tokens"] == frame["capabilities"]["max_output_tokens"],
+                         "prepared execution limits differ from capabilities")
                 _int(execution["memory_limit_bytes"], 1)
                 limit = execution["memory_limit_bytes"]
                 _int(execution["allocator_cache_limit_bytes"], 1, limit)

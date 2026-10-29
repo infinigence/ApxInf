@@ -249,6 +249,7 @@ impl MiniCpm5 {
             self.prepared = None;
         }
         if self.capacity != capacity || self.states.is_empty() {
+            self.states.clear();
             if !same_profile {
                 self.step = None;
                 self.prepared = None;
@@ -916,6 +917,9 @@ impl LlmTrait for MiniCpm5 {
             .map(|e| e.to_string());
     }
     fn release_request_state_retaining_preparation(&mut self) -> Result<()> {
+        if self.variant != Variant::Compiled {
+            return Err(Error::Contract("prepared-code retention requires ordinary compiled MiniCPM5"));
+        }
         if self.failure.is_some() { return self.release_request_state(); }
         self.backend.stream().synchronize()?;
         self.states.clear();
