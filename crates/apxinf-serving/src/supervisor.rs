@@ -93,6 +93,11 @@ pub enum WorkerRuntime {
     PythonClef {
         loader: PathBuf,
     },
+    NativeMiniCpm5Prepared {
+        executable: PathBuf,
+        metal_library: PathBuf,
+        cache_limit_bytes: u64,
+    },
     NativeMiniCpm5 {
         executable: PathBuf,
         metal_library: PathBuf,
@@ -117,6 +122,7 @@ impl WorkerRuntime {
             Self::Python => PROTOCOL,
             Self::PythonMiniCpmVision => contracts::VISION_PROTOCOL,
             Self::PythonClef { .. } => contracts::CLEF_PROTOCOL,
+            Self::NativeMiniCpm5Prepared { .. } => contracts::NATIVE_PREPARED_PROTOCOL,
             Self::NativeMiniCpm5 { .. } => contracts::NATIVE_PROTOCOL,
             Self::NativeMiniCpm5Sampled { .. } => contracts::NATIVE_SAMPLED_PROTOCOL,
             Self::NativeMiniCpm5Thinking { .. } => contracts::NATIVE_THINKING_PROTOCOL,
@@ -176,7 +182,8 @@ impl Config {
         }
         if matches!(
             self.runtime,
-            WorkerRuntime::NativeMiniCpm5 { .. }
+            WorkerRuntime::NativeMiniCpm5Prepared { .. }
+                | WorkerRuntime::NativeMiniCpm5 { .. }
                 | WorkerRuntime::NativeMiniCpm5Sampled { .. }
                 | WorkerRuntime::NativeMiniCpm5Thinking { .. }
                 | WorkerRuntime::NativeMiniCpm5BoundedThinking { .. }
@@ -188,6 +195,11 @@ impl Config {
                 "Native MiniCPM5 requires at most 16384 positions, 256-token prefill chunks, and one token per output frame."
                     .into(),
             );
+        }
+        if let WorkerRuntime::NativeMiniCpm5Prepared { cache_limit_bytes, .. } = self.runtime {
+            if cache_limit_bytes == 0 || cache_limit_bytes > self.memory_budget || self.sequence_reservation >= self.memory_budget {
+                return Err("Prepared native cache and retained memory limits must fit the process budget.".into());
+            }
         }
         if !(1..=contracts::MAX_SAFE_INTEGER).contains(&self.memory_budget)
             || !(1..=contracts::MAX_SAFE_INTEGER).contains(&self.sequence_reservation)
@@ -209,6 +221,16 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn settle_memory(service: &Service, frame: &Value) -> Result<(), ApiError> {
+    if frame["protocol"] != contracts::NATIVE_PREPARED_PROTOCOL { return Ok(()); }
+    let mut ready = service.ready_snapshot();
+    ready["memory"] = frame["memory"].clone();
+    let (_, peak) = ready_memory_totals(&ready).map_err(|e| ApiError::new(500, "protocol_fault", e))?;
+    service.metrics.peak_bytes.fetch_max(peak, Ordering::Relaxed);
+    *service.ready_state.write().unwrap() = ready;
+    Ok(())
 }
 
 fn ready_memory_totals(ready: &Value) -> Result<(u64, u64), String> {
@@ -411,6 +433,16 @@ impl Service {
             cancel,
         })
     }
+    fn require_request_capacity(&self, reservation: u64) -> Result<(), ApiError> {
+        let required = ready_memory_totals(&self.ready_snapshot()).ok()
+            .and_then(|(resident, _)| resident.checked_add(reservation));
+        if required.is_none_or(|bytes| bytes > self.memory_budget) {
+            return Err(ApiError::new(503, "capacity_unavailable",
+                "Retained model allocation and request reservation exceed the memory budget."));
+        }
+        Ok(())
+    }
+
     pub fn ready_snapshot(&self) -> Value {
         self.ready_state
             .read()
@@ -683,7 +715,8 @@ async fn launch_worker_until(
             command.arg(&config.worker);
             command
         }
-        WorkerRuntime::NativeMiniCpm5 { executable, .. }
+        WorkerRuntime::NativeMiniCpm5Prepared { executable, .. }
+        | WorkerRuntime::NativeMiniCpm5 { executable, .. }
         | WorkerRuntime::NativeMiniCpm5Sampled { executable, .. }
         | WorkerRuntime::NativeMiniCpm5Thinking { executable, .. }
         | WorkerRuntime::NativeMiniCpm5BoundedThinking { executable, .. } => {
@@ -720,7 +753,8 @@ async fn launch_worker_until(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    if let WorkerRuntime::NativeMiniCpm5 { metal_library, .. }
+    if let WorkerRuntime::NativeMiniCpm5Prepared { metal_library, .. }
+    | WorkerRuntime::NativeMiniCpm5 { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5Sampled { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5Thinking { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5BoundedThinking { metal_library, .. } = &config.runtime
@@ -731,6 +765,10 @@ async fn launch_worker_until(
                 .parent()
                 .ok_or_else(|| "The Metal library needs a parent directory.".to_owned())?,
         );
+    }
+    if let WorkerRuntime::NativeMiniCpm5Prepared { cache_limit_bytes, .. } = config.runtime {
+        command.arg("--cache-limit-bytes").arg(cache_limit_bytes.to_string())
+            .arg("--retained-memory-limit-bytes").arg((config.memory_budget - config.sequence_reservation).to_string());
     }
     let mut child = command
         .spawn()
@@ -1079,6 +1117,13 @@ where
                 .settled(&shared.metrics.observations, Instant::now());
             finish_before_execution(&mut job, &shared, error);
             continue;
+        }
+        if worker.protocol == contracts::NATIVE_PREPARED_PROTOCOL {
+            if let Err(error) = shared.require_request_capacity(sequence_reservation) {
+                job.observation.settled(&shared.metrics.observations, Instant::now());
+                finish_before_execution(&mut job, &shared, error);
+                continue;
+            }
         }
         shared
             .metrics
@@ -1551,7 +1596,7 @@ async fn settle_stopped_submission(
                         .await?;
                     control_sent = true;
                 }
-                Some("resources_released") => return Ok(()),
+                Some("resources_released") => { settle_memory(service, &frame)?; return Ok(()); },
                 Some("tokens" | "terminal" | "rejected" | "prefill_progress") => {}
                 _ => {
                     return Err(ApiError::new(
@@ -1635,7 +1680,8 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
             return Err(format!("The model artifact identity differs: {name}"));
         }
     }
-    if let WorkerRuntime::NativeMiniCpm5 {
+    if let WorkerRuntime::NativeMiniCpm5Prepared { executable, metal_library, .. }
+    | WorkerRuntime::NativeMiniCpm5 {
         executable,
         metal_library,
     }
@@ -1656,7 +1702,10 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
         let bounded = config.runtime.protocol() == contracts::NATIVE_BOUNDED_THINKING_PROTOCOL;
         let thinking = config.runtime.protocol() == contracts::NATIVE_THINKING_PROTOCOL;
         let sampled = config.runtime.protocol() == contracts::NATIVE_SAMPLED_PROTOCOL;
-        let adapter = if bounded {
+        let prepared = config.runtime.protocol() == contracts::NATIVE_PREPARED_PROTOCOL;
+        let adapter = if prepared {
+            "apxinf-native-minicpm5-prepared-v1"
+        } else if bounded {
             "apxinf-native-minicpm5-bounded-thinking-v1"
         } else if thinking {
             "apxinf-native-minicpm5-thinking-v1"
@@ -1665,7 +1714,10 @@ fn verify_manifest(manifest: &Value, config: &Config) -> Result<(), String> {
         } else {
             "apxinf-native-minicpm5-v1"
         };
-        let execution = if bounded {
+        let execution = if let WorkerRuntime::NativeMiniCpm5Prepared { cache_limit_bytes, .. } = config.runtime {
+            crate::native_identity::prepared_execution(config.max_context, config.max_output, config.memory_budget,
+                cache_limit_bytes, config.memory_budget - config.sequence_reservation)
+        } else if bounded {
             crate::native_identity::bounded_thinking_execution(
                 config.max_context,
                 config.max_output,
@@ -1828,6 +1880,7 @@ async fn execute(
     let profile = if matches!(
         worker.protocol,
         contracts::NATIVE_PROTOCOL
+            | contracts::NATIVE_PREPARED_PROTOCOL
             | contracts::NATIVE_SAMPLED_PROTOCOL
             | contracts::NATIVE_THINKING_PROTOCOL
             | contracts::NATIVE_BOUNDED_THINKING_PROTOCOL
@@ -1991,7 +2044,7 @@ async fn execute(
                     }
                 }
             }
-            "resources_released" => break,
+            "resources_released" => { settle_memory(service, &frame)?; break; },
             "accepted" => {
                 public.accept(&job);
             }

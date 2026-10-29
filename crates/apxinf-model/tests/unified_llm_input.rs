@@ -852,3 +852,30 @@ fn load_model_unifies_detected_and_explicit_model_selection() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+
+struct OverrideSensitiveModel(TextOnlyModel);
+impl LlmTrait for OverrideSensitiveModel {
+    fn load(_: ModelConfig, _: HashMap<String, Tensor>, _: Device) -> Result<Self> { unreachable!() }
+    fn forward(&mut self, ids: &[u32], position: u32) -> Result<Tensor> { self.0.forward(ids, position) }
+    fn backend(&self) -> &dyn Backend { self.0.backend() }
+    fn reset(&mut self) { self.0.reset(); }
+    fn vocab_size(&self) -> usize { 4 }
+    fn token_sequence<'a>(&'a mut self, _: Tensor, _: Box<dyn TokenSampler>, _: &TokenSamplingParams, _: u32)
+        -> Result<Box<dyn apxinf_model::llm_trait::TokenSequence + 'a>> {
+        Err(Error::Contract("family sequence selected"))
+    }
+}
+
+#[test]
+fn caller_sampler_is_not_bypassed_by_a_family_greedy_sequence() {
+    let mut model = OverrideSensitiveModel(TextOnlyModel::default());
+    let options = GenerationOptions::greedy(2, None);
+    let input = LlmInput::text(&[0, 1]);
+    let mut sampler = SuppliedSampler::new(4, &[0, 1]);
+    let result = generate_streaming_controlled_with_sampler(&mut model,
+        GenerationRequest { input, options: &options }, &mut sampler, |_| Ok(true)).unwrap();
+    assert_eq!(result.token_ids(), vec![0, 1]);
+    let error = model.generate_streaming_with_options(GenerationRequest { input, options: &options }, |_| {}).err().unwrap();
+    assert!(error.to_string().contains("family sequence selected"));
+}

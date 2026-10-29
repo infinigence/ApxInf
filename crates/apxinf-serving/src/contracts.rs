@@ -11,6 +11,7 @@ pub use clef::PROTOCOL as CLEF_PROTOCOL;
 
 pub const VISION_PROTOCOL: &str = "apxinf-worker/2.5";
 pub const PROTOCOL: &str = "apxinf-worker/2.0";
+pub const NATIVE_PREPARED_PROTOCOL: &str = "apxinf-worker/2.7";
 pub const NATIVE_PROTOCOL: &str = "apxinf-worker/2.1";
 pub const NATIVE_SAMPLED_PROTOCOL: &str = "apxinf-worker/2.2";
 pub const NATIVE_THINKING_PROTOCOL: &str = "apxinf-worker/2.3";
@@ -432,6 +433,7 @@ pub fn validate_command_envelope(frame: &Value) -> Result<()> {
     object(frame)?;
     require(
         frame["protocol"] == PROTOCOL
+            || frame["protocol"] == NATIVE_PREPARED_PROTOCOL
             || frame["protocol"] == NATIVE_PROTOCOL
             || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
             || frame["protocol"] == NATIVE_THINKING_PROTOCOL
@@ -479,6 +481,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
     object(frame)?;
     require(
         frame["protocol"] == PROTOCOL
+            || frame["protocol"] == NATIVE_PREPARED_PROTOCOL
             || frame["protocol"] == NATIVE_PROTOCOL
             || frame["protocol"] == NATIVE_SAMPLED_PROTOCOL
             || frame["protocol"] == NATIVE_THINKING_PROTOCOL
@@ -490,7 +493,8 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
     let bounded = frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL;
     let thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL || bounded;
     let sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL || thinking;
-    let native = frame["protocol"] == NATIVE_PROTOCOL || sampled;
+    let prepared = frame["protocol"] == NATIVE_PREPARED_PROTOCOL;
+    let native = frame["protocol"] == NATIVE_PROTOCOL || prepared || sampled;
     uuid(&frame["worker_epoch"])?;
     let kind = string(&frame["kind"])?;
     if let Some(id) = frame.get("command_id") {
@@ -583,6 +587,25 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     frame["model_manifest"]["runtime"] == frame["runtime"],
                     "native runtime mismatch",
                 )?;
+                if prepared {
+                    let execution = &manifest["execution"];
+                    fields(execution, &[], &["provider", "precision", "variant", "parser", "enable_thinking",
+                        "max_context", "max_output_tokens", "memory_limit_bytes", "preparation_policy",
+                        "allocator_cache_limit_bytes", "retained_memory_limit_bytes"], &[])?;
+                    require(manifest["adapter_revision"] == "apxinf-native-minicpm5-prepared-v1"
+                        && execution["provider"] == "metal_minicpm5" && execution["precision"] == "bf16"
+                        && execution["variant"] == "bf16-compiled" && execution["parser"] == "minicpm5_xml"
+                        && execution["enable_thinking"] == false
+                        && execution["preparation_policy"] == "single-code-entry-v1"
+                        && frame["runtime"]["mlx"] == "0.32.3", "unsupported prepared execution identity")?;
+                    let limit = integer(&execution["memory_limit_bytes"], 1, MAX_SAFE_INTEGER)?;
+                    integer(&execution["allocator_cache_limit_bytes"], 1, limit)?;
+                    integer(&execution["retained_memory_limit_bytes"], 1, limit)?;
+                } else {
+                    require(manifest["adapter_revision"] != "apxinf-native-minicpm5-prepared-v1"
+                        && manifest["execution"].get("preparation_policy").is_none(),
+                        "prepared execution requires protocol 2.7")?;
+                }
                 if sampled {
                     let manifest = &frame["model_manifest"];
                     let execution = &manifest["execution"];
@@ -889,12 +912,12 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
             )?;
         }
         "resources_released" => {
-            fields(
-                frame,
-                EVENT,
-                &["released_lease_ids", "retained_lease_ids"],
-                &[],
-            )?;
+            fields(frame, EVENT, &["released_lease_ids", "retained_lease_ids"], if prepared { &["memory"] } else { &[] })?;
+            if prepared {
+                counts(&frame["memory"], &["active_bytes", "cache_bytes", "peak_bytes"])?;
+                require(frame["memory"]["peak_bytes"].as_u64() >= frame["memory"]["active_bytes"].as_u64(),
+                    "active memory exceeds recorded peak")?;
+            }
             leases(&frame["released_lease_ids"])?;
             require(
                 leases(&frame["retained_lease_ids"])?.is_empty(),
@@ -1370,6 +1393,43 @@ mod tests {
                 assert!(validate_frame(&frame).is_err());
             }
         }
+    }
+
+    #[test]
+    fn shared_native_prepared_profile() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-prepared-v0.1.json")).unwrap();
+        for case in corpus["frame_cases"].as_array().unwrap() {
+            let frame = fixture(&corpus, case);
+            assert_eq!(validate_frame(&frame).is_ok(), case["valid"].as_bool().unwrap(), "{}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn prepared_runtime_identity_is_versioned_and_budgeted() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/serving/native-thinking-v0.1.json")).unwrap();
+        let mut ready = corpus["templates"]["ready"].clone();
+        ready["protocol"] = NATIVE_PREPARED_PROTOCOL.into();
+        ready["runtime"]["mlx"] = "0.32.3".into();
+        ready["model_manifest"]["runtime"] = ready["runtime"].clone();
+        ready["model_manifest"]["adapter_revision"] = "apxinf-native-minicpm5-prepared-v1".into();
+        ready["model_manifest"]["execution"] = crate::native_identity::prepared_execution(16384, 1024, 9000000, 1000000, 8000000);
+        ready["capabilities"]["sampling"] = false.into();
+        let refresh = |ready: &mut Value| {
+            ready["model_revision"] = canonical_identity_digest("apxinf-model-identity-v1", &ready["model_manifest"]).unwrap().into();
+            ready["capability_revision"] = canonical_identity_digest("apxinf-capability-v1", &ready["capabilities"]).unwrap().into();
+        };
+        refresh(&mut ready);
+        validate_frame(&ready).unwrap();
+        for cache in [serde_json::json!(true), serde_json::json!(0), serde_json::json!(9000001)] {
+            let mut invalid = ready.clone();
+            invalid["model_manifest"]["execution"]["allocator_cache_limit_bytes"] = cache;
+            refresh(&mut invalid);
+            assert!(validate_frame(&invalid).is_err());
+        }
+        ready["protocol"] = NATIVE_PROTOCOL.into();
+        assert!(validate_frame(&ready).is_err());
     }
 
     #[test]

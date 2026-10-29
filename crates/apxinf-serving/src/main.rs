@@ -25,7 +25,7 @@ struct Args {
     model: PathBuf,
     #[arg(long, default_value = "apxinf-local")]
     model_id: String,
-    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "mlx-vlm-minicpmv47", "python-clef", "native-minicpm5", "native-minicpm5-sampled", "native-minicpm5-thinking", "native-minicpm5-thinking-bounded"])]
+    #[arg(long, default_value = "python-mlx-lm", value_parser = ["python-mlx-lm", "mlx-vlm-minicpmv47", "python-clef", "native-minicpm5", "native-minicpm5-prepared", "native-minicpm5-sampled", "native-minicpm5-thinking", "native-minicpm5-thinking-bounded"])]
     provider: String,
     #[arg(long)]
     native_worker: Option<PathBuf>,
@@ -57,6 +57,8 @@ struct Args {
     memory_budget_bytes: u64,
     #[arg(long, default_value_t = 1073741824)]
     sequence_reservation_bytes: u64,
+    #[arg(long)]
+    allocator_cache_limit_bytes: Option<u64>,
     #[arg(long, value_enum, default_value = "macos")]
     host_pressure_policy: HostPressurePolicy,
 }
@@ -108,9 +110,13 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     if args.provider != "python-clef" && args.clef_loader.is_some() {
         return Err("The --clef-loader option requires --provider python-clef.".into());
     }
+    if args.allocator_cache_limit_bytes.is_some() && args.provider != "native-minicpm5-prepared" {
+        return Err("Allocator cache limit requires native-minicpm5-prepared.".into());
+    }
     let runtime = if matches!(
         args.provider.as_str(),
         "native-minicpm5"
+            | "native-minicpm5-prepared"
             | "native-minicpm5-sampled"
             | "native-minicpm5-thinking"
             | "native-minicpm5-thinking-bounded"
@@ -123,7 +129,10 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             args.metal_library
                 .ok_or("Native provider requires --metal-library.")?,
         )?;
-        if args.provider == "native-minicpm5-thinking-bounded" {
+        if args.provider == "native-minicpm5-prepared" {
+            WorkerRuntime::NativeMiniCpm5Prepared { executable, metal_library,
+                cache_limit_bytes: args.allocator_cache_limit_bytes.unwrap_or(2147483648) }
+        } else if args.provider == "native-minicpm5-thinking-bounded" {
             WorkerRuntime::NativeMiniCpm5BoundedThinking {
                 executable,
                 metal_library,

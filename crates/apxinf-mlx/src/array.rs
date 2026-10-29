@@ -65,6 +65,12 @@ pub fn reset_peak_memory() -> Result<()> {
 }
 /// Release cached allocator buffers process-wide. Active arrays remain valid.
 /// Synchronize first when measuring release, and use an isolated test process.
+pub fn set_cache_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_cache_limit(limit, &mut previous) })?;
+    Ok(previous)
+}
+
 pub fn clear_cache() -> Result<()> {
     check(unsafe { ffi::apx_mlx_clear_cache() })
 }

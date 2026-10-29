@@ -144,6 +144,7 @@ pub struct MiniCpm5 {
     step: Option<Compiled>,
     attention_policy: DecodeAttentionPolicy,
     prepared: Option<PreparedRequest>,
+    retained_preparation: bool,
     states: Vec<Array>,
     capacity: usize,
     pub(crate) offset: usize,
@@ -204,6 +205,7 @@ impl MiniCpm5 {
             step: None,
             attention_policy,
             prepared: None,
+            retained_preparation: false,
             states: Vec::new(),
             capacity: 0,
             offset: 0,
@@ -233,47 +235,38 @@ impl MiniCpm5 {
     fn prepare_inner(&mut self, prompt: usize, output: usize) -> Result<()> {
         let capacity = self.config.request_capacity(self.variant, prompt, output)?;
         let attention = self.attention_policy.resolve(self.variant, prompt, output);
-        if self.capacity == capacity
-            && self
-                .prepared
-                .as_ref()
-                .is_some_and(|p| p.prefill.prompt == prompt && p.output == output)
-            && self.failure.is_none()
-            && !self.states.is_empty()
-        {
-            return Ok(());
-        }
-        if self.offset != 0 {
-            return Err(Error::Contract(
-                "reset before changing MiniCPM request preparation",
-            ));
-        }
-        let reuse_bucket = attention == DecodeAttention::Bucketed
-            && self.capacity == capacity
-            && !self.states.is_empty()
-            && self
-                .prepared
-                .as_ref()
-                .is_some_and(|p| p.attention == DecodeAttention::Bucketed);
-        if !reuse_bucket {
+        let same_profile = self.capacity == capacity
+            && self.prepared.as_ref().is_some_and(|p| p.prefill.prompt == prompt && p.output == output && p.attention == attention)
+            && self.failure.is_none();
+        if same_profile && !self.states.is_empty() { return Ok(()); }
+        if self.offset != 0 { return Err(Error::Contract("reset before changing MiniCPM request preparation")); }
+        let reuse_bucket = attention == DecodeAttention::Bucketed && self.capacity == capacity
+            && !self.states.is_empty() && self.prepared.as_ref().is_some_and(|p| p.attention == DecodeAttention::Bucketed);
+        if self.retained_preparation && !same_profile {
+            self.release_request_state()?;
+        } else if !same_profile && !reuse_bucket {
             self.step = None;
             self.prepared = None;
         }
         if self.capacity != capacity || self.states.is_empty() {
-            self.states.clear();
-            self.step = None;
-            self.prepared = None;
-            self.capacity = 0;
+            if !same_profile {
+                self.step = None;
+                self.prepared = None;
+                self.capacity = 0;
+            }
             let stream = self.backend.stream();
-            let (cos, sin) = math::tables(stream, capacity)?;
-            self.cos = cos;
-            self.sin = sin;
+            if self.capacity != capacity {
+                let (cos, sin) = math::tables(stream, capacity)?;
+                self.cos = cos;
+                self.sin = sin;
+            }
             let zero = Array::zeros(stream, &[1, 2, capacity, 128], MlxDType::BF16)?;
             let states = vec![zero; 84];
             stream.eval(&states)?;
             self.states = states;
             self.capacity = capacity;
         }
+        if same_profile { return Ok(()); }
         if self.step.is_none() && self.variant != Variant::Public {
             self.step = Some(self.compile_step(attention)?);
         }
@@ -922,10 +915,21 @@ impl LlmTrait for MiniCpm5 {
             .err()
             .map(|e| e.to_string());
     }
+    fn release_request_state_retaining_preparation(&mut self) -> Result<()> {
+        if self.failure.is_some() { return self.release_request_state(); }
+        self.backend.stream().synchronize()?;
+        self.states.clear();
+        self.last_taps = None;
+        self.offset = 0;
+        self.retained_preparation = true;
+        Ok(())
+    }
     fn release_request_state(&mut self) -> Result<()> {
         self.backend.stream().synchronize()?;
         self.states.clear();
         self.step = None;
+        self.prepared = None;
+        self.retained_preparation = false;
         self.last_taps = None;
         self.local = None;
         let stream = self.backend.stream();

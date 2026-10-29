@@ -305,3 +305,13 @@ fn ready_downloads_wait_for_their_own_array_and_need_row_contiguity() -> Result<
     assert!(a.transpose(&[1, 0])?.to_bytes_ready().is_err());
     Ok(())
 }
+
+#[test]
+fn cache_limit_returns_the_previous_process_policy() -> Result<()> {
+    let original = apxinf_mlx::set_cache_limit(1 << 30)?;
+    let observed = apxinf_mlx::set_cache_limit(2 << 30)?;
+    let restore = apxinf_mlx::set_cache_limit(original);
+    assert_eq!(observed, 1 << 30);
+    restore?;
+    Ok(())
+}

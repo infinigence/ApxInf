@@ -394,3 +394,42 @@ fn real_checkpoint_full_forward_retention_and_release() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires official MiniCPM checkpoint, real replay inputs and exclusive shared Metal locks"]
+fn real_checkpoint_prepared_code_reuses_with_fresh_request_state() -> Result<()> {
+    let checkpoint = PathBuf::from(env::var_os("APXINF_MINICPM_CHECKPOINT")
+        .ok_or(Error::Contract("set APXINF_MINICPM_CHECKPOINT"))?);
+    let replay = PathBuf::from(env::var_os("APXINF_DSPARK_REPLAY_INPUT")
+        .ok_or(Error::Contract("set APXINF_DSPARK_REPLAY_INPUT"))?);
+    let inputs: ReplayInputs = serde_json::from_slice(&std::fs::read(replay)?)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    if inputs.cases.len() < 2 || inputs.cases[..2].iter().any(|c| c.prompt_token_ids.is_empty()) {
+        return Err(Error::Contract("two nonempty real prompts are required"));
+    }
+    let config = Config::from_json(&std::fs::read_to_string(checkpoint.join("config.json"))?)?;
+    let backend = MlxBackend::new(0)?;
+    let (map, _) = apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
+    let weights = Weights::load(&config, backend.stream(), map)?;
+    let mut model = MiniCpm5::new(config, weights, backend.clone(), Variant::Compiled)?;
+    let options = crate::GenerationOptions::greedy(8, None);
+    let run = |model: &mut MiniCpm5, index: usize| {
+        model.generate_streaming_with_options(crate::GenerationRequest {
+            input: LlmInput::text(&inputs.cases[index].prompt_token_ids), options: &options,
+        }, |_| {}).map(|output| output.token_ids())
+    };
+    let first = run(&mut model, 0)?;
+    model.release_request_state_retaining_preparation()?;
+    assert_eq!(model.preparation_status().state, TextPreparationState::Unprepared);
+    let traces = backend.stream().counters().trace_callbacks;
+    assert_eq!(run(&mut model, 0)?, first);
+    assert_eq!(backend.stream().counters().trace_callbacks, traces,
+        "same-profile request traced after prepared-code retention");
+    model.release_request_state_retaining_preparation()?;
+    let changed = run(&mut model, 1)?;
+    model.release_request_state()?;
+    assert_eq!(run(&mut model, 1)?, changed, "retained preparation leaked prior request state");
+    model.release_request_state()?;
+    assert_eq!(run(&mut model, 0)?, first, "changed profile altered the original output");
+    Ok(())
+}

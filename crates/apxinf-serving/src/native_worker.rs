@@ -33,6 +33,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NativeProfile {
     Greedy,
+    Prepared,
     Sampled,
     Thinking,
     BoundedThinking,
@@ -42,6 +43,7 @@ impl NativeProfile {
     fn from_protocol(protocol: &str) -> Option<Self> {
         match protocol {
             contracts::NATIVE_PROTOCOL => Some(Self::Greedy),
+            contracts::NATIVE_PREPARED_PROTOCOL => Some(Self::Prepared),
             contracts::NATIVE_SAMPLED_PROTOCOL => Some(Self::Sampled),
             contracts::NATIVE_THINKING_PROTOCOL => Some(Self::Thinking),
             contracts::NATIVE_BOUNDED_THINKING_PROTOCOL => Some(Self::BoundedThinking),
@@ -51,7 +53,7 @@ impl NativeProfile {
 
     fn execution(self, context: usize, output: usize, memory: u64) -> Value {
         match self {
-            Self::Greedy => native_identity::execution(context, output, memory),
+            Self::Greedy | Self::Prepared => native_identity::execution(context, output, memory),
             Self::Sampled => native_identity::sampled_execution(context, output, memory),
             Self::Thinking => native_identity::thinking_execution(context, output, memory),
             Self::BoundedThinking => {
@@ -65,7 +67,7 @@ impl NativeProfile {
     }
 
     fn sampling(self) -> bool {
-        self != Self::Greedy
+        !matches!(self, Self::Greedy | Self::Prepared)
     }
 }
 
@@ -89,6 +91,10 @@ struct Args {
     prefill_step_size: usize,
     #[arg(long)]
     output_batch_tokens: usize,
+    #[arg(long)]
+    cache_limit_bytes: Option<u64>,
+    #[arg(long)]
+    retained_memory_limit_bytes: Option<u64>,
 }
 
 fn main() {
@@ -466,6 +472,15 @@ fn run(args: Args) -> Result<()> {
     {
         return Err("Unsupported native launch profile".into());
     }
+    let prepared = profile == NativeProfile::Prepared;
+    if prepared {
+        if args.cache_limit_bytes.is_none_or(|v| v == 0 || v > args.memory_limit_bytes)
+            || args.retained_memory_limit_bytes.is_none_or(|v| v == 0 || v > args.memory_limit_bytes) {
+            return Err("Prepared native memory limits must fit the process budget".into());
+        }
+    } else if args.cache_limit_bytes.is_some() || args.retained_memory_limit_bytes.is_some() {
+        return Err("Prepared memory limits require worker protocol 2.7".into());
+    }
     let loaded_library = std::fs::canonicalize(apxinf_mlx::loaded_library_path()?)?;
     if loaded_library != std::fs::canonicalize(&args.metal_library)? {
         return Err("Loaded MLX library differs from the selected runtime.".into());
@@ -474,11 +489,10 @@ fn run(args: Args) -> Result<()> {
     let manifest = native_identity::manifest(
         &args.model,
         runtime.clone(),
-        profile.execution(
-            args.max_context,
-            args.max_output_tokens,
-            args.memory_limit_bytes,
-        ),
+        if prepared {
+            native_identity::prepared_execution(args.max_context, args.max_output_tokens, args.memory_limit_bytes,
+                args.cache_limit_bytes.unwrap(), args.retained_memory_limit_bytes.unwrap())
+        } else { profile.execution(args.max_context, args.max_output_tokens, args.memory_limit_bytes) },
     )?;
     let model_revision =
         contracts::canonical_identity_digest("apxinf-model-identity-v1", &manifest)?;
@@ -488,6 +502,7 @@ fn run(args: Args) -> Result<()> {
     let capability_revision =
         contracts::canonical_identity_digest("apxinf-capability-v1", &capabilities)?;
     apxinf_mlx::set_memory_limit(usize::try_from(args.memory_limit_bytes)?)?;
+    if let Some(limit) = args.cache_limit_bytes { apxinf_mlx::set_cache_limit(usize::try_from(limit)?)?; }
     let mut model = AutoModel::load_model(
         Device::Metal(0),
         &args.model,
@@ -655,10 +670,9 @@ fn reject_invalid(state: &mut State, command: Value) -> Result<()> {
     state.event("terminal",json!({"status":"failed","cause":"invalid_request","error":failure,
         "usage":{"input_tokens":count,"output_tokens":0},"state_result":{"validity":"none","consumed_position":0,"history_count":count},
         "text_delta":"","metrics":{"elapsed_ns":0,"ttft_ns":0,"peak_memory_bytes":0}}))?;
-    state.event(
-        "resources_released",
-        json!({"released_lease_ids":leases,"retained_lease_ids":[]}),
-    )?;
+    let mut settlement = json!({"released_lease_ids":leases,"retained_lease_ids":[]});
+    if state.protocol == contracts::NATIVE_PREPARED_PROTOCOL { settlement["memory"] = memory()?; }
+    state.event("resources_released", settlement)?;
     state.active = None;
     Ok(())
 }
@@ -826,8 +840,7 @@ fn submit(
         state.event("accepted", json!({}))?;
         if state.check_controls()? && maximum > 0 {
             mutated = true;
-            let mut output_ids = Vec::new();
-            let mut emitted = String::new();
+            let mut decoder = tokenizer.incremental_decoder(false);
             let options = generation_options(&state.active.as_ref().unwrap().command, maximum, eos);
             let mut boundary = |boundary| {
                 let result = (|| -> Result<bool> {
@@ -842,20 +855,7 @@ fn submit(
                         }
                         GenerationBoundary::Token(token) => {
                             let terminal = eos.contains(&token.token_id);
-                            if !terminal {
-                                output_ids.push(token.token_id);
-                            }
-                            let decoded = tokenizer.decode_with_options(&output_ids, false)?;
-                            let text = if decoded.ends_with('\u{fffd}') {
-                                String::new()
-                            } else {
-                                let suffix = decoded
-                                    .strip_prefix(&emitted)
-                                    .ok_or("Tokenizer changed emitted text")?
-                                    .to_owned();
-                                emitted = decoded;
-                                suffix
-                            };
+                            let text = if terminal { String::new() } else { decoder.push(token.token_id)? };
                             let a = state.active.as_mut().unwrap();
                             if a.output_count == 0 {
                                 a.first_token_ns = a.started.elapsed().as_nanos() as u64;
@@ -922,11 +922,7 @@ fn submit(
                 eprintln!("Native generation failed: {error_value}");
                 failure = Some(error("internal_error", "Native model execution failed."));
             } else {
-                let decoded = tokenizer.decode_with_options(&output_ids, false)?;
-                tail = decoded
-                    .strip_prefix(&emitted)
-                    .ok_or("Tokenizer changed final text")?
-                    .to_owned();
+                tail = decoder.finish()?;
             }
         }
     }
@@ -948,16 +944,33 @@ fn submit(
         terminal["error"] = failure;
     }
     state.event("terminal", terminal)?;
+    let prepared = args.protocol == contracts::NATIVE_PREPARED_PROTOCOL;
     if mutated {
-        model.text_mut()?.release_request_state()?;
+        if prepared { model.text_mut()?.release_request_state_retaining_preparation()?; }
+        else { model.text_mut()?.release_request_state()?; }
         apxinf_mlx::clear_cache()?;
+    }
+    let mut settled_memory = memory()?;
+    if prepared {
+        let retained = settled_memory["active_bytes"].as_u64().unwrap()
+            .checked_add(settled_memory["cache_bytes"].as_u64().unwrap()).ok_or("Native retained memory overflow")?;
+        if retained > args.retained_memory_limit_bytes.unwrap() {
+            model.text_mut()?.release_request_state()?;
+            apxinf_mlx::clear_cache()?;
+            settled_memory = memory()?;
+            let remaining = settled_memory["active_bytes"].as_u64().unwrap()
+                .checked_add(settled_memory["cache_bytes"].as_u64().unwrap()).ok_or("Native retained memory overflow")?;
+            if remaining > args.retained_memory_limit_bytes.unwrap() {
+                return Err("Native residency exceeds the retained memory budget after eviction".into());
+            }
+        }
     }
     eprintln!("native_request_settled {}", memory()?);
     let leases = state.active.as_ref().unwrap().command["capacity_lease_ids"].clone();
-    state.event(
-        "resources_released",
-        json!({"released_lease_ids":leases,"retained_lease_ids":[]}),
-    )?;
+    let mut settlement = json!({"released_lease_ids":leases,"retained_lease_ids":[]});
+    if prepared { settlement["memory"] = settled_memory; }
+    state.event("resources_released", settlement)?;
+
     if status == "completed" {
         state.completed += 1;
     }

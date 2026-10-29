@@ -268,3 +268,35 @@ fn memory_peak_uses_the_reported_peak_and_the_allocator_total() {
     }}))
     .is_err());
 }
+
+
+#[test]
+fn prepared_settlement_refreshes_residency_before_next_admission() {
+    let ready = json!({"protocol":contracts::NATIVE_PREPARED_PROTOCOL,
+        "memory":{"active_bytes":1024,"cache_bytes":0,"peak_bytes":2048}});
+    let service = super::lifecycle_regressions::cpu_service(ready, Duration::from_secs(1), 1);
+    service.require_request_capacity(1024).unwrap();
+    let frame = json!({"protocol":contracts::NATIVE_PREPARED_PROTOCOL,
+        "memory":{"active_bytes":3000,"cache_bytes":200,"peak_bytes":4000}});
+    settle_memory(&service, &frame).unwrap();
+    assert_eq!(service.ready_snapshot()["memory"], frame["memory"]);
+    assert_eq!(service.require_request_capacity(1024).unwrap_err().code, "capacity_unavailable");
+    assert_eq!(service.metrics.peak_bytes.load(Ordering::Relaxed), 4000);
+    settle_memory(&service, &json!({"protocol":contracts::NATIVE_PROTOCOL,"memory":{}})).unwrap();
+    assert_eq!(service.ready_snapshot()["memory"], frame["memory"]);
+}
+
+#[test]
+fn prepared_cache_policy_is_bound_to_the_selected_manifest() {
+    let mut config = configuration(4096, 1024);
+    config.prefill_step_size = 256;
+    config.runtime = WorkerRuntime::NativeMiniCpm5Prepared {
+        executable: "/worker".into(), metal_library: "/libmlx.dylib".into(), cache_limit_bytes: 2048 };
+    config.validate_memory().unwrap();
+    assert_eq!(config.runtime.protocol(), contracts::NATIVE_PREPARED_PROTOCOL);
+    config.runtime = WorkerRuntime::NativeMiniCpm5Prepared {
+        executable: "/worker".into(), metal_library: "/libmlx.dylib".into(), cache_limit_bytes: 4097 };
+    assert!(config.validate_memory().is_err());
+    config.sequence_reservation = 4096;
+    assert!(config.validate_memory().is_err());
+}

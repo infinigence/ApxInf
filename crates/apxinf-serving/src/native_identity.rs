@@ -41,6 +41,14 @@ pub fn execution(context: usize, output: usize, memory: u64) -> Value {
         "max_output_tokens":output, "memory_limit_bytes":memory})
 }
 
+pub fn prepared_execution(context: usize, output: usize, memory: u64, cache: u64, retained: u64) -> Value {
+    let mut value = execution(context, output, memory);
+    value["preparation_policy"] = "single-code-entry-v1".into();
+    value["allocator_cache_limit_bytes"] = cache.into();
+    value["retained_memory_limit_bytes"] = retained.into();
+    value
+}
+
 pub fn sampled_execution(context: usize, output: usize, memory: u64) -> Value {
     let mut value = execution(context, output, memory);
     value["sampling"] = json!({"algorithm":"apxinf-cpu-categorical-v1",
@@ -82,7 +90,9 @@ pub fn manifest(model: &Path, runtime: Value, execution: Value) -> Result<Value,
         }
         artifacts.push(json!({"path":path.file_name().and_then(|v|v.to_str()).ok_or("Invalid artifact name.")?, "size_bytes":size, "sha256":sha256}));
     }
-    let adapter_revision = if execution.get("initial_reasoning").is_some() {
+    let adapter_revision = if execution.get("preparation_policy").is_some() {
+        "apxinf-native-minicpm5-prepared-v1"
+    } else if execution.get("initial_reasoning").is_some() {
         "apxinf-native-minicpm5-bounded-thinking-v1"
     } else if execution.get("output_policy").is_some() {
         "apxinf-native-minicpm5-thinking-v1"

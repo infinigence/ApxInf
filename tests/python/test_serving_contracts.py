@@ -73,6 +73,17 @@ class ServingContractTests(unittest.TestCase):
                 with self.assertRaises(contracts.ContractError):
                     contracts.validate_frame(frame)
 
+    def test_shared_native_prepared_profile(self):
+        corpus = json.loads((ROOT / "tests/fixtures/serving/native-prepared-v0.1.json").read_text())
+        for case in corpus["frame_cases"]:
+            with self.subTest(case=case["name"]):
+                frame = fixture(case, corpus)
+                if case["valid"]:
+                    contracts.validate_frame(frame)
+                else:
+                    with self.assertRaises(contracts.ContractError):
+                        contracts.validate_frame(frame)
+
     def test_shared_native_sampling_profile(self):
         corpus = json.loads((ROOT / "tests/fixtures/serving/native-sampling-v0.1.json").read_text())
         self.check_sampled_profile(corpus)
