@@ -10,7 +10,11 @@ The service must reject another protocol for that worker.
 The native `runtime` object contains exactly these string fields:
 `kind`, `apxinf`, `mlx`, `executable_sha256`, and `metal_library_sha256`.
 `kind` is `native_minicpm5`.
-`apxinf` is `0.1.0` and `mlx` is `0.31.2`.
+`apxinf` is `0.1.0`.
+Current native builds use MLX `0.32.3`.
+Validators retain compatibility with earlier `0.31.2` runtime records.
+The loaded library must match the native build's SDK version.
+This 2026-10-29 amendment does not transfer earlier device qualification to the upgraded runtime.
 Both digest fields contain lowercase SHA-256 hexadecimal strings.
 The manifest repeats this runtime object and includes the sorted bundle artifact records.
 The service checks each artifact and runtime file digest before readiness.

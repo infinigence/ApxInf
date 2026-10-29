@@ -30,7 +30,7 @@ pub fn runtime(executable: &Path, library: &Path) -> Result<Value, String> {
         return Err("The native runtime requires libmlx.dylib.".into());
     }
     Ok(
-        json!({"kind":"native_minicpm5", "apxinf":"0.1.0", "mlx":"0.31.2",
+        json!({"kind":"native_minicpm5", "apxinf":"0.1.0", "mlx":"0.32.3",
         "executable_sha256":digest(executable)?.1, "metal_library_sha256":digest(library)?.1}),
     )
 }
