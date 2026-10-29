@@ -197,7 +197,7 @@ python3 benchmarks/serving/http_benchmark.py \
   --model qwen3.5-2b \
   --samples 32 --warmup 2 --concurrency 1 2 4 \
   --workload mixed --max-tokens 64 \
-  --metal-lock /Users/haiyan-mini/.cache/enginetailor/metal-measure.lock \
+  --metal-lock /absolute/path/to/metal-measure.lock \
   --output /tmp/apxinf-serving-benchmark.json
 ```
 
@@ -324,7 +324,7 @@ python3 benchmarks/serving/claude_code_tasks.py \
   --base-url http://127.0.0.1:8080 \
   --model qwen3.5-2b \
   --tasks read edit check --repeats 1 \
-  --metal-lock /Users/haiyan-mini/.cache/enginetailor/metal-measure.lock \
+  --metal-lock /absolute/path/to/metal-measure.lock \
   --output-dir /tmp/apxinf-claude-tasks
 ```
 

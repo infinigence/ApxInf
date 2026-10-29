@@ -575,7 +575,7 @@ python3 -m pytest -q \
 ```
 
 Follow [the benchmark guide](../../benchmarks/serving/README.md) for real model and Claude Code tests.
-Follow [the Metal experiments](metal-experiments.md) for controlled parameter comparisons.
+Follow [support and verification boundaries](support-status.md) for controlled parameter comparisons.
 Tests must preserve raw failures and actual outputs.
 CPU test doubles cannot establish real inference or client compatibility.
 The [lifecycle report](supervisor-acceptance.md) separates the latest CPU checks from historical model measurements.
