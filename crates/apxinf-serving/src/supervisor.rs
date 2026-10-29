@@ -192,7 +192,7 @@ impl Config {
             || self.prefill_step_size != 256)
         {
             return Err(
-                "Native MiniCPM5 requires at most 16384 positions, 256-token prefill chunks, and one token per output frame."
+                "Native MiniCPM5 requires at most 16384 positions, --prefill-step-size 256 for launch compatibility, and one token per output frame."
                     .into(),
             );
         }
