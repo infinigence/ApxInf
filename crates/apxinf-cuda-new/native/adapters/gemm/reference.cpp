@@ -168,6 +168,7 @@ void validate_candidates(const Spec& spec,
   for (const auto& implementation : registry(spec.semantic)) {
     if (!supports_device(implementation, device) ||
         !implementation.supports(spec) ||
+        !supports_weight_layout(implementation, spec) ||
         !supports_alignment(implementation, spec) ||
         (policy.graph_safe && !implementation.graph_safe) ||
         (policy.deterministic && !implementation.deterministic)) {
@@ -177,13 +178,13 @@ void validate_candidates(const Spec& spec,
     std::vector<int> configurations;
     implementation.enumerate_configs(spec, configurations);
     for (int configuration : configurations) {
-      std::unique_ptr<Execution> candidate;
+      std::unique_ptr<CandidateTrial> candidate;
       std::vector<float> actual;
       try {
-        candidate = prepare(implementation, configuration, spec, policy,
+        candidate = prepare_trial(implementation, configuration, spec, policy,
                             bindings, device);
         poison(bindings, output_bytes);
-        check_cuda(implementation.enqueue(*candidate));
+        check_cuda(implementation.enqueue(*candidate->execution));
         actual = read_output(output.pointer, count, spec.output_dtype,
                              static_cast<cudaStream_t>(bindings.stream));
       } catch (const Failure&) {
@@ -201,7 +202,7 @@ void validate_candidates(const Spec& spec,
       }
 
       if (policy.graph_safe) {
-        CapturedExecution graph(*candidate);
+        CapturedExecution graph(*candidate->execution);
         poison(bindings, output_bytes);
         graph.launch();
         const auto graph_actual = read_output(

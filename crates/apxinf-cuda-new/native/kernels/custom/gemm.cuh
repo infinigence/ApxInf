@@ -18,10 +18,27 @@ __device__ inline void save(void* p,int type,int64_t i,float x) {
  else if(type==2) ((__nv_bfloat16*)p)[i]=__float2bfloat16_rn(x);
  else ((__nv_fp8_e4m3*)p)[i]=__nv_fp8_e4m3(x);
 }
+static __device__ inline int64_t weight_layout_index(int64_t row, int64_t col, int64_t k, int64_t n, uint32_t layout) {
+  if (layout == 1) return col * k + row;
+  const int64_t half = n / 2;
+  if (layout == 2) return row * n + (col % half / 256) * 512 + (col >= half ? 256 : 0) + col % 256;
+  if (layout == 3) return row * n + 2 * (col % half) + (col >= half);
+  return row * n + col;
+}
+template <typename Bits>
+static __global__ void relayout_weight_bits(const Bits* source, Bits* destination, int64_t k, int64_t n,
+                             uint32_t from, uint32_t to) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < k*n;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    const auto row = i / n, col = i % n;
+    destination[weight_layout_index(row,col,k,n,to)] = source[weight_layout_index(row,col,k,n,from)];
+  }
+}
 static __global__ void unpack(const void* src,void* dst,int out_type,int type,int64_t rows,int64_t cols,int layout) {
  for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<rows*cols;i+=int64_t(gridDim.x)*blockDim.x) {
   int64_t r=i/cols,c=i%cols,j=i;
   if(layout==1) j=c*rows+r;
+  if(layout==3) { int64_t h=cols/2; j=r*cols+2*(c%h)+(c>=h); }
   if(layout==2) { int64_t h=cols/2; j=r*cols+(c%h/256)*512+(c>=h?256:0)+c%256; }
   save(dst,out_type,i,load(src,type,j));
  }
@@ -38,24 +55,33 @@ static __global__ void dequantize_i8_bf16(const int8_t* src,
                                           const float* scales,
                                           int64_t rows,
                                           int64_t cols,
-                                          bool rowwise) {
+                                          bool rowwise, int layout) {
  for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<rows*cols;i+=int64_t(gridDim.x)*blockDim.x) {
   int64_t r=i/cols,c=i%cols;
   float scale=rowwise?scales[r]:scales[c];
-  dst[i]=__float2bfloat16_rn(float(src[i])*scale);
+  dst[i]=__float2bfloat16_rn(float(src[layout==1?c*rows+r:i])*scale);
  }
 }
 __device__ inline float gelu(float x) {return 0.5f*x*(1.f+tanhf(0.7978845608028654f*(x+0.044715f*x*x*x)));}
 static __global__ void finish(const void* projection,int projection_type,void* output,int out_type,
  const void* bias,int bias_type,const void* residual,int residual_type,const float* as,const float* bs,
- int64_t m,int64_t n,int semantic,int scale_mode,float alpha,float output_scale) {
+ int64_t m,int64_t n,int semantic,int scale_mode,float alpha,float output_scale,int layout) {
  int64_t width=semantic==2?n/2:n;
  for(int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<m*width;i+=int64_t(gridDim.x)*blockDim.x) {
   int64_t r=i/width,c=i%width;
   float factor=scale_mode==1?as[r]*bs[c]:1.f;
-  float x=load(projection,projection_type,r*n+c)*factor*alpha;
+  int64_t pc=c, uc=c+width;
+  if(layout==2) {
+   int64_t h=n/2;
+   pc=(c%h/256)*512+(c>=h?256:0)+c%256;
+   uc=(uc%h/256)*512+(uc>=h?256:0)+uc%256;
+  } else if(layout==3) {
+   pc=2*(c%(n/2))+(c>=n/2);
+   uc=2*(uc%(n/2))+(uc>=n/2);
+  }
+  float x=load(projection,projection_type,r*n+pc)*factor*alpha;
   if(semantic==2) {
-   float up=load(projection,projection_type,r*n+c+width)*alpha;
+   float up=load(projection,projection_type,r*n+uc)*alpha;
    if(scale_mode==1) up*=as[r]*bs[c+width];
    x=gelu(x)*up;
   } else {
@@ -71,10 +97,10 @@ inline cudaError_t unpack_gemm(const void* src,void* dst,int out_type,int type,i
 }
 inline cudaError_t dequantize_i8_gemm(const void* src,void* dst,
                                      const float* scales,int64_t r,int64_t c,
-                                     bool rowwise,cudaStream_t stream) {
+                                     bool rowwise,cudaStream_t stream,int layout=0) {
  dequantize_i8_bf16<<<int(std::min<int64_t>((r*c+255)/256,4096)),256,0,stream>>>(
      static_cast<const int8_t*>(src),static_cast<__nv_bfloat16*>(dst),
-     scales,r,c,rowwise);
+     scales,r,c,rowwise,layout);
  return cudaGetLastError();
 }
 } // namespace

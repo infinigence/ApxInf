@@ -16,7 +16,7 @@ struct Allocation {
 class GemmTuningProblem {
  public:
   using Implementation = apxinf::gemm::Implementation;
-  using Execution = apxinf::gemm::Execution;
+  using Execution = apxinf::gemm::CandidateTrial;
 
   GemmTuningProblem(const Spec& spec, const apxinf_gemm_policy_t& policy,
                     const apxinf_gemm_bindings_t& bindings, int device)
@@ -43,7 +43,7 @@ class GemmTuningProblem {
       reason = "device";
       return false;
     }
-    if (!implementation.supports(spec_)) {
+    if (!implementation.supports(spec_) || !supports_weight_layout(implementation, spec_)) {
       reason = "contract";
       return false;
     }
@@ -69,12 +69,12 @@ class GemmTuningProblem {
 
   std::unique_ptr<Execution> prepare(const Implementation& implementation,
                                      int configuration) const {
-    return apxinf::gemm::prepare(implementation, configuration, spec_, policy_,
+    return apxinf::gemm::prepare_trial(implementation, configuration, spec_, policy_,
                                  bindings_, device_);
   }
 
   cudaError_t enqueue(Execution& execution) const {
-    return execution.implementation->enqueue(execution);
+    return execution.implementation->enqueue(*execution.execution);
   }
 
   cudaStream_t stream() const {

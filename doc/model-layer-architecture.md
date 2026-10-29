@@ -113,6 +113,90 @@ selects a policy; that policy calls the binding, which invokes Rust `AutoModel`.
 Reuse these entry points for a new family instead of adding a factory/runner
 wrapper merely to reproduce the names in this table.
 
+### Repacked GEMM weight ownership
+
+PI0.5 device linear weights retain cuda-new `RepackedWeight` layout state next
+to their allocation. Loading only uploads canonical bytes and creates this state.
+The first native GEMM preparation selects a recipe, then repacks through a local
+RAII temporary, copies back to the original weight address, and frees the temporary
+before returning. There is no separate commit call and no packed-weight buffer,
+borrowed packed pointer, or ownership flag in the W8A8/GeGLU Execution. Its kernel
+reads `bindings.b` directly. Autotuning and candidate validation own isolated
+trial weights; they never rewrite model weights while evaluating candidates.
+
+Layout participates in recipe and execution keys. Every consumer of a repackable
+allocation must use the same state. cuda-new registers the allocation owner and
+address range when adopting it: a second independent state is rejected, as is a
+canonical GEMM binding to that allocation (including tensor/buffer views). Clone
+the existing state instead. Registration lasts until the allocation dies, even
+if the public state handle is dropped; it does not retain device memory. This
+check protects GEMM preparation, not arbitrary raw readback/export or other
+tensor operations, which must still respect the prepared representation.
+Later IO addresses and shapes may create new
+Executions and select different kernels, but only implementations compatible with
+the prepared layout are eligible. Canonical choices are fixed too, protecting
+existing graph readers. The cuBLAS baseline can read prepared layouts for shape
+or semantic changes. A failed writeback invalidates the weight; reload it rather
+than retrying partially overwritten bytes. Weight replacement requires new
+storage/state and retiring the old graph readers.
+
+Ordinary Tensor/`WeightVersion` arguments stay canonical: they do not authorize
+in-place packing and cannot select kernels requiring packed weights. Callers
+wanting these kernels must attach `RepackedWeight`. This change does not move
+computation scratch out of provider state or change activation workspace ownership.
+
+Kernel weight layout is an explicit property of each native `Implementation`
+registry entry. Implementation IDs are local to a semantic registry and must
+not be used to infer layout across registries; in particular CUTLASS ID 4 means
+different implementations for GEMM and GeGLU.
+
+### Shared layouts for heterogeneous consumers
+
+`RepackedWeight::new` commits one layout for consumers known to share a physical
+representation. `RepackedWeight::with_layout_cache` instead caches profile
+choices separately from physical layouts. PI0.5 BF16/FP8 language gate/up uses this
+mode: fixed two-view input with T=10 has M=522 (fused GeGLU), whereas T=11 has
+M=523 (plain GEMM plus pointwise). Camera count remains fixed per instance.
+
+The base allocation can change layout during preparation only when no live
+execution leases it. Default inference synchronizes and retires the previous
+plan before preparing another shape, so it can reuse the original address for
+the new representation without retaining a second full weight. A temporary
+bit-preserving permutation completes before the new execution is published;
+failed writeback invalidates the state.
+
+When an older execution/graph still leases the base, preparation selects on a
+private canonical trial. An extra layout is allocated only if concurrent
+consumers need it and the budget permits it. Consumers selecting the same layout
+share its allocation. Each Execution owns a physical-storage lease; the weight
+state holds only weak entries for extra layouts. Retiring the last consumer
+reclaims that extra allocation even while the model remains loaded. One capture
+can contain multiple layouts, and explicitly retained older graphs remain valid.
+
+The model retains CPU selection metadata separately: semantic/provider/implementation/
+version/configuration, physical layout and the effective resource limit. Rebinding
+new IO rebuilds the exact provider resources from this metadata; a heuristic
+configuration must retain the resource limit under which it was chosen. Metadata
+owns no native execution or GPU buffer. Native operation descriptors must not
+retain pointers to discarded trials. Leases, rather than Tensor alias reference
+counts, determine whether changing base bytes is safe.
+
+PI0.5 BF16/FP8 permits at most one extra live layout per language gate/up weight
+by default, allocated lazily only for concurrent incompatible consumers. `LoadOptions` and native
+Python `ModelRunner.load` expose `weight_layout_budget_bytes`; the policy frontend
+forwards this load-time option. The budget covers additional leased weight
+allocations, not graph arenas, provider workspace or prepare-local trial storage.
+A zero budget fixes canonical at adoption, eliminating first-call dependence
+without an extra copy, but may slow a fixed fused-GeGLU profile. Partial budgets
+are assigned deterministically in layer order, not by whichever request arrives
+first. INT8 and unrelated BF16/FP8 weights retain the single-layout path.
+
+Evaluate fixed profiles, mixed profiles, both prepare orders, prepare cost,
+steady latency, live/peak allocations and precision together. A per-kernel timing
+winner is not automatically an end-to-end memory/latency optimum. Benchmark
+shared layouts against canonical-only when choosing a deployment budget rather
+than embedding a universal speedup threshold in the backend.
+
 ### Dependency direction within a family
 
 ```text

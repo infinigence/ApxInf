@@ -1038,7 +1038,7 @@ impl ModelRunner {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None, weight_layout_budget_bytes=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -1055,6 +1055,7 @@ impl ModelRunner {
         sampling_seed: u64,
         assets: Option<BTreeMap<String, PathBuf>>,
         model_variant: Option<String>,
+        weight_layout_budget_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -1097,6 +1098,7 @@ impl ModelRunner {
             model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
             model_variant,
+            weight_layout_budget_bytes,
             calibration_path: calibration,
             tuning_path: tactics,
             assets: assets.unwrap_or_default(),

@@ -23,6 +23,10 @@ typedef enum {
   APXINF_GEMM_LAYOUT_KN = 0,
   APXINF_GEMM_LAYOUT_NK = 1,
   APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256 = 2,
+  APXINF_GEMM_LAYOUT_GATE_UP_ADJACENT = 3,
+  APXINF_GEMM_LAYOUT_CANONICAL = 4,
+  // Returned to the model only after a failed in-place writeback; not a valid Spec.
+  APXINF_GEMM_LAYOUT_INVALID = 5,
 } apxinf_gemm_layout_t;
 
 typedef enum {
@@ -53,8 +57,11 @@ typedef struct {
   uint32_t accumulation_dtype;
   uint32_t output_dtype;
   uint32_t quantization;
-  /* Changes whether candidate preparation may hoist weight preprocessing. */
+  /* In-place weight preparation requires immutable B after preparation. */
   uint32_t b_is_immutable;
+  /* 0: canonical candidate input; 1: NK; 2: interleave-256;
+     3: adjacent interleave; 4: committed canonical. */
+  uint32_t b_layout;
   /* Largest guaranteed power-of-two byte alignment, capped at 256. */
   uint32_t a_alignment;
   uint32_t b_alignment;
@@ -87,7 +94,7 @@ typedef apxinf_tuning_policy_t apxinf_gemm_policy_t;
 typedef struct {
   const void* a;
   const void* b;
-  /* A prepared-weight identity is (b allocation address, b_version). */
+  /* Canonical callers may version their B allocation for execution caching. */
   uint64_t b_version;
   uint32_t b_is_immutable;
   const void* bias;

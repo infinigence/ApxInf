@@ -9,8 +9,9 @@ mod linear {
     use crate::pi05::LinearWeights;
 
     pub struct Int8DynamicLinearWeights {
-        /// Canonical contiguous row-major `[input,output]` signed INT8 weight.
+        /// Logical `[input,output]` INT8 weight; `layout` tracks physical packing.
         pub weight: Tensor,
+        pub layout: crate::pi05::backend::ops::RepackedWeight,
         /// Dequantization multiplier for each output channel.
         pub channel_scales: Tensor,
         pub bias: Option<Tensor>,
@@ -74,6 +75,7 @@ mod linear {
                 ));
             };
             Ok(Self {
+                layout: crate::pi05::backend::ops::RepackedWeight::new(&weight)?,
                 weight,
                 channel_scales,
                 bias,
@@ -128,7 +130,7 @@ mod linear {
                 &self.channel_scales,
                 &mut output,
             )
-            .with_immutable_weight(ops::WeightVersion::new(0));
+            .with_repacked_weight(&self.layout);
             args.policy = w8a8_gemm_policy(gemm_policy);
             ops::gemm(ctx, args)?;
             Ok(output)

@@ -8,12 +8,45 @@ extern "C" {
 
 typedef struct apxinf_gemm_execution* apxinf_gemm_execution_t;
 
+/* weight_layout is model-owned state for an initially unprepared B (layout 0).
+   Prepare selects a kernel, packs through a local temporary, and writes back
+   before returning an execution. On writeback failure it becomes INVALID.
+   Canonical callers use layout 4 and may pass nullptr; their B is never changed. */
 apxinf_status_t apxinf_gemm_prepare(
     apxinf_runtime_t runtime, const apxinf_gemm_spec_t* spec,
     const apxinf_gemm_policy_t* policy,
     const apxinf_gemm_bindings_t* bindings,
-    apxinf_gemm_execution_t* execution);
+    apxinf_gemm_execution_t* execution, uint32_t* weight_layout);
 apxinf_status_t apxinf_gemm_enqueue(apxinf_gemm_execution_t execution);
+/* CPU-only selection metadata; owns no execution or GPU storage. Preserve the
+   resource limit because a heuristic configuration is interpreted under it. */
+typedef struct apxinf_gemm_choice {
+  uint32_t provider_id;
+  uint32_t implementation_id;
+  uint32_t implementation_version;
+  int32_t configuration;
+  uint32_t weight_layout;
+  uint64_t resource_limit;
+} apxinf_gemm_choice_t;
+apxinf_status_t apxinf_gemm_get_choice(
+    apxinf_gemm_execution_t execution, apxinf_gemm_choice_t* choice);
+/* Bind the exact selected choice to new IO/storage. Validate the current Spec,
+   layout and Policy; do not tune or repack, or retain another execution. */
+apxinf_status_t apxinf_gemm_prepare_choice(
+    apxinf_runtime_t runtime, const apxinf_gemm_spec_t* spec,
+    const apxinf_gemm_policy_t* policy, const apxinf_gemm_bindings_t* bindings,
+    const apxinf_gemm_choice_t* choice, apxinf_gemm_execution_t* output);
+/* Initial physical layouts of applicable candidates, as bits (1u << layout).
+   A capability query only: no tuning, allocation or weight modification. */
+apxinf_status_t apxinf_gemm_candidate_layouts(
+    apxinf_runtime_t runtime, const apxinf_gemm_spec_t* spec,
+    const apxinf_gemm_policy_t* policy, uint32_t* layouts);
+/* Prepare-local bit-preserving permutation; source and destination must not
+   overlap. Layouts 1..4 describe NK, interleave-256, adjacent, canonical. */
+apxinf_status_t apxinf_gemm_relayout_weight(
+    const void* source, void* destination, int64_t k, int64_t n,
+    uint32_t dtype, uint32_t source_layout, uint32_t target_layout,
+    apxinf_cuda_stream_t stream);
 void apxinf_gemm_destroy(apxinf_gemm_execution_t execution);
 const char* apxinf_gemm_summary(apxinf_gemm_execution_t execution);
 
@@ -67,8 +100,6 @@ apxinf_status_t apxinf_gemm_nvfp4_swiglu(
     const void* input_global_scale, const void* down_inverse_global_scale,
     int64_t rows, int64_t n, int64_t k, apxinf_cuda_stream_t stream);
 
-uint64_t apxinf_gemm_execution_weight_prepack_count(
-    apxinf_gemm_execution_t execution);
 apxinf_status_t apxinf_gemm_test_validate_candidates(
     apxinf_runtime_t runtime, const apxinf_gemm_spec_t* spec,
     const apxinf_gemm_policy_t* policy,

@@ -14,6 +14,7 @@ pub(crate) struct Spec {
     pub output_dtype: u32,
     pub quantization: u32,
     pub b_is_immutable: u32,
+    pub b_layout: u32,
     pub a_alignment: u32,
     pub b_alignment: u32,
     pub bias_alignment: u32,
@@ -52,7 +53,20 @@ pub(crate) struct Bindings {
     pub output_scale: f32,
 }
 
+pub(crate) const WEIGHT_LAYOUT_INVALID: u32 = 5;
+
 pub(crate) type Execution = *mut c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Choice {
+    pub provider_id: u32,
+    pub implementation_id: u32,
+    pub implementation_version: u32,
+    pub configuration: i32,
+    pub weight_layout: u32,
+    pub resource_limit: u64,
+}
 
 unsafe extern "C" {
     pub(crate) fn apxinf_gemm_prepare(
@@ -61,14 +75,36 @@ unsafe extern "C" {
         policy: *const Policy,
         bindings: *const Bindings,
         execution: *mut Execution,
+        weight_layout: *mut u32,
     ) -> i32;
     pub(crate) fn apxinf_gemm_enqueue(execution: Execution) -> i32;
-    pub(crate) fn apxinf_gemm_destroy(execution: Execution);
-    pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(
-        rows: i64,
+    pub(crate) fn apxinf_gemm_candidate_layouts(
+        runtime: Runtime,
+        spec: *const Spec,
+        policy: *const Policy,
+        layouts: *mut u32,
+    ) -> i32;
+    pub(crate) fn apxinf_gemm_get_choice(execution: Execution, choice: *mut Choice) -> i32;
+    pub(crate) fn apxinf_gemm_prepare_choice(
+        runtime: Runtime,
+        spec: *const Spec,
+        policy: *const Policy,
+        bindings: *const Bindings,
+        choice: *const Choice,
+        output: *mut Execution,
+    ) -> i32;
+    pub(crate) fn apxinf_gemm_relayout_weight(
+        source: *const c_void,
+        destination: *mut c_void,
         k: i64,
-        sf_vec_size: u32,
-    ) -> u64;
+        n: i64,
+        dtype: u32,
+        source_layout: u32,
+        target_layout: u32,
+        stream: CudaStream,
+    ) -> i32;
+    pub(crate) fn apxinf_gemm_destroy(execution: Execution);
+    pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(rows: i64, k: i64, sf_vec_size: u32) -> u64;
     pub(crate) fn apxinf_gemm_nvfp4_pack_block_scales(
         source_row_major: *const c_void,
         destination: *mut c_void,
@@ -130,8 +166,6 @@ unsafe extern "C" {
     #[cfg(test)]
     pub(crate) fn apxinf_gemm_summary(execution: Execution) -> *const c_char;
     #[cfg(test)]
-    pub(crate) fn apxinf_gemm_execution_weight_prepack_count(execution: Execution) -> u64;
-
     #[cfg(test)]
     pub(crate) fn apxinf_gemm_test_validate_candidates(
         runtime: Runtime,
