@@ -151,13 +151,13 @@ One MLX worker executes one request at a time.
 Read the [startup guide](doc/serving/local-service-v0.1.md) for the pinned
 environment, deployment limits, and supported API fields.
 Read the [validation report](doc/serving/text-provider-acceptance.md) for
-Qwen3.5-2B measurements and actual Claude Code tasks.
+provider limits and the distinction between implementation and device qualification.
 The [system design](doc/serving-system-design-20261009.md) defines the broader
 framework and staged extensions.
 The default text profile does not accept images.
 The separate [MiniCPM-V profile](doc/serving/minicpm-vision-v0.1.md) accepts bounded PNG inputs through Anthropic Messages.
 The service does not provide persistent sessions, prefix reuse, or continuous batching.
-Read the [current update report](doc/serving/supervisor-acceptance.md) for tested capabilities and remaining limits.
+Read the [current update report](doc/serving/supervisor-acceptance.md) for supported scope and remaining verification requirements.
 
 ### Run a policy through Python API
 
