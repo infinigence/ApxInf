@@ -377,6 +377,8 @@ extern "C" int apxinf_hip_error_string(int code, char* buf, int len) {
   const char* message;
   if (code == kNoCkInstance) {
     message = "no Composable Kernel attention instance matches these arguments";
+  } else if (code == kCkException) {
+    message = "Composable Kernel reported a launch failure (exception caught at the C boundary)";
   } else if (code >= kInvalidArgument) {
     message = "argument rejected by the apxinf-hip shim";
   } else if (code >= kBlasStatusBase) {

@@ -16,6 +16,10 @@ pub(crate) const NOT_COMPILED: i32 = -1;
 pub(crate) const DTYPE_F32: i32 = 0;
 pub(crate) const DTYPE_BF16: i32 = 1;
 
+/// Mirror of `kNoCkInstance`: a Composable Kernel dispatcher found no
+/// instance for the arguments (wrong device architecture or shape).
+pub(crate) const NO_CK_INSTANCE: i32 = 200_001;
+
 macro_rules! hip_abi {
     ($( fn $name:ident($($arg:ident: $ty:ty),* $(,)?); )*) => {
         #[cfg(apxinf_hip_runtime)]

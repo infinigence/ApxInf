@@ -16,7 +16,7 @@
 use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::{bf16_ptr, int, long, require_numel};
-use crate::ffi::{self, check};
+use crate::ffi::{self, check, NO_CK_INSTANCE};
 use crate::runtime::HipContext;
 
 /// Extents of one attention call. Query head `h` reads KV head
@@ -48,21 +48,31 @@ pub enum AttentionKernel {
 /// unsplit; 2 and 8 splits were within 15%.
 const SPLITKV_SPLITS: usize = 4;
 
-/// The default kernel for a geometry. CK covers head dims up to 256 in
-/// multiples of 8 (head dim 72 runs on the padded 128 instances); the vendored
-/// split-KV instances are head dim 256 only. Split-KV pays off when few query
-/// rows face many keys: one 16-row query tile per head cannot fill the GPU.
-pub fn attention_kernel(geometry: &AttentionGeometry) -> AttentionKernel {
+/// The default kernel for a geometry on a device.
+///
+/// The vendored CK dispatchers gate on the device name at run time — the
+/// forward instances on `gfx115*`, split-KV on `gfx11*` — so any other
+/// architecture (CDNA, gfx12) gets apxinf's own kernel rather than a call
+/// that cannot resolve. `arch` is `HipDeviceCaps::base_arch()`.
+///
+/// Within CK's architectures: CK covers head dims up to 256 in multiples of 8
+/// (head dim 72 runs on the padded 128 instances); the vendored split-KV
+/// instances are head dim 256 only. Split-KV pays off when few query rows face
+/// many keys: one 16-row query tile per head cannot fill the GPU.
+pub fn attention_kernel(arch: &str, geometry: &AttentionGeometry) -> AttentionKernel {
     let g = geometry;
     if g.head_dim > 256 || !g.head_dim.is_multiple_of(8) {
         return AttentionKernel::Reference;
     }
-    if g.head_dim == 256 && g.q_tokens <= 16 && g.kv_tokens >= 256 {
+    if g.head_dim == 256 && g.q_tokens <= 16 && g.kv_tokens >= 256 && arch.starts_with("gfx11") {
         return AttentionKernel::CkSplitKv {
             splits: SPLITKV_SPLITS,
         };
     }
-    AttentionKernel::Ck
+    if arch.starts_with("gfx115") {
+        return AttentionKernel::Ck;
+    }
+    AttentionKernel::Reference
 }
 
 /// F32 scratch elements `kernel` needs for `geometry`: split-KV's partial
@@ -138,8 +148,8 @@ pub fn attention(
         bf16_ptr(ctx, out)?,
     );
     let scale = 1.0 / (head_dim as f32).sqrt();
-    match kernel {
-        AttentionKernel::Reference => check("attention", unsafe {
+    let reference = || {
+        check("attention", unsafe {
             ffi::apxinf_hip_native_attention(
                 pq,
                 pk,
@@ -156,7 +166,10 @@ pub fn attention(
                 scale,
                 ctx.stream(),
             )
-        }),
+        })
+    };
+    match kernel {
+        AttentionKernel::Reference => reference(),
         AttentionKernel::Ck => {
             // With one KV head and no mask, the query heads are independent rows
             // over the same keys: [tokens, heads, d] is [tokens * heads, 1, d]
@@ -167,7 +180,7 @@ pub fn attention(
             } else {
                 (q_tokens, q_heads)
             };
-            check("ck attention", unsafe {
+            let status = unsafe {
                 ffi::apxinf_hip_ck_attention(
                     pq,
                     pk,
@@ -187,7 +200,13 @@ pub fn attention(
                     scale,
                     ctx.stream(),
                 )
-            })
+            };
+            // No CK instance (an architecture or shape the vendored set does
+            // not cover): fall back to the kernel that runs everywhere.
+            if status == NO_CK_INSTANCE {
+                return reference();
+            }
+            check("ck attention", status)
         }
         AttentionKernel::CkSplitKv { splits } => {
             let needed = attention_scratch_elements(geometry, kernel);
@@ -205,7 +224,7 @@ pub fn attention(
             // SAFETY: the scratch holds `needed` floats, which is the padded
             // log-sum-exp block plus the output block.
             let o_acc = unsafe { base.cast::<f32>().add(lse_elements) };
-            check("ck split-KV attention", unsafe {
+            let status = unsafe {
                 ffi::apxinf_hip_ck_attention(
                     pq,
                     pk,
@@ -225,7 +244,11 @@ pub fn attention(
                     scale,
                     ctx.stream(),
                 )
-            })
+            };
+            if status == NO_CK_INSTANCE {
+                return reference();
+            }
+            check("ck split-KV attention", status)
         }
     }
 }

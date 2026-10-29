@@ -16,7 +16,7 @@ independent of both. Two surfaces:
 | `Backend`: not yet | The seven methods only Qwen3VL calls (`layer_norm`, `gelu_tanh`, `add_bias`, `rope_mrope`, `rope_vision_2d`, `vision_sdpa`, `concat_2d`); graph capture |
 | `native` | pi05's operator set: GEMM, LayerNorm/RMSNorm/adaptive RMSNorm and their fused residual forms, bias+activation, GeGLU, Euler step, embedding, position embedding, RGB→patches, QKV split with RoPE into a cache, non-causal attention (Composable Kernel flash-attention, with apxinf's own kernel as the reference and fallback); an arena allocator |
 | Dtypes | `Backend`: F32 and BF16. `native`: BF16. F32 arithmetic, one rounding at the store |
-| Verified on | Radeon 8060S (`gfx1151`, wave32), ROCm 7.2.1 |
+| Verified on | Radeon 8060S (`gfx1151`, wave32), ROCm 7.2.1. The vendored CK attention instances resolve on `gfx115*` only (split-KV on `gfx11*`); other architectures take apxinf's own attention kernel, which is correct but slow |
 | Performance | Eager, unfused, host-side sampling. Attention uses tuned kernels (CK); GEMMs are hipBLAS defaults |
 
 `Backend` numerics follow `apxinf-cuda`. Two deliberate differences:

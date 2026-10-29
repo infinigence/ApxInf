@@ -100,7 +100,7 @@ impl Ops<'_> {
         geometry: &AttentionGeometry,
         out: &Tensor,
     ) -> Result<()> {
-        let kernel = native::attention_kernel(geometry);
+        let kernel = native::attention_kernel(self.ctx.caps().base_arch(), geometry);
         let elements = native::attention_scratch_elements(geometry, kernel);
         let scratch = (elements > 0)
             .then(|| self.arena.tensor(vec![elements], DType::F32))
@@ -208,9 +208,11 @@ impl HipPi05Model {
         let h = config.action_horizon;
         // Attention scratch (split-KV partials, F32) for every attention call:
         // 27 vision, 17 language (the last layer stops before attention), and
-        // one per action layer per flow step.
+        // one per action layer per flow step. Sized for the scratch-maximal
+        // kernel choice (gfx1151); other architectures use none of it.
         let scratch = |g: AttentionGeometry| {
-            let elements = native::attention_scratch_elements(&g, native::attention_kernel(&g));
+            let elements =
+                native::attention_scratch_elements(&g, native::attention_kernel("gfx1151", &g));
             if elements == 0 {
                 0
             } else {

@@ -788,6 +788,31 @@ fn attention_matches_the_reference_for_every_pi05_shape() {
     );
 }
 
+/// Forcing CK onto a geometry the vendored instances cannot resolve (head dim
+/// 40 exists in no instance) must fall back to the reference kernel at run
+/// time and still produce the right answer — the behaviour a non-gfx115 device
+/// relies on for every call.
+#[test]
+fn ck_without_an_instance_falls_back_to_the_reference_kernel() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    let g = AttentionGeometry {
+        batch: 1,
+        q_tokens: 12,
+        q_heads: 4,
+        kv_heads: 4,
+        head_dim: 40,
+        kv_tokens: 64,
+    };
+    let (q, qh) = input(&ctx, &[1, 12, 4, 40], 90, 2.0);
+    let (k, kh) = input(&ctx, &[64, 4, 40], 91, 2.0);
+    let (v, vh) = input(&ctx, &[64, 4, 40], 92, 1.0);
+    let out = arena.tensor(vec![1, 12, 4, 40], DType::BF16).unwrap();
+    native::attention(&ctx, &q, &k, &v, &g, AttentionKernel::Ck, None, &out).unwrap();
+    let want = attention_reference(&qh, &kh, &vh, &g, 64);
+    assert_close(&host(&ctx, &out), &want, ACCUMULATE_TOL, "ck fallback");
+}
+
 #[test]
 fn default_attention_kernels_for_pi05() {
     let g = |batch, q_tokens, q_heads, kv_heads, head_dim, kv_tokens| AttentionGeometry {
@@ -800,25 +825,47 @@ fn default_attention_kernels_for_pi05() {
     };
     // Vision and prefix: CK flash-attention forward.
     assert_eq!(
-        native::attention_kernel(&g(2, 256, 16, 16, 72, 256)),
+        native::attention_kernel("gfx1151", &g(2, 256, 16, 16, 72, 256)),
         AttentionKernel::Ck
     );
     assert_eq!(
-        native::attention_kernel(&g(1, 522, 8, 1, 256, 522)),
+        native::attention_kernel("gfx1151", &g(1, 522, 8, 1, 256, 522)),
         AttentionKernel::Ck
     );
     // Action expert: 10 queries over the prefix plus its own rows, split-KV.
     assert_eq!(
-        native::attention_kernel(&g(1, 10, 8, 1, 256, 532)),
+        native::attention_kernel("gfx1151", &g(1, 10, 8, 1, 256, 532)),
         AttentionKernel::CkSplitKv { splits: 4 }
     );
     // Head dims CK's vendored instances cannot run fall back to apxinf's kernel.
     assert_eq!(
-        native::attention_kernel(&g(1, 10, 8, 1, 512, 64)),
+        native::attention_kernel("gfx1151", &g(1, 10, 8, 1, 512, 64)),
         AttentionKernel::Reference
     );
     assert_eq!(
-        native::attention_kernel(&g(1, 10, 8, 1, 60, 64)),
+        native::attention_kernel("gfx1151", &g(1, 10, 8, 1, 60, 64)),
+        AttentionKernel::Reference
+    );
+    // The vendored CK dispatchers gate on the device name: forward is gfx115*,
+    // split-KV gfx11*. Everything else must get the kernel that runs anywhere.
+    assert_eq!(
+        native::attention_kernel("gfx942", &g(1, 522, 8, 1, 256, 522)),
+        AttentionKernel::Reference
+    );
+    assert_eq!(
+        native::attention_kernel("gfx942", &g(1, 10, 8, 1, 256, 532)),
+        AttentionKernel::Reference
+    );
+    assert_eq!(
+        native::attention_kernel("gfx1100", &g(1, 522, 8, 1, 256, 522)),
+        AttentionKernel::Reference
+    );
+    assert_eq!(
+        native::attention_kernel("gfx1100", &g(1, 10, 8, 1, 256, 532)),
+        AttentionKernel::CkSplitKv { splits: 4 }
+    );
+    assert_eq!(
+        native::attention_kernel("gfx1201", &g(2, 256, 16, 16, 72, 256)),
         AttentionKernel::Reference
     );
 }

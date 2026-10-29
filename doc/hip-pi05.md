@@ -50,8 +50,12 @@ Attention runs on Composable Kernel's flash-attention, vendored in
 `crates/apxinf-hip/kernels/ck/`: CK forward for vision and the prefix (whose 8
 query heads share one KV head and are folded into one head of 8x the rows), and
 CK split-KV with 4 key splits for the action expert's 10 queries over the
-prefix. `native::attention_kernel` makes that choice; apxinf's own kernel remains
-the test reference and the fallback for head dims CK does not cover. CK rounds
+prefix. `native::attention_kernel` makes that choice from the device architecture and
+the geometry: the vendored CK dispatchers resolve on `gfx115*` only (split-KV on
+`gfx11*`), so every other architecture, and any head dim CK does not cover, runs
+apxinf's own kernel — which also remains the test reference. A CK call that
+still finds no instance falls back to that kernel at run time instead of
+failing. CK rounds
 the attention probabilities to BF16 before the value product; apxinf's kernel
 keeps them in F32.
 

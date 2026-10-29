@@ -22,9 +22,18 @@
 
 namespace {
 
+using apxinf_hip::kCkException;
 using apxinf_hip::kInvalidArgument;
 // CK's dispatchers return a negative time when no instance matches.
 using apxinf_hip::kNoCkInstance;
+
+// CK checks launches with hipPeekAtLastError, which does not clear the sticky
+// error, and its dispatchers return -1 without clearing it either. Clear it on
+// every non-success path so one failure cannot be blamed on the next call.
+int no_instance() {
+  (void)hipGetLastError();
+  return kNoCkInstance;
+}
 
 template <typename Args>
 void set_layout(Args& a, int batch, int q_tokens, int q_heads, int kv_heads, int head_dim,
@@ -84,7 +93,7 @@ int run_fwd(const void* q, const void* k, const void* v, void* out, int batch, i
   a.drop_seed_offset = std::make_pair(uint64_t{0}, uint64_t{0});
 
   const float time = fmha_fwd(traits, a, ck_tile::stream_config{stream, false, 0});
-  if (time < 0) return kNoCkInstance;
+  if (time < 0) return no_instance();
   return static_cast<int>(hipGetLastError());
 }
 
@@ -126,7 +135,7 @@ int run_splitkv(const void* q, const void* k, const void* v, void* out, int batc
   a.batch_stride_o_acc = q_heads * num_splits * q_tokens * head_dim;
 
   const float time = fmha_fwd_splitkv(traits, a, ck_tile::stream_config{stream, false, 0});
-  if (time < 0) return kNoCkInstance;
+  if (time < 0) return no_instance();
   return static_cast<int>(hipGetLastError());
 }
 
@@ -137,17 +146,27 @@ extern "C" int apxinf_hip_ck_attention(const void* q, const void* k, const void*
                                        int head_dim, int kv_tokens, int64_t kv_batch_stride,
                                        int64_t kv_token_stride, int num_splits, void* lse_acc,
                                        void* o_acc, float scale, void* stream) {
+  // 128 is CK's own split ceiling (num_splits_heuristic); empty trailing
+  // splits are handled by the combine kernel, so kv_tokens is not a bound.
   if (batch <= 0 || q_tokens <= 0 || q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 ||
       head_dim <= 0 || kv_tokens <= 0 || kv_token_stride < static_cast<int64_t>(kv_heads) * head_dim ||
-      kv_batch_stride > INT32_MAX || kv_token_stride > INT32_MAX) {
+      kv_batch_stride > INT32_MAX || kv_token_stride > INT32_MAX || num_splits < 1 ||
+      num_splits > 128) {
     return kInvalidArgument;
   }
   hipStream_t s = static_cast<hipStream_t>(stream);
-  if (num_splits <= 1) {
-    return run_fwd(q, k, v, out, batch, q_tokens, q_heads, kv_heads, head_dim, kv_tokens,
-                   kv_batch_stride, kv_token_stride, scale, s);
+  // CK raises errors by throwing (HIP_CHECK_ERROR in launch_and_check); an
+  // exception must not unwind through this extern "C" frame into Rust.
+  try {
+    if (num_splits == 1) {
+      return run_fwd(q, k, v, out, batch, q_tokens, q_heads, kv_heads, head_dim, kv_tokens,
+                     kv_batch_stride, kv_token_stride, scale, s);
+    }
+    if (lse_acc == nullptr || o_acc == nullptr) return kInvalidArgument;
+    return run_splitkv(q, k, v, out, batch, q_tokens, q_heads, kv_heads, head_dim, kv_tokens,
+                       kv_batch_stride, kv_token_stride, num_splits, lse_acc, o_acc, scale, s);
+  } catch (...) {
+    (void)hipGetLastError();
+    return kCkException;
   }
-  if (lse_acc == nullptr || o_acc == nullptr) return kInvalidArgument;
-  return run_splitkv(q, k, v, out, batch, q_tokens, q_heads, kv_heads, head_dim, kv_tokens,
-                     kv_batch_stride, kv_token_stride, num_splits, lse_acc, o_acc, scale, s);
 }

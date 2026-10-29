@@ -25,6 +25,9 @@ constexpr int kBlasStatusBase = 100000;
 constexpr int kInvalidArgument = 200000;
 // A Composable Kernel dispatcher found no instance for the arguments.
 constexpr int kNoCkInstance = 200001;
+// Composable Kernel reported a launch failure by throwing; the wrapper caught
+// it at the C ABI boundary.
+constexpr int kCkException = 200002;
 
 constexpr int kElementwiseBlock = 256;
 constexpr int kReduceBlock = 256;

@@ -58,6 +58,10 @@ fn main() {
     let arch = target_arch(&rocm);
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernels = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("kernels");
+    // Freshness alone would reuse objects across a toolchain change: an
+    // in-place ROCm upgrade touches no file in this repository. Fold the
+    // compiler's identity into the object names, like the arch below.
+    let toolchain = hipcc_version(&hipcc);
 
     let ck = kernels.join("ck");
     let ck_include = ck.join("include");
@@ -69,7 +73,13 @@ fn main() {
         .iter()
         .map(|source| Unit {
             source: kernels.join(source),
-            object: out_dir.join(Path::new(source).with_extension("o")),
+            // The arch is part of the name: an object compiled for another
+            // `APXINF_HIP_ARCH` must not be mistaken for a fresh one, or it
+            // defeats the arch check in `HipContext::new`.
+            object: out_dir.join(format!(
+                "{arch}_{toolchain}_{}.o",
+                Path::new(source).file_stem().unwrap().to_string_lossy()
+            )),
             ck: false,
             inputs_changed: common,
         })
@@ -85,7 +95,7 @@ fn main() {
     for source in std::iter::once(kernels.join("ck_attention.hip")).chain(generated) {
         let name = source.file_stem().unwrap().to_string_lossy().into_owned();
         units.push(Unit {
-            object: out_dir.join(format!("ck_{name}.o")),
+            object: out_dir.join(format!("{arch}_{toolchain}_ck_{name}.o")),
             source,
             ck: true,
             inputs_changed: ck_inputs,
@@ -93,7 +103,11 @@ fn main() {
     }
 
     let compile = |unit: &Unit| {
-        if is_fresh(&unit.object, std::slice::from_ref(&unit.source), unit.inputs_changed) {
+        if is_fresh(
+            &unit.object,
+            std::slice::from_ref(&unit.source),
+            unit.inputs_changed,
+        ) {
             return;
         }
         let mut command = Command::new(&hipcc);
@@ -149,7 +163,13 @@ fn main() {
             );
         }
     };
-    let jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
+    // Respect cargo's job count (`cargo build -j2`); each hipcc uses ~1.5 GB.
+    let jobs = env::var("NUM_JOBS")
+        .ok()
+        .and_then(|jobs| jobs.parse::<usize>().ok())
+        .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
+        .unwrap_or(4)
+        .max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..jobs.min(units.len()) {
@@ -224,6 +244,33 @@ struct Unit {
     ck: bool,
     /// Newest modification time among the unit's headers.
     inputs_changed: SystemTime,
+}
+
+/// A short token identifying the hipcc that will compile the objects.
+fn hipcc_version(hipcc: &Path) -> String {
+    let output = Command::new(hipcc).arg("--version").output();
+    let text = output
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    // "HIP version: 7.2.53211-..." -> "7.2.53211"; hash the line as a fallback.
+    let version = text
+        .lines()
+        .find_map(|line| line.strip_prefix("HIP version: "))
+        .map(|v| {
+            v.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "h{:08x}",
+                text.bytes()
+                    .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32))
+            )
+        });
+    version.replace('.', "_")
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
