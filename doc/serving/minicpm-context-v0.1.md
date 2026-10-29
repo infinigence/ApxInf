@@ -30,16 +30,19 @@ The caller retains responsibility for request cleanup with device synchronizatio
 
 ## Model execution
 
-A prefill chunk contains at most 256 consecutive prompt tokens.
-Ordinary MiniCPM prefill executes these chunks in order.
+The model family selects the prepared prefill plan.
+Prompts of at most 4096 tokens use one complete-prompt chunk.
+Longer compiled prompts use 1024-token chunks by default; public mode uses 512-token chunks.
+Construction-time chunk overrides remain part of the family plan.
+Ordinary MiniCPM prefill executes the selected chunks in order.
 Each chunk uses absolute RoPE positions and a causal mask over prior and current positions.
 Each chunk evaluates its outputs before it publishes KV state, advances the offset, and reports progress.
 The model checks control before the first chunk and after each completed chunk.
 The final chunk returns one logit row for sampling.
 
 The model admits each chunk at its exact prepared offset and row count.
-A one-row tail uses the same eager prefill path as other chunks.
-Preparation warms the complete prompt, each distinct chunk length, and the supported decode lengths.
+A one-row tail uses the family's admitted prefill path.
+Preparation warms admitted chunk lengths and the supported decode profiles.
 `prepared_sequence_lengths` reports those admitted lengths in ascending order.
 The full `forward` operation retains all input logit rows and its complete-prompt admission rule.
 The shared sampler and EOS behavior remain unchanged.
@@ -50,13 +53,13 @@ Chunked prefill does not establish DSpark support at larger lengths.
 
 ## Context limits
 
-The initial equivalence gate passed with the existing 4096-position limit.
-The ordinary BF16 model permits a 16384-position profile.
-The limit applies to `bf16-public` and `bf16-compiled` only.
+The native serving deployment permits at most 16384 consumed positions.
+The ordinary BF16 family has a separate source capacity of 65792 positions, subject to checkpoint limits.
+That family capacity does not widen the serving deployment or establish quality at those lengths.
 Variant limits control RoPE table size, preparation, and token admission together.
 The [support overview](support-status.md) separates historical observations from current qualification.
 These gates do not establish equivalent quality for every task or variant.
-A 32768-position profile remains deferred.
+A serving profile above 16384 positions remains outside this deployment.
 
 Admission includes the complete prepared input and maximum output allowance.
 The effective limit is the smaller model limit and deployment limit.
@@ -74,7 +77,8 @@ This BF16 tolerance permits changes in reduction order without permitting a chan
 
 The test also rejects an invalid token after the first chunk before any KV mutation.
 Cancellation before prefill must consume zero tokens.
-Cancellation after the first chunk must consume exactly 256 tokens and return no logits.
+Cancellation after the first chunk must stop at its prepared end and return no logits.
+The actual consumed count follows the selected family plan, not a fixed 256-token interval.
 Release after device synchronization must permit a successful subsequent request on the same instance.
 CPU checks cover shape admission, context boundaries, overflow, and shared control behavior.
 

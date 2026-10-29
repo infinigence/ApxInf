@@ -281,4 +281,3 @@ The caller constructs `AttemptTracker` from a checked submit frame.
 Its `observe` operation checks identity, event order, output ranges, terminal counts, and lease settlement.
 It rejects invalid events before changing its state.
 Both implementations consume the same original conformance fixtures.
-No code generator creates the types, validators, or fixtures.

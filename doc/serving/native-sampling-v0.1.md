@@ -11,7 +11,8 @@ The operator explicitly selects the native sampled profile before startup.
 Its worker protocol is `apxinf-worker/2.2`.
 Its public profile name is `apxinf-native-sampled-v0.1`.
 The model provider remains `metal_minicpm5`, with BF16 weights and variant `bf16-compiled`.
-The profile supports one text sequence, 256-token prefill chunks, and at most 16384 positions.
+The profile supports one text sequence and at most 16384 consumed positions.
+Prefill follows the [family-selected plan](minicpm-context-v0.1.md#model-execution).
 It does not enable image input, state reuse, or model thinking.
 
 Omitted sampling parameters select temperature 1.0 and top-p 0.95.

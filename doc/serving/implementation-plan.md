@@ -12,8 +12,7 @@ P1a code and CPU checks do not complete the P1 acceptance gate.
 
 [The contract](contracts-v0.1.md) defines the canonical semantics for serving. [The system design](../serving-system-design-20261009.md) records the research, architecture choices, and supporting evidence. This plan defines work order, module boundaries, and phase gates. A conflict requires a contract correction before implementation continues.
 
-Contributors write the implementation directly from the ApxInf contract. Contributors do not copy, translate, or vendor implementation code from external serving engines.
-Public dependency APIs remain permitted. Each adapter records its dependency versions, API calls, and observed limitations. The project does not use code generators for serving types, adapters, or test stubs.
+Each adapter records its dependency versions, API calls, and observed limitations.
 
 Rust and Python use separate types. Both implementations follow the same contract and original conformance fixtures. The fixtures contain input cases, expected events, and expected resource outcomes. They do not define a second semantic specification.
 Changes to fields, states, or ownership rules start in the contract. The same change includes the affected types and fixtures.

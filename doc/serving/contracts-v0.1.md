@@ -804,7 +804,7 @@ These rules add no worker fields and do not change public result semantics.
 
 **IC-01.** This document must remain the semantic source for the serving interfaces.
 
-**IC-02.** Authors must write Rust and Python types and validators by hand from this contract.
+**IC-02.** Rust and Python types and validators must follow this contract.
 
 **IC-03.** Both validators must use the same original valid and invalid fixtures.
 
