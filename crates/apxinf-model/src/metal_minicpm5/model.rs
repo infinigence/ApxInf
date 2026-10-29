@@ -113,7 +113,7 @@ impl MiniCpm5 {
             .ok_or(Error::Contract("MiniCPM context overflow"))?;
         if prompt == 0 || total > CONTEXT_CAPACITY {
             return Err(Error::Contract(
-                "MiniCPM5 supports B1 with at most 9216 consumed positions",
+                "MiniCPM5 supports B1 with at most 4096 consumed positions",
             ));
         }
         let capacity = total.max(1).div_ceil(256) * 256;

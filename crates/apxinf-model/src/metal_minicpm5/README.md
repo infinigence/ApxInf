@@ -37,9 +37,7 @@ only to its final normalized hidden row. This distinction retains the accepted
 prefill optimization without weakening the full forward contract. Ordinary
 generation uses ApxInf's shared sampler/EOS loop.
 
-The supported workload is one text sequence with at most 9216 consumed positions
-(`CONTEXT_CAPACITY`); the 8192-token prompt plus 128 output tokens fits. KV is allocated
-per request at the 256-rounded request size, so short requests do not pay for the bound.
+The supported workload is one text sequence with at most 4096 consumed positions.
 Only greedy sampling without penalties/log-probability is currently implemented
 by the native backend. Unsupported sampling requests fail explicitly. DSpark is
 an explicit selection with a separately pinned drafter; it is never the default.

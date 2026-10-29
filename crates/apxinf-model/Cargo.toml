@@ -34,10 +34,6 @@ pi05-only = ["cuda"]
 hip = ["dep:apxinf-hip"]
 
 [[example]]
-name = "minicpm5_longctx_bench"
-required-features = ["mlx"]
-
-[[example]]
 name = "pi05_bench"
 required-features = ["cuda"]
 

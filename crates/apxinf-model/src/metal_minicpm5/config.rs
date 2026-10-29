@@ -2,9 +2,7 @@
 use apxinf_core::{Error, Result};
 use serde::Deserialize;
 
-/// Covers the frozen 8192-prompt + 128-output long-context workload with headroom; the KV
-/// itself is allocated per request at the 256-rounded request size, not at this bound.
-pub const CONTEXT_CAPACITY: usize = 9216;
+pub const CONTEXT_CAPACITY: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
