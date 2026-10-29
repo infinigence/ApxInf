@@ -72,7 +72,9 @@ The optional native worker uses existing workspace libraries through their publi
 `apxinf-mlx` supplies checked allocator statistics and cache release.
 The current native worker pins MLX 0.32.3 through the existing backend build checks.
 The prepared profile also calls `mlx::core::set_cache_limit` before loading.
-The tokenizer adapter uses tokenizers 0.20.4 through its public `decode_stream` API.
+The tokenizer adapter uses the public decode API from tokenizers 0.20.4.
+ByteLevel output retains an unfinished UTF-8 tail between calls.
+Other decoders use complete-history prefix checks.
 It does not copy the dependency's decoding implementation.
 It calls the public `mlx::core::set_memory_limit` API before model loading.
 This API sets an allocation guideline during graph evaluation.
