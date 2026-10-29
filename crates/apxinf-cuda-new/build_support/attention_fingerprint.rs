@@ -28,8 +28,6 @@ const INPUT_FILES: &[&str] = &[
     "include/apxinf_cuda/tuning_types.h",
     "include/apxinf_cuda/types.h",
     "kernels/custom/attention.cuh",
-    "kernels/custom/attention_softmax.cuh",
-    "kernels/custom/attention_short_f32.cuh",
 ];
 
 fn hash_bytes(hash: &mut u128, bytes: &[u8]) {

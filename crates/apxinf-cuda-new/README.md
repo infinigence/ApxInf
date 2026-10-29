@@ -11,9 +11,10 @@ The direct PI05 RMSNorm interface is `ops::rms_norm(ctx, RmsNormArgs)`.
 The BF16 MLP helper remains available as
 `ops::mlp::rms_norm(ctx, input, weight, output, epsilon)`; it has a distinct
 signature and is used by the Qwen integration tests.
-Attention Spec version 5 adds additive bias bindings and explicit intermediate
+Attention Spec version 6 declares additive bias bindings and explicit intermediate
 precision. Dense attention also accepts F32 inputs and output; KV-cache and
-segmented contracts retain F16/BF16. Prior attention specs are rejected.
+segmented contracts retain F16/BF16. Prior attention specs are rejected. Norm Spec version 2 adds explicit RMS
+intermediate dtype, defaulting to the unchanged F32 fused arithmetic.
 Dense F32 MHA with at most 1024 keys has a pedantic cuBLAS candidate using
 interleaved head strides and fused mask/softmax. It preserves F32 products
 without TF32 conversion, prepares all scratch before capture, and participates
@@ -186,8 +187,10 @@ benchmark default to cache-only/fallback, not tuning. Tuning occurs at first eag
 execution or prepare, never inside graph capture or steady-state replay. A warm
 cache does not retune just because `--autotune` is present.
 
-Additive attention uses F32 score/probability arithmetic through custom
-candidates. Dense F32 attention has a pedantic cuBLAS implementation with
+Additive attention defaults to F32 score/probability arithmetic through custom
+candidates. Its L3 `intermediate_dtype=BF16` request selects a separate cuBLAS
+MHA implementation with BF16 materialization boundaries and F32 accumulators;
+default calls never select it. Dense F32 attention has a pedantic cuBLAS implementation with
 execution-local score/probability storage and a shared 4 MiB stream workspace. Existing
 F16/BF16 dense candidates keep their original selection domain. Attention
 recipes include the runtime cuBLAS version and source fingerprint.

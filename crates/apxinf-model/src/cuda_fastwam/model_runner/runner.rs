@@ -351,7 +351,7 @@ mod tests {
         eprintln!("loading native Fast-WAM");
         let load_start = Instant::now();
         let weights =
-            crate::cuda_fastwam::weights::bf16::Bf16Weights::load(&ctx, &checkpoint, &text, &vae)
+            crate::cuda_fastwam::weights::Bf16Weights::load(&ctx, &checkpoint, &text, &vae)
                 .unwrap();
         let model =
             crate::cuda_fastwam::model::build_model(&ctx, weights, gemm, attention).unwrap();

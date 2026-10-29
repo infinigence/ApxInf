@@ -199,7 +199,7 @@ mod dit {
     use super::ops::cast;
     use super::ops::{bias_add, binary};
     use crate::cuda_fastwam::backend::{ops, Context};
-    use crate::cuda_fastwam::weights::bf16::dit::{ExpertWeights, ProjectionWeights};
+    use crate::cuda_fastwam::weights::{ExpertWeights, ProjectionWeights};
     pub(in crate::cuda_fastwam::model::blocks::bf16) struct Expert {
         pub weights: ExpertWeights,
         /// [step][block][shift/scale/gate], computed once during construction.
@@ -440,12 +440,14 @@ mod text {
     //! gated GELU. Zero padding is applied after encoding, as in Fast-WAM.
     use super::ops as compute;
     use crate::cuda_fastwam::backend::{ops, Context};
-    use crate::cuda_fastwam::weights::bf16::text::TextEncoderWeights as TextWeights;
+    use crate::cuda_fastwam::weights::TextEncoderWeights as TextWeights;
     use apxinf_core::{DType, Result, Shape, Tensor};
 
     fn rms(ctx: &Context, x: &Tensor, w: &Tensor) -> Result<Tensor> {
         let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
-        ops::rms_norm(ctx, ops::RmsNormArgs::new(x, w, &mut out, 1e-6))?;
+        let mut args = ops::RmsNormArgs::new(x, w, &mut out, 1e-6);
+        args.intermediate_dtype = DType::BF16;
+        ops::rms_norm(ctx, args)?;
         Ok(out)
     }
     pub(in crate::cuda_fastwam::model::blocks::bf16) struct TextEncoder {
@@ -525,6 +527,7 @@ mod text {
                 ops::additive_attention(
                     ctx,
                     ops::AttentionBiasArgs {
+                        intermediate_dtype: DType::BF16,
                         attention: args,
                         bias: &bias,
                     },
@@ -660,6 +663,7 @@ mod text {
                 ops::additive_attention(
                     ctx,
                     ops::AttentionBiasArgs {
+                        intermediate_dtype: DType::BF16,
                         attention: args,
                         bias: &bias,
                     },
@@ -781,7 +785,7 @@ mod vae {
     use super::ops as compute;
     use super::ops::cast;
     use crate::cuda_fastwam::backend::{ops, Context};
-    use crate::cuda_fastwam::weights::bf16::vae::{
+    use crate::cuda_fastwam::weights::{
         AttentionWeights, ConvWeights, DownBlockWeights, NormWeights, ResidualWeights, VaeWeights,
     };
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
@@ -1240,10 +1244,7 @@ mod prepare {
     };
     use crate::cuda_fastwam::{
         backend::{self, ops, Context},
-        weights::{
-            bf16::dit::{ExpertWeights, TimeWeights},
-            host_tensor,
-        },
+        weights::{host_tensor, ExpertWeights, TimeWeights},
     };
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
     impl Expert {
@@ -1340,7 +1341,7 @@ use self::ops::cast;
 use super::super::Inputs;
 use crate::cuda_fastwam::{
     backend::{ops as cuda_ops, Context},
-    weights::{bf16::Bf16Weights, LinearWeights},
+    weights::{Bf16Weights, LinearWeights},
 };
 use apxinf_core::{DType, Result, Shape, Tensor};
 use dit::{ContextCache, Expert, Kv};

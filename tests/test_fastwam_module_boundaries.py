@@ -22,15 +22,15 @@ def test_current_fastwam_ownership():
     [
         ("backend.rs", "fn projection() { ops::gemm(); }", "operator composition"),
         ("weights/host.rs", "use crate::cuda_fastwam::backend::Context;", "host checkpoint storage"),
-        ("weights/bf16/dit.rs", "fn prepare() { time.forward(); }", "weights invoke"),
+        ("weights/bf16.rs", "fn prepare() { time.forward(); }", "weights invoke"),
         ("text.rs", "fn forward() {}", "belongs under model/blocks/bf16"),
         ("model/blocks/bf16.rs", "use crate::vla::VlaRequest;", "execution ownership"),
         ("model/mod.rs", "fn leak() { ops::pointwise(); }", "precision and subnetwork"),
         ("model/blocks/bf16.rs", "impl LinearWeights {}", "inherent methods"),
         ("model/blocks/bf16.rs", "fn load() { Store::load(); }", "checkpoint loading"),
         ("model/blocks/bf16.rs", "use crate::cuda_fastwam::weights::cast_weight;", "activation conversion"),
-        ("weights/bf16/mod.rs", "impl Store {}", "consume the host store"),
-        ("weights/bf16/mod.rs", "fn cast() {}", "activation computation"),
+        ("weights/bf16.rs", "impl Store {}", "consume the host store"),
+        ("weights/bf16.rs", "fn cast() {}", "activation computation"),
         ("load.rs", "use super::model::blocks::bf16;", "concrete block construction"),
     ],
 )
@@ -40,3 +40,10 @@ def test_guard_rejects_ownership_regressions(tmp_path, path, code, expected):
     with (root / path).open("a") as output:
         output.write("\n" + code + "\n")
     assert any(expected in error for error in guard.check(root))
+
+
+def test_bf16_directory_split_is_rejected(tmp_path):
+    root = tmp_path / "fastwam"
+    shutil.copytree(guard.ROOT, root)
+    (root / "weights/bf16").mkdir()
+    assert any("BF16 implementation stays in one file" in error for error in guard.check(root))

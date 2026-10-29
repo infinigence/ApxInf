@@ -57,7 +57,7 @@ typedef enum {
   APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL = 8,
 } apxinf_norm_semantic_t;
 
-#define APXINF_NORM_SPEC_VERSION 1u
+#define APXINF_NORM_SPEC_VERSION 2u
 
 typedef struct {
   uint32_t version;
@@ -82,6 +82,8 @@ typedef struct {
      bindings is what lets one tuned Recipe serve every layer that differs only
      by its calibration scale. */
   uint32_t output_scale_is_unit;
+  /* RMS only: F32 fused baseline or input dtype before affine multiplication. */
+  uint32_t intermediate_dtype;
 } apxinf_norm_spec_t;
 
 typedef struct {

@@ -191,7 +191,7 @@ fn public_l3_capture_rejects_a_different_operator_order() {
 #[test]
 fn additive_attention_graph_retains_bias_and_tensor_storage() {
     use apxinf_cuda_new::{additive_attention, AttentionArgs, AttentionBiasArgs};
-    {
+    for intermediate_dtype in [DType::F32, DType::BF16] {
         let ctx = CudaContext::new(0).unwrap();
         let query = bf16_tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
         let key = bf16_tensor(0, vec![1, 2, 1, 2], &[0.0; 4]);
@@ -211,6 +211,7 @@ fn additive_attention_graph_retains_bias_and_tensor_storage() {
         prepare_with_session(&session, || {
             let mut args =
                 AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
+            args.intermediate_dtype = intermediate_dtype;
             args.attention.policy.online_tune = false;
             additive_attention(&ctx, args)
         })
@@ -221,6 +222,7 @@ fn additive_attention_graph_retains_bias_and_tensor_storage() {
                     AttentionArgs::new(&query, &key, &value, &mut out),
                     &bias,
                 );
+                args.intermediate_dtype = intermediate_dtype;
                 args.attention.policy.online_tune = false;
                 additive_attention(&ctx, args)
             })

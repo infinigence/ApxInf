@@ -1,7 +1,7 @@
 //! Model topology and fixed flow schedule. Precision details live in blocks.
 mod blocks;
 use super::backend::{ops, Context, DeviceBuffer};
-use super::weights::bf16::Bf16Weights;
+use super::weights::Bf16Weights;
 use apxinf_core::{Result, Tensor};
 use blocks::Bf16Blocks;
 

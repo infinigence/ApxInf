@@ -1047,63 +1047,75 @@ fn rounded_primitives_and_pairwise_rope_capture_contract() {
 
 #[test]
 fn additive_attention_validates_bias_and_replays_changed_bias() {
+    use apxinf_core::DType;
     use super::framework::f32_tensor;
-    let ctx = CudaContext::new(0).unwrap();
-    let query = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
-    let key = tensor(0, vec![1, 2, 1, 2], &[0.0; 4]);
-    let value = tensor(0, vec![1, 2, 1, 2], &[1.0, 2.0, 3.0, 4.0]);
-    let bias = f32_tensor(0, vec![1, 1, 1, 2], &[0.0, f32::NEG_INFINITY]);
-    let bad_bias = f32_tensor(0, vec![1, 1, 2, 1], &[0.0; 2]);
-    let mut out = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
-    let args = AttentionBiasArgs::new(
-        AttentionArgs::new(&query, &key, &value, &mut out),
-        &bad_bias,
-    );
-    assert!(additive_attention(&ctx, args)
-        .unwrap_err()
-        .to_string()
-        .contains("bias must be"));
-    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
-    prepare_with_session(&session, || {
-        let mut args =
-            AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
-        args.attention.policy.online_tune = false;
-        additive_attention(&ctx, args)
-    })
-    .unwrap();
-    assert_eq!(values(&out), [1.0, 2.0]);
-    let graph = crate::capture(&ctx, || {
-        with_session(&session, || {
+    for intermediate_dtype in [DType::F32, DType::BF16] {
+        let ctx = CudaContext::new(0).unwrap();
+        let query = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+        let key = tensor(0, vec![1, 2, 1, 2], &[0.0; 4]);
+        let value = tensor(0, vec![1, 2, 1, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let bias = f32_tensor(0, vec![1, 1, 1, 2], &[0.0, f32::NEG_INFINITY]);
+        let bad_bias = f32_tensor(0, vec![1, 1, 2, 1], &[0.0; 2]);
+        let mut out = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+        let args = AttentionBiasArgs::new(
+            AttentionArgs::new(&query, &key, &value, &mut out),
+            &bad_bias,
+        );
+        assert!(additive_attention(&ctx, args)
+            .unwrap_err()
+            .to_string()
+            .contains("bias must be"));
+        let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+        prepare_with_session(&session, || {
             let mut args =
                 AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
+            args.intermediate_dtype = intermediate_dtype;
             args.attention.policy.online_tune = false;
             additive_attention(&ctx, args)
         })
-    })
-    .unwrap();
-    let changed: Vec<_> = [f32::NEG_INFINITY, 0.0]
-        .iter()
-        .flat_map(|x| x.to_ne_bytes())
-        .collect();
-    crate::CudaBuffer::from_tensor(&bias)
-        .unwrap()
-        .copy_from_host(&changed)
         .unwrap();
-    graph.replay().unwrap();
-    ctx.synchronize().unwrap();
-    assert_eq!(values(&out), [3.0, 4.0]);
-    // Addresses must be retained by the prepared session, and replacing a bias
-    // allocation must miss even when the structural recipe is equivalent.
-    let replacement = f32_tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
-    let err = with_session(&session, || {
-        additive_attention(
-            &ctx,
-            AttentionBiasArgs::new(
-                AttentionArgs::new(&query, &key, &value, &mut out),
-                &replacement,
-            ),
-        )
-    })
-    .unwrap_err();
-    assert!(err.to_string().contains("cache miss"), "{err}");
+        assert_eq!(values(&out), [1.0, 2.0]);
+        let graph = crate::capture(&ctx, || {
+            with_session(&session, || {
+                let mut args = AttentionBiasArgs::new(
+                    AttentionArgs::new(&query, &key, &value, &mut out),
+                    &bias,
+                );
+                args.intermediate_dtype = intermediate_dtype;
+                args.attention.policy.online_tune = false;
+                additive_attention(&ctx, args)
+            })
+        })
+        .unwrap();
+        let changed: Vec<_> = [f32::NEG_INFINITY, 0.0]
+            .iter()
+            .flat_map(|x| x.to_ne_bytes())
+            .collect();
+        crate::CudaBuffer::from_tensor(&bias)
+            .unwrap()
+            .copy_from_host(&changed)
+            .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&out), [3.0, 4.0]);
+        // Addresses must be retained by the prepared session, and replacing a bias
+        // allocation must miss even when the structural recipe is equivalent.
+        let replacement = f32_tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+        let err = with_session(&session, || {
+            additive_attention(&ctx, {
+                let mut args = AttentionBiasArgs::new(
+                    AttentionArgs::new(&query, &key, &value, &mut out),
+                    &replacement,
+                );
+                args.intermediate_dtype = intermediate_dtype;
+                args
+            })
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cache miss"), "{err}");
+        let mut invalid =
+            AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
+        invalid.intermediate_dtype = DType::F16;
+        assert!(additive_attention(&ctx, invalid).is_err());
+    }
 }

@@ -3,7 +3,7 @@ use super::{
     config::Config,
     model::build_model,
     model_runner::FastWamModelRunner,
-    weights::bf16::Bf16Weights,
+    weights::Bf16Weights,
 };
 use crate::auto::{cuda_recipe_options, LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Device, Error, Result};

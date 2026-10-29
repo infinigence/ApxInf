@@ -32,7 +32,7 @@ void validate_spec(const Spec& spec) {
       spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
-  if (spec.version != 5 ||
+  if (spec.version != 6 ||
       spec.semantic > APXINF_ATTENTION_SEMANTIC_ADDITIVE ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16 &&
        !(spec.dtype == APXINF_DTYPE_F32 &&
@@ -65,7 +65,8 @@ void validate_spec(const Spec& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid dense Attention semantic fields");
   }
-  if (spec.reserved != 0 || spec.input_precision != 0 ||
+  if (spec.reserved != 0 || spec.input_precision > 1 ||
+      (spec.input_precision == 1 && spec.dtype != APXINF_DTYPE_BF16) ||
       spec.bias_broadcast_batch > 1 ||
       (spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE
            ? (!valid_alignment(spec.bias_alignment) || spec.bias_alignment < 4 ||

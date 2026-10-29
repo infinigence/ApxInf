@@ -43,6 +43,7 @@ typedef struct {
   uint32_t dynamic_decode;
   uint32_t bias_alignment;
   uint32_t bias_broadcast_batch;
+  /* 0: F32 intermediates; 1: BF16 QK/bias/probability boundaries (BF16 additive MHA). */
   uint32_t input_precision;
   uint32_t reserved;
 } apxinf_attention_spec_t;

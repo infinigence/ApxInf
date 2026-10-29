@@ -27,6 +27,7 @@ fn reference(
     broadcast: bool,
     dtype: DType,
     causal: bool,
+    round_intermediates: bool,
 ) -> Vec<f32> {
     let mut out = vec![0.; b * tq * hq * d];
     for batch in 0..b {
@@ -44,12 +45,18 @@ fn reference(
                         .map(|i| q[qoffset + i] as f64 * k[koff + i] as f64)
                         .sum();
                     let mut score = (dot * scale as f64) as f32;
+                    if round_intermediates {
+                        score = rounded(score, dtype);
+                    }
 
                     if let Some(bias) = bias {
                         score += bias[(((if broadcast { 0 } else { batch }) * hq + head) * tq
                             + row)
                             * tk
                             + col];
+                    }
+                    if round_intermediates {
+                        score = rounded(score, dtype);
                     }
                     scores[col] = score as f64;
                 }
@@ -63,7 +70,11 @@ fn reference(
                     .iter()
                     .map(|p| {
                         let p = (p / sum) as f32;
-                        p
+                        if round_intermediates {
+                            rounded(p, dtype)
+                        } else {
+                            p
+                        }
                     })
                     .collect();
                 for dim in 0..d {
@@ -157,6 +168,7 @@ fn attention_f32_reduction_all_candidates_match_reference() {
             false,
             DType::F32,
             false,
+            false,
         );
         let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
         super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
@@ -216,6 +228,7 @@ fn attention_f32_real_shapes_all_candidates_match_reference() {
             false,
             DType::F32,
             causal,
+            false,
         );
         let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
         super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
@@ -292,6 +305,7 @@ fn attention_short_f32_needs_no_global_workspace() {
         args.scale,
         false,
         DType::F32,
+        false,
         false,
     );
     args.policy.workspace_limit = 0;
@@ -377,6 +391,7 @@ fn attention_bf16_vae_all_candidates_match_reference() {
         false,
         DType::BF16,
         false,
+        false,
     );
     let norm = super::super::attention_contracts::normalize(&ctx, args).unwrap();
     super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
@@ -387,8 +402,11 @@ fn attention_bf16_vae_all_candidates_match_reference() {
 fn additive_attention_persisted_recipe_restores_in_new_process() {
     const CACHE_ENV: &str = "APXINF_ATTENTION_TEST_CACHE";
     const STAGE_ENV: &str = "APXINF_ATTENTION_TEST_STAGE";
+    const PRECISION_ENV: &str = "APXINF_ATTENTION_TEST_PRECISION";
     if let Ok(cache) = std::env::var(CACHE_ENV) {
         let stage = std::env::var(STAGE_ENV).unwrap();
+        let bf16 =
+            (std::env::var(PRECISION_ENV).unwrap() == "bf16") != (stage == "different_precision");
         let ctx = CudaContext::new(0).unwrap();
         let q = input(vec![1, 2, 2, 4], &data(16, 1, DType::BF16), DType::BF16);
         let k = input(vec![1, 3, 2, 4], &data(24, 7, DType::BF16), DType::BF16);
@@ -402,13 +420,14 @@ fn additive_attention_persisted_recipe_restores_in_new_process() {
         let norm = normalize_additive(
             &ctx,
             AttentionBiasArgs {
+                intermediate_dtype: if bf16 { DType::BF16 } else { DType::F32 },
                 attention,
                 bias: &bias,
             },
         )
         .unwrap();
         let prepared = super::super::attention_execution::prepare(&ctx, norm);
-        if stage == "invalid" {
+        if stage == "invalid" || stage == "different_precision" {
             assert!(prepared.is_err());
             return;
         }
@@ -421,47 +440,67 @@ fn additive_attention_persisted_recipe_restores_in_new_process() {
         ctx.synchronize().unwrap();
         return;
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let cache = root
-        .join("devlocal/wam-pr/results")
-        .join(format!("attention-recipe-{}", std::process::id()));
-    std::fs::create_dir_all(&cache).unwrap();
-    let invoke = |stage: &str| {
-        let result=std::process::Command::new(std::env::current_exe().unwrap())
+    for precision in ["f32", "bf16"] {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let cache = root.join("devlocal/wam-pr/results").join(format!(
+            "attention-recipe-{}-{precision}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&cache).unwrap();
+        let invoke = |stage: &str| {
+            let result=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","ops::tests::precision::attention_precision::additive_attention_persisted_recipe_restores_in_new_process","--nocapture"])
-            .env(CACHE_ENV,&cache).env(STAGE_ENV,stage).output().unwrap();
-        assert!(
-            result.status.success(),
-            "stage {stage}: {}\n{}",
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr)
-        );
-    };
-    invoke("cold");
-    invoke("warm");
-    let recipes: Vec<_> = std::fs::read_dir(&cache)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("recipe"))
-        .collect();
-    assert_eq!(recipes.len(), 1);
-    std::fs::write(&recipes[0], "invalid recipe data").unwrap();
-    invoke("invalid");
-    invoke("repair");
-    invoke("warm");
+            .env(CACHE_ENV,&cache).env(STAGE_ENV,stage).env(PRECISION_ENV,precision).output().unwrap();
+            assert!(
+                result.status.success(),
+                "stage {stage}: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        };
+        invoke("cold");
+        invoke("warm");
+        invoke("different_precision");
+        let recipes: Vec<_> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("recipe"))
+            .collect();
+        assert_eq!(recipes.len(), 1);
+        std::fs::write(&recipes[0], "invalid recipe data").unwrap();
+        invoke("invalid");
+        invoke("repair");
+        invoke("warm");
+        invoke("different_precision");
+    }
 }
 
 #[test]
 fn additive_attention_all_candidates_match_reference() {
     let ctx = CudaContext::new(0).unwrap();
     for dtype in [DType::F32, DType::F16, DType::BF16] {
-        {
+        for intermediate_dtype in if dtype == DType::BF16 {
+            vec![DType::F32, DType::BF16]
+        } else {
+            vec![DType::F32]
+        } {
             for broadcast in [true, false] {
-                let (b, tq, tk, hq, hk, d) = (2, 3, 7, 4, 2, 9);
+                let (b, tq, tk, hq, hk, d) = (
+                    2,
+                    3,
+                    7,
+                    4,
+                    if intermediate_dtype == DType::BF16 {
+                        4
+                    } else {
+                        2
+                    },
+                    9,
+                );
                 let qv = data(b * tq * hq * d, 1, dtype);
                 let kv = data(b * tk * hk * d, 7, dtype);
                 let vv = data(b * tk * hk * d, 19, dtype);
@@ -497,10 +536,12 @@ fn additive_attention_all_candidates_match_reference() {
                     broadcast,
                     dtype,
                     true,
+                    intermediate_dtype == DType::BF16,
                 );
                 let norm = normalize_additive(
                     &ctx,
                     AttentionBiasArgs {
+                        intermediate_dtype,
                         attention,
                         bias: &bias,
                     },
@@ -512,42 +553,46 @@ fn additive_attention_all_candidates_match_reference() {
         }
     }
     // Real UMT5-XXL encoder shape, F32 score/probability arithmetic.
-    let (t, h, d) = (128, 64, 64);
-    let qv = data(t * h * d, 1, DType::BF16);
-    let kv = data(t * h * d, 7, DType::BF16);
-    let vv = data(t * h * d, 19, DType::BF16);
-    let bv = data(h * t * t, 3, DType::F32);
-    let q = input(vec![1, t, h, d], &qv, DType::BF16);
-    let k = input(vec![1, t, h, d], &kv, DType::BF16);
-    let v = input(vec![1, t, h, d], &vv, DType::BF16);
-    let bias = f32_tensor(0, vec![1, h, t, t], &bv);
-    let mut out = zeros_tensor(0, vec![1, t, h, d], DType::BF16);
-    let mut attention = AttentionArgs::new(&q, &k, &v, &mut out);
-    attention.scale = 1.0;
-    let expected = reference(
-        &qv,
-        &kv,
-        &vv,
-        Some(&bv),
-        1,
-        t,
-        t,
-        h,
-        h,
-        d,
-        1.0,
-        true,
-        DType::BF16,
-        false,
-    );
-    let norm = normalize_additive(
-        &ctx,
-        AttentionBiasArgs {
-            attention,
-            bias: &bias,
-        },
-    )
-    .unwrap();
-    super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
-    report_real_shape_timing(&ctx, norm);
+    for intermediate_dtype in [DType::F32, DType::BF16] {
+        let (t, h, d) = (128, 64, 64);
+        let qv = data(t * h * d, 1, DType::BF16);
+        let kv = data(t * h * d, 7, DType::BF16);
+        let vv = data(t * h * d, 19, DType::BF16);
+        let bv = data(h * t * t, 3, DType::F32);
+        let q = input(vec![1, t, h, d], &qv, DType::BF16);
+        let k = input(vec![1, t, h, d], &kv, DType::BF16);
+        let v = input(vec![1, t, h, d], &vv, DType::BF16);
+        let bias = f32_tensor(0, vec![1, h, t, t], &bv);
+        let mut out = zeros_tensor(0, vec![1, t, h, d], DType::BF16);
+        let mut attention = AttentionArgs::new(&q, &k, &v, &mut out);
+        attention.scale = 1.0;
+        let expected = reference(
+            &qv,
+            &kv,
+            &vv,
+            Some(&bv),
+            1,
+            t,
+            t,
+            h,
+            h,
+            d,
+            1.0,
+            true,
+            DType::BF16,
+            false,
+            intermediate_dtype == DType::BF16,
+        );
+        let norm = normalize_additive(
+            &ctx,
+            AttentionBiasArgs {
+                intermediate_dtype,
+                attention,
+                bias: &bias,
+            },
+        )
+        .unwrap();
+        super::super::attention_execution::validate_candidates(&ctx, &norm, &expected).unwrap();
+        report_real_shape_timing(&ctx, norm);
+    }
 }

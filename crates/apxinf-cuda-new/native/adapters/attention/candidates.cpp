@@ -26,7 +26,7 @@ bool supports_dense_custom(const Spec& spec) {
 }
 
 bool supports_additive_custom(const Spec& spec) {
-  return spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE &&
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE && spec.input_precision == 0 &&
          (supports_custom(spec) || (spec.dtype == APXINF_DTYPE_F32 &&
                                    spec.output_dtype == spec.dtype));
 }
@@ -43,6 +43,14 @@ bool supports_parallel_custom(const Spec& spec) {
 
 // Strided batched GEMMs operate directly on interleaved B,T,H,D MHA.
 // GQA remains with the custom provider; each GEMM batch has one head.
+bool supports_bf16_intermediate(const Spec& spec) {
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE && spec.input_precision == 1 &&
+         spec.dtype == APXINF_DTYPE_BF16 && spec.output_dtype == spec.dtype &&
+         spec.query_heads == spec.kv_heads && spec.key_tokens <= 1024 &&
+         static_cast<uint64_t>(spec.query_heads) * spec.head_dim <= INT32_MAX &&
+         static_cast<uint64_t>(spec.batch) * spec.query_heads <= INT32_MAX / spec.query_tokens;
+}
+
 bool supports_f32_cublas(const Spec& spec) {
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
          spec.dtype == APXINF_DTYPE_F32 && spec.output_dtype == spec.dtype &&
@@ -227,6 +235,10 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        launch_custom, destroy_custom},
   };
   static const ImplementationRegistry additive_entries = {
+      {4, 1, 2, "cublas-bf16-intermediate-attention", 0, true, true,
+       true, supports_bf16_intermediate, natural_alignment,
+       cublas_resource_requirements, one_configuration, prepare_cublas,
+       launch_bf16_intermediate_cublas, destroy_cublas},
       {kProviderCustom, 6, 1, "custom-warp-attention", 0, true, true,
        true, supports_parallel_custom, natural_alignment,
        custom_resource_requirements, one_configuration, prepare_custom,

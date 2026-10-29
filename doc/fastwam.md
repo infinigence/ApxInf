@@ -1,13 +1,11 @@
 # Fast-WAM action inference
 
-> Current baseline-first revision: historical precision/performance results below
-> describe earlier snapshots. Public GEMM bias arithmetic, RMS/GELU/Euler,
-> quantization and H2D upload behavior have been restored to the PR base.
-> cuBLAS handle/workspace storage is shared per concrete stream to bound prepared
-> execution memory. Redundant Add/BroadcastAdd, rounding-only RMS/GELU/Euler and Input-attention
-> variants were removed. Intermediate reference equality is diagnostic, not
-> proof of downstream task quality. The 2026-10-29 numerical qualification is
-> recorded below; task-level results from earlier snapshots are not inherited.
+> Historical precision/performance results below describe their original snapshots.
+> Default shared-operator arithmetic is unchanged. Fast-WAM text encoding explicitly
+> requests BF16 intermediate materialization through the existing RMSNorm and
+> additive-attention L3 arguments; their reductions and GEMMs still accumulate in F32.
+> GELU, Euler, quantization and H2D retain baseline behavior. Intermediate reference
+> equality is diagnostic, not proof of downstream task quality.
 
 
 The `fastwam` family implements the action-only profile of
@@ -30,8 +28,9 @@ extend the shared observation, action or prepared-inference contracts.
 
 The frozen Wan VAE, UMT5 encoder, video conditioning and all action steps execute
 natively on the GPU. Wan attention uses F32 arithmetic; UMT5 uses BF16 tensors
-with the baseline RMSNorm, GELU and additive-attention arithmetic. Its standalone
-frozen BF16 output regression currently fails; see the qualification note below.
+with explicit BF16 intermediate boundaries in RMSNorm and additive attention,
+and baseline GELU arithmetic. See the qualification notes below for the independent
+text-output and downstream acceptance results.
 DiT residual state and LayerNorm use F32 to
 avoid repeated BF16 rounding across blocks. The small action input and output
 projections preserve F32 state through Euler integration and the next step. Branch
@@ -321,8 +320,9 @@ The native implementation is `crates/apxinf-model/src/cuda_fastwam/`.
 `model/blocks/bf16.rs` composes DiT, UMT5 and VAE operators. Private inline modules hold the subnetwork implementations; only `Bf16Blocks`
 is exposed to the model. It owns physical conditioning caches, dtype boundaries
 and workspace requirements. `weights/host.rs` owns
-checkpoint storage and source validation; `weights/bf16/` owns device weight
-representations and upload/packing, including explicitly F32 tensors used by
+checkpoint storage and source validation; `weights/bf16.rs` owns device weight
+representations and upload/packing in one file, with private inline modules and
+family-level type exports through `weights`, matching PI0.5. This includes explicitly F32 tensors used by
 this implementation. The loader materializes `Bf16Weights` before constructing
 the model. Weight data types use the `*Weights` suffix; Blocks functions consume
 them explicitly rather than adding computation methods to those types. Loading
@@ -374,7 +374,7 @@ an optional arithmetic variant is justified; reference-stage equality alone is
 not a reason to change an existing operator.
 
 
-### Baseline-arithmetic qualification (2026-10-29)
+### Baseline-arithmetic qualification (2026-10-29, commit `19a40227`)
 
 On Thor SM110 / CUDA 13.2, cuda-new passes 102 library tests (two unrelated
 opt-in tests ignored) and seven public integration tests. The VAE F32/BF16
@@ -397,3 +397,31 @@ The standalone UMT5 frozen-output test remains failing: relative-L2 is
 limit. End-to-end action acceptance does not make that independent test pass or
 establish intermediate equality. This revision has no new LIBERO rollout result;
 the historical rollout and latency tables above describe their original snapshots.
+
+### Explicit text intermediate precision (2026-10-29)
+
+The model and weight precision implementations each occupy one `bf16.rs`, matching
+PI05's directory and family-export structure. RMSNorm and additive attention stay
+in their existing operator families. Their L3 `intermediate_dtype` arguments default
+to F32; Fast-WAM text explicitly selects BF16 materialization. RMS reductions and
+attention GEMMs still accumulate in F32. GELU and all default operator paths remain
+unchanged; this is not a global replacement of baseline arithmetic.
+
+Same-input replay of the previously failing LIBERO-Spatial task found no local
+wiring/semantic mismatch: 168 linear, 24 GELU and 74 arithmetic/embedding/mask checks
+were exact; RMS relative-L2 was at most 3.04e-5 and attention versus FP64 at most
+4.91e-5. Chain drift grows substantially around zero-based layers 18–19 FFN/residual
+and layer 22 attention. Independently restoring only RMS/attention intermediate
+boundaries in the reference recovered task 9 (122 steps versus baseline native
+text failure at 300). This intervention isolates a numerical cause in the tested
+path; it is not full-native task qualification.
+
+On Thor SM110 / CUDA 13.2, the changed implementation passes 103 cuda-new library
+tests (two unrelated opt-in tests ignored), seven public integration tests,
+convolution/VAE checks, and the twelve native frozen cases against FP32 with the
+unchanged non-inferiority gates. Whole-model eager/graph parity, input/RNG rebinding
+and output lifetime checks pass. Canonical text cosine improves from 0.997469 to
+0.999507, relative-L2 from 0.0711166 to 0.0314636, and maximum-absolute error from
+0.306641 to 0.0703125. The independent 0.01 text-output threshold still fails and
+has not been relaxed. Task 9 text cosine improves from 0.976986 to 0.999184, but
+improvement is not uniform across all prompts; task-level checks remain necessary.

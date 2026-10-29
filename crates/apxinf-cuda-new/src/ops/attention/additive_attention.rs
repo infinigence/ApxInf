@@ -12,13 +12,19 @@ use crate::CudaContext;
 /// infinity masks a key; an entirely masked row produces zero output.
 /// Q/K/V and output have the same F16, BF16, or F32 dtype.
 pub struct AttentionBiasArgs<'a> {
+    /// F32 baseline, or BF16 materialization of QK, biased scores and probabilities. Accumulation remains F32.
+    pub intermediate_dtype: DType,
     pub attention: AttentionArgs<'a>,
     pub bias: &'a Tensor,
 }
 
 impl<'a> AttentionBiasArgs<'a> {
     pub fn new(attention: AttentionArgs<'a>, bias: &'a Tensor) -> Self {
-        Self { attention, bias }
+        Self {
+            attention,
+            bias,
+            intermediate_dtype: DType::F32,
+        }
     }
 }
 
@@ -31,6 +37,14 @@ pub(crate) fn normalize_additive(
             "additive Attention requires input/output dtype equality",
         ));
     }
+    if args.intermediate_dtype != DType::F32
+        && (args.intermediate_dtype != DType::BF16 || args.attention.query.dtype() != DType::BF16)
+    {
+        return Err(invalid(
+            "additive Attention intermediate dtype must be F32 or BF16 with BF16 operands",
+        ));
+    }
+    let input_precision = u32::from(args.intermediate_dtype == DType::BF16);
     let out_bytes = required_bytes(
         args.attention.out.dtype(),
         args.attention.out.shape().dims(),
@@ -64,7 +78,7 @@ pub(crate) fn normalize_additive(
     spec.semantic = Semantic::Additive.abi_value();
     spec.bias_alignment = alignment(bias.ptr());
     spec.bias_broadcast_batch = u32::from(shape[0] == 1);
-    spec.input_precision = 0; // Reserved ABI slot; no alternate rounding mode.
+    spec.input_precision = input_precision;
     normalized.bindings.bias = bias.ptr();
     normalized.storage.push(bias);
     Ok(normalized)

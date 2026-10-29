@@ -1,4 +1,4 @@
-use apxinf_core::{Result, Tensor};
+use apxinf_core::{DType, Result, Tensor};
 
 use super::contracts::{normalize, RawArgs, Semantic};
 use super::launch;
@@ -6,6 +6,8 @@ use crate::CudaContext;
 
 /// Inputs for ordinary RMS normalization.
 pub struct RmsNormArgs<'a> {
+    /// F32 keeps the fused baseline; input dtype rounds normalized values before weight multiplication.
+    pub intermediate_dtype: DType,
     pub input: &'a Tensor,
     pub weight: &'a Tensor,
     pub normalized: &'a mut Tensor,
@@ -16,7 +18,7 @@ pub struct RmsNormArgs<'a> {
 
 impl<'a> RmsNormArgs<'a> {
     pub fn new(input: &'a Tensor, weight: &'a Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, weight, normalized, eps, output_scale: 1.0 }
+        Self { input, weight, normalized, eps, output_scale: 1.0, intermediate_dtype: DType::F32 }
     }
 }
 
@@ -158,37 +160,37 @@ fn execute(ctx: &CudaContext, args: RawArgs<'_>) -> Result<()> {
 }
 
 pub fn rms_norm(ctx: &CudaContext, args: RmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::Rms, input: args.input, bias: None, residual: None, weight: Some(args.weight), norm_bias: None, norm_style: None, gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+    execute(ctx, RawArgs { intermediate_dtype: args.intermediate_dtype, semantic: Semantic::Rms, input: args.input, bias: None, residual: None, weight: Some(args.weight), norm_bias: None, norm_style: None, gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
 }
 
 pub fn layer_norm(ctx: &CudaContext, args: LayerNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::Layer, input: args.input, bias: None, residual: None, weight: Some(args.weight), norm_bias: Some(args.bias), norm_style: None, gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::Layer, input: args.input, bias: None, residual: None, weight: Some(args.weight), norm_bias: Some(args.bias), norm_style: None, gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
 }
 
 pub fn adaptive_rms_norm(ctx: &CudaContext, args: AdaptiveRmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::AdaptiveRms, input: args.input, bias: None, residual: None, weight: None, norm_bias: None, norm_style: Some(args.norm_style), gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::AdaptiveRms, input: args.input, bias: None, residual: None, weight: None, norm_bias: None, norm_style: Some(args.norm_style), gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
 }
 
 pub fn bias_residual(ctx: &CudaContext, args: BiasResidualArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::BiasResidual, input: args.input, bias: args.bias, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
+    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::BiasResidual, input: args.input, bias: args.bias, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
 }
 
 pub fn bias_residual_rms_norm(ctx: &CudaContext, args: BiasResidualRmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::BiasResidualRms, input: args.input, bias: args.bias, residual: Some(args.residual), weight: Some(args.weight), norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::BiasResidualRms, input: args.input, bias: args.bias, residual: Some(args.residual), weight: Some(args.weight), norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
 }
 
 pub fn bias_residual_layer_norm(ctx: &CudaContext, args: BiasResidualLayerNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::BiasResidualLayer, input: args.input, bias: args.bias, residual: Some(args.residual), weight: Some(args.weight), norm_bias: Some(args.norm_bias), norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::BiasResidualLayer, input: args.input, bias: args.bias, residual: Some(args.residual), weight: Some(args.weight), norm_bias: Some(args.norm_bias), norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
 }
 
 pub fn ada_gate_residual(ctx: &CudaContext, args: AdaGateResidualArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::AdaGateResidual, input: args.input, bias: None, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: Some(args.gate_style), hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
+    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::AdaGateResidual, input: args.input, bias: None, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: Some(args.gate_style), hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
 }
 
 pub fn ada_gate_residual_rms_norm(ctx: &CudaContext, args: AdaGateResidualRmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::AdaGateResidualRms, input: args.input, bias: None, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: Some(args.norm_style), gate_style: Some(args.gate_style), hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::AdaGateResidualRms, input: args.input, bias: None, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: Some(args.norm_style), gate_style: Some(args.gate_style), hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
 }
 
 pub fn bias_then_residual(ctx: &CudaContext, args: BiasThenResidualArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { semantic: Semantic::BiasThenResidual, input: args.input, bias: args.bias, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
+    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::BiasThenResidual, input: args.input, bias: args.bias, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
 }

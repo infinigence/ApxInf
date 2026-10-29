@@ -174,3 +174,74 @@ fn rounded_pairwise_rope_real_shapes_and_changed_input_replay() {
         }
     }
 }
+
+#[test]
+fn rms_intermediate_dtype_preserves_default_and_explicit_boundary() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (rows, cols) = (128, 4096);
+    let host: Vec<f32> = (0..rows * cols)
+        .map(|i| half::bf16::from_f32(((i * 17 % 251) as f32 - 125.0) / 37.0).to_f32())
+        .collect();
+    let weights: Vec<f32> = (0..cols)
+        .map(|i| half::bf16::from_f32((i % 19) as f32 / 13.0 + 0.25).to_f32())
+        .collect();
+    let input = tensor(0, vec![rows, cols], &host);
+    let weight = tensor(0, vec![cols], &weights);
+    let mut out = zeros_tensor(0, vec![rows, cols], DType::BF16);
+    let mut baseline = Vec::new();
+    for intermediate_dtype in [DType::F32, DType::BF16] {
+        let run = |out: &mut Tensor| {
+            let mut args = RmsNormArgs::new(&input, &weight, out, 1e-6);
+            assert_eq!(args.intermediate_dtype, DType::F32);
+            args.intermediate_dtype = intermediate_dtype;
+            rms_norm(&ctx, args)
+        };
+        run(&mut out).unwrap();
+        ctx.synchronize().unwrap();
+        let actual = values(&out);
+        let mut error = 0f64;
+        let mut norm = 0f64;
+        for (row, a) in host.chunks_exact(cols).zip(actual.chunks_exact(cols)) {
+            let inv = (row.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / cols as f64 + 1e-6)
+                .sqrt()
+                .recip();
+            for ((&x, &w), &a) in row.iter().zip(&weights).zip(a) {
+                let mut y = (x as f64 * inv) as f32;
+                if intermediate_dtype == DType::BF16 {
+                    y = half::bf16::from_f32(y).to_f32();
+                }
+                let y = half::bf16::from_f32(y * w).to_f32();
+                error += (a as f64 - y as f64).powi(2);
+                norm += (y as f64).powi(2);
+            }
+        }
+        assert!(
+            (error / norm).sqrt() < 1e-4,
+            "RMS {:?} relative_l2={}",
+            intermediate_dtype,
+            (error / norm).sqrt()
+        );
+        if intermediate_dtype == DType::F32 {
+            baseline = actual.clone();
+        } else {
+            assert_ne!(baseline, actual);
+        }
+        let graph = crate::capture(&ctx, || run(&mut out)).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&out), actual);
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            graph.replay().unwrap();
+        }
+        ctx.synchronize().unwrap();
+        eprintln!(
+            "RMS {:?} graph_replay_mean_us={}",
+            intermediate_dtype,
+            started.elapsed().as_secs_f64() * 1e4
+        );
+    }
+    let mut invalid = RmsNormArgs::new(&input, &weight, &mut out, 1e-6);
+    invalid.intermediate_dtype = DType::F16;
+    assert!(rms_norm(&ctx, invalid).is_err());
+}

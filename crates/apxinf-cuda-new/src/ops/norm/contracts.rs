@@ -86,6 +86,7 @@ impl Semantic {
 /// `norm_style` is `[2 * cols]` (scale then shift) and `gate_style` is
 /// `[3 * cols]` whose third segment is the gate; they are not interchangeable.
 pub(crate) struct RawArgs<'a> {
+    pub(crate) intermediate_dtype: DType,
     pub(crate) semantic: Semantic,
     pub(crate) input: &'a Tensor,
     pub(crate) bias: Option<&'a Tensor>,
@@ -166,6 +167,16 @@ fn tensor_storage(
 }
 
 pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normalized> {
+    if args.intermediate_dtype != DType::F32
+        && (args.semantic != Semantic::Rms
+            || args.intermediate_dtype != args.input.dtype()
+            || args.output_scale != 1.0
+            || args.normalized.as_ref().map(|x| x.dtype()) != Some(args.input.dtype()))
+    {
+        return Err(invalid(
+            "RMS intermediate dtype must be F32 or the unquantized input dtype",
+        ));
+    }
     let semantic = args.semantic;
     let dims = args.input.shape().dims();
     if dims.len() != 2 {
@@ -380,6 +391,12 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         rows: i64::from(rows_abi),
         cols: i64::from(cols_abi),
         output_scale_is_unit: u32::from(args.output_scale == 1.0),
+        intermediate_dtype: match args.intermediate_dtype {
+            DType::F32 => 0,
+            DType::F16 => 1,
+            DType::BF16 => 2,
+            _ => return Err(invalid("unsupported RMS intermediate dtype")),
+        },
     };
 
     let bindings = abi::Bindings {

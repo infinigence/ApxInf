@@ -97,6 +97,27 @@ __global__ void rms_norm(const T* input, const T* weight, T* output, int rows,
 }
 
 template <class T>
+__global__ void rms_norm_staged(const T* input, const T* weight, T* output, int rows,
+                         int cols, float eps) {
+  __shared__ float scratch[32];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  float square_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float value = to_float(input[static_cast<int64_t>(row) * cols + col]);
+    square_sum = __fadd_rn(square_sum, __fmul_rn(value, value));
+  }
+  const float inverse_rms =
+      rsqrtf(block_sum_parallel_unsafe(square_sum, scratch) / cols + eps);
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int64_t index = static_cast<int64_t>(row) * cols + col;
+    float normalized = __fmul_rn(to_float(input[index]), inverse_rms);
+    normalized = to_float(from_float<T>(normalized));
+    output[index] = from_float<T>(__fmul_rn(normalized, to_float(weight[col])));
+  }
+}
+
+template <class T>
 __global__ void layer_norm(const T* input, const T* weight, const T* bias,
                            T* output, int rows, int cols, float eps) {
   __shared__ float scratch[32];

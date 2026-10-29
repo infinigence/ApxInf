@@ -3,7 +3,7 @@ use std::ffi::{c_char, c_void};
 pub(crate) use super::types::Policy;
 use super::types::{CudaStream, Runtime};
 
-pub(crate) const SPEC_VERSION: u32 = 5;
+pub(crate) const SPEC_VERSION: u32 = 6;
 pub(crate) const SEMANTIC_DENSE: u32 = 0;
 pub(crate) const SEMANTIC_KV_CACHE: u32 = 1;
 pub(crate) const SEMANTIC_SEGMENTED: u32 = 2;

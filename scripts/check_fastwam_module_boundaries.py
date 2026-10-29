@@ -30,9 +30,12 @@ def production_source(path):
 def check(root):
     errors = []
     execution_types = r"\b(model_runner|FastWamModelRunner|ModelRunner|PreparedInference|ExecutionSession|PreparedPhase|ExecutionPolicy|VlaRequest|InferenceSpec)\b"
-    for name in ("model/mod.rs", "model/blocks/bf16.rs", "weights/host.rs", "weights/bf16/mod.rs", "model_runner/runner.rs", "model_runner/prepare.rs"):
+    for name in ("model/mod.rs", "model/blocks/bf16.rs", "weights/host.rs", "weights/bf16.rs", "model_runner/runner.rs", "model_runner/prepare.rs"):
         if not (root / name).is_file():
             errors.append(f"{name}: missing model computation owner")
+    for directory in ("weights/bf16", "model/blocks/bf16"):
+        if (root / directory).exists():
+            errors.append(f"{directory}: BF16 implementation stays in one file")
     # All new computation files must live under model, not escape a fixed list.
     allowed_root = {"mod.rs", "backend.rs", "config.rs", "load.rs"}
     for path in root.glob("*.rs"):

@@ -1,6 +1,5 @@
 #include "../internal.h"
 #include "../../../kernels/custom/attention.cuh"
-#include "../../../kernels/custom/attention_short_f32.cuh"
 
 namespace apxinf::attention {
 namespace {

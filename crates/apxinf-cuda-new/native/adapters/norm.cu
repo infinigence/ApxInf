@@ -68,7 +68,10 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3 &&
       writes_normalized(spec.semantic);
-  if (spec.version != APXINF_NORM_SPEC_VERSION ||
+  if ((spec.intermediate_dtype != APXINF_DTYPE_F32 &&
+       (spec.semantic != APXINF_NORM_SEMANTIC_RMS || spec.intermediate_dtype != spec.dtype ||
+        spec.output_dtype != spec.dtype || !spec.output_scale_is_unit)) ||
+      spec.version != APXINF_NORM_SPEC_VERSION ||
       spec.semantic > APXINF_NORM_SEMANTIC_BIAS_THEN_RESIDUAL ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16 &&
        !(spec.dtype == APXINF_DTYPE_F32 && spec.semantic == APXINF_NORM_SEMANTIC_LAYER)) ||
@@ -237,6 +240,11 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
 
   switch (spec.semantic) {
     case APXINF_NORM_SEMANTIC_RMS:
+      if (spec.intermediate_dtype != APXINF_DTYPE_F32) {
+        kernels::rms_norm_staged<T><<<rows, kThreads, 0, stream>>>(
+            input, weight, normalized, rows, cols, bindings.eps);
+        break;
+      }
       kernels::rms_norm<T><<<rows, kThreads, 0, stream>>>(
           input, weight, normalized, rows, cols, bindings.eps);
       break;

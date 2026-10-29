@@ -127,13 +127,13 @@ providers.
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::additive_attention(ctx, AttentionBiasArgs { attention, bias })` |
+| Rust API | `ops::additive_attention(ctx, AttentionBiasArgs { attention, bias, intermediate_dtype })` |
 | Inputs | Dense Q/K/V as above, F16/BF16/F32; F32 `bias=[1 or B,Hq,Tq,Tk]`, broadcast across batch when its leading dimension is one |
 | Output | Same shape and dtype as Q; no E4M3 output |
 | Mathematical semantic | `softmax(mask(scale * QK^T + bias)) @ V`; negative infinity masks a key, and an entirely masked row produces zero |
-| Arithmetic | Scores, additive bias, probabilities and PV use F32 arithmetic; the final output is converted to the input dtype. |
+| Arithmetic | `intermediate_dtype=F32` (constructor default) keeps scores/probabilities in F32. Explicit BF16 rounds scaled QK, biased scores and softmax probabilities to BF16; QK/PV accumulation and softmax reductions remain F32. This BF16 option currently supports BF16 MHA with at most 1024 keys. |
 | Constraints | Same masks and positive scale as dense attention; bias must not alias output. NaN and positive-infinity bias are outside the contract. |
-| Graph/tuning identity | Bias address belongs to the execution key; its values can change between replays. Broadcast belongs to the exact recipe key. |
+| Graph/tuning identity | Bias address belongs to the execution key; its values can change between replays. Broadcast and intermediate precision belong to the exact recipe key. |
 | Reference tests | `additive_attention_all_candidates_match_reference`; `additive_attention_validates_bias_and_replays_changed_bias` |
 
 <!-- l3-operator:kv_cache_attention -->
@@ -239,10 +239,10 @@ common offset. The contract requires
 finite positive epsilon and unit output scale. F32 output may not overlap any
 read-only binding. Mixed F32/BF16 bindings and F32 quantized output are rejected.
 Other Norm semantics retain their existing dtype domains. This fixed kernel
-has no tuning recipe or workspace and retains operand owners during capture.
+has no tuning recipe or workspace and follows the existing caller-owned operand lifetime during capture.
 `layer_norm_f32_real_shapes_match_independent_f64_eager_and_graph` covers
 1024/3072 columns, learned affine parameters, true F32 inputs, changed-input
-replay and dropped owners against an independent F64 Welford reference.
+replay against an independent F64 Welford reference.
 
 <!-- l3-operator:pairwise-rope -->
 `PairwiseRopeTable::new(ctx, tokens, head_dim, coefficients)` uploads immutable
@@ -255,3 +255,19 @@ no model family or axis convention enters this operator. Partial overlapping
 input/output storage is rejected; exact alias is allowed for BF16 only. The
 captured graph retains the immutable table and activation storage through
 replay, even after the caller drops its handles.
+
+### RMS intermediate precision
+
+`RmsNormArgs::new` retains `intermediate_dtype=F32`, using the unchanged fused
+baseline kernel. Explicit F16/BF16 (equal to the input dtype) selects a separate
+implementation that rounds `x * rsqrt(mean(x*x)+eps)` before weight multiplication.
+The reduction accumulator stays F32 in both implementations. This option requires
+unquantized output of the same dtype and unit output scale; other combinations
+are rejected. Other norm semantics retain their existing arithmetic. No new
+mathematical operator or model-specific semantic is introduced.
+
+`rms_intermediate_dtype_preserves_default_and_explicit_boundary` checks independent
+reference values, both numerical boundaries, rejected combinations and graph replay.
+Attention's BF16 intermediate implementation is covered by the existing additive
+all-candidate, cold/warm/corrupt recipe and retained-binding graph tests in both
+precision modes; a recipe for one mode must not satisfy the other.
