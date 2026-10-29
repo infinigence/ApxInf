@@ -27,6 +27,14 @@ mod linear {
         /// one absmax quantization scale. This produces graph-ready QKV and
         /// gate/up matrices without runtime concatenation or mixed descales.
         pub fn from_host_parts(linears: &[&LinearWeights], context: &Context) -> Result<Self> {
+            Self::from_host_parts_with_cache(linears, context, None)
+        }
+
+        pub(super) fn from_host_parts_with_cache(
+            linears: &[&LinearWeights],
+            context: &Context,
+            extra_bytes: Option<usize>,
+        ) -> Result<Self> {
             if linears.is_empty() {
                 return Err(Error::Other("cannot pack an empty FP8 linear group".into()));
             }
@@ -45,7 +53,10 @@ mod linear {
                 .map(|bias| backend::to_device(context, bias))
                 .transpose()?;
             Ok(Self {
-                layout: crate::pi05::backend::ops::RepackedWeight::new(&weight)?,
+                layout: match extra_bytes {
+                    Some(bytes) => ops::RepackedWeight::with_layout_cache(&weight, bytes)?,
+                    None => ops::RepackedWeight::new(&weight)?,
+                },
                 weight,
                 weight_scale,
                 bias,
@@ -147,8 +158,8 @@ mod linear {
 pub use linear::*;
 // Fully materialized static-FP8 π0.5 weights.
 
-use apxinf_core::{Result, Tensor};
 use crate::pi05::backend::Context;
+use apxinf_core::{Result, Tensor};
 
 use crate::pi05::{
     ActionLayerWeights, AdaRmsNormWeights, LanguageLayerWeights, LayerNormWeights, Pi05Weights,
@@ -211,6 +222,17 @@ pub struct Fp8StaticWeights {
 
 impl Fp8StaticWeights {
     pub fn from_host(weights: &Pi05Weights, backend: &Context) -> Result<Self> {
+        Self::from_host_with_layout_budget(weights, backend, usize::MAX)
+    }
+
+    /// Bound additional physical layouts for language gate/up weights. Zero
+    /// selects canonical before any execution; otherwise each eligible layer
+    /// reserves capacity for one extra layout, allocated only when selected.
+    pub fn from_host_with_layout_budget(
+        weights: &Pi05Weights,
+        backend: &Context,
+        mut extra_bytes: usize,
+    ) -> Result<Self> {
         let vision_layers = weights
             .vision
             .blocks
@@ -220,7 +242,25 @@ impl Fp8StaticWeights {
         let language_layers = weights
             .language_layers
             .iter()
-            .map(|layer| Fp8StaticDeviceLanguageLayer::from_host(layer, backend))
+            .map(|layer| {
+                let bytes = layer
+                    .mlp
+                    .gate
+                    .weight
+                    .shape()
+                    .numel()
+                    .checked_add(layer.mlp.up.weight.shape().numel())
+                    .ok_or_else(|| {
+                        apxinf_core::Error::Other("FP8 layout budget size overflow".into())
+                    })?;
+                let reserved = if extra_bytes >= bytes {
+                    extra_bytes -= bytes;
+                    bytes
+                } else {
+                    0
+                };
+                Fp8StaticDeviceLanguageLayer::from_host(layer, backend, reserved)
+            })
             .collect::<Result<Vec<_>>>()?;
         let action_layers = weights
             .action_layers
@@ -281,7 +321,11 @@ impl Fp8StaticDeviceVisionBlock {
 }
 
 impl Fp8StaticDeviceLanguageLayer {
-    fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
+    fn from_host(
+        weights: &LanguageLayerWeights,
+        backend: &Context,
+        layout_bytes: usize,
+    ) -> Result<Self> {
         Ok(Self {
             input_norm_scale: fp16_to_device(&weights.input_norm_scale, backend)?,
             qkv: Fp8StaticLinearWeights::from_host_parts(
@@ -294,9 +338,10 @@ impl Fp8StaticDeviceLanguageLayer {
             )?,
             output: Fp8StaticLinearWeights::from_host(&weights.attention.output, backend)?,
             post_attention_norm_scale: fp16_to_device(&weights.post_attention_norm_scale, backend)?,
-            gate_up: Fp8StaticLinearWeights::from_host_parts(
+            gate_up: Fp8StaticLinearWeights::from_host_parts_with_cache(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,
+                Some(layout_bytes),
             )?,
             down: Fp8StaticLinearWeights::from_host(&weights.mlp.down, backend)?,
         })

@@ -1,5 +1,6 @@
 //! Model-owned physical layout state, independent of execution IO addresses.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::CudaBuffer;
@@ -63,6 +64,39 @@ pub(crate) struct WeightState {
     pub shape: Vec<usize>,
     pub dtype: apxinf_core::DType,
     pub layout: u32,
+    pub cache: Option<LayoutCache>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct LayoutChoiceKey {
+    spec: crate::ffi::abi::gemm::Spec,
+    workspace_limit: usize,
+    graph_safe: bool,
+    deterministic: bool,
+    online_tune: bool,
+    allow_fallback: bool,
+    cache_dir: Option<String>,
+}
+
+impl LayoutChoiceKey {
+    pub fn new(mut spec: crate::ffi::abi::gemm::Spec, policy: &super::GemmPolicy) -> Self {
+        spec.b_layout = 0;
+        Self {
+            spec,
+            workspace_limit: policy.workspace_limit,
+            graph_safe: policy.graph_safe,
+            deterministic: policy.deterministic,
+            online_tune: policy.online_tune,
+            allow_fallback: policy.allow_fallback,
+            cache_dir: policy.cache_dir.clone(),
+        }
+    }
+}
+
+pub(crate) struct LayoutCache {
+    pub budget: usize,
+    pub buffers: HashMap<u32, CudaBuffer>,
+    pub choices: HashMap<LayoutChoiceKey, u32>,
 }
 
 impl std::fmt::Debug for RepackedWeight {
@@ -72,6 +106,30 @@ impl std::fmt::Debug for RepackedWeight {
 }
 
 impl RepackedWeight {
+    /// Allow independent shape/semantic choices while sharing each physical
+    /// layout across all executions. The original allocation remains the first
+    /// prepared representation; additional representations are immutable copies.
+    /// `extra_bytes` bounds persistent copies, excluding prepare-local trials.
+    /// A budget smaller than one weight pins canonical at adoption, avoiding a
+    /// first-caller decision when no second representation could be retained.
+    pub fn with_layout_cache(weight: &Tensor, extra_bytes: usize) -> Result<Self> {
+        let result = Self::new(weight)?;
+        {
+            let mut state = result
+                .state
+                .lock()
+                .map_err(|_| Error::Cuda("weight state lock poisoned".into()))?;
+            if extra_bytes < state.buffer.len() {
+                state.layout = 4;
+            }
+            state.cache = Some(LayoutCache {
+                budget: extra_bytes,
+                buffers: HashMap::new(),
+                choices: HashMap::new(),
+            });
+        }
+        Ok(result)
+    }
     /// Adopt a canonical weight. No device allocation or packing occurs here.
     pub fn new(weight: &Tensor) -> Result<Self> {
         let buffer = CudaBuffer::from_tensor(weight).map_err(Error::Cuda)?;
@@ -97,6 +155,7 @@ impl RepackedWeight {
                 shape: weight.shape().dims().to_vec(),
                 dtype: weight.dtype(),
                 layout: 0,
+                cache: None,
             })),
         })
     }

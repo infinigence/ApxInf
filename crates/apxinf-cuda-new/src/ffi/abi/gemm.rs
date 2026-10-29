@@ -87,6 +87,29 @@ unsafe extern "C" {
         weight_layout: *mut u32,
     ) -> i32;
     pub(crate) fn apxinf_gemm_enqueue(execution: Execution) -> i32;
+    pub(crate) fn apxinf_gemm_candidate_layouts(
+        runtime: Runtime,
+        spec: *const Spec,
+        policy: *const Policy,
+        layouts: *mut u32,
+    ) -> i32;
+    pub(crate) fn apxinf_gemm_rebind_weight(
+        runtime: Runtime,
+        source: Execution,
+        weight: *const c_void,
+        policy: *const Policy,
+        output: *mut Execution,
+    ) -> i32;
+    pub(crate) fn apxinf_gemm_relayout_weight(
+        source: *const c_void,
+        destination: *mut c_void,
+        k: i64,
+        n: i64,
+        dtype: u32,
+        source_layout: u32,
+        target_layout: u32,
+        stream: CudaStream,
+    ) -> i32;
     pub(crate) fn apxinf_gemm_destroy(execution: Execution);
     pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(rows: i64, k: i64, sf_vec_size: u32) -> u64;
     pub(crate) fn apxinf_gemm_nvfp4_pack_block_scales(
@@ -150,7 +173,6 @@ unsafe extern "C" {
     #[cfg(test)]
     pub(crate) fn apxinf_gemm_summary(execution: Execution) -> *const c_char;
     #[cfg(test)]
-
     #[cfg(test)]
     pub(crate) fn apxinf_gemm_execution_weight_prepack_count(execution: Execution) -> u64;
     #[cfg(test)]

@@ -341,6 +341,7 @@ class Pi05Policy:
         calibration=None,
         tactics=None,
         autotune: bool = False,
+        weight_layout_budget_bytes: Optional[int] = None,
         tokenizer_path=None,
         norm_key: str = "actions",
         unnormalizer: Optional[Unnormalizer] = None,
@@ -376,6 +377,13 @@ class Pi05Policy:
         width; ``None`` uses the transform's full width. ``unnormalizer`` replaces
         that action transform and determines the width, so it cannot be combined
         with ``action_dim``.
+
+        ``weight_layout_budget_bytes`` limits persistent extra GEMM weight layouts
+        for BF16/FP8 language gate/up projections. ``None`` allows one extra
+        representation per weight, allocated lazily and shared across shapes;
+        ``0`` keeps canonical weights. This excludes temporary preparation buffers
+        and execution workspaces. Set it when constructing a supplied runner.
+
         ``action_horizon`` overrides
         the checkpoint's chunk length: ``None`` runs the native ``config.json``
         value, an explicit value outranks it (the horizon is a sequence length,
@@ -481,6 +489,8 @@ class Pi05Policy:
                 **({"calibration": str(calibration)} if calibration else {}),
                 **({"tactics": str(tactics)} if tactics else {}),
                 autotune=bool(autotune),
+                **({"weight_layout_budget_bytes": int(weight_layout_budget_bytes)}
+                   if weight_layout_budget_bytes is not None else {}),
                 # An openpi export has no config.json, so without this the Rust
                 # loader silently ran Pi05Config::default(). The constants come
                 # from the checkpoint's own metadata.pt.
@@ -490,6 +500,10 @@ class Pi05Policy:
                 **({"num_flow_steps": int(num_flow_steps)} if num_flow_steps is not None else {}),
                 **({"flow_start_time": float(flow_start_time)} if flow_start_time is not None else {}),
                 sampling_seed=int(seed),
+            )
+        elif weight_layout_budget_bytes is not None:
+            raise ValueError(
+                "weight_layout_budget_bytes must be set when constructing the supplied model_runner"
             )
         elif action_horizon is not None and int(action_horizon) != int(model_runner.action_horizon):
             # A pre-built model carries its own horizon; silently ignoring the
