@@ -587,7 +587,8 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                     frame["model_manifest"]["runtime"] == frame["runtime"],
                     "native runtime mismatch",
                 )?;
-                object(&manifest["execution"])?;
+                if prepared { object(&manifest["execution"])?; }
+                else if let Some(execution) = manifest.get("execution") { object(execution)?; }
                 if prepared {
                     let execution = &manifest["execution"];
                     fields(execution, &[], &["provider", "precision", "variant", "parser", "enable_thinking",
@@ -1424,7 +1425,7 @@ mod tests {
         ready["runtime"]["mlx"] = "0.32.3".into();
         ready["model_manifest"]["runtime"] = ready["runtime"].clone();
         ready["model_manifest"]["adapter_revision"] = "apxinf-native-minicpm5-prepared-v1".into();
-        ready["model_manifest"]["execution"] = crate::native_identity::prepared_execution(16384, 1024, 9000000, 1000000, 8000000);
+        ready["model_manifest"]["execution"] = crate::native_identity::prepared_execution(16384, 128, 9000000, 1000000, 8000000);
         ready["capabilities"]["sampling"] = false.into();
         let refresh = |ready: &mut Value| {
             ready["model_revision"] = canonical_identity_digest("apxinf-model-identity-v1", &ready["model_manifest"]).unwrap().into();
