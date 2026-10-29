@@ -34,7 +34,9 @@ extern "C" {
         bytes: *mut u8,
         len: usize,
     ) -> i32;
+    pub fn apx_mlx_array_read_ready(array: *const c_void, bytes: *mut u8, len: usize) -> i32;
     pub fn apx_mlx_eval(stream: Handle, arrays: *const *const c_void, count: usize) -> i32;
+    pub fn apx_mlx_async_eval(arrays: *const *const c_void, count: usize) -> i32;
     pub fn apx_mlx_op(
         stream: Handle,
         op: i32,
