@@ -77,12 +77,9 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
         StatusCode::SERVICE_UNAVAILABLE
     };
     let sampled = service.sampling_enabled();
-    let tools = if !service.image_enabled()
-        && (service.ready["protocol"] == crate::contracts::NATIVE_PROTOCOL || sampled)
-    {
-        "minicpm5_xml"
-    } else {
-        "qwen_xml_or_json"
+    let tools = match service.output_profile() {
+        crate::output::OutputProfile::MiniCpm5 => "minicpm5_xml",
+        crate::output::OutputProfile::Qwen => "qwen_xml_or_json",
     };
     let mut body = json!({"ready":status==StatusCode::OK,"worker_available":worker_available,"host_pressure":host_pressure,"model":service.model_id,"worker":service.ready_snapshot(),"profile":public_profile(&service),"public_capabilities":{"anthropic_messages":true,"openai_chat_completions":true,"tools":tools,"tool_choice":["auto","none"],"thinking":false,"sampling":sampled,"images":false,"sessions":false,"batching":false,"prompt_cache":false,"output_effort":"advisory_only"}});
     if service.image_enabled() {
@@ -107,6 +104,8 @@ async fn ready(State(service): State<Arc<Service>>) -> Response {
 fn public_profile(service: &Service) -> &'static str {
     if service.decision_enabled() {
         "apxinf-clef-text-v0.1"
+    } else if service.ready["protocol"] == crate::contracts::NATIVE_PREPARED_PROTOCOL {
+        "apxinf-native-prepared-v0.1"
     } else if service.image_enabled() {
         "apxinf-minicpm-vision-v0.1"
     } else if service.bounded_thinking() {
@@ -883,6 +882,20 @@ impl Stream for PublicStream {
 mod tests {
     use super::*;
     use crate::supervisor::gateway_test_service;
+
+    #[tokio::test]
+    async fn prepared_readiness_advertises_the_selected_native_tool_parser() {
+        let (service, _) = crate::supervisor::gateway_test_service_with_protocol(
+            crate::contracts::NATIVE_PREPARED_PROTOCOL);
+        let response = ready(State(service.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 10000).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["public_capabilities"]["tools"], "minicpm5_xml");
+        assert_eq!(body["public_capabilities"]["sampling"], false);
+        assert_eq!(body["profile"], "apxinf-native-prepared-v0.1");
+        service.shutdown();
+    }
 
     #[tokio::test]
     async fn sampled_profile_preserves_policy_through_public_admission() {

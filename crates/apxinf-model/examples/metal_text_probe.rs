@@ -6,6 +6,8 @@ mod native {
     use apxinf_tokenizer::Tokenizer;
     use serde::Deserialize;
     use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
     use std::{path::PathBuf, time::Instant};
 
     #[derive(Deserialize)]
@@ -67,10 +69,21 @@ mod native {
         if !source.status.success() || !dirty.status.success() {
             return Err("run from the measured source checkout".into());
         }
+        let executable = std::env::current_exe()?;
+        let mut file = std::fs::File::open(&executable)?;
+        let mut checksum = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            checksum.update(&buffer[..count]);
+        }
         println!(
             "{}",
-            json!({"kind":"metadata", "source_commit":String::from_utf8(source.stdout)?.trim(),
-        "source_dirty":!dirty.stdout.is_empty(), "model_path":model_path, "cleanup_policy":args[3],
+            json!({"kind":"metadata", "checkout_commit":String::from_utf8(source.stdout)?.trim(),
+        "checkout_dirty":!dirty.stdout.is_empty(), "executable_sha256":format!("{:x}", checksum.finalize()), "model_path":model_path, "cleanup_policy":args[3],
         "mlx_library":apxinf_mlx::loaded_library_path()?, "allocator_cache_limit_bytes":2147483648u64,
         "memory_limit_bytes":10737418240u64,"prefill_chunk_tokens":256})
         );
