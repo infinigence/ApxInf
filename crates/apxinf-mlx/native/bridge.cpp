@@ -48,6 +48,7 @@ void apx_mlx_stream_free(void* p){delete static_cast<S*>(p);}
 int apx_mlx_sync(void* p){TRY mx::synchronize(*static_cast<S*>(p));CATCH}
 int apx_mlx_memory_stats(size_t* active,size_t* cache,size_t* peak){TRY *active=mx::get_active_memory();*cache=mx::get_cache_memory();*peak=mx::get_peak_memory();CATCH}
 int apx_mlx_reset_peak_memory(void){TRY mx::reset_peak_memory();CATCH}
+int apx_mlx_set_cache_limit(size_t limit,size_t* previous){TRY *previous=mx::set_cache_limit(limit);CATCH}
 int apx_mlx_clear_cache(void){TRY mx::clear_cache();CATCH}
 int apx_mlx_set_cache_limit(size_t limit,size_t* previous){TRY *previous=mx::set_cache_limit(limit);CATCH}
 // gpu::device_info returns MLX's function-local static map, so both strings

@@ -1,0 +1,26 @@
+{
+  "templates": {
+    "settled": {
+      "protocol": "apxinf-worker/2.7",
+      "kind": "resources_released",
+      "worker_epoch": "10000000-0000-4000-8000-000000000001",
+      "request_id": "20000000-0000-4000-8000-000000000002",
+      "attempt": 1,
+      "event_seq": 3,
+      "released_lease_ids": ["30000000-0000-4000-8000-000000000003"],
+      "retained_lease_ids": [],
+      "memory": {"active_bytes": 4096, "cache_bytes": 1024, "peak_bytes": 8192}
+    }
+  },
+  "frame_cases": [
+    {"name": "checked_post_cleanup_memory", "template": "settled", "valid": true},
+    {"name": "legacy_rejects_settlement_extension", "template": "settled", "set": {"/protocol": "apxinf-worker/2.1"}, "valid": false},
+    {"name": "legacy_cleanup_remains_valid", "template": "settled", "set": {"/protocol": "apxinf-worker/2.1"}, "remove": ["memory"], "valid": true},
+    {"name": "prepared_cleanup_requires_memory", "template": "settled", "remove": ["memory"], "valid": false},
+    {"name": "memory_is_not_boolean", "template": "settled", "set": {"/memory/active_bytes": true}, "valid": false},
+    {"name": "memory_is_not_negative", "template": "settled", "set": {"/memory/cache_bytes": -1}, "valid": false},
+    {"name": "memory_is_safe_integer", "template": "settled", "set": {"/memory/cache_bytes": 9007199254740992}, "valid": false},
+    {"name": "peak_covers_active_allocation", "template": "settled", "set": {"/memory/peak_bytes": 4095}, "valid": false},
+    {"name": "prepared_code_is_not_request_lease", "template": "settled", "set": {"/retained_lease_ids": ["30000000-0000-4000-8000-000000000003"]}, "valid": false}
+  ]
+}

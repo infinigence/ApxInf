@@ -239,21 +239,15 @@ impl<'a, M: LlmTrait + ?Sized> SyncTokenSequence<'a, M> {
             position,
         }
     }
-
     fn with_caller(
         model: &'a mut M,
         first: Tensor,
         sampler: &'a mut dyn TokenSampler,
         position: u32,
     ) -> Self {
-        Self {
-            model,
-            sampler: GenerationSampler::Caller(sampler),
-            first: Some(first),
-            previous: None,
-            position,
-        }
+        Self { model, first: Some(first), sampler: GenerationSampler::Caller(sampler), previous: None, position }
     }
+
 }
 
 impl<M: LlmTrait + ?Sized> TokenSequence for SyncTokenSequence<'_, M> {
@@ -352,6 +346,12 @@ pub trait LlmTrait {
     /// Release request-owned state after checked device settlement.
     fn release_request_state(&mut self) -> Result<()> {
         Err(Error::Contract("request state release is unsupported"))
+    }
+
+    /// Release request arrays while retaining one bounded model-owned preparation entry.
+    /// Implementations must reject this operation unless they separate these lifetimes.
+    fn release_request_state_retaining_preparation(&mut self) -> Result<()> {
+        Err(Error::Contract("prepared-code retention is unsupported"))
     }
 
     /// Run the shared loop with control before prefill and at completed execution boundaries.
@@ -613,67 +613,50 @@ where
     let prompt_tokens = input.token_ids;
     let prompt_end = u32::try_from(prompt_tokens.len())
         .map_err(|_| Error::Other("generation position exceeds u32".into()))?;
+    u32::try_from(prompt_tokens.len().checked_add(options.max_new_tokens)
+        .ok_or_else(|| Error::Other("generation sequence length overflow".into()))?)
+        .map_err(|_| Error::Other("generation position exceeds u32".into()))?;
     sampler.sampler().begin(TokenSamplingInit {
         prompt_token_ids: prompt_tokens,
         params: &options.sampling,
         rng: options.rng,
     })?;
-
+    if !boundary(GenerationBoundary::PrefillStart)? {
+        return Ok(empty_generation_output(prompt_tokens.len(), profile));
+    }
     model.reset();
     model.prewarm_decode(prompt_tokens.len(), options.max_new_tokens);
-
-    let mut generated = Vec::with_capacity(options.max_new_tokens);
-    let Some(logits) = model.prefill_controlled(input, &mut boundary)? else {
-        profile.finalize(prompt_tokens.len(), 0);
-        return Ok(GenerationOutput {
-            tokens: Vec::new(),
-            profile,
-        });
+    let Some(logits) = model.prefill_controlled(input, &mut |event| {
+        if matches!(event, GenerationBoundary::PrefillStart) { Ok(true) } else { boundary(event) }
+    })? else {
+        return Ok(empty_generation_output(prompt_tokens.len(), profile));
     };
     let mut sequence: Box<dyn TokenSequence + '_> = match sampler {
-        GenerationSampler::Backend(sampler) => {
-            model.token_sequence(logits, sampler, &options.sampling, prompt_end)?
-        }
-        GenerationSampler::Caller(sampler) => Box::new(SyncTokenSequence::with_caller(
-            model, logits, sampler, prompt_end,
-        )),
+        GenerationSampler::Backend(sampler) => model.token_sequence(logits, sampler, &options.sampling, prompt_end)?,
+        GenerationSampler::Caller(sampler) => Box::new(SyncTokenSequence::with_caller(model, logits, sampler, prompt_end)),
     };
     let overlaps = sequence.overlaps_callbacks();
+    let mut generated = Vec::with_capacity(options.max_new_tokens);
     let run = (|| -> Result<()> {
         for index in 0..options.max_new_tokens {
             let token = sequence.next(index + 1 < options.max_new_tokens)?;
-            if index == 0 {
-                profile.record_first_token();
-            }
+            if index == 0 { profile.record_first_token(); }
             generated.push(token);
-            let keep_going = if overlaps {
-                boundary(GenerationBoundary::Token(token))?
-            } else {
-                profile.run_unprofiled(|| boundary(GenerationBoundary::Token(token)))?
-            };
-            if !keep_going || options.eos_token_ids.contains(&token.token_id) {
-                break;
-            }
+            let keep_going = if overlaps { boundary(GenerationBoundary::Token(token))? }
+                else { profile.run_unprofiled(|| boundary(GenerationBoundary::Token(token)))? };
+            if !keep_going || options.eos_token_ids.contains(&token.token_id) { break; }
         }
         Ok(())
     })();
     let cleanup = sequence.finish(generated.len());
     match (run, cleanup) {
-        (Err(primary), Err(cleanup)) => {
-            return Err(Error::Other(format!(
-                "{primary}; cleanup failed: {cleanup}"
-            )))
-        }
+        (Err(primary), Err(cleanup)) => return Err(Error::Other(format!("{primary}; cleanup failed: {cleanup}"))),
         (Err(primary), _) => return Err(primary),
         (_, Err(cleanup)) => return Err(cleanup),
         _ => {}
     }
-
     profile.finalize(prompt_tokens.len(), generated.len());
-    Ok(GenerationOutput {
-        tokens: generated,
-        profile,
-    })
+    Ok(GenerationOutput { tokens: generated, profile })
 }
 
 /// Run the shared greedy generation loop for a concrete model or

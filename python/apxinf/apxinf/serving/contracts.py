@@ -8,6 +8,7 @@ from typing import Any
 
 PROTOCOL = "apxinf-worker/2.0"
 VISION_PROTOCOL = "apxinf-worker/2.5"
+NATIVE_PREPARED_PROTOCOL = "apxinf-worker/2.7"
 NATIVE_PROTOCOL = "apxinf-worker/2.1"
 NATIVE_SAMPLED_PROTOCOL = "apxinf-worker/2.2"
 NATIVE_THINKING_PROTOCOL = "apxinf-worker/2.3"
@@ -345,7 +346,7 @@ def validate_command_envelope(frame: dict) -> None:
         return
     _tree(frame)
     _require(type(frame) is dict, "expected command object")
-    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL, VISION_PROTOCOL), "unsupported protocol")
+    _require(frame.get("protocol") in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_PREPARED_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL, VISION_PROTOCOL), "unsupported protocol")
     _uuid(frame.get("worker_epoch"))
     _uuid(frame.get("command_id"))
     kind = frame.get("kind")
@@ -378,12 +379,13 @@ def validate_frame(frame: dict) -> None:
         return
     _tree(frame)
     _require(type(frame) is dict and BASE <= frame.keys(), "missing frame envelope")
-    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL, VISION_PROTOCOL), "unsupported protocol")
+    _require(frame["protocol"] in (PROTOCOL, NATIVE_PROTOCOL, NATIVE_PREPARED_PROTOCOL, NATIVE_SAMPLED_PROTOCOL, NATIVE_THINKING_PROTOCOL, NATIVE_BOUNDED_THINKING_PROTOCOL, VISION_PROTOCOL), "unsupported protocol")
     vision = frame["protocol"] == VISION_PROTOCOL
     bounded = frame["protocol"] == NATIVE_BOUNDED_THINKING_PROTOCOL
     thinking = frame["protocol"] == NATIVE_THINKING_PROTOCOL or bounded
     sampled = frame["protocol"] == NATIVE_SAMPLED_PROTOCOL or thinking
-    native = frame["protocol"] == NATIVE_PROTOCOL or sampled
+    prepared = frame["protocol"] == NATIVE_PREPARED_PROTOCOL
+    native = frame["protocol"] == NATIVE_PROTOCOL or prepared or sampled
     _uuid(frame["worker_epoch"])
     kind = frame["kind"]
     _str(kind)
@@ -424,6 +426,25 @@ def validate_frame(frame: dict) -> None:
             _digest(frame["runtime"]["metal_library_sha256"])
             _require(type(frame["model_manifest"]) is dict, "model manifest must be an object")
             _require(frame["model_manifest"].get("runtime") == frame["runtime"], "native runtime mismatch")
+            if prepared:
+                execution = manifest.get("execution")
+                _keys(execution, {"provider", "precision", "variant", "parser", "enable_thinking", "max_context",
+                                  "max_output_tokens", "memory_limit_bytes", "preparation_policy",
+                                  "allocator_cache_limit_bytes", "retained_memory_limit_bytes"})
+                _require(manifest.get("adapter_revision") == "apxinf-native-minicpm5-prepared-v1"
+                         and execution["provider"] == "metal_minicpm5" and execution["precision"] == "bf16"
+                         and execution["variant"] == "bf16-compiled" and execution["parser"] == "minicpm5_xml"
+                         and execution["enable_thinking"] is False
+                         and execution["preparation_policy"] == "single-code-entry-v1"
+                         and frame["runtime"]["mlx"] == "0.32.3", "unsupported prepared execution identity")
+                _int(execution["memory_limit_bytes"], 1)
+                limit = execution["memory_limit_bytes"]
+                _int(execution["allocator_cache_limit_bytes"], 1, limit)
+                _int(execution["retained_memory_limit_bytes"], 1, limit)
+            else:
+                _require(manifest.get("adapter_revision") != "apxinf-native-minicpm5-prepared-v1"
+                         and "preparation_policy" not in manifest.get("execution", {}),
+                         "prepared execution requires protocol 2.7")
             if sampled:
                 manifest = frame["model_manifest"]
                 execution = manifest.get("execution")
@@ -541,7 +562,10 @@ def validate_frame(frame: dict) -> None:
         _counts(frame["metrics"], {"elapsed_ns", "ttft_ns", "peak_memory_bytes"} | ({"source_media_bytes", "peak_host_array_bytes"} if vision else set()))
         _require(frame["metrics"]["ttft_ns"] <= frame["metrics"]["elapsed_ns"], "TTFT exceeds elapsed time")
     elif kind == "resources_released":
-        _keys(frame, EVENT | {"released_lease_ids", "retained_lease_ids"})
+        _keys(frame, EVENT | {"released_lease_ids", "retained_lease_ids"} | ({"memory"} if prepared else set()))
+        if prepared:
+            _counts(frame["memory"], {"active_bytes", "cache_bytes", "peak_bytes"})
+            _require(frame["memory"]["peak_bytes"] >= frame["memory"]["active_bytes"], "active memory exceeds recorded peak")
         _leases(frame["released_lease_ids"])
         _leases(frame["retained_lease_ids"])
         _require(not frame["retained_lease_ids"], "stateless profile cannot retain leases")

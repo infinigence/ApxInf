@@ -11,6 +11,7 @@ void apx_mlx_stream_free(void* stream);
 int apx_mlx_sync(void* stream);
 int apx_mlx_memory_stats(size_t* active, size_t* cache, size_t* peak);
 int apx_mlx_reset_peak_memory(void);
+int apx_mlx_set_cache_limit(size_t limit, size_t* previous);
 int apx_mlx_clear_cache(void);
 int apx_mlx_set_cache_limit(size_t limit, size_t* previous);
 int apx_mlx_device_info(int32_t index, const char** name, const char** architecture);
