@@ -6,7 +6,6 @@
 //! execution lifecycle.
 
 mod config;
-mod runtime;
 mod weights;
 
 #[cfg(feature = "cuda")]
@@ -20,9 +19,12 @@ mod runner;
 #[cfg(feature = "cuda")]
 mod vision;
 
+pub use crate::decision::{DecisionInput, DecisionOutput, DecisionRuntime, DecisionScore};
 pub use config::{D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig};
-pub use runtime::{
-    DecisionInput, DecisionOutput, DecisionRuntime, DecisionScore, D3_DEFAULT_TEXT_PROFILE_LIMIT,
-    D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
-};
 pub use weights::{D3CheckpointWeights, D3ReadoutWeights};
+
+/// Safe defaults for the d3 text CUDA Graph profile cache. The full public
+/// Decision Index contains many distinct prompt lengths; leaving this cache
+/// unbounded can exhaust a 24 GiB GPU before the run completes.
+pub const D3_DEFAULT_TEXT_PROFILE_LIMIT: usize = 12;
+pub const D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET: usize = 30_000;

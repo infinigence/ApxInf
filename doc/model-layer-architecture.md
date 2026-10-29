@@ -59,6 +59,14 @@ return its final `[1, vocab_size]` row. The common sampler selects the last row
 through `NextTokenLogits::last`; specialized schedules such as DSpark override
 the request-level generation hook without weakening `forward`.
 
+`DecisionRuntime` (`decision.rs`) is the shared non-generative decision
+contract. Its existing `decide(DecisionInput)` scores an encoded prompt over a
+package code table and returns `DecisionOutput`. The `d3` and root type exports,
+fields and required trait methods retain their existing shape.
+The additive `decide_schema` method accepts named questions for `metal_clef`
+and returns `SchemaDecisionOutput`; other runtimes default to unsupported.
+Schema answers have question IDs and option scores without package token IDs.
+
 `LlmTrait::preparation_status` exposes `TextPreparationStatus` as data only:
 state, selected implementation/variant, prepared compilation scopes and shape
 profiles, capacity and retained error. Only successful preparation reports
@@ -180,6 +188,7 @@ renamed as part of unrelated work.
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
 | Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
 | MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
+| Clef Flash / `DecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 4096 tokens. `auto` stays on the GPU, using optimized kernels on `applegpu_g13s` and the reference elsewhere. With `coreml`, explicit `gpu-ane-columns` selects 6656 GPU columns and 5632 ANE INT8 columns per MLP in 512-token tiles. Selection does not qualify a new hardware, OS, checkpoint or profile. `reference` retains the stock MLX-VLM composition. The decision CLI owns its 1 GiB process cache limit; loading the library model leaves the caller's limit unchanged. All compositions prepare the local shapeless decay/beta callable at load for lengths 1, 2 and 4096; this is not whole-backbone/head or Core ML preparation. |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until

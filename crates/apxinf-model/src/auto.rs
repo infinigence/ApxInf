@@ -7,7 +7,9 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 
 use crate::accelerator::create_backend_with_recipe_options;
 use crate::builtin::register_builtin_models;
-use crate::d3::{DecisionInput, DecisionOutput, DecisionRuntime};
+use crate::decision::{
+    DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema, SchemaDecisionOutput,
+};
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
@@ -130,6 +132,11 @@ impl LoadedModel {
 
     pub fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
         self.decision_mut()?.decide(input)
+    }
+
+    /// Score named schema questions without changing encoded decision requests.
+    pub fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
+        self.decision_mut()?.decide_schema(request)
     }
 
     pub fn decision_code_names(&self) -> Result<&[String]> {
@@ -317,6 +324,10 @@ impl AutoModel {
         // Decision 3.0 deliberately preserves the base Qwen3.5 model_type in
         // config.json. Its package-level format is the discriminator; without
         // this check it is incorrectly routed to the Qwen3.8 NVFP4 loader.
+        // Clef keeps the Qwen3.5 model_type; its joint schema head identifies it.
+        if model_dir.join("joint_head_config.json").is_file() {
+            return Ok("clef".to_owned());
+        }
         let decision_path = model_dir.join("decision_config.json");
         if decision_path.is_file() {
             let raw = std::fs::read_to_string(&decision_path).map_err(|error| {
