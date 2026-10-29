@@ -158,27 +158,33 @@ choices separately from physical layouts. PI0.5 BF16/FP8 language gate/up uses t
 mode: fixed two-view input with T=10 has M=522 (fused GeGLU), whereas T=11 has
 M=523 (plain GEMM plus pointwise). Camera count remains fixed per instance.
 
-The first selected layout can still replace the original allocation in place.
-Once exposed to an execution it is immutable. For a new shape/semantic/policy,
-preparation recovers canonical bytes into a private temporary with a bit-preserving
-permutation and selects a recipe independently of previous choices. A new physical
-layout is retained once per logical weight; another profile selecting the same
-layout reuses its allocation. The exact selected implementation/configuration is
-rebound to existing storage by rebuilding provider resources, without retuning
-or launch-time packing. Native operation descriptors must never retain pointers
-to discarded trials. Each Execution retains its actual physical buffer; captures
-can mix layouts and old graphs remain valid after preparing another profile.
+The base allocation can change layout during preparation only when no live
+execution leases it. Default inference synchronizes and retires the previous
+plan before preparing another shape, so it can reuse the original address for
+the new representation without retaining a second full weight. A temporary
+bit-preserving permutation completes before the new execution is published;
+failed writeback invalidates the state.
 
-The weight owner retains the layout cache, while executions/graphs retain their
-own buffer references. No capture transition overwrites or forcibly frees a
-representation still in use. Releasing the last owner frees the allocation.
-The cache is bounded by layout count and bytes, not IO addresses or shape count;
-there is no automatic eviction of live graph storage.
+When an older execution/graph still leases the base, preparation selects on a
+private canonical trial. An extra layout is allocated only if concurrent
+consumers need it and the budget permits it. Consumers selecting the same layout
+share its allocation. Each Execution owns a physical-storage lease; the weight
+state holds only weak entries for extra layouts. Retiring the last consumer
+reclaims that extra allocation even while the model remains loaded. One capture
+can contain multiple layouts, and explicitly retained older graphs remain valid.
 
-PI0.5 BF16/FP8 reserves at most one extra full-sized layout per language gate/up
-weight by default, allocated lazily only if selected. `LoadOptions` and native
+The model retains CPU selection metadata separately: semantic/provider/implementation/
+version/configuration, physical layout and the effective resource limit. Rebinding
+new IO rebuilds the exact provider resources from this metadata; a heuristic
+configuration must retain the resource limit under which it was chosen. Metadata
+owns no native execution or GPU buffer. Native operation descriptors must not
+retain pointers to discarded trials. Leases, rather than Tensor alias reference
+counts, determine whether changing base bytes is safe.
+
+PI0.5 BF16/FP8 permits at most one extra live layout per language gate/up weight
+by default, allocated lazily only for concurrent incompatible consumers. `LoadOptions` and native
 Python `ModelRunner.load` expose `weight_layout_budget_bytes`; the policy frontend
-forwards this load-time option. The budget covers additional persistent weight
+forwards this load-time option. The budget covers additional leased weight
 allocations, not graph arenas, provider workspace or prepare-local trial storage.
 A zero budget fixes canonical at adoption, eliminating first-call dependence
 without an extra copy, but may slow a fixed fused-GeGLU profile. Partial budgets

@@ -57,6 +57,17 @@ pub(crate) const WEIGHT_LAYOUT_INVALID: u32 = 5;
 
 pub(crate) type Execution = *mut c_void;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Choice {
+    pub provider_id: u32,
+    pub implementation_id: u32,
+    pub implementation_version: u32,
+    pub configuration: i32,
+    pub weight_layout: u32,
+    pub resource_limit: u64,
+}
+
 unsafe extern "C" {
     pub(crate) fn apxinf_gemm_prepare(
         runtime: Runtime,
@@ -73,11 +84,13 @@ unsafe extern "C" {
         policy: *const Policy,
         layouts: *mut u32,
     ) -> i32;
-    pub(crate) fn apxinf_gemm_rebind_weight(
+    pub(crate) fn apxinf_gemm_get_choice(execution: Execution, choice: *mut Choice) -> i32;
+    pub(crate) fn apxinf_gemm_prepare_choice(
         runtime: Runtime,
-        source: Execution,
-        weight: *const c_void,
+        spec: *const Spec,
         policy: *const Policy,
+        bindings: *const Bindings,
+        choice: *const Choice,
         output: *mut Execution,
     ) -> i32;
     pub(crate) fn apxinf_gemm_relayout_weight(

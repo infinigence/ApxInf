@@ -18,11 +18,24 @@ apxinf_status_t apxinf_gemm_prepare(
     const apxinf_gemm_bindings_t* bindings,
     apxinf_gemm_execution_t* execution, uint32_t* weight_layout);
 apxinf_status_t apxinf_gemm_enqueue(apxinf_gemm_execution_t execution);
-/* Rebuild provider resources for the exact selected recipe with a different
-   immutable B allocation of the same physical layout. No tuning or repacking. */
-apxinf_status_t apxinf_gemm_rebind_weight(
-    apxinf_runtime_t runtime, apxinf_gemm_execution_t source, const void* weight,
-    const apxinf_gemm_policy_t* policy, apxinf_gemm_execution_t* output);
+/* CPU-only selection metadata; owns no execution or GPU storage. Preserve the
+   resource limit because a heuristic configuration is interpreted under it. */
+typedef struct apxinf_gemm_choice {
+  uint32_t provider_id;
+  uint32_t implementation_id;
+  uint32_t implementation_version;
+  int32_t configuration;
+  uint32_t weight_layout;
+  uint64_t resource_limit;
+} apxinf_gemm_choice_t;
+apxinf_status_t apxinf_gemm_get_choice(
+    apxinf_gemm_execution_t execution, apxinf_gemm_choice_t* choice);
+/* Bind the exact selected choice to new IO/storage. Validate the current Spec,
+   layout and Policy; do not tune or repack, or retain another execution. */
+apxinf_status_t apxinf_gemm_prepare_choice(
+    apxinf_runtime_t runtime, const apxinf_gemm_spec_t* spec,
+    const apxinf_gemm_policy_t* policy, const apxinf_gemm_bindings_t* bindings,
+    const apxinf_gemm_choice_t* choice, apxinf_gemm_execution_t* output);
 /* Initial physical layouts of applicable candidates, as bits (1u << layout).
    A capability query only: no tuning, allocation or weight modification. */
 apxinf_status_t apxinf_gemm_candidate_layouts(

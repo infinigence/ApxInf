@@ -1809,10 +1809,7 @@ fn gpu_shared_weight_layouts_are_deduplicated_and_graph_safe() {
                 1,
                 "four profiles need only two physical layouts"
             );
-            assert_eq!(
-                cache.buffers.values().map(CudaBuffer::len).sum::<usize>(),
-                k * n
-            );
+            assert_eq!(cache.extra_bytes(), k * n);
             assert_eq!(cache.choices.len(), 4);
         }
         // Both layouts coexist inside one graph, and an older graph remains valid.
@@ -1909,6 +1906,146 @@ fn gpu_shared_weight_zero_budget_stays_canonical() {
     let guard = state.state.lock().unwrap();
     assert_eq!(guard.layout, 4);
     assert!(guard.cache.as_ref().unwrap().buffers.is_empty());
+}
+
+#[test]
+fn gpu_shared_weight_storage_retires_with_graphs_and_base_can_change_layout() {
+    let ctx = CudaContext::new(0).unwrap();
+    if !matches!(ctx.caps().sm, 100 | 101 | 110) {
+        return;
+    }
+    let (k, n) = (2048, 32768);
+    let codes = [0x20, 0x28, 0x30, 0x38];
+    let source = (0..k * n)
+        .map(|i| codes[(i / n + i % n + i / 128) % 4])
+        .collect::<Vec<_>>();
+    let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &source);
+    let weight = crate::ops::RepackedWeight::with_layout_cache(&b, k * n).unwrap();
+    let cache_dir = scratch_cache_dir("graph-owned-layouts");
+    let read = |tensor: &Tensor| {
+        let buffer = CudaBuffer::from_tensor(tensor).unwrap();
+        let mut bytes = vec![0; buffer.len()];
+        buffer.copy_to_host(&mut bytes).unwrap();
+        bytes
+    };
+    let prepare = |m: usize, fused: bool| {
+        let mut data = vec![0; m * k];
+        for row in 0..m {
+            data[row * k + row % k] = 0x38;
+        }
+        let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &data);
+        let mut out = zeros_tensor(
+            0,
+            vec![m, if fused { n / 2 } else { n }],
+            if fused { DType::F8E4M3 } else { DType::F16 },
+        );
+        let mut args = GemmArgs::new(&a, &b, &mut out).with_repacked_weight(&weight);
+        args.quantization = GemmQuantization::Fp8UnitScale;
+        args.policy.online_tune = false;
+        args.policy.allow_fallback = false;
+        args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        let semantic = if fused {
+            super::contracts::Semantic::GemmGeglu
+        } else {
+            super::contracts::Semantic::Gemm
+        };
+        let normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
+        let (id, version) = if fused { (2, 2) } else { (1, 1) };
+        super::execution::seed_recipe(&ctx, &normalized, 3, id, version, 0).unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        (execution, out)
+    };
+    let (first, first_out) = prepare(522, true);
+    let first_values = read(&first_out);
+    let original_pointer = CudaBuffer::from_tensor(&b).unwrap().ptr();
+    let packed = read(&b);
+    assert_ne!(packed, source);
+    let first_graph = crate::capture(&ctx, || first.enqueue()).unwrap();
+    let (second, second_out) = prepare(523, false);
+    let second_values = read(&second_out);
+    let second_graph = crate::capture(&ctx, || second.enqueue()).unwrap();
+    let (extra, allocation) = {
+        let state = weight.state.lock().unwrap();
+        assert_eq!(state.layout, 2, "old graph still leases the base");
+        let extra = state.cache.as_ref().unwrap().buffers[&4].clone();
+        let allocation =
+            std::sync::Arc::downgrade(extra.upgrade().unwrap().buffer.allocation_owner());
+        (extra, allocation)
+    };
+    drop(second);
+    assert!(
+        extra.upgrade().is_some(),
+        "graph retains the execution's storage"
+    );
+    first_graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(read(&first_out), first_values);
+    assert_eq!(read(&b), packed, "live graph forbids base mutation");
+    drop(first_graph);
+    drop(first);
+    // The base is now unused, but the second graph still needs canonical.
+    // Another canonical-only profile shares that existing extra allocation.
+    let (coexisting, _) = prepare(524, false);
+    assert_eq!(weight.state.lock().unwrap().layout, 2);
+    assert_eq!(
+        weight
+            .state
+            .lock()
+            .unwrap()
+            .cache
+            .as_ref()
+            .unwrap()
+            .extra_bytes(),
+        k * n
+    );
+    drop(second_graph);
+    assert!(
+        extra.upgrade().is_some(),
+        "another execution still leases the layout"
+    );
+    drop(coexisting);
+    assert!(
+        extra.upgrade().is_none(),
+        "retired graph releases extra layout"
+    );
+    assert_eq!(
+        allocation.strong_count(),
+        0,
+        "weak model metadata owns no allocation"
+    );
+    assert_eq!(weight.state.lock().unwrap().base_lease.strong_count(), 0);
+
+    // Known canonical choice survives as CPU metadata. No extra allocation
+    // survives: reuse the original address after the last old reader retires.
+    let (third, third_out) = prepare(523, false);
+    {
+        let state = weight.state.lock().unwrap();
+        assert_eq!(state.layout, 4);
+        assert_eq!(state.buffer.ptr(), original_pointer);
+        assert_eq!(state.cache.as_ref().unwrap().extra_bytes(), 0);
+    }
+    assert_eq!(read(&b), source);
+    assert_eq!(read(&third_out), second_values);
+    assert!(third.summary().contains("source=profile-choice"));
+    drop(third);
+    let (fourth, fourth_out) = prepare(522, true);
+    assert_eq!(weight.state.lock().unwrap().layout, 2);
+    assert_eq!(
+        weight
+            .state
+            .lock()
+            .unwrap()
+            .cache
+            .as_ref()
+            .unwrap()
+            .extra_bytes(),
+        0
+    );
+    assert_eq!(read(&fourth_out), first_values);
+    drop(fourth);
+    std::fs::remove_dir_all(cache_dir).unwrap();
 }
 
 #[test]

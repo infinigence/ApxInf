@@ -77,6 +77,7 @@ pub(crate) struct Execution {
     raw: abi::Execution,
     stream: Arc<crate::CudaStream>,
     _storage: Vec<CudaBuffer>,
+    _weight_lease: Option<Arc<super::weight::WeightStorage>>,
     #[cfg(test)]
     summary: String,
     _not_send: PhantomData<Rc<()>>,
@@ -147,20 +148,223 @@ fn prepare_native(
     }
     Ok(NativeExecution(raw))
 }
+fn execution_choice(execution: &NativeExecution) -> Result<abi::Choice> {
+    let mut choice = abi::Choice::default();
+    unsafe {
+        status::check(abi::apxinf_gemm_get_choice(execution.0, &mut choice))?;
+    }
+    Ok(choice)
+}
+
+fn prepare_choice(
+    ctx: &CudaContext,
+    spec: &abi::Spec,
+    policy: &abi::Policy,
+    bindings: &abi::Bindings,
+    choice: &abi::Choice,
+) -> Result<NativeExecution> {
+    let mut raw = std::ptr::null_mut();
+    unsafe {
+        status::check(abi::apxinf_gemm_prepare_choice(
+            ctx.runtime(),
+            spec,
+            policy,
+            bindings,
+            choice,
+            &mut raw,
+        ))?;
+    }
+    if raw.is_null() {
+        return Err(invalid("GEMM choice binding returned null"));
+    }
+    Ok(NativeExecution(raw))
+}
+
+fn relayout(
+    source: &CudaBuffer,
+    destination: &CudaBuffer,
+    spec: &abi::Spec,
+    from: u32,
+    to: u32,
+    stream: crate::ffi::abi::types::CudaStream,
+) -> Result<()> {
+    unsafe {
+        status::check(abi::apxinf_gemm_relayout_weight(
+            source.ptr(),
+            destination.ptr(),
+            spec.k,
+            spec.n,
+            spec.b_dtype,
+            from,
+            to,
+            stream,
+        ))
+    }
+}
+
+/// No execution may observe this allocation while its bytes change. A weak
+/// lease is authoritative; Tensor/allocation aliases are not reader counts.
+fn rewrite_base(
+    weight: &mut super::weight::WeightState,
+    spec: &abi::Spec,
+    layout: u32,
+    stream: crate::ffi::abi::types::CudaStream,
+    prepared: Option<&CudaBuffer>,
+) -> Result<()> {
+    if weight.layout == layout {
+        return Ok(());
+    }
+    if weight.base_lease.strong_count() != 0 {
+        return Err(invalid(
+            "cannot change a weight layout with live executions",
+        ));
+    }
+    let from = weight.layout;
+    let converted = if let Some(prepared) = prepared {
+        prepared.clone()
+    } else if let Some(existing) = weight.extra(layout) {
+        existing.buffer.clone()
+    } else {
+        let temporary =
+            CudaBuffer::alloc(weight.buffer.len(), weight.buffer.device()).map_err(Error::Cuda)?;
+        relayout(&weight.buffer, &temporary, spec, from, layout, stream)?;
+        temporary
+    };
+    // A failed write may leave partial bytes. Never make that weight usable.
+    weight.layout = abi::WEIGHT_LAYOUT_INVALID;
+    relayout(&converted, &weight.buffer, spec, layout, layout, stream)?;
+    weight.layout = layout;
+    if std::env::var_os("APXINF_GEMM_REPORT").is_some() {
+        eprintln!(
+            "[apxinf-gemm-weight-transition] k={} n={} from={} to={}",
+            spec.k, spec.n, from, layout
+        );
+    }
+    Ok(())
+}
+
+fn can_add_layout(weight: &super::weight::WeightState) -> bool {
+    weight.cache.as_ref().is_some_and(|cache| {
+        cache
+            .extra_bytes()
+            .checked_add(weight.buffer.len())
+            .is_some_and(|bytes| bytes <= cache.budget)
+    })
+}
+
+fn extra_lease(
+    weight: &mut super::weight::WeightState,
+    buffer: CudaBuffer,
+    layout: u32,
+) -> Arc<super::weight::WeightStorage> {
+    let lease = Arc::new(super::weight::WeightStorage { buffer, layout });
+    let cache = weight.cache.as_mut().expect("shared layout state");
+    cache.buffers.insert(layout, Arc::downgrade(&lease));
+    if std::env::var_os("APXINF_GEMM_REPORT").is_some() {
+        eprintln!(
+            "[apxinf-gemm-weight] k={} n={} layout={} extra_bytes={} cached_layouts={}",
+            weight.shape[0],
+            weight.shape[1],
+            layout,
+            cache.extra_bytes(),
+            cache
+                .buffers
+                .values()
+                .filter(|value| value.strong_count() != 0)
+                .count()
+        );
+    }
+    lease
+}
+
+fn bind_storage(
+    lease: &Arc<super::weight::WeightStorage>,
+    spec: &mut abi::Spec,
+    bindings: &mut abi::Bindings,
+    storage: &mut Vec<CudaBuffer>,
+) {
+    spec.b_layout = lease.layout;
+    bindings.b = lease.buffer.ptr();
+    storage.push(lease.buffer.clone());
+}
+
 fn prepare_weight(
     ctx: &CudaContext,
     weight: &mut super::weight::WeightState,
-    choice: super::weight::LayoutChoiceKey,
+    key: super::weight::LayoutChoiceKey,
     spec: &mut abi::Spec,
     policy: &abi::Policy,
     bindings: &mut abi::Bindings,
     storage: &mut Vec<CudaBuffer>,
-) -> Result<NativeExecution> {
-    let independent_trial = weight.layout != 0
-        && weight.cache.as_ref().is_some_and(|cache| {
-            !cache.choices.contains_key(&choice) && cache.budget >= weight.buffer.len()
-        });
-    if independent_trial {
+) -> Result<(NativeExecution, Arc<super::weight::WeightStorage>)> {
+    if let Some(choice) = weight
+        .cache
+        .as_ref()
+        .and_then(|cache| cache.choices.get(&key))
+        .copied()
+    {
+        let layout = choice.weight_layout;
+        let lease = if layout == weight.layout {
+            Some(weight.lease_base())
+        } else if let Some(existing) = weight.extra(layout) {
+            Some(existing)
+        } else if weight.base_lease.strong_count() == 0
+            && weight.buffer.len() as u64 <= policy.workspace_limit
+        {
+            rewrite_base(weight, spec, layout, bindings.stream, None)?;
+            Some(weight.lease_base())
+        } else if can_add_layout(weight) {
+            let buffer =
+                CudaBuffer::alloc(weight.buffer.len(), ctx.device_id()).map_err(Error::Cuda)?;
+            relayout(
+                &weight.buffer,
+                &buffer,
+                spec,
+                weight.layout,
+                layout,
+                bindings.stream,
+            )?;
+            Some(extra_lease(weight, buffer, layout))
+        } else {
+            None
+        };
+        if let Some(lease) = lease {
+            bind_storage(&lease, spec, bindings, storage);
+            return Ok((prepare_choice(ctx, spec, policy, bindings, &choice)?, lease));
+        }
+        // A live reader and exhausted budget can constrain this particular
+        // binding. Keep the unconstrained metadata for a later retired plan.
+        spec.b_layout = weight.layout;
+        bindings.b = weight.buffer.ptr();
+        let execution = prepare_native(ctx, spec, policy, bindings, None)?;
+        return Ok((execution, weight.lease_base()));
+    }
+
+    let independent = weight
+        .cache
+        .as_ref()
+        .is_some_and(|cache| cache.budget >= weight.buffer.len());
+    let base_available = weight.base_lease.strong_count() == 0;
+    let can_restore_base =
+        matches!(weight.layout, 0 | 4) || weight.buffer.len() as u64 <= policy.workspace_limit;
+    let execution;
+    let lease;
+    let no_live_extras = weight
+        .cache
+        .as_ref()
+        .is_none_or(|cache| cache.extra_bytes() == 0);
+    if independent && base_available && can_restore_base && no_live_extras {
+        if !matches!(weight.layout, 0 | 4) {
+            rewrite_base(weight, spec, 4, bindings.stream, None)?;
+        }
+        spec.b_layout = 0;
+        bindings.b = weight.buffer.ptr();
+        execution = prepare_native(ctx, spec, policy, bindings, Some(&mut weight.layout))?;
+        spec.b_layout = weight.layout;
+        lease = weight.lease_base();
+    } else if independent {
+        // A live base is immutable. Select independently on private storage;
+        // retain an extra representation only when concurrent readers need it.
         let mut layouts = 0;
         unsafe {
             status::check(abi::apxinf_gemm_candidate_layouts(
@@ -170,145 +374,102 @@ fn prepare_weight(
                 &mut layouts,
             ))?;
         }
-        if layouts == (1u32 << 4) {
-            let existing = if weight.layout == 4 {
-                Some(weight.buffer.clone())
-            } else {
-                weight
-                    .cache
-                    .as_ref()
-                    .and_then(|cache| cache.buffers.get(&4))
-                    .cloned()
-            };
-            if let Some(buffer) = existing {
-                // All applicable candidates read canonical bytes, so selecting
-                // with layout 0 cannot repack this allocation. Keep the same
-                // unrestricted recipe key (including restored recipes) without
-                // allocating/copying a canonical trial unnecessarily.
-                bindings.b = buffer.ptr();
-                storage.push(buffer);
-                spec.b_layout = 0;
-                let mut selected_layout = 0;
-                let execution =
-                    prepare_native(ctx, spec, policy, bindings, Some(&mut selected_layout))?;
-                if selected_layout != 4 {
-                    return Err(invalid("canonical-only candidate query changed layout"));
-                }
-                spec.b_layout = 4;
-                weight
-                    .cache
-                    .as_mut()
-                    .expect("shared layout cache")
-                    .choices
-                    .insert(choice, 4);
-                return Ok(execution);
-            }
-        }
-    }
-
-    let execution = if independent_trial {
-        // Recover canonical bytes into a private trial even when the original
-        // allocation is packed. Existing graphs keep reading immutable storage.
-        let trial = CudaBuffer::alloc(weight.buffer.len(), ctx.device_id()).map_err(Error::Cuda)?;
-        let (source, source_layout) = weight
-            .cache
-            .as_ref()
-            .and_then(|cache| cache.buffers.get(&4))
-            .map(|buffer| (buffer, 4))
-            .unwrap_or((&weight.buffer, weight.layout));
-        unsafe {
-            status::check(abi::apxinf_gemm_relayout_weight(
-                source.ptr(),
-                trial.ptr(),
-                spec.k,
-                spec.n,
-                spec.b_dtype,
-                source_layout,
-                4,
-                bindings.stream,
-            ))?;
-        }
-        let mut trial_spec = *spec;
-        trial_spec.b_layout = 0;
-        let mut trial_bindings = *bindings;
-        trial_bindings.b = trial.ptr();
-        let mut layout = 0;
-        let selected =
-            prepare_native(ctx, &trial_spec, policy, &trial_bindings, Some(&mut layout))?;
-        let cache = weight.cache.as_mut().expect("shared layout cache");
-        let existing = if layout == weight.layout {
-            Some(weight.buffer.clone())
+        let canonical = if weight.layout == 4 {
+            weight.base_lease.upgrade()
         } else {
-            cache.buffers.get(&layout).cloned()
+            weight.extra(4)
         };
-        if let Some(buffer) = existing {
-            let mut rebound = std::ptr::null_mut();
-            unsafe {
-                status::check(abi::apxinf_gemm_rebind_weight(
-                    ctx.runtime(),
-                    selected.0,
-                    buffer.ptr(),
-                    policy,
-                    &mut rebound,
-                ))?;
+        if layouts == (1u32 << 4) && canonical.is_some() {
+            lease = canonical.expect("live canonical layout");
+            bind_storage(&lease, spec, bindings, storage);
+            spec.b_layout = 0;
+            let mut layout = 0;
+            execution = prepare_native(ctx, spec, policy, bindings, Some(&mut layout))?;
+            if layout != 4 {
+                return Err(invalid("canonical-only selection changed layout"));
             }
-            if rebound.is_null() {
-                return Err(invalid("shared weight binding returned null"));
-            }
-            spec.b_layout = layout;
-            bindings.b = buffer.ptr();
-            storage.push(buffer);
-            NativeExecution(rebound)
-        } else if cache
-            .buffers
-            .values()
-            .map(CudaBuffer::len)
-            .sum::<usize>()
-            .checked_add(trial.len())
-            .is_some_and(|bytes| bytes <= cache.budget)
-        {
-            spec.b_layout = layout;
-            bindings.b = trial.ptr();
-            cache.buffers.insert(layout, trial.clone());
-            if std::env::var_os("APXINF_GEMM_REPORT").is_some() {
-                eprintln!(
-                    "[apxinf-gemm-weight] k={} n={} layout={} extra_bytes={} cached_layouts={}",
-                    spec.k,
-                    spec.n,
-                    layout,
-                    cache.buffers.values().map(CudaBuffer::len).sum::<usize>(),
-                    cache.buffers.len()
-                );
-            }
-            storage.push(trial);
-            selected
+            spec.b_layout = 4;
         } else {
-            // A caller-supplied budget is a hard constraint. Keep the base
-            // representation and tune compatible implementations without ever
-            // changing an allocation referenced by an older execution.
-            drop(selected);
-            spec.b_layout = weight.layout;
-            bindings.b = weight.buffer.ptr();
-            prepare_native(ctx, spec, policy, bindings, None)?
+            let trial =
+                CudaBuffer::alloc(weight.buffer.len(), ctx.device_id()).map_err(Error::Cuda)?;
+            if let Some(canonical) = weight.extra(4) {
+                relayout(&canonical.buffer, &trial, spec, 4, 4, bindings.stream)?;
+            } else {
+                relayout(
+                    &weight.buffer,
+                    &trial,
+                    spec,
+                    weight.layout,
+                    4,
+                    bindings.stream,
+                )?;
+            }
+            let mut trial_spec = *spec;
+            trial_spec.b_layout = 0;
+            let mut trial_bindings = *bindings;
+            trial_bindings.b = trial.ptr();
+            let mut layout = 0;
+            let selected =
+                prepare_native(ctx, &trial_spec, policy, &trial_bindings, Some(&mut layout))?;
+            let choice = execution_choice(&selected)?;
+            weight
+                .cache
+                .as_mut()
+                .expect("layout choices")
+                .choices
+                .insert(key.clone(), choice);
+            if layout == weight.layout {
+                lease = weight.lease_base();
+                bind_storage(&lease, spec, bindings, storage);
+                execution = prepare_choice(ctx, spec, policy, bindings, &choice)?;
+            } else if let Some(existing) = weight.extra(layout) {
+                lease = existing;
+                bind_storage(&lease, spec, bindings, storage);
+                execution = prepare_choice(ctx, spec, policy, bindings, &choice)?;
+            } else if base_available && can_restore_base {
+                // Other graphs may lease extra layouts while the original
+                // allocation is unused. Reuse that address for a new choice.
+                rewrite_base(weight, spec, layout, bindings.stream, Some(&trial))?;
+                lease = weight.lease_base();
+                bind_storage(&lease, spec, bindings, storage);
+                execution = prepare_choice(ctx, spec, policy, bindings, &choice)?;
+            } else if can_add_layout(weight) {
+                lease = extra_lease(weight, trial, layout);
+                bind_storage(&lease, spec, bindings, storage);
+                execution = selected;
+            } else {
+                spec.b_layout = weight.layout;
+                bindings.b = weight.buffer.ptr();
+                execution = prepare_native(ctx, spec, policy, bindings, None)?;
+                // Do not replace the independently selected choice with this
+                // budget-constrained fallback.
+                return Ok((execution, weight.lease_base()));
+            }
         }
     } else {
-        let unprepared = spec.b_layout == 0;
-        let execution = prepare_native(
+        spec.b_layout = weight.layout;
+        bindings.b = weight.buffer.ptr();
+        let unprepared = weight.layout == 0;
+        execution = prepare_native(
             ctx,
             spec,
             policy,
             bindings,
             unprepared.then_some(&mut weight.layout),
         )?;
-        if unprepared {
-            spec.b_layout = weight.layout;
-        }
-        execution
-    };
-    if let Some(cache) = weight.cache.as_mut() {
-        cache.choices.insert(choice, spec.b_layout);
+        spec.b_layout = weight.layout;
+        lease = weight.lease_base();
     }
-    Ok(execution)
+    if weight.cache.is_some() {
+        let choice = execution_choice(&execution)?;
+        weight
+            .cache
+            .as_mut()
+            .expect("layout choices")
+            .choices
+            .insert(key, choice);
+    }
+    Ok((execution, lease))
 }
 
 pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Execution>> {
@@ -336,7 +497,9 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
                 .map_err(|_| invalid("weight state lock poisoned"))
         })
         .transpose()?;
-    if let Some(weight) = weight_guard.as_ref() {
+    // Keep a discovered live extra leased until native preparation binds it.
+    let mut selected_storage = None;
+    if let Some(weight) = weight_guard.as_mut() {
         if bindings.b_is_immutable == 0 {
             return Err(invalid(
                 "repacked weights must be immutable after preparation",
@@ -359,20 +522,19 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
                 "weight layout state has different geometry or dtype",
             ));
         }
-        spec.b_layout = weight
+        weight.prune_layouts();
+        let layout = weight
             .cache
             .as_ref()
-            .and_then(|cache| cache.choices.get(&choice_key).copied())
+            .and_then(|cache| cache.choices.get(&choice_key))
+            .map(|choice| choice.weight_layout)
             .unwrap_or(weight.layout);
-        if spec.b_layout != weight.layout {
-            let buffer = weight
-                .cache
-                .as_ref()
-                .and_then(|cache| cache.buffers.get(&spec.b_layout))
-                .ok_or_else(|| invalid("selected shared weight layout is missing"))?
-                .clone();
-            bindings.b = buffer.ptr().cast_const();
-            storage.push(buffer);
+        spec.b_layout = weight.layout;
+        if layout != weight.layout {
+            if let Some(lease) = weight.extra(layout) {
+                bind_storage(&lease, &mut spec, &mut bindings, &mut storage);
+                selected_storage = Some(lease);
+            }
         }
     }
     let key = ExecutionKey::new(ctx, spec, bindings, &options);
@@ -402,8 +564,8 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
             .as_ref()
             .map_or(std::ptr::null(), |path| path.as_ptr()),
     };
-    let native = if let Some(weight) = weight_guard.as_mut() {
-        prepare_weight(
+    let (native, weight_lease) = if let Some(weight) = weight_guard.as_mut() {
+        let (native, lease) = prepare_weight(
             ctx,
             weight,
             choice_key,
@@ -411,10 +573,12 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
             &policy,
             &mut bindings,
             &mut storage,
-        )?
+        )?;
+        (native, Some(lease))
     } else {
-        prepare_native(ctx, &spec, &policy, &bindings, None)?
+        (prepare_native(ctx, &spec, &policy, &bindings, None)?, None)
     };
+    drop(selected_storage);
     let raw = native.into_raw();
     let key = ExecutionKey::new(ctx, spec, bindings, &options);
     #[cfg(test)]
@@ -427,6 +591,7 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
         raw,
         stream: ctx.shared_stream(),
         _storage: storage,
+        _weight_lease: weight_lease,
         #[cfg(test)]
         summary,
         _not_send: PhantomData,

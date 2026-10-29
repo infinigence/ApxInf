@@ -486,40 +486,61 @@ extern "C" apxinf_status_t apxinf_gemm_candidate_layouts(
   });
 }
 
-extern "C" apxinf_status_t apxinf_gemm_rebind_weight(
-    apxinf_runtime_t runtime, apxinf_gemm_execution_t source,
-    const void* weight, const apxinf_gemm_policy_t* policy,
-    apxinf_gemm_execution_t* output) {
+extern "C" apxinf_status_t apxinf_gemm_get_choice(
+    apxinf_gemm_execution_t source, apxinf_gemm_choice_t* choice) {
+  return apxinf::gemm::abi_boundary([&] {
+    const auto* execution = reinterpret_cast<const Execution*>(source);
+    if (execution == nullptr || choice == nullptr) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM choice query");
+    }
+    *choice = {execution->implementation->provider_id,
+               execution->implementation->implementation_id,
+               execution->implementation->implementation_version,
+               execution->configuration, execution->spec.b_layout,
+               execution->resource_limit};
+  });
+}
+
+extern "C" apxinf_status_t apxinf_gemm_prepare_choice(
+    apxinf_runtime_t runtime, const apxinf_gemm_spec_t* spec,
+    const apxinf_gemm_policy_t* policy, const apxinf_gemm_bindings_t* bindings,
+    const apxinf_gemm_choice_t* choice, apxinf_gemm_execution_t* output) {
   if (output != nullptr) *output = nullptr;
   return apxinf::gemm::abi_boundary([&] {
-    const auto* original = reinterpret_cast<const Execution*>(source);
-    if (runtime == nullptr || original == nullptr || weight == nullptr ||
-        policy == nullptr || output == nullptr || runtime->device != original->device) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid shared weight binding");
+    if (runtime == nullptr || spec == nullptr || policy == nullptr ||
+        bindings == nullptr || choice == nullptr || output == nullptr) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM choice binding");
     }
+    apxinf::gemm::Spec normalized{};
+    static_cast<apxinf_gemm_spec_t&>(normalized) = *spec;
+    validate_spec(normalized);
     validate_policy(*policy);
-    auto bindings = original->bindings;
-    bindings.b = weight;
-    validate_bindings(original->spec, bindings, true);
+    validate_bindings(normalized, *bindings, true);
+    if (normalized.b_layout == 0 || normalized.b_layout != choice->weight_layout) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "GEMM choice layout mismatch");
+    }
+    apxinf::gemm::check_cuda(cudaSetDevice(runtime->device));
     cudaStreamCaptureStatus capture;
     apxinf::gemm::check_cuda(cudaStreamIsCapturing(
-        static_cast<cudaStream_t>(bindings.stream), &capture));
+        static_cast<cudaStream_t>(bindings->stream), &capture));
     if (capture != cudaStreamCaptureStatusNone) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "bind shared weights before capture");
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "bind GEMM choices before capture");
+    }
+    const Recipe recipe{choice->provider_id, choice->implementation_id,
+                        choice->implementation_version, choice->configuration};
+    const auto* implementation = find_implementation(recipe, normalized, runtime->device);
+    if (implementation == nullptr) {
+      throw Failure(APXINF_STATUS_UNSUPPORTED, "GEMM choice no longer supports the Spec");
     }
     auto binding_policy = *policy;
     binding_policy.workspace_limit = std::min<uint64_t>(
-        binding_policy.workspace_limit, original->resource_limit);
-    auto execution = apxinf::gemm::prepare(*original->implementation,
-        original->configuration, original->spec, binding_policy, bindings, original->device);
-    execution->summary = original->summary + " shared-layout";
-    const auto keys = apxinf::gemm::tuning_keys(execution->spec, binding_policy, runtime->device);
-    {
-      std::lock_guard<std::mutex> lock(runtime->gemm_mutex);
-      runtime->gemm_recipes[keys.key] = Recipe{execution->implementation->provider_id,
-          execution->implementation->implementation_id,
-          execution->implementation->implementation_version, execution->configuration};
-    }
+        binding_policy.workspace_limit, choice->resource_limit);
+    auto execution = apxinf::gemm::prepare(*implementation, choice->configuration,
+        normalized, binding_policy, *bindings, runtime->device);
+    execution->summary = std::string(implementation->name) +
+        " config=" + std::to_string(choice->configuration) +
+        " workspace=" + std::to_string(execution->resource_bytes) +
+        " source=profile-choice";
     *output = reinterpret_cast<apxinf_gemm_execution_t>(execution.release());
   });
 }
