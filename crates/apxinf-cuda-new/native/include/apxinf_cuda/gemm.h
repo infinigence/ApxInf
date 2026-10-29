@@ -6,6 +6,14 @@
 extern "C" {
 #endif
 
+apxinf_status_t apxinf_gemm_fp8_gemv(
+    const void* weight, const void* activation, void* output, int64_t n,
+    int64_t k, float alpha, apxinf_cuda_stream_t stream);
+apxinf_status_t apxinf_gemm_nvfp4_gemv(
+    const void* weight, const void* weight_scales, const void* activation,
+    const void* activation_scales, void* output, int64_t n, int64_t k,
+    float alpha, apxinf_cuda_stream_t stream);
+
 typedef struct apxinf_gemm_execution* apxinf_gemm_execution_t;
 
 apxinf_status_t apxinf_gemm_prepare(

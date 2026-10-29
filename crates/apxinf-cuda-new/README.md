@@ -7,13 +7,18 @@ Preparation and graph capture have different owners. GEMM and Attention may own 
 - Current public interfaces and mathematical semantics: [L3 operator catalog](cuda-operator.md)
 - Workflow for adding or extending a kernel: [Adding New Kernels](../../doc/adding-new-kernels.md)
 
-The direct PI05 RMSNorm interface is `ops::rms_norm(ctx, RmsNormArgs)`.
-The BF16 MLP helper remains available as
-`ops::mlp::rms_norm(ctx, input, weight, output, epsilon)`; it has a distinct
-signature and is used by the Qwen integration tests.
-GEMM Spec version 6 combines NVFP4 block-scale bindings with the
-`GEMM_BIAS_RESIDUAL` semantic. Version 5 specs are rejected rather than reused
-across these incompatible layouts.
+The norm family exposes exactly three caller-owned L3 entries:
+`ops::norm::norm(ctx, NormArgs)`, `ops::fused_add_norm(ctx, FusedAddNormArgs)`,
+and `ops::residual_add(ctx, ResidualAddArgs)`. RMS/Layer statistics, affine
+form, gating, rounding order, numerical compatibility and optional quantization
+are fields rather than additional function names. Norm Spec version 6 carries
+the common operation/statistic/affine/gate/quantization axes directly; the
+previous nine-value combination semantic is rejected. The planning-compatible
+weighted-adaptive and unit-offset-gate implementations are selected behind the
+same three L3 entries while their remaining private launch ABIs are retired.
+GEMM Spec version 9 includes the provider-neutral `GemmNumerics` constraint in
+the execution and recipe key. Older specs are rejected rather than reused
+across incompatible contracts.
 
 ## Operator Layers: L3 to L0
 

@@ -5,10 +5,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use apxinf_core::{Backend, DType, Device, Error, Result, Shape, Tensor};
-use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, PreparedPhase};
+use apxinf_cuda_new::{ops, CudaBuffer, CudaContext, CudaNewBackend, PreparedPhase};
 use apxinf_loader::ModelConfig;
 
-use crate::accelerator::create_backend;
 use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
 
 use super::config::{
@@ -26,9 +25,8 @@ use super::{backend, model, model_runner, vision, weights};
 /// validated configuration. The kernel harness keeps its own switches for A/B
 /// comparison.
 pub struct Qwen38 {
-    ctx: CudaContext,
-    /// Existing model-neutral sampling backend. Vision and language compute
-    /// remain on `ctx`; this field is used only by `LlmTrait` token sampling.
+    ctx: Arc<CudaContext>,
+    /// Model-neutral sampling backend sharing the model CUDA context.
     backend: Arc<dyn Backend>,
     model: weights::Model,
     /// Some text-only checkpoints intentionally omit the visual tower.
@@ -63,6 +61,16 @@ impl Qwen38 {
         device: Device,
         kv_capacity: usize,
     ) -> Result<Self> {
+        Self::new_with_recipe_options(weights, device, kv_capacity, true, None)
+    }
+
+    pub(crate) fn new_with_recipe_options(
+        weights: HashMap<String, Tensor>,
+        device: Device,
+        kv_capacity: usize,
+        allow_online_tune: bool,
+        recipe_cache_dir: Option<String>,
+    ) -> Result<Self> {
         let Device::Cuda(ordinal) = device else {
             return Err(Error::Other("qwen38 requires a CUDA device".into()));
         };
@@ -75,8 +83,10 @@ impl Qwen38 {
         // configuration. TODO(cuda-new): promote to per-call arguments.
         model_runner::apply_validated_kernel_defaults();
 
-        let ctx = CudaContext::new(ordinal).map_err(Error::Cuda)?;
-        let backend = create_backend(device)?;
+        let ctx = Arc::new(
+            CudaContext::new_with_recipe_options(ordinal, allow_online_tune, recipe_cache_dir)
+                .map_err(Error::Cuda)?,
+        );
         let vision = weights
             .contains_key("model.visual.patch_embed.proj.weight")
             .then(|| VisionWeights::load(&weights, &ctx))
@@ -84,6 +94,11 @@ impl Qwen38 {
         let model = weights::load_model(&ctx, &weights, true);
         ctx.synchronize().map_err(Error::Cuda)?;
         drop(weights);
+        // The sampling surface is the only part of `LlmTrait` that needs a
+        // `dyn Backend`; everything else already runs on `ctx` through
+        // `apxinf_cuda_new::ops`. Sharing one context between the model and
+        // the backend keeps the sampler on the same stream and device.
+        let backend: Arc<dyn Backend> = Arc::new(CudaNewBackend::from_context(ctx.clone()));
 
         let capacity = kv_capacity.next_power_of_two();
         let gdn_states: Vec<model::GdnState> = (0..LAYERS - LAYERS / FULL_ATTENTION_INTERVAL)
@@ -110,6 +125,23 @@ impl Qwen38 {
             rope_delta: 0,
             kv_capacity: capacity,
         })
+    }
+
+    pub(crate) fn load_with_recipe_options(
+        config: ModelConfig,
+        weights: HashMap<String, Tensor>,
+        device: Device,
+        allow_online_tune: bool,
+        recipe_cache_dir: Option<String>,
+    ) -> Result<Self> {
+        let capacity = config.max_seq_len.max(MIN_KV_CAPACITY);
+        Self::new_with_recipe_options(
+            weights,
+            device,
+            capacity,
+            allow_online_tune,
+            recipe_cache_dir,
+        )
     }
 
     fn ensure_graphs(&mut self) {

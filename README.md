@@ -593,7 +593,11 @@ entry point — the raw tokens — and L2 turns them into actions:
 ```python
 from apxinf import AutoPolicy
 
-policy = AutoPolicy.from_pretrained("<path-to-model>", precision="bf16")
+policy = AutoPolicy.from_pretrained(
+    "<path-to-model>",
+    precision="bf16",
+    state_key="observation/state",
+)
 
 # L1: raw FAST action tokens, uint32 [max_action_tokens]
 tokens = policy.model.infer_action_tokens_rgb(rgb, "nhwc", token_ids)

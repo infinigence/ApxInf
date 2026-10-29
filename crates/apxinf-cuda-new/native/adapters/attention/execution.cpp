@@ -30,13 +30,15 @@ void validate_spec(const Spec& spec) {
   const bool native_output = spec.output_dtype == spec.dtype;
   const bool static_e4m3_output =
       spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+      spec.qkv_layout == APXINF_ATTENTION_QKV_LAYOUT_SEPARATE &&
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
-  if (spec.version != 4 ||
-      spec.semantic > APXINF_ATTENTION_SEMANTIC_PACKED_QKV ||
+  if (spec.version != 6 ||
+      spec.semantic > APXINF_ATTENTION_SEMANTIC_SEGMENTED ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!native_output && !static_e4m3_output) ||
       spec.mask > APXINF_ATTENTION_MASK_CAUSAL || spec.batch <= 0 ||
+      spec.qkv_layout > APXINF_ATTENTION_QKV_LAYOUT_PACKED_TOKEN ||
       spec.query_tokens <= 0 || spec.key_tokens <= 0 ||
       spec.key_capacity < spec.key_tokens ||
       spec.query_heads <= 0 || spec.kv_heads <= 0 || spec.head_dim <= 0 ||
@@ -46,7 +48,8 @@ void validate_spec(const Spec& spec) {
       spec.query_heads > INT32_MAX || spec.kv_heads > INT32_MAX ||
       spec.head_dim > INT32_MAX || spec.query_start > INT32_MAX ||
       spec.segments > INT32_MAX || spec.max_segment_tokens > INT32_MAX ||
-      spec.scale_is_default > 1 || spec.dynamic_decode > 1) {
+      spec.scale_is_default > 1 || spec.dynamic_decode > 1 ||
+      spec.numerics > APXINF_ATTENTION_NUMERICS_STABLE) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Attention Spec");
   }
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
@@ -61,16 +64,22 @@ void validate_spec(const Spec& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid dense Attention semantic fields");
   }
-  if (spec.semantic == APXINF_ATTENTION_SEMANTIC_PACKED_QKV &&
+  if (spec.qkv_layout == APXINF_ATTENTION_QKV_LAYOUT_PACKED_TOKEN &&
+      (spec.semantic != APXINF_ATTENTION_SEMANTIC_DENSE ||
       (spec.key_tokens != spec.query_tokens ||
-       spec.key_capacity != spec.query_tokens ||
-       spec.query_heads != spec.kv_heads ||
-       spec.mask != APXINF_ATTENTION_MASK_NONE || spec.query_start != 0 ||
-       spec.segments != 0 || spec.max_segment_tokens != 0 ||
-       spec.offsets_hash != 0 || spec.offsets_alignment != 0 ||
-       spec.output_dtype != spec.dtype)) {
+        spec.key_capacity != spec.query_tokens ||
+        spec.query_heads != spec.kv_heads ||
+        spec.mask != APXINF_ATTENTION_MASK_NONE || spec.query_start != 0 ||
+        spec.segments != 0 || spec.max_segment_tokens != 0 ||
+        spec.offsets_hash != 0 || spec.offsets_alignment != 0 ||
+        spec.output_dtype != spec.dtype))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
-                  "invalid packed-QKV Attention semantic fields");
+                  "invalid packed-QKV Attention layout fields");
+  }
+  if (spec.semantic != APXINF_ATTENTION_SEMANTIC_DENSE &&
+      spec.qkv_layout != APXINF_ATTENTION_QKV_LAYOUT_SEPARATE) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "non-dense Attention requires separate Q/K/V layout");
   }
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
       ((spec.dynamic_decode != 0 &&
@@ -195,25 +204,45 @@ const apxinf::attention::Implementation* find_implementation(
 std::unique_ptr<Execution> fallback(
     const Spec& spec, const apxinf_attention_policy_t& policy,
     const apxinf_attention_bindings_t& bindings, int device) {
-  for (const auto& implementation :
-       apxinf::attention::registry(spec.semantic)) {
-    if (!implementation.fallback ||
-        !apxinf::attention::supports_device(implementation, device) ||
-        !implementation.supports(spec) ||
-        (policy.graph_safe && !implementation.graph_safe) ||
-        (policy.deterministic && !implementation.deterministic)) {
-      continue;
-    }
-    std::vector<int> configurations;
-    implementation.enumerate_configs(spec, configurations);
-    for (int configuration : configurations) {
-      try {
-        return apxinf::attention::prepare(
-            implementation, configuration, spec, policy, bindings, device);
-      } catch (const Failure&) {
-        cudaGetLastError();
+  constexpr uint32_t kProviderFa2 = 2;
+  const auto& implementations = apxinf::attention::registry(spec.semantic);
+  auto prepare_first_supported = [&](uint32_t provider_id,
+                                     bool exclude_provider)
+      -> std::unique_ptr<Execution> {
+    for (const auto& implementation : implementations) {
+      if ((provider_id != 0 &&
+           (implementation.provider_id == provider_id) == exclude_provider) ||
+          !apxinf::attention::supports_device(implementation, device) ||
+          !implementation.supports(spec) ||
+          (policy.graph_safe && !implementation.graph_safe) ||
+          (policy.deterministic && !implementation.deterministic)) {
+        continue;
+      }
+      std::vector<int> configurations;
+      implementation.enumerate_configs(spec, configurations);
+      for (int configuration : configurations) {
+        try {
+          return apxinf::attention::prepare(
+              implementation, configuration, spec, policy, bindings, device);
+        } catch (const Failure&) {
+          cudaGetLastError();
+        }
       }
     }
+    return nullptr;
+  };
+
+  // FA2 is the portable, production-scale no-timing baseline.  Trying an
+  // exact specialization first made a clean PI0.5 run materially slower than
+  // the tuned recipe even though FA2 was the winner for the same Spec.
+  if (auto execution = prepare_first_supported(kProviderFa2, false)) {
+    return execution;
+  }
+  // Continue with the remaining specializations and finally the portable
+  // cuBLAS/custom implementations. Preparation neither benchmarks candidates
+  // nor persists a recipe.
+  if (auto execution = prepare_first_supported(kProviderFa2, true)) {
+    return execution;
   }
   throw Failure(APXINF_STATUS_UNSUPPORTED,
                 "no Attention fallback satisfies the Spec and Policy");

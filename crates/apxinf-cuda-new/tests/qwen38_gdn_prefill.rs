@@ -22,7 +22,10 @@ fn upload_bf16(ctx: &CudaContext, values: &[f32], dims: Vec<usize>) -> Tensor {
 }
 
 fn upload_f32(ctx: &CudaContext, values: &[f32], dims: Vec<usize>) -> Tensor {
-    let bytes: Vec<u8> = values.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
     let buffer = CudaBuffer::alloc(bytes.len(), ctx.device_id()).unwrap();
     buffer.copy_from_host(&bytes).unwrap();
     buffer.as_tensor(Shape::new(dims), DType::F32).unwrap()
@@ -66,7 +69,11 @@ fn cosine_rel_l2(got: &[f32], want: &[f32]) -> (f64, f64) {
     } else {
         1.0
     };
-    let rel = if nw > 0.0 { (diff / nw).sqrt() } else { diff.sqrt() };
+    let rel = if nw > 0.0 {
+        (diff / nw).sqrt()
+    } else {
+        diff.sqrt()
+    };
     (cos, rel)
 }
 
@@ -193,7 +200,20 @@ fn chunked_prefill_state_matches_single_token_decode() {
     let dg = upload_f32(&ctx, &pf_g, vec![seq_padded, V_HEADS]);
     let db = upload_f32(&ctx, &pf_b, vec![seq_padded, V_HEADS]);
     ops::gdn_chunk_scan(
-        &ctx, &dq, &dk, &dv, &dg, &db, &pf_out, &pf_state, V_HEADS, K_HEADS, CHUNK,
+        &ctx,
+        ops::GdnChunkScanArgs {
+            input: ops::GdnChunkScanInput::Split {
+                q: &dq,
+                k: &dk,
+                v: &dv,
+            },
+            gate_log: &dg,
+            beta: &db,
+            output: &pf_out,
+            state: &pf_state,
+            key_heads: K_HEADS,
+            chunk_size: CHUNK,
+        },
     )
     .unwrap();
     ctx.synchronize().unwrap();
@@ -229,6 +249,109 @@ fn chunked_prefill_state_matches_single_token_decode() {
         worst_rel <= 0.01,
         "prefill state diverged from decode: worst relL2 {worst_rel}"
     );
+}
+
+#[test]
+fn chunk_scan_layout_is_one_contract_and_replays_in_graph() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (tokens, k_heads, v_heads, dim, chunk) = (64, 1, 1, 128, 64);
+    let q = (0..tokens * k_heads * dim)
+        .map(|index| ((index as f32) * 0.011).sin())
+        .collect::<Vec<_>>();
+    let k = (0..tokens * k_heads * dim)
+        .map(|index| ((index as f32) * 0.013).cos())
+        .collect::<Vec<_>>();
+    let v = (0..tokens * v_heads * dim)
+        .map(|index| ((index as f32) * 0.017).sin() * 0.5)
+        .collect::<Vec<_>>();
+    let gate_log = (0..tokens * v_heads)
+        .map(|index| -0.01 - (index % 7) as f32 * 0.003)
+        .collect::<Vec<_>>();
+    let beta = (0..tokens * v_heads)
+        .map(|index| 0.2 + (index % 5) as f32 * 0.1)
+        .collect::<Vec<_>>();
+    let row_width = (2 * k_heads + v_heads) * dim;
+    let mut fused = vec![0.0_f32; tokens * row_width];
+    for token in 0..tokens {
+        let row = token * row_width;
+        let q_row = token * k_heads * dim;
+        let v_row = token * v_heads * dim;
+        fused[row..row + k_heads * dim].copy_from_slice(&q[q_row..q_row + k_heads * dim]);
+        fused[row + k_heads * dim..row + 2 * k_heads * dim]
+            .copy_from_slice(&k[q_row..q_row + k_heads * dim]);
+        fused[row + 2 * k_heads * dim..row + row_width]
+            .copy_from_slice(&v[v_row..v_row + v_heads * dim]);
+    }
+
+    let q = upload_bf16(&ctx, &q, vec![tokens, k_heads, dim]);
+    let k = upload_bf16(&ctx, &k, vec![tokens, k_heads, dim]);
+    let v = upload_bf16(&ctx, &v, vec![tokens, v_heads, dim]);
+    let fused = upload_bf16(&ctx, &fused, vec![tokens, row_width]);
+    let gate_log = upload_f32(&ctx, &gate_log, vec![tokens, v_heads]);
+    let beta = upload_f32(&ctx, &beta, vec![tokens, v_heads]);
+    let split_output = upload_bf16(
+        &ctx,
+        &vec![0.0; tokens * v_heads * dim],
+        vec![tokens, v_heads, dim],
+    );
+    let fused_output = upload_bf16(
+        &ctx,
+        &vec![0.0; tokens * v_heads * dim],
+        vec![tokens, v_heads, dim],
+    );
+    let split_state = upload_f32(
+        &ctx,
+        &vec![0.0; v_heads * dim * dim],
+        vec![v_heads, dim, dim],
+    );
+    let fused_state = upload_f32(
+        &ctx,
+        &vec![0.0; v_heads * dim * dim],
+        vec![v_heads, dim, dim],
+    );
+
+    ops::gdn_chunk_scan(
+        &ctx,
+        ops::GdnChunkScanArgs {
+            input: ops::GdnChunkScanInput::Split {
+                q: &q,
+                k: &k,
+                v: &v,
+            },
+            gate_log: &gate_log,
+            beta: &beta,
+            output: &split_output,
+            state: &split_state,
+            key_heads: k_heads,
+            chunk_size: chunk,
+        },
+    )
+    .unwrap();
+    ctx.synchronize().unwrap();
+
+    let graph = apxinf_cuda_new::capture(&ctx, || {
+        ops::gdn_chunk_scan(
+            &ctx,
+            ops::GdnChunkScanArgs {
+                input: ops::GdnChunkScanInput::Interleaved {
+                    fused: &fused,
+                    offsets: [0, k_heads * dim, 2 * k_heads * dim],
+                },
+                gate_log: &gate_log,
+                beta: &beta,
+                output: &fused_output,
+                state: &fused_state,
+                key_heads: k_heads,
+                chunk_size: chunk,
+            },
+        )
+    })
+    .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+
+    assert_eq!(read_bf16(&fused_output), read_bf16(&split_output));
+    assert_eq!(read_f32(&fused_state), read_f32(&split_state));
 }
 
 // -------------------------------------------------------------------------
@@ -315,9 +438,14 @@ on purpose."
     let (_g_shape, g_data) = load_npy_f32(&format!("{dir}/l0_10_g_log_decay.npy"));
     let (_b_shape, b_data) = load_npy_f32(&format!("{dir}/l0_09_beta.npy"));
 
-    let seq = q_shape[1];
-    let k_heads = q_shape[2];
-    let dim = q_shape[3];
+    let (seq, k_heads, dim) = match q_shape.as_slice() {
+        // Current reference snapshots store the leading batch dimension
+        // squeezed and flatten heads into the final width.
+        [seq, width] => (*seq, K_HEADS, *width / K_HEADS),
+        // Keep accepting older snapshots that retained [batch, seq, heads, dim].
+        [_, seq, heads, dim] => (*seq, *heads, *dim),
+        shape => panic!("unexpected q reference shape: {shape:?}"),
+    };
     let v_heads = V_HEADS;
     assert_eq!(dim, DIM);
     assert_eq!(k_heads, K_HEADS);
@@ -364,7 +492,20 @@ on purpose."
     let dg = upload_f32(&ctx, &pf_g, vec![seq_padded, v_heads]);
     let db = upload_f32(&ctx, &pf_b, vec![seq_padded, v_heads]);
     ops::gdn_chunk_scan(
-        &ctx, &dq, &dk, &dv, &dg, &db, &pf_out, &pf_state, v_heads, k_heads, CHUNK,
+        &ctx,
+        ops::GdnChunkScanArgs {
+            input: ops::GdnChunkScanInput::Split {
+                q: &dq,
+                k: &dk,
+                v: &dv,
+            },
+            gate_log: &dg,
+            beta: &db,
+            output: &pf_out,
+            state: &pf_state,
+            key_heads: k_heads,
+            chunk_size: CHUNK,
+        },
     )
     .unwrap();
     ctx.synchronize().unwrap();
@@ -383,20 +524,26 @@ on purpose."
     let (out_cos, out_rel) = cosine_rel_l2(&got_out, &ref_out);
     println!("core_attn_out (l0_16): cosine {out_cos:.6}  relL2 {out_rel:.5}");
 
-    // --- final state: kernel port [v_heads, v_dim, k_dim] = S[v][k]
-    //     ref [1, v_heads, k_dim, v_dim] = S_ref[k][v]. Transpose to compare.
+    // --- final state: the official torch snapshot is [v_heads, k_dim, v_dim],
+    //     while cuda-new deliberately keeps [v_heads, v_dim, k_dim] so the
+    //     prefill result can be consumed directly by recurrent decode.  The
+    //     shipped Qwen3.8 dimensions are square, so comparing the two flat
+    //     buffers without this transpose silently compares different cells.
     let state = read_f32(&pf_state);
-    let (_s_shape, ref_state) = load_npy_f32(&format!("{dir}/l0_15_recurrent_state_final.npy"));
-    let mut got_state = vec![0.0f32; v_heads * dim * dim];
+    let (s_shape, ref_state) = load_npy_f32(&format!("{dir}/l0_15_recurrent_state_final.npy"));
+    assert!(
+        s_shape.as_slice() == [v_heads, dim, dim] || s_shape.as_slice() == [1, v_heads, dim, dim],
+        "unexpected recurrent-state reference shape: {s_shape:?}"
+    );
+    let mut ref_state_vk = vec![0.0f32; ref_state.len()];
     for h in 0..v_heads {
-        for kk in 0..dim {
-            for vv in 0..dim {
-                // ref index [h][k][v] -> our port [h][v][k]
-                got_state[(h * dim + kk) * dim + vv] = state[(h * dim + vv) * dim + kk];
+        for k in 0..dim {
+            for v in 0..dim {
+                ref_state_vk[(h * dim + v) * dim + k] = ref_state[(h * dim + k) * dim + v];
             }
         }
     }
-    let (st_cos, st_rel) = cosine_rel_l2(&got_state, &ref_state);
+    let (st_cos, st_rel) = cosine_rel_l2(&state, &ref_state_vk);
     println!("recurrent_state_final (l0_15): cosine {st_cos:.6}  relL2 {st_rel:.5}");
 
     assert!(

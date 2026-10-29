@@ -116,7 +116,6 @@ fn upcast_bf16_weights(tensors: &mut HashMap<String, Tensor>) -> Result<()> {
     Ok(())
 }
 
-
 /// Qwen3.8-27B-NVFP4 on CUDA: safetensors shards in the checkpoint directory,
 /// validated default execution (FlashInfer-GDN prefill, CUDA-graph decode,
 /// split-KV attention).
@@ -125,12 +124,18 @@ fn load_qwen38(
     path: &Path,
     device: Device,
     _backend: Arc<dyn Backend>,
-    _options: &LoadOptions,
+    options: &LoadOptions,
 ) -> Result<LoadedModel> {
-    use crate::llm_trait::LlmTrait;
     let (tensors, metadata) = apxinf_loader::safetensors::load_native_path(path)
         .map_err(|error| Error::Other(format!("load {}: {error}", path.display())))?;
     let config = apxinf_loader::safetensors::config_from_metadata(&metadata);
-    let model = crate::qwen38::Qwen38::load(config, tensors, device)?;
+    let recipe = crate::auto::cuda_recipe_options(options)?;
+    let model = crate::qwen38::Qwen38::load_with_recipe_options(
+        config,
+        tensors,
+        device,
+        recipe.online_tune,
+        recipe.cache_dir,
+    )?;
     Ok(LoadedModel::text(Box::new(model)))
 }

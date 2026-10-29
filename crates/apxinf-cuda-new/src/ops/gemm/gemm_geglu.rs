@@ -15,5 +15,6 @@ pub struct GemmGegluArgs<'a> {
 }
 
 pub fn gemm_geglu(ctx: &CudaContext, args: GemmGegluArgs<'_>) -> Result<()> {
+    super::observer::observe(&args.gemm)?;
     execution::execute(ctx, normalize(ctx, args.gemm, Semantic::GemmGeglu, None)?)
 }

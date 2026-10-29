@@ -65,12 +65,22 @@ cudaDataType_t projection_cuda_dtype(const vendor::CommonResources& common) {
   return CUDA_R_16BF;
 }
 
+bool supports_native_bf16_bias(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+         spec.a_dtype == APXINF_DTYPE_BF16 &&
+         spec.b_dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.output_scale_is_unit != 0;
+}
+
 size_t common_requirement(const Spec& spec, bool native_fp8) {
   const bool needs_zero_bias =
       native_fp8 &&
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL &&
       spec.bias_alignment == 0;
-  return vendor::common_resource_requirements(spec, native_fp8) +
+  return vendor::common_resource_requirements(
+             spec, native_fp8, supports_native_bf16_bias(spec)) +
          (needs_zero_bias
               ? static_cast<size_t>(spec.n) * dtype_bytes(APXINF_DTYPE_F16)
               : 0);
@@ -87,7 +97,9 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   const int heuristic_rank =
       split_geglu ? state.configuration / 3 : state.configuration;
   resources->common.projection_dtype =
-      native_fp4 ? APXINF_DTYPE_BF16 : vendor::common_projection_dtype(spec);
+      (native_fp4 || supports_native_bf16_bias(spec))
+          ? spec.output_dtype
+          : vendor::common_projection_dtype(spec);
   const size_t c_buffer_bytes =
       (direct_fp8_gelu || split_geglu)
           ? static_cast<size_t>(spec.m * projection_stride) * sizeof(half)
@@ -151,10 +163,11 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
       spec.output_scale_is_unit != 0;
   const bool native_bias =
-      native_fp8 &&
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
-      spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
-      spec.output_scale_is_unit != 0;
+      (native_fp8 &&
+       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
+       spec.output_scale_is_unit != 0) ||
+      supports_native_bf16_bias(spec);
   if (native_bias_residual && state.bindings.bias == nullptr) {
     check_cuda(cudaMalloc(&resources->zero_bias,
                           static_cast<size_t>(spec.n) *
@@ -256,7 +269,8 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     resources->split_geglu = true;
     resources->common.resource_bytes = fixed_bytes;
   } else if (!native_fp4) {
-    vendor::allocate_common_resources(spec, resources->common, native_fp8);
+    vendor::allocate_common_resources(spec, resources->common, native_fp8,
+                                      supports_native_bf16_bias(spec));
   }
   if (resources->workspace_bytes != 0) {
     check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
