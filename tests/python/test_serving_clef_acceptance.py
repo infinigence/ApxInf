@@ -294,6 +294,77 @@ class ClefAcceptanceTests(unittest.TestCase):
         self.assertEqual(fixture.ready["worker"]["worker_epoch"], epoch)
         self.assertRegex(result["error"], r"^(TimeoutError|ValueError): .*settlement")
 
+    def test_settlement_deadline_rejects_late_successful_observations(self):
+        for expired_observation in (1, 2, 3):
+            with self.subTest(expired_observation=expired_observation):
+                fixture = ServiceFixture()
+                exchange = a.exchange
+                now = [100.0]
+                observations = []
+
+                def late_observation(base, method, endpoint, body, timeout):
+                    result = exchange(base, method, endpoint, body, timeout)
+                    observations.append(result)
+                    if len(observations) == expired_observation:
+                        now[0] += 3
+                    return result
+
+                with patch.object(a.time, "monotonic", side_effect=lambda: now[0]), \
+                        patch.object(a, "exchange", side_effect=late_observation):
+                    result = self.run_fixture(fixture, settlement_timeout=2)
+                self.assertFalse(result["passed"])
+                self.assertEqual(result["phase"], "initial_settlement")
+                self.assertEqual(fixture.posts, [])
+                self.assertEqual(len(result["exchanges"]), expired_observation)
+                self.assertEqual(result["raw_bodies"][-1], observations[-1].raw)
+                self.assertRegex(result["error"], r"^TimeoutError: .*settlement")
+
+    def test_metrics_transport_failure_keeps_its_error_before_settlement_deadline(self):
+        for expired in (False, True):
+            with self.subTest(expired=expired):
+                fixture = ServiceFixture()
+                exchange = a.exchange
+                now = [100.0]
+                failure = a.Exchange(None, (), b"partial metrics", "metrics request timed out")
+
+                def failed_metrics(base, method, endpoint, body, timeout):
+                    if endpoint == "/metrics":
+                        if expired:
+                            now[0] += 3
+                        return failure
+                    return exchange(base, method, endpoint, body, timeout)
+
+                with patch.object(a.time, "monotonic", side_effect=lambda: now[0]), \
+                        patch.object(a, "exchange", side_effect=failed_metrics):
+                    result = self.run_fixture(fixture, settlement_timeout=2)
+                self.assertFalse(result["passed"])
+                self.assertEqual(result["phase"], "initial_settlement")
+                self.assertEqual(fixture.posts, [])
+                self.assertEqual(result["raw_bodies"][-1], failure.raw)
+                self.assertEqual(result["exchanges"][-1]["error"], failure.error)
+                self.assertRegex(result["error"], r"^TimeoutError: .*settlement" if expired
+                                 else r"^ValueError: Metrics observation failed\.$")
+
+    def test_evidence_write_cannot_publish_a_late_settlement(self):
+        fixture = ServiceFixture()
+        save = a.save_report
+        now = [100.0]
+
+        def slow_final_observation(path, report):
+            save(path, report)
+            if report["phase"] == "initial_settlement" and len(report["exchanges"]) == 3:
+                now[0] += 3
+
+        with patch.object(a.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(a, "save_report", side_effect=slow_final_observation):
+            result = self.run_fixture(fixture, settlement_timeout=2)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["phase"], "initial_settlement")
+        self.assertEqual(fixture.posts, [])
+        self.assertEqual(len(result["exchanges"]), 3)
+        self.assertTrue(all(row["status"] == 200 for row in result["exchanges"]))
+        self.assertRegex(result["error"], r"^TimeoutError: .*settlement")
+
     def test_counter_fault_and_other_operations_fail(self):
         for fault in ("counter", "counter_decrease", "other_operation"):
             with self.subTest(fault=fault):
