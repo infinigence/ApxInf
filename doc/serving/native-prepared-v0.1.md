@@ -48,6 +48,6 @@ The coordinator updates resident accounting from the checked settlement record.
 It checks resident allocation plus sequence reservation before another execution.
 A public success still requires checked resource settlement.
 
-The public HTTP request and response schemas are unchanged.
+The profile preserves the public HTTP request and response schemas.
 Earlier protocols reject the new settlement field.
 This document does not establish device qualification or a performance improvement.
