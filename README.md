@@ -151,7 +151,7 @@ One MLX worker executes one request at a time.
 Read the [startup guide](doc/serving/local-service-v0.1.md) for the pinned
 environment, deployment limits, and supported API fields.
 Read the [validation report](doc/serving/text-provider-acceptance.md) for
-Qwen3.5-2B measurements and actual Claude Code tasks.
+provider limits and the distinction between implementation and device qualification.
 The [system design](doc/serving-system-design-20261009.md) defines the broader
 framework and staged extensions.
 This HTTP profile does not expose images, sessions, prefix reuse, or continuous batching.

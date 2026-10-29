@@ -80,7 +80,7 @@ Build the native executable with the existing MLX 0.31.2 C++ SDK.
 Select the provider and runtime files explicitly.
 The native provider does not fall back to Python.
 Its context limit permits 16384 positions with fixed 256-token prefill chunks.
-The [validation report](native-minicpm-acceptance.md) records measured deployment gates.
+The [validation report](native-minicpm-acceptance.md) separates implementation limits from device qualification.
 This limit includes the input and output reservation.
 
 ```sh
@@ -107,7 +107,7 @@ This profile uses temperature 1 and top-p 0.95 when the request omits both param
 Set request temperature to zero to select greedy generation.
 The ready response reports `sampling=true` and public profile `apxinf-native-sampled-v0.1`.
 Model thinking and image input remain disabled in this profile.
-For the measured 16K configuration, set `--max-context 16384 --max-output-tokens 4096`.
+For an explicitly selected 16K configuration, set `--max-context 16384 --max-output-tokens 4096`.
 The total includes prompt tokens and the requested output allowance.
 
 Select `--provider native-minicpm5-thinking` for the explicit [model thinking profile](native-thinking-v0.1.md).
@@ -125,8 +125,8 @@ The closing token uses one position within the existing output allowance.
 Readiness reports `initial_reasoning_budget_tokens=512` under public capabilities.
 The profile retains exact usage, the 16K total limit, and the unsupported Anthropic extended-thinking boundary.
 The original thinking provider retains its behavior without a separate reasoning budget.
-The [validation record](native-minicpm-acceptance.md) covers native controls and a completed real client tool cycle.
-The original pelican output still fails visual acceptance.
+The [validation record](native-minicpm-acceptance.md) describes the scope of native controls and remaining task-quality checks.
+Thinking controls do not establish drawing quality.
 The [default-policy record](native-minicpm-acceptance.md) tests 4096 output tokens without the private blocking-limit override.
 Its isolated bare client completes the short tool cycle, but the drawing still fails visual acceptance.
 
@@ -529,4 +529,4 @@ Follow [the benchmark guide](https://github.com/qhy991/ApxInf/blob/d82ae3b06631e
 Follow [the Metal experiments](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/metal-experiments.md) for controlled parameter comparisons.
 Tests must preserve raw failures and actual outputs.
 CPU test doubles cannot establish real inference or client compatibility.
-The [lifecycle report](supervisor-acceptance.md) separates the latest CPU checks from historical model measurements.
+The [lifecycle report](supervisor-acceptance.md) explains why CPU checks do not establish model or device qualification.
