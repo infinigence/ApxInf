@@ -81,32 +81,3 @@ CPU checks cover shape admission, context boundaries, overflow, and shared contr
 Larger context acceptance additionally requires production HTTP quality, memory, cancellation, and recovery evidence.
 The root integration report records that separate gate.
 Structural writing checks do not establish a complete dictionary review or certification.
-
-## Verification record
-
-The 4096-position profile passed the real-checkpoint gate on 2026-10-22 with `bf16-compiled`.
-The checkpoint revision was `f97400052a43d642bbc6e9975e2397e3ae6a6b52`.
-The test used one model instance under the shared Metal lock.
-
-| Input tokens | Maximum absolute logit error | Matching greedy token |
-| --- | --- | --- |
-| 255 | 0.03125 | 285 |
-| 256 | 0.03125 | 17101 |
-| 257 | 0.25 | 16682 |
-| 513 | 0.21875 | 285 |
-
-All compared logits were finite.
-The invalid token at index 400 caused rejection before a callback or consumed position change.
-Cancellation before prefill consumed zero tokens.
-Cancellation after the first chunk consumed 256 tokens without sampling an output token.
-Release and subsequent prefill and generation succeeded on the same instance.
-The recovered 257-token request retained its original greedy token and emitted one progress boundary per chunk.
-
-The initial three CPU shape tests and 15 shared input tests passed.
-The four CPU shape tests passed after the 16384-position candidate change.
-These tests include variant limits and insufficient checkpoint positions.
-The structural document check reported zero findings.
-These results do not establish larger context quality, memory coverage, or latency acceptance.
-The separate validation report covers HTTP requests with 2040, 8190, and 15998 input tokens.
-It also records host memory, long-prefill cancellation, and fault settlement.
-No latency target or general quality claim follows from those measurements.

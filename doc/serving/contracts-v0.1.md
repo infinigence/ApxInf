@@ -15,9 +15,6 @@ The [implementation plan](implementation-plan.md) defines the delivery stages.
 
 ## Document rules
 
-This document uses ASD-STE100 Issue 9 principles for English structure.
-The project does not claim a complete dictionary review or certification.
-The [review record](README.md) states the scope of the checks.
 
 Each rule ID identifies one contract obligation.
 In this document, `must` states an obligation.
@@ -25,22 +22,6 @@ The word `can` states a capability.
 The word `may` states a permitted choice.
 This requirement notation is a project convention.
 
-## Original implementation
-
-**OR-01.** Authors must write all new first-party code by hand.
-
-**OR-02.** Authors must not copy, translate, port, or lightly rewrite implementation code from another repository.
-
-**OR-03.** Authors must write tests and fixtures from this contract and ApxInf behavior.
-
-**OR-04.** Authors may study external designs and call approved dependencies through public APIs.
-
-**OR-05.** Each dependency decision must identify the library, version, public API, purpose, and replacement boundary.
-
-The MLX adapter can call MLX-LM through its public API.
-That call does not make the MLX-LM implementation ApxInf code.
-The adapter must not copy the MLX-LM scheduler into this repository.
-The same rule applies to oMLX, llama.cpp, Ollama, vLLM, and SGLang.
 
 ## Terms
 
@@ -820,7 +801,7 @@ These rules add no worker fields and do not change public result semantics.
 
 **IC-01.** This document must remain the semantic source for the serving interfaces.
 
-**IC-02.** Authors must write Rust and Python types and validators by hand from this contract.
+**IC-02.** Rust and Python types and validators must follow this contract.
 
 **IC-03.** Both validators must use the same original valid and invalid fixtures.
 
