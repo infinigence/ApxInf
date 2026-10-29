@@ -410,7 +410,7 @@ The output file is `meeting-actions.json` with exactly these fields:
 
 Both outputs must contain one strict JSON object within 8192 bytes.
 Duplicate fields, unknown fields, nonfinite numbers, and incorrect value types fail validation.
-The checker compares the complete structured result with independent, handwritten expectations.
+The checker compares the complete structured result with independent, expectations.
 The checker never executes model output.
 
 A pass requires the actual initial tool inventory and a successful final client result.

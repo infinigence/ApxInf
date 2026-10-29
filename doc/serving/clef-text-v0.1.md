@@ -350,7 +350,7 @@ Readiness remains false while a replacement is absent or loading.
 
 ## Shared conformance corpus
 
-`tests/fixtures/serving/clef-v0.1.json` is an original handwritten corpus.
+`tests/fixtures/serving/clef-v0.1.json` is an original corpus.
 `requests` checks strict public parsing and canonical records.
 `encodings` checks metadata, ordering, and span bounds.
 `probabilities` checks cardinality, values, normalization, and public projections.

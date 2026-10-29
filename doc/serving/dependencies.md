@@ -3,7 +3,6 @@
 Date: 2026-10-09. Scope: serial profile 0.1.
 
 This record describes dependency calls, not imported implementation code.
-All new ApxInf source, tests, and fixtures are handwritten.
 The [serial profile](serial-profile-v0.1.md) defines the wire interface.
 `Cargo.lock` records the resolved Rust dependency versions.
 
@@ -38,7 +37,7 @@ The [vision profile](minicpm-vision-v0.1.md) defines a separately selected runti
 Its worker uses public dependency APIs. No dependency implementation enters first-party source.
 The existing text runtime retains its existing versions.
 The vision worker requires Python 3.14.3 and these exact package versions.
-The [support and verification boundaries](support-status.md) records the selected runtime checks and remaining limits.
+The [support and verification boundaries](support-status.md) describes the required runtime checks and remaining qualification boundaries.
 
 | Package | Version | Role |
 | --- | --- | --- |
@@ -188,7 +187,7 @@ It records allocator counters and cache metadata through that adapter's observat
 Cache `nbytes` and optional `offset` properties describe logical arrays and supported sequence positions.
 The observer does not evaluate cache arrays or add their payload to allocator memory.
 
-The handwritten `host_memory.py` helper uses Python `ctypes`, `struct`, and `resource` standard library APIs.
+The `host_memory.py` helper uses Python `ctypes`, `struct`, and `resource` standard library APIs.
 It reads macOS pressure, swap usage, hardware identity, and process peak RSS.
 The driver uses `fcntl.flock` and inherited descriptors for the existing Metal measurement lock.
 It reuses the first-party `metal_matrix.stop_owned_group` helper to reclaim its isolated child process.

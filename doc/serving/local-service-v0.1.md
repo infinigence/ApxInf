@@ -92,7 +92,7 @@ Select the existing pinned Python environment and external loader explicitly.
 The [dependency record](dependencies.md#clef-text-runtime) lists their roles and versions.
 The model bundle must match the approved artifact digests.
 The external loader remains an installed dependency outside this repository.
-The [support and verification boundaries](support-status.md) records successful diagnostic HTTP tests.
+The [support and verification boundaries](support-status.md) describes verification requirements without granting device qualification.
 Default host pressure checks can still prevent readiness on the tested machine.
 
 ```sh
@@ -129,7 +129,7 @@ Build the native executable with the existing MLX 0.31.2 C++ SDK.
 Select the provider and runtime files explicitly.
 The native provider does not fall back to Python.
 Its context limit permits 16384 positions with fixed 256-token prefill chunks.
-The [support and verification boundaries](support-status.md) records measured deployment gates.
+The [support and verification boundaries](support-status.md) separates implementation limits from device qualification.
 This limit includes the input and output reservation.
 
 ```sh
@@ -156,7 +156,7 @@ This profile uses temperature 1 and top-p 0.95 when the request omits both param
 Set request temperature to zero to select greedy generation.
 The ready response reports `sampling=true` and public profile `apxinf-native-sampled-v0.1`.
 Model thinking and image input remain disabled in this profile.
-For the measured 16K configuration, set `--max-context 16384 --max-output-tokens 4096`.
+For an explicitly selected 16K configuration, set `--max-context 16384 --max-output-tokens 4096`.
 The total includes prompt tokens and the requested output allowance.
 
 Select `--provider native-minicpm5-thinking` for the explicit [model thinking profile](native-thinking-v0.1.md).
@@ -174,10 +174,9 @@ The closing token uses one position within the existing output allowance.
 Readiness reports `initial_reasoning_budget_tokens=512` under public capabilities.
 The profile retains exact usage, the 16K total limit, and the unsupported Anthropic extended-thinking boundary.
 The original thinking provider retains its behavior without a separate reasoning budget.
-The [support and verification boundaries](support-status.md) covers native controls and a completed real client tool cycle.
-The original pelican output still fails visual acceptance.
-The [support and verification boundaries](support-status.md) tests 4096 output tokens without the private blocking-limit override.
-Its isolated bare client completes the short tool cycle, but the drawing still fails visual acceptance.
+The [support and verification boundaries](support-status.md) describes the scope of native controls and remaining task-quality checks.
+Thinking controls do not establish drawing quality.
+Client context handling and complete task outcomes require separate verification.
 
 ### Python MLX-LM
 
@@ -575,7 +574,7 @@ python3 -m pytest -q \
 ```
 
 Follow [the benchmark guide](../../benchmarks/serving/README.md) for real model and Claude Code tests.
-Follow [support and verification boundaries](support-status.md) for controlled parameter comparisons.
+Use controlled inputs and record each parameter choice when comparing service configurations.
 Tests must preserve raw failures and actual outputs.
 CPU test doubles cannot establish real inference or client compatibility.
-The [support and verification boundaries](support-status.md) separates the latest CPU checks from historical model measurements.
+The [support and verification boundaries](support-status.md) explains why CPU checks do not establish model or device qualification.

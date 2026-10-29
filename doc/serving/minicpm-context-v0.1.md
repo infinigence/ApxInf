@@ -54,8 +54,8 @@ The initial equivalence gate passed with the existing 4096-position limit.
 The ordinary BF16 model permits a 16384-position profile.
 The limit applies to `bf16-public` and `bf16-compiled` only.
 Variant limits control RoPE table size, preparation, and token admission together.
-The [support and verification boundaries](support-status.md) records measured gates for the `bf16-compiled` deployment.
-These gates do not establish equivalent quality for every task or variant.
+The [support and verification boundaries](support-status.md) separates this deployment's source limits from device qualification.
+These source limits do not establish equivalent quality for every task or variant.
 A 32768-position profile remains deferred.
 
 Admission includes the complete prepared input and maximum output allowance.
