@@ -2548,3 +2548,53 @@ fn execution_session_distinguishes_selection_policies() {
     })
     .unwrap();
 }
+
+#[test]
+fn repeated_prepare_retires_eager_bindings_and_preserves_captured_graph() {
+    let ctx = CudaContext::new(0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let a = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    let mut old_output = tensor(0, vec![2, 2], &[0.0; 4]);
+    let enqueue = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a, &b, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+    session.prepare(|| enqueue(&mut old_output)).unwrap();
+    let graph = crate::capture(&ctx, || session.run(|| enqueue(&mut old_output))).unwrap();
+    let mut generations = Vec::new();
+    for generation in 0..64 {
+        let mut output = tensor(0, vec![2, 2], &[0.0; 4]);
+        session
+            .prepare(|| {
+                if generation < 2 {
+                    // Grow beyond the old graph's cuBLAS scratch binding.
+                    crate::workspace::provider_scratch(&ctx, (8 << 20) << generation)?;
+                }
+                let mut args = GemmArgs::new(&a, &b, &mut output);
+                args.policy.online_tune = false;
+                args.policy.cache_dir = Some(String::new());
+                let execution = prepare_test_gemm(&ctx, args)?;
+                generations.push(std::rc::Rc::downgrade(&execution));
+                execution.enqueue()
+            })
+            .unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&output), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            generations.iter().filter(|e| e.strong_count() != 0).count(),
+            1,
+            "new eager IO bindings retained obsolete Executions"
+        );
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&old_output), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+    drop(session);
+    assert!(generations.iter().all(|e| e.strong_count() == 0));
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&old_output), vec![1.0, 2.0, 3.0, 4.0]);
+}

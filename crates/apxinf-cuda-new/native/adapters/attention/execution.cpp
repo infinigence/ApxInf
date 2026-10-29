@@ -616,3 +616,17 @@ extern "C" apxinf_status_t apxinf_decode_attention(
 #endif
   });
 }
+
+extern "C" uint64_t apxinf_attention_scratch_bytes(apxinf_attention_execution_t handle) {
+  return handle == nullptr ? 0 : handle->state->scratch.bytes();
+}
+extern "C" apxinf_status_t apxinf_attention_bind_scratch(
+    apxinf_attention_execution_t handle, void* buffer, uint64_t bytes) {
+  return apxinf::framework::abi_boundary([&] {
+    if (handle == nullptr) {
+      throw apxinf::framework::Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                                       "null scratch execution");
+    }
+    handle->state->scratch.bind(buffer, bytes);
+  });
+}

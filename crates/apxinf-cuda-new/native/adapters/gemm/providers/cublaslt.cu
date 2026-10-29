@@ -38,9 +38,7 @@ struct CublasLtState {
   }
 
   void release_resources() noexcept {
-    if (workspace != nullptr) cudaFree(workspace);
     if (zero_bias != nullptr) cudaFree(zero_bias);
-    if (c_buffer != nullptr) cudaFree(c_buffer);
     if (output_scale != nullptr) cudaFree(output_scale);
     workspace = nullptr;
     zero_bias = nullptr;
@@ -254,7 +252,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   // scratch. Allocate common buffers only after the full requirement is
   // known to fit the caller's policy.
   if (direct_fp8_gelu) {
-    check_cuda(cudaMalloc(&resources->c_buffer, c_buffer_bytes));
+    state.scratch.allocate(&resources->c_buffer, c_buffer_bytes);
     check_cuda(cudaMalloc(&resources->output_scale, sizeof(float)));
     const float inverse_output_scale = 1.0F / state.bindings.output_scale;
     check_cuda(cudaMemcpy(resources->output_scale, &inverse_output_scale,
@@ -265,15 +263,15 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     resources->direct_fp8_gelu = true;
     resources->common.resource_bytes = fixed_bytes;
   } else if (split_geglu) {
-    check_cuda(cudaMalloc(&resources->c_buffer, c_buffer_bytes));
+    state.scratch.allocate(&resources->c_buffer, c_buffer_bytes);
     resources->split_geglu = true;
     resources->common.resource_bytes = fixed_bytes;
   } else if (!native_fp4) {
-    vendor::allocate_common_resources(spec, resources->common, native_fp8,
+    vendor::allocate_common_resources(state, spec, resources->common, native_fp8,
                                       supports_native_bf16_bias(spec));
   }
   if (resources->workspace_bytes != 0) {
-    check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
+    state.scratch.allocate(&resources->workspace, resources->workspace_bytes);
   }
   state.resource_bytes =
       resources->common.resource_bytes + resources->workspace_bytes +

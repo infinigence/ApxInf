@@ -18,6 +18,10 @@ apxinf_status_t apxinf_attention_prepare(
     const apxinf_attention_bindings_t* bindings,
     apxinf_attention_execution_t* execution);
 apxinf_status_t apxinf_attention_enqueue(apxinf_attention_execution_t execution);
+// Final prepare only: bind before enqueue/capture. Caller retains the buffer
+// for execution/graph lifetime and serializes users of the same scratch block.
+uint64_t apxinf_attention_scratch_bytes(apxinf_attention_execution_t execution);
+apxinf_status_t apxinf_attention_bind_scratch(apxinf_attention_execution_t execution, void* buffer, uint64_t bytes);
 void apxinf_attention_destroy(apxinf_attention_execution_t execution);
 const char* apxinf_attention_summary(apxinf_attention_execution_t execution);
 

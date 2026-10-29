@@ -167,8 +167,24 @@ storage/state and retiring the old graph readers.
 
 Ordinary Tensor/`WeightVersion` arguments stay canonical: they do not authorize
 in-place packing and cannot select kernels requiring packed weights. Callers
-wanting these kernels must attach `RepackedWeight`. This change does not move
-computation scratch out of provider state or change activation workspace ownership.
+wanting these kernels must attach `RepackedWeight`. Provider computation scratch is managed separately from weights and activations.
+PI0.5's runner owns a cuda-new `ProviderWorkspace`, shared by its prepared
+profiles on the same stream. Each session owns its activation `GraphWorkspace`;
+persistent KV/state remains model/request storage. Serial GEMM vendor scratch
+(workspace, unpack/dequantization and projection) and attention temporary
+probabilities/LSE/partials borrow aligned slices of a per-stream block. Different
+streams/devices use distinct blocks. Power-of-two growth preserves previous
+blocks retained by executions and captured graphs; it never rewrites an old
+binding. Constants such as cuBLASLt zero bias and output scale remain private.
+The opaque prepared NVFP4 GEMM workspace remains private until its embedded
+launch state supports external rebinding.
+
+Tuning candidates use private scratch. Final prepared executions borrow runner
+storage after selection and retain the actual block for graph lifetime.
+Repeated `ExecutionSession::prepare` replaces its previous binding cache;
+captured graphs retain their own executions. Changing eager IO addresses cannot
+accumulate obsolete executions in that cache. This does not migrate PI0FAST:
+its current CUDA implementation still uses the legacy eager arena/lease path.
 
 Kernel weight layout is an explicit property of each native `Implementation`
 registry entry. Implementation IDs are local to a semantic registry and must
