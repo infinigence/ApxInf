@@ -1,18 +1,16 @@
 #include "../internal.h"
+#include "../../cublas_resources.h"
 #include "../../../kernels/custom/attention_softmax.cuh"
 
 namespace apxinf::attention {
 namespace {
 using apxinf::framework::check_cublas;
-constexpr size_t kWorkspaceBytes = 4 * 1024 * 1024;
+constexpr size_t kWorkspaceBytes = providers::CublasStreamResources::workspace_bytes;
 struct CublasState {
-  cublasHandle_t handle = nullptr;
-  void* workspace = nullptr;
+  std::shared_ptr<providers::CublasStreamResources> shared;
   void* scores = nullptr;
   ~CublasState() {
     if (scores != nullptr) cudaFree(scores);
-    if (workspace != nullptr) cudaFree(workspace);
-    if (handle != nullptr) cublasDestroy(handle);
   }
 };
 }  // namespace
@@ -30,30 +28,27 @@ void prepare_cublas(Execution& execution) {
   if (bytes > execution.resource_limit)
     throw Failure(APXINF_STATUS_UNSUPPORTED, "Attention cuBLAS scratch exceeds policy");
   auto state = std::make_unique<CublasState>();
-  check_cublas(cublasCreate(&state->handle));
-  check_cublas(cublasSetMathMode(state->handle, CUBLAS_PEDANTIC_MATH));
-  check_cuda(cudaMalloc(&state->workspace, kWorkspaceBytes));
-  check_cublas(cublasSetStream(state->handle, static_cast<cudaStream_t>(execution.bindings.stream)));
-  check_cublas(cublasSetWorkspace(state->handle, state->workspace, kWorkspaceBytes));
+  state->shared = providers::acquire_cublas_stream_resources(
+      execution.device, static_cast<cudaStream_t>(execution.bindings.stream));
   check_cuda(cudaMalloc(&state->scores, bytes - kWorkspaceBytes));
   execution.resource_bytes = bytes;
   execution.provider_state = state.release();
 }
 
 
-
 // Pedantic F32 GEMMs retain full F32 products (no TF32 conversion). Prepared
-// handle state is immutable and the scratch allocation precedes graph capture.
+// handle/workspace are shared on one stream; score storage precedes capture.
 cudaError_t launch_f32_cublas(Execution& execution) {
   const auto& s = execution.spec;
   const auto& b = execution.bindings;
   auto& state = *static_cast<CublasState*>(execution.provider_state);
   const auto stream = static_cast<cudaStream_t>(b.stream);
+  std::lock_guard<std::mutex> lock(state.shared->enqueue_mutex);
   const float one = 1.0F, zero = 0.0F;
   const int h = s.query_heads, d = s.head_dim, q = s.query_tokens, k = s.key_tokens;
   auto* scores = static_cast<float*>(state.scores);
   for (uint32_t batch = 0; batch < s.batch; ++batch) {
-    check_cublas(cublasSgemmStridedBatched(state.handle,
+    check_cublas(cublasSgemmStridedBatched(state.shared->handle,
         CUBLAS_OP_T, CUBLAS_OP_N, k, q, d, &b.scale,
         static_cast<const float*>(b.key) + static_cast<int64_t>(batch) * k * h * d,
         h * d, d,
@@ -64,7 +59,7 @@ cudaError_t launch_f32_cublas(Execution& execution) {
   check_cuda(kernels::launch_attention_f32_softmax(scores, s.batch, h, q, k,
       s.mask == APXINF_ATTENTION_MASK_CAUSAL, s.query_start, stream));
   for (uint32_t batch = 0; batch < s.batch; ++batch) {
-    check_cublas(cublasSgemmStridedBatched(state.handle,
+    check_cublas(cublasSgemmStridedBatched(state.shared->handle,
         CUBLAS_OP_N, CUBLAS_OP_N, d, q, k, &one,
         static_cast<const float*>(b.value) + static_cast<int64_t>(batch) * k * h * d,
         h * d, d, scores + static_cast<int64_t>(batch) * h * q * k,

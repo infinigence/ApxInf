@@ -188,7 +188,7 @@ cache does not retune just because `--autotune` is present.
 
 Additive attention uses F32 score/probability arithmetic through custom
 candidates. Dense F32 attention has a pedantic cuBLAS implementation with
-execution-local score/probability storage and 4 MiB workspace. Existing
+execution-local score/probability storage and a shared 4 MiB stream workspace. Existing
 F16/BF16 dense candidates keep their original selection domain. Attention
 recipes include the runtime cuBLAS version and source fingerprint.
 
@@ -212,10 +212,14 @@ the Attention build fingerprint, invalidating incompatible cached recipes.
 
 The graph retains the executions and storage used during capture. The recipe key does not contain raw pointers; fixed addresses and the stream belong to the Rust execution cache key.
 
-cuBLAS resource ownership and host upload behavior retain the existing baseline.
-This model port does not introduce a shared-handle/workspace pool or change
-public transfer synchronization. The new F32 attention provider owns its own
-prepared handle and scratch allocation.
+GEMM and F32 Attention executions on one concrete CUDA stream share a cuBLAS
+handle and 4 MiB workspace. Enqueue uses a host mutex around the complete library
+call sequence; GPU work remains ordered by the bound stream. A weak lookup table
+does not retain unused pools, while prepared executions and captured graphs keep
+their resources alive. Score, projection, unpack and dequantization storage stays
+execution-local. Per-thread stream sentinels receive private resources.
+The public prepared-execution test checks that many tiny GEMMs retain bounded
+memory and replay correctly after the session is dropped.
 
 ## Directory Responsibilities
 

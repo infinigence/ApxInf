@@ -238,3 +238,47 @@ fn additive_attention_graph_retains_bias_and_tensor_storage() {
         assert_eq!(values(&observed), [1.0, 2.0]);
     }
 }
+
+#[test]
+fn public_l3_many_prepared_gemms_have_bounded_stream_resources() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = bf16_tensor(0, vec![1, 1], &[2.0]);
+    let b = bf16_tensor(0, vec![1, 1], &[3.0]);
+    let mut outputs: Vec<_> = (0..17)
+        .map(|_| bf16_tensor(0, vec![1, 1], &[0.0]))
+        .collect();
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let (before, after) = prepare_with_session(&session, || {
+        // Warm the library before measuring additional prepared executions.
+        run_gemm(&ctx, &a, &b, &mut outputs[0])?;
+        ctx.synchronize().map_err(apxinf_core::Error::Cuda)?;
+        let before = ctx.memory_info().map_err(apxinf_core::Error::Cuda)?.0;
+        for out in outputs.iter_mut().skip(1) {
+            run_gemm(&ctx, &a, &b, out)?;
+        }
+        ctx.synchronize().map_err(apxinf_core::Error::Cuda)?;
+        let after = ctx.memory_info().map_err(apxinf_core::Error::Cuda)?.0;
+        Ok((before, after))
+    })
+    .unwrap();
+    let additional = before.saturating_sub(after);
+    eprintln!("additional prepared GEMM resources: {additional} bytes");
+    assert!(
+        additional < 128 * 1024 * 1024,
+        "tiny GEMMs retained {additional} bytes: stream resources must be shared"
+    );
+
+    let graph = capture(&ctx, || {
+        with_session(&session, || {
+            for out in &mut outputs {
+                run_gemm(&ctx, &a, &b, out)?;
+            }
+            Ok(())
+        })
+    })
+    .unwrap();
+    drop(session);
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert!(outputs.iter().all(|out| values(out) == [6.0]));
+}

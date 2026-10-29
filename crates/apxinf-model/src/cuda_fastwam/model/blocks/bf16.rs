@@ -1479,7 +1479,9 @@ impl Bf16Blocks {
         let mut args =
             cuda_ops::PointwiseArgs::new(cuda_ops::PointwiseSemantic::EulerUpdate, x, &mut next);
         args.secondary = Some(&velocity);
-        args.dt = dt;
+        // The BF16 checkpoint profile's scheduler materializes deltas in BF16,
+        // then promotes them when integrating the F32 state.
+        args.dt = half::bf16::from_f32(dt).to_f32();
         cuda_ops::pointwise(ctx, args)?;
         Ok(next)
     }

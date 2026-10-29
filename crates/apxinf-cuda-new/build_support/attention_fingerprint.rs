@@ -21,6 +21,7 @@ const INPUT_TREES: &[&str] = &[
     "patches",
 ];
 const INPUT_FILES: &[&str] = &[
+    "adapters/cublas_resources.h",
     "include/apxinf_cuda/attention.h",
     "include/apxinf_cuda/attention_types.h",
     "include/apxinf_cuda/status.h",

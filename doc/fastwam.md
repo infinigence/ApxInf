@@ -2,11 +2,12 @@
 
 > Current baseline-first revision: historical precision/performance results below
 > describe earlier snapshots. Public GEMM bias arithmetic, RMS/GELU/Euler,
-> cuBLAS resource ownership, quantization and H2D upload behavior have been
-> restored to the PR base. Redundant Add/BroadcastAdd, rounding-only RMS/GELU/Euler and Input-attention
+> quantization and H2D upload behavior have been restored to the PR base.
+> cuBLAS handle/workspace storage is shared per concrete stream to bound prepared
+> execution memory. Redundant Add/BroadcastAdd, rounding-only RMS/GELU/Euler and Input-attention
 > variants were removed. Intermediate reference equality is diagnostic, not
-> proof of downstream task quality. This revision needs fresh numerical and
-> task-level qualification; no historical pass is inherited.
+> proof of downstream task quality. The 2026-10-29 numerical qualification is
+> recorded below; task-level results from earlier snapshots are not inherited.
 
 
 The `fastwam` family implements the action-only profile of
@@ -28,8 +29,10 @@ extend the shared observation, action or prepared-inference contracts.
 | Scope | One observed frame; action prediction without generated video |
 
 The frozen Wan VAE, UMT5 encoder, video conditioning and all action steps execute
-natively on the GPU. Wan attention preserves its F32 arithmetic; UMT5 preserves
-its BF16 intermediate rounding. DiT residual state and LayerNorm use F32 to
+natively on the GPU. Wan attention uses F32 arithmetic; UMT5 uses BF16 tensors
+with the baseline RMSNorm, GELU and additive-attention arithmetic. Its standalone
+frozen BF16 output regression currently fails; see the qualification note below.
+DiT residual state and LayerNorm use F32 to
 avoid repeated BF16 rounding across blocks. The small action input and output
 projections preserve F32 state through Euler integration and the next step. Branch
 projections, gates and schedule deltas retain BF16 rounding. The variant name
@@ -344,8 +347,9 @@ selection spellings remain compatible. The Python policy name stays `fastwam`.
 ### Baseline-first operator inventory
 
 The model uses existing GEMM/GEMM-bias, RMSNorm, GELU/SiLU, EulerUpdate,
-embedding gather, concatenation and BF16/F32 casts. Their baseline numerical,
-resource and transfer contracts are retained. Added dtype support does not
+embedding gather, concatenation and BF16/F32 casts. Their baseline numerical
+and transfer contracts are retained. Prepared cuBLAS executions share stream
+resources; their tensor scratch remains execution-local. Added dtype support does not
 change the existing F16/BF16 path.
 
 Remaining capability gaps have concrete call sites in `model/blocks/bf16.rs`:
@@ -364,7 +368,32 @@ Remaining capability gaps have concrete call sites in `model/blocks/bf16.rs`:
 | elementwise multiply and row/column broadcast multiply | residuals, gates and masks |
 
 F32 attention alternatives remain in their new dtype domain; existing dense
-F16/BF16 default selection is not displaced. Memory-pool work is deferred to
-its separate owner. Any accuracy failure is reported before deciding whether
+F16/BF16 default selection is not displaced. Backend-owned cuBLAS handle/workspace
+sharing bounds the cost of retained GEMM/Attention executions. Any accuracy failure is reported before deciding whether
 an optional arithmetic variant is justified; reference-stage equality alone is
 not a reason to change an existing operator.
+
+
+### Baseline-arithmetic qualification (2026-10-29)
+
+On Thor SM110 / CUDA 13.2, cuda-new passes 102 library tests (two unrelated
+opt-in tests ignored) and seven public integration tests. The VAE F32/BF16
+checkpoint and captured-execution checks pass. Native action inference and
+Python AutoPolicy each pass all twelve frozen cases against the official FP32
+oracle: both relative-L2 and maximum-absolute error are no worse than the
+corresponding official BF16 errors. Native eager/graph parity, input/RNG rebinding,
+layout rejection and retained-output lifetime also pass. No threshold changed.
+
+The BF16 profile materializes schedule deltas in BF16 before promoting them
+for F32 state integration, matching the pinned reference scheduler. This is a
+model-level constant conversion; the generic Euler operator retains its baseline
+arithmetic. GEMM and F32 Attention share backend-owned cuBLAS stream resources.
+A public regression retains sixteen additional tiny GEMM executions after warmup:
+additional device allocation falls from 1,154,490,368 bytes with individual handles
+to zero with shared resources, and graph replay remains correct.
+
+The standalone UMT5 frozen-output test remains failing: relative-L2 is
+0.0711166, maximum-absolute error 0.30664063, versus its unchanged 0.01 relative-L2
+limit. End-to-end action acceptance does not make that independent test pass or
+establish intermediate equality. This revision has no new LIBERO rollout result;
+the historical rollout and latency tables above describe their original snapshots.
