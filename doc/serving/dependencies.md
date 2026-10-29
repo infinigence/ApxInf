@@ -38,7 +38,7 @@ The [vision profile](minicpm-vision-v0.1.md) defines a separately selected runti
 Its worker uses public dependency APIs. No dependency implementation enters first-party source.
 The existing text runtime retains its existing versions.
 The vision worker requires Python 3.14.3 and these exact package versions.
-The [worker report](minicpm-vision-worker-validation-20261023.md) records the selected runtime checks and remaining limits.
+The [support and verification boundaries](support-status.md) records the selected runtime checks and remaining limits.
 
 | Package | Version | Role |
 | --- | --- | --- |

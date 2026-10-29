@@ -7,16 +7,14 @@ The [serial profile](serial-profile-v0.1.md) defines the first implemented subse
 The [local service](local-service-v0.1.md) records its boundaries.
 The [Clef text profile](clef-text-v0.1.md) defines a separate decision workload within the existing coordinator.
 P1a code and CPU checks do not complete the P1 acceptance gate.
-The plan applies structural principles from ASD-STE100 Issue 9. It does not claim full dictionary compliance or certification.
 
 ## Authority and implementation policy
 
 [The contract](contracts-v0.1.md) defines the canonical semantics for serving. [The system design](../serving-system-design-20261009.md) records the research, architecture choices, and supporting evidence. This plan defines work order, module boundaries, and phase gates. A conflict requires a contract correction before implementation continues.
 
-Contributors write the implementation directly from the ApxInf contract. Contributors do not copy, translate, or vendor implementation code from external serving engines.
-Public dependency APIs remain permitted. Each adapter records its dependency versions, API calls, and observed limitations. The project does not use code generators for serving types, adapters, or test stubs.
+Each adapter records its dependency versions, API calls, and observed limitations.
 
-Rust and Python use separate handwritten types. Both implementations follow the same contract and original conformance fixtures. The fixtures contain input cases, expected events, and expected resource outcomes. They do not define a second semantic specification.
+Rust and Python use separate types. Both implementations follow the same contract and original conformance fixtures. The fixtures contain input cases, expected events, and expected resource outcomes. They do not define a second semantic specification.
 Changes to fields, states, or ownership rules start in the contract. The same change includes the affected types and fixtures.
 
 The existing service v1 and session v1 interfaces remain frozen. New streaming and control events use a separate protocol version. Existing commands retain their documented behavior.
@@ -28,7 +26,7 @@ Every path in this table describes a future module. The first implementation cre
 | Proposed path | Owner and boundary |
 | --- | --- |
 | `src/serve.rs` | This entry point reads configuration and connects the components. |
-| `crates/apxinf-serving/src/contracts.rs` | These handwritten types represent the canonical contract in Rust. |
+| `crates/apxinf-serving/src/contracts.rs` | These types represent the canonical contract in Rust. |
 | `crates/apxinf-serving/src/gateway.rs` | Gateway owns HTTP parsing, response formatting, and bounded output streams. |
 | `crates/apxinf-serving/src/coordinator.rs` | Coordinator owns the request registry, admission decisions, and deadlines. |
 | `crates/apxinf-serving/src/model_supervisor.rs` | ModelSupervisor owns worker identity, readiness, drain, restart, and process recovery. |
@@ -36,10 +34,10 @@ Every path in this table describes a future module. The first implementation cre
 | `crates/apxinf-serving/src/prompt_adapter.rs` | PromptAdapter owns templates, tokenization, media normalization, and effective input length. |
 | `crates/apxinf-serving/src/state_store.rs` | StateStore owns snapshot identity, references, byte accounting, and eviction policy. |
 | `crates/apxinf-serving/src/metrics.rs` | This module records contract events and separate latency intervals. |
-| `crates/apxinf-serving/src/workers/mod.rs` | This module defines handwritten interfaces for TextWorker and PolicyWorker. |
+| `crates/apxinf-serving/src/workers/mod.rs` | This module defines interfaces for TextWorker and PolicyWorker. |
 | `crates/apxinf-serving/src/workers/mlx.rs` | This adapter owns the new MLX protocol connection. |
 | `crates/apxinf-serving/src/workers/native.rs` | This adapter owns native model execution on its assigned thread. |
-| `python/apxinf/apxinf/serving/contracts.py` | These handwritten types represent the same contract in Python. |
+| `python/apxinf/apxinf/serving/contracts.py` | These types represent the same contract in Python. |
 | `python/apxinf/apxinf/serving/text_worker.py` | TextWorker owns model execution, active sequence state, and dependency calls. |
 | `python/apxinf/apxinf/serving/policy_worker.py` | PolicyWorker owns policy execution and observation deadlines. |
 | `tests/fixtures/serving/` | Original fixtures describe cases that both languages consume. |
@@ -225,7 +223,7 @@ Long-context exit checks:
 - Check model quality and client context metadata before publishing a larger capability profile.
 - Check mixed short and long workloads when a future batch adapter passes its own correctness gate.
 
-The [memory evidence plan](memory-evidence-plan-20261010.md) defines the current measurement sequence.
+The [benchmark guide](../../benchmarks/serving/README.md) describes the maintained calibration tools.
 The [production validation profile](production-memory-validation-v0.1.md) defines the separate production evidence boundary.
 Neither document approves a memory budget or promises a larger supported context size.
 

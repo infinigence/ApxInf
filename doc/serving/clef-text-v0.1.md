@@ -371,5 +371,3 @@ Frame validation accepts no model objects and changes no state.
 Tracker observation accepts one checked frame and changes state only on success.
 Reaping takes the observed exit code, EOF status, and drained status.
 Both implementations consume this same corpus before runtime integration.
-
-Structural writing checks do not establish a complete dictionary review or certification.

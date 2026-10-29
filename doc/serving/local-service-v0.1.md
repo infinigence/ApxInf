@@ -92,7 +92,7 @@ Select the existing pinned Python environment and external loader explicitly.
 The [dependency record](dependencies.md#clef-text-runtime) lists their roles and versions.
 The model bundle must match the approved artifact digests.
 The external loader remains an installed dependency outside this repository.
-The [Clef validation report](clef-serving-validation-20261023.md) records successful diagnostic HTTP tests.
+The [support and verification boundaries](support-status.md) records successful diagnostic HTTP tests.
 Default host pressure checks can still prevent readiness on the tested machine.
 
 ```sh
@@ -129,7 +129,7 @@ Build the native executable with the existing MLX 0.31.2 C++ SDK.
 Select the provider and runtime files explicitly.
 The native provider does not fall back to Python.
 Its context limit permits 16384 positions with fixed 256-token prefill chunks.
-The [validation report](minicpm-native-validation-20261022.md) records measured deployment gates.
+The [support and verification boundaries](support-status.md) records measured deployment gates.
 This limit includes the input and output reservation.
 
 ```sh
@@ -174,9 +174,9 @@ The closing token uses one position within the existing output allowance.
 Readiness reports `initial_reasoning_budget_tokens=512` under public capabilities.
 The profile retains exact usage, the 16K total limit, and the unsupported Anthropic extended-thinking boundary.
 The original thinking provider retains its behavior without a separate reasoning budget.
-The [validation record](native-bounded-thinking-validation-20261023.md) covers native controls and a completed real client tool cycle.
+The [support and verification boundaries](support-status.md) covers native controls and a completed real client tool cycle.
 The original pelican output still fails visual acceptance.
-The [default-policy record](minicpm-default-context-validation-20261023.md) tests 4096 output tokens without the private blocking-limit override.
+The [support and verification boundaries](support-status.md) tests 4096 output tokens without the private blocking-limit override.
 Its isolated bare client completes the short tool cycle, but the drawing still fails visual acceptance.
 
 ### Python MLX-LM
@@ -575,7 +575,7 @@ python3 -m pytest -q \
 ```
 
 Follow [the benchmark guide](../../benchmarks/serving/README.md) for real model and Claude Code tests.
-Follow [the Metal experiments](metal-experiments.md) for controlled parameter comparisons.
+Follow [support and verification boundaries](support-status.md) for controlled parameter comparisons.
 Tests must preserve raw failures and actual outputs.
 CPU test doubles cannot establish real inference or client compatibility.
-The [lifecycle report](lifecycle-hardening-20261009.md) separates the latest CPU checks from historical model measurements.
+The [support and verification boundaries](support-status.md) separates the latest CPU checks from historical model measurements.
