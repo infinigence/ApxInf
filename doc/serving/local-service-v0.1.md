@@ -130,6 +130,7 @@ Select the provider and runtime files explicitly.
 The native provider does not fall back to Python.
 Its deployment context limit permits 16384 positions.
 The model family selects and prepares the actual prefill chunk plan.
+The native worker explicitly selects 256-token long-prompt chunks; prompts of at most 4096 tokens remain one chunk.
 The [support overview](support-status.md) describes historical verification and remaining limits.
 This limit includes the input and output reservation.
 
