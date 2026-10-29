@@ -48,6 +48,10 @@ request state. `synchronize` alone does not evaluate a lazy expression.
 `Compiled::prepare` evaluates one profile twice and rejects a replay that invokes
 the trace callback again. Family preparation can use it to verify compiler
 availability and exact-profile reuse. It does not observe Metal pipeline JIT.
+`Compiled::prepare_trace` checks the same graph reuse without evaluation.
+It leaves device compilation and allocation to the first evaluation; callers
+must include that work in cold-request timing rather than claim warmed Metal
+execution from the graph check alone.
 Constructing a compiled callable rejects any present `MLX_DISABLE_COMPILE`
 environment variable, even `MLX_DISABLE_COMPILE=0`, matching MLX's presence rule.
 The bridge never changes the process-wide compile mode to force availability.
@@ -58,6 +62,10 @@ owns the captured callable through a shared pointer whose deleter erases its
 entry from the compiler cache of the thread that created it. Dropping a Rust
 `Compiled` uses that ownership path;
 the bridge does not clear other functions' compiler caches.
+
+`Stream::async_eval` enqueues evaluation and returns, so host work such as a
+Neural Engine prediction overlaps the GPU; a later evaluation, download or
+dependent operation waits for it.
 
 `Stream::counters()` snapshots cumulative trace callbacks, explicit upload and
 download bytes, and evaluation boundaries (including downloads). Cloned streams

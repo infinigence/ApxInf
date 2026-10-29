@@ -141,6 +141,25 @@ python scripts/bench_pi05.py --random-weights --model-variant fp8_static --layer
 Reported latency is P50 over 30 samples after 10 warm-up iterations
 (`--warmup` / `--samples`).
 
+### Local HTTP serving on macOS
+
+The separate `apxinf-serve` binary exposes local text generation through
+Anthropic Messages and OpenAI Chat Completions.
+It supports SSE output, client tools, cancellation, a bounded queue, and metrics.
+One MLX worker executes one request at a time.
+
+Read the [startup guide](doc/serving/local-service-v0.1.md) for the pinned
+environment, deployment limits, and supported API fields.
+Read the [support overview](doc/serving/support-status.md) for
+provider boundaries and the scope of historical model and client observations.
+The [system design](doc/serving-system-design-20261009.md) defines the broader
+framework and staged extensions.
+The default text profile does not accept images.
+The separate [MiniCPM-V profile](doc/serving/minicpm-vision-v0.1.md) accepts bounded PNG inputs through Anthropic Messages.
+The separate [Clef text profile](doc/serving/clef-text-v0.1.md) exposes typed decisions through `POST /v1/systemone`.
+It returns `noul`, `choice`, and `score` probabilities from the joint schema head.
+The service does not provide persistent sessions, prefix reuse, or continuous batching.
+
 ### Run a policy through Python API
 
 ```python

@@ -19,6 +19,7 @@ pub struct GenerationProfile {
     first_token_time: Option<Instant>,
     end_time: Option<Instant>,
     excluded_time: Duration,
+    preparation_time: Duration,
     input_tokens: usize,
     output_tokens: usize,
 }
@@ -31,10 +32,18 @@ impl GenerationProfile {
             first_token_time: None,
             end_time: None,
             excluded_time: Duration::ZERO,
+            preparation_time: Duration::ZERO,
             input_tokens: 0,
             output_tokens: 0,
         }
     }
+
+    pub(crate) fn record_preparation(&mut self, elapsed: Duration) {
+        self.preparation_time = elapsed;
+    }
+
+    /// Time spent resetting and preparing execution, included in TTFT.
+    pub fn preparation_time(&self) -> Duration { self.preparation_time }
 
     /// Record the moment the first output token is ready (end of prefill).
     pub fn record_first_token(&mut self) {
@@ -180,6 +189,7 @@ mod tests {
             first_token_time: Some(start + Duration::from_millis(10)),
             end_time: Some(start + Duration::from_millis(100)),
             excluded_time: Duration::from_millis(20),
+            preparation_time: Duration::ZERO,
             input_tokens: 8,
             output_tokens: 3,
         };

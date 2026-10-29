@@ -1,6 +1,6 @@
 //! Real-checkpoint lifecycle checks, separate from numerical qualification.
 use super::{config::Config, weights::Weights, MiniCpm5, Variant};
-use crate::{LlmTrait, TextPreparationState};
+use crate::{LlmInput, LlmTrait, TextPreparationState};
 use apxinf_core::{Error, Result, Tensor};
 use apxinf_mlx::{clear_cache, memory_stats, MlxBackend};
 use serde::Deserialize;
@@ -52,6 +52,40 @@ fn full_forward(model: &mut MiniCpm5, case: &ReplayCase) -> Result<Tensor> {
         case.id
     );
     Ok(output)
+}
+
+#[test]
+#[ignore = "requires official MiniCPM checkpoint, isolated process and exclusive shared Metal locks"]
+fn real_checkpoint_long_chunk_and_bucket_boundary() -> Result<()> {
+    let checkpoint = PathBuf::from(
+        env::var_os("APXINF_MINICPM_CHECKPOINT")
+            .ok_or(Error::Contract("set APXINF_MINICPM_CHECKPOINT"))?,
+    );
+    let config = Config::from_json(&std::fs::read_to_string(checkpoint.join("config.json"))?)?;
+    let backend = MlxBackend::new(0)?;
+    let (map, _) =
+        apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
+    let weights = Weights::load(&config, backend.stream(), map)?;
+    let mut model = MiniCpm5::new(config, weights, backend.clone(), Variant::Compiled)?;
+    model.prepare(3, 1)?;
+    let short = model.prefill(LlmInput::text(&[1, 7, 3]))?;
+    let expected = digest(&backend, &short)?;
+    model.reset();
+    model.prepare(4351, 2)?;
+    assert_eq!(model.preparation_status().kv_capacity, Some(4608));
+    model.prefill(LlmInput::text(&vec![7; 4351]))?;
+    let traces = backend.stream().counters().trace_callbacks;
+    model.forward(&[2], 4351)?;
+    model.forward(&[3], 4352)?;
+    assert_eq!(backend.stream().counters().trace_callbacks, traces);
+    assert!(model.forward(&[3], 4608).is_err());
+    model.reset();
+    model.prepare(3, 1)?;
+    assert_eq!(model.preparation_status().kv_capacity, Some(256));
+    let repeated = model.prefill(LlmInput::text(&[1, 7, 3]))?;
+    assert_eq!(digest(&backend, &repeated)?, expected);
+    assert_eq!(digest(&backend, &short)?, expected);
+    Ok(())
 }
 
 /// Run only this test in an isolated process under the shared Metal lock:
@@ -159,5 +193,55 @@ fn real_checkpoint_full_forward_retention_and_release() -> Result<()> {
         assert_eq!(released.cache_bytes, 0);
         eprintln!("cycle={cycle} first_case={} full_logits={original:?} baseline={baseline:?} released={released:?}", inputs.cases[first].id);
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires official MiniCPM checkpoint and exclusive shared Metal locks"]
+fn real_checkpoint_prepared_code_reuses_with_fresh_request_state() -> Result<()> {
+    let checkpoint = PathBuf::from(env::var_os("APXINF_MINICPM_CHECKPOINT")
+        .ok_or(Error::Contract("set APXINF_MINICPM_CHECKPOINT"))?);
+    let tokenizer = apxinf_tokenizer::Tokenizer::from_file(checkpoint.join("tokenizer.json"))?;
+    let template_options = serde_json::Map::from_iter([("enable_thinking".into(), serde_json::Value::Bool(false))]);
+    let mut cases = Vec::new();
+    for (id, question) in [
+        ("cache-en", "Explain why a cache can reduce repeated work. Answer in two sentences."),
+        ("cache-zh", "请用两句话说明为什么缓存可以减少重复计算。"),
+    ] {
+        let prompt = tokenizer.apply_chat_template_with_options(&[apxinf_tokenizer::ChatMessage::user(question)], &template_options)?;
+        cases.push(ReplayCase { id: id.into(), prompt_token_ids: tokenizer.encode(&prompt)? });
+    }
+    let inputs = ReplayInputs { cases };
+    let config = Config::from_json(&std::fs::read_to_string(checkpoint.join("config.json"))?)?;
+    apxinf_mlx::set_memory_limit(10 * 1024 * 1024 * 1024)?;
+    apxinf_mlx::set_cache_limit(2 * 1024 * 1024 * 1024)?;
+    let backend = MlxBackend::new(0)?;
+    let (map, _) = apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
+    let weights = Weights::load(&config, backend.stream(), map)?;
+    let mut model = MiniCpm5::new(config, weights, backend.clone(), Variant::Compiled)?;
+    let options = crate::GenerationOptions::greedy(8, None);
+    let run = |model: &mut MiniCpm5, index: usize| {
+        model.generate_streaming_with_options(crate::GenerationRequest {
+            input: LlmInput::text(&inputs.cases[index].prompt_token_ids), options: &options,
+        }, |_| {}).map(|output| output.token_ids())
+    };
+    let first = run(&mut model, 0)?;
+    model.release_request_state_retaining_preparation()?;
+    assert_eq!(model.preparation_status().state, TextPreparationState::Unprepared);
+    let traces = backend.stream().counters().trace_callbacks;
+    assert_eq!(run(&mut model, 0)?, first);
+    assert_eq!(backend.stream().counters().trace_callbacks, traces,
+        "same-profile request traced after prepared-code retention");
+    model.release_request_state_retaining_preparation()?;
+    let changed = run(&mut model, 1)?;
+    model.release_request_state()?;
+    assert_eq!(run(&mut model, 1)?, changed, "retained preparation leaked prior request state");
+    model.release_request_state()?;
+    assert_eq!(run(&mut model, 0)?, first, "changed profile altered the original output");
+    let old_capacity = model.preparation_status().kv_capacity.unwrap();
+    model.reset();
+    model.prepare(old_capacity + 1, 8)?;
+    assert!(model.preparation_status().kv_capacity.unwrap() > old_capacity);
+    assert_eq!(run(&mut model, 1)?, changed, "ordinary capacity change leaked prior state");
     Ok(())
 }

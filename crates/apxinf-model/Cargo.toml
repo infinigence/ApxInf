@@ -17,6 +17,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", optional = true }
 
+[dev-dependencies]
+apxinf-tokenizer = { path = "../apxinf-tokenizer" }
+
 [features]
 default = []
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
@@ -92,3 +95,7 @@ required-features = ["cuda"]
 [[example]]
 name = "d3_decision_index"
 required-features = ["cuda"]
+
+[[example]]
+name = "metal_text_probe"
+required-features = ["mlx"]

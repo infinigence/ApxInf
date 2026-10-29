@@ -48,15 +48,40 @@ pub fn memory_stats() -> Result<MemoryStats> {
     })?;
     Ok(stats)
 }
+pub fn loaded_library_path() -> Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut path = std::ptr::null();
+    check(unsafe { ffi::apx_mlx_loaded_library_path(&mut path) })?;
+    if path.is_null() {
+        return Err(error("Loaded MLX library path is absent"));
+    }
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    Ok(std::ffi::OsStr::from_bytes(bytes).into())
+}
 /// Reset the process-wide peak allocator observation. Use an isolated process
 /// for qualification; another model in this process shares the observation.
 pub fn reset_peak_memory() -> Result<()> {
     check(unsafe { ffi::apx_mlx_reset_peak_memory() })
 }
+/// Set the process-wide MLX allocator cache limit and return the previous value.
+pub fn set_cache_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_cache_limit(limit, &mut previous) })?;
+    Ok(previous)
+}
+
 /// Release cached allocator buffers process-wide. Active arrays remain valid.
 /// Synchronize first when measuring release, and use an isolated test process.
 pub fn clear_cache() -> Result<()> {
     check(unsafe { ffi::apx_mlx_clear_cache() })
+}
+
+/// Set the process-wide MLX allocation guideline and return the previous value.
+/// MLX can exceed this value for one operation. It is not a physical memory cap.
+pub fn set_memory_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_memory_limit(limit, &mut previous) })?;
+    Ok(previous)
 }
 fn count(shape: &[usize]) -> Result<usize> {
     shape.iter().try_fold(1usize, |n, &d| {
@@ -158,6 +183,14 @@ impl Stream {
         let p = self.inputs(arrays.iter())?;
         self.record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
         check(unsafe { ffi::apx_mlx_eval(self.raw(), p.as_ptr(), p.len()) })
+    }
+    /// Enqueues evaluation of `arrays` and returns without waiting, so host
+    /// work (such as a Neural Engine prediction) overlaps the device. A later
+    /// [`eval`](Self::eval), download or dependent evaluation waits for it.
+    pub fn async_eval(&self, arrays: &[Array]) -> Result<()> {
+        let p = self.inputs(arrays.iter())?;
+        self.record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_async_eval(p.as_ptr(), p.len()) })
     }
     fn raw(&self) -> ffi::Handle {
         self.0.raw.as_ptr()
@@ -344,6 +377,19 @@ impl Array {
         check(unsafe {
             ffi::apx_mlx_array_read(self.stream().raw(), self.raw(), out.as_mut_ptr(), out.len())
         })?;
+        self.stream()
+            .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
+        Ok(out)
+    }
+    /// Like [`to_bytes`](Self::to_bytes), but waits only for this array's
+    /// computation, not for other work queued on its stream, and adds no
+    /// operation: work submitted later with [`Stream::async_eval`] keeps
+    /// running. The array must be row-contiguous (for example a kernel output).
+    pub fn to_bytes_ready(&self) -> Result<Vec<u8>> {
+        let mut out = vec![0; self.numel() * self.dtype().size_in_bytes()];
+        self.stream()
+            .record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_array_read_ready(self.raw(), out.as_mut_ptr(), out.len()) })?;
         self.stream()
             .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
         Ok(out)
@@ -728,6 +774,19 @@ impl Compiled {
         }
         Ok(output)
     }
+
+    /// Compile an exact input profile and verify reuse without evaluating it.
+    /// This prepares the MLX graph, not Metal pipelines or allocator workspaces.
+    /// The first evaluation can still incur device compilation and allocation.
+    pub fn prepare_trace(&self, inputs: &[Array]) -> Result<Vec<Array>> {
+        self.call(inputs)?;
+        let before = self.trace.stream.counters().trace_callbacks;
+        let output = self.call(inputs)?;
+        if self.trace.stream.counters().trace_callbacks != before {
+            return Err(error("MLX prepared profile retraced on replay; required compiled execution is unavailable"));
+        }
+        Ok(output)
+    }
 }
 impl Drop for Compiled {
     fn drop(&mut self) {
@@ -783,6 +842,14 @@ unsafe extern "C" fn trace_callback(
 
 /// Prepared custom Metal primitive. Source validity and operand geometry remain
 /// the safe model-neutral wrapper's contract; no Python execution is involved.
+/// Compile-time argument of a custom Metal kernel template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateArg {
+    DType(MlxDType),
+    Int(i32),
+    Bool(bool),
+}
+
 pub struct MetalKernel {
     raw: NonNull<c_void>,
     stream: Stream,
@@ -840,7 +907,7 @@ impl MetalKernel {
         output_specs: &[(&[usize], MlxDType)],
         grid: [usize; 3],
         threadgroup: [usize; 3],
-        template_dtype: Option<MlxDType>,
+        templates: &[(&str, TemplateArg)],
     ) -> Result<Vec<Array>> {
         if inputs.len() != self.input_count || output_specs.len() != self.output_count {
             return Err(error("Metal kernel arity mismatch"));
@@ -860,6 +927,19 @@ impl MetalKernel {
         if g.contains(&0) || tg.contains(&0) {
             return Err(error("zero Metal launch geometry"));
         }
+        let names = templates
+            .iter()
+            .map(|(n, _)| CString::new(*n).map_err(|_| error("NUL in Metal template name")))
+            .collect::<Result<Vec<_>>>()?;
+        let name_ptrs: Vec<_> = names.iter().map(|n| n.as_ptr()).collect();
+        let (kinds, values): (Vec<i32>, Vec<i32>) = templates
+            .iter()
+            .map(|(_, arg)| match *arg {
+                TemplateArg::DType(d) => (0, d as i32),
+                TemplateArg::Int(v) => (1, v),
+                TemplateArg::Bool(v) => (2, v as i32),
+            })
+            .unzip();
         let mut out = vec![std::ptr::null_mut(); self.output_count];
         check(ffi::apx_mlx_metal_call(
             self.stream.raw(),
@@ -872,7 +952,10 @@ impl MetalKernel {
             self.output_count,
             g.as_ptr(),
             tg.as_ptr(),
-            template_dtype.map_or(-1, |d| d as i32),
+            name_ptrs.as_ptr(),
+            kinds.as_ptr(),
+            values.as_ptr(),
+            templates.len(),
             out.as_mut_ptr(),
         ))?;
         own_many(&self.stream, &mut out)

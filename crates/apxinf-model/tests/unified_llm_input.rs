@@ -2,12 +2,16 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use apxinf_core::{Backend, CpuBackend, Device, Result, Tensor};
+use apxinf_core::{
+    Backend, CpuBackend, Device, Error, NextTokenLogits, Result, RngKey, Tensor, TokenSample,
+    TokenSampler, TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec,
+};
 use apxinf_loader::ModelConfig;
 use apxinf_model::{
-    register, Action, AutoModel, GenerationOptions, GenerationRequest, ImageInput, InferenceSpec,
-    LlmCapabilities, LlmInput, LlmTrait, LoadOptions, LoadedModel, PreparedInference, SamplingMode,
-    VlaContract, VlaRequest, VlaRuntime,
+    generate_streaming_controlled_with_sampler, register, Action, AutoModel, GenerationBoundary,
+    GenerationOptions, GenerationRequest, ImageInput, InferenceSpec, LlmCapabilities, LlmInput,
+    LlmTrait, LoadOptions, LoadedModel, PreparedInference, SamplingMode, VlaContract, VlaRequest,
+    VlaRuntime,
 };
 
 #[derive(Default)]
@@ -65,6 +69,299 @@ impl LlmTrait for TextOnlyModel {
     }
 }
 
+struct SuppliedSampler {
+    spec: TokenSamplingSpec,
+    tokens: Vec<u32>,
+    sample_calls: usize,
+    initializations: Vec<(Vec<u32>, TokenSamplingParams, RngKey)>,
+    fail_begin: bool,
+}
+
+impl SuppliedSampler {
+    fn new(capacity: usize, tokens: &[u32]) -> Self {
+        Self {
+            spec: TokenSamplingSpec {
+                vocab_size: 4,
+                max_sequence_len: capacity,
+            },
+            tokens: tokens.to_vec(),
+            sample_calls: 0,
+            initializations: Vec::new(),
+            fail_begin: false,
+        }
+    }
+}
+
+impl TokenSampler for SuppliedSampler {
+    fn spec(&self) -> TokenSamplingSpec {
+        self.spec
+    }
+
+    fn begin(&mut self, init: TokenSamplingInit<'_>) -> Result<()> {
+        self.initializations.push((
+            init.prompt_token_ids.to_vec(),
+            init.params.clone(),
+            init.rng,
+        ));
+        self.sample_calls = 0;
+        if self.fail_begin {
+            return Err(Error::Other(
+                "supplied sampler initialization failed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn sample(&mut self, logits: NextTokenLogits<'_>) -> Result<TokenSample> {
+        assert_eq!(logits.vocab_size(), self.spec.vocab_size);
+        assert_eq!(logits.row_index() + 1, logits.tensor().shape().dims()[0]);
+        let token_id = self.tokens[self.sample_calls];
+        self.sample_calls += 1;
+        Ok(TokenSample {
+            token_id,
+            logprob: Some(-0.5),
+        })
+    }
+}
+
+#[test]
+fn supplied_sampler_controls_prefill_and_decode_tokens() {
+    let mut model = TextOnlyModel::default();
+    let options = GenerationOptions::greedy(3, None);
+    let mut sampler = SuppliedSampler::new(8, &[1, 0, 2]);
+    let mut streamed = Vec::new();
+    let output = generate_streaming_controlled_with_sampler(
+        &mut model as &mut dyn LlmTrait,
+        GenerationRequest {
+            input: LlmInput::text(&[0, 1]),
+            options: &options,
+        },
+        &mut sampler,
+        |boundary| {
+            if let GenerationBoundary::Token(token) = boundary {
+                streamed.push(token);
+            }
+            Ok(true)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(output.token_ids(), vec![1, 0, 2]);
+    assert_eq!(streamed, output.tokens);
+    assert!(streamed.iter().all(|token| token.logprob == Some(-0.5)));
+    assert_eq!(sampler.sample_calls, 3);
+    assert_eq!(
+        model.forward_calls,
+        vec![(vec![0, 1], 0), (vec![1], 2), (vec![0], 3)]
+    );
+}
+
+#[test]
+fn supplied_sampler_begins_each_request_with_prompt_resolved_params_and_seed() {
+    let mut model = TextOnlyModel::default();
+    let mut sampler = SuppliedSampler::new(8, &[0]);
+    let options = GenerationOptions {
+        max_new_tokens: Some(1),
+        temperature: Some(0.7),
+        top_p: Some(0.8),
+        repetition_penalty: Some(1.2),
+        seed: Some(41),
+        ..GenerationOptions::default()
+    };
+    let second = GenerationOptions {
+        seed: Some(97),
+        ..options.clone()
+    };
+    for (prompt, settings) in [(&[3, 1, 3][..], &options), (&[2][..], &second)] {
+        generate_streaming_controlled_with_sampler(
+            &mut model,
+            GenerationRequest {
+                input: LlmInput::text(prompt),
+                options: settings,
+            },
+            &mut sampler,
+            |_| Ok(true),
+        )
+        .unwrap();
+    }
+
+    assert_eq!(sampler.initializations.len(), 2);
+    assert_eq!(sampler.initializations[0].0, vec![3, 1, 3]);
+    assert_eq!(sampler.initializations[1].0, vec![2]);
+    assert_eq!(sampler.initializations[0].2, RngKey::new(41, 0, 0));
+    assert_eq!(sampler.initializations[1].2, RngKey::new(97, 0, 0));
+    let params = &sampler.initializations[0].1;
+    assert_eq!(
+        params.selection,
+        apxinf_core::TokenSelection::Random {
+            temperature: 0.7,
+            top_k: None,
+            top_p: 0.8,
+        }
+    );
+    assert_eq!(
+        params.penalties,
+        apxinf_core::TokenPenalties {
+            repetition: 1.2,
+            frequency: 0.0,
+            presence: 0.0,
+        }
+    );
+    assert!(!params.return_logprob);
+    assert_eq!(sampler.initializations[1].1, *params);
+}
+
+#[test]
+fn supplied_sampler_rejects_bad_specs_before_model_mutation() {
+    for (vocab_size, capacity) in [(3, 8), (4, 3), (0, 8), (4, 0)] {
+        let mut model = TextOnlyModel::default();
+        model.forward_calls.push((vec![3], 19));
+        let options = GenerationOptions::greedy(2, None);
+        let mut sampler = SuppliedSampler::new(capacity, &[]);
+        sampler.spec.vocab_size = vocab_size;
+        let result = generate_streaming_controlled_with_sampler(
+            &mut model,
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            &mut sampler,
+            |_| panic!("invalid sampler invoked boundary callback"),
+        );
+        assert!(result.is_err());
+        assert_eq!(model.forward_calls, vec![(vec![3], 19)]);
+        assert!(model.prewarm_calls.is_empty());
+        assert!(sampler.initializations.is_empty());
+    }
+}
+
+#[test]
+fn supplied_sampler_zero_output_checks_spec_without_initialization_or_model_mutation() {
+    let mut model = TextOnlyModel::default();
+    model.forward_calls.push((vec![3], 19));
+    let options = GenerationOptions::greedy(0, None);
+    let mut sampler = SuppliedSampler::new(2, &[]);
+    for capacity in [2, 1] {
+        sampler.spec.max_sequence_len = capacity;
+        let result = generate_streaming_controlled_with_sampler(
+            &mut model,
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            &mut sampler,
+            |_| panic!("zero-output request invoked boundary callback"),
+        );
+        if capacity == 2 {
+            assert!(result.unwrap().tokens.is_empty());
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    assert_eq!(model.forward_calls, vec![(vec![3], 19)]);
+    assert!(model.prewarm_calls.is_empty());
+    assert!(sampler.initializations.is_empty());
+}
+
+#[test]
+fn supplied_sampler_prefill_cancel_does_not_sample() {
+    for cancel_at_start in [true, false] {
+        let mut model = TextOnlyModel::default();
+        let options = GenerationOptions::greedy(3, None);
+        let mut sampler = SuppliedSampler::new(5, &[]);
+        let mut boundaries = Vec::new();
+        let output = generate_streaming_controlled_with_sampler(
+            &mut model,
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            &mut sampler,
+            |boundary| {
+                boundaries.push(boundary);
+                Ok(!cancel_at_start && matches!(boundary, GenerationBoundary::PrefillStart))
+            },
+        )
+        .unwrap();
+        assert!(output.tokens.is_empty());
+        assert_eq!(sampler.initializations.len(), 1);
+        assert_eq!(sampler.sample_calls, 0);
+        assert_eq!(boundaries[0], GenerationBoundary::PrefillStart);
+        if cancel_at_start {
+            assert_eq!(boundaries.len(), 1);
+            assert!(model.forward_calls.is_empty());
+        } else {
+            assert_eq!(
+                boundaries,
+                vec![
+                    GenerationBoundary::PrefillStart,
+                    GenerationBoundary::PrefillProgress { consumed_tokens: 2 }
+                ]
+            );
+            assert_eq!(model.forward_calls, vec![(vec![0, 1], 0)]);
+        }
+    }
+}
+
+#[test]
+fn supplied_sampler_eos_and_token_stop_preserve_the_last_emitted_token() {
+    for stop_on_token in [true, false] {
+        let mut model = TextOnlyModel::default();
+        let options = GenerationOptions {
+            eos_token_ids: Some(vec![0, 3]),
+            ..GenerationOptions::greedy(4, None)
+        };
+        let mut sampler = SuppliedSampler::new(6, &[1, 3]);
+        let mut streamed = Vec::new();
+        let output = generate_streaming_controlled_with_sampler(
+            &mut model,
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            &mut sampler,
+            |boundary| {
+                if let GenerationBoundary::Token(token) = boundary {
+                    streamed.push(token.token_id);
+                    return Ok(!stop_on_token);
+                }
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            output.token_ids(),
+            if stop_on_token { vec![1] } else { vec![1, 3] }
+        );
+        assert_eq!(output.token_ids(), streamed);
+        assert_eq!(model.forward_calls.len(), streamed.len());
+        assert_eq!(sampler.sample_calls, streamed.len());
+    }
+}
+
+#[test]
+fn supplied_sampler_begin_error_precedes_model_mutation() {
+    let mut model = TextOnlyModel::default();
+    model.forward_calls.push((vec![3], 19));
+    let options = GenerationOptions::greedy(1, None);
+    let mut sampler = SuppliedSampler::new(3, &[]);
+    sampler.fail_begin = true;
+    let error = generate_streaming_controlled_with_sampler(
+        &mut model,
+        GenerationRequest {
+            input: LlmInput::text(&[0, 1]),
+            options: &options,
+        },
+        &mut sampler,
+        |_| panic!("failed initialization invoked boundary callback"),
+    )
+    .err()
+    .unwrap();
+    assert!(error.to_string().contains("initialization failed"));
+    assert_eq!(model.forward_calls, vec![(vec![3], 19)]);
+    assert!(model.prewarm_calls.is_empty());
+}
+
 fn load_generation_config_test_model(
     _path: &Path,
     _device: Device,
@@ -72,6 +369,92 @@ fn load_generation_config_test_model(
     _options: &LoadOptions,
 ) -> Result<LoadedModel> {
     Ok(LoadedModel::text(Box::new(TextOnlyModel::default())))
+}
+
+#[test]
+fn controlled_generation_stops_after_prefill_without_sampling_a_token() {
+    let mut model = TextOnlyModel::default();
+    let options = GenerationOptions::greedy(4, Some(1));
+    let mut boundaries = Vec::new();
+    let output = model
+        .generate_streaming_controlled_dyn(
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            &mut |boundary| {
+                boundaries.push(boundary);
+                Ok(matches!(
+                    boundary,
+                    apxinf_model::GenerationBoundary::PrefillStart
+                ))
+            },
+        )
+        .unwrap();
+    assert!(output.tokens.is_empty());
+    assert_eq!(
+        boundaries,
+        vec![
+            apxinf_model::GenerationBoundary::PrefillStart,
+            apxinf_model::GenerationBoundary::PrefillProgress { consumed_tokens: 2 },
+        ]
+    );
+    assert_eq!(model.forward_calls, vec![(vec![0, 1], 0)]);
+}
+
+#[test]
+fn controlled_generation_stops_before_prompt_execution() {
+    let mut model = TextOnlyModel::default();
+    let options = GenerationOptions::greedy(4, Some(1));
+    let mut boundaries = Vec::new();
+    let output = model
+        .generate_streaming_controlled_dyn(
+            GenerationRequest {
+                input: LlmInput::text(&[0, 1]),
+                options: &options,
+            },
+            &mut |boundary| {
+                boundaries.push(boundary);
+                Ok(false)
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        boundaries,
+        vec![apxinf_model::GenerationBoundary::PrefillStart]
+    );
+    assert!(output.tokens.is_empty());
+    assert!(model.forward_calls.is_empty());
+}
+
+#[test]
+fn controlled_generation_preserves_tokens_and_stops_before_another_decode() {
+    let options = GenerationOptions::greedy(4, Some(1));
+    let mut model = TextOnlyModel::default();
+    let request = GenerationRequest {
+        input: LlmInput::text(&[0]),
+        options: &options,
+    };
+    let baseline = model
+        .generate_streaming_with_options(request, |_| {})
+        .unwrap()
+        .token_ids();
+    let controlled = model
+        .generate_streaming_controlled_dyn(request, &mut |_| Ok(true))
+        .unwrap()
+        .token_ids();
+    assert_eq!(baseline, controlled);
+    let stopped = model
+        .generate_streaming_controlled_dyn(request, &mut |boundary| {
+            Ok(!matches!(
+                boundary,
+                apxinf_model::GenerationBoundary::Token(_)
+            ))
+        })
+        .unwrap()
+        .token_ids();
+    assert_eq!(stopped, vec![2]);
+    assert_eq!(model.forward_calls.len(), 1);
 }
 
 struct DummyVlaModel;
@@ -468,4 +851,70 @@ fn load_model_unifies_detected_and_explicit_model_selection() {
         .contains("missing_override_model"));
 
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+
+struct OverrideSensitiveModel(TextOnlyModel);
+impl LlmTrait for OverrideSensitiveModel {
+    fn load(_: ModelConfig, _: HashMap<String, Tensor>, _: Device) -> Result<Self> { unreachable!() }
+    fn forward(&mut self, ids: &[u32], position: u32) -> Result<Tensor> { self.0.forward(ids, position) }
+    fn backend(&self) -> &dyn Backend { self.0.backend() }
+    fn reset(&mut self) { self.0.reset(); }
+    fn vocab_size(&self) -> usize { 4 }
+    fn token_sequence<'a>(&'a mut self, _: Tensor, _: Box<dyn TokenSampler>, _: &TokenSamplingParams, _: u32)
+        -> Result<Box<dyn apxinf_model::llm_trait::TokenSequence + 'a>> {
+        Err(Error::Contract("family sequence selected"))
+    }
+}
+
+#[test]
+fn caller_sampler_is_not_bypassed_by_a_family_greedy_sequence() {
+    let mut model = OverrideSensitiveModel(TextOnlyModel::default());
+    let options = GenerationOptions::greedy(2, None);
+    let input = LlmInput::text(&[0, 1]);
+    let mut sampler = SuppliedSampler::new(4, &[0, 1]);
+    let result = generate_streaming_controlled_with_sampler(&mut model,
+        GenerationRequest { input, options: &options }, &mut sampler, |_| Ok(true)).unwrap();
+    assert_eq!(result.token_ids(), vec![0, 1]);
+    let error = model.generate_streaming_with_options(GenerationRequest { input, options: &options }, |_| {}).err().unwrap();
+    assert!(error.to_string().contains("family sequence selected"));
+}
+
+#[test]
+fn callback_error_finishes_the_family_sequence_and_preserves_the_error() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Producer(Arc<AtomicBool>);
+    struct Sequence(Arc<AtomicBool>);
+    impl apxinf_model::llm_trait::TokenSequence for Sequence {
+        fn next(&mut self, _: bool) -> Result<apxinf_model::GeneratedToken> {
+            Ok(apxinf_model::GeneratedToken { token_id: 2, logprob: None })
+        }
+        fn finish(self: Box<Self>, _: usize) -> Result<()> {
+            self.0.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+    impl LlmTrait for Producer {
+        fn load(_: ModelConfig, _: HashMap<String, Tensor>, _: Device) -> Result<Self> { unreachable!() }
+        fn forward(&mut self, ids: &[u32], _: u32) -> Result<Tensor> { TextOnlyModel::logits(ids.len(), 2) }
+        fn backend(&self) -> &dyn Backend { &CpuBackend }
+        fn reset(&mut self) {}
+        fn vocab_size(&self) -> usize { 4 }
+        fn token_sequence<'a>(&'a mut self, _: Tensor, _: Box<dyn TokenSampler>, _: &TokenSamplingParams, _: u32)
+            -> Result<Box<dyn apxinf_model::llm_trait::TokenSequence + 'a>> {
+            Ok(Box::new(Sequence(self.0.clone())))
+        }
+    }
+    let finished = Arc::new(AtomicBool::new(false));
+    let mut model = Producer(finished.clone());
+    let options = GenerationOptions::greedy(3, None);
+    let failure = model.generate_streaming_controlled_dyn(GenerationRequest {
+        input: LlmInput::text(&[0, 1]), options: &options,
+    }, &mut |event| {
+        assert!(!finished.load(Ordering::Acquire));
+        if matches!(event, GenerationBoundary::Token(_)) { Err(Error::Contract("consumer rejected output")) }
+        else { Ok(true) }
+    }).err().unwrap();
+    assert!(failure.to_string().contains("consumer rejected output"));
+    assert!(finished.load(Ordering::Acquire));
 }

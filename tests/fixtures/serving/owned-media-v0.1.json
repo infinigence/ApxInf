@@ -1,0 +1,76 @@
+{
+  "format": "apxinf-owned-png-conformance-v1",
+  "provenance": "Original red RGB pixels and maximum-dimension strips, plus a blue RGBA pixel with half alpha. Cases below are handwritten boundary mutations.",
+  "images": {
+    "rgb": {
+      "data_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC",
+      "sha256": "b1ff9c8ea3a780bad09b346c423d2d0e46815926879b18e841d928376a946640",
+      "byte_count": 69, "width": 1, "height": 1, "media_type": "image/png"
+    },
+    "max_width": {
+      "data_base64": "iVBORw0KGgoAAAANSUhEUgAABAAAAAABCAIAAADPbEtiAAAAG0lEQVR4nO3BAQEAAAgCIP0/2oYEdAEAAPLEAQy2AQFhZQklAAAAAElFTkSuQmCC",
+      "sha256": "a561d4232b384e40643c446d6de5b7a9304a37e4890801ba0cb2ed056f337932",
+      "byte_count": 84, "width": 1024, "height": 1, "media_type": "image/png"
+    },
+    "max_height": {
+      "data_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAQACAIAAACvZKRoAAAAL0lEQVR4nO3QQQ0AAAgAoZv9O2sPx4MCtDXhIAc5cJCDHDjIQQ4c5CAHDnLQv4MD86II/vUqZ3sAAAAASUVORK5CYII=",
+      "sha256": "e1475c5722264173172fbc5aa604653d2530928c77b955c5bf23b7f25e3434b0",
+      "byte_count": 104, "width": 1, "height": 1024, "media_type": "image/png"
+    },
+    "rgba": {
+      "data_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgcPjfAAADQwHAsLQKxwAAAABJRU5ErkJggg==",
+      "sha256": "154081953cad48fcc5daed642681c33d0e848cf2339ff12bb2c776be42f1374e",
+      "byte_count": 70, "width": 1, "height": 1, "media_type": "image/png"
+    }
+  },
+  "cases": [
+    {"name":"rgb_source", "operation":"source", "images":["rgb"], "valid":true},
+    {"name":"rgba_descriptor", "operation":"descriptor", "images":["rgba"], "valid":true},
+    {"name":"max_width", "operation":"descriptor", "images":["max_width"], "valid":true},
+    {"name":"max_height", "operation":"descriptor", "images":["max_height"], "valid":true},
+    {"name":"empty_batch", "operation":"batch", "images":[], "valid":true},
+    {"name":"ordered_duplicates", "operation":"batch", "images":["rgba","rgb","rgba","rgb"], "valid":true},
+    {"name":"too_many_images", "operation":"batch", "images":["rgb","rgb","rgb","rgb","rgb"], "error":"unsupported_feature"},
+    {"name":"file_byte_limit", "operation":"source", "images":["rgb"], "pad_to_bytes":131072, "valid":true},
+    {"name":"file_byte_limit_plus_one", "operation":"source", "images":["rgb"], "pad_to_bytes":131073, "error":"unsupported_feature"},
+    {"name":"batch_byte_limit", "operation":"batch", "images":["rgb","rgba"], "pad_to_bytes":131072, "valid":true},
+    {"name":"batch_byte_limit_exceeded", "operation":"batch", "images":["rgb","rgba","rgb"], "pad_to_bytes":87382, "error":"unsupported_feature"},
+    {"name":"source_url", "operation":"source", "images":["rgb"], "set":{"type":"url"}, "error":"unsupported_feature"},
+    {"name":"source_jpeg", "operation":"source", "images":["rgb"], "set":{"media_type":"image/jpeg"}, "error":"unsupported_feature"},
+    {"name":"source_nonstring", "operation":"source", "images":["rgb"], "set":{"data":true}, "error":"invalid_request"},
+    {"name":"source_unknown_field", "operation":"source", "images":["rgb"], "set":{"path":"image.png"}, "error":"invalid_request"},
+    {"name":"source_missing_data", "operation":"source", "images":["rgb"], "remove":"data", "error":"invalid_request"},
+    {"name":"base64_whitespace", "operation":"source", "images":["rgb"], "base64_suffix":"\n", "error":"invalid_request"},
+    {"name":"base64_missing_padding", "operation":"source", "images":["rgba"], "strip_padding":true, "error":"invalid_request"},
+    {"name":"base64_unused_bits", "operation":"source", "images":["rgba"], "base64_tail":"gh==", "error":"invalid_request"},
+    {"name":"base64_empty", "operation":"source", "images":["rgb"], "set":{"data":""}, "error":"invalid_request"},
+    {"name":"wrong_digest", "operation":"descriptor", "images":["rgb"], "set":{"sha256":"wrong"}, "error":"invalid_request"},
+    {"name":"wrong_byte_count", "operation":"descriptor", "images":["rgb"], "set":{"byte_count":70}, "error":"invalid_request"},
+    {"name":"boolean_width", "operation":"descriptor", "images":["rgb"], "set":{"width":true}, "error":"invalid_request"},
+    {"name":"float_height", "operation":"descriptor", "images":["rgb"], "set":{"height":1.0}, "error":"invalid_request"},
+    {"name":"string_width", "operation":"descriptor", "images":["rgb"], "set":{"width":"1"}, "error":"invalid_request"},
+    {"name":"unknown_descriptor_field", "operation":"descriptor", "images":["rgb"], "set":{"lifetime":"forever"}, "error":"invalid_request"},
+    {"name":"header_crc", "operation":"source", "images":["rgb"], "xor_offset":29, "error":"invalid_request"},
+    {"name":"iend_crc", "operation":"source", "images":["rgb"], "xor_offset":68, "error":"invalid_request"},
+    {"name":"broken_pixels_valid_chunk_crc", "operation":"source", "images":["rgb"], "xor_offset":41, "repair_crc_offset":33, "error":"invalid_request"},
+    {"name":"bad_adler_valid_chunk_crc", "operation":"source", "images":["rgb"], "xor_offset":52, "repair_crc_offset":33, "error":"invalid_request"},
+    {"name":"missing_adler_valid_chunk_crc", "operation":"source", "images":["rgb"], "replace_idat_hex":"789c63f8cfc00000", "error":"invalid_request"},
+    {"name":"extra_scanline_bytes", "operation":"source", "images":["rgb"], "replace_idat_hex":"789c63f8cf00060007010100", "error":"invalid_request"},
+    {"name":"trailing_idat_data", "operation":"source", "images":["rgb"], "replace_idat_hex":"789c63f8cfc000000301010000", "error":"invalid_request"},
+    {"name":"truncated_iend", "operation":"source", "images":["rgb"], "truncate":1, "error":"invalid_request"},
+    {"name":"trailing_bytes", "operation":"source", "images":["rgb"], "append_hex":"00", "error":"invalid_request"},
+    {"name":"width_zero", "operation":"source", "images":["rgb"], "set_byte":[19,0], "repair_crc_offset":8, "error":"invalid_request"},
+    {"name":"width_over_limit", "operation":"source", "images":["rgb"], "set_byte":[18,8], "repair_crc_offset":8, "error":"unsupported_feature"},
+    {"name":"unsupported_depth", "operation":"source", "images":["rgb"], "set_byte":[24,16], "repair_crc_offset":8, "error":"unsupported_feature"},
+    {"name":"unsupported_interlace", "operation":"source", "images":["rgb"], "set_byte":[28,1], "repair_crc_offset":8, "error":"unsupported_feature"},
+    {"name":"animation", "operation":"source", "images":["rgb"], "insert_chunk":{"type":"acTL","data_hex":"0000000100000000"}, "error":"unsupported_feature"},
+    {"name":"compressed_metadata", "operation":"source", "images":["rgb"], "insert_chunk":{"type":"iCCP","data_hex":""}, "error":"unsupported_feature"},
+    {"name":"srgb", "operation":"source", "images":["rgb"], "insert_chunk":{"type":"sRGB","data_hex":"00"}, "valid":true},
+    {"name":"late_srgb", "operation":"source", "images":["rgb"], "insert_chunk":{"type":"sRGB","data_hex":"00","after_idat":true}, "error":"invalid_request"},
+    {"name":"duplicate_srgb", "operation":"source", "images":["rgb"], "insert_chunk":{"type":"sRGB","data_hex":"00","repeat":2}, "error":"invalid_request"},
+    {"name":"srgb_intent_outside_range", "operation":"source", "images":["rgb"], "insert_chunk":{"type":"sRGB","data_hex":"ff"}, "error":"invalid_request"},
+    {"name":"empty_idat_then_metadata_then_idat", "operation":"source", "images":["rgb"], "empty_idats":1, "insert_chunk":{"type":"sRGB","data_hex":"00"}, "error":"invalid_request"},
+    {"name":"chunk_limit", "operation":"source", "images":["rgb"], "empty_idats":1021, "valid":true},
+    {"name":"chunk_limit_plus_one", "operation":"source", "images":["rgb"], "empty_idats":1022, "error":"unsupported_feature"}
+  ]
+}
