@@ -378,9 +378,12 @@ class Pi05Policy:
         that action transform and determines the width, so it cannot be combined
         with ``action_dim``.
 
-        ``weight_layout_budget_bytes`` limits persistent extra GEMM weight layouts
+        ``weight_layout_budget_bytes`` limits live extra GEMM weight layouts
         for BF16/FP8 language gate/up projections. ``None`` allows one extra
-        representation per weight, allocated lazily and shared across shapes;
+        representation per weight for concurrent consumers. Copies are released
+        with their last execution/graph; after old readers retire, prepare can
+        transition the base weight in place. With no live incompatible readers,
+        changing shape does not retain historical layout copies;
         ``0`` keeps canonical weights. This excludes temporary preparation buffers
         and execution workspaces. Set it when constructing a supplied runner.
 

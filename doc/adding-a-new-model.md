@@ -166,10 +166,11 @@ does not make its surviving tensor aliases canonical again. This enforcement
 does not make raw tensor readback/export layout-aware.
 For weights shared across shapes or semantics, use `with_layout_cache` with an
 explicit extra-weight budget when their optimal implementations require different
-physical layouts. It caches profile recipes separately and shares one immutable
-allocation per selected layout; executions retain the physical allocation they
-read. New layouts are prepared from a bit-preserving private canonical trial,
-never by overwriting a live graph's bytes. A zero budget fixes canonical before
+physical layouts. It caches CPU selection metadata separately; executions own
+physical-storage leases and the model retains weak extra-layout entries. When
+all readers of the base retire, prepare may transition that allocation in place.
+Concurrent incompatible consumers share extra layouts, reclaimed with their
+last execution/graph. Preparation never overwrites a live reader's bytes. A zero budget fixes canonical before
 any execution. Benchmark every consumer and both preparation orders, including
 prepare time, live/peak allocations and steady replay; a layout-aware fallback
 establishes correctness but not performance parity.

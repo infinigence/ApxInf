@@ -602,14 +602,9 @@ fn language_layer_bf16_with_policies(
         rms_eps,
     )?;
     let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up)?;
-<<<<<<< HEAD
-    let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
-    let hidden = bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
-=======
     let projected = gemm_bf16(ctx, policies, &activated, &weights.down)?;
     let hidden =
         bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
->>>>>>> 31782e00 (fix(cuda): enforce shared allocation state for repackable weights)
     Ok(Bf16LanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,

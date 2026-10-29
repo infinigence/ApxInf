@@ -47,13 +47,14 @@ pub(crate) fn reject_canonical_alias(buffer: &CudaBuffer) -> Result<()> {
     Ok(())
 }
 
-/// One weight allocation whose layout may be committed during first preparation.
+/// Model-owned weight allocation with an explicitly tracked physical layout.
 ///
 /// Every consumer of this allocation must attach this same state to its GEMM
 /// arguments. The caller must not modify or read the tensor through canonical
 /// tensor operations after preparation. Replacing a weight requires a new
 /// allocation and state after retiring all executions/graphs that use the old one.
-/// Clones share the layout decision; they do not allocate device memory.
+/// Shared-layout mode can transition the base only after its execution leases
+/// retire. Clones share state; they do not allocate device memory.
 #[derive(Clone)]
 pub struct RepackedWeight {
     pub(crate) state: Arc<Mutex<WeightState>>,
@@ -64,7 +65,40 @@ pub(crate) struct WeightState {
     pub shape: Vec<usize>,
     pub dtype: apxinf_core::DType,
     pub layout: u32,
+    pub base_lease: Weak<WeightStorage>,
     pub cache: Option<LayoutCache>,
+}
+
+/// A live execution/graph lease, independent of model metadata. Extra storage
+/// dies with its last consumer; weak model entries cannot keep it allocated.
+pub(crate) struct WeightStorage {
+    pub buffer: CudaBuffer,
+    pub layout: u32,
+}
+
+impl WeightState {
+    pub fn prune_layouts(&mut self) {
+        if let Some(cache) = self.cache.as_mut() {
+            cache.buffers.retain(|_, buffer| buffer.strong_count() != 0);
+        }
+    }
+
+    pub fn extra(&self, layout: u32) -> Option<Arc<WeightStorage>> {
+        self.cache.as_ref()?.buffers.get(&layout)?.upgrade()
+    }
+
+    pub fn lease_base(&mut self) -> Arc<WeightStorage> {
+        if let Some(lease) = self.base_lease.upgrade() {
+            debug_assert_eq!(lease.layout, self.layout);
+            return lease;
+        }
+        let lease = Arc::new(WeightStorage {
+            buffer: self.buffer.clone(),
+            layout: self.layout,
+        });
+        self.base_lease = Arc::downgrade(&lease);
+        lease
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -95,8 +129,18 @@ impl LayoutChoiceKey {
 
 pub(crate) struct LayoutCache {
     pub budget: usize,
-    pub buffers: HashMap<u32, CudaBuffer>,
-    pub choices: HashMap<LayoutChoiceKey, u32>,
+    pub buffers: HashMap<u32, Weak<WeightStorage>>,
+    pub choices: HashMap<LayoutChoiceKey, crate::ffi::abi::gemm::Choice>,
+}
+
+impl LayoutCache {
+    pub fn extra_bytes(&self) -> usize {
+        self.buffers
+            .values()
+            .filter_map(Weak::upgrade)
+            .map(|storage| storage.buffer.len())
+            .sum()
+    }
 }
 
 impl std::fmt::Debug for RepackedWeight {
@@ -107,9 +151,10 @@ impl std::fmt::Debug for RepackedWeight {
 
 impl RepackedWeight {
     /// Allow independent shape/semantic choices while sharing each physical
-    /// layout across all executions. The original allocation remains the first
-    /// prepared representation; additional representations are immutable copies.
-    /// `extra_bytes` bounds persistent copies, excluding prepare-local trials.
+    /// layout across live executions. A base with no live execution lease can
+    /// change layout during prepare; leased allocations remain immutable.
+    /// Extra representations are owned by their consumers, with weak model
+    /// entries for reuse. `extra_bytes` bounds live copies, excluding trials.
     /// A budget smaller than one weight pins canonical at adoption, avoiding a
     /// first-caller decision when no second representation could be retained.
     pub fn with_layout_cache(weight: &Tensor, extra_bytes: usize) -> Result<Self> {
@@ -155,6 +200,7 @@ impl RepackedWeight {
                 shape: weight.shape().dims().to_vec(),
                 dtype: weight.dtype(),
                 layout: 0,
+                base_lease: Weak::new(),
                 cache: None,
             })),
         })

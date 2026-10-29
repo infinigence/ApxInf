@@ -56,8 +56,9 @@ pub struct LoadOptions {
     /// hardware/toolkit tuning directory; legacy JSON records are not loaded.
     pub tuning_path: Option<PathBuf>,
     /// PI0.5 BF16/FP8: maximum extra bytes for language gate/up layout copies.
-    /// None reserves one extra layout per weight; copies are lazy and shared
-    /// across shapes/IO. Some(0) fixes canonical without additional copies.
+    /// None permits one extra live layout per weight for concurrent consumers.
+    /// Copies die with their last execution/graph; retired bases can transition
+    /// in place. Some(0) fixes canonical without additional copies.
     pub weight_layout_budget_bytes: Option<usize>,
     /// Additional named model artifacts that are not embedded in the primary
     /// checkpoint. Model loaders must reject missing or unknown required
