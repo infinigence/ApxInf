@@ -675,6 +675,11 @@ fn run_decide_schema(
             .map_err(|error| format!("Failed to detect model type: {error}"))?,
     };
     options.model_name = Some(model_name.clone());
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    if matches!(device, Device::Metal(_)) {
+        apxinf_mlx::set_cache_limit(1 << 30)
+            .map_err(|error| format!("Failed to set the decision process cache limit: {error}"))?;
+    }
     writeln!(writer, "Loading {model_name} from {:?}...", model_dir)
         .map_err(|error| error.to_string())?;
     let mut model = load_model(device, model_dir, &options)

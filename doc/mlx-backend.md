@@ -132,6 +132,15 @@ chat options containing `tools` enable this behavior automatically. MiniCPM's
 
 ## Clef decision preparation
 
+`auto` selects only GPU execution. Core ML column splitting requires the explicit
+`gpu-ane-columns` model variant and the `coreml` feature. An architecture name
+does not qualify a new OS, checkpoint, or execution profile. The declared
+placement and complete-request qualification requirements still apply.
+
+The decision CLI sets its process allocator cache limit before loading.
+Library callers retain ownership of their process policy through
+`apxinf_mlx::set_cache_limit`; loading Clef does not change that limit.
+
 With `coreml`, Clef checks its selected fixed input/output profile before
 compilation and matches the inspected expected plan to the generated source
 graph. Typed literals and bounded weight blobs establish static dependencies;
