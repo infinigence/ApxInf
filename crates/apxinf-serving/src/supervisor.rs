@@ -337,6 +337,15 @@ pub struct Service {
 }
 
 impl Service {
+    pub(crate) fn output_profile(&self) -> OutputProfile {
+        if self.ready["model_manifest"]["execution"]["parser"] == "minicpm5_xml"
+            || self.ready["runtime"]["kind"] == "native_minicpm5" {
+            OutputProfile::MiniCpm5
+        } else {
+            OutputProfile::Qwen
+        }
+    }
+
     pub(crate) fn decision_enabled(&self) -> bool {
         self.ready["protocol"] == contracts::CLEF_PROTOCOL
     }
@@ -1877,18 +1886,7 @@ async fn execute(
         return settle_stopped_submission(worker, service, &job, tracker, stopped).await;
     }
     let mut public = GenerationPublic::new(&mut job, begin);
-    let profile = if matches!(
-        worker.protocol,
-        contracts::NATIVE_PROTOCOL
-            | contracts::NATIVE_PREPARED_PROTOCOL
-            | contracts::NATIVE_SAMPLED_PROTOCOL
-            | contracts::NATIVE_THINKING_PROTOCOL
-            | contracts::NATIVE_BOUNDED_THINKING_PROTOCOL
-    ) {
-        OutputProfile::MiniCpm5
-    } else {
-        OutputProfile::Qwen
-    };
+    let profile = service.output_profile();
     let mut parser = OutputParser::with_profile(job.text().tools.clone(), profile);
     let mut stops = StopMatcher::new(job.text().stops.clone());
     let mut thinking_prefix = service
@@ -2278,6 +2276,7 @@ fn gateway_test_service_config(
     if protocol == contracts::VISION_PROTOCOL {
         capabilities["media_limits"] = json!({"max_images":4,"max_image_bytes":131072,"max_total_bytes":262144,"max_dimension":1024,"max_host_array_bytes":67108864});
     }
+    let native = !matches!(protocol, PROTOCOL | contracts::VISION_PROTOCOL | contracts::CLEF_PROTOCOL);
     let service = Arc::new(Service {
         queue: PendingQueue::new(8),
         host_pressure: pressure,
@@ -2285,6 +2284,7 @@ fn gateway_test_service_config(
         ready_state: RwLock::new(json!({"worker_epoch":"00000000-0000-4000-8000-000000000001"})),
         ready: json!({
             "protocol": protocol,
+            "runtime": if native { json!({"kind":"native_minicpm5"}) } else { json!({"python":"test"}) },
             "worker_epoch": "00000000-0000-4000-8000-000000000001",
             "model_revision": "1111111111111111111111111111111111111111111111111111111111111111",
             "capabilities": capabilities

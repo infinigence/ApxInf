@@ -65,11 +65,14 @@ class NativeComparisonTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
-    def invoke(self, directory, worker, model, base):
+    def invoke(self, directory, worker, model, base, receipt_mode="valid"):
         corpus = directory / "corpus.json"
         corpus.write_text(json.dumps({"cases": [{"id": "question", "messages": [{"role": "user", "content": "Explain caching."}], "max_tokens": 8}]}))
+        probe = directory / "probe"
+        probe.write_bytes(b"original probe fixture")
         direct = directory / "direct.jsonl"
-        direct.write_text(json.dumps({"kind": "metadata", "source_commit": "test-source", "source_dirty": False,
+        direct.write_text(json.dumps({"kind": "metadata", "checkout_commit": "test-source", "checkout_dirty": False,
+                                      "executable_sha256": hashlib.sha256(probe.read_bytes()).hexdigest(),
                                       "model_path": str(model), "allocator_cache_limit_bytes": 2147483648,
                                       "memory_limit_bytes": 10737418240}) + "\n" +
                           json.dumps({"kind": "result", "id": "question", "repeat": 0, "input_tokens": 5,
@@ -77,10 +80,20 @@ class NativeComparisonTests(unittest.TestCase):
         result = directory / "comparison.json"
         lock = directory / "metal.lock"
         argv = ["native_runtime_compare", "--base-url", base, "--corpus", str(corpus), "--direct-jsonl", str(direct),
-                "--native-worker", str(worker), "--output", str(result), "--metal-lock", str(lock), "--lock-owned-by-parent"]
+                "--native-worker", str(worker), "--native-probe", str(probe), "--output", str(result),
+                "--metal-lock", str(lock), "--lock-owned-by-parent"]
+        if receipt_mode != "none":
+            receipt = {"source_commit": "test-source", "source_dirty": False, "binaries": {
+                "metal_text_probe": {"bytes": probe.stat().st_size, "sha256": hashlib.sha256(probe.read_bytes()).hexdigest()},
+                "apxinf-native-worker": {"bytes": worker.stat().st_size, "sha256": hashlib.sha256(worker.read_bytes()).hexdigest()}}}
+            if receipt_mode == "stale-probe":
+                receipt["binaries"]["metal_text_probe"]["sha256"] = "0" * 64
+            receipt_path = directory / "build-receipt.json"
+            receipt_path.write_text(json.dumps(receipt))
+            argv.extend(["--build-receipt", str(receipt_path)])
         with lock.open("w") as owned_lock:
             fcntl.flock(owned_lock, fcntl.LOCK_EX)
-            with patch.object(sys, "argv", argv), patch.object(comparison, "source_commit", return_value="test-source"):
+            with patch.object(sys, "argv", argv), patch.object(comparison, "checkout_commit", return_value="test-source"):
                 comparison.main()
         return result
 
@@ -91,6 +104,8 @@ class NativeComparisonTests(unittest.TestCase):
                 result = self.invoke(directory, worker, model, base)
             report = json.loads(result.read_text())
             self.assertTrue(report["all_outputs_equal"])
+            self.assertEqual(report["source_binding"]["status"], "verified_external_build_receipt")
+            self.assertFalse(report["model_binding"]["artifact_equality_verified"])
             self.assertEqual(report["rows"][0]["http"]["usage"]["completion_tokens"], 3)
             self.assertEqual(requests[0]["stream_options"], {"include_usage": True})
 
@@ -113,3 +128,21 @@ class NativeComparisonTests(unittest.TestCase):
                     self.invoke(directory, worker, model, base)
                 self.assertEqual(requests, [])
             self.assertFalse((directory / "comparison.json").exists())
+
+    def test_stale_probe_in_build_receipt_fails_before_generation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with self.deployment(directory) as (worker, model, base, requests):
+                with self.assertRaisesRegex(ValueError, "metal_text_probe differs"):
+                    self.invoke(directory, worker, model, base, receipt_mode="stale-probe")
+                self.assertEqual(requests, [])
+            self.assertFalse((directory / "comparison.json").exists())
+
+    def test_checkout_metadata_without_receipt_is_not_source_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with self.deployment(directory) as (worker, model, base, _):
+                result = self.invoke(directory, worker, model, base, receipt_mode="none")
+            report = json.loads(result.read_text())
+            self.assertEqual(report["source_binding"]["status"], "unverified")
+            self.assertNotIn("source_commit", report)
