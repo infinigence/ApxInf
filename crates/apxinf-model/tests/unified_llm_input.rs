@@ -879,3 +879,42 @@ fn caller_sampler_is_not_bypassed_by_a_family_greedy_sequence() {
     let error = model.generate_streaming_with_options(GenerationRequest { input, options: &options }, |_| {}).err().unwrap();
     assert!(error.to_string().contains("family sequence selected"));
 }
+
+#[test]
+fn callback_error_finishes_the_family_sequence_and_preserves_the_error() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Producer(Arc<AtomicBool>);
+    struct Sequence(Arc<AtomicBool>);
+    impl apxinf_model::llm_trait::TokenSequence for Sequence {
+        fn next(&mut self, _: bool) -> Result<apxinf_model::GeneratedToken> {
+            Ok(apxinf_model::GeneratedToken { token_id: 2, logprob: None })
+        }
+        fn finish(self: Box<Self>, _: usize) -> Result<()> {
+            self.0.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+    impl LlmTrait for Producer {
+        fn load(_: ModelConfig, _: HashMap<String, Tensor>, _: Device) -> Result<Self> { unreachable!() }
+        fn forward(&mut self, ids: &[u32], _: u32) -> Result<Tensor> { TextOnlyModel::logits(ids.len(), 2) }
+        fn backend(&self) -> &dyn Backend { &CpuBackend }
+        fn reset(&mut self) {}
+        fn vocab_size(&self) -> usize { 4 }
+        fn token_sequence<'a>(&'a mut self, _: Tensor, _: Box<dyn TokenSampler>, _: &TokenSamplingParams, _: u32)
+            -> Result<Box<dyn apxinf_model::llm_trait::TokenSequence + 'a>> {
+            Ok(Box::new(Sequence(self.0.clone())))
+        }
+    }
+    let finished = Arc::new(AtomicBool::new(false));
+    let mut model = Producer(finished.clone());
+    let options = GenerationOptions::greedy(3, None);
+    let failure = model.generate_streaming_controlled_dyn(GenerationRequest {
+        input: LlmInput::text(&[0, 1]), options: &options,
+    }, &mut |event| {
+        assert!(!finished.load(Ordering::Acquire));
+        if matches!(event, GenerationBoundary::Token(_)) { Err(Error::Contract("consumer rejected output")) }
+        else { Ok(true) }
+    }).err().unwrap();
+    assert!(failure.to_string().contains("consumer rejected output"));
+    assert!(finished.load(Ordering::Acquire));
+}

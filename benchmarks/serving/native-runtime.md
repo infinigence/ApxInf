@@ -54,7 +54,7 @@ Use `release-all` for a direct cleanup control.
 The probe records the source revision, actual library, model directory and memory policy.
 Each request records complete token IDs, text, stop reason and engine timings.
 Preparation remains included in engine TTFT.
-Cleanup and retained allocation are reported separately.
+The probe reports cleanup and retained allocation separately.
 The probe does not identify itself as a numerically independent oracle.
 
 Start the selected service after the probe exits:
