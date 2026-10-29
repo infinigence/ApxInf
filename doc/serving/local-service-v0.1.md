@@ -469,4 +469,4 @@ Follow [the benchmark guide](https://github.com/qhy991/ApxInf/blob/d82ae3b06631e
 Follow [the Metal experiments](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/metal-experiments.md) for controlled parameter comparisons.
 Tests must preserve raw failures and actual outputs.
 CPU test doubles cannot establish real inference or client compatibility.
-The [lifecycle report](supervisor-acceptance.md) separates the latest CPU checks from historical model measurements.
+The [lifecycle report](supervisor-acceptance.md) explains why CPU checks do not establish model or device qualification.
