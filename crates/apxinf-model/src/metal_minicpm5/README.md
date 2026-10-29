@@ -42,6 +42,7 @@ One model-owned compiled entry and immutable shape metadata can remain.
 Preparation status becomes `Unprepared` until fresh request KV exists.
 A changed complete preparation key replaces the entry and its local traces.
 The ordinary `release_request_state` operation still removes prepared code.
+It reconstructs local callables with the same variant-selected normalization as model loading.
 The [native prepared profile](../../../../doc/serving/native-prepared-v0.1.md) defines its service accounting and opt-in selection.
 
 Initial allocation gives all 84 K/V slots one shared immutable BF16 zero array.
@@ -77,11 +78,10 @@ rounded to 256 tokens, with unwritten positions masked. Capacity at most 4096
 retains the original attention shape. The actual decode buckets are prepared
 before inference; crossing a bucket does not retrace the compiled step.
 
-Ordinary compiled requests with 16384–65536 prompt tokens and 1–128 reserved
-output tokens select exact KV views without a mask for one-row decode. Other
-requests keep bucketed attention. The construction-time override
-`APXINF_MINICPM5_EXACT_ATTN=1` forces exact attention; every other present value
-forces bucketed attention. Public and DSpark always keep their existing path.
+Ordinary compiled requests use bucketed attention by default. The experimental
+construction-time override `APXINF_MINICPM5_EXACT_ATTN=1` selects exact KV views
+without a mask for one-row decode. All other values retain bucketed attention.
+Public and DSpark always keep their existing path.
 Preparation owns the prompt, output budget, resolved attention mode and width
 profiles together; changing exact geometry or attention mode replaces the
 compiled graph. The first and last widths are evaluated during preparation;
@@ -89,9 +89,10 @@ intermediate widths receive graph-only preparation. This verifies Rust trace
 reuse, not every Metal pipeline's warm state. Cold-request measurements include
 remaining device compilation and allocation. Direct forward calls beyond the
 prepared exact prompt/output profile are rejected. Exact attention changes BF16
-rounding. External teacher counts did not regress in the recorded tests;
-long output trajectories can differ. Final five-block performance qualification
-is tracked in the dated decode report.
+rounding. The recorded short-input teacher suite does not exercise the long
+exact-attention path. Long real-input numerical and semantic qualification is
+incomplete, so exact attention remains opt-in. Historical timing and trajectory
+observations do not establish default-on acceptance.
 
 On a 16 GiB host, BF16 KV uses
 `2 * 42 layers * 2 KV heads * 128 channels * 2 bytes = 42 KiB/token`.

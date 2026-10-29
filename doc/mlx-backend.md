@@ -275,7 +275,7 @@ family variants and fallible family `prepare` methods. `Compiled` owns the pure
 Rust callback; `call` is lazy and `call_and_eval` completes all returned arrays.
 `Compiled::prepare` evaluates twice and rejects any Rust trace callback on the
 second invocation. `Compiled::prepare_trace` checks graph reuse without evaluation.
-The MiniCPM5 exact-attention path evaluates its first and last
+The opt-in MiniCPM5 exact-attention path evaluates its first and last
 widths and uses graph-only preparation for intermediate widths. Their first
 device evaluation can still compile shaders and allocate buffers; cold-request
 timing includes that work. Callable construction rejects

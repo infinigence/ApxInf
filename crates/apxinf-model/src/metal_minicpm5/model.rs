@@ -19,6 +19,28 @@ struct LocalMath {
     rope: Compiled,
 }
 
+impl LocalMath {
+    fn new(variant: Variant, epsilon: &Array, rms_norm_eps: f32) -> Result<Option<Self>> {
+        if variant == Variant::Public {
+            return Ok(None);
+        }
+        let stream = epsilon.stream();
+        let eps = epsilon.clone();
+        let native_norm = variant == Variant::Compiled;
+        Ok(Some(Self {
+            norm: Compiled::with_shapeless(stream, 1, true, move |a| {
+                let normalized = if native_norm {
+                    a[0].fast_rms_norm(&a[1], rms_norm_eps)?
+                } else {
+                    math::norm(&a[0], &a[1], &eps)?
+                };
+                Ok(vec![normalized])
+            })?,
+            rope: Compiled::new(stream, 1, |a| Ok(vec![math::rotate(&a[0], &a[1], &a[2])?]))?,
+        }))
+    }
+}
+
 enum RequiredOutput {
     CacheOnly,
     Logits { last_only: bool },
@@ -31,7 +53,6 @@ enum DecodeAttention {
 }
 
 enum DecodeAttentionPolicy {
-    Auto,
     Bucketed,
     Exact,
 }
@@ -39,21 +60,17 @@ enum DecodeAttentionPolicy {
 impl DecodeAttentionPolicy {
     fn from_override(value: Option<&std::ffi::OsStr>) -> Self {
         match value {
-            None => Self::Auto,
             Some(value) if value == "1" => Self::Exact,
-            Some(_) => Self::Bucketed,
+            _ => Self::Bucketed,
         }
     }
 
-    fn resolve(&self, variant: Variant, prompt: usize, output: usize) -> DecodeAttention {
+    fn resolve(&self, variant: Variant) -> DecodeAttention {
         if variant != Variant::Compiled {
             return DecodeAttention::Bucketed;
         }
         match self {
             Self::Exact => DecodeAttention::Exact,
-            Self::Auto if (16384..=65536).contains(&prompt) && (1..=128).contains(&output) => {
-                DecodeAttention::Exact
-            }
             _ => DecodeAttention::Bucketed,
         }
     }
@@ -65,24 +82,10 @@ mod attention_policy_tests {
     use std::ffi::OsStr;
 
     #[test]
-    fn automatic_attention_is_bounded_by_request_geometry_and_variant() {
+    fn default_attention_remains_bucketed_for_every_variant() {
         let policy = DecodeAttentionPolicy::from_override(None);
-        for (prompt, output, expected) in [
-            (16383, 128, DecodeAttention::Bucketed),
-            (16384, 0, DecodeAttention::Bucketed),
-            (16384, 1, DecodeAttention::Exact),
-            (16384, 128, DecodeAttention::Exact),
-            (16384, 129, DecodeAttention::Bucketed),
-            (65536, 128, DecodeAttention::Exact),
-            (65537, 128, DecodeAttention::Bucketed),
-        ] {
-            assert_eq!(policy.resolve(Variant::Compiled, prompt, output), expected);
-            for variant in [Variant::Public, Variant::DSpark] {
-                assert_eq!(
-                    policy.resolve(variant, prompt, output),
-                    DecodeAttention::Bucketed
-                );
-            }
+        for variant in [Variant::Compiled, Variant::Public, Variant::DSpark] {
+            assert_eq!(policy.resolve(variant), DecodeAttention::Bucketed);
         }
     }
 
@@ -90,21 +93,16 @@ mod attention_policy_tests {
     fn explicit_attention_override_preserves_existing_semantics() {
         let exact = DecodeAttentionPolicy::from_override(Some(OsStr::new("1")));
         assert_eq!(
-            exact.resolve(Variant::Compiled, 1, 0),
+            exact.resolve(Variant::Compiled),
             DecodeAttention::Exact
         );
-        assert_eq!(
-            exact.resolve(Variant::Compiled, 16384, 256),
-            DecodeAttention::Exact
-        );
-        assert_eq!(
-            exact.resolve(Variant::Public, 16384, 128),
-            DecodeAttention::Bucketed
-        );
+        for variant in [Variant::Public, Variant::DSpark] {
+            assert_eq!(exact.resolve(variant), DecodeAttention::Bucketed);
+        }
         for value in ["0", "", "true", "invalid"] {
             let policy = DecodeAttentionPolicy::from_override(Some(OsStr::new(value)));
             assert_eq!(
-                policy.resolve(Variant::Compiled, 16384, 128),
+                policy.resolve(Variant::Compiled),
                 DecodeAttention::Bucketed
             );
         }
@@ -116,7 +114,7 @@ mod attention_policy_tests {
         use std::os::unix::ffi::OsStrExt;
         let policy = DecodeAttentionPolicy::from_override(Some(OsStr::from_bytes(&[0xff])));
         assert_eq!(
-            policy.resolve(Variant::Compiled, 16384, 128),
+            policy.resolve(Variant::Compiled),
             DecodeAttention::Bucketed
         );
     }
@@ -167,24 +165,7 @@ impl MiniCpm5 {
         let stream = backend.stream();
         let epsilon = Array::scalar(stream, config.rms_norm_eps, MlxDType::F32)?;
         let (cos, sin) = math::tables(stream, 256)?;
-        let local = if variant == Variant::Public {
-            None
-        } else {
-            let eps = epsilon.clone();
-            let native_norm = variant == Variant::Compiled;
-            let rms_norm_eps = config.rms_norm_eps;
-            Some(LocalMath {
-                norm: Compiled::with_shapeless(stream, 1, true, move |a| {
-                    let normalized = if native_norm {
-                        a[0].fast_rms_norm(&a[1], rms_norm_eps)?
-                    } else {
-                        math::norm(&a[0], &a[1], &eps)?
-                    };
-                    Ok(vec![normalized])
-                })?,
-                rope: Compiled::new(stream, 1, |a| Ok(vec![math::rotate(&a[0], &a[1], &a[2])?]))?,
-            })
-        };
+        let local = LocalMath::new(variant, &epsilon, config.rms_norm_eps)?;
         let swiglu =
             Compiled::with_shapeless(stream, 1, true, |a| Ok(vec![math::swiglu(&a[0], &a[1])?]))?;
         let attention_policy = DecodeAttentionPolicy::from_override(
@@ -233,7 +214,7 @@ impl MiniCpm5 {
 
     fn prepare_inner(&mut self, prompt: usize, output: usize) -> Result<()> {
         let capacity = self.config.request_capacity(self.variant, prompt, output)?;
-        let attention = self.attention_policy.resolve(self.variant, prompt, output);
+        let attention = self.attention_policy.resolve(self.variant);
         let same_profile = self.capacity == capacity
             && self.prepared.as_ref().is_some_and(|p| p.prefill.prompt == prompt && p.output == output && p.attention == attention)
             && self.failure.is_none();
@@ -885,13 +866,7 @@ impl LlmTrait for MiniCpm5 {
         self.local = None;
         let stream = self.backend.stream();
         self.swiglu = Compiled::with_shapeless(stream, 1, true, |a| Ok(vec![math::swiglu(&a[0], &a[1])?]))?;
-        if self.variant != Variant::Public {
-            let eps = self.epsilon.clone();
-            self.local = Some(LocalMath {
-                norm: Compiled::with_shapeless(stream, 1, true, move |a| Ok(vec![math::norm(&a[0], &a[1], &eps)?]))?,
-                rope: Compiled::new(stream, 1, |a| Ok(vec![math::rotate(&a[0], &a[1], &a[2])?]))?,
-            });
-        }
+        self.local = LocalMath::new(self.variant, &self.epsilon, self.config.rms_norm_eps)?;
         self.capacity = 0;
         self.offset = 0;
         self.failure = None;
