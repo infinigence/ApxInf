@@ -254,7 +254,7 @@ fn full_forward(model: &mut MiniCpm5, case: &ReplayCase) -> Result<Tensor> {
 }
 
 #[test]
-#[ignore = "requires official MiniCPM checkpoint and exclusive shared Metal locks"]
+#[ignore = "requires official MiniCPM checkpoint, isolated process and exclusive shared Metal locks"]
 fn real_checkpoint_long_chunk_and_bucket_boundary() -> Result<()> {
     let checkpoint = PathBuf::from(
         env::var_os("APXINF_MINICPM_CHECKPOINT")
@@ -396,18 +396,24 @@ fn real_checkpoint_full_forward_retention_and_release() -> Result<()> {
 }
 
 #[test]
-#[ignore = "requires official MiniCPM checkpoint, real replay inputs and exclusive shared Metal locks"]
+#[ignore = "requires official MiniCPM checkpoint and exclusive shared Metal locks"]
 fn real_checkpoint_prepared_code_reuses_with_fresh_request_state() -> Result<()> {
     let checkpoint = PathBuf::from(env::var_os("APXINF_MINICPM_CHECKPOINT")
         .ok_or(Error::Contract("set APXINF_MINICPM_CHECKPOINT"))?);
-    let replay = PathBuf::from(env::var_os("APXINF_DSPARK_REPLAY_INPUT")
-        .ok_or(Error::Contract("set APXINF_DSPARK_REPLAY_INPUT"))?);
-    let inputs: ReplayInputs = serde_json::from_slice(&std::fs::read(replay)?)
-        .map_err(|e| Error::Other(e.to_string()))?;
-    if inputs.cases.len() < 2 || inputs.cases[..2].iter().any(|c| c.prompt_token_ids.is_empty()) {
-        return Err(Error::Contract("two nonempty real prompts are required"));
+    let tokenizer = apxinf_tokenizer::Tokenizer::from_file(checkpoint.join("tokenizer.json"))?;
+    let template_options = serde_json::Map::from_iter([("enable_thinking".into(), serde_json::Value::Bool(false))]);
+    let mut cases = Vec::new();
+    for (id, question) in [
+        ("cache-en", "Explain why a cache can reduce repeated work. Answer in two sentences."),
+        ("cache-zh", "请用两句话说明为什么缓存可以减少重复计算。"),
+    ] {
+        let prompt = tokenizer.apply_chat_template_with_options(&[apxinf_tokenizer::ChatMessage::user(question)], &template_options)?;
+        cases.push(ReplayCase { id: id.into(), prompt_token_ids: tokenizer.encode(&prompt)? });
     }
+    let inputs = ReplayInputs { cases };
     let config = Config::from_json(&std::fs::read_to_string(checkpoint.join("config.json"))?)?;
+    apxinf_mlx::set_memory_limit(10 * 1024 * 1024 * 1024)?;
+    apxinf_mlx::set_cache_limit(2 * 1024 * 1024 * 1024)?;
     let backend = MlxBackend::new(0)?;
     let (map, _) = apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
     let weights = Weights::load(&config, backend.stream(), map)?;

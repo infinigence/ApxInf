@@ -25,7 +25,6 @@ sha2 = { version = "0.10", optional = true }
 # Decodes recorded Core ML packages in the Clef GPU+ANE device test.
 prost = "0.14"
 sha2 = "0.10"
-apxinf-tokenizer = { path = "../apxinf-tokenizer" }
 
 [features]
 default = []
@@ -116,4 +115,8 @@ required-features = ["cuda"]
 
 [[example]]
 name = "clef_decision_index"
+required-features = ["mlx"]
+
+[[example]]
+name = "metal_text_probe"
 required-features = ["mlx"]

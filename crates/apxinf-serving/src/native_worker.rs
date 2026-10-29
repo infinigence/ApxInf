@@ -829,6 +829,8 @@ fn submit(
     });
     let mut failure = None;
     let mut tail = String::new();
+    let mut preparation_ns = None;
+    let mut detokenization_ns = 0u64;
     let mut mutated = false;
     if invalid {
         failure = Some(error(
@@ -855,7 +857,9 @@ fn submit(
                         }
                         GenerationBoundary::Token(token) => {
                             let terminal = eos.contains(&token.token_id);
+                            let decode_started = Instant::now();
                             let text = if terminal { String::new() } else { decoder.push(token.token_id)? };
+                            detokenization_ns += decode_started.elapsed().as_nanos() as u64;
                             let a = state.active.as_mut().unwrap();
                             if a.output_count == 0 {
                                 a.first_token_ns = a.started.elapsed().as_nanos() as u64;
@@ -918,11 +922,17 @@ fn submit(
                     text_model.generate_streaming_controlled_dyn(request, &mut boundary)
                 }
             })();
-            if let Err(error_value) = generated {
-                eprintln!("Native generation failed: {error_value}");
-                failure = Some(error("internal_error", "Native model execution failed."));
-            } else {
-                tail = decoder.finish()?;
+            match generated {
+                Err(error_value) => {
+                    eprintln!("Native generation failed: {error_value}");
+                    failure = Some(error("internal_error", "Native model execution failed."));
+                }
+                Ok(output) => {
+                    preparation_ns = Some(output.profile.preparation_time().as_nanos() as u64);
+                    let decode_started = Instant::now();
+                    tail = decoder.finish()?;
+                    detokenization_ns += decode_started.elapsed().as_nanos() as u64;
+                }
             }
         }
     }
@@ -944,6 +954,7 @@ fn submit(
         terminal["error"] = failure;
     }
     state.event("terminal", terminal)?;
+    let cleanup_started = Instant::now();
     let prepared = args.protocol == contracts::NATIVE_PREPARED_PROTOCOL;
     if mutated {
         if prepared { model.text_mut()?.release_request_state_retaining_preparation()?; }
@@ -965,7 +976,9 @@ fn submit(
             }
         }
     }
-    eprintln!("native_request_settled {}", memory()?);
+    eprintln!("{}", json!({"event":"native_request_settled", "request_id":state.active.as_ref().unwrap().command["request_id"],
+        "preparation_ns":preparation_ns, "detokenization_ns":detokenization_ns,
+        "cleanup_ns":cleanup_started.elapsed().as_nanos() as u64, "memory":settled_memory}));
     let leases = state.active.as_ref().unwrap().command["capacity_lease_ids"].clone();
     let mut settlement = json!({"released_lease_ids":leases,"retained_lease_ids":[]});
     if prepared { settlement["memory"] = settled_memory; }
