@@ -6,6 +6,7 @@ pub const CONTEXT_CAPACITY: usize = 65792;
 pub const DSPARK_CONTEXT_CAPACITY: usize = 4096;
 #[derive(Clone, Copy)]
 pub(super) enum PrefillChunk {
+    Tokens256 = 256,
     Tokens512 = 512,
     Tokens1024 = 1024,
     Tokens2048 = 2048,
@@ -16,6 +17,7 @@ impl PrefillChunk {
         match std::env::var("APXINF_MINICPM5_PREFILL_CHUNK") {
             Err(std::env::VarError::NotPresent) => Ok(None),
             Ok(value) => match value.as_str() {
+                "256" => Ok(Some(Self::Tokens256)),
                 "512" => Ok(Some(Self::Tokens512)),
                 "1024" => Ok(Some(Self::Tokens1024)),
                 "2048" => Ok(Some(Self::Tokens2048)),
@@ -155,16 +157,6 @@ impl Config {
         }
         Ok(())
     }
-
-    pub(crate) fn validate_variant(&self, variant: Variant) -> Result<()> {
-        self.validate()?;
-        if self.max_position_embeddings < variant.context_capacity() {
-            return Err(Error::Contract(
-                "MiniCPM checkpoint positions do not cover the selected variant",
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,53 +167,6 @@ pub enum Variant {
 }
 
 impl Variant {
-    pub const fn context_capacity(self) -> usize {
-        match self {
-            Self::Public | Self::Compiled => CONTEXT_CAPACITY,
-            Self::DSpark => DSPARK_CONTEXT_CAPACITY,
-        }
-    }
-
-    pub(crate) fn request_capacity(self, prompt: usize, output: usize) -> Result<usize> {
-        let total = prompt
-            .checked_add(output)
-            .ok_or(Error::Contract("MiniCPM context overflow"))?;
-        if prompt == 0 || total > self.context_capacity() {
-            return Err(Error::Other(format!(
-                "MiniCPM5 supports B1 with at most {} consumed positions for {self:?}",
-                self.context_capacity()
-            )));
-        }
-        Ok(total.div_ceil(PREFILL_CHUNK_TOKENS) * PREFILL_CHUNK_TOKENS)
-    }
-
-    pub(crate) fn prefill_rows(self, prompt: usize, position: usize) -> Option<usize> {
-        if position >= prompt {
-            return None;
-        }
-        if self == Self::DSpark {
-            return (position == 0).then_some(prompt);
-        }
-        (position % PREFILL_CHUNK_TOKENS == 0)
-            .then_some((prompt - position).min(PREFILL_CHUNK_TOKENS))
-    }
-
-    pub(crate) fn prepared_lengths(self, prompt: usize) -> Vec<usize> {
-        let max_decode_rows = if self == Self::DSpark { 8 } else { 1 };
-        let mut lengths = (1..=max_decode_rows).collect::<Vec<_>>();
-        lengths.push(prompt);
-        if self != Self::DSpark {
-            lengths.push(prompt.min(PREFILL_CHUNK_TOKENS));
-            let tail = prompt % PREFILL_CHUNK_TOKENS;
-            if tail > 0 {
-                lengths.push(tail);
-            }
-        }
-        lengths.sort_unstable();
-        lengths.dedup();
-        lengths
-    }
-
     pub fn parse(name: Option<&str>) -> Result<Self> {
         match name.unwrap_or("bf16-compiled") {
             "bf16-public" => Ok(Self::Public),
