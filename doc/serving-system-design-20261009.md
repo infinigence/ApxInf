@@ -1,13 +1,13 @@
 # ApxInf 面向 Mac 本地模型与编程 Agent 的 Serving 系统方案
 
-日期：2026-10-09。状态：系统设计提案。首个串行子集已完成实机验证，范围见[本地服务说明](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/local-service-v0.1.md)和[验证报告](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/serving-validation-20261009.md)。本文其余路线仍为规划。
+日期：2026-10-09。状态：系统设计提案。实现子集与未验证能力见[设计入口](serving/README.md)。本文其余路线仍为规划。
 
-本方案以 Mac 本地 LLM／VLM 与编程 Agent 为优先场景，保留 CUDA／Jetson 和 PI0.5 的扩展边界。初始审计基线为 ApxInf `df5c55a06140107b24964d9e4abbefd9fa2a4733`。现状表描述该基线；外部机制依据官方文档与源码；后文的架构、阶段和验收条件属于设计建议。后续首个实现子集、已有本地模型实测和 Claude Code 结果见[实现与验证报告](https://github.com/qhy991/ApxInf/blob/d82ae3b06631ea1285f22f7e83b03722db4f6eee/doc/serving/serving-validation-20261009.md)，不将这些结果扩展到尚未实现的路线。
+本方案以 Mac 本地 LLM／VLM 与编程 Agent 为优先场景，保留 CUDA／Jetson 和 PI0.5 的扩展边界。初始审计基线为 ApxInf `df5c55a06140107b24964d9e4abbefd9fa2a4733`。现状表描述该基线；外部机制依据官方文档与源码；后文的架构、阶段和验收条件属于设计建议。当前提交的支持范围与验证边界以[设计入口](serving/README.md)为准。
 
 该审计基线属于 `qhy991/ApxInf` 的历史 fork，不代表本次 PR 所基于的上游能力。旧 MLX 服务、会话缓存和原生 Qwen3.5 状态文件没有随本次 Serving 变更移植；相关依据链接固定到保存这些文件的历史提交 `7cee272c0d3d6c70af63d3376be0713c7c565e31`。
 
 
-后续设计以[设计入口](serving/README.md)、[英文接口规范](serving/contracts-v0.1.md)和[实施计划](serving/implementation-plan.md)为配套文档。接口规范使用 ASD-STE100 Issue 9 的写作原则，并作为新 serving 接口的语义依据。本文件用于中文说明和调研，不声称符合 STE 英文标准。接口示意如与规范冲突，以规范为准。先确定完整框架与首个接口子集，再逐步编写实现，不一次性生成全部模块骨架。
+后续设计以[设计入口](serving/README.md)、[英文接口规范](serving/contracts-v0.1.md)和[实施计划](serving/implementation-plan.md)为配套文档。接口规范作为新 serving 接口的语义依据。本文件用于中文说明和调研。接口示意如与规范冲突，以规范为准。先确定完整框架与首个接口子集，再逐步编写实现，不一次性生成全部模块骨架。
 
 建议新增 **ApxInf Serve：Rust 接入与资源管理层，加能力可协商的模型 worker**。Mac 首个实用执行路径继续使用已验证的 MLX provider，原生路径保留独立验证与演进空间。先建立可靠的流式服务，再接入 MLX 连续批处理和可恢复状态缓存；根据实际收益决定 SSD 缓存与原生批处理的投入。
 
