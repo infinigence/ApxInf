@@ -125,7 +125,7 @@ Allocator limits do not guarantee a hard process memory limit.
 
 ### Native MiniCPM5
 
-Build the native executable with the existing MLX 0.31.2 C++ SDK.
+Build the native executable with the pinned MLX 0.32.3 C++ SDK.
 Select the provider and runtime files explicitly.
 The native provider does not fall back to Python.
 Its context limit permits 16384 positions with fixed 256-token prefill chunks.
@@ -134,7 +134,7 @@ This limit includes the input and output reservation.
 
 ```sh
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk
-export MLX_ROOT=/absolute/path/to/mlx-0.31.2
+export MLX_ROOT=/absolute/path/to/mlx-0.32.3
 cargo build -p apxinf-serving --features native-minicpm5 --release
 DYLD_LIBRARY_PATH="$MLX_ROOT/lib" target/release/apxinf-serve \
   --provider native-minicpm5 \

@@ -419,7 +419,7 @@ def validate_frame(frame: dict) -> None:
             _int(value)
         if native:
             _keys(frame["runtime"], {"kind", "apxinf", "mlx", "executable_sha256", "metal_library_sha256"})
-            _require(frame["runtime"]["kind"] == "native_minicpm5" and frame["runtime"]["apxinf"] == "0.1.0" and frame["runtime"]["mlx"] == "0.31.2", "unsupported native runtime")
+            _require(frame["runtime"]["kind"] == "native_minicpm5" and frame["runtime"]["apxinf"] == "0.1.0" and frame["runtime"]["mlx"] in ("0.31.2", "0.32.3"), "unsupported native runtime")
             _digest(frame["runtime"]["executable_sha256"])
             _digest(frame["runtime"]["metal_library_sha256"])
             _require(type(frame["model_manifest"]) is dict, "model manifest must be an object")

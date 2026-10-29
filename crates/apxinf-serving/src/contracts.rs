@@ -574,7 +574,7 @@ pub fn validate_frame(frame: &Value) -> Result<()> {
                 require(
                     frame["runtime"]["kind"] == "native_minicpm5"
                         && frame["runtime"]["apxinf"] == "0.1.0"
-                        && frame["runtime"]["mlx"] == "0.31.2",
+                        && matches!(frame["runtime"]["mlx"].as_str(), Some("0.31.2" | "0.32.3")),
                     "unsupported native runtime",
                 )?;
                 digest(&frame["runtime"]["executable_sha256"])?;
