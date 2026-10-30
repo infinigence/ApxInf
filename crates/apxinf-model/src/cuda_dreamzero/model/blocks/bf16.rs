@@ -1548,6 +1548,21 @@ mod vae {
         g: ops::Unfold3dGeometry,
         out: &Tensor,
     ) -> Result<()> {
+        convolution_prefix(ctx, p, s, x, w, g, out, None)
+    }
+    // A caller may establish that every output frame from `steady` onward is
+    // identical. Keep each original GEMM's M (including the original last tile),
+    // compute through one complete steady frame, then materialize its suffix.
+    fn convolution_prefix(
+        ctx: &Context,
+        p: &Policies,
+        s: &VaeWorkspace,
+        x: &Tensor,
+        w: &Conv,
+        g: ops::Unfold3dGeometry,
+        out: &Tensor,
+        steady: Option<usize>,
+    ) -> Result<()> {
         let shape = x.shape().dims();
         let dst = out.shape().dims();
         if shape.len() != 5
@@ -1569,7 +1584,13 @@ mod vae {
         }
         let rows = dst[1] * dst[2] * dst[3];
         let k = w.padded_input * w.kernel.iter().product::<usize>();
-        for start in (0..rows).step_by(TILE) {
+        let steady = steady.filter(|&frame| frame + 1 < dst[1]);
+        let required = steady.map_or(rows, |frame| (frame + 1) * dst[2] * dst[3]);
+        // The original last partial tile may select a different GEMM algorithm.
+        // Retain it even when the repeated suffix skips the preceding full tiles.
+        let last_start = rows / TILE * TILE;
+        let retain_last = (rows % TILE != 0 && last_start >= required).then_some(last_start);
+        for start in (0..required).step_by(TILE).chain(retain_last) {
             let n = (rows - start).min(TILE);
             let mut columns = view(&s.columns, 0, &[n, k])?;
             let mut projected = view(&s.projected_tile, 0, &[n, w.output])?;
@@ -1587,6 +1608,36 @@ mod vae {
                 &biased,
                 &view(out, start * w.output, &[n, w.output])?,
             )?;
+        }
+        if let Some(frame) = steady {
+            repeat_frame_suffix(ctx, out, frame, last_start)?;
+        }
+        Ok(())
+    }
+    fn repeat_frame_suffix(
+        ctx: &Context,
+        out: &Tensor,
+        first: usize,
+        last_full_tile_end: usize,
+    ) -> Result<()> {
+        let shape = out.shape().dims();
+        let frame = shape[2] * shape[3] * shape[4];
+        // Express the copy range in elements: the preserved final partial tile
+        // can begin inside a frame. Never overwrite those independently computed
+        // rows with values produced by a full-M GEMM.
+        let end = last_full_tile_end * shape[4];
+        let begin = first * frame;
+        let mut filled = frame;
+        while begin + filled < end {
+            let count = filled.min(end - begin - filled);
+            // Source and destination never overlap; count never exceeds the
+            // already materialized prefix. Views retain ordinary backend owners.
+            transfers::copy_cuda_to_cuda(
+                ctx,
+                &view(out, begin, &[count])?,
+                &view(out, begin + filled, &[count])?,
+            )?;
+            filled += count;
         }
         Ok(())
     }
@@ -1779,12 +1830,32 @@ mod vae {
         w: &Residual,
         out: &Tensor,
     ) -> Result<()> {
+        residual_prefix(ctx, p, s, x, w, out, None)
+    }
+    fn residual_prefix(
+        ctx: &Context,
+        p: &Policies,
+        s: &VaeWorkspace,
+        x: &Tensor,
+        w: &Residual,
+        out: &Tensor,
+        steady: Option<usize>,
+    ) -> Result<()> {
         let activated = normalized_silu(ctx, s, x, &w.norm1)?;
         let branch = s.slot(5, out.shape().dims())?;
-        convolution(ctx, p, s, &activated, &w.conv1, geometry(&w.conv1), &branch)?;
+        convolution_prefix(
+            ctx,
+            p,
+            s,
+            &activated,
+            &w.conv1,
+            geometry(&w.conv1),
+            &branch,
+            steady.map(|frame| frame + w.conv1.kernel[0] - 1),
+        )?;
         let activated = normalized_silu(ctx, s, &branch, &w.norm2)?;
         let projected = s.slot(6, out.shape().dims())?;
-        convolution(
+        convolution_prefix(
             ctx,
             p,
             s,
@@ -1792,6 +1863,7 @@ mod vae {
             &w.conv2,
             geometry(&w.conv2),
             &projected,
+            steady.map(|frame| frame + w.conv1.kernel[0] + w.conv2.kernel[0] - 2),
         )?;
         let shortcut = if let Some(w) = &w.shortcut {
             // The normalization scratch is dead before shortcut computation.
@@ -1816,9 +1888,33 @@ mod vae {
         w: &VaeWeights,
         s: &VaeWorkspace,
     ) -> Result<()> {
+        encode_impl(ctx, p, w, s, false)
+    }
+    #[cfg(test)]
+    pub(super) fn encode_initial_steady_prefix(
+        ctx: &Context,
+        p: &Policies,
+        w: &VaeWeights,
+        s: &VaeWorkspace,
+    ) -> Result<()> {
+        assert_eq!(s.frames, 33);
+        encode_impl(ctx, p, w, s, true)
+    }
+    fn encode_impl(
+        ctx: &Context,
+        p: &Policies,
+        w: &VaeWeights,
+        s: &VaeWorkspace,
+        initial_zero_suffix: bool,
+    ) -> Result<()> {
         let mut shape = [1, s.frames, s.height, s.width, 96];
         let mut current = s.slot(0, &shape)?;
         convolution(ctx, p, s, &s.input, &w.input, geometry(&w.input), &current)?;
+        // The initial request binds a real first frame followed by 32 zeros.
+        // The native causal stem has a three-frame transient. For this first
+        // experiment only specialize the two high-resolution residual blocks;
+        // every later stage keeps its existing complete execution.
+        let mut steady = initial_zero_suffix.then_some(3);
         let mut index = 0;
         for layer in &w.down {
             let next_index = 1 - index;
@@ -1826,10 +1922,13 @@ mod vae {
                 Down::Residual(block) => {
                     shape[4] = block.conv2.output;
                     let out = s.slot(next_index, &shape)?;
-                    residual(ctx, p, s, &current, block, &out)?;
+                    residual_prefix(ctx, p, s, &current, block, &out, steady)?;
+                    steady = steady
+                        .map(|frame| frame + block.conv1.kernel[0] + block.conv2.kernel[0] - 2);
                     current = out;
                 }
                 Down::Spatial { conv, temporal } => {
+                    steady = None;
                     shape[2] /= 2;
                     shape[3] /= 2;
                     let out = s.slot(next_index, &shape)?;
@@ -3530,6 +3629,92 @@ mod acceptance {
             0.01,
         );
         compare_with_limit("clip", &first, &fixture["clip.output"], 0.01);
+    }
+
+    #[test]
+    #[ignore = "requires official VAE weights and captured RGB inputs"]
+    fn checkpoint_vae_initial_steady_prefix_bitwise_and_graph() {
+        let (mut map, fixture) = inputs();
+        map.retain(|key, _| key.starts_with("action_head.vae."));
+        let ctx = Context::new_with_autotune(0, false).unwrap();
+        let weights = weights::vae::VaeWeights::from_map(&ctx, &mut map).unwrap();
+        drop(map);
+        let p = Policies::default();
+        let bits = |value: &Tensor| -> Vec<u16> {
+            ctx.synchronize().unwrap();
+            transfers::to_cpu(value)
+                .unwrap()
+                .as_bf16()
+                .unwrap()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect()
+        };
+        let compare_bits = |label: &str, actual: Vec<u16>, expected: &[u16]| {
+            assert_eq!(actual.len(), expected.len(), "{label} length");
+            let mismatch = actual.iter().zip(expected).filter(|(a, b)| a != b).count();
+            let first = actual
+                .iter()
+                .zip(expected)
+                .enumerate()
+                .find_map(|(i, (&a, &b))| (a != b).then_some((i, a, b)));
+            eprintln!(
+                "{}",
+                serde_json::json!({"case":label,
+                "raw_bf16_mismatches":mismatch,"elements":expected.len(),"first":first})
+            );
+            assert_eq!(mismatch, 0, "{label}: first raw BF16 mismatch {first:?}");
+        };
+        let w = vae::VaeWorkspace::new(&ctx, 33, 352, 640, true).unwrap();
+        let session = backend::ExecutionSession::with_capacity(256, 0).unwrap();
+        let mut graph = None;
+        let mut previous = None;
+        for key in ["vae33.input", "vae33.changed.input"] {
+            let rgb = fixture[key].as_bf16().unwrap();
+            let mut canonical = vec![half::bf16::ZERO; w.input.numel()];
+            let frame = 352 * 640 * 3;
+            canonical[..frame].copy_from_slice(&rgb[..frame]);
+            let input = Tensor::from_bf16(w.input.shape().dims().to_vec(), &canonical).unwrap();
+            transfers::copy_cpu_to_cuda(&input, &w.input).unwrap();
+            session
+                .prepare(|| vae::encode(&ctx, &p, &weights, &w))
+                .unwrap();
+            let expected = bits(&w.output);
+            assert!(expected
+                .iter()
+                .all(|&x| half::bf16::from_bits(x).is_finite()));
+            if let Some(previous) = previous {
+                assert!(
+                    expected != previous,
+                    "changed canonical RGB did not change VAE output"
+                );
+            }
+            session
+                .prepare(|| vae::encode_initial_steady_prefix(&ctx, &p, &weights, &w))
+                .unwrap();
+            compare_bits(&format!("{key}.eager"), bits(&w.output), &expected);
+            if graph.is_none() {
+                graph = Some(
+                    session
+                        .run(|| {
+                            backend::capture(&ctx, || {
+                                vae::encode_initial_steady_prefix(&ctx, &p, &weights, &w)
+                            })
+                        })
+                        .unwrap(),
+                );
+            }
+            graph.as_ref().unwrap().replay().unwrap();
+            compare_bits(&format!("{key}.graph"), bits(&w.output), &expected);
+            eprintln!("VAE steady prefix {key}: eager and rebound graph bitwise exact");
+            previous = Some(expected);
+        }
+        let output = w.output.clone();
+        drop(w);
+        drop(weights);
+        drop(session);
+        graph.unwrap().replay().unwrap();
+        compare_bits("retained-prefix-graph", bits(&output), &previous.unwrap());
     }
 
     #[test]
