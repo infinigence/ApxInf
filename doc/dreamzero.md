@@ -491,6 +491,24 @@ FP32 split-K partial reduction before one BF16 output conversion. The family-def
 projections explicitly select `Any` while preserving `StagedBias`, determinism
 and the 1 MiB bound; a workspace limit alone does not specify a reduction order.
 
+Initial vision binds one real RGB montage followed by 32 zero frames. The
+model reuses the identical temporal suffix within the first two high-resolution
+VAE residual blocks: it computes the transient and one complete steady frame,
+then fills repeated output frames with nonoverlapping device copies. Retained
+convolution tiles keep their original GEMM row count, including the final
+partial tile. Normalization and later VAE stages keep their full execution;
+all nine initial latent frames remain available to conditioning. History and
+general 1/9/33-frame encoding use the ordinary full path. No activation is
+reused across requests.
+
+The opt-in `checkpoint_vae_initial_steady_prefix_bitwise_and_graph` test compares
+raw BF16 bits against full VAE execution for two RGB inputs, changed-input graph
+replay, and replay after releasing the original workspace owners. The existing
+`checkpoint_vae_temporal_profiles_eager_capture_and_lifetime` test retains the
+independent 1/9/33-frame reference coverage. Complete joint explicit/implicit
+history suites and public request timing are still required for a new build;
+component parity alone does not qualify it.
+
 VAE spatial attention uses native memory-efficient CUTLASS at head width 384.
 Pinned upstream dependency headers, license and provenance are retained under
 `apxinf-cuda-new/native/kernels/efficient_attention`; inference links no
