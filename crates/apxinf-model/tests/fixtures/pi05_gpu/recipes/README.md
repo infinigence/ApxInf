@@ -22,5 +22,5 @@ For a deliberate new qualification, use `run_pi05_reference_gate.py --tuning DIR
 --autotune` (an empty directory retunes all operations). Then replay without
 `--autotune`, inspect all required case/mode results and preserve the environment
 and reports before updating these banks. Improved results should raise the
-per-case floors in `configs/pi05/reference-gate.json`; never lower existing floors
+per-case floors in `crates/apxinf-model/tests/pi05_reference/policy.json`; never lower existing floors
 or change inputs to accommodate a faster but less accurate tactic.

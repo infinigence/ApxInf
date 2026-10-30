@@ -8,7 +8,9 @@ No camera data or trained weights are bundled. The latents were drawn with NumPy
 reference validation; their exact values are stored, so replay does not depend
 on an RNG implementation or seed alone.
 
-Materialize the inputs with the standard library:
+For complete device-side test commands, dependencies and result interpretation,
+start with the [regression test README](../../pi05_reference/README.md).
+The runner materializes these inputs automatically. To inspect them separately:
 
 ```sh
 python crates/apxinf-model/tests/fixtures/pi05_gpu/materialize.py \
@@ -23,7 +25,7 @@ FP8 additionally needs an explicit calibration path and its SHA256 recorded as
 qualification; a different calibration requires a new baseline.
 
 The empty `limits` map makes the Rust runner a measurement producer. CI applies
-`configs/pi05/reference-gate.json` afterward: per-case cosine floors for Thor
+`crates/apxinf-model/tests/pi05_reference/policy.json` afterward: per-case cosine floors for Thor
 BF16/FP8 and Orin BF16; Orin INT8 is advisory. Floors start at measured values
 rounded down to six decimal places and can only increase. L2/max-abs remain
 reported diagnostics. The policy also requires exact eager/graph agreement and

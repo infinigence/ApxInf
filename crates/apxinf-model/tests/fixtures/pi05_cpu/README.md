@@ -42,5 +42,5 @@ a regression pass. SafeTensors header ordering may differ, so file hashes pin th
 checked-in artifact rather than promise byte-identical serialization on regeneration.
 
 This small geometry does not exercise production CUDA kernels or calibrate GPU
-precision tolerances. Use the full-checkpoint `pi05_reference_gate` example for
-that separate check, as described in `doc/pi05-cpu-reference.md`.
+precision tolerances. Use the [full-checkpoint regression suite](../../pi05_reference/README.md)
+for that separate check.

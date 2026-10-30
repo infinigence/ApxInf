@@ -168,56 +168,21 @@ python crates/apxinf-model/tests/fixtures/pi05_gpu/materialize.py \
   --output devlocal/pi05-cpu-reference/gpu-diagnostic
 ```
 
-Prepare an input manifest from existing NPZ requests containing `images`
-(`[views,224,224,3]` uint8), `token_ids` and `noise` (`[horizon,32]` float32):
+The maintained regression suite and all device-side commands are documented in
+[the test README](../crates/apxinf-model/tests/pi05_reference/README.md). It covers
+SSH execution on Thor/Orin, dependencies, all four lanes, report interpretation,
+and the separate self-hosted GitHub runner setup. Neither an SSH run nor a local
+run requires GitHub Actions registration.
 
-```sh
-python scripts/prepare_pi05_reference_gate.py \
-  --checkpoint /models/pi05/model.safetensors \
-  --calibration /models/pi05/calibration.json \
-  --output devlocal/pi05-cpu-reference/gate-inputs \
-  /fixtures/case-a.npz /fixtures/case-b.npz
-cargo build --release -p apxinf-model --example pi05_reference_gate --features cuda,openblas
-```
+The Rust driver is a Cargo integration test at
+`crates/apxinf-model/tests/pi05_reference_gate.rs`. Its three metric/fixture tests
+run on CPU by default; the full-checkpoint hardware case is explicitly ignored
+unless the suite runner supplies its configuration and selects it. The Python
+runner builds that test, computes a fresh CPU reference, runs the GPU comparison
+and applies the board-specific policy. `scripts/run_pi05_reference_gate.py` is
+only a compatibility launcher. New test code and instructions belong in the suite.
 
-Omit `--calibration` when only checking BF16/INT8. Use existing real-input cases
-for threshold measurements; small random fixtures do not calibrate production
-quantization. The generated manifest has an empty `limits` map. First collect
-measurements on the appropriate GPU (BF16/FP8 on Thor, BF16/INT8 on Orin):
-
-```sh
-OPENBLAS_NUM_THREADS=4 target/release/examples/pi05_reference_gate \
-  /models/pi05/model.safetensors \
-  devlocal/pi05-cpu-reference/gate-inputs/manifest.json \
-  bf16 devlocal/pi05-cpu-reference/bf16-measure.json \
-  --tuning devlocal/pi05-cpu-reference/recipes --autotune --measure
-```
-
-For `fp8_static`, add `--calibration /models/pi05/calibration.json`.
-To use an existing recipe directory, add `--tuning PATH`. To populate a dedicated
-run directory, add `--tuning devlocal/pi05-cpu-reference/recipes --autotune`.
-The report records this selection. Preserve the qualified recipe directory with
-the run evidence; recipe misses use the backend's fallback and can change the
-implementation being measured. Measurement mode reports `passed: null`; it is not a passing
-regression gate. After reviewing the real-input baseline, pin each variant's
-`min_cosine`, `max_relative_l2`, `max_abs`, and `eager_graph_max_abs` under
-`limits.bf16`, `limits.fp8_static` or `limits.int8_dynamic`. Re-run without
-`--measure` to enforce all limits and return a nonzero exit status on a failure.
-Missing limits are an error. Each invocation saves its FP32 reference as
-`REPORT.json.cpu.json` before starting GPU work. Subsequent precision runs may
-pass `--cpu-reference REPORT.json.cpu.json`; the tool verifies the checkpoint,
-geometry, RGB hashes, token IDs and exact latents match. Changing thresholds or
-FP8 calibration does not change the CPU input identity. To regenerate the
-reference without running a GPU, select variant `cpu`. Regenerate it deliberately
-when qualifying a CPU implementation change; cached outputs are frozen evidence,
-not proof that a changed CPU model still matches OpenPI.
-
-Keep the pinned manifest, reports and source revision
-with the validation evidence under `devlocal/pi05-cpu-reference/` and attach the
-results to the PR, following the repository's manual GPU regression process.
-
-This GPU gate requires an external full checkpoint and GPU; the default corpus
-contains reproducible generated inputs. It does not run in portable CI. Its tensor-level accuracy checks are separate from the
+The full-checkpoint checks are separate from the
 [formal 500-episode task-success evaluation](pi05-cuda-regression.md#7-accuracy-standard-and-current-reference-results).
 
 ### GPU qualification status (2026-10-29)
@@ -248,7 +213,7 @@ The two DROID cases remain numerical stress inputs for a LIBERO checkpoint.
 
 ### CI policy and monotonic thresholds
 
-[reference-gate.json](../configs/pi05/reference-gate.json) pins the public corpus
+[reference-gate.json](../crates/apxinf-model/tests/pi05_reference/policy.json) pins the public corpus
 hash and separate floors for both eager and graph outputs:
 
 | Required path | T10 cosine floor | T21 cosine floor |
@@ -291,7 +256,7 @@ protection is enabled.
 Run the identical lane locally in a Git checkout:
 
 ```sh
-OPENBLAS_NUM_THREADS=4 python3 scripts/run_pi05_reference_gate.py \
+OPENBLAS_NUM_THREADS=4 python3 crates/apxinf-model/tests/pi05_reference/run.py \
   --board thor --variant fp8_static \
   --checkpoint /models/pi05/model.safetensors \
   --calibration /models/pi05/calibration.json \
