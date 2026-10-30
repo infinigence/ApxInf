@@ -206,10 +206,32 @@ pub struct ProviderWorkspace {
     buffers: Rc<RefCell<HashMap<(usize, usize), CudaBuffer>>>,
 }
 
+// Type-erased caches retain typed lookup while supporting generation pruning.
+trait ExecutionCache: Any {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn retire_unused(&mut self, generation: u64);
+}
+
+struct TypedExecutionCache<K, V>(HashMap<K, (Rc<V>, Cell<u64>)>);
+
+impl<K: Eq + Hash + 'static, V: Any> ExecutionCache for TypedExecutionCache<K, V> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn retire_unused(&mut self, generation: u64) {
+        self.0.retain(|_, (_, used)| used.get() == generation);
+    }
+}
+
 struct ExecutionSessionInner {
     workspace: Rc<GraphWorkspace>,
     scratch: ProviderWorkspace,
-    caches: RefCell<HashMap<TypeId, Box<dyn Any>>>,
+    caches: RefCell<HashMap<TypeId, Box<dyn ExecutionCache>>>,
+    generation: Cell<u64>,
     prepared_sequence: RefCell<Vec<usize>>,
     sequence_cursor: Cell<usize>,
 }
@@ -220,12 +242,14 @@ impl ExecutionSessionInner {
         K: Eq + Hash + 'static,
         V: Any,
     {
-        self.caches
-            .borrow()
+        let caches = self.caches.borrow();
+        let cache = caches
             .get(&TypeId::of::<(K, V)>())?
-            .downcast_ref::<HashMap<K, Rc<V>>>()?
-            .get(key)
-            .cloned()
+            .as_any()
+            .downcast_ref::<TypedExecutionCache<K, V>>()?;
+        let (value, used) = cache.0.get(key)?;
+        used.set(self.generation.get());
+        Some(value.clone())
     }
 
     fn store<K, V>(&self, key: K, value: Rc<V>)
@@ -236,11 +260,16 @@ impl ExecutionSessionInner {
         let mut caches = self.caches.borrow_mut();
         let cache = caches
             .entry(TypeId::of::<(K, V)>())
-            .or_insert_with(|| Box::new(HashMap::<K, Rc<V>>::new()));
+            .or_insert_with(|| Box::new(TypedExecutionCache::<K, V>(HashMap::new())));
+        // Values and per-entry generation marks have interior mutability only
+        // for lookup; insertion uses the concrete cache's Any identity below.
+        let cache = cache
+            .as_any_mut()
+            .downcast_mut::<TypedExecutionCache<K, V>>()
+            .expect("execution cache type identity collision");
         cache
-            .downcast_mut::<HashMap<K, Rc<V>>>()
-            .expect("execution cache type identity collision")
-            .insert(key, value);
+            .0
+            .insert(key, (value, Cell::new(self.generation.get())));
     }
 }
 
@@ -263,6 +292,7 @@ impl ExecutionSession {
                 workspace: Rc::new(workspace),
                 scratch,
                 caches: RefCell::new(HashMap::new()),
+                generation: Cell::new(0),
                 prepared_sequence: RefCell::new(Vec::new()),
                 sequence_cursor: Cell::new(0),
             }),
@@ -288,8 +318,9 @@ impl ExecutionSession {
     /// Traverse the real execution once before graph capture.
     ///
     /// This allocates deterministic workspace slices, prepares native resources,
-    /// and records the order of prepared operators. Replaces the previous
-    /// binding cache; already captured graphs retain their own resources.
+    /// and records the order of prepared operators. Reuses matching bindings
+    /// and retires unused bindings after traversal; captured graphs retain
+    /// their own resources.
     /// Stateless operators execute directly and do not enter the cache or sequence.
     pub fn prepare<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         prepare_with_session(self, operation)
@@ -343,11 +374,16 @@ fn with_session_phase<T>(
         }
         session.inner.workspace.reset()?;
         if prepare {
-            // Each preparation defines a new binding generation. Graph capture
-            // retains its own executions, so retiring this cache cannot revoke
-            // old graphs, and changing eager IO addresses cannot grow it forever.
+            // Stable arena bindings must remain cache hits across eager requests.
+            // Retire only entries not used by this traversal, after it completes.
+            let generation = session
+                .inner
+                .generation
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("execution generation overflow".into()))?;
+            session.inner.generation.set(generation);
             session.inner.prepared_sequence.borrow_mut().clear();
-            session.inner.caches.borrow_mut().clear();
         }
         session.inner.sequence_cursor.set(0);
         let previous = active.replace(Rc::as_ptr(&session.inner));
@@ -361,6 +397,11 @@ fn with_session_phase<T>(
         // eager generation merely because an older graph is still alive.
         retain_resource(&session.inner.workspace);
         let result = operation();
+        if prepare {
+            for cache in session.inner.caches.borrow_mut().values_mut() {
+                cache.retire_unused(session.inner.generation.get());
+            }
+        }
         if result.is_ok()
             && !prepare
             && session.inner.sequence_cursor.get() != session.inner.prepared_sequence.borrow().len()
