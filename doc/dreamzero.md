@@ -319,8 +319,40 @@ This matched improvement is 1.043×, or 4.1% less latency. All public action
 metrics are zero, with exact replay and leading-batch noise checks. All measured
 GPU/EMC samples remain 1,575 MHz / 4.266 GHz for both variants. This is a separate
 experiment from the earlier comparisons. These warm T=1 measurements do not
-establish streaming history performance: single first-replay history timers in
-the full acceptance runs vary substantially and require a controlled comparison.
+establish streaming history performance.
+
+A separate canonical-native streaming A→B→B→A comparison exercises the same six
+history scenarios in order, with one warmup sequence followed by two measured
+sequences per fresh process. Each variant has two processes and four measured
+calls per scenario. Calls include implicit profile preparation, binding, replay,
+action download and history publication; they exclude policy camera resizing
+and tokenization. Joint future video is computed, but this experiment gates only
+the returned 24×32 normalized actions against the independent fixtures; video
+qualification remains the separate full-checkpoint acceptance above.
+
+| Canonical scenario | Published request-KV (`2f6be45`) | Staged affine + direct KV (`0cd880b`) |
+| --- | ---: | ---: |
+| initial | 53.959 | 48.389 |
+| repeat | 22.578 | 21.711 |
+| history | 53.549 | 48.128 |
+| history2 | 57.913 | 52.425 |
+| history3 | 62.322 | 57.861 |
+| window | 54.212 | 49.065 |
+
+Values are median seconds. All 72 calls, including warmups, have zero action
+relative L2, RMSE and max-absolute error. The measured scenario reductions range
+from 3.8% to 10.3%; the controlled history3 comparison does not reproduce the
+apparent regression suggested by isolated first-replay acceptance timers.
+Default DVFS remains enabled: measured-call frequency samples range from
+315 to 1,575 MHz GPU and 2.75 to 4.266 GHz EMC for both variants, including CPU
+preparation intervals. No fixed-clock or physical-traffic claim follows.
+
+The first baseline process completed and saved all 18 calls, then exited with a
+cleanup-only error from an unsupported `ModelRunner.close()` call. Its original
+script, report and exit status are retained. Cleanup was corrected for the
+remaining processes; the program preceding cleanup is byte-identical. Those
+already completed timed calls remain in this comparison, with the exception
+recorded explicitly rather than normalized to a successful process exit.
 
 Earlier pre-performance runs measured 47.617 s cold and 47.756 s restored public
 medians (5 samples each). The historical official preprocessed BF16-head median
