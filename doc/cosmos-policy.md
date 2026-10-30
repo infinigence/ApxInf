@@ -200,6 +200,20 @@ median / 1198.45 ms p95. Functional acceptance passes; performance remains
 Existing GEMM and attention candidate tuning was exercised; the convolution
 lowering and repeated text projections remain optimization opportunities.
 
+A 2026-10-30 release-build rerun on Thor MAXN compared the post-merge baseline
+with vectorized, bounds-checked causal volume lowering. With five warmups and
+20 measured requests per variant, no other GPU process observed during either
+run, median/p95 changed from **2428.23 / 2428.78 ms** to
+**1410.86 / 1411.78 ms** (1.72x median speedup). This measures native request
+binding, Graph replay, independent Action publication and synchronization;
+Python preprocessing and D2H conversion are excluded. The complete joint latent
+was bitwise identical between variants; normalized action maximum error against
+the official fixture was 0.00459105 and RMSE 0.00108809. Updated causal-volume
+padding/history/stride/unaligned-view tests and the full preparation/lifecycle
+regression passed. This is an optimization checkpoint, not a claim of reaching
+the BF16 roofline; convolution materialization and transformer memory passes
+remain significant.
+
 A single tuned plan's process GPU-memory samples reached 14,044 MiB (3-second
 polling). This is sampled driver accounting, not an exact allocator peak.
 The reference reported 6,866,727,424 bytes peak PyTorch allocation; these two
@@ -223,3 +237,31 @@ No closed-loop robot rollout, other GPU,
 other checkpoint, precision, arbitrary text encoder or planning-search mode is
 claimed. Future image/state/value latents are genuinely jointly denoised; the
 optional future RGB decoder is outside the direct Action path.
+
+## Reproducible native performance measurement
+
+`cosmos_policy_bench` uses the public `AutoModel` / `VlaRuntime` contract with
+prepared BF16 assets and captured canonical input. Its fixture directory must
+contain `joint-fixture.safetensors` (normalized state, joint noise and reference
+actions), `public-rgb.bin` and `public-task-id.txt`. It does not download weights
+or synthesize a reference. For example, from the project root:
+
+```bash
+cargo run --release -p apxinf-model --features cuda \
+  --example cosmos_policy_bench -- /path/to/prepared-assets /path/to/fixtures \
+  devlocal/cosmos-thor-roofline/run-name/results/native.json \
+  --recipes /path/to/recipes --warmup 5 --iterations 20
+```
+
+Use `--autotune` once for missing exact recipes; preparation/tuning is excluded
+from timed samples. The benchmark requires successful Graph capture, checks
+reference action error/gripper decisions and fixed-input replay, and reports
+individual wall-clock samples plus median/p95. These samples include request
+binding, model Graph, independent Action publication and synchronization; they
+exclude Python preprocessing and action D2H conversion. Device-wide contention,
+power mode and clocks must be recorded separately before interpreting a speedup.
+`--profile` brackets only timed requests with the CUDA profiler API, allowing
+Nsight Systems `--capture-range=cudaProfilerApi --capture-range-end=stop` without
+including model loading or preparation. Use `--iterations 1` for an individual
+steady-state trace. This timing tool is not a substitute for full joint-latent
+numerical and lifecycle tests.

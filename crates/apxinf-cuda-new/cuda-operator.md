@@ -173,8 +173,11 @@ This preserves causal history without a host readback or a full im2col allocatio
 the caller tiles rows and composes ordinary GEMM. Output must not alias either
 source. `enqueue` performs exact BF16 copies with zero padding, allocates no
 memory and can be captured after preparation. Captured graphs retain the prepared execution and its
-input/output storage even after caller handles are dropped. The single deterministic baseline
-uses no device workspace or persistent recipe. Supported dtype is BF16 only.
+input/output storage even after caller handles are dropped. Deterministic dispatch
+uses vectorized bit copies for supported aligned geometries with proven 32-bit
+index bounds, and retains a 64-bit scalar path for all other valid inputs.
+This adds no device workspace or persistent recipe and does not strengthen the
+public BF16 alignment requirement. Supported dtype is BF16 only.
 Target-device numerical/capture acceptance is required before a model claims it.
 
 <!-- l3-operator:ChannelL2Norm -->

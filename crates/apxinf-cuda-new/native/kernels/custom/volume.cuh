@@ -3,6 +3,52 @@
 #include "../../include/apxinf_cuda/volume_types.h"
 
 namespace apxinf::volume::kernels {
+// Eight BF16 values share one neighborhood address calculation. Constant
+// channel/kernel extents turn the flattened-column divisions into multiply/
+// shift sequences. The launcher checks alignment and all 32-bit index bounds;
+// arbitrary geometry continues to use the 64-bit scalar implementation below.
+template <int Channels, int KernelT, int KernelH, int KernelW>
+__global__ void unfold3d_vectorized(apxinf_unfold3d_spec_t s,
+                                  const __nv_bfloat16* input,
+                                  const __nv_bfloat16* history,
+                                  __nv_bfloat16* output) {
+  constexpr int channel_vectors = Channels / 8;
+  constexpr int volume = KernelT * KernelH * KernelW;
+  const int count = static_cast<int>(s.rows) * volume * channel_vectors;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+       i += gridDim.x * blockDim.x) {
+    const int voxel = i / channel_vectors;
+    const int channel = (i % channel_vectors) * 8;
+    const int kernel = voxel % volume;
+    int row = static_cast<int>(s.row_start) + voxel / volume;
+    const int ow = row % static_cast<int>(s.output[2]);
+    row /= static_cast<int>(s.output[2]);
+    const int oh = row % static_cast<int>(s.output[1]);
+    const int ot = row / static_cast<int>(s.output[1]);
+    const int w = ow * static_cast<int>(s.stride[2]) + kernel % KernelW -
+                  static_cast<int>(s.padding_before[2]);
+    const int h = oh * static_cast<int>(s.stride[1]) +
+                  (kernel / KernelW) % KernelH -
+                  static_cast<int>(s.padding_before[1]);
+    const int t = ot * static_cast<int>(s.stride[0]) +
+                  kernel / (KernelW * KernelH) -
+                  static_cast<int>(s.padding_before[0]);
+    uint4 value = make_uint4(0, 0, 0, 0);
+    if (t >= 0 && t < s.input[0] + s.history_frames &&
+        h >= 0 && h < s.input[1] && w >= 0 && w < s.input[2]) {
+      const bool cached = t < s.history_frames;
+      const int local_t = cached ? t : t - static_cast<int>(s.history_frames);
+      const int offset =
+          ((local_t * static_cast<int>(s.input[1]) + h) *
+               static_cast<int>(s.input[2]) +
+           w) * Channels + channel;
+      value = *reinterpret_cast<const uint4*>(
+          (cached ? history : input) + offset);
+    }
+    reinterpret_cast<uint4*>(output)[i] = value;
+  }
+}
+
 // Pure bit copies, including exact BF16 zero padding; no arithmetic rounding.
 __global__ void unfold3d(apxinf_unfold3d_spec_t s, const __nv_bfloat16* input,
                        const __nv_bfloat16* history, __nv_bfloat16* output,

@@ -100,6 +100,9 @@ fn tiled_unfold_history_padding_stride_and_graph_rebinding() {
             [0, 0, 0],
             [0, 1, 1],
         ),
+        ([3, 5, 7, 32], 0, [1, 1, 1], [1; 3], [0; 3], [0; 3]),
+        ([3, 5, 7, 96], 0, [2, 2, 1], [1; 3], [0; 3], [0; 3]),
+        ([3, 5, 7, 128], 0, [3; 3], [1; 3], [1; 3], [1; 3]),
     ];
     for (shape, ht, kernel, stride, padding_before, padding_after) in cases {
         let geometry = Unfold3dGeometry {
@@ -156,6 +159,45 @@ fn tiled_unfold_history_padding_stride_and_graph_rebinding() {
             );
         }
     }
+}
+
+#[test]
+fn unfold_accepts_bf16_aligned_views_without_vector_alignment() {
+    let ctx = CudaContext::new(0).unwrap();
+    let shape = [3, 5, 7, 96];
+    let source = values(shape.iter().product(), 0);
+    let geometry = Unfold3dGeometry {
+        kernel: [3; 3],
+        stride: [1; 3],
+        padding_before: [1; 3],
+        padding_after: [1; 3],
+    };
+    let (gold, columns) = expected(&source, &[], shape, 0, geometry);
+    let input = upload(shape.to_vec(), &source);
+    // A two-byte output offset is valid BF16 storage. Fast vector copies must
+    // not impose a stronger public alignment contract or overwrite the guard.
+    let storage = upload(vec![gold.len() + 1], &vec![0x3f80; gold.len() + 1]);
+    let mut output = CudaBuffer::from_tensor(&storage)
+        .unwrap()
+        .view(2, gold.len() * 2)
+        .unwrap()
+        .as_tensor(Shape::new(vec![gold.len() / columns, columns]), DType::BF16)
+        .unwrap();
+    let operation = PreparedUnfold3d::new(
+        &ctx,
+        Unfold3dArgs {
+            input: &input,
+            history: None,
+            geometry,
+            row_start: 0,
+            out: &mut output,
+        },
+    )
+    .unwrap();
+    operation.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(download(&output), gold);
+    assert_eq!(download(&storage)[0], 0x3f80);
 }
 
 #[test]
