@@ -25,6 +25,10 @@ TuningKeys tuning_keys(const Spec& spec,
   int driver_version = 0;
   check_cuda(cudaRuntimeGetVersion(&runtime_version));
   check_cuda(cudaDriverGetVersion(&driver_version));
+  int cublas_major = 0, cublas_minor = 0, cublas_patch = 0;
+  apxinf::framework::check_cublas(cublasGetProperty(MAJOR_VERSION, &cublas_major));
+  apxinf::framework::check_cublas(cublasGetProperty(MINOR_VERSION, &cublas_minor));
+  apxinf::framework::check_cublas(cublasGetProperty(PATCH_LEVEL, &cublas_patch));
   cudaDeviceProp properties{};
   check_cuda(cudaGetDeviceProperties(&properties, device));
 
@@ -41,6 +45,7 @@ TuningKeys tuning_keys(const Spec& spec,
       << "|sms=" << properties.multiProcessorCount
       << "|cuda=" << cuda_compat_version(runtime_version)
       << "|driver=" << cuda_compat_version(driver_version)
+      << "|cublas=" << cublas_major << '.' << cublas_minor << '.' << cublas_patch
       // Flexible numerics retains the pre-v5 normalized suffix. The build
       // fingerprint still invalidates recipes when candidate code changes.
       << "|op|" << spec.version << '|' << spec.semantic << '|'
@@ -59,6 +64,8 @@ TuningKeys tuning_keys(const Spec& spec,
   }
   key << spec.segments << '|' << spec.max_segment_tokens << '|'
       << spec.scale_is_default << '|'
+      << spec.bias_broadcast_batch << '|' << spec.input_precision << '|'
+      << alignment_class(spec.bias_alignment, 4) << '|'
       << alignment_class(spec.q_alignment, 16) << '|'
       << alignment_class(spec.k_alignment, 16) << '|'
       << alignment_class(spec.v_alignment, 16) << '|'

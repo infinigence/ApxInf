@@ -16,3 +16,8 @@ mod nvfp4_precision;
 mod operator_doc;
 #[path = "precision/precision.rs"]
 mod precision;
+#[path = "precision/primitive_precision.rs"]
+mod primitive_precision;
+
+#[path = "precision/norm_precision.rs"]
+mod norm_precision;

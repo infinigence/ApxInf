@@ -81,7 +81,7 @@ typedef enum {
   APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL = 1,
 } apxinf_norm_bias_order_t;
 
-#define APXINF_NORM_SPEC_VERSION 7u
+#define APXINF_NORM_SPEC_VERSION 8u
 
 typedef struct {
   uint32_t version;
@@ -122,6 +122,7 @@ typedef struct {
      bindings is what lets one tuned Recipe serve every layer that differs only
      by its calibration scale. */
   uint32_t output_scale_is_unit;
+  uint32_t intermediate_dtype;
 } apxinf_norm_spec_t;
 
 typedef struct {

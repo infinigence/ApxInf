@@ -11,7 +11,7 @@ The norm family exposes exactly three caller-owned L3 entries:
 `ops::norm::norm(ctx, NormArgs)`, `ops::fused_add_norm(ctx, FusedAddNormArgs)`,
 and `ops::residual_add(ctx, ResidualAddArgs)`. RMS/Layer statistics, affine
 form, gating, rounding order, numerical compatibility and optional quantization
-are fields rather than additional function names. Norm Spec version 6 carries
+are fields rather than additional function names. Norm Spec version 8 carries
 the common operation/statistic/affine/gate/quantization axes directly; the
 previous nine-value combination semantic is rejected. The planning-compatible
 weighted-adaptive and unit-offset-gate implementations are selected behind the
@@ -19,6 +19,12 @@ same three L3 entries while their remaining private launch ABIs are retired.
 GEMM Spec version 9 includes the provider-neutral `GemmNumerics` constraint in
 the execution and recipe key. Older specs are rejected rather than reused
 across incompatible contracts.
+
+Attention Spec version 7 additionally declares additive-bias bindings and explicit
+intermediate precision. Dense attention accepts F32 inputs/output. Norm Spec
+version 8 adds `NormArgs::intermediate_dtype`, default F32, to the unified Norm
+contract. Fast-WAM explicitly requests BF16 RMS and additive-attention intermediate
+materialization while accumulating in F32. Ordinary LayerNorm also accepts F32.
 
 ## Operator Layers: L3 to L0
 
@@ -126,7 +132,7 @@ Recipe hit → resolve Candidate → validate → prepare → Execution
 | Component | Attention | GEMM |
 | --- | --- | --- |
 | Problem | Complete normalized `Spec` | Complete normalized `Spec` |
-| Device and execution location | device, Q/K/V/offsets/output addresses, stream | device, A/B/bias/scales/output addresses, stream |
+| Device and execution location | device, Q/K/V/bias/offsets/output addresses, stream | device, A/B/bias/scales/output addresses, stream |
 | Actual dynamic values | Bit patterns of `scale` and `output_scale` | Bit patterns of `alpha` and `output_scale`; B version/immutable flag |
 | Policy affecting prepared state | workspace limit, graph-safe, deterministic | workspace limit, graph-safe, deterministic |
 | Excluded from key | `online_tune`, `allow_fallback`, `cache_dir` | `online_tune`, `allow_fallback`, `cache_dir` |
@@ -136,8 +142,8 @@ Recipe hit → resolve Candidate → validate → prepare → Execution
 | Component | Contents |
 | --- | --- |
 | Cache/build namespace | recipe schema version, operator build fingerprint, compiled CUDA toolkit |
-| Runtime environment | GPU compute capability, SM count; compatible CUDA runtime/driver version; GEMM also includes the cuBLASLt version |
-| Attention equivalence class | semantic, input/output dtype, mask, batch, Q/K tokens, key capacity, Q/KV heads, head dim, query start, segments/max segment, default-scale predicate |
+| Runtime environment | GPU compute capability, SM count; compatible CUDA runtime/driver version; GEMM also includes the cuBLASLt version, and Attention includes the cuBLAS version |
+| Attention equivalence class | semantic, input/output dtype, mask, batch, Q/K tokens, key capacity, Q/KV heads, head dim, query start, segments/max segment, default-scale predicate, additive-bias broadcast and intermediate precision |
 | GEMM equivalence class | semantic, M/N/K, A/B/accumulation/output dtype, quantization, B immutable, unit-alpha/unit-output-scale predicates |
 | Candidate eligibility | Alignment class for each binding, workspace limit, graph-safe, deterministic |
 | Excluded from key | Raw pointers, stream, input contents, actual scale, B version, device UUID, cache dir, tune/fallback switches, Attention offsets contents |
@@ -182,6 +188,23 @@ benchmark default to cache-only/fallback, not tuning. Tuning occurs at first eag
 execution or prepare, never inside graph capture or steady-state replay. A warm
 cache does not retune just because `--autotune` is present.
 
+Additive attention defaults to F32 score/probability arithmetic through custom
+candidates. Its L3 `intermediate_dtype=BF16` request selects a separate cuBLAS
+MHA implementation with BF16 materialization boundaries and F32 accumulators;
+default calls never select it. Dense F32 attention has a pedantic cuBLAS implementation with
+execution-local score/probability storage and a shared 4 MiB stream workspace. Existing
+F16/BF16 dense candidates keep their original selection domain. Attention
+recipes include the runtime cuBLAS version and source fingerprint.
+
+Dense F32 MHA also has a fused short-sequence candidate: B1, Q16–128,
+K1–160, D128, no mask, at most 65535 heads and 16-byte-aligned bindings.
+Four queries reuse vectorized K/V loads, eight-lane groups compute QK, and
+four warps reduce PV. Scores and probabilities stay in shared memory;
+there is no global workspace and all arithmetic stays F32. This candidate
+precedes cuBLAS in fallback order. Batched/causal and other shapes retain
+the pedantic F32 cuBLAS or general custom paths. Its source is included in
+the Attention build fingerprint, invalidating incompatible cached recipes.
+
 ## Session / CUDA Graph State Machine
 
 | Stage | Entry Point | Allowed | Forbidden/Failure Conditions | Result |
@@ -192,6 +215,15 @@ cache does not retune just because `--autotune` is present.
 | Replay | `CapturedGraph::replay()` | Launch the instantiated graph | changing the captured structure | GPU work |
 
 The graph retains the executions and storage used during capture. The recipe key does not contain raw pointers; fixed addresses and the stream belong to the Rust execution cache key.
+
+GEMM and F32 Attention executions on one concrete CUDA stream share a cuBLAS
+handle and 4 MiB workspace. Enqueue uses a host mutex around the complete library
+call sequence; GPU work remains ordered by the bound stream. A weak lookup table
+does not retain unused pools, while prepared executions and captured graphs keep
+their resources alive. Score, projection, unpack and dequantization storage stays
+execution-local. Per-thread stream sentinels receive private resources.
+The public prepared-execution test checks that many tiny GEMMs retain bounded
+memory and replay correctly after the session is dropped.
 
 ## Directory Responsibilities
 

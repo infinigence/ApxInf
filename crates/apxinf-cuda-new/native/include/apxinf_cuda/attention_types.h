@@ -13,6 +13,7 @@ typedef enum {
   APXINF_ATTENTION_SEMANTIC_DENSE = 0,
   APXINF_ATTENTION_SEMANTIC_KV_CACHE = 1,
   APXINF_ATTENTION_SEMANTIC_SEGMENTED = 2,
+  APXINF_ATTENTION_SEMANTIC_ADDITIVE = 4,
 } apxinf_attention_semantic_t;
 
 typedef enum {
@@ -53,6 +54,11 @@ typedef struct {
   uint64_t offsets_hash;
   uint32_t scale_is_default;
   uint32_t dynamic_decode;
+  uint32_t bias_alignment;
+  uint32_t bias_broadcast_batch;
+  /* 0: F32 intermediates; 1: BF16 QK/bias/probability boundaries (BF16 additive MHA). */
+  uint32_t input_precision;
+  uint32_t reserved;
   uint32_t numerics;
 } apxinf_attention_spec_t;
 
@@ -63,6 +69,7 @@ typedef struct {
   const void* key;
   const void* value;
   const void* offsets;
+  const void* bias;
   const uint32_t* decode_meta;
   void* output;
   apxinf_cuda_stream_t stream;

@@ -57,3 +57,5 @@ pub const NVFP4_GEMM_SWIGLU: bool = cfg!(apxinf_nvfp4_gemm_swiglu);
 /// Like [`NVFP4_GEMM_SWIGLU`], this is a zero-cost compile-time constant
 /// carrying a build-time cfg across the crate boundary.
 pub const FA2_DECODE: bool = cfg!(apxinf_fa2_decode);
+
+pub use ops::{additive_attention, AttentionBiasArgs, pairwise_rope, PairwiseRopeArgs, PairwiseRopeTable, channel_l2_normalize, channel_standardize, image_grouped_average, image_im2col, image_rgb_indices, image_space_to_depth, ImageMemoryLayout};

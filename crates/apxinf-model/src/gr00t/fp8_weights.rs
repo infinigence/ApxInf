@@ -477,6 +477,7 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         ops::norm::norm(
             backend.context(),
             ops::NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input,
                 output: Some(&normalized),
                 kind: ops::NormKind::Layer,
@@ -505,6 +506,7 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         ops::norm::norm(
             backend.context(),
             ops::NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input,
                 output: None,
                 kind: ops::NormKind::Rms,

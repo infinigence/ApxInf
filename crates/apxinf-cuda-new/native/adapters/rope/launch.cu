@@ -583,3 +583,30 @@ extern "C" apxinf_status_t apxinf_rope_launch(
     apxinf::framework::check_cuda(status);
   });
 }
+
+extern "C" apxinf_status_t apxinf_pairwise_rope_launch(
+    apxinf_runtime_t runtime, uint32_t version, const void* input,
+    const void* coefficients, void* output, int64_t tokens, int64_t heads,
+    int64_t head_dim, uint32_t output_dtype, apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (runtime == nullptr || version != 1 || input == nullptr || coefficients == nullptr || output == nullptr ||
+        tokens <= 0 || tokens > INT32_MAX || heads <= 0 || heads > INT32_MAX ||
+        head_dim <= 0 || head_dim > 2048 || head_dim % 2 ||
+        tokens > INT64_MAX / heads / head_dim || (output_dtype != 0 && output_dtype != 2)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid pairwise RoPE contract");
+    }
+    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
+    const int64_t count = tokens * heads * (head_dim / 2);
+    const int blocks = static_cast<int>(std::min<int64_t>(4096, (count + 255) / 256));
+    if (output_dtype == 0) {
+      kernels::pairwise_rotate<float><<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+          static_cast<const __nv_bfloat16*>(input), static_cast<const double2*>(coefficients),
+          static_cast<float*>(output), count, heads, head_dim);
+    } else {
+      kernels::pairwise_rotate<__nv_bfloat16><<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+          static_cast<const __nv_bfloat16*>(input), static_cast<const double2*>(coefficients),
+          static_cast<__nv_bfloat16*>(output), count, heads, head_dim);
+    }
+    apxinf::framework::check_cuda(cudaGetLastError());
+  });
+}

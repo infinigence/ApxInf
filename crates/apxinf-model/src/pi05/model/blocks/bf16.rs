@@ -71,6 +71,7 @@ fn adaptive_rms_bf16(ctx: &Context, input: &Tensor, style: &Tensor, eps: f32) ->
     crate::pi05::backend::ops::norm::norm(
         ctx,
         NormArgs {
+            intermediate_dtype: apxinf_core::DType::F32,
             input,
             output: Some(&output),
             kind: NormKind::Rms,

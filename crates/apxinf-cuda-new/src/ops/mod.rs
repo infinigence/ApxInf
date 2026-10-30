@@ -128,3 +128,8 @@ pub fn scratch_buffer_tail_zeroed(
 }
 #[cfg(test)]
 mod tests;
+
+mod image;
+pub use image::{channel_l2_normalize, channel_standardize, image_grouped_average, image_im2col, image_rgb_indices, image_space_to_depth, ImageMemoryLayout};
+pub use attention::{additive_attention, AttentionBiasArgs};
+pub use rope::{pairwise_rope, PairwiseRopeArgs, PairwiseRopeTable};

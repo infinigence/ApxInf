@@ -20,8 +20,14 @@ __device__ inline float to_float(__nv_bfloat16 value) {
   return __bfloat162float(value);
 }
 
+template <>
+__device__ inline float to_float(float value) { return value; }
+
 template <class T>
 __device__ T from_float(float value);
+
+template <>
+__device__ inline float from_float(float value) { return value; }
 
 template <>
 __device__ inline __half from_float(float value) {
@@ -106,6 +112,64 @@ __global__ void attention_scores_softmax(
 }
 
 template <class T>
+__global__ void attention_scores_softmax_additive(
+    const T* query, const T* key, float* probabilities, int query_tokens,
+    int key_tokens, int key_stride, int query_heads, int kv_heads,
+    int head_dim, int batch_size, bool causal, int query_start,
+    const uint32_t* decode_meta, float scale, const float* bias,
+    bool bias_broadcast_batch) {
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t rows =
+      static_cast<int64_t>(batch_size) * query_tokens * query_heads;
+  if (row >= rows) return;
+
+  const int q_head = row % query_heads;
+  const int query_token = (row / query_heads) % query_tokens;
+  const int batch = row / (static_cast<int64_t>(query_heads) * query_tokens);
+  const int kv_head = q_head / (query_heads / kv_heads);
+  const int valid_keys = runtime_valid_keys(
+      key_tokens, causal, query_start, query_token, decode_meta);
+  const T* q = query +
+      ((static_cast<int64_t>(batch) * query_tokens + query_token) * query_heads +
+       q_head) * head_dim;
+  float* scores = probabilities + row * key_tokens;
+
+  float maximum = -CUDART_INF_F;
+  for (int key_token = 0; key_token < valid_keys; ++key_token) {
+    const T* k = key +
+        ((static_cast<int64_t>(batch) * key_stride + key_token) * kv_heads +
+         kv_head) * head_dim;
+    float dot = 0.0F;
+    for (int dimension = 0; dimension < head_dim; ++dimension) {
+      dot += to_float(q[dimension]) * to_float(k[dimension]);
+    }
+    float score = dot * scale;
+
+    if (bias != nullptr) {
+      const int bias_batch = bias_broadcast_batch ? 0 : batch;
+      score += bias[((static_cast<int64_t>(bias_batch) * query_heads + q_head) *
+                     query_tokens + query_token) * key_tokens + key_token];
+
+    }
+    scores[key_token] = score;
+    maximum = fmaxf(maximum, scores[key_token]);
+  }
+  float sum = 0.0F;
+  for (int key_token = 0; key_token < valid_keys; ++key_token) {
+    const float value = maximum == -CUDART_INF_F ? 0.0F : expf(scores[key_token] - maximum);
+    scores[key_token] = value;
+    sum += value;
+  }
+  for (int key_token = 0; key_token < valid_keys; ++key_token) {
+    scores[key_token] = sum == 0.0F ? 0.0F : scores[key_token] / sum;
+
+  }
+  for (int key_token = valid_keys; key_token < key_tokens; ++key_token) {
+    scores[key_token] = 0.0F;
+  }
+}
+
+template <class T>
 __global__ void attention_values(const float* probabilities, const T* value,
                                  T* output, int query_tokens, int key_tokens,
                                  int key_stride, int query_heads, int kv_heads,
@@ -149,16 +213,26 @@ cudaError_t launch_attention(const void* query, const void* key,
                              int query_heads, int kv_heads, int head_dim,
                              bool causal, int query_start,
                              const uint32_t* decode_meta, float scale,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, const float* bias = nullptr,
+                             bool bias_broadcast_batch = false) {
   constexpr int threads = 128;
   const int64_t rows =
       static_cast<int64_t>(batch) * query_tokens * query_heads;
+  if (bias == nullptr) {
   attention_scores_softmax<T><<<
       static_cast<unsigned>((rows + threads - 1) / threads), threads, 0,
       stream>>>(static_cast<const T*>(query), static_cast<const T*>(key),
                 probabilities, query_tokens, key_tokens, key_stride,
                 query_heads, kv_heads, head_dim, batch, causal, query_start,
                 decode_meta, scale);
+  } else {
+  attention_scores_softmax_additive<T><<<
+      static_cast<unsigned>((rows + threads - 1) / threads), threads, 0,
+      stream>>>(static_cast<const T*>(query), static_cast<const T*>(key),
+                probabilities, query_tokens, key_tokens, key_stride,
+                query_heads, kv_heads, head_dim, batch, causal, query_start,
+                decode_meta, scale, bias, bias_broadcast_batch);
+  }
   auto status = cudaGetLastError();
   if (status != cudaSuccess) return status;
   const int64_t elements = rows * head_dim;
@@ -168,6 +242,129 @@ cudaError_t launch_attention(const void* query, const void* key,
                 static_cast<T*>(output), query_tokens, key_tokens, key_stride,
                 query_heads, kv_heads, head_dim, batch, causal, query_start,
                 decode_meta);
+  return cudaGetLastError();
+}
+
+// All 128 threads participate; the final barrier protects scratch reuse.
+template <bool Maximum>
+__device__ __forceinline__ float attention_block_reduce(float value, float* scratch) {
+  for (int offset = 16; offset > 0; offset /= 2) {
+    const float other = __shfl_down_sync(0xffffffff, value, offset);
+    value = Maximum ? fmaxf(value, other) : value + other;
+  }
+  if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = value;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = scratch[0];
+    for (int warp = 1; warp < 4; ++warp)
+      total = Maximum ? fmaxf(total, scratch[warp]) : total + scratch[warp];
+    scratch[0] = total;
+  }
+  __syncthreads();
+  const float result = scratch[0];
+  __syncthreads();
+  return result;
+}
+
+// One block owns a row. The cooperative variant distributes each QK dot over
+// a warp and reduces softmax across the block; the baseline uses serial dots
+// and softmax. Global scratch is prepared before capture. Shared memory has a
+// fixed size, so arbitrary positive head dimensions remain supported.
+template <class T, bool Cooperative>
+__global__ void attention_parallel_kernel(
+    const T* query, const T* key, const T* value, T* output,
+    float* probabilities, int query_tokens, int key_tokens, int query_heads,
+    int kv_heads, int head_dim, float scale, bool causal, int query_start,
+    const float* bias, bool bias_broadcast_batch) {
+  const int64_t row = blockIdx.x;
+  const int q_head = row % query_heads;
+  const int query_token = (row / query_heads) % query_tokens;
+  const int batch = row / (static_cast<int64_t>(query_heads) * query_tokens);
+  const int kv_head = q_head / (query_heads / kv_heads);
+  const int valid_keys = causal ? min(key_tokens, query_start + query_token + 1) : key_tokens;
+  const T* q = query + row * head_dim;
+  float* scores = probabilities + row * key_tokens;
+  const int lane = threadIdx.x % 32;
+  const int first_key = Cooperative ? threadIdx.x / 32 : threadIdx.x;
+  const int key_step = Cooperative ? blockDim.x / 32 : blockDim.x;
+  for (int token = first_key; token < key_tokens; token += key_step) {
+    float score = -CUDART_INF_F;
+    if (token < valid_keys) {
+      const T* k = key + ((static_cast<int64_t>(batch) * key_tokens + token) * kv_heads + kv_head) * head_dim;
+      float dot = 0.0F;
+      for (int d = Cooperative ? lane : 0; d < head_dim; d += Cooperative ? 32 : 1)
+        dot += to_float(q[d]) * to_float(k[d]);
+      if constexpr (Cooperative) {
+        for (int offset = 16; offset > 0; offset /= 2)
+          dot += __shfl_down_sync(0xffffffff, dot, offset);
+      }
+      score = dot * scale;
+
+      if (bias != nullptr) {
+        const int bias_batch = bias_broadcast_batch ? 0 : batch;
+        score += bias[((static_cast<int64_t>(bias_batch) * query_heads + q_head) * query_tokens + query_token) * key_tokens + token];
+
+      }
+    }
+    if (!Cooperative || lane == 0) scores[token] = score;
+  }
+  __syncthreads();
+  if constexpr (Cooperative) {
+    __shared__ float reduction[4];
+    float local_max = -CUDART_INF_F;
+    for (int token = threadIdx.x; token < valid_keys; token += blockDim.x)
+      local_max = fmaxf(local_max, scores[token]);
+    const float maximum = attention_block_reduce<true>(local_max, reduction);
+    float local_sum = 0.0F;
+    for (int token = threadIdx.x; token < key_tokens; token += blockDim.x) {
+      const float p = maximum == -CUDART_INF_F ? 0.0F : expf(scores[token] - maximum);
+      scores[token] = p;
+      local_sum += p;
+    }
+    const float sum = attention_block_reduce<false>(local_sum, reduction);
+    for (int token = threadIdx.x; token < key_tokens; token += blockDim.x) {
+      float p = sum == 0.0F ? 0.0F : scores[token] / sum;
+
+      scores[token] = p;
+    }
+  } else if (threadIdx.x == 0) {
+    float maximum = -CUDART_INF_F;
+    for (int token = 0; token < valid_keys; ++token) maximum = fmaxf(maximum, scores[token]);
+    float sum = 0.0F;
+    for (int token = 0; token < key_tokens; ++token) {
+      const float p = maximum == -CUDART_INF_F ? 0.0F : expf(scores[token] - maximum);
+      scores[token] = p;
+      sum += p;
+    }
+    for (int token = 0; token < key_tokens; ++token) {
+      float p = sum == 0.0F ? 0.0F : scores[token] / sum;
+
+      scores[token] = p;
+    }
+  }
+  __syncthreads();
+  for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    float result = 0.0F;
+    for (int token = 0; token < valid_keys; ++token) {
+      const T* v = value + ((static_cast<int64_t>(batch) * key_tokens + token) * kv_heads + kv_head) * head_dim;
+      result += scores[token] * to_float(v[d]);
+    }
+    output[row * head_dim + d] = from_float<T>(result);
+  }
+}
+
+template <class T, bool Cooperative = false>
+cudaError_t launch_parallel_attention(const void* query, const void* key,
+    const void* value, void* output, float* probabilities, int batch,
+    int query_tokens, int key_tokens, int query_heads, int kv_heads,
+    int head_dim, float scale, bool causal, int query_start, const float* bias,
+    bool bias_broadcast_batch, cudaStream_t stream) {
+  const uint64_t rows = static_cast<uint64_t>(batch) * query_tokens * query_heads;
+  attention_parallel_kernel<T, Cooperative><<<static_cast<unsigned>(rows), 128, 0, stream>>>(
+      static_cast<const T*>(query), static_cast<const T*>(key),
+      static_cast<const T*>(value), static_cast<T*>(output), probabilities,
+      query_tokens, key_tokens, query_heads, kv_heads, head_dim, scale, causal,
+      query_start, bias, bias_broadcast_batch);
   return cudaGetLastError();
 }
 
@@ -248,5 +445,269 @@ cudaError_t launch_segmented_attention(
       heads, head_dim, scale);
   return cudaGetLastError();
 }
+
+
+// Short dense F32 MHA, D128. Four warps share QueryTile query rows and reuse
+// each vectorized K/V load across those rows. QK uses independent eight-lane groups;
+// PV splits keys over the four warps before a shared-memory reduction. Scores
+// remain on chip. Products, probabilities and accumulators all remain F32.
+// The provider checks B1, Q16..128, K1..160, equal heads and 16-byte alignment.
+template <int QueryTile>
+__global__ void attention_short_f32(
+    const float* query, const float* key, const float* value, float* output,
+    int query_tokens, int key_tokens, int heads, float scale) {
+  constexpr int kWarps = 4;
+  constexpr int kGroup = 8;
+  __shared__ float scores[QueryTile][160];
+  __shared__ float partial[kWarps][QueryTile][128];
+  const int lane = threadIdx.x % 32;
+  const int warp = threadIdx.x / 32;
+  const int group_lane = threadIdx.x % kGroup;
+  const unsigned group_mask = 0xffu << ((lane / kGroup) * kGroup);
+  const int head = blockIdx.y;
+  const int first_query = blockIdx.x * QueryTile;
+
+  float q[QueryTile][16];
+#pragma unroll
+  for (int row = 0; row < QueryTile; ++row) {
+#pragma unroll
+    for (int part = 0; part < 4; ++part) {
+      const float4 x = first_query + row < query_tokens
+          ? reinterpret_cast<const float4*>(
+                query + ((first_query + row) * heads + head) * 128)
+                [group_lane + part * kGroup]
+          : make_float4(0, 0, 0, 0);
+      q[row][part * 4] = x.x;
+      q[row][part * 4 + 1] = x.y;
+      q[row][part * 4 + 2] = x.z;
+      q[row][part * 4 + 3] = x.w;
+    }
+  }
+  for (int token = threadIdx.x / kGroup; token < key_tokens;
+       token += kWarps * 32 / kGroup) {
+    float k[16];
+#pragma unroll
+    for (int part = 0; part < 4; ++part) {
+      const float4 x = reinterpret_cast<const float4*>(
+          key + (token * heads + head) * 128)[group_lane + part * kGroup];
+      k[part * 4] = x.x;
+      k[part * 4 + 1] = x.y;
+      k[part * 4 + 2] = x.z;
+      k[part * 4 + 3] = x.w;
+    }
+#pragma unroll
+    for (int row = 0; row < QueryTile; ++row) {
+      float dot = 0;
+#pragma unroll
+      for (int dim = 0; dim < 16; ++dim)
+        dot = fmaf(q[row][dim], k[dim], dot);
+      // The final key iteration may contain a partially active warp.
+      // Naming inactive groups in the mask would violate shuffle convergence.
+#pragma unroll
+      for (int delta = 4; delta > 0; delta /= 2)
+        dot += __shfl_down_sync(group_mask, dot, delta, kGroup);
+      if (group_lane == 0) scores[row][token] = dot * scale;
+    }
+  }
+  __syncthreads();
+
+  for (int row = warp; row < QueryTile; row += kWarps) {
+    float maximum = -CUDART_INF_F;
+    for (int token = lane; token < key_tokens; token += 32)
+      maximum = fmaxf(maximum, scores[row][token]);
+    for (int delta = 16; delta > 0; delta /= 2)
+      maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, delta));
+    float sum = 0;
+    for (int token = lane; token < key_tokens; token += 32) {
+      const float p = expf(scores[row][token] - maximum);
+      scores[row][token] = p;
+      sum += p;
+    }
+    for (int delta = 16; delta > 0; delta /= 2)
+      sum += __shfl_xor_sync(0xffffffff, sum, delta);
+    for (int token = lane; token < key_tokens; token += 32)
+      scores[row][token] /= sum;
+  }
+  __syncthreads();
+
+  float accum[QueryTile][4] = {};
+  for (int token = warp; token < key_tokens; token += kWarps) {
+    const float4 x = reinterpret_cast<const float4*>(
+        value + (token * heads + head) * 128)[lane];
+    const float v[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+    for (int row = 0; row < QueryTile; ++row) {
+      const float p = scores[row][token];
+#pragma unroll
+      for (int dim = 0; dim < 4; ++dim)
+        accum[row][dim] = fmaf(p, v[dim], accum[row][dim]);
+    }
+  }
+#pragma unroll
+  for (int row = 0; row < QueryTile; ++row) {
+#pragma unroll
+    for (int dim = 0; dim < 4; ++dim)
+      partial[warp][row][lane * 4 + dim] = accum[row][dim];
+  }
+  __syncthreads();
+  for (int index = threadIdx.x; index < QueryTile * 128;
+       index += kWarps * 32) {
+    const int row = index / 128;
+    const int dim = index % 128;
+    float sum = 0;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) sum += partial[w][row][dim];
+    if (first_query + row < query_tokens)
+      output[((first_query + row) * heads + head) * 128 + dim] = sum;
+  }
+}
+
+inline cudaError_t launch_attention_short_f32(
+    const void* query, const void* key, const void* value, void* output,
+    int query_tokens, int key_tokens, int heads, float scale,
+    cudaStream_t stream) {
+  attention_short_f32<4><<<dim3((query_tokens + 3) / 4, heads), 128, 0, stream>>>(
+      static_cast<const float*>(query), static_cast<const float*>(key),
+      static_cast<const float*>(value), static_cast<float*>(output),
+      query_tokens, key_tokens, heads, scale);
+  return cudaGetLastError();
+}
+
+
+
+// Head-major BF16 QK and P, with one warp per row. The lane-strided local
+// sum followed by a butterfly reduction preserves eager FP32 softmax rounding
+// before the explicit BF16 probability boundary. No intermediate is on host.
+template <int Columns>
+__global__ void attention_input_softmax(__nv_bfloat16* scores, const float* bias,
+    int batch, int heads, int queries, int keys, bool broadcast_batch,
+    bool causal, int query_start) {
+  constexpr int width = Columns < 32 ? Columns : 32;
+  constexpr int items = Columns / width;
+  const int lane = threadIdx.x;
+  const int64_t row = static_cast<int64_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+  if (row >= static_cast<int64_t>(batch) * heads * queries) return;
+  const int query = row % queries;
+  const int64_t bias_row = broadcast_batch ? row % (static_cast<int64_t>(heads) * queries) : row;
+  float values[items];
+  float maximum = -CUDART_INF_F;
+#pragma unroll
+  for (int i = 0; i < items; ++i) {
+    const int key = lane + i * width;
+    float value = -CUDART_INF_F;
+    if (key < keys && (!causal || key <= query_start + query)) {
+      value = __bfloat162float(__float2bfloat16(
+          __bfloat162float(scores[row * keys + key]) + bias[bias_row * keys + key]));
+    }
+    values[i] = value;
+    maximum = fmaxf(maximum, value);
+  }
+  const unsigned active = __activemask();
+  for (int delta = width / 2; delta; delta /= 2)
+    maximum = fmaxf(maximum, __shfl_xor_sync(active, maximum, delta, width));
+  float sum = 0.0F;
+#pragma unroll
+  for (int i = 0; i < items; ++i) {
+    values[i] = maximum == -CUDART_INF_F ? 0.0F : expf(values[i] - maximum);
+    sum += values[i];
+  }
+  for (int delta = width / 2; delta; delta /= 2)
+    sum += __shfl_xor_sync(active, sum, delta, width);
+#pragma unroll
+  for (int i = 0; i < items; ++i) {
+    const int key = lane + i * width;
+    if (key < keys)
+      scores[row * keys + key] = __float2bfloat16(sum == 0.0F ? 0.0F : values[i] / sum);
+  }
+}
+
+inline cudaError_t launch_attention_input_softmax(void* scores, const float* bias,
+    int batch, int heads, int queries, int keys, bool broadcast_batch,
+    bool causal, int query_start, cudaStream_t stream) {
+  const int64_t rows = static_cast<int64_t>(batch) * heads * queries;
+#define APXINF_INPUT_SOFTMAX(C) \
+  case C: { \
+    constexpr int width = C < 32 ? C : 32; \
+    constexpr int rows_per_block = 128 / width; \
+    attention_input_softmax<C><<<static_cast<unsigned>((rows + rows_per_block - 1) / rows_per_block), dim3(width, rows_per_block), 0, stream>>>( \
+        static_cast<__nv_bfloat16*>(scores), bias, batch, heads, queries, keys, broadcast_batch, causal, query_start); \
+    break; \
+  }
+  int columns = 1;
+  while (columns < keys) columns *= 2;
+  switch (columns) {
+    APXINF_INPUT_SOFTMAX(1)
+    APXINF_INPUT_SOFTMAX(2)
+    APXINF_INPUT_SOFTMAX(4)
+    APXINF_INPUT_SOFTMAX(8)
+    APXINF_INPUT_SOFTMAX(16)
+    APXINF_INPUT_SOFTMAX(32)
+    APXINF_INPUT_SOFTMAX(64)
+    APXINF_INPUT_SOFTMAX(128)
+    APXINF_INPUT_SOFTMAX(256)
+    APXINF_INPUT_SOFTMAX(512)
+    APXINF_INPUT_SOFTMAX(1024)
+    default: return cudaErrorInvalidValue;
+  }
+#undef APXINF_INPUT_SOFTMAX
+  return cudaGetLastError();
+}
+
+
+// Block reduction for the F32 provider. All threads consume shared scratch
+// before another reduction can reuse it.
+template <bool Maximum>
+__device__ inline float f32_softmax_reduce(float value, float* scratch) {
+  for (int delta = 16; delta; delta /= 2) {
+    const float other = __shfl_down_sync(0xffffffff, value, delta);
+    value = Maximum ? fmaxf(value, other) : value + other;
+  }
+  if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = value;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float result = scratch[0];
+    for (int warp = 1; warp < 4; ++warp)
+      result = Maximum ? fmaxf(result, scratch[warp]) : result + scratch[warp];
+    scratch[0] = result;
+  }
+  __syncthreads();
+  const float result = scratch[0];
+  __syncthreads();
+  return result;
+}
+
+static __global__ void attention_f32_softmax(float* scores, int queries, int keys,
+                                     bool causal, int query_start) {
+  __shared__ float scratch[4];
+  const int64_t row = blockIdx.x;
+  const int64_t valid = causal
+      ? min(static_cast<int64_t>(keys), static_cast<int64_t>(query_start) + row % queries + 1)
+      : keys;
+  float* values = scores + row * keys;
+  float maximum = -CUDART_INF_F;
+  for (int key = threadIdx.x; key < valid; key += 128)
+    maximum = fmaxf(maximum, values[key]);
+  maximum = f32_softmax_reduce<true>(maximum, scratch);
+  float sum = 0.0F;
+  for (int key = threadIdx.x; key < keys; key += 128) {
+    const float value = key < valid && maximum != -CUDART_INF_F
+        ? expf(values[key] - maximum) : 0.0F;
+    values[key] = value;
+    sum += value;
+  }
+  sum = f32_softmax_reduce<false>(sum, scratch);
+  for (int key = threadIdx.x; key < keys; key += 128)
+    values[key] = sum == 0.0F ? 0.0F : values[key] / sum;
+}
+
+inline cudaError_t launch_attention_f32_softmax(float* scores, int batch,
+    int heads, int queries, int keys, bool causal, int query_start,
+    cudaStream_t stream) {
+  const int64_t rows = static_cast<int64_t>(batch) * heads * queries;
+  attention_f32_softmax<<<static_cast<unsigned>(rows), 128, 0, stream>>>(
+      scores, queries, keys, causal, query_start);
+  return cudaGetLastError();
+}
+
 
 }  // namespace apxinf::attention::kernels

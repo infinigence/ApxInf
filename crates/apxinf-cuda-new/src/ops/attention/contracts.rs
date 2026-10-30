@@ -9,6 +9,7 @@ use crate::{CudaBuffer, CudaContext};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Semantic {
     Dense = abi::SEMANTIC_DENSE,
+    Additive = abi::SEMANTIC_ADDITIVE,
     KvCache = abi::SEMANTIC_KV_CACHE,
     Segmented = abi::SEMANTIC_SEGMENTED,
 }
@@ -19,12 +20,14 @@ impl Semantic {
     }
 
     #[cfg(test)]
-    pub(crate) const ALL: &'static [Self] = &[Self::Dense, Self::KvCache, Self::Segmented];
+    pub(crate) const ALL: &'static [Self] =
+        &[Self::Dense, Self::Additive, Self::KvCache, Self::Segmented];
 
     #[cfg(test)]
     pub(crate) const fn doc_id(self) -> &'static str {
         match self {
             Self::Dense => "attention",
+            Self::Additive => "additive_attention",
             Self::KvCache => "kv_cache_attention",
             Self::Segmented => "segmented_attention",
         }
@@ -97,7 +100,7 @@ pub struct AttentionArgs<'a> {
     pub scale: f32,
     /// Static dequantization scale for an E4M3 output. The stored value is
     /// `round_to_e4m3(attention / output_scale)`. Must remain `1.0` for
-    /// ordinary F16/BF16 output.
+    /// ordinary F16/BF16/F32 output.
     pub output_scale: f32,
     pub numerics: AttentionNumerics,
     pub policy: AttentionPolicy,
@@ -152,7 +155,8 @@ pub(crate) fn dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
-        _ => Err(invalid("Attention currently supports F16 and BF16")),
+        DType::F32 => Ok(0),
+        _ => Err(invalid("Attention currently supports F16, BF16, and F32")),
     }
 }
 
@@ -160,9 +164,10 @@ fn output_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
+        DType::F32 => Ok(0),
         DType::F8E4M3 => Ok(3),
         _ => Err(invalid(
-            "Attention output currently supports F16, BF16, and E4M3",
+            "Attention output currently supports F16, BF16, F32, and E4M3",
         )),
     }
 }
@@ -303,6 +308,7 @@ fn normalize_separate(
     }
     let default_scale = 1.0 / (head_dim as f32).sqrt();
     let bindings = abi::Bindings {
+        bias: std::ptr::null(),
         query: q.ptr(),
         key: k.ptr(),
         value: v.ptr(),
@@ -319,6 +325,10 @@ fn normalize_separate(
     }
     Ok(Normalized {
         spec: abi::Spec {
+            bias_alignment: 0,
+            bias_broadcast_batch: 0,
+            input_precision: 0,
+            reserved: 0,
             version: abi::SPEC_VERSION,
             semantic: Semantic::Dense.abi_value(),
             dtype: dtype_code(dtype)?,
@@ -419,6 +429,7 @@ fn normalize_packed_qkv(
         .map_err(Error::Cuda)?;
     let default_scale = 1.0 / (head_dim as f32).sqrt();
     let bindings = abi::Bindings {
+        bias: std::ptr::null(),
         query: qkv.ptr(),
         key: key.ptr(),
         value: value.ptr(),
@@ -435,6 +446,10 @@ fn normalize_packed_qkv(
     }
     Ok(Normalized {
         spec: abi::Spec {
+            bias_alignment: 0,
+            bias_broadcast_batch: 0,
+            input_precision: 0,
+            reserved: 0,
             version: abi::SPEC_VERSION,
             semantic: Semantic::Dense.abi_value(),
             dtype: dtype_code(dtype)?,

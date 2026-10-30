@@ -3,7 +3,7 @@ use std::ffi::c_void;
 pub(crate) use super::types::CudaStream;
 use super::types::Runtime;
 
-pub(crate) const SPEC_VERSION: u32 = 7;
+pub(crate) const SPEC_VERSION: u32 = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,6 +35,7 @@ pub(crate) struct Spec {
     pub quantized_cols: i64,
     /// Structural predicate only: the scale value lives in [`Bindings`].
     pub output_scale_is_unit: u32,
+    pub intermediate_dtype: u32,
 }
 
 #[repr(C)]

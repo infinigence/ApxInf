@@ -476,6 +476,7 @@ fn planning_norm_contracts_use_formal_entries_and_replay_in_graph() {
         norm::norm(
             &ctx,
             NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input: &adaptive_hidden,
                 output: Some(&adaptive_normalized),
                 kind: NormKind::Rms,
@@ -578,6 +579,7 @@ fn bf16_static_e4m3_norm_preserves_legacy_bits_and_replays_as_one_graph() {
         norm::norm(
             &ctx,
             NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input: &input,
                 output: None,
                 kind: NormKind::Rms,
@@ -597,6 +599,7 @@ fn bf16_static_e4m3_norm_preserves_legacy_bits_and_replays_as_one_graph() {
         norm::norm(
             &ctx,
             NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input: &input,
                 output: None,
                 kind: NormKind::Layer,
@@ -695,6 +698,7 @@ fn adaptive_layer_norm_dual_output_preserves_legacy_bits_and_graph_replay() {
         norm::norm(
             &ctx,
             NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input: &input,
                 output: Some(&plain),
                 kind: NormKind::Layer,
@@ -707,6 +711,7 @@ fn adaptive_layer_norm_dual_output_preserves_legacy_bits_and_graph_replay() {
         norm::norm(
             &ctx,
             NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input: &input,
                 output: Some(&native),
                 kind: NormKind::Layer,
@@ -799,6 +804,7 @@ fn rowwise_quantized_norm_matches_legacy_entries_and_replays_as_one_graph() {
         norm::norm(
             &ctx,
             NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input: &input,
                 output: None,
                 kind: NormKind::Rms,
@@ -842,6 +848,7 @@ fn rowwise_quantized_norm_matches_legacy_entries_and_replays_as_one_graph() {
         norm::norm(
             &ctx,
             NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input: &input,
                 output: Some(&adaptive_native),
                 kind: NormKind::Layer,
@@ -857,6 +864,7 @@ fn rowwise_quantized_norm_matches_legacy_entries_and_replays_as_one_graph() {
         norm::norm(
             &ctx,
             NormArgs {
+                intermediate_dtype: apxinf_core::DType::F32,
                 input: &input,
                 output: Some(&layer_native),
                 kind: NormKind::Layer,
@@ -1166,30 +1174,6 @@ fn quantization_rejects_packed_fp4_input() {
 }
 
 #[test]
-fn quantization_casts_bf16_to_f32_exactly() {
-    use apxinf_core::DType;
-
-    let ctx = CudaContext::new(0).unwrap();
-    let source = [1.0, -2.5, 0.125, 65_536.0];
-    let input = tensor(0, vec![1, source.len()], &source);
-    let mut output = zeros_tensor(0, vec![1, source.len()], DType::F32);
-    quantization(
-        &ctx,
-        QuantizationArgs::new(QuantizationSemantic::CastBf16ToF32, &input, &mut output),
-    )
-    .unwrap();
-    ctx.synchronize().unwrap();
-    let buffer = crate::CudaBuffer::from_tensor(&output).unwrap();
-    let mut bytes = vec![0u8; source.len() * 4];
-    buffer.copy_to_host(&mut bytes).unwrap();
-    let actual = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
-        .collect::<Vec<_>>();
-    assert_eq!(actual, source);
-}
-
-#[test]
 fn quantization_casts_f32_to_bf16_with_rounding() {
     use apxinf_core::{DType, Shape};
 
@@ -1215,6 +1199,46 @@ fn quantization_casts_f32_to_bf16_with_rounding() {
         .map(|value| bf16::from_f32(*value).to_f32())
         .collect::<Vec<_>>();
     assert_eq!(values(&output), expected);
+}
+
+#[test]
+fn quantization_bf16_f32_preserves_all_values_and_unaligned_tails() {
+    use apxinf_core::{DType, Shape};
+
+    let ctx = CudaContext::new(0).unwrap();
+    for count in [1, 3, 4, 5, 1023, 1024, 1025, 65536] {
+        let source: Vec<u8> = (0..count).flat_map(|i| (i as u16).to_ne_bytes()).collect();
+        for (input_offset, output_offset) in [(0, 0), (2, 0), (0, 4), (2, 4)] {
+            let src = crate::CudaBuffer::alloc(input_offset + count * 2, 0).unwrap();
+            let src = src.view(input_offset, count * 2).unwrap();
+            src.copy_from_host(&source).unwrap();
+            let input = src.as_tensor(Shape::new(vec![count]), DType::BF16).unwrap();
+            let dst = crate::CudaBuffer::alloc(output_offset + count * 4, 0).unwrap();
+            let dst = dst.view(output_offset, count * 4).unwrap();
+            let mut output = dst.as_tensor(Shape::new(vec![count]), DType::F32).unwrap();
+            quantization(
+                &ctx,
+                QuantizationArgs::new(QuantizationSemantic::CastBf16ToF32, &input, &mut output),
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            let mut bytes = vec![0; count * 4];
+            dst.copy_to_host(&mut bytes).unwrap();
+            for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+                let actual = f32::from_ne_bytes(chunk.try_into().unwrap());
+                let expected = f32::from_bits((i as u32) << 16);
+                if expected.is_nan() {
+                    assert!(actual.is_nan());
+                } else {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "index {i}, offsets {input_offset}/{output_offset}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -2978,4 +3002,136 @@ fn attention_semantics_use_distinct_native_registries() {
     assert_ne!(dense_summary, cache_summary);
     assert_ne!(dense_summary, segmented_summary);
     assert_ne!(cache_summary, segmented_summary);
+}
+
+#[test]
+fn rounded_primitives_and_pairwise_rope_capture_contract() {
+    use apxinf_core::DType;
+    let ctx = CudaContext::new(0).unwrap();
+    let input = tensor(0, vec![2, 4], &[1.0, -2.0, 3.0, 4.0, -1.0, 0.5, 8.0, -4.0]);
+    let columns = tensor(0, vec![4], &[0.5, 2.0, -1.0, 0.0]);
+    let mut output = zeros_tensor(0, vec![2, 4], DType::BF16);
+    let apply = |output: &mut apxinf_core::Tensor| {
+        let mut args = PointwiseArgs::new(PointwiseSemantic::BroadcastMultiply, &input, output);
+        args.secondary = Some(&columns);
+        pointwise(&ctx, args)
+    };
+    apply(&mut output).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        values(&output),
+        vec![0.5, -4.0, -3.0, 0.0, -0.5, 1.0, -8.0, 0.0]
+    );
+    let graph = crate::capture(&ctx, || apply(&mut output)).unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        values(&output),
+        vec![0.5, -4.0, -3.0, 0.0, -0.5, 1.0, -8.0, 0.0]
+    );
+    let bad = tensor(0, vec![3], &[1.0; 3]);
+    let mut args = PointwiseArgs::new(PointwiseSemantic::BroadcastMultiply, &input, &mut output);
+    args.secondary = Some(&bad);
+    assert!(pointwise(&ctx, args).is_err());
+    let table = PairwiseRopeTable::new(&ctx, 2, 4, &[(0.0, 1.0); 4]).unwrap();
+    let mut rotated = zeros_tensor(0, vec![2, 4], DType::F32);
+    let graph = crate::capture(&ctx, || {
+        pairwise_rope(
+            &ctx,
+            PairwiseRopeArgs {
+                input: &input,
+                table: &table,
+                output: &mut rotated,
+                heads: 1,
+            },
+        )
+    })
+    .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    let buffer = crate::CudaBuffer::from_tensor(&rotated).unwrap();
+    let mut bytes = vec![0; 8 * 4];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    let actual: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+        .collect();
+    assert_eq!(actual, vec![2.0, 1.0, -4.0, 3.0, -0.5, -1.0, 4.0, 8.0]);
+    assert!(PairwiseRopeTable::new(&ctx, 2, 3, &[(0.0, 1.0); 3]).is_err());
+    assert!(PairwiseRopeTable::new(&ctx, 2, 4, &[(f64::NAN, 1.0); 4]).is_err());
+}
+
+#[test]
+fn additive_attention_validates_bias_and_replays_changed_bias() {
+    use apxinf_core::DType;
+    use super::framework::f32_tensor;
+    for intermediate_dtype in [DType::F32, DType::BF16] {
+        let ctx = CudaContext::new(0).unwrap();
+        let query = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+        let key = tensor(0, vec![1, 2, 1, 2], &[0.0; 4]);
+        let value = tensor(0, vec![1, 2, 1, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let bias = f32_tensor(0, vec![1, 1, 1, 2], &[0.0, f32::NEG_INFINITY]);
+        let bad_bias = f32_tensor(0, vec![1, 1, 2, 1], &[0.0; 2]);
+        let mut out = tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+        let args = AttentionBiasArgs::new(
+            AttentionArgs::new(&query, &key, &value, &mut out),
+            &bad_bias,
+        );
+        assert!(additive_attention(&ctx, args)
+            .unwrap_err()
+            .to_string()
+            .contains("bias must be"));
+        let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+        prepare_with_session(&session, || {
+            let mut args =
+                AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
+            args.intermediate_dtype = intermediate_dtype;
+            args.attention.policy.online_tune = false;
+            additive_attention(&ctx, args)
+        })
+        .unwrap();
+        assert_eq!(values(&out), [1.0, 2.0]);
+        let graph = crate::capture(&ctx, || {
+            with_session(&session, || {
+                let mut args = AttentionBiasArgs::new(
+                    AttentionArgs::new(&query, &key, &value, &mut out),
+                    &bias,
+                );
+                args.intermediate_dtype = intermediate_dtype;
+                args.attention.policy.online_tune = false;
+                additive_attention(&ctx, args)
+            })
+        })
+        .unwrap();
+        let changed: Vec<_> = [f32::NEG_INFINITY, 0.0]
+            .iter()
+            .flat_map(|x| x.to_ne_bytes())
+            .collect();
+        crate::CudaBuffer::from_tensor(&bias)
+            .unwrap()
+            .copy_from_host(&changed)
+            .unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&out), [3.0, 4.0]);
+        // Addresses must be retained by the prepared session, and replacing a bias
+        // allocation must miss even when the structural recipe is equivalent.
+        let replacement = f32_tensor(0, vec![1, 1, 1, 2], &[0.0; 2]);
+        let err = with_session(&session, || {
+            additive_attention(&ctx, {
+                let mut args = AttentionBiasArgs::new(
+                    AttentionArgs::new(&query, &key, &value, &mut out),
+                    &replacement,
+                );
+                args.intermediate_dtype = intermediate_dtype;
+                args
+            })
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("cache miss"), "{err}");
+        let mut invalid =
+            AttentionBiasArgs::new(AttentionArgs::new(&query, &key, &value, &mut out), &bias);
+        invalid.intermediate_dtype = DType::F16;
+        assert!(additive_attention(&ctx, invalid).is_err());
+    }
 }

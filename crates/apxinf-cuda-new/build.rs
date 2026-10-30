@@ -386,6 +386,7 @@ fn main() {
         "pointwise/launch.cu",
         "rope/launch.cu",
         "gather/launch.cu",
+        "image.cu",
         "quantization/launch.cu",
     ]
     .map(|source| adapters.join(source))
@@ -527,6 +528,7 @@ fn main() {
     }
     let patched_fa2_root =
         (!fa2_e4m3_sources.is_empty()).then(|| stage_patched_fa2(&native, &fa2_root, &out));
+    let input_attention_source = adapters.join("attention/providers/cublas.cu");
     let missing_sources = generic_sources
         .iter()
         .chain(&cutlass_sources)
@@ -535,6 +537,7 @@ fn main() {
         .chain(&cutlass_sm89_sources)
         .chain(&fa2_sources)
         .chain(&fa2_e4m3_sources)
+        .chain(std::iter::once(&input_attention_source))
         .filter(|path| !path.is_file())
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
@@ -636,6 +639,15 @@ fn main() {
                 .into_iter()
                 .map(|source| (source, false, false, false, false, false, true)),
         )
+        .chain(std::iter::once((
+            input_attention_source,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )))
         .enumerate()
     {
         let (source, is_cutlass, is_sm110, is_cutlass_sm87, is_cutlass_sm89, is_fa2, is_fa2_e4m3) =
