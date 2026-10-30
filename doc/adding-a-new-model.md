@@ -110,6 +110,12 @@ HF tokenizer, state/action normalization, two-camera resize-with-padding, and
 action unnormalization. Its maintained latency and LIBERO entry points are
 `scripts/bench_smolvla.py` and `scripts/eval_smolvla_libero.py`.
 
+The [PI0.5 CPU reference](pi05-cpu-reference.md) is an independent
+`cpu_pi05/` port with its own config, weights, concrete model and eager runner.
+It shares public contracts and reference fixtures with other ports. CPU operator
+implementation and BLAS linking belong to `apxinf-cpu`; see the
+[CPU backend contract](../crates/apxinf-cpu/README.md).
+
 Inspect or copy PI0.5's model/Blocks and runner
 structure when semantics fit; use `<Family>Model` and `<Family>ModelRunner` for
 those roles. Preserve static precision specialization and keep one owner of
@@ -167,7 +173,7 @@ not belong on the portable trait. Trait is the floor; concrete types are the
 ceiling.
 
 A port written directly against one backend's native API goes in a
-self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`) that
+self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`, `cpu_`) that
 copies, rather than imports, any config, checkpoint or math code it shares with
 another backend's port; see
 [where backend-native model code lives](model-layer-architecture.md#where-backend-native-model-code-lives).

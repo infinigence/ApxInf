@@ -494,7 +494,8 @@ impl apxinf_core::SamplingBackend for CudaNewBackend {
 
 #[cfg(test)]
 mod tests {
-    use apxinf_core::{Backend, CpuBackend, Shape, Tensor};
+    use apxinf_core::{Backend, Shape, Tensor};
+    use apxinf_cpu::CpuBackend;
     use half::bf16;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 

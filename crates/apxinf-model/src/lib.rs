@@ -57,3 +57,6 @@ pub use vla::{
     PreparationStatus, PreparedInference, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
     VlaRuntime,
 };
+
+/// Self-contained FP32 CPU PI0.5 port.
+pub mod cpu_pi05;

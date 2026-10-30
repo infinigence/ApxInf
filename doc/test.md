@@ -4,24 +4,25 @@
 
 ```bash
 # Run the portable library test suite
-cargo test -p apxinf-core -p apxinf-loader -p apxinf-model -p apxinf-tokenizer --lib
+cargo test -p apxinf-core -p apxinf-cpu -p apxinf-loader -p apxinf-model -p apxinf-tokenizer --lib
 
 # Compile all workspace library, binary, and test targets
 cargo check --workspace --lib --bins --tests
 
 # Run tests for a specific crate
 cargo test -p apxinf-core
+cargo test -p apxinf-cpu
 cargo test -p apxinf-loader
 cargo test -p apxinf-model
 cargo test -p apxinf-tokenizer
 
 # Run a specific test
-cargo test -p apxinf-core test_matmul_cpu
+cargo test -p apxinf-cpu test_matmul_cpu
 ```
 
 ## Test Summary
 
-The portable suite currently contains 65 tests across `apxinf-core`,
+The portable suite covers `apxinf-core`, `apxinf-cpu`,
 `apxinf-loader`, `apxinf-model`, and `apxinf-tokenizer`. CUDA compilation is
 covered by the workspace check above; CUDA-linked tests and benchmarks run on
 NVIDIA devices.
@@ -97,16 +98,24 @@ Tests that reshaping to incompatible shape returns an error.
 #### `test_transpose_2d`
 Tests 2D tensor transposition.
 
+#### `test_display`
+Tests the `Display` trait implementation for `Tensor`.
+
+---
+
+## apxinf-cpu
+
+CPU backend tests cover GEMM, dense grouped attention against scalar FP64,
+normalization, categorical sampling, penalties and FP32/F16/BF16 normal output.
+Run `cargo test -p apxinf-cpu --features openblas` to exercise OpenBLAS instead
+of the default serial Rust GEMM. See [CPU backend](../crates/apxinf-cpu/README.md)
+for linking configuration.
+
 #### `test_matmul_cpu`
 Tests CPU matrix multiplication.
 ```rust
 [2, 3] @ [3, 2] -> [2, 2]
 ```
-
-#### `test_display`
-Tests the `Display` trait implementation for `Tensor`.
-
----
 
 ## apxinf-loader
 

@@ -6,6 +6,7 @@ on:
       - 'Cargo.lock'
       - 'src/**'
       - 'crates/apxinf-core/**'
+      - 'crates/apxinf-cpu/**'
       - 'crates/apxinf-mlx/**'
       - 'crates/apxinf-model/**'
       - 'crates/apxinf-tokenizer/**'
@@ -22,5 +23,7 @@ jobs:
       # No MLX_ROOT or Apple SDK: unified features must stay inert on Linux.
       - run: cargo check --locked --features mlx
       - run: cargo test --locked -p apxinf-core --features opaque-storage --test opaque_storage
+      - run: cargo test --locked -p apxinf-core -p apxinf-cpu --lib
+      - run: cargo test --locked -p apxinf-model --test cpu_pi05
       - run: cargo test --locked -p apxinf-tokenizer --lib
       - run: cargo test --locked -p apxinf-tokenizer --features minijinja/json --lib

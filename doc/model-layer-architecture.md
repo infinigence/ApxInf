@@ -32,8 +32,12 @@ apxinf-model
   architecture, weights, schedules and execution orchestration
                          |
                          v
-apxinf-core / apxinf-cuda-new / apxinf-mlx
-  tensors, devices, model-neutral operators, kernel APIs
+apxinf-cpu / apxinf-cuda-new / apxinf-hip / apxinf-mlx
+  model-neutral operators, kernel APIs
+                         |
+                         v
+apxinf-core
+  tensors, devices, backend and sampling contracts
 ```
 
 Dependencies flow downward. Backend crates never import model concepts.
@@ -94,6 +98,8 @@ not a port requirement.
 | `weights/` | Checkpoint mapping, model-local packing, device weight trees and fixed calibration scales; fixed weight operations stay with their physical representation | [weights/mod.rs](../crates/apxinf-model/src/pi05/weights/mod.rs) |
 | `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
+| `apxinf-core` | Tensor/storage data and backend, KV cache and sampling contracts; no concrete CPU operators or BLAS linking | [Core crate](../crates/apxinf-core/src/lib.rs) |
+| `apxinf-cpu` | Synchronous CPU operators, concrete KV storage and sampling; owns optional OpenBLAS calls and linking | [CPU crate](../crates/apxinf-cpu/README.md) |
 | `apxinf-cuda-new` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda-new/src/lib.rs) |
 | `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
 
@@ -136,7 +142,7 @@ rather than through `dyn Backend`, is a **port**. Ports follow one rule, whether
 or not another backend already implements the same family:
 
 1. **A port is a top-level module `<backend>_<family>/`** in `apxinf-model/src/`,
-   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`. For example
+   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`, `cpu_`. For example
    `metal_qwen3/` is the Metal port of Qwen3; a CUDA port of the same family would
    be `cuda_qwen3/`, beside it rather than inside it.
 2. **A port is self-contained.** It depends only on the core crates
@@ -173,6 +179,7 @@ renamed as part of unrelated work.
 | Family / contract | Current organization and limits |
 | --- | --- |
 | PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| PI0.5 CPU / `VlaRuntime` | Independent `cpu_pi05/{config,weights,model,runner,load}.rs`; concrete `CpuPi05Model` and `CpuPi05Runner`, FP32 eager reference. See [CPU contract](pi05-cpu-reference.md). |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | `model/` (`WallossModel` + `ModelVariant` over BF16 and dynamic FP8, `blocks/`), `model_runner/` (`WallossModelRunner`, `prepare.rs`: explicit preparation policy/status, capture during preparation, one implicit plan replaced on shape change), `weights/`; per-request grids via `VlaMetadata::image_grid_thw` kept in the family's plan key; model-reported workspace backed by the config-only `workspace.rs` budget; rejected host requests preserve the cached plan; `check_walloss_module_boundaries.py`. See [WallOSS](walloss.md). |

@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use apxinf_core::Backend;
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
     AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput,
@@ -989,7 +990,7 @@ fn run_test() {
 
     let a = Tensor::from_f32(vec![2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let b = Tensor::from_f32(vec![3, 2], &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
-    let c_cpu = a.matmul_cpu(&b).unwrap();
+    let c_cpu = apxinf_cpu::CpuBackend.matmul(&a, &b).unwrap();
     println!("[CPU] A: {a}");
     println!("[CPU] B: {b}");
     println!("[CPU] C = A @ B: {c_cpu}");

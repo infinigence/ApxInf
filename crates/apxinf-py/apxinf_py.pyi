@@ -49,11 +49,14 @@ class ModelRunner:
         flow_start_time: float | None = ...,
         sampling_seed: int = ...,
         assets: dict[str, str] | None = ...,
+        model_variant: str | None = ...,
     ) -> "ModelRunner":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
         ``device`` is ``cuda:N`` (default) or ``cpu``.
-        ``precision`` is ``auto`` (default), ``fp8``, ``bf16``, or ``int8``.
+        PI0.5 uses ``model_variant``: CUDA accepts ``auto``, ``bf16``,
+        ``fp8_static``, ``int8_dynamic``; CPU accepts ``auto``/``fp32_reference``.
+        Leave legacy ``precision`` at ``auto`` for PI0.5.
         ``config_json`` supplies architecture JSON when it is stored outside the
         checkpoint's ``config.json``. ``None`` leaves loading to AutoModel.
         ``action_horizon`` overrides the checkpoint's chunk length (a sequence

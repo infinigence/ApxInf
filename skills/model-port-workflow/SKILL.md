@@ -106,6 +106,9 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    `metal_<family>` for native Metal composition and registration. The evolving
    cross-backend contract is not a prerequisite: preserve the model's numerical
    recipe and measured performance without introducing per-op trait wrappers.
+   For an explicitly requested CPU reference target, compose the model in
+   `cpu_<family>` using [apxinf-cpu](../../crates/apxinf-cpu/README.md); keep
+   CPU operators and BLAS linking in that backend and shared contracts in core.
 5. Classify fused and primitive coverage. If a real gap exists, follow
    `adding-new-kernels.md`, then replay the returned implementation against the
    original references. A CPU layer implementation is a named correctness
