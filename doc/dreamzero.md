@@ -289,3 +289,34 @@ The joint noise shape, native action shape, Python policy/registry names,
 history transaction and separate `reset_history`/`clear_prepared` operations
 remain the public contract. Historical measurements above are tied to their
 recorded source; they do not by themselves validate this revision.
+
+Current-source validation at `59a2a683` on the same Thor2 / SM110 and NVCC
+13.0.88 profile passes all 14 joint-history scenarios and all 28 action/video
+comparisons: relative L2, RMSE and max-absolute error are all exactly zero.
+Every scenario passes exact eager/three-graph parity. Repeated replay, native
+RNG behavior, changed history profiles, window rollover, reset and
+session/episode/task isolation pass. Real device inference followed by injected
+action-download errors or nonfinite host results preserves the committed
+history. Eager/PreferGraph plans and returned outputs retain their resources
+after their original owners are dropped.
+
+The current backend run passes 161 tests (2 ignored); the unchanged convolution
+suite separately passes all 480 candidate checks across 12 dtype/profile
+configurations. All 9 non-ignored DreamZero model contracts pass, along with
+4 CPU family tests, 9 loader tests, 2 shared VLA tests and 18 Python policy tests.
+CUDA-feature model/backend/test and binding type checks, model-family/CUDA
+architecture guards and GitHub CI pass. The native and fresh extension builds
+record source/binary SHA-256 identities; all 157 transferred source files match
+the recorded revision. Evidence is retained under the ignored
+`devlocal/dreamzero-port/architecture-20261030/` directory. These checks do not
+rerun the historical whole-model tuned/restored, component, performance or
+Nsight measurements above.
+
+The fresh PyO3 extension at the same revision passes the registered AutoPolicy
+path from raw cameras/task/state: all 24×32 normalized actions and 24×8 decoded
+robot actions match the official captures with zero error. Leading-batch joint
+noise `[1,113408]` and one warm replay produce exactly identical outputs. The
+actually imported extension path and SHA-256 match the freshly built artifact.
+This public rerun covers raw-input parity, batch-noise canonicalization and
+repeatability; the broader history/RNG/lifecycle coverage above is the native
+acceptance run.
