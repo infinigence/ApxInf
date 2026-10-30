@@ -96,3 +96,37 @@ fn complex_rotary_validates_shape_coefficients_and_partial_aliases() {
         .unwrap();
     assert!(complex_rotary(&ctx, &table, &input, &mut wrong).is_err());
 }
+
+#[test]
+fn complex_rotary_accepts_the_declared_head_grid_limit() {
+    let ctx = CudaContext::new(0).unwrap();
+    let table = ComplexRotaryTable::new(&ctx, 1, 2, &[0., 1.]).unwrap();
+    for heads in [65535, 65536] {
+        let values: Vec<_> = (0..heads).flat_map(|_| [1., 2.]).collect();
+        let host = Tensor::from_bf16(
+            vec![1, heads, 2],
+            &values
+                .into_iter()
+                .map(half::bf16::from_f32)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let input = transfers::to_cuda(&host, 0).unwrap();
+        let mut output = ctx
+            .allocate_output(Shape::new(vec![1, heads, 2]), DType::BF16)
+            .unwrap();
+        let result = complex_rotary(&ctx, &table, &input, &mut output);
+        if heads == 65536 {
+            assert!(result.is_err());
+        } else {
+            result.unwrap();
+            ctx.synchronize().unwrap();
+            assert!(transfers::to_cpu(&output)
+                .unwrap()
+                .to_f32_vec()
+                .unwrap()
+                .chunks_exact(2)
+                .all(|pair| pair == [-2., 1.]));
+        }
+    }
+}

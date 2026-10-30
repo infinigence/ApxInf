@@ -180,6 +180,7 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
   if (spec.semantic != APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE &&
       spec.semantic != APXINF_ROPE_SEMANTIC_PARTIAL_MROPE &&
       spec.semantic != APXINF_ROPE_SEMANTIC_APPLY &&
+      spec.semantic != APXINF_ROPE_SEMANTIC_COMPLEX_TABLE &&
       static_cast<uint64_t>(spec.q_heads) + 2ull * spec.kv_heads > 65535) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid RoPE grid");
   }
@@ -188,6 +189,9 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
       spec.q_heads != spec.kv_heads) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "unrotated QKV split requires q_heads == kv_heads");
+  }
+  if (spec.semantic == APXINF_ROPE_SEMANTIC_COMPLEX_TABLE && spec.q_heads > 65535) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid complex rotary grid");
   }
   if (spec.semantic == APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE &&
       (spec.dtype != APXINF_DTYPE_BF16 || spec.tokens != 1 ||
