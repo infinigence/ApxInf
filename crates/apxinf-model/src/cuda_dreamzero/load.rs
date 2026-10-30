@@ -16,14 +16,6 @@ pub(super) fn load_registered(
     _backend: Arc<dyn Backend>,
     options: &LoadOptions,
 ) -> Result<LoadedModel> {
-    load_with_cuda_new(path, device, options)
-}
-
-pub(crate) fn load_with_cuda_new(
-    path: &Path,
-    device: Device,
-    options: &LoadOptions,
-) -> Result<LoadedModel> {
     let Device::Cuda(index) = device else {
         return Err(Error::UnsupportedDevice(device));
     };

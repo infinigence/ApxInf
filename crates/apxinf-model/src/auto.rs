@@ -407,14 +407,6 @@ impl AutoModel {
             return Err(Error::Other("d3-mini requires CUDA support".into()));
         }
 
-        if matches!(model_name, "dreamzero" | "dreamzero_droid") {
-            #[cfg(feature = "cuda")]
-            return crate::cuda_dreamzero::load::load_with_cuda_new(path, device, options);
-
-            #[cfg(not(feature = "cuda"))]
-            return Err(Error::Other("DreamZero requires CUDA support".into()));
-        }
-
         register_builtin_models();
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
