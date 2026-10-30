@@ -201,6 +201,30 @@ impl DreamZeroModelRunner {
             implicit: RefCell::new(None),
         }
     }
+    fn infer_host_with_download(
+        &self,
+        request: &VlaRequest<'_>,
+        download: impl FnOnce(&Tensor) -> Result<Vec<f32>>,
+    ) -> Result<Vec<f32>> {
+        // Public host inference is transactional through its output transfer
+        // and validation, not merely through the last device launch. History
+        // snapshots own immutable storage, so cloning retains the old episode
+        // without copying or downloading its K/V tensors.
+        let previous = self.session.borrow().clone();
+        let result = (|| {
+            let action = self.infer(request)?;
+            self.model.ctx.synchronize().map_err(Error::Cuda)?;
+            let values = download(action.tensor())?;
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(Error::Other("DreamZero produced nonfinite actions".into()));
+            }
+            Ok(values)
+        })();
+        if result.is_err() {
+            *self.session.borrow_mut() = previous;
+        }
+        result
+    }
 }
 
 pub(super) fn bind(
@@ -380,24 +404,7 @@ impl VlaRuntime for DreamZeroModelRunner {
         }
     }
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
-        // Public host inference is transactional through its output transfer
-        // and validation, not merely through the last device launch. History
-        // snapshots own immutable storage, so cloning retains the old episode
-        // without copying or downloading its K/V tensors.
-        let previous = self.session.borrow().clone();
-        let result = (|| {
-            let action = self.infer(request)?;
-            self.model.ctx.synchronize().map_err(Error::Cuda)?;
-            let values = transfers::to_cpu(action.tensor())?.to_f32_vec()?;
-            if values.iter().any(|value| !value.is_finite()) {
-                return Err(Error::Other("DreamZero produced nonfinite actions".into()));
-            }
-            Ok(values)
-        })();
-        if result.is_err() {
-            *self.session.borrow_mut() = previous;
-        }
-        result
+        self.infer_host_with_download(request, |tensor| transfers::to_cpu(tensor)?.to_f32_vec())
     }
 }
 

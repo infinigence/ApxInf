@@ -71,8 +71,7 @@ fn joint_checkpoint(selection: CheckpointCases) {
         .unwrap(),
     );
     let weights =
-        crate::cuda_dreamzero::weights::Bf16Weights::from_safetensors(&ctx, &checkpoint)
-            .unwrap();
+        crate::cuda_dreamzero::weights::Bf16Weights::from_safetensors(&ctx, &checkpoint).unwrap();
     let model = DreamZeroModel::new(
         ctx,
         weights,
@@ -304,12 +303,12 @@ fn joint_checkpoint(selection: CheckpointCases) {
             "returned action storage outlived plan"
         );
         if name == "initial" && selection == CheckpointCases::Full {
-            // Finite, representable BF16 noise can still overflow the network.
-            // A failed public output must not publish another episode's K/V.
-            let extreme = Tensor::from_f32(vec![NOISE], &vec![1e38; NOISE]).unwrap();
+            // Fail the host-output boundary after real device work. Large but
+            // finite noise need not produce NaNs under every valid backend.
+            // Both download errors and nonfinite host outputs must roll back K/V.
             let failed = VlaRequest::provided_with_metadata(
                 &observation,
-                &extreme,
+                &data["noise"],
                 VlaMetadata {
                     history: Some(HistoryContext {
                         session: "failed-caller",
@@ -326,18 +325,37 @@ fn joint_checkpoint(selection: CheckpointCases) {
                 .key
                 .identity
                 .clone();
-            let error = runner.infer_host_f32(&failed).unwrap_err();
-            assert!(error.to_string().contains("nonfinite actions"), "{error}");
-            assert_eq!(
-                runner.session.borrow().as_ref().unwrap().key.identity,
-                previous
-            );
-            assert_eq!(
-                runner.session.borrow().as_ref().unwrap().key.next_frame,
-                position
-            );
+            for download_error in [false, true] {
+                let error = runner
+                    .infer_host_with_download(&failed, |_| {
+                        if download_error {
+                            Err(apxinf_core::Error::Other(
+                                "injected action download failure".into(),
+                            ))
+                        } else {
+                            Ok(vec![f32::NAN])
+                        }
+                    })
+                    .unwrap_err();
+                let expected = if download_error {
+                    "injected action download failure"
+                } else {
+                    "nonfinite actions"
+                };
+                assert!(error.to_string().contains(expected), "{error}");
+                assert_eq!(
+                    runner.session.borrow().as_ref().unwrap().key.identity,
+                    previous
+                );
+                assert_eq!(
+                    runner.session.borrow().as_ref().unwrap().key.next_frame,
+                    position
+                );
+            }
             runner.clear_prepared().unwrap();
-            eprintln!("nonfinite public output preserves the committed episode");
+            eprintln!(
+                "download errors and nonfinite public outputs preserve the committed episode"
+            );
             for policy in [ExecutionPolicy::Eager, ExecutionPolicy::PreferGraph] {
                 // A separate runner's owner can be dropped while the explicit
                 // plan retains its model, session and graph resources.

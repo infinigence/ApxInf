@@ -149,6 +149,11 @@ therefore not an admitted DreamZero numerical profile. The constrained policy is
 
 ## Qualified device profile
 
+The full qualification and performance figures in this section were collected
+for `4af38ed3`, before the architecture revision and main integration below.
+They establish the historical admitted profile; current-source revalidation is
+reported separately under Architecture revision.
+
 Validation uses NVIDIA Thor (SM110), driver 595.78, CUDA runtime 13.2.86,
 cuBLAS 13.4 and cuDNN 9.20.0, in the existing MAXN power mode. The native CUDA
 code is compiled with NVCC 13.0.88, matching the reference PyTorch build; the
