@@ -357,7 +357,7 @@ Cold observations are limited: baseline first/cached ranges are 50.273–56.078 
 remains enabled; first/cached windows include CPU work and sample GPU 315–1,575
 MHz and EMC 2.75–4.266 GHz. All warm-window samples are 1,575 MHz GPU and 4.266
 GHz EMC. These observations establish neither a serving SLA nor a hardware
-minimum. The canonical streaming comparison below predates preparation-result
+minimum. The first canonical streaming comparison below predates preparation-result
 reuse and measures the separately identified revisions.
 
 A separate canonical-native streaming A→B→B→A comparison exercises the same six
@@ -392,6 +392,35 @@ script, report and exit status are retained. Cleanup was corrected for the
 remaining processes; the program preceding cleanup is byte-identical. Those
 already completed timed calls remain in this comparison, with the exception
 recorded explicitly rather than normalized to a successful process exit.
+
+A second canonical-native streaming A→B→B→A comparison measures preparation-result
+reuse against `0cd880b`, using the same six-case sequence and one warmup plus two
+measured sequences per fresh process. Each variant again has four measured calls
+per scenario; this comparison includes profile preparation and history publication.
+
+| Canonical scenario | Staged affine + direct KV | Preparation-result reuse |
+| --- | ---: | ---: |
+| initial | 48.247 | 26.597 |
+| repeat | 21.733 | 21.735 |
+| history | 48.146 | 25.850 |
+| history2 | 52.818 | 27.988 |
+| history3 | 57.362 | 30.471 |
+| window | 49.026 | 26.888 |
+
+Values are median seconds. All 72 calls, including warmups, have zero normalized
+action relative L2, RMSE and max-absolute error. Profile-changing calls have
+44.9–47.0% lower medians; repeat is effectively unchanged (21.733 versus 21.735 s).
+The explicit and implicit full-checkpoint suites separately qualify future video
+and lifecycle behavior with all 56 action/video metric rows zero. This streaming
+benchmark returns actions; it does not independently revalidate future video.
+
+Default DVFS is retained: measured windows sample GPU 315–1,575 MHz and EMC
+2.75–4.266 GHz for both variants, including CPU preparation. No foreign compute
+PID or observer timeout occurs in the measured-window samples. The first baseline
+warmup history3 call takes 92.614 s and contains two observer timeouts; the
+predeclared warmup exclusion applies to every process. All four processes finish
+successfully. These small-sample observations establish neither a serving SLA nor
+a physical hardware minimum.
 
 Earlier pre-performance runs measured 47.617 s cold and 47.756 s restored public
 medians (5 samples each). The historical official preprocessed BF16-head median
