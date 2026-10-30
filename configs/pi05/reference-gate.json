@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "manifest_sha256": "8555c09ec6c2e4666ea331bb366ec5629116da571c5d1a2611ce1d003ef6d277",
+  "baseline_revision": "8449a97c179e0ce1099e72c544d79210bc57519e",
+  "rounding": "floor cosine to six decimal places; each case and execution mode must pass",
+  "lanes": {
+    "thor/bf16": {
+      "required": true,
+      "eager_graph_max_abs": 0.0,
+      "evidence_sha256": "9b29d532e29e114cdbcebb2115d0a2aba40dcb2b1b5977e2c0dc974207f664cb",
+      "cases": {
+        "gradient-t10-normal-noise": {
+          "min_cosine": 0.999991,
+          "measured_cosine": 0.999991120170907
+        },
+        "gradient-t21-normal-noise": {
+          "min_cosine": 0.999917,
+          "measured_cosine": 0.9999179993792137
+        }
+      }
+    },
+    "thor/fp8_static": {
+      "required": true,
+      "eager_graph_max_abs": 0.0,
+      "evidence_sha256": "410d28e532440f30908dfa565e194260e65d56bfa1d593e53d1b2be9678de8c8",
+      "cases": {
+        "gradient-t10-normal-noise": {
+          "min_cosine": 0.997492,
+          "measured_cosine": 0.9974927554026985
+        },
+        "gradient-t21-normal-noise": {
+          "min_cosine": 0.991482,
+          "measured_cosine": 0.9914828362158845
+        }
+      }
+    },
+    "orin/bf16": {
+      "required": true,
+      "eager_graph_max_abs": 0.0,
+      "evidence_sha256": "71298ab8317d6d305fe26a6fd762e04b11cd3bfeca9d2204ea32771cd3a36b5b",
+      "cases": {
+        "gradient-t10-normal-noise": {
+          "min_cosine": 0.999977,
+          "measured_cosine": 0.9999776225754096
+        },
+        "gradient-t21-normal-noise": {
+          "min_cosine": 0.999917,
+          "measured_cosine": 0.9999176771415982
+        }
+      }
+    },
+    "orin/int8_dynamic": {
+      "required": false,
+      "eager_graph_max_abs": 0.0,
+      "evidence_sha256": "de3238c99ad1fe0d0d05f15bf3231b7511ad2c72b919e87dfa592c5ee6645534",
+      "cases": {
+        "gradient-t10-normal-noise": {
+          "min_cosine": 0.509397,
+          "measured_cosine": 0.5093971725539775
+        },
+        "gradient-t21-normal-noise": {
+          "min_cosine": 0.96947,
+          "measured_cosine": 0.9694704434378854
+        }
+      }
+    }
+  }
+}

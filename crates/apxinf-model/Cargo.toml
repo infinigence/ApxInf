@@ -104,3 +104,6 @@ required-features = ["cuda"]
 [[example]]
 name = "clef_decision_index"
 required-features = ["mlx"]
+
+[dev-dependencies]
+sha2 = "0.10"
