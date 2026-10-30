@@ -299,12 +299,41 @@ OPENBLAS_NUM_THREADS=4 python3 scripts/run_pi05_reference_gate.py \
 ```
 
 Every run builds current source, recomputes its CPU reference, saves source/binary
-identity, explicit generated recipes and numerical reports, then applies the
-policy. Existing output directories are rejected to preserve evidence. The
+identity, a copy and digest of the qualified recipes, and numerical reports, then
+applies the policy. CI uses the tracked board-specific recipe banks with autotuning
+disabled. To qualify a new bank deliberately, supply `--tuning PATH --autotune`;
+use an empty directory to retune every operation. Preserve the resulting recipes
+and rerun without autotuning before promoting them. Existing output directories are rejected to preserve evidence. The
 initial measurements above precede the main-branch CUDA migration merged at
 `9a1dbce7`; the source revision in each new report identifies what was actually
 executed. Synthetic corpus coverage complements, but does not replace, real
 image/state/view coverage or task-success evaluation.
+
+### Post-merge GPU verification (2026-10-30)
+
+Merged production source at `9a1dbce7` with the committed reference-gate example
+was compiled on Thor and Orin. Fresh CPU outputs on both boards are bitwise equal.
+With the [qualified recipes](../crates/apxinf-model/tests/fixtures/pi05_gpu/recipes/README.md),
+all three required paths reproduce their initial per-case cosine measurements:
+
+| Required path | T10 cosine | T21 cosine | Result |
+| --- | ---: | ---: | --- |
+| Thor BF16 | 0.999991120 | 0.999917999 | Pass |
+| Thor FP8 | 0.997492755 | 0.991482836 | Pass |
+| Orin BF16 | 0.999977623 | 0.999917677 | Pass |
+
+Eager/graph max-abs is zero and graph repeats are bitwise equal. A fresh Orin
+autotune initially selected different GEMM tactics and produced cosine
+0.999938083 / 0.999796691, failing the unchanged floors. Holding source, CPU
+reference and inputs fixed, restoring three previously qualified plain-GEMM
+choices reproduced the original results. CI therefore freezes the measured
+recipes instead of timing/selecting algorithms on every run. Recipe qualification
+and performance optimization must continue to satisfy the same cosine floors;
+thresholds were not lowered. The advisory Orin INT8 run reproduces cosine
+0.509397173 / 0.969470443; meeting that regression floor does not imply adequate
+quantized accuracy. Native recipe namespaces include build/library/device
+identity. After changing those dependencies, qualify the bank again: stale recipes
+may miss and fall back, and are not evidence that the intended tactics ran.
 
 ### Recorded numerical validation (2026-10-27)
 
