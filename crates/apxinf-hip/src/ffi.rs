@@ -16,6 +16,10 @@ pub(crate) const NOT_COMPILED: i32 = -1;
 pub(crate) const DTYPE_F32: i32 = 0;
 pub(crate) const DTYPE_BF16: i32 = 1;
 
+/// Mirror of `kNoCkInstance`: a Composable Kernel dispatcher found no
+/// instance for the arguments (wrong device architecture or shape).
+pub(crate) const NO_CK_INSTANCE: i32 = 200_001;
+
 macro_rules! hip_abi {
     ($( fn $name:ident($($arg:ident: $ty:ty),* $(,)?); )*) => {
         #[cfg(apxinf_hip_runtime)]
@@ -276,6 +280,25 @@ hip_abi! {
         v: *mut c_void,
         tokens: i32,
         width: i32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_ck_attention(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        out: *mut c_void,
+        batch: i32,
+        q_tokens: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        kv_tokens: i32,
+        kv_batch_stride: i64,
+        kv_token_stride: i64,
+        num_splits: i32,
+        lse_acc: *mut c_void,
+        o_acc: *mut c_void,
+        scale: f32,
         stream: *mut c_void,
     );
     fn apxinf_hip_native_attention(

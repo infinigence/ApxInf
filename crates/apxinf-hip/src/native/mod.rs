@@ -29,7 +29,9 @@ use std::sync::Arc;
 use apxinf_core::{DType, Error, NormalGenerator, Result, Tensor};
 
 pub use arena::HipArena;
-pub use attention::{attention, AttentionGeometry};
+pub use attention::{
+    attention, attention_kernel, attention_scratch_elements, AttentionGeometry, AttentionKernel,
+};
 pub use elementwise::{
     add_position, bias_activation, copy_rows, embedding, euler_update, geglu, rgb_to_patches,
     split_qkv_bias, split_qkv_rope, Activation, HipDeviceBytes, ImageLayout, QkvRope,

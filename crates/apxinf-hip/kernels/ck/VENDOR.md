@@ -5,8 +5,8 @@ runs on gfx1151. This directory holds only upstream material: headers copied
 byte for byte and the output of CK's own code generator. The apxinf-owned C
 ABI wrapper that marshals apxinf's tensors into CK's arguments belongs outside
 this directory (`../ck_attention.hip`), and choosing between CK and apxinf's own
-kernel belongs to `apxinf_hip::native::attention`. Until those land, nothing
-compiles this directory.
+kernel belongs to `apxinf_hip::native::attention`. `build.rs` compiles every
+file in `generated/` plus the wrapper, with the flags below.
 
 ## Source
 
