@@ -288,8 +288,44 @@ cudaError_t launch(const apxinf_pointwise_spec_t& spec,
     case APXINF_POINTWISE_SEMANTIC_EXP:
     case APXINF_POINTWISE_SEMANTIC_SIN:
     case APXINF_POINTWISE_SEMANTIC_COS:
-      kernels::binary_scalar<T><<<grid, kDirectThreads, 0, stream>>>(
-          input, secondary, output, count, cols, static_cast<int>(spec.semantic), bindings.dt);
+      {
+        constexpr int unit=16/sizeof(T);
+        const bool broadcast=spec.semantic==APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD ||
+            spec.semantic==APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY ||
+            spec.semantic==APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY;
+        const bool vector_secondary=spec.semantic<=APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY;
+        const bool aligned=reinterpret_cast<uintptr_t>(input)%16==0 &&
+            reinterpret_cast<uintptr_t>(output)%16==0 &&
+            (!vector_secondary || reinterpret_cast<uintptr_t>(secondary)%16==0);
+        const bool vectorized=count>=8192 && count%unit==0 && count/unit<=INT_MAX &&
+            (!broadcast || cols%unit==0) && aligned;
+        if (vectorized) {
+          const int groups=static_cast<int>(count/unit);
+          const int blocks=blocks_for(groups);
+          const cutlass::FastDivmod divisor(broadcast?cols/unit:1);
+#define APXINF_BINARY_VECTOR_CASE(S) case S: \
+          kernels::binary_vector<T,S><<<blocks,kDirectThreads,0,stream>>>( \
+              input,secondary,output,groups,divisor,bindings.dt); break
+          switch(spec.semantic) {
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_ADD);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SUBTRACT);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_MULTIPLY);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SCALE);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SCALAR_ADD);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SCALAR_DIVIDE);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_EXP);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SIN);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_COS);
+          }
+#undef APXINF_BINARY_VECTOR_CASE
+        } else {
+          kernels::binary_scalar<T><<<grid,kDirectThreads,0,stream>>>(
+              input,secondary,output,count,cols,static_cast<int>(spec.semantic),bindings.dt);
+        }
+      }
       break;
     default:
       return cudaErrorInvalidValue;

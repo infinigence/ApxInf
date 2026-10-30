@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <cutlass/fast_math.h>
 #include "../../include/apxinf_cuda/gather_types.h"
 
 namespace apxinf::gather::kernels {
@@ -156,6 +157,69 @@ __global__ void permute(const T* input,T* output,apxinf_gather_spec_t spec) {
       residual/=spec.layout_shape[axis];
     }
     output[i]=input[source];
+  }
+}
+
+// Copy in scalar or aligned 16-byte units. Host-precomputed exact integer
+// dividers avoid per-element runtime 64-bit division; no floating arithmetic
+// or convolution accumulation order changes. The launcher proves the index
+// domain first and retains the general 64-bit kernel for larger geometry.
+struct UnfoldIndex32 {
+  int count, start, channels, shape[5], stride[3], padding[3], dilation[3], block;
+  cutlass::FastDivmod cols, block_div, taps, taps_block, kernel[3], spatial[3];
+
+  explicit UnfoldIndex32(const apxinf_gather_spec_t& s, int unit)
+      : count(s.rows*s.cols/unit), start(s.row_start),
+        channels(s.layout_shape[4]/unit),
+        block((s.channel_block ? s.channel_block
+               : s.cols/(s.kernel[0]*s.kernel[1]*s.kernel[2]))/unit),
+        cols(s.cols/unit), block_div(block),
+        taps(s.kernel[0]*s.kernel[1]*s.kernel[2]), taps_block(taps.divisor*block) {
+    for (int a=0; a<5; ++a) shape[a]=s.layout_shape[a];
+    for (int a=0; a<3; ++a) {
+      stride[a]=s.stride[a];
+      padding[a]=s.padding[a];
+      dilation[a]=s.dilation[a];
+      kernel[a]=cutlass::FastDivmod(s.kernel[a]);
+      spatial[a]=cutlass::FastDivmod(s.output_spatial[a]);
+    }
+  }
+};
+
+template<class V>
+__global__ void unfold3d_index32(const V* input, V* output, UnfoldIndex32 g) {
+  // Unsigned iteration also keeps the last grid-stride increment defined when
+  // the proven count is close to INT_MAX.
+  for (uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+       i<static_cast<uint32_t>(g.count); i+=gridDim.x*blockDim.x) {
+    int row, col;
+    g.cols(row,col,i);
+    row+=g.start;
+    int group, ignored, lane;
+    g.taps_block(group,ignored,col);
+    g.block_div(ignored,lane,col);
+    const int channel=group*g.block+lane;
+    int tap;
+    g.taps(ignored,tap,g.block_div.div(col));
+    int coord[3];
+    #pragma unroll
+    for (int a=2; a>=0; --a) {
+      int kernel_offset, center;
+      g.kernel[a](tap,kernel_offset,tap);
+      g.spatial[a](row,center,row);
+      coord[a]=center*g.stride[a]-g.padding[a]+kernel_offset*g.dilation[a];
+    }
+    bool inside=channel<g.channels;
+    #pragma unroll
+    for (int a=0; a<3; ++a)
+      inside &= coord[a]>=0 && coord[a]<g.shape[a+1];
+    if (inside) {
+      const int64_t offset=(((int64_t(row)*g.shape[1]+coord[0])*g.shape[2]
+          +coord[1])*g.shape[3]+coord[2])*g.channels+channel;
+      output[i]=input[offset];
+    } else {
+      output[i]=V{};
+    }
   }
 }
 

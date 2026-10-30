@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cutlass/fast_math.h>
 
 namespace apxinf::pointwise::kernels {
 
@@ -125,6 +126,57 @@ __global__ void bias_activation(const T* input, const T* bias, T* output,
       output[index] = from_float<T>(activation == kActivationGeluRounded
           ? gelu_rounded<T>(rounded<T>(value)) : apply_activation(value, activation));
     }
+  }
+}
+
+// Aligned vector transport; every lane retains the scalar F32 operation and
+// output rounding. No half2 arithmetic or fused multiply-add is introduced.
+template<class T>
+union BinaryVectorPack {
+  uint4 bits;
+  T lane[16/sizeof(T)];
+};
+
+template<int Semantic>
+__device__ float binary_vector_value(float x, float y, float scalar) {
+  if constexpr (Semantic==12) return __fmul_rn(x,scalar);
+  else if constexpr (Semantic==13) return __fadd_rn(x,scalar);
+  else if constexpr (Semantic==14) return __fdiv_rn(x,scalar);
+  else if constexpr (Semantic==15) return expf(x);
+  else if constexpr (Semantic==16) return sinf(x);
+  else if constexpr (Semantic==17) return cosf(x);
+  else if constexpr (Semantic==6 || Semantic==9) return __fadd_rn(x,y);
+  else if constexpr (Semantic==7) return __fsub_rn(x,y);
+  else return __fmul_rn(x,y);
+}
+
+template<class T, int Semantic>
+__global__ void binary_vector(const T* input, const T* secondary, T* output,
+                              int count, cutlass::FastDivmod columns, float scalar) {
+  constexpr int unit=16/sizeof(T);
+  for (uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+       i<static_cast<uint32_t>(count); i+=gridDim.x*blockDim.x) {
+    BinaryVectorPack<T> x, y, result;
+    x.bits=reinterpret_cast<const uint4*>(input)[i];
+    float row_value=0;
+    if constexpr (Semantic<=10) {
+      int j=i;
+      if constexpr (Semantic==9 || Semantic==10) {
+        int ignored;
+        columns(ignored,j,i);
+      }
+      y.bits=reinterpret_cast<const uint4*>(secondary)[j];
+    }
+    if constexpr (Semantic==11) row_value=to_float(secondary[columns.div(i)]);
+    #pragma unroll
+    for (int lane=0; lane<unit; ++lane) {
+      float rhs=0;
+      if constexpr (Semantic<=10) rhs=to_float(y.lane[lane]);
+      else if constexpr (Semantic==11) rhs=row_value;
+      result.lane[lane]=from_float<T>(
+          binary_vector_value<Semantic>(to_float(x.lane[lane]),rhs,scalar));
+    }
+    reinterpret_cast<uint4*>(output)[i]=result.bits;
   }
 }
 

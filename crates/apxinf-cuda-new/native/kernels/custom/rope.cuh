@@ -248,4 +248,62 @@ __global__ void complex_table(const T* input, const double* coefficients,
   }
 }
 
+__device__ inline unsigned short complex_bits(__half value) {
+  return __half_as_ushort(value);
+}
+__device__ inline unsigned short complex_bits(__nv_bfloat16 value) {
+  return __bfloat16_as_ushort(value);
+}
+
+__device__ inline float2 complex_product_bounds(float a, float lo, float hi) {
+  return a >= 0 ? make_float2(__fmul_rd(a, lo), __fmul_ru(a, hi))
+                : make_float2(__fmul_rd(a, hi), __fmul_ru(a, lo));
+}
+
+// Launch 256 threads: four heads share the 64 coefficient pairs. This translation
+// unit is compiled with FTZ disabled so directed FP32 operations enclose subnormals.
+template <class T>
+__global__ void complex_table_certified_128(const T* input,
+                                           const double* coefficients,
+                                           T* output, int heads) {
+  __shared__ float4 bounds[64];
+  const int token = blockIdx.x, lane = threadIdx.x;
+  const int pair = lane % 64, head = blockIdx.y * 4 + lane / 64;
+  const int64_t coeff = static_cast<int64_t>(token) * 128 + 2 * pair;
+  if (lane < 64) {
+    const double c = coefficients[coeff], s = coefficients[coeff + 1];
+    bounds[pair] = make_float4(__double2float_rd(c), __double2float_ru(c),
+                              __double2float_rd(s), __double2float_ru(s));
+  }
+  __syncthreads();
+  if (head >= heads) return;
+  const int64_t offset = (static_cast<int64_t>(token) * heads + head) * 128 + 2 * pair;
+  const float a = to_float(input[offset]), b = to_float(input[offset + 1]);
+  const float4 cs = bounds[pair];
+  const float2 ac = complex_product_bounds(a, cs.x, cs.y);
+  const float2 bs = complex_product_bounds(b, cs.z, cs.w);
+  const float2 as = complex_product_bounds(a, cs.z, cs.w);
+  const float2 bc = complex_product_bounds(b, cs.x, cs.y);
+  const float rl = __fsub_rd(ac.x, bs.y), rh = __fsub_ru(ac.y, bs.x);
+  const float il = __fadd_rd(as.x, bc.x), ih = __fadd_ru(as.y, bc.y);
+  T real = from_float<T>(rl), imag = from_float<T>(il);
+  // Each directed FP32 interval also encloses the separately rounded FP64
+  // product/sum: its endpoints are exact FP64 values and RN64 is monotone.
+  // RN16(RN32(x)) is monotone too. Equal endpoint encodings therefore certify
+  // the reference bits. Exclude zeros/nonfinite values to preserve sign and NaNs.
+  const bool certified =
+      isfinite(rl) && isfinite(rh) && isfinite(il) && isfinite(ih) &&
+      isfinite(to_float(real)) && isfinite(to_float(imag)) &&
+      to_float(real) != 0 && to_float(imag) != 0 &&
+      complex_bits(real) == complex_bits(from_float<T>(rh)) &&
+      complex_bits(imag) == complex_bits(from_float<T>(ih));
+  if (!certified) {
+    const double c = coefficients[coeff], s = coefficients[coeff + 1];
+    real = from_double<T>(__dsub_rn(__dmul_rn(double(a), c), __dmul_rn(double(b), s)));
+    imag = from_double<T>(__dadd_rn(__dmul_rn(double(a), s), __dmul_rn(double(b), c)));
+  }
+  output[offset] = real;
+  output[offset + 1] = imag;
+}
+
 }  // namespace apxinf::rope::kernels

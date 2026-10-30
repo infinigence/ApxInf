@@ -1266,6 +1266,12 @@ mod dit_block {
         history_v: Option<&Tensor>,
         observed_cache: Option<(&Tensor, &Tensor)>,
     ) -> Result<()> {
+        // Tune bulk transformer projections independently of the qualified
+        // encoder and output-head reduction orders. Preparation owns tuning;
+        // replay uses the retained executions and the same numerical contract.
+        let mut block_policies = p.clone();
+        block_policies.gemm.algorithm = ops::GemmAlgorithmPolicy::Any;
+        let p = &block_policies;
         if text.shape().dims() != [512, DIM]
             || image.shape().dims() != [257, DIM]
             || observed_cache.is_some_and(|(k, v)| {

@@ -169,7 +169,10 @@ caching and unwraps two UniPC compile decorators for an eager BF16 baseline. An
 allocation adapter skips redundant base-Wan loading and assigns every tensor
 from the complete checkpoint. These differences are part of the qualified scope.
 
-| Validation | Result |
+The following table retains the pre-performance integration evidence. The
+2026-10-30 performance revision has separate, current acceptance below.
+
+| Validation | Pre-performance integration result |
 | --- | --- |
 | Full cold, tuned and fresh-process restored model | Each passes 14 scenarios and 28 action/video metrics, all finite with relative L2, RMSE and max-absolute error 0 |
 | Final-binary components | 9 tests and 122 unique encoder, VAE, DiT and sampler checkpoints, all numerical errors 0 |
@@ -182,8 +185,8 @@ future-video relative L2 0.02, full CLIP/UMT5 encoder relative L2 0.01, and isol
 learned-block relative L2 0.005. Eager/captured parity is exact. The full runs used
 a frozen binary whose test-only video predicate was temporarily 0.04; every raw
 metric was independently re-evaluated against the original 0.02 gate and the
-stronger zero-error predicate before restoring 0.02 in the maintained test. Only
-that test predicate/comment and this documentation changed after qualification;
+stronger zero-error predicate before restoring 0.02 in the maintained test. For that pre-performance qualification, only
+that test predicate/comment and its documentation changed afterward;
 the executed source/binary identities and earlier failures remain preserved.
 
 The 14 scenarios cover initial/repeat, three successive history observations,
@@ -193,35 +196,78 @@ separate session. Fixed joint noise establishes reference/native agreement;
 separate perturbations demonstrate cross-modal influence. Inputs are synthetic
 camera/state/task fixtures, not evidence of closed-loop robot task success.
 
+## Performance revision acceptance (2026-10-30)
+
+The optimized native build preserves standard BF16 joint future-video/action
+inference with 16 evaluations per CFG branch. Its full real-checkpoint test
+passes all 14 scenarios and 28 action/video metrics with relative L2, RMSE and
+max-absolute error zero, using the maintained gates directly. History rollover,
+request rebinding, graph ownership, RNG and failed-call rollback checks pass.
+The CUDA backend suite passes 163 tests (2 ignored; the unchanged long
+convolution-candidate test is filtered); all 9 family contract tests pass.
+These are results for the frozen performance build, rather than a new run of
+the historical 122 component checkpoints above.
+
+The changes use exact indexed/vector transport for unfold and pointwise, plus
+certified FP32 intervals with the original FP64 fallback for complex rotation.
+Bulk DiT block projections may tune within deterministic `StagedBias` and the
+1 MiB workspace limit. Encoders, context/timestep projections and output heads
+retain `ColdBaseline`. Algorithm selection is qualified for the recorded Thor,
+CUDA and library build; deterministic execution alone does not promise identical
+arithmetic across every future library tactic.
+
+A fresh process restores the optimized public profile without online tuning:
+47 disk-recipe and 1,431 memory-recipe preparation summaries are recorded, and
+public outputs remain exact. Its full-process CUDA/NVTX trace passes the same
+strict process, event-loss, transfer and three-graph audit described below.
+
 ## Measured performance and residency
 
-Uninstrumented wall times on the qualified device, in seconds:
+Uninstrumented public-boundary A/B results on Thor in MAXN, in seconds. Four
+fresh processes run in A→B→B→A order with three warm samples each. Both paths use
+the same raw-input script, fixed joint noise and numerical checks; online tuning
+is disabled and the optimized path restores its previously qualified recipes.
 
-| Path | Load | First prepare/infer | Warm median | Warm p95 | Warm samples |
+| Path | Median load | Median first prepare/infer | Warm median | Warm p95 | Warm samples |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Native AutoPolicy, cold recipes | 38.664 | 109.011 | 47.617 | 47.623 | 5 |
-| Native AutoPolicy, fresh process with recipes | 32.041 | 109.060 | 47.756 | 47.772 | 5 |
-| Official preprocessed BF16 head | 22.446 | 40.542 | 39.875 | 39.893 | 5 |
+| Native baseline, before performance changes | 37.448 | 107.525 | 47.541 | 47.577 | 6 |
+| Native optimized, restored recipes | 34.869 | 65.164 | 24.975 | 25.179 | 6 |
+
+The matched warm speedup is 1.904×, a 47.5% latency reduction. Every
+process returns exact normalized and robot actions, including exact replay and
+leading-batch noise checks. GPU frequency samples inside the measured calls are
+1,575 MHz for both paths. Default memory DVFS is retained: baseline EMC samples
+range from 3.2 to 4.266 GHz; optimized samples stay at 4.266 GHz. These are stock
+MAXN end-to-end results, rather than an experiment that locks both memory clocks.
+
+Earlier pre-performance runs measured 47.617 s cold and 47.756 s restored public
+medians (5 samples each). The historical official preprocessed BF16-head median
+is 39.875 s (5 samples); it has a different API boundary and experiment context.
 
 Load and first inference are separate intervals. Processes are fresh, but OS file
 caches were retained. Native timings include raw camera preprocessing/tokenizing,
 input upload and returned robot actions. Reference timings begin with preprocessed
 BF16 head inputs and include upload through action download; the joint video path
-is computed in both. These are different API boundaries, so this is not a speedup
-claim. The small-sample p95 is empirical interpolation, not a serving SLA. Profiler
-runs are excluded. No other compute PID was observed in the approximately
-two-second whole-process samples; this does not exclude shorter activity or the
+is computed in both. The native/reference figures have different API boundaries; the speedup above
+compares only the two matched native public paths. The small-sample p95 is
+empirical interpolation, not a serving SLA. Profiler runs are excluded. No other
+compute PID was observed in the approximately one-second A/B samples; this does not exclude shorter activity or the
 existing graphics desktop.
 
-Nsight's complete-process allocation trace records a Device allocation high-water
+The pre-performance complete-process allocation trace records a Device
+allocation high-water
 of 79,935,015,722 bytes (74.45 GiB), with Device Static and Pinned categories
 reported separately. This is not total physical memory or driver overhead.
+That allocation high-water has not been remeasured for the optimized build.
 Reference PyTorch peaks are 53,079,793,664 allocated bytes (49.43 GiB) and
 56,358,862,848 reserved bytes (52.49 GiB); allocator statistics are not equivalent
 to native traced allocation usage. System `MemAvailable` is tracked separately
 for run admission/protection and is not a process memory measurement.
 
-The complete-process CUDA/NVTX trace contains one marked warm public request:
+The optimized complete-process CUDA/NVTX trace contains one synchronized warm
+public request lasting 25.182 s. Summed kernel durations are 12.974 s GEMM,
+3.666 s attention, 2.920 s pointwise, 1.975 s normalization, 1.394 s unfold and
+0.922 s complex rotation. It contains
 three graph launches and 83,802 GPU kernels, nine declared H2D uploads totaling
 1,586,816 bytes before computation, and one 1,536-byte action download afterward.
 All recorded kernels, copies and memsets associated with that request are inside
@@ -238,10 +284,14 @@ managed allocation API or managed allocation event was recorded, but physical
 page migration, page faults and mapped-host accesses were not measured. Explicit
 CUDA copies and allocation events do not establish total physical memory traffic.
 
-Performance status is **best effort with remaining debt**. The exact native path
-is slower at the measured public boundary and has a larger allocation high-water
-than the reference allocator reports. Its constrained GEMM domain deliberately
-excludes faster alternative reduction orders that failed complete trajectories.
+Performance status is **best effort with remaining debt**. The optimized path
+is about 1.90× faster than the matched original native public path. A physical
+DRAM-counter roofline and a complete-model hardware minimum have not been
+established; the earlier optimistic DiT-only arithmetic floor is not an achieved
+whole-model latency. The historical native/reference allocation figures use
+different accounting and do not establish current optimized residency. Encoder
+and output-head reduction orders remain constrained after earlier complete-model
+failures; only the qualified bulk DiT domain is open to tuning.
 Streaming history changes require new preparation, and transactional observed-K/V
 snapshots allocate/copy outside the captured graphs. Warm standalone T=1 replay
 is not streaming latency or allocation-free replay.
@@ -254,8 +304,10 @@ is loaded only when queried, so other families do not gain a mandatory runtime
 dependency. DreamZero uses deterministic FP32-reduction convolution plans within
 a caller-owned 256 MiB workspace for the RGB stem and four temporal convolutions.
 Biased projections use a 1 MiB cuBLASLt bound and FP32 accumulation, including
-FP32 split-K partial reduction before one BF16 output conversion. The explicit
-`ColdBaseline` policy, not the workspace bound alone, constrains the algorithm.
+FP32 split-K partial reduction before one BF16 output conversion. The family-default
+`ColdBaseline` policy anchors encoders and output heads. Bulk DiT block
+projections explicitly select `Any` while preserving `StagedBias`, determinism
+and the 1 MiB bound; a workspace limit alone does not specify a reduction order.
 
 VAE spatial attention uses native memory-efficient CUTLASS at head width 384.
 Pinned upstream dependency headers, license and provenance are retained under

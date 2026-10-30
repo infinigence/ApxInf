@@ -254,8 +254,13 @@ the input/output allocations.
 | `Scale`, `ScalarAdd` | x `[rows,cols]`, scalar `dt` | `x*dt`, `x+dt` |
 | `ScalarDivide` | x `[rows,cols]`, finite nonzero scalar `dt` | FP32 division `x/dt`, then dtype cast |
 
+Aligned sufficiently large binary, broadcast, scalar and transcendental inputs
+use 16-byte vector transport with the same scalar FP32 operations and output
+rounding in every lane. Incompatible alignment, row widths or index ranges retain
+the scalar path; no half2 arithmetic or intermediate rounding change is implied.
+
 `BiasActivation` supports None, tanh GELU, exact erf GELU, SiLU, ReLU and
-`GeluRounded`, and `SwishRounded`. None without a bias is rejected. ReLU preserves NaNs.
+`GeluRounded`, and `SwishRounded`. None without a bias is rejected. ReLU follows `fmax(x,0)`, including NaN → 0.
 `SwishRounded` rounds the sigmoid tensor to the input dtype before multiplication;
 it is distinct from fused SiLU. Optional bias is rounded before this activation.
 `GeluRounded` materializes the cubic power, its coefficient multiplication,
@@ -287,6 +292,11 @@ normalization and output geometry.
 `[tokens,head_dim/2,2]` outside capture. `complex_rotary` rotates adjacent pairs
 in F16/BF16 `[tokens,heads,head_dim]` using FP64 separate multiply/add operations,
 then casts through FP32 to the output dtype, matching Torch's complex cast.
+For head_dim 128 and at least four heads, directed FP32 intervals certify the
+same output bits when both endpoint conversions agree. Zero, nonfinite and
+ambiguous results use the original separate FP64 operations. This specialization
+shares coefficients across four heads and requires FTZ disabled, which the
+adapter's build flags enforce; it does not change the rounding contract.
 Input and output may be exactly identical; partial overlap is rejected.
 The direct launch retains the coefficient table and activation allocations in
 captured graphs. It has no tuning or workspace. Torch CUDA fixtures cover both
@@ -351,6 +361,11 @@ capture retains input/output storage. Device parity and graph tests are required
 
 <!-- l3-operator:unfold3d -->
 ### `unfold3d`
+
+The native implementation uses exact precomputed 32-bit index division when
+its geometry is proven to fit, with aligned 16-byte copies for compatible
+channel layouts. Other geometry keeps the general 64-bit indexing path. Both
+paths copy the same tensor bits and preserve padding and blocked-channel order.
 
 Extracts zero-padded convolution windows from NTHWC F32/F16/BF16 input into a
 matrix whose columns flatten kernel-time/kernel-height/kernel-width/channel.

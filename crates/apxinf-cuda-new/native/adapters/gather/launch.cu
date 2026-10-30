@@ -192,6 +192,22 @@ int blocks_for(int64_t count) {
   return static_cast<int>(blocks < kMaxBlocks ? blocks : kMaxBlocks);
 }
 
+// All divmod dividends and coordinate arithmetic must fit signed 32-bit.
+// Tensor addresses remain 64-bit. Large/unaligned geometries retain coverage.
+bool unfold_index32_supported(const apxinf_gather_spec_t& s, int unit) {
+  if (s.rows > INT_MAX || s.row_start > INT_MAX-s.rows ||
+      s.cols/unit > INT_MAX || s.rows > INT_MAX/(s.cols/unit)) return false;
+  for (int a=0;a<5;++a) if (s.layout_shape[a]>INT_MAX) return false;
+  for (int a=0;a<3;++a) {
+    if (s.kernel[a]>INT_MAX || s.output_spatial[a]>INT_MAX ||
+        s.stride[a]>INT_MAX || s.padding[a]>INT_MAX || s.dilation[a]>INT_MAX)
+      return false;
+    if ((s.output_spatial[a]-1)*s.stride[a]+(s.kernel[a]-1)*s.dilation[a]>INT_MAX)
+      return false;
+  }
+  return true;
+}
+
 template <class T>
 cudaError_t launch(const apxinf_gather_spec_t& spec,
                    const apxinf_gather_bindings_t& bindings) {
@@ -253,7 +269,32 @@ cudaError_t launch(const apxinf_gather_spec_t& spec,
       kernels::permute<T><<<grid,kThreads,0,stream>>>(input,output,spec);
       break;
     case APXINF_GATHER_SEMANTIC_UNFOLD3D:
-      kernels::unfold3d<T><<<grid,kThreads,0,stream>>>(input,output,spec);
+      {
+        constexpr int vector_elements = 16/sizeof(T);
+        const int64_t taps=spec.kernel[0]*spec.kernel[1]*spec.kernel[2];
+        const int64_t block=spec.channel_block?spec.channel_block:spec.cols/taps;
+        const bool vectorized=spec.layout_shape[4]%vector_elements==0 &&
+            block%vector_elements==0 &&
+            reinterpret_cast<uintptr_t>(input)%16==0 &&
+            reinterpret_cast<uintptr_t>(output)%16==0;
+        const int unit=vectorized?vector_elements:1;
+        if (unfold_index32_supported(spec,unit)) {
+          kernels::UnfoldIndex32 index(spec,unit);
+          const int fast_grid=blocks_for(index.count);
+          if (vectorized) {
+            kernels::unfold3d_index32<uint4><<<fast_grid,kThreads,0,stream>>>(
+                reinterpret_cast<const uint4*>(input),reinterpret_cast<uint4*>(output),index);
+          } else if constexpr (sizeof(T)==4) {
+            kernels::unfold3d_index32<uint32_t><<<fast_grid,kThreads,0,stream>>>(
+                reinterpret_cast<const uint32_t*>(input),reinterpret_cast<uint32_t*>(output),index);
+          } else {
+            kernels::unfold3d_index32<uint16_t><<<fast_grid,kThreads,0,stream>>>(
+                reinterpret_cast<const uint16_t*>(input),reinterpret_cast<uint16_t*>(output),index);
+          }
+        } else {
+          kernels::unfold3d<T><<<grid,kThreads,0,stream>>>(input,output,spec);
+        }
+      }
       break;
     case APXINF_GATHER_SEMANTIC_RESIZE_BICUBIC:
       kernels::resize_bicubic<T><<<grid,kThreads,0,stream>>>(input,output,spec);

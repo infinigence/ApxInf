@@ -411,6 +411,14 @@ cudaError_t launch_split(const apxinf_rope_spec_t& spec,
 
   switch (spec.semantic) {
     case APXINF_ROPE_SEMANTIC_COMPLEX_TABLE:
+      if (head_dim == 128 && q_heads >= 4) {
+        kernels::complex_table_certified_128<T>
+            <<<dim3(tokens, (q_heads + 3) / 4), 256, 0, stream>>>(
+                static_cast<const T*>(bindings.qkv),
+                static_cast<const double*>(bindings.bias),
+                static_cast<T*>(bindings.q), q_heads);
+        break;
+      }
       kernels::complex_table<T><<<dim3(tokens,q_heads),128,0,stream>>>(
           static_cast<const T*>(bindings.qkv), static_cast<const double*>(bindings.bias),
           static_cast<T*>(bindings.q), q_heads,head_dim);

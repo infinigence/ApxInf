@@ -674,6 +674,16 @@ fn main() {
             .args(["--compiler-options", "-fPIC", "-O3", "-std=c++17"])
             .arg(format!("-I{}", native.join("include").display()))
             .arg(format!("-I{}", out.display()));
+        if source == adapters.join("gather/launch.cu")
+            || source == adapters.join("pointwise/launch.cu")
+        {
+            command.arg(format!("-I{}", cutlass_root.join("include").display()));
+        }
+        if source == adapters.join("rope/launch.cu") {
+            // The certified complex rotation uses directed FP32 intervals,
+            // including subnormals, to preserve the separate FP64 result.
+            command.arg("--ftz=false");
+        }
         // The build IDs fold a whole-tree fingerprint, so they change on any
         // kernel edit. Only the two tuning-key translation units read them;
         // putting them on every command line would invalidate the whole object

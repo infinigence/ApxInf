@@ -149,34 +149,39 @@ fn pointwise_broadcast_rejects_wrong_shape_alias_and_nonfinite_scalar() {
 #[test]
 fn pointwise_graph_rebinds_values_and_retains_dropped_inputs() {
     let ctx = CudaContext::new(0).unwrap();
-    let x = upload(vec![2, 3], &[1., 2., 3., 4., 5., 6.], DType::BF16);
-    let y = upload(vec![1, 3], &[2., -1., 0.5], DType::BF16);
-    let mut output = upload(vec![2, 3], &[0.; 6], DType::BF16);
-    let invoke = |out: &mut Tensor| {
-        let mut args = PointwiseArgs::new(PointwiseSemantic::BroadcastMultiply, &x, out);
-        args.secondary = Some(&y);
-        pointwise(&ctx, args)
-    };
-    invoke(&mut output).unwrap();
-    let graph = capture(&ctx, || invoke(&mut output)).unwrap();
-    let x_buffer = CudaBuffer::from_tensor(&x).unwrap();
-    let data = [bf16::from_f32(8.); 6];
-    let bytes: Vec<_> = data
-        .iter()
-        .flat_map(|v| v.to_bits().to_ne_bytes())
-        .collect();
-    ctx.synchronize().unwrap();
-    x_buffer.copy_from_host(&bytes).unwrap();
-    drop(x_buffer);
-    drop(x);
-    drop(y);
-    for _ in 0..3 {
-        graph.replay().unwrap();
+    for cols in [3, 5120] {
+        let input: Vec<_> = (0..2 * cols).map(|i| (i % 6 + 1) as f32).collect();
+        let bias: Vec<_> = (0..cols).map(|i| [2., -1., 0.5][i % 3]).collect();
+        let x = upload(vec![2, cols], &input, DType::BF16);
+        let y = upload(vec![1, cols], &bias, DType::BF16);
+        let mut output = upload(vec![2, cols], &vec![0.; 2 * cols], DType::BF16);
+        let invoke = |out: &mut Tensor| {
+            let mut args = PointwiseArgs::new(PointwiseSemantic::BroadcastMultiply, &x, out);
+            args.secondary = Some(&y);
+            pointwise(&ctx, args)
+        };
+        invoke(&mut output).unwrap();
+        let graph = capture(&ctx, || invoke(&mut output)).unwrap();
+        let x_buffer = CudaBuffer::from_tensor(&x).unwrap();
+        let data = vec![bf16::from_f32(8.); 2 * cols];
+        let bytes: Vec<_> = data
+            .iter()
+            .flat_map(|v| v.to_bits().to_ne_bytes())
+            .collect();
         ctx.synchronize().unwrap();
-        assert_eq!(
-            transfers::to_cpu(&output).unwrap().to_f32_vec().unwrap(),
-            vec![16., -8., 4., 16., -8., 4.]
-        );
+        x_buffer.copy_from_host(&bytes).unwrap();
+        drop(x_buffer);
+        drop(x);
+        drop(y);
+        let expected: Vec<_> = (0..2 * cols).map(|i| 8. * bias[i % cols]).collect();
+        for _ in 0..3 {
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                transfers::to_cpu(&output).unwrap().to_f32_vec().unwrap(),
+                expected
+            );
+        }
     }
 }
 
@@ -585,57 +590,60 @@ fn l2_f32_preserves_promoted_precision_and_replays() {
 #[test]
 fn pointwise_transcendentals_match_f64_and_replay_after_owner_drop() {
     let ctx = CudaContext::new(0).unwrap();
-    let values = [-8., -3.125, -0.5, 0., 0.125, 1.25, 8.];
-    for dtype in [DType::F32, DType::F16, DType::BF16] {
-        for semantic in [
-            PointwiseSemantic::Exp,
-            PointwiseSemantic::Sin,
-            PointwiseSemantic::Cos,
-        ] {
-            let input = upload(vec![1, values.len()], &values, dtype);
-            let mut output = upload(vec![1, values.len()], &[0.; 7], dtype);
-            let check = |output: &Tensor, source: &[f32]| {
-                ctx.synchronize().unwrap();
-                let actual = transfers::to_cpu(output).unwrap().to_f32_vec().unwrap();
-                for (&actual, &x) in actual.iter().zip(source) {
-                    let x = f64::from(x);
-                    let expected = rounded(
-                        match semantic {
-                            PointwiseSemantic::Exp => x.exp(),
-                            PointwiseSemantic::Sin => x.sin(),
-                            PointwiseSemantic::Cos => x.cos(),
-                            _ => unreachable!(),
-                        },
-                        dtype,
-                    );
-                    let tolerance = if dtype == DType::F32 {
-                        2e-6 * expected.abs().max(1.)
-                    } else {
-                        0.
-                    };
-                    assert!(
-                        (actual - expected).abs() <= tolerance,
-                        "{semantic:?} {dtype:?}: {actual} != {expected}"
-                    );
+    let pattern = [-8., -3.125, -0.5, 0., 0.125, 1.25, 8.];
+    for count in [7, 10240] {
+        let values: Vec<_> = (0..count).map(|i| pattern[i % pattern.len()]).collect();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for semantic in [
+                PointwiseSemantic::Exp,
+                PointwiseSemantic::Sin,
+                PointwiseSemantic::Cos,
+            ] {
+                let input = upload(vec![1, values.len()], &values, dtype);
+                let mut output = upload(vec![1, values.len()], &vec![0.; values.len()], dtype);
+                let check = |output: &Tensor, source: &[f32]| {
+                    ctx.synchronize().unwrap();
+                    let actual = transfers::to_cpu(output).unwrap().to_f32_vec().unwrap();
+                    for (&actual, &x) in actual.iter().zip(source) {
+                        let x = f64::from(x);
+                        let expected = rounded(
+                            match semantic {
+                                PointwiseSemantic::Exp => x.exp(),
+                                PointwiseSemantic::Sin => x.sin(),
+                                PointwiseSemantic::Cos => x.cos(),
+                                _ => unreachable!(),
+                            },
+                            dtype,
+                        );
+                        let tolerance = if dtype == DType::F32 {
+                            2e-6 * expected.abs().max(1.)
+                        } else {
+                            0.
+                        };
+                        assert!(
+                            (actual - expected).abs() <= tolerance,
+                            "{semantic:?} {dtype:?}: {actual} != {expected}"
+                        );
+                    }
+                };
+                pointwise(&ctx, PointwiseArgs::new(semantic, &input, &mut output)).unwrap();
+                check(&output, &values);
+                let mut invalid = PointwiseArgs::new(semantic, &input, &mut output);
+                invalid.secondary = Some(&input);
+                assert!(pointwise(&ctx, invalid).is_err());
+                let graph = capture(&ctx, || {
+                    pointwise(&ctx, PointwiseArgs::new(semantic, &input, &mut output))
+                })
+                .unwrap();
+                let changed: Vec<_> = values.iter().map(|x| -*x).collect();
+                let new_input = upload(vec![1, values.len()], &changed, dtype);
+                transfers::copy_cuda_to_cuda(&ctx, &new_input, &input).unwrap();
+                drop(new_input);
+                drop(input);
+                for _ in 0..2 {
+                    graph.replay().unwrap();
+                    check(&output, &changed);
                 }
-            };
-            pointwise(&ctx, PointwiseArgs::new(semantic, &input, &mut output)).unwrap();
-            check(&output, &values);
-            let mut invalid = PointwiseArgs::new(semantic, &input, &mut output);
-            invalid.secondary = Some(&input);
-            assert!(pointwise(&ctx, invalid).is_err());
-            let graph = capture(&ctx, || {
-                pointwise(&ctx, PointwiseArgs::new(semantic, &input, &mut output))
-            })
-            .unwrap();
-            let changed: Vec<_> = values.iter().map(|x| -*x).collect();
-            let new_input = upload(vec![1, values.len()], &changed, dtype);
-            transfers::copy_cuda_to_cuda(&ctx, &new_input, &input).unwrap();
-            drop(new_input);
-            drop(input);
-            for _ in 0..2 {
-                graph.replay().unwrap();
-                check(&output, &changed);
             }
         }
     }
