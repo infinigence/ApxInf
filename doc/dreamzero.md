@@ -236,6 +236,13 @@ exact public outputs, and the strict process, event-loss, transfer and three-gra
 audit described below. Those trace counts describe that build, not the subsequent
 RMS/RoPE and request-context K/V revision.
 
+The subsequent RMS/RoPE + request-K/V build also has an accepted fresh-process
+full-request trace. Its synchronized diagnostic window is 22.639 s with 73,402
+kernels and three graph launches; public outputs remain exact and the strict
+copy/helper/event-loss audit passes. Relative to the RMS/RoPE-only intermediate
+trace (81,082 kernels), K/V reuse removes exactly 7,680 kernel launches. These
+instrumented timings are separate from the matched uninstrumented results below.
+
 ## Measured performance and residency
 
 Uninstrumented public-boundary A/B results on Thor in MAXN, in seconds. Four
