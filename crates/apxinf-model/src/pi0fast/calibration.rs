@@ -6,8 +6,8 @@
 //! calibration call is active.
 //!
 //! Every π0-FAST projection except the FP32 SigLIP patch embedding leaves this
-//! crate through `gemm::bf16` or `gemm::bf16_geglu_fused`, both of which offer
-//! their activation and weight to the installed observer. The observer keys on
+//! crate through a formal GEMM semantic, all of which offer their BF16
+//! activation and weight to the installed observer. The observer keys on
 //! the *weight* tensor's device pointer, so it records exactly the operands the
 //! FP8 runtime will later quantize, and nothing has to be threaded through the
 //! layer signatures.
@@ -16,8 +16,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use apxinf_cuda::kernels::gemm::Bf16ActivationObserver;
-use apxinf_core::{Backend, Error, Result, Tensor};
+use apxinf_core::{Error, Result, Tensor};
+use apxinf_cuda_new::ops::gemm::GemmActivationObserver;
 
 use super::backend::RuntimeBackend;
 use super::fp8_calibration::Pi0FastCalibrationPlan;
@@ -99,7 +99,7 @@ impl Pi0FastCalibrationObserver {
     }
 }
 
-impl Bf16ActivationObserver for Pi0FastCalibrationObserver {
+impl GemmActivationObserver for Pi0FastCalibrationObserver {
     fn observe(&self, activation: &Tensor, weight: &Tensor) -> Result<()> {
         let pointer = weight
             .storage()

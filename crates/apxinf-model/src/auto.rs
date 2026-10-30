@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use apxinf_core::{DType, Device, Error, Result, Tensor};
 
-use crate::accelerator::create_backend;
+use crate::accelerator::create_backend_with_recipe_options;
 use crate::builtin::register_builtin_models;
 use crate::d3::{DecisionInput, DecisionOutput, DecisionRuntime};
 use crate::generation_config::{
@@ -43,8 +43,8 @@ pub struct LoadOptions {
     /// `config.json:model_type`.
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
-    /// auto, bf16, fp8_static and int8_dynamic. Native Metal Qwen3/MiniCPM5
-    /// variants are parsed by their family loader. Other families migrate separately.
+    /// auto, bf16, fp8_static and int8_dynamic. Native Metal families parse
+    /// their own variants. Other families migrate separately.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
@@ -376,12 +376,18 @@ impl AutoModel {
             )));
         }
 
-        if matches!(model_name, "pi05" | "pi05-cuda") {
+        if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip") {
+            #[cfg(feature = "hip")]
+            if matches!(device, Device::Hip(_)) {
+                let config = options.config.as_ref().map(hip_pi05_config);
+                return crate::hip_pi05::load(path, device, options, config);
+            }
+
             #[cfg(feature = "cuda")]
             return crate::pi05::load_with_cuda_new(path, device, options);
 
             #[cfg(not(feature = "cuda"))]
-            return Err(Error::Other("PI0.5 requires CUDA support".into()));
+            return Err(Error::Other("PI0.5 requires CUDA or HIP support".into()));
         }
 
         if matches!(model_name, "d3" | "d3-cuda") {
@@ -392,7 +398,10 @@ impl AutoModel {
             return Err(Error::Other("d3-mini requires CUDA support".into()));
         }
 
-        if matches!(model_name, "cosmos-policy" | "cosmos-policy-cuda" | "cuda_cosmos_policy") {
+        if matches!(
+            model_name,
+            "cosmos-policy" | "cosmos-policy-cuda" | "cuda_cosmos_policy"
+        ) {
             #[cfg(feature = "cuda")]
             return crate::cuda_cosmos_policy::load::load_with_cuda_new(path, device, options);
             #[cfg(not(feature = "cuda"))]
@@ -424,11 +433,13 @@ impl AutoModel {
                 })?
         };
         // Resolve admission before touching a device or loading checkpoint data.
-        let backend = create_backend(device)?;
         #[cfg(feature = "cuda")]
-        if let Some(cuda) = crate::accelerator::cuda::downcast(&*backend) {
-            configure_cuda_tuning(cuda, path, options)?;
-        }
+        let backend = {
+            let recipe = cuda_recipe_options(options)?;
+            create_backend_with_recipe_options(device, recipe.online_tune, recipe.cache_dir)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let backend = create_backend_with_recipe_options(device, options.autotune, None)?;
         let mut loaded = factory(path, device, backend, options)?;
         if let LoadedModel::Text {
             generation_defaults,
@@ -458,7 +469,7 @@ pub(crate) fn cuda_recipe_options(options: &LoadOptions) -> Result<CudaRecipeOpt
     let cache_dir = options
         .tuning_path
         .as_deref()
-        .map(exact_recipe_directory)
+        .and_then(|path| (!is_source_hardware_tactics(path)).then(|| exact_recipe_directory(path)))
         .map(|path| {
             path.to_str().map(str::to_owned).ok_or_else(|| {
                 Error::Other(format!(
@@ -472,6 +483,28 @@ pub(crate) fn cuda_recipe_options(options: &LoadOptions) -> Result<CudaRecipeOpt
         cache_dir,
         online_tune: options.autotune,
     })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn is_source_hardware_tactics(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("tactics.json") {
+        return false;
+    }
+    let Some(device_directory) = path.parent() else {
+        return false;
+    };
+    let Some(vendor_directory) = device_directory.parent() else {
+        return false;
+    };
+    let Some(tuning_directory) = vendor_directory.parent() else {
+        return false;
+    };
+    let Some(configs_directory) = tuning_directory.parent() else {
+        return false;
+    };
+    vendor_directory.file_name().and_then(|name| name.to_str()) == Some("nvidia")
+        && tuning_directory.file_name().and_then(|name| name.to_str()) == Some("tuning")
+        && configs_directory.file_name().and_then(|name| name.to_str()) == Some("configs")
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -503,13 +536,53 @@ fn metal_registry_name(model_name: &str) -> String {
     }
 }
 
+/// A frontend's PI0.5 overrides (`LoadOptions::config`, the CUDA family's
+/// type) as the HIP port's own config. Lives here, outside both families, so
+/// neither imports the other.
+#[cfg(feature = "hip")]
+fn hip_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::hip_pi05::Config {
+    let gemma = |g: &crate::pi05::GemmaVariantConfig| crate::hip_pi05::config::GemmaConfig {
+        width: g.width,
+        depth: g.depth,
+        mlp_dim: g.mlp_dim,
+        num_heads: g.num_heads,
+        num_kv_heads: g.num_kv_heads,
+        head_dim: g.head_dim,
+    };
+    crate::hip_pi05::Config {
+        action_dim: frontend.action_dim,
+        action_horizon: frontend.action_horizon,
+        max_token_len: frontend.max_token_len,
+        num_flow_steps: frontend.num_flow_steps,
+        flow_start_time: frontend.flow_start_time,
+        num_views: frontend.num_views,
+        image_size: frontend.image_size,
+        patch_size: frontend.patch_size,
+        vision_width: frontend.vision_width,
+        vision_depth: frontend.vision_depth,
+        vision_mlp_dim: frontend.vision_mlp_dim,
+        vision_heads: frontend.vision_heads,
+        vision_head_dim: frontend.vision_head_dim,
+        vocab_size: frontend.vocab_size,
+        rms_norm_eps: frontend.rms_norm_eps,
+        layer_norm_eps: frontend.layer_norm_eps,
+        rope_theta: frontend.rope_theta,
+        time_min_period: frontend.time_min_period,
+        time_max_period: frontend.time_max_period,
+        language: gemma(&frontend.language),
+        action_expert: gemma(&frontend.action_expert),
+    }
+}
+
 // Admission only: supported variant names and precision semantics are owned by
-// each family loader, not a second central implementation registry.
+// each family loader, not a second central implementation registry. A Metal
+// request reaches only a registered `metal_` factory, which parses its variant.
 fn supports_model_variant(model_name: &str, device: Device) -> bool {
     matches!(
         model_name,
         "pi05"
             | "pi05-cuda"
+            | "pi05-hip"
             | "qwen_drive"
             | "qwen_drive-cuda"
             | "d3"
@@ -519,75 +592,8 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "cosmos-policy"
             | "cosmos-policy-cuda"
             | "cuda_cosmos_policy"
-    ) || (matches!(device, Device::Metal(_))
-        && matches!(
-            model_name,
-            "qwen3" | "metal_qwen3" | "qwen3-mlx" | "minicpm5" | "metal_minicpm5" | "minicpm5-mlx"
-        ))
+    ) || matches!(device, Device::Metal(_))
 }
-
-#[cfg(feature = "cuda")]
-fn configure_cuda_tuning(
-    cuda: &apxinf_cuda::CudaBackend,
-    model_path: &Path,
-    options: &LoadOptions,
-) -> Result<()> {
-    use apxinf_cuda::tuning::{TuningDb, TuningMode, TuningPaths};
-
-    let default_paths = TuningPaths::resolve_for_cuda(
-        "configs/tuning",
-        cuda.context().caps(),
-        cuda.context().library_versions(),
-    );
-    let model_root = if model_path.is_dir() {
-        model_path
-    } else {
-        model_path.parent().unwrap_or_else(|| Path::new("."))
-    };
-    let legacy_path = model_root.join("tactics.json");
-    let selected = select_cuda_tuning_database_path(&default_paths.tactics, &legacy_path, options);
-    let database = selected
-        .as_deref()
-        .map(TuningDb::from_json_file)
-        .transpose()?;
-    let paths = options
-        .tuning_path
-        .clone()
-        .map(TuningPaths::from_tactics)
-        .unwrap_or(default_paths);
-    let mode = if options.autotune {
-        TuningMode::AutoTune
-    } else {
-        TuningMode::Inference
-    };
-    apxinf_cuda::kernels::gemm::configure_tuning(
-        cuda.context(),
-        mode,
-        database.as_ref().map(std::slice::from_ref).unwrap_or(&[]),
-        Some(paths),
-    )
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn select_cuda_tuning_database_path(
-    default_path: &Path,
-    legacy_path: &Path,
-    options: &LoadOptions,
-) -> Option<PathBuf> {
-    match options.tuning_path.as_ref() {
-        Some(path) if path.is_file() => Some(path.clone()),
-        Some(_) if options.autotune => None,
-        Some(path) => Some(path.clone()),
-        None => default_path
-            .is_file()
-            .then(|| default_path.to_path_buf())
-            .or_else(|| {
-                (options.synthetic.is_none() && legacy_path.is_file())
-                    .then(|| legacy_path.to_path_buf())
-            }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +612,26 @@ mod tests {
         assert!(recipe.online_tune);
         options.autotune = false;
         assert!(!cuda_recipe_options(&options).unwrap().online_tune);
+    }
+
+    #[test]
+    fn source_hardware_tactics_defer_to_the_native_toolkit_directory() {
+        let options = LoadOptions {
+            tuning_path: Some(PathBuf::from(
+                "/checkout/configs/tuning/nvidia/thor-sm110/tactics.json",
+            )),
+            ..LoadOptions::default()
+        };
+        assert_eq!(cuda_recipe_options(&options).unwrap().cache_dir, None);
+
+        let options = LoadOptions {
+            tuning_path: Some(PathBuf::from("/checkpoint/tactics.json")),
+            ..LoadOptions::default()
+        };
+        assert_eq!(
+            cuda_recipe_options(&options).unwrap().cache_dir.as_deref(),
+            Some("/checkpoint/tactics.recipes")
+        );
     }
 
     #[test]
@@ -642,10 +668,52 @@ mod tests {
                 "accepted {name}"
             );
         }
+        // A variant neither bypasses the family requirement nor reaches a device.
+        for name in ["llama", "qwen3_vl"] {
+            let options = LoadOptions {
+                model_name: Some(name.into()),
+                model_variant: Some("bf16-compiled".into()),
+                ..LoadOptions::default()
+            };
+            assert!(
+                matches!(
+                    AutoModel::load_model(Device::Metal(0), path, &options),
+                    Err(Error::UnsupportedDevice(Device::Metal(0)))
+                ),
+                "accepted {name} with a variant"
+            );
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_pi05_config_converts_frontend_overrides_field_for_field() {
+        let frontend = crate::pi05::Pi05Config {
+            num_views: 2,
+            action_horizon: 10,
+            flow_start_time: 0.5,
+            ..crate::pi05::Pi05Config::default()
+        };
+        let config = hip_pi05_config(&frontend);
+        assert_eq!(
+            (
+                config.num_views,
+                config.action_horizon,
+                config.flow_start_time
+            ),
+            (2, 10, 0.5)
+        );
+        assert_eq!(
+            config.language,
+            crate::hip_pi05::config::GemmaConfig::GEMMA_2B
+        );
+        assert_eq!(config.vocab_size, frontend.vocab_size);
+        config.validate().unwrap();
     }
 
     #[test]
     fn metal_variant_admission_is_family_and_device_specific() {
+        // Metal defers to the registered family factory; other devices keep the list.
         for name in [
             "qwen3",
             "metal_qwen3",
@@ -653,17 +721,43 @@ mod tests {
             "minicpm5",
             "metal_minicpm5",
             "minicpm5-mlx",
+            "llama",
+            "qwen3_vl",
         ] {
             assert!(supports_model_variant(name, Device::Metal(0)));
             assert!(!supports_model_variant(name, Device::Cpu));
             assert!(!supports_model_variant(name, Device::Cuda(0)));
         }
-        assert!(!supports_model_variant("llama", Device::Metal(0)));
-        assert!(!supports_model_variant("qwen3_vl", Device::Metal(0)));
         assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
+        assert!(supports_model_variant("pi05-hip", Device::Hip(0)));
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
         assert!(supports_model_variant("smolvla", Device::Cuda(0)));
         assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
+    }
+
+    /// `Pi05Policy.from_pretrained(model_name="pi05-hip")` always sends a
+    /// model_variant (`"auto"` by default). Both must pass admission and reach
+    /// the PI0.5 loader; here that loader then fails for lack of a device or a
+    /// checkpoint, which is fine — only the admission rejection is the bug.
+    #[test]
+    fn pi05_hip_alias_admits_auto_and_bf16_model_variants() {
+        let path = temporary_directory("pi05-hip-admission");
+        for variant in ["auto", "bf16"] {
+            let options = LoadOptions {
+                model_name: Some("pi05-hip".into()),
+                model_variant: Some(variant.into()),
+                ..LoadOptions::default()
+            };
+            let error = match AutoModel::load_model(Device::Hip(0), &path, &options) {
+                Ok(_) => panic!("an empty directory cannot load as PI0.5"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                !error.contains("does not yet support model_variant"),
+                "model_variant={variant} was rejected before the PI0.5 loader: {error}"
+            );
+        }
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
@@ -693,54 +787,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
-    }
-
-    #[test]
-    fn synthetic_load_ignores_model_local_legacy_tactics() {
-        let directory = temporary_directory("synthetic-tactics");
-        let default_path = directory.join("missing-hardware-tactics.json");
-        let legacy_path = directory.join("tactics.json");
-        std::fs::write(&legacy_path, "{}").unwrap();
-        let options = LoadOptions {
-            synthetic: Some(SyntheticWeights { seed: 0 }),
-            ..LoadOptions::default()
-        };
-
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            None
-        );
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &LoadOptions::default()),
-            Some(legacy_path)
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn synthetic_load_still_uses_hardware_or_explicit_tactics() {
-        let directory = temporary_directory("explicit-tactics");
-        let default_path = directory.join("hardware.json");
-        let legacy_path = directory.join("tactics.json");
-        let explicit_path = directory.join("explicit.json");
-        std::fs::write(&default_path, "{}").unwrap();
-        std::fs::write(&legacy_path, "{}").unwrap();
-        std::fs::write(&explicit_path, "{}").unwrap();
-        let mut options = LoadOptions {
-            synthetic: Some(SyntheticWeights { seed: 0 }),
-            ..LoadOptions::default()
-        };
-
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            Some(default_path.clone())
-        );
-        options.tuning_path = Some(explicit_path.clone());
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            Some(explicit_path)
-        );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

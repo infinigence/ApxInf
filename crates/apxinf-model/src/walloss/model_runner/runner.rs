@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use apxinf_core::{Backend, Error, Result, Tensor};
+use apxinf_core::{Error, Result, Tensor};
 
 use crate::vla::{
     Action, ExecutionMode, ExecutionPolicy, InferenceSpec, InitialLatent, PreparationStatus,

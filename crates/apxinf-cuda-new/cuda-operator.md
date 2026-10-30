@@ -18,7 +18,12 @@ This document describes only public contracts and does not promise a specific pr
 
 ## Shared GEMM Contract
 
-GEMM uses `A=[M,K]` and `B=[K,N]`. `alpha` applies to the projection, and the final result is divided by a finite positive `output_scale`. `projection(A,B)` interprets inputs according to the following quantization contract:
+GEMM uses `A=[M,K]` and a weight whose physical interpretation is carried by
+`GemmWeightLayout`: `Kn` stores `B=[K,N]`, `OutputMajor` stores the same logical
+weight as `[N,K]`, and `GateUpPairs` stores the paired gate/up encoding accepted
+only by `gemm_swiglu`. `alpha` applies to the projection, and the final result is
+divided by a finite positive `output_scale`. `projection(A,B)` interprets inputs
+according to the following quantization contract:
 
 - `None`: A/B have the same dtype, which is neither E4M3 nor INT8.
 - `Fp8UnitScale`: A/B are both E4M3 tensors with the expected scaling already applied.
@@ -28,7 +33,7 @@ GEMM uses `A=[M,K]` and `B=[K,N]`. `alpha` applies to the projection, and the fi
 
 `Nvfp4` is the one contract whose operand storage is not the canonical `A=[M,K]`, `B=[K,N]`: both operands are K-packed, so `A` is stored `[M, K/2]` and `B` is stored `[N, K/2]`. That is the orientation a ModelOpt checkpoint already uses and the one the block-scaled kernel consumes, so requiring the usual layout would force a transpose that buys nothing. Any per-tensor scale a checkpoint carries alongside the block scales (ModelOpt's `weight_scale_2` and `input_scale`) multiplies the whole projection and therefore belongs in `alpha`, which also keeps it out of the tuning key.
 
-Block-scale tensors must be in the layout the candidate reads, which is **not** a plain `[rows, K/block_size]` array. Build them once with `ops::nvfp4_pack_block_scales` into a buffer sized by `ops::nvfp4_scale_buffer_bytes`; the layout depends only on `block_size`, so the result stays valid when the autotuner selects a different configuration.
+Block-scale tensors must be in the layout the candidate reads, which is **not** a plain `[rows, K/block_size]` array. Build them once with `ops::pack_block_scales` into a buffer sized by `ops::block_scale_buffer_bytes`; the layout depends only on `block_size`, so the result stays valid when the autotuner selects a different configuration.
 
 Quantization occurs before the API call; the current L3 contract does not include dynamic quantization. At least one registered candidate must still support the concrete spec.
 
@@ -38,10 +43,11 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Item | Contract |
 | --- | --- |
 | Rust API | `ops::gemm(ctx, GemmArgs)` |
-| Inputs | `A=[M,K]`, `B=[K,N]`; supports `None`, `Fp8UnitScale`, `Fp8`, `W8A8`, and `Nvfp4` (whose operands are stored `A=[M,K/2]`, `B=[N,K/2]`) |
+| Inputs | `A=[M,K]`, logical `B=[K,N]`; `GemmWeightLayout` records canonical `[K,N]`, checkpoint `[N,K]`, or the semantic-specific gate/up-pair encoding; supports `None`, `Fp8UnitScale`, `Fp8`, `W8A8`, and `Nvfp4` (whose operands are stored `A=[M,K/2]`, `B=[N,K/2]`) |
 | Output | `Y=[M,N]` |
 | Mathematical semantic | `Y = alpha * projection(A,B) / output_scale` |
 | Constraints | W8A8 and NVFP4 output must be BF16; `WeightVersion` may declare immutable weights and allow prepare to cache an internal prepacked copy |
+| Numerical policy | `GemmNumerics::Default`, or `LegacyCublas` for the established unit-scale canonical BF16 reduction path; the model still calls `gemm` |
 | Reference test | `gemm_all_candidates_match_torch`, `nvfp4_all_candidates_match_reference` |
 
 <!-- l3-operator:gemm_bias -->
@@ -50,11 +56,11 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Item | Contract |
 | --- | --- |
 | Rust API | `ops::gemm_bias(ctx, GemmBiasArgs { gemm, bias })` |
-| Inputs | `A=[M,K]`, `B=[K,N]`, `bias=[N]`; supports all four GEMM quantization contracts |
+| Inputs | `A=[M,K]`, logical `B=[K,N]`, `bias=[N]`; plain BF16 checkpoint weights may use physical `[N,K]`; supports the applicable shared GEMM quantization contracts |
 | Output | `Y=[M,N]` |
 | Mathematical semantic | `Y = (alpha * projection(A,B) + bias) / output_scale`, with bias broadcast across M |
 | Constraints | bias dtype matches the projection dtype; W8A8 output must be BF16 |
-| Reference test | `gemm_bias_all_candidates_match_torch` |
+| Reference test | `gemm_bias_all_candidates_match_torch`, `gemm_bias_accepts_output_major_checkpoint_weights_and_replays` |
 
 <!-- l3-operator:gemm_bias_residual -->
 ### `gemm_bias_residual`
@@ -92,6 +98,18 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Constraints | The second dimension of B is even; FP8 with row/channel scales and W8A8 are unsupported; candidate-specific packing may occur only internally |
 | FP8 candidates | Vendor decomposition (FP16 projection for E4M3 output); dual-GeGLU at M522/M533; SM100-family split-GeGLU at M778, 2N32768, K2048; eligible decomposed candidates remain available to autotune |
 | Reference tests | `gemm_geglu_all_candidates_match_torch`, `gemm_geglu_three_view_all_candidates_match_torch` (unit/non-unit scales, eager/graph) |
+
+<!-- l3-operator:gemm_swiglu -->
+### `gemm_swiglu`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::gemm_swiglu(ctx, GemmSwiGluArgs { gemm })` |
+| Inputs | BF16 `A=[M,K]`, `B=[K,2N]`; `GemmWeightLayout::GateUpPairs { pair_width }` describes the paired gate/up column encoding |
+| Output | BF16 `Y=[M,N]` |
+| Mathematical semantic | rounded `SiLU(A@B_gate) * (A@B_up)` for each 256-column pair |
+| Constraints | `2N` is divisible by 512; scales are unit; provider padding is private and never changes the output shape |
+| Candidates | cuBLAS fallback, cuBLASLt, and fixed SM110 CUTLASS at M3387/N9216/K2560 |
 
 ## Shared Attention Contract
 
@@ -140,6 +158,11 @@ The catalog test ensures only that semantics are neither missing nor duplicated;
 
 Tests must run through `crates/apxinf-cuda-new/test-new.sh`; a normal `cargo test` from the repository root does not automatically test this crate.
 
+The translated fixed-shape implementations are not separate model APIs.
+D256 attention and the 624/2200 vision schedule are candidates in the existing
+Attention registries. BF16 SwiGLU is the GEMM semantic above. First-prefill GDN
+is `ops::gdn_first_prefill`; it owns both the fixed SM110 launch and the generic
+decomposition, so candidate misses never escape to model code.
 <!-- l3-operator:Unfold3d -->
 ### Unfold3d
 
@@ -157,7 +180,9 @@ Target-device numerical/capture acceptance is required before a model claims it.
 <!-- l3-operator:ChannelL2Norm -->
 ### ChannelL2Norm
 
-`channel_l2_norm` accepts contiguous BF16 `[rows, channels]` and learned BF16
+`channel_l2_norm` uses the unified `NormArgs` contract with
+`NormKind::ChannelL2` (plain weighted normalization, BF16 only, without
+quantization or fused residuals). It accepts contiguous BF16 `[rows, channels]` and learned BF16
 `[channels]` weights. It computes the L2 norm in FP32, rounds the norm to BF16,
 clamps it by epsilon (normal positive FP32), divides and rounds to BF16, multiplies
 by `sqrt(channels)` and rounds again, then multiplies by the learned weight.

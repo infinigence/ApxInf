@@ -33,9 +33,49 @@ typedef enum {
   APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL = 3,
   /* In-place partial interleaved temporal/height/width rotary embedding. */
   APXINF_ROPE_SEMANTIC_PARTIAL_MROPE = 4,
+  /* Packed BF16 vision QKV split with either H/W position ids or a
+     precomputed float2 rotation table. */
+  APXINF_ROPE_SEMANTIC_SPLIT_QKV_VISION = 5,
+  /* Packed BF16 GQA split with striped temporal/height/width positions and
+     token-major K/V cache writes. */
+  APXINF_ROPE_SEMANTIC_SPLIT_QKV_MROPE_CACHE = 6,
+  /* Rotary embedding over one input/output tensor. Rotation source and
+     convention distinguish 1D, multimodal and vision-axis forms. */
+  APXINF_ROPE_SEMANTIC_APPLY = 7,
 } apxinf_rope_semantic_t;
 
-#define APXINF_ROPE_SPEC_VERSION 3u
+typedef enum {
+  APXINF_ROPE_LAYOUT_PACKED_QKV = 0,
+  APXINF_ROPE_LAYOUT_SEPARATE_QKV = 1,
+  APXINF_ROPE_LAYOUT_IN_PLACE = 2,
+  APXINF_ROPE_LAYOUT_SINGLE_TENSOR = 3,
+} apxinf_rope_layout_t;
+
+typedef enum {
+  APXINF_ROPE_CACHE_WRITE_NONE = 0,
+  APXINF_ROPE_CACHE_WRITE_TOKEN_MAJOR = 1,
+  APXINF_ROPE_CACHE_WRITE_HEAD_MAJOR = 2,
+} apxinf_rope_cache_write_t;
+
+typedef enum {
+  APXINF_ROPE_ROTATION_NONE = 0,
+  APXINF_ROPE_ROTATION_POSITION_OFFSET = 1,
+  APXINF_ROPE_ROTATION_DEVICE_SCALAR = 2,
+  APXINF_ROPE_ROTATION_AXIAL_IDS = 3,
+  APXINF_ROPE_ROTATION_MULTIMODAL_IDS = 4,
+  APXINF_ROPE_ROTATION_PRECOMPUTED_TABLE = 5,
+} apxinf_rope_rotation_source_t;
+
+typedef enum {
+  APXINF_ROPE_CONVENTION_NONE = 0,
+  APXINF_ROPE_CONVENTION_HALF_SPLIT = 1,
+  APXINF_ROPE_CONVENTION_HALF_SPLIT_AXIAL = 2,
+  APXINF_ROPE_CONVENTION_HALF_SPLIT_INTERLEAVED_AXES = 3,
+  /* Axial half-split rotation after the biased inputs are rounded to BF16. */
+  APXINF_ROPE_CONVENTION_HALF_SPLIT_AXIAL_ROUNDED_INPUT = 4,
+} apxinf_rope_convention_t;
+
+#define APXINF_ROPE_SPEC_VERSION 6u
 
 typedef struct {
   uint32_t version;
@@ -43,6 +83,10 @@ typedef struct {
   uint32_t dtype;
   /* A null bias is a different kernel path, so it belongs to the identity. */
   uint32_t has_bias;
+  uint32_t layout;
+  uint32_t cache_write;
+  uint32_t rotation_source;
+  uint32_t rotary_convention;
   uint32_t q_heads;
   uint32_t kv_heads;
   uint32_t head_dim;
@@ -56,7 +100,7 @@ typedef struct {
   uint32_t bias_alignment;
   uint32_t q_alignment;
   uint32_t kv_alignment;
-  uint32_t position_alignment;
+  uint32_t rotation_alignment;
   int64_t tokens;
   int64_t cache_capacity;
 } apxinf_rope_spec_t;
@@ -73,6 +117,8 @@ typedef struct {
   const void* value_input;
   /* Stable device u32 read at enqueue/replay time. */
   const uint32_t* position;
+  /* Optional precomputed float2 table selected by rotation_source. */
+  const void* rotation_table;
   apxinf_cuda_stream_t stream;
   /* RoPE base; unused by SPLIT_QKV_BIAS. */
   float theta;

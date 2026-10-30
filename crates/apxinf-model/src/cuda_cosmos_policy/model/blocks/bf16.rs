@@ -271,9 +271,9 @@ mod vae {
     //! No activation state crosses observation boundaries.
     use crate::cuda_cosmos_policy::backend::ops::{embedding_gather, GemmPolicy};
     use crate::cuda_cosmos_policy::backend::{
-        attention, bias_residual, channel_l2_norm, pointwise, AttentionArgs, AttentionPolicy,
-        BiasResidualArgs, ChannelL2NormArgs, CudaBuffer, CudaContext, PointwiseActivation,
-        PointwiseArgs, PointwiseSemantic,
+        attention, channel_l2_norm, pointwise, residual_add, AttentionArgs, AttentionPolicy,
+        BiasOrder, ChannelL2NormArgs, CudaBuffer, CudaContext, PointwiseActivation, PointwiseArgs,
+        PointwiseSemantic, ResidualAddArgs,
     };
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
@@ -350,9 +350,16 @@ mod vae {
     }
 
     fn add(ctx: &CudaContext, a: &Tensor, b: &Tensor, out: &Tensor) -> Result<()> {
-        bias_residual(
+        residual_add(
             ctx,
-            BiasResidualArgs::new(&matrix(a)?, None, &matrix(b)?, &mut matrix(out)?),
+            ResidualAddArgs {
+                input: &matrix(a)?,
+                bias: None,
+                residual: &matrix(b)?,
+                hidden: &matrix(out)?,
+                gate: None,
+                bias_order: BiasOrder::SingleRound,
+            },
         )
     }
 
@@ -834,8 +841,7 @@ mod dit {
     use super::tensor_ops::*;
     use crate::cuda_cosmos_policy::backend::ops::GemmPolicy;
     use crate::cuda_cosmos_policy::backend::{
-        attention, layer_norm, rms_norm, AttentionArgs, AttentionPolicy, CudaContext,
-        LayerNormArgs, PointwiseActivation, RmsNormArgs,
+        attention, norm, AttentionArgs, AttentionPolicy, CudaContext, NormArgs, PointwiseActivation,
     };
     use crate::cuda_cosmos_policy::weights::{upload, Attention, DitWeights, Modulation};
     use apxinf_core::{DType, Result, Tensor};
@@ -1033,9 +1039,9 @@ mod dit {
                 PointwiseActivation::None,
                 &self.scale,
             )?;
-            layer_norm(
+            norm(
                 ctx,
-                LayerNormArgs::new(
+                NormArgs::layer(
                     &self.hidden,
                     &self.ones,
                     &self.zeros,
@@ -1061,18 +1067,18 @@ mod dit {
             linear(ctx, &self.normalized, &w.q, &self.q, gemm)?;
             linear(ctx, context, &w.k, k, gemm)?;
             linear(ctx, context, &w.v, v, gemm)?;
-            rms_norm(
+            norm(
                 ctx,
-                RmsNormArgs::new(
+                NormArgs::rms(
                     &matrix(&self.q, 128)?,
                     &w.q_norm,
                     &mut matrix(&self.q, 128)?,
                     1e-6,
                 ),
             )?;
-            rms_norm(
+            norm(
                 ctx,
-                RmsNormArgs::new(&matrix(k, 128)?, &w.k_norm, &mut matrix(k, 128)?, 1e-6),
+                NormArgs::rms(&matrix(k, 128)?, &w.k_norm, &mut matrix(k, 128)?, 1e-6),
             )?;
             if text.is_none() {
                 self.rotary.apply(ctx, &self.q)?;
@@ -1123,9 +1129,9 @@ mod dit {
                 &self.time_hidden,
             )?;
             linear(ctx, &self.time_hidden, &w.time_out, &self.time_global, gemm)?;
-            rms_norm(
+            norm(
                 ctx,
-                RmsNormArgs::new(time, &w.time_norm, &mut self.time_normalized.clone(), 1e-6),
+                NormArgs::rms(time, &w.time_norm, &mut self.time_normalized.clone(), 1e-6),
             )?;
             activate(
                 ctx,

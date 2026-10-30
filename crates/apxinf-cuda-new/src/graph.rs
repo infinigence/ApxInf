@@ -87,6 +87,20 @@ pub(crate) fn end(ctx: &CudaContext) -> std::result::Result<CapturedGraph, Strin
     })
 }
 
+/// Discard a failed or unwinding capture without instantiating its graph.
+pub(crate) fn abort(ctx: &CudaContext) {
+    let _ = ctx.stream().set_current_device();
+    let mut graph = std::ptr::null_mut();
+    unsafe {
+        let _ = ffi::cudaStreamEndCapture(ctx.stream().handle(), &mut graph);
+        if !graph.is_null() {
+            let _ = ffi::cudaGraphDestroy(graph);
+        }
+    }
+    let _ = crate::workspace::end_capture_retention();
+    clear_capture_error();
+}
+
 fn clear_capture_error() {
     unsafe {
         if matches!(ffi::cudaPeekAtLastError(), 900 | 901) {
@@ -150,6 +164,7 @@ mod tests {
 
     #[test]
     fn captured_async_zero_replays() {
+        let _guard = crate::CUDA_TEST_LOCK.lock().unwrap();
         let ctx = CudaContext::new(0).unwrap();
         let buffer = crate::CudaBuffer::alloc(32, ctx.device_id()).unwrap();
         let fill = |value| unsafe {
@@ -176,6 +191,7 @@ mod tests {
 
     #[test]
     fn failed_capture_preserves_operation_error_and_recovers() {
+        let _guard = crate::CUDA_TEST_LOCK.lock().unwrap();
         let ctx = CudaContext::new(0).unwrap();
         let result = capture(&ctx, || ctx.synchronize().map_err(Error::Cuda));
         let error = result.err().expect("capture synchronization must fail");
@@ -185,6 +201,7 @@ mod tests {
 
     #[test]
     fn invalidated_capture_preserves_end_error_and_recovers() {
+        let _guard = crate::CUDA_TEST_LOCK.lock().unwrap();
         let ctx = CudaContext::new(0).unwrap();
         let result = capture(&ctx, || {
             assert!(ctx.synchronize().is_err());
@@ -197,6 +214,7 @@ mod tests {
 
     #[test]
     fn invalidated_capture_preserves_panic_and_recovers() {
+        let _guard = crate::CUDA_TEST_LOCK.lock().unwrap();
         let ctx = CudaContext::new(0).unwrap();
         let result = catch_unwind(AssertUnwindSafe(|| {
             let _ = capture(&ctx, || {
@@ -204,7 +222,9 @@ mod tests {
                 panic!("capture recovery fixture");
             });
         }));
-        let payload = result.err().expect("capture must resume the original panic");
+        let payload = result
+            .err()
+            .expect("capture must resume the original panic");
         assert_eq!(
             payload.downcast_ref::<&str>(),
             Some(&"capture recovery fixture")
@@ -214,6 +234,7 @@ mod tests {
 
     #[test]
     fn capture_cleanup_preserves_unrelated_cuda_errors() {
+        let _guard = crate::CUDA_TEST_LOCK.lock().unwrap();
         let _ctx = CudaContext::new(0).unwrap();
         let error = unsafe { ffi::cudaSetDevice(-1) };
         assert_ne!(error, ffi::CUDA_SUCCESS);
