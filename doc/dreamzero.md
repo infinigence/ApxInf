@@ -133,8 +133,10 @@ calls rebind and replay normally. Explicit `prepare_for` still publishes no
 history, and every explicit prepared `run` rebinds and executes its request.
 The `checkpoint_joint_implicit_history_preparation_result` opt-in test checks
 the complete action/video history sequence and generated-noise/cache replay.
-This preparation revision requires fresh device qualification; the published
-performance measurements below describe the preceding frozen build.
+The explicit and implicit complete-checkpoint suites each pass all 14 scenarios,
+with all 56 action/video metric rows zero. Earlier performance comparisons below
+describe their recorded frozen builds; preparation-result reuse is measured
+separately.
 Self-attention K/V projections write directly into the current-token rows of
 the contiguous attention buffers. Only that K view receives staged RMS/complex
 RoPE; committed history is copied into the separate prefix before projection
@@ -331,6 +333,32 @@ metrics are zero, with exact replay and leading-batch noise checks. All measured
 GPU/EMC samples remain 1,575 MHz / 4.266 GHz for both variants. This is a separate
 experiment from the earlier comparisons. These warm T=1 measurements do not
 establish streaming history performance.
+
+A fourth public A→B→B→A comparison isolates implicit preparation-result reuse
+against the staged-affine/direct-KV build (`0cd880b`). Each variant has two fresh
+processes, two first-request/first-cached observations and six warm samples.
+The same raw-input script, fixed joint noise and frozen recipes are used with
+online tuning disabled. Values below are median seconds.
+
+| Path | First request | First cached request | First two requests | Warm replay |
+| --- | ---: | ---: | ---: | ---: |
+| Staged affine + direct KV | 53.176 | 23.489 | 76.665 | 21.701 |
+| Implicit preparation-result reuse | 31.040 | 22.696 | 53.736 | 21.686 |
+
+The first cached request includes the first graph replay; the first-two total
+accounts for work deferred to that call. Observed median latency is 41.6% lower
+for the first request and 29.9% lower for the first two requests together. Warm
+replay is effectively unchanged in this experiment. All 12 normalized/deployed/
+robot action metric rows are zero, including leading-batch noise and exact replay
+checks. The full BF16 joint schedule remains 16 evaluations per CFG branch.
+
+Cold observations are limited: baseline first/cached ranges are 50.273–56.078 /
+21.635–25.343 s; reuse ranges are 30.164–31.916 / 22.666–22.725 s. Default DVFS
+remains enabled; first/cached windows include CPU work and sample GPU 315–1,575
+MHz and EMC 2.75–4.266 GHz. All warm-window samples are 1,575 MHz GPU and 4.266
+GHz EMC. These observations establish neither a serving SLA nor a hardware
+minimum. The canonical streaming comparison below predates preparation-result
+reuse and measures the separately identified revisions.
 
 A separate canonical-native streaming A→B→B→A comparison exercises the same six
 history scenarios in order, with one warmup sequence followed by two measured
