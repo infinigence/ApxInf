@@ -11,19 +11,18 @@
 //!    token_embedding (cached at model load), passed via
 //!    `Qwen3VLDecodeGraphWeights::lm_head`.
 //!
-//! CUDA + bf16 only. Uses the same fused kernels as Llama:
+//! CUDA + bf16 only. Uses the same fused ops as Llama:
 //! flash_attn_decode_bf16, rms_norm_add_bf16, silu_mul_bf16, plus
 //! rope_mrope_decode_bf16 for the mRoPE step. Cannot use rope_k_write_bf16
 //! (K goes through QK-norm first, so RoPE can't fuse with cache write).
 
 #![cfg(feature = "cuda")]
 
-use apxinf_core::{Backend, DType, Error, Graph, KvCache, Result, Shape, Tensor};
+use apxinf_core::{Backend as _, DType, Error, Graph, KvCache, Result, Shape, Tensor};
 
-use crate::accelerator::cuda::{
-    kernels, Context as CudaContext, DeviceAddress,
-    DeviceBuffer as CudaBuffer, KvCache as CudaKVCache, MappedBuffer as HostMappedBuffer,
-    RuntimeBackend as CudaBackend,
+use apxinf_cuda_new::{
+    ops, CudaBuffer, CudaContext, CudaDeviceAddress as DeviceAddress, CudaKvCache as CudaKVCache,
+    CudaNewBackend as CudaBackend, HostMappedBuffer,
 };
 
 // ── Config + weight views ────────────────────────────────────────────────
@@ -81,23 +80,23 @@ pub struct Qwen3VLDecodeLayerWeights<'a> {
 
 struct DecodeWorkspace {
     dtype: DType,
-    x: CudaBuffer,            // [hidden] flowing residual
-    logits: CudaBuffer,       // [vocab]
-    norm_out: CudaBuffer,     // [hidden] pre-attn normed (reused across layers)
-    q: CudaBuffer,            // [hidden]
-    k: CudaBuffer,            // [n_kv_heads*head_dim]
-    v: CudaBuffer,            // [n_kv_heads*head_dim]
-    qkv: CudaBuffer,          // [hidden + 2*kv_proj] fused QKV output
-    gate_up: CudaBuffer,      // [2*intermediate] fused Gate/Up output
-    q_normed: CudaBuffer,     // [hidden] post-QK-norm Q
-    k_normed: CudaBuffer,     // [n_kv_heads*head_dim] post-QK-norm K
-    q_rope: CudaBuffer,       // [hidden]
-    k_rope: CudaBuffer,       // [n_kv_heads*head_dim]
-    attn_out: CudaBuffer,     // [n_heads*head_dim] raw attention output
-    attn_proj: CudaBuffer,    // [hidden]
-    ffn_norm_out: CudaBuffer, // [hidden]
-    mlp_hidden: CudaBuffer,   // [intermediate]
-    mlp_out: CudaBuffer,      // [hidden]
+    x: CudaBuffer,               // [hidden] flowing residual
+    logits: CudaBuffer,          // [vocab]
+    norm_out: CudaBuffer,        // [hidden] pre-attn normed (reused across layers)
+    q: CudaBuffer,               // [hidden]
+    k: CudaBuffer,               // [n_kv_heads*head_dim]
+    v: CudaBuffer,               // [n_kv_heads*head_dim]
+    qkv: CudaBuffer,             // [hidden + 2*kv_proj] fused QKV output
+    gate_up: CudaBuffer,         // [2*intermediate] fused Gate/Up output
+    q_normed: CudaBuffer,        // [hidden] post-QK-norm Q
+    k_normed: CudaBuffer,        // [n_kv_heads*head_dim] post-QK-norm K
+    q_rope: CudaBuffer,          // [hidden]
+    k_rope: CudaBuffer,          // [n_kv_heads*head_dim]
+    attn_out: CudaBuffer,        // [n_heads*head_dim] raw attention output
+    attn_proj: CudaBuffer,       // [hidden]
+    ffn_norm_out: CudaBuffer,    // [hidden]
+    mlp_hidden: CudaBuffer,      // [intermediate]
+    mlp_out: CudaBuffer,         // [hidden]
     token_buf: HostMappedBuffer, // [1] u32
     /// `[3]` u32 for mRoPE (t, h, w). Written by the caller before each
     /// decode; read by the rope_mrope_decode_bf16 kernel.
@@ -154,6 +153,64 @@ fn weight_view(tensor: &Tensor, device_id: usize) -> Result<CudaBuffer> {
     Ok(buffer)
 }
 
+fn activation_view(buffer: &CudaBuffer, heads: usize, head_dim: usize) -> Result<Tensor> {
+    buffer
+        .as_tensor(Shape::new(vec![heads, head_dim]), DType::BF16)
+        .map_err(Error::Cuda)
+}
+
+fn stable_rms_norm(
+    ctx: &CudaContext,
+    input: &CudaBuffer,
+    weight: &Tensor,
+    output: &CudaBuffer,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<()> {
+    let input = activation_view(input, rows, cols)?;
+    let output = activation_view(output, rows, cols)?;
+    let mut args = ops::NormArgs::rms(&input, weight, &output, eps);
+    args.numerics = ops::NormNumerics::StableDecode;
+    ops::norm::norm(ctx, args)
+}
+
+fn stable_residual_rms_norm(
+    ctx: &CudaContext,
+    residual: &CudaBuffer,
+    delta: &CudaBuffer,
+    weight: &Tensor,
+    output: &CudaBuffer,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<()> {
+    let residual = activation_view(residual, rows, cols)?;
+    let delta = activation_view(delta, rows, cols)?;
+    let output = activation_view(output, rows, cols)?;
+    ops::fused_add_norm(
+        ctx,
+        ops::FusedAddNormArgs {
+            input: &delta,
+            bias: None,
+            residual: &residual,
+            gate: None,
+            hidden: &residual,
+            normalized: Some(&output),
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Weight {
+                weight,
+                bias: None,
+                offset: false,
+            },
+            quantized: None,
+            numerics: ops::NormNumerics::StableDecode,
+            bias_order: ops::BiasOrder::SingleRound,
+            eps,
+        },
+    )
+}
+
 fn device_logits(ws: &DecodeWorkspace, vocab: usize) -> Result<Tensor> {
     ws.logits
         .as_tensor(Shape::new(vec![1, vocab]), ws.dtype)
@@ -189,12 +246,14 @@ fn decode_forward_capturable(
         return Err(Error::Other("Qwen3-VL decode graph: bf16 only".into()));
     }
 
-    let cache = kv.as_any_mut().downcast_mut::<CudaKVCache>()
+    let cache = kv
+        .as_any_mut()
+        .downcast_mut::<CudaKVCache>()
         .ok_or_else(|| Error::Other("expected CudaKVCache".into()))?;
 
     // Embedding lookup
     let token_embedding = weight_view(weights.token_embedding, device_id)?;
-    kernels::embedding::lookup_into(
+    ops::embedding::lookup_into(
         ctx,
         dtype,
         &token_embedding,
@@ -206,41 +265,54 @@ fn decode_forward_capturable(
 
     // Layer 0 pre-attention norm (standalone). Subsequent layers' pre-attn
     // norms are fused into the previous layer's post-FFN rms_norm_add.
-    let first_norm = weight_view(weights.layers[0].attn_norm_weight, device_id)?;
-    kernels::norm::rms_into(
+    stable_rms_norm(
         ctx,
-        dtype,
         &ws.x,
-        &first_norm,
+        weights.layers[0].attn_norm_weight,
         &ws.norm_out,
-        hidden,
         1,
+        hidden,
         cfg.rms_norm_eps,
     )?;
 
     for (i, layer) in weights.layers.iter().enumerate() {
         // ── QKV projection (fused if qkv_packed is Some) ──
         let (q_view, k_view, v_view) = if let Some(qkv_w) = layer.qkv_packed {
-            let norm_view = ws.norm_out.view(0, ws.norm_out.len()).map_err(Error::Cuda)?;
+            let norm_view = ws
+                .norm_out
+                .view(0, ws.norm_out.len())
+                .map_err(Error::Cuda)?;
             let qkv_wv = weight_view(qkv_w, device_id)?;
             let fused_n = q_dim + 2 * kv_proj;
-            kernels::gemm::write(ctx, dtype, 1, fused_n, hidden, 1.0, &norm_view, &qkv_wv, 0.0, &ws.qkv)
-                ?;
+            ops::gemm::write(
+                ctx, dtype, 1, fused_n, hidden, 1.0, &norm_view, &qkv_wv, 0.0, &ws.qkv,
+            )?;
             (
                 ws.qkv.view(0, q_dim * elem).map_err(Error::Cuda)?,
-                ws.qkv.view(q_dim * elem, kv_proj * elem).map_err(Error::Cuda)?,
+                ws.qkv
+                    .view(q_dim * elem, kv_proj * elem)
+                    .map_err(Error::Cuda)?,
                 ws.qkv
                     .view((q_dim + kv_proj) * elem, kv_proj * elem)
                     .map_err(Error::Cuda)?,
             )
         } else {
-            let norm_view = ws.norm_out.view(0, ws.norm_out.len()).map_err(Error::Cuda)?;
+            let norm_view = ws
+                .norm_out
+                .view(0, ws.norm_out.len())
+                .map_err(Error::Cuda)?;
             let wq_v = weight_view(layer.wq, device_id)?;
             let wk_v = weight_view(layer.wk, device_id)?;
             let wv_v = weight_view(layer.wv, device_id)?;
-            kernels::gemm::write(ctx, dtype, 1, q_dim, hidden, 1.0, &norm_view, &wq_v, 0.0, &ws.q)?;
-            kernels::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wk_v, 0.0, &ws.k)?;
-            kernels::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wv_v, 0.0, &ws.v)?;
+            ops::gemm::write(
+                ctx, dtype, 1, q_dim, hidden, 1.0, &norm_view, &wq_v, 0.0, &ws.q,
+            )?;
+            ops::gemm::write(
+                ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wk_v, 0.0, &ws.k,
+            )?;
+            ops::gemm::write(
+                ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wv_v, 0.0, &ws.v,
+            )?;
             (
                 ws.q.view(0, ws.q.len()).map_err(Error::Cuda)?,
                 ws.k.view(0, ws.k.len()).map_err(Error::Cuda)?,
@@ -252,52 +324,58 @@ fn decode_forward_capturable(
         // Reshape [hidden] → [n_heads, head_dim] for Q; [kv_proj] → [n_kv_heads, head_dim] for K.
         // The rms_norm_bf16 kernel takes cols=head_dim, rows=n_heads and applies
         // the head_dim-length weight per row. Output to ws.q_normed / ws.k_normed.
-        let q_norm_weight = weight_view(layer.q_norm_weight, device_id)?;
-        let k_norm_weight = weight_view(layer.k_norm_weight, device_id)?;
-        kernels::norm::rms_into(
+        stable_rms_norm(
             ctx,
-            dtype,
             &q_view,
-            &q_norm_weight,
+            layer.q_norm_weight,
             &ws.q_normed,
-            head_dim,
             n_heads,
+            head_dim,
             cfg.rms_norm_eps,
         )?;
-        kernels::norm::rms_into(
+        stable_rms_norm(
             ctx,
-            dtype,
             &k_view,
-            &k_norm_weight,
+            layer.k_norm_weight,
             &ws.k_normed,
-            head_dim,
             n_kv_heads,
+            head_dim,
             cfg.rms_norm_eps,
         )?;
 
         // ── mRoPE on Q and K ──
         // sections is [T, H, W] but the kernel takes sec_h, sec_w (T is implicit).
-        kernels::rope::apply_mrope_bf16_into(
+        let query = activation_view(&ws.q_normed, n_heads, head_dim)?;
+        let mut query_out = activation_view(&ws.q_rope, n_heads, head_dim)?;
+        ops::rope::decode_rotation(
             ctx,
-            &ws.q_normed,
-            &ws.q_rope,
-            head_dim,
-            n_heads,
-            cfg.rope_theta,
-            positions,
-            cfg.mrope_section[1],
-            cfg.mrope_section[2],
+            ops::rope::DecodeRotationArgs {
+                input: &query,
+                output: &mut query_out,
+                heads: n_heads,
+                head_dim,
+                theta: cfg.rope_theta,
+                position: ops::rope::DecodeRotationPosition::Multimodal {
+                    positions,
+                    sections: cfg.mrope_section,
+                },
+            },
         )?;
-        kernels::rope::apply_mrope_bf16_into(
+        let key = activation_view(&ws.k_normed, n_kv_heads, head_dim)?;
+        let mut key_out = activation_view(&ws.k_rope, n_kv_heads, head_dim)?;
+        ops::rope::decode_rotation(
             ctx,
-            &ws.k_normed,
-            &ws.k_rope,
-            head_dim,
-            n_kv_heads,
-            cfg.rope_theta,
-            positions,
-            cfg.mrope_section[1],
-            cfg.mrope_section[2],
+            ops::rope::DecodeRotationArgs {
+                input: &key,
+                output: &mut key_out,
+                heads: n_kv_heads,
+                head_dim,
+                theta: cfg.rope_theta,
+                position: ops::rope::DecodeRotationPosition::Multimodal {
+                    positions,
+                    sections: cfg.mrope_section,
+                },
+            },
         )?;
 
         // ── KV cache append (V from qkv, K from k_rope) ──
@@ -329,7 +407,7 @@ fn decode_forward_capturable(
         // I'll extend the workspace with `cache_pos_buf`.
         // (See DecodeGraph::decode below for how the caller populates it.)
         let cache_position = cache_pos_view(ws)?;
-        kernels::cache::append_at(
+        ops::cache::append_at(
             ctx,
             dtype,
             cache.k_buffer(i),
@@ -339,7 +417,7 @@ fn decode_forward_capturable(
             max_seq,
             cache_position,
         )?;
-        kernels::cache::append_at(
+        ops::cache::append_at(
             ctx,
             dtype,
             cache.v_buffer(i),
@@ -351,7 +429,7 @@ fn decode_forward_capturable(
         )?;
 
         // ── Flash Attention decode ──
-        kernels::attention::flash_bf16_into(
+        apxinf_cuda_new::runtime::attention::flash_into(
             ctx,
             &ws.q_rope,
             cache.k_buffer(i),
@@ -371,39 +449,78 @@ fn decode_forward_capturable(
         // always hidden_size (Qwen3-VL-4B: 32*128=4096 vs hidden 2560).
         let ao_view = ws.attn_out.view(0, q_dim * elem).map_err(Error::Cuda)?;
         let wo_v = weight_view(layer.wo, device_id)?;
-        kernels::gemm::write(ctx, dtype, 1, hidden, q_dim, 1.0, &ao_view, &wo_v, 0.0, &ws.attn_proj)?;
+        ops::gemm::write(
+            ctx,
+            dtype,
+            1,
+            hidden,
+            q_dim,
+            1.0,
+            &ao_view,
+            &wo_v,
+            0.0,
+            &ws.attn_proj,
+        )?;
 
         // ── Fused post-attn residual add + pre-FFN norm ──
-        let ffn_norm_weight = weight_view(layer.ffn_norm_weight, device_id)?;
-        kernels::norm::residual_add_rms_bf16_into(
+        stable_residual_rms_norm(
             ctx,
             &ws.x,
             &ws.attn_proj,
-            &ffn_norm_weight,
+            layer.ffn_norm_weight,
             &ws.ffn_norm_out,
-            hidden,
             1,
+            hidden,
             cfg.rms_norm_eps,
         )?;
 
         // ── Gate/Up GEMM + fused SiLU*Mul (fused if gate_up_packed is Some) ──
-        let fn_view = ws.ffn_norm_out.view(0, ws.ffn_norm_out.len()).map_err(Error::Cuda)?;
+        let fn_view = ws
+            .ffn_norm_out
+            .view(0, ws.ffn_norm_out.len())
+            .map_err(Error::Cuda)?;
         if let Some(gate_up_w) = layer.gate_up_packed {
             let gu_wv = weight_view(gate_up_w, device_id)?;
-            kernels::gemm::write(ctx, dtype, 1, 2 * inter, hidden, 1.0, &fn_view, &gu_wv, 0.0, &ws.gate_up)
-                ?;
-            kernels::activation::silu_mul_bf16_into(ctx, &ws.gate_up, &ws.mlp_hidden, inter)?;
+            ops::gemm::write(
+                ctx,
+                dtype,
+                1,
+                2 * inter,
+                hidden,
+                1.0,
+                &fn_view,
+                &gu_wv,
+                0.0,
+                &ws.gate_up,
+            )?;
+            ops::pointwise::silu_mul_into(ctx, &ws.gate_up, &ws.mlp_hidden, inter)?;
         } else {
             // Fallback path: separate gate/up GEMMs + silu + mul. We don't
             // have a dedicated `ws.gate` in the Qwen3-VL workspace (packed is
             // the fast path), so this fallback requires packed to be present.
-            return Err(Error::Other("Qwen3-VL decode graph requires packed Gate/Up weights".into()));
+            return Err(Error::Other(
+                "Qwen3-VL decode graph requires packed Gate/Up weights".into(),
+            ));
         }
 
         // ── down GEMM ──
-        let mh_view = ws.mlp_hidden.view(0, ws.mlp_hidden.len()).map_err(Error::Cuda)?;
+        let mh_view = ws
+            .mlp_hidden
+            .view(0, ws.mlp_hidden.len())
+            .map_err(Error::Cuda)?;
         let wd_v = weight_view(layer.w_down, device_id)?;
-        kernels::gemm::write(ctx, dtype, 1, hidden, inter, 1.0, &mh_view, &wd_v, 0.0, &ws.mlp_out)?;
+        ops::gemm::write(
+            ctx,
+            dtype,
+            1,
+            hidden,
+            inter,
+            1.0,
+            &mh_view,
+            &wd_v,
+            0.0,
+            &ws.mlp_out,
+        )?;
 
         // ── Fused post-FFN residual add + next layer's pre-attn norm
         //    (or the final output norm for the last layer) ──
@@ -412,24 +529,28 @@ fn decode_forward_capturable(
         } else {
             weights.output_norm_weight
         };
-        let next_norm_weight = weight_view(next_norm_w, device_id)?;
-        kernels::norm::residual_add_rms_bf16_into(
+        stable_residual_rms_norm(
             ctx,
             &ws.x,
             &ws.mlp_out,
-            &next_norm_weight,
+            next_norm_w,
             &ws.norm_out,
-            hidden,
             1,
+            hidden,
             cfg.rms_norm_eps,
         )?;
     }
 
     // ── lm_head matmul (tied embeddings — lm_head IS the transposed
     //    token_embedding, passed in Qwen3VLDecodeGraphWeights) ──
-    let no_view = ws.norm_out.view(0, ws.norm_out.len()).map_err(Error::Cuda)?;
+    let no_view = ws
+        .norm_out
+        .view(0, ws.norm_out.len())
+        .map_err(Error::Cuda)?;
     let lm_v = weight_view(weights.lm_head, device_id)?;
-    kernels::gemm::write(ctx, dtype, 1, vocab, hidden, 1.0, &no_view, &lm_v, 0.0, &ws.logits)?;
+    ops::gemm::write(
+        ctx, dtype, 1, vocab, hidden, 1.0, &no_view, &lm_v, 0.0, &ws.logits,
+    )?;
 
     Ok(())
 }
@@ -455,14 +576,20 @@ pub struct Qwen3VLDecodeGraph {
 
 impl Qwen3VLDecodeGraph {
     pub fn new(backend: &CudaBackend, cfg: Qwen3VLDecodeGraphConfig) -> Result<Self> {
-        let ws = DecodeWorkspace::new(backend.device_id(), &cfg)
-            .map_err(Error::Other)?;
-        Ok(Self { config: cfg, workspace: ws, buckets: Vec::new() })
+        let ws = DecodeWorkspace::new(backend.device_id(), &cfg).map_err(Error::Other)?;
+        Ok(Self {
+            config: cfg,
+            workspace: ws,
+            buckets: Vec::new(),
+        })
     }
 
     fn bucket_for(&self, cache_pos: u32) -> usize {
         let kv_len = cache_pos as usize + 1;
-        kv_len.next_power_of_two().min(self.config.max_seq_len).max(1)
+        kv_len
+            .next_power_of_two()
+            .min(self.config.max_seq_len)
+            .max(1)
     }
 
     /// Decode one token. `pos_ids` is the mRoPE (t, h, w) coordinate;
@@ -479,7 +606,10 @@ impl Qwen3VLDecodeGraph {
         let ctx = backend.context();
         let bucket_kv_len = self.bucket_for(cache_pos);
         let vocab = self.config.vocab_size;
-        let have = self.buckets.iter().any(|b| b.bucket_kv_len == bucket_kv_len);
+        let have = self
+            .buckets
+            .iter()
+            .any(|b| b.bucket_kv_len == bucket_kv_len);
 
         // Reallocate the pos_ids buffer to 16 bytes if needed (lazily grow
         // to include the 4th u32 for cache position — the constructor
@@ -489,24 +619,47 @@ impl Qwen3VLDecodeGraph {
         // allocate 16 (see DecodeWorkspace::new).
 
         if !have {
-            self.workspace.token_buf.write_u32(token).map_err(Error::Cuda)?;
+            self.workspace
+                .token_buf
+                .write_u32(token)
+                .map_err(Error::Cuda)?;
             self.workspace
                 .pos_ids_buf
                 .write_u32s(&[pos_ids[0], pos_ids[1], pos_ids[2], cache_pos])
                 .map_err(Error::Cuda)?;
-            decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len)?;
+            decode_forward_capturable(
+                ctx,
+                &self.workspace,
+                weights,
+                kv,
+                &self.config,
+                bucket_kv_len,
+            )?;
             backend.synchronize()?;
             let logits = device_logits(&self.workspace, vocab)?;
 
-            backend.begin_capture_relaxed()?;
-            let cap_res = decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len);
+            backend.begin_capture()?;
+            let cap_res = decode_forward_capturable(
+                ctx,
+                &self.workspace,
+                weights,
+                kv,
+                &self.config,
+                bucket_kv_len,
+            );
             let graph = backend.end_capture()?;
             cap_res?;
-            self.buckets.push(BucketGraph { bucket_kv_len, graph });
+            self.buckets.push(BucketGraph {
+                bucket_kv_len,
+                graph,
+            });
             return Ok(logits);
         }
 
-        self.workspace.token_buf.write_u32(token).map_err(Error::Cuda)?;
+        self.workspace
+            .token_buf
+            .write_u32(token)
+            .map_err(Error::Cuda)?;
         self.workspace
             .pos_ids_buf
             .write_u32s(&[pos_ids[0], pos_ids[1], pos_ids[2], cache_pos])

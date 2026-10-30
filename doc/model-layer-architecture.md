@@ -32,7 +32,7 @@ apxinf-model
   architecture, weights, schedules and execution orchestration
                          |
                          v
-apxinf-cpu / apxinf-cuda / apxinf-hip / apxinf-mlx
+apxinf-cpu / apxinf-cuda-new / apxinf-hip / apxinf-mlx
   model-neutral operators, kernel APIs
                          |
                          v
@@ -47,12 +47,11 @@ implemented. The selection table defines each family's supported geometry,
 precision and compilation scopes; a compiled callable alone does not establish
 hardware or workload acceptance.
 
-Within the legacy CUDA backend, safe Rust operators in `src/kernels/` call
-private `src/ffi/` declarations. The C/C++ boundary in
-[`adapters/`](../crates/apxinf-cuda/adapters/README.md) integrates vendor/AOT
-launches; device implementations belong in `kernels/`, and offline CuTe export
-belongs in `aot/`. These are backend implementation details, not additional
-model-layer interfaces.
+Within the CUDA backend, safe Rust L3 operators call private `src/ffi/`
+declarations. The C/C++ L1 boundary in
+[`native/adapters/`](../crates/apxinf-cuda-new/native/adapters) selects and
+launches in-tree L0 kernels from `native/kernels/`. These are backend
+implementation details, not additional model-layer interfaces.
 
 ## Runtime contracts
 
@@ -101,7 +100,7 @@ not a port requirement.
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
 | `apxinf-core` | Tensor/storage data and backend, KV cache and sampling contracts; no concrete CPU operators or BLAS linking | [Core crate](../crates/apxinf-core/src/lib.rs) |
 | `apxinf-cpu` | Synchronous CPU operators, concrete KV storage and sampling; owns optional OpenBLAS calls and linking | [CPU crate](../crates/apxinf-cpu/README.md) |
-| `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda/src/lib.rs) |
+| `apxinf-cuda-new` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda-new/src/lib.rs) |
 | `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
 
 `model_variant` is the shared loading field and CLI option `--model-variant`.
@@ -197,10 +196,12 @@ separately migrated; do not rename or import them as part of an unrelated port.
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
 The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
-names, and for Qwen3/MiniCPM5 names when the device is Metal. Each MLX family
-parses its variants locally; the common loader does not infer quantization from
-a shared CUDA precision choice. Supporting it for a new family requires updating that admission check
-and implementing family-local parsing/validation; registration alone is not
+names, and for every Metal request. Metal admission reaches only a registered
+`metal_` factory, and each MLX family parses its variants locally; the common
+loader does not infer quantization from a shared CUDA precision choice. A new
+Metal family needs no central admission edit. Supporting it for a new non-Metal
+family requires updating that admission check and implementing family-local
+parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and
@@ -292,7 +293,7 @@ library. During an initial port, dependencies follow this matrix:
 | Dependency | Allowed |
 |---|---|
 | `<new_model>` → `apxinf-core` contracts | yes |
-| `<new_model>` → safe `apxinf-cuda` kernel interfaces | yes |
+| `<new_model>` → safe `apxinf-cuda-new` kernel interfaces | yes |
 | `<new_model>` → explicitly shared top-level model modules | yes |
 | `<new_model>` → another model-family directory | no |
 | another model-family directory changed to accommodate `<new_model>` | no by default; requires a separate shared-seam design and review |

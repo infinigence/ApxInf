@@ -9,11 +9,68 @@ use crate::stream::CudaStream;
 use crate::CudaDeviceCaps;
 
 /// Owns the stream and opaque native runtime used by GEMM executions.
+/// CUDA runtime and cuBLAS library versions, as the legacy context exposed
+/// them. Used by gr00t's fixed-shape M41 FP8 gate.
+#[derive(Clone, Debug)]
+pub struct CudaLibraryVersions {
+    pub cuda: String,
+    pub cublas: String,
+}
+
+impl CudaLibraryVersions {
+    fn query(cublas: &crate::cublas::CublasHandle) -> Result<Self, String> {
+        let mut cuda = 0;
+        unsafe {
+            crate::ffi::raw::cuda_runtime::check_cuda(
+                crate::ffi::raw::cuda_runtime::cudaRuntimeGetVersion(&mut cuda),
+            )?;
+        }
+        Ok(Self {
+            cuda: format_cuda_runtime_version(cuda)?,
+            cublas: format_cublas_version(cublas.version()?)?,
+        })
+    }
+}
+
+fn format_version(major: i32, minor: i32, patch: i32) -> String {
+    if patch == 0 {
+        format!("{major}.{minor}")
+    } else {
+        format!("{major}.{minor}.{patch}")
+    }
+}
+
+fn format_cuda_runtime_version(version: i32) -> Result<String, String> {
+    if version <= 0 {
+        return Err(format!("CUDA runtime returned invalid version {version}"));
+    }
+    Ok(format_version(
+        version / 1000,
+        (version % 1000) / 10,
+        version % 10,
+    ))
+}
+
+fn format_cublas_version(version: i32) -> Result<String, String> {
+    if version <= 0 {
+        return Err(format!("cuBLAS returned invalid version {version}"));
+    }
+    let (major, minor, patch) = if version >= 10_000 {
+        (version / 10_000, (version % 10_000) / 100, version % 100)
+    } else {
+        (version / 1000, (version % 1000) / 100, version % 100)
+    };
+    Ok(format_version(major, minor, patch))
+}
+
 pub struct CudaContext {
     device_id: usize,
     stream: Arc<CudaStream>,
     runtime: crate::ffi::abi::types::Runtime,
     caps: CudaDeviceCaps,
+    cublas: crate::cublas::CublasHandle,
+    library_versions: CudaLibraryVersions,
+    recipe_cache_dir: Option<String>,
 }
 
 impl CudaContext {
@@ -27,6 +84,18 @@ impl CudaContext {
     /// Tuning requires both this permission and the operator policy's
     /// `online_tune`. Disabling it still permits reuse of persisted recipes.
     pub fn new_with_autotune(device_id: usize, allow_online_tune: bool) -> Result<Self, String> {
+        Self::new_with_recipe_options(device_id, allow_online_tune, None)
+    }
+
+    /// Create a context with model-load recipe policy.
+    ///
+    /// An explicit directory becomes the default for GEMM and Attention when
+    /// an individual operation does not provide a narrower override.
+    pub fn new_with_recipe_options(
+        device_id: usize,
+        allow_online_tune: bool,
+        recipe_cache_dir: Option<String>,
+    ) -> Result<Self, String> {
         let device = i32::try_from(device_id)
             .map_err(|_| format!("CUDA device id {device_id} does not fit in i32"))?;
         unsafe {
@@ -45,8 +114,15 @@ impl CudaContext {
             )
             .map_err(|error| error.to_string())?;
         }
-        let caps = match CudaDeviceCaps::query(runtime) {
-            Ok(caps) => caps,
+        let initialized = (|| {
+            let caps = CudaDeviceCaps::query(runtime)?;
+            let cublas = crate::cublas::CublasHandle::new()?;
+            cublas.set_stream(&stream)?;
+            let library_versions = CudaLibraryVersions::query(&cublas)?;
+            Ok::<_, String>((caps, cublas, library_versions))
+        })();
+        let (caps, cublas, library_versions) = match initialized {
+            Ok(initialized) => initialized,
             Err(error) => {
                 unsafe { crate::ffi::abi::runtime::apxinf_runtime_destroy(runtime) };
                 return Err(error);
@@ -58,6 +134,9 @@ impl CudaContext {
             stream,
             runtime,
             caps,
+            library_versions,
+            cublas,
+            recipe_cache_dir,
         })
     }
 
@@ -67,6 +146,9 @@ impl CudaContext {
     /// Default recipe directory, relative to the process working directory.
     /// An explicit operator `cache_dir` overrides this hardware/toolkit path.
     pub fn default_cache_dir(&self) -> &str {
+        if let Some(directory) = self.recipe_cache_dir.as_deref() {
+            return directory;
+        }
         unsafe {
             std::ffi::CStr::from_ptr(crate::ffi::abi::runtime::apxinf_runtime_default_cache_dir(
                 self.runtime,
@@ -75,8 +157,20 @@ impl CudaContext {
         .to_str()
         .expect("native default cache directory is ASCII")
     }
+    pub(crate) fn recipe_cache_dir(&self) -> Option<&str> {
+        self.recipe_cache_dir.as_deref()
+    }
     pub fn stream(&self) -> &CudaStream {
         &self.stream
+    }
+    /// Raw cuBLAS handle bound to the context stream, for the direct-launch
+    /// GEMM helpers that predate the tuned GEMM operator.
+    pub fn cublas(&self) -> &crate::cublas::CublasHandle {
+        &self.cublas
+    }
+    /// CUDA runtime and cuBLAS library versions.
+    pub fn library_versions(&self) -> &CudaLibraryVersions {
+        &self.library_versions
     }
     pub fn caps(&self) -> &CudaDeviceCaps {
         &self.caps

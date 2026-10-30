@@ -4,7 +4,6 @@
 //! block-scale relayout) and the per-layer weight structs. No model or
 //! runner types.
 
-
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -13,7 +12,6 @@ use apxinf_cuda_new::{ops, CudaContext};
 
 use super::backend::{cpu_bytes, upload, zeros};
 use super::config::*;
-
 
 pub(crate) fn checkpoint(path: &Path) -> HashMap<String, Tensor> {
     apxinf_loader::safetensors::load_native_path(path)
@@ -48,9 +46,19 @@ pub(crate) struct FusedFc1Weight {
 }
 
 fn relayout(ctx: &CudaContext, source: &Tensor, rows: usize, k: usize) -> Tensor {
-    let bytes = ops::nvfp4_scale_buffer_bytes(rows, k, BLOCK).unwrap();
+    let bytes = ops::block_scale_buffer_bytes(rows, k, BLOCK).unwrap();
     let destination = zeros(ctx, vec![bytes], DType::F8E4M3);
-    ops::nvfp4_pack_block_scales(ctx, source, &destination, rows, k, BLOCK).unwrap();
+    ops::pack_block_scales(
+        ctx,
+        ops::PackBlockScalesArgs {
+            source,
+            output: &destination,
+            rows,
+            k,
+            block_size: BLOCK,
+        },
+    )
+    .unwrap();
     destination
 }
 
@@ -116,8 +124,12 @@ fn load_fused_gate_up(
     );
 
     let mut scales = Vec::new();
-    scales.extend_from_slice(cpu_bytes(&tensors[&format!("{prefix}.gate_proj.weight_scale")]));
-    scales.extend_from_slice(cpu_bytes(&tensors[&format!("{prefix}.up_proj.weight_scale")]));
+    scales.extend_from_slice(cpu_bytes(
+        &tensors[&format!("{prefix}.gate_proj.weight_scale")],
+    ));
+    scales.extend_from_slice(cpu_bytes(
+        &tensors[&format!("{prefix}.up_proj.weight_scale")],
+    ));
     let checkpoint_scales = upload(
         ctx,
         &scales,
@@ -228,7 +240,11 @@ fn load_fp8(
     let weight_scale = scalar(tensors, &format!("{prefix}.weight_scale"));
     let input_scale = scalar(tensors, &format!("{prefix}.input_scale"));
     let source = cpu_bytes(&tensors[&format!("{prefix}.weight")]);
-    assert_eq!(source.len(), n * k, "{prefix}.weight is not [{n}, {k}] E4M3");
+    assert_eq!(
+        source.len(),
+        n * k,
+        "{prefix}.weight is not [{n}, {k}] E4M3"
+    );
 
     let transposed = for_prefill.then(|| {
         let mut flipped = vec![0u8; source.len()];
@@ -307,8 +323,16 @@ fn load_bf16_transposed_pair(
     let element = DType::BF16.size_in_bytes();
     let first = cpu_bytes(&tensors[first_name]);
     let second = cpu_bytes(&tensors[second_name]);
-    assert_eq!(first.len(), rows * cols * element, "invalid {first_name} shape");
-    assert_eq!(second.len(), rows * cols * element, "invalid {second_name} shape");
+    assert_eq!(
+        first.len(),
+        rows * cols * element,
+        "invalid {first_name} shape"
+    );
+    assert_eq!(
+        second.len(),
+        rows * cols * element,
+        "invalid {second_name} shape"
+    );
     let mut transposed = vec![0u8; first.len() + second.len()];
     for column in 0..cols {
         for row in 0..rows {
@@ -376,7 +400,12 @@ pub(crate) fn load_model(
     let mut layers = Vec::with_capacity(LAYERS);
     for layer in 0..LAYERS {
         let prefix = format!("model.language_model.layers.{layer}");
-        let input_norm = load_bf16(ctx, tensors, &format!("{prefix}.input_layernorm.weight"), vec![HIDDEN]);
+        let input_norm = load_bf16(
+            ctx,
+            tensors,
+            &format!("{prefix}.input_layernorm.weight"),
+            vec![HIDDEN],
+        );
         let post_norm = load_bf16(
             ctx,
             tensors,
@@ -396,12 +425,50 @@ pub(crate) fn load_model(
             layers.push(Layer::Attention(Box::new(AttentionLayer {
                 input_norm,
                 post_norm,
-                q: load_fp8(ctx, tensors, &format!("{prefix}.self_attn.q_proj"), 2 * HEADS * HEAD_DIM, HIDDEN, for_prefill),
-                k: load_fp8(ctx, tensors, &format!("{prefix}.self_attn.k_proj"), KV_HEADS * HEAD_DIM, HIDDEN, for_prefill),
-                v: load_fp8(ctx, tensors, &format!("{prefix}.self_attn.v_proj"), KV_HEADS * HEAD_DIM, HIDDEN, for_prefill),
-                o: load_fp8(ctx, tensors, &format!("{prefix}.self_attn.o_proj"), HIDDEN, HEADS * HEAD_DIM, for_prefill),
-                q_norm: load_bf16(ctx, tensors, &format!("{prefix}.self_attn.q_norm.weight"), vec![HEAD_DIM]),
-                k_norm: load_bf16(ctx, tensors, &format!("{prefix}.self_attn.k_norm.weight"), vec![HEAD_DIM]),
+                q: load_fp8(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.self_attn.q_proj"),
+                    2 * HEADS * HEAD_DIM,
+                    HIDDEN,
+                    for_prefill,
+                ),
+                k: load_fp8(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.self_attn.k_proj"),
+                    KV_HEADS * HEAD_DIM,
+                    HIDDEN,
+                    for_prefill,
+                ),
+                v: load_fp8(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.self_attn.v_proj"),
+                    KV_HEADS * HEAD_DIM,
+                    HIDDEN,
+                    for_prefill,
+                ),
+                o: load_fp8(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.self_attn.o_proj"),
+                    HIDDEN,
+                    HEADS * HEAD_DIM,
+                    for_prefill,
+                ),
+                q_norm: load_bf16(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.self_attn.q_norm.weight"),
+                    vec![HEAD_DIM],
+                ),
+                k_norm: load_bf16(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.self_attn.k_norm.weight"),
+                    vec![HEAD_DIM],
+                ),
                 gate_up,
                 down,
             })));
@@ -409,14 +476,47 @@ pub(crate) fn load_model(
             layers.push(Layer::Gdn(Box::new(GdnLayer {
                 input_norm,
                 post_norm,
-                qkv: load_fp8(ctx, tensors, &format!("{prefix}.linear_attn.in_proj_qkv"), QKV_WIDTH, HIDDEN, for_prefill),
-                z: load_fp8(ctx, tensors, &format!("{prefix}.linear_attn.in_proj_z"), Z_WIDTH, HIDDEN, for_prefill),
-                out: load_fp8(ctx, tensors, &format!("{prefix}.linear_attn.out_proj"), HIDDEN, Z_WIDTH, for_prefill),
+                qkv: load_fp8(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.in_proj_qkv"),
+                    QKV_WIDTH,
+                    HIDDEN,
+                    for_prefill,
+                ),
+                z: load_fp8(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.in_proj_z"),
+                    Z_WIDTH,
+                    HIDDEN,
+                    for_prefill,
+                ),
+                out: load_fp8(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.out_proj"),
+                    HIDDEN,
+                    Z_WIDTH,
+                    for_prefill,
+                ),
                 // Transposed at load to [HIDDEN, GDN_V_HEADS]: these two are
                 // the only weights that reach a GEMM through `GemmArgs::new`,
                 // which requires b = [K, N].
-                in_proj_a: load_bf16_transposed(ctx, tensors, &format!("{prefix}.linear_attn.in_proj_a.weight"), GDN_V_HEADS, HIDDEN),
-                in_proj_b: load_bf16_transposed(ctx, tensors, &format!("{prefix}.linear_attn.in_proj_b.weight"), GDN_V_HEADS, HIDDEN),
+                in_proj_a: load_bf16_transposed(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.in_proj_a.weight"),
+                    GDN_V_HEADS,
+                    HIDDEN,
+                ),
+                in_proj_b: load_bf16_transposed(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.in_proj_b.weight"),
+                    GDN_V_HEADS,
+                    HIDDEN,
+                ),
                 in_proj_ab: load_bf16_transposed_pair(
                     ctx,
                     tensors,
@@ -425,10 +525,30 @@ pub(crate) fn load_model(
                     GDN_V_HEADS,
                     HIDDEN,
                 ),
-                a_log: load_bf16(ctx, tensors, &format!("{prefix}.linear_attn.A_log"), vec![GDN_V_HEADS]),
-                dt_bias: load_bf16(ctx, tensors, &format!("{prefix}.linear_attn.dt_bias"), vec![GDN_V_HEADS]),
-                conv_weight: load_bf16(ctx, tensors, &format!("{prefix}.linear_attn.conv1d.weight"), vec![QKV_WIDTH, CONV_WIDTH]),
-                norm_weight: load_bf16(ctx, tensors, &format!("{prefix}.linear_attn.norm.weight"), vec![GDN_HEAD_DIM]),
+                a_log: load_bf16(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.A_log"),
+                    vec![GDN_V_HEADS],
+                ),
+                dt_bias: load_bf16(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.dt_bias"),
+                    vec![GDN_V_HEADS],
+                ),
+                conv_weight: load_bf16(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.conv1d.weight"),
+                    vec![QKV_WIDTH, CONV_WIDTH],
+                ),
+                norm_weight: load_bf16(
+                    ctx,
+                    tensors,
+                    &format!("{prefix}.linear_attn.norm.weight"),
+                    vec![GDN_HEAD_DIM],
+                ),
                 gate_up,
                 down,
             })));
@@ -436,9 +556,19 @@ pub(crate) fn load_model(
     }
 
     Model {
-        embedding: load_bf16(ctx, tensors, "model.language_model.embed_tokens.weight", vec![VOCAB, HIDDEN]),
+        embedding: load_bf16(
+            ctx,
+            tensors,
+            "model.language_model.embed_tokens.weight",
+            vec![VOCAB, HIDDEN],
+        ),
         layers,
-        final_norm: load_bf16(ctx, tensors, "model.language_model.norm.weight", vec![HIDDEN]),
+        final_norm: load_bf16(
+            ctx,
+            tensors,
+            "model.language_model.norm.weight",
+            vec![HIDDEN],
+        ),
         lm_head: load_nvfp4(ctx, tensors, "lm_head", VOCAB, HIDDEN),
     }
 }

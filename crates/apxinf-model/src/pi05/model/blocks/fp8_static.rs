@@ -55,11 +55,8 @@ fn fixed_quantize(
     scale: f32,
 ) -> Result<Tensor> {
     let mut out = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
-    let mut args = ops::QuantizationArgs::new(
-        ops::QuantizationSemantic::FixedScaleE4m3,
-        input,
-        &mut out,
-    );
+    let mut args =
+        ops::QuantizationArgs::new(ops::QuantizationSemantic::FixedScaleE4m3, input, &mut out);
     args.scale = scale;
     ops::quantization(ctx, args)?;
     Ok(out)
@@ -183,9 +180,8 @@ fn fp8_gemm_geglu(
     if weight_dims[1] % 2 != 0 {
         return Err(Error::Other("π0.5 FP8 GeGLU width must be even".into()));
     }
-    let fused_shape = matches!(dims[0], 522 | 533 | 778 | 789)
-        && dims[1] == 2048
-        && weight_dims == [2048, 32768];
+    let fused_shape =
+        matches!(dims[0], 522 | 533 | 778 | 789) && dims[1] == 2048 && weight_dims == [2048, 32768];
     if fused_shape {
         let mut out = output(ctx, vec![dims[0], weight_dims[1] / 2], DType::F8E4M3)?;
         let mut gemm = ops::GemmArgs::new(input, &weights.weight, &mut out)
@@ -229,10 +225,26 @@ fn rms_normalized_fp8(
     eps: f32,
     scale: f32,
 ) -> Result<Tensor> {
-    let mut normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
-    let mut args = ops::RmsNormArgs::new(input, weight, &mut normalized, eps);
-    args.output_scale = scale;
-    ops::rms_norm(ctx, args)?;
+    let normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
+    ops::norm::norm(
+        ctx,
+        ops::NormArgs {
+            input,
+            output: None,
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Weight {
+                weight,
+                bias: None,
+                offset: false,
+            },
+            quantized: Some(ops::QuantOut::StaticE4m3 {
+                output: &normalized,
+                scale,
+            }),
+            numerics: ops::NormNumerics::Flexible,
+            eps,
+        },
+    )?;
     Ok(normalized)
 }
 
@@ -245,10 +257,26 @@ fn layer_normalized_fp8(
     eps: f32,
     scale: f32,
 ) -> Result<Tensor> {
-    let mut normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
-    let mut args = ops::LayerNormArgs::new(input, weight, bias, &mut normalized, eps);
-    args.output_scale = scale;
-    ops::layer_norm(ctx, args)?;
+    let normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
+    ops::norm::norm(
+        ctx,
+        ops::NormArgs {
+            input,
+            output: None,
+            kind: ops::NormKind::Layer,
+            affine: ops::Affine::Weight {
+                weight,
+                bias: Some(bias),
+                offset: false,
+            },
+            quantized: Some(ops::QuantOut::StaticE4m3 {
+                output: &normalized,
+                scale,
+            }),
+            numerics: ops::NormNumerics::Flexible,
+            eps,
+        },
+    )?;
     Ok(normalized)
 }
 
@@ -283,10 +311,22 @@ fn adaptive_rms_normalized_fp8(
         .copied()
         .ok_or_else(|| Error::Other("PI0.5 adaptive RMS input has no columns".into()))?;
     let norm_style = f16_vector_prefix(norm_style, 2 * cols)?;
-    let mut normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
-    let mut args = ops::AdaptiveRmsNormArgs::new(input, &norm_style, &mut normalized, eps);
-    args.output_scale = scale;
-    ops::adaptive_rms_norm(ctx, args)?;
+    let normalized = output(ctx, input.shape().dims().to_vec(), DType::F8E4M3)?;
+    ops::norm::norm(
+        ctx,
+        ops::NormArgs {
+            input,
+            output: None,
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Adaptive { style: &norm_style },
+            quantized: Some(ops::QuantOut::StaticE4m3 {
+                output: &normalized,
+                scale,
+            }),
+            numerics: ops::NormNumerics::Flexible,
+            eps,
+        },
+    )?;
     Ok(normalized)
 }
 
@@ -302,13 +342,32 @@ fn bias_residual_rms_normalized_fp8(
     scale: f32,
 ) -> Result<(Tensor, Tensor)> {
     let shape = input.shape().dims().to_vec();
-    let mut hidden = output(ctx, shape.clone(), input.dtype())?;
-    let mut normalized = output(ctx, shape, DType::F8E4M3)?;
-    let mut args = ops::BiasResidualRmsNormArgs::new(
-        input, bias, residual, weight, &mut hidden, &mut normalized, eps,
-    );
-    args.output_scale = scale;
-    ops::bias_residual_rms_norm(ctx, args)?;
+    let hidden = output(ctx, shape.clone(), input.dtype())?;
+    let normalized = output(ctx, shape, DType::F8E4M3)?;
+    ops::fused_add_norm(
+        ctx,
+        ops::FusedAddNormArgs {
+            input,
+            bias,
+            residual,
+            gate: None,
+            hidden: &hidden,
+            normalized: None,
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Weight {
+                weight,
+                bias: None,
+                offset: false,
+            },
+            quantized: Some(ops::QuantOut::StaticE4m3 {
+                output: &normalized,
+                scale,
+            }),
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
+            eps,
+        },
+    )?;
     Ok((hidden, normalized))
 }
 
@@ -325,13 +384,32 @@ fn bias_residual_layer_normalized_fp8(
     scale: f32,
 ) -> Result<(Tensor, Tensor)> {
     let shape = input.shape().dims().to_vec();
-    let mut hidden = output(ctx, shape.clone(), input.dtype())?;
-    let mut normalized = output(ctx, shape, DType::F8E4M3)?;
-    let mut args = ops::BiasResidualLayerNormArgs::new(
-        input, bias, residual, weight, norm_bias, &mut hidden, &mut normalized, eps,
-    );
-    args.output_scale = scale;
-    ops::bias_residual_layer_norm(ctx, args)?;
+    let hidden = output(ctx, shape.clone(), input.dtype())?;
+    let normalized = output(ctx, shape, DType::F8E4M3)?;
+    ops::fused_add_norm(
+        ctx,
+        ops::FusedAddNormArgs {
+            input,
+            bias,
+            residual,
+            gate: None,
+            hidden: &hidden,
+            normalized: None,
+            kind: ops::NormKind::Layer,
+            affine: ops::Affine::Weight {
+                weight,
+                bias: Some(norm_bias),
+                offset: false,
+            },
+            quantized: Some(ops::QuantOut::StaticE4m3 {
+                output: &normalized,
+                scale,
+            }),
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
+            eps,
+        },
+    )?;
     Ok((hidden, normalized))
 }
 
@@ -354,13 +432,28 @@ fn ada_gate_residual_rms_normalized_fp8(
         .ok_or_else(|| Error::Other("PI0.5 AdaRMS input has no columns".into()))?;
     let norm_style = f16_vector_prefix(norm_style, 2 * cols)?;
     let shape = input.shape().dims().to_vec();
-    let mut hidden = output(ctx, shape.clone(), input.dtype())?;
-    let mut normalized = output(ctx, shape, DType::F8E4M3)?;
-    let mut args = ops::AdaGateResidualRmsNormArgs::new(
-        input, residual, &norm_style, gate_style, &mut hidden, &mut normalized, eps,
-    );
-    args.output_scale = scale;
-    ops::ada_gate_residual_rms_norm(ctx, args)?;
+    let hidden = output(ctx, shape.clone(), input.dtype())?;
+    let normalized = output(ctx, shape, DType::F8E4M3)?;
+    ops::fused_add_norm(
+        ctx,
+        ops::FusedAddNormArgs {
+            input,
+            bias: None,
+            residual,
+            gate: Some(ops::ResidualGate::PackedStyle(gate_style)),
+            hidden: &hidden,
+            normalized: None,
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Adaptive { style: &norm_style },
+            quantized: Some(ops::QuantOut::StaticE4m3 {
+                output: &normalized,
+                scale,
+            }),
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
+            eps,
+        },
+    )?;
     Ok((hidden, normalized))
 }
 
@@ -510,7 +603,13 @@ fn language_layer_fp8_static_with_policies(
         rms_eps,
         scales.attention_norm,
     )?;
-    let qkv = fp8_gemm(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?;
+    let qkv = fp8_gemm(
+        ctx,
+        policies,
+        &normalized,
+        scales.attention_norm,
+        &weights.qkv,
+    )?;
     let qkv = split_qkv(
         ctx,
         policies,
@@ -654,7 +753,13 @@ fn action_layer_fp8_static_with_policies(
             scales.attention_norm,
         )?,
     };
-    let qkv = fp8_gemm(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?;
+    let qkv = fp8_gemm(
+        ctx,
+        policies,
+        &normalized,
+        scales.attention_norm,
+        &weights.qkv,
+    )?;
     let q = split_qkv_to_cache(
         ctx,
         policies,
@@ -846,9 +951,21 @@ fn vision_layer_fp8_static_with_policies(
         && head_dim == 72
         && weights.qkv.bias.is_some();
     let qkv = if use_packed_qkv {
-        fp8_gemm_bias(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?
+        fp8_gemm_bias(
+            ctx,
+            policies,
+            &normalized,
+            scales.attention_norm,
+            &weights.qkv,
+        )?
     } else {
-        fp8_gemm(ctx, policies, &normalized, scales.attention_norm, &weights.qkv)?
+        fp8_gemm(
+            ctx,
+            policies,
+            &normalized,
+            scales.attention_norm,
+            &weights.qkv,
+        )?
     };
     let tokens = input.shape().dims()[0];
     let views = tokens / patches_per_view;
@@ -859,9 +976,9 @@ fn vision_layer_fp8_static_with_policies(
             vec![views, patches_per_view, heads, head_dim],
             DType::F16,
         )?;
-        let mut args = ops::PackedQkvAttentionArgs::new(&qkv, &mut attention);
+        let mut args = ops::AttentionArgs::from_packed_qkv(&qkv, &mut attention);
         args.policy = policies.attention.clone();
-        ops::packed_qkv_attention(ctx, args)?;
+        ops::attention(ctx, args)?;
         attention
     } else {
         let mut q = output(ctx, vec![tokens, heads, head_dim], DType::F16)?;
@@ -991,11 +1108,8 @@ mod tests {
         let source = (0..64)
             .map(|i| f16::from_f32((i as f32 - 31.0) / 32.0))
             .collect::<Vec<_>>();
-        let input = backend::to_device(
-            &backend,
-            &Tensor::from_f16(vec![4, 16], &source).unwrap(),
-        )
-        .unwrap();
+        let input =
+            backend::to_device(&backend, &Tensor::from_f16(vec![4, 16], &source).unwrap()).unwrap();
         let output = language_layer_fp8_static(
             &backend,
             config,
@@ -1192,6 +1306,7 @@ pub(in crate::pi05::model) mod backbone {
             );
             args.ids = Some(token_ids);
             args.vocab_size = self.weights.token_embedding.shape().dims()[0];
+            args.embedding_scale = ops::EmbeddingScale::SqrtWidth;
             ops::gather(self.ctx(), args)?;
             ops::concat_rows(self.ctx(), vision_tokens, &language)
         }
@@ -1221,16 +1336,8 @@ pub(in crate::pi05::model) mod backbone {
                 )?;
                 hidden = output.hidden;
                 let cache_rows = prefix.shape().dims()[0] + self.config.action_horizon;
-                keys.push(ops::reserve_prefix(
-                    self.ctx(),
-                    &output.key,
-                    cache_rows,
-                )?);
-                values.push(ops::reserve_prefix(
-                    self.ctx(),
-                    &output.value,
-                    cache_rows,
-                )?);
+                keys.push(ops::reserve_prefix(self.ctx(), &output.key, cache_rows)?);
+                values.push(ops::reserve_prefix(self.ctx(), &output.value, cache_rows)?);
             }
             Ok(Fp8StaticPrefixKvCache {
                 keys,
@@ -1260,12 +1367,8 @@ pub(in crate::pi05::model) mod backbone {
                 self.weights.time_mlp_in.bias.as_ref(),
                 ops::PointwiseActivation::Silu,
             )?;
-            let hidden = fixed_quantize(
-                self.ctx(),
-                &self.policies,
-                &hidden,
-                self.scales.time_hidden,
-            )?;
+            let hidden =
+                fixed_quantize(self.ctx(), &self.policies, &hidden, self.scales.time_hidden)?;
             let output = fp8_gemm(
                 self.ctx(),
                 &self.policies,
@@ -1366,12 +1469,8 @@ pub(in crate::pi05::model) mod backbone {
                     "π0.5 prefix KV/modulation depth mismatch".into(),
                 ));
             }
-            let state_fp8 = fixed_quantize(
-                self.ctx(),
-                &self.policies,
-                state,
-                self.scales.action_input,
-            )?;
+            let state_fp8 =
+                fixed_quantize(self.ctx(), &self.policies, state, self.scales.action_input)?;
             let hidden = fp8_gemm(
                 self.ctx(),
                 &self.policies,

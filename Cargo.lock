@@ -73,7 +73,7 @@ version = "0.1.0"
 dependencies = [
  "apxinf-core",
  "apxinf-cpu",
- "apxinf-cuda",
+ "apxinf-cuda-new",
  "apxinf-hip",
  "apxinf-loader",
  "apxinf-mlx",
@@ -103,25 +103,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "apxinf-cuda"
-version = "0.1.0"
-dependencies = [
- "apxinf-core",
- "apxinf-cpu",
- "bytemuck",
- "cc",
- "half",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "apxinf-cuda-new"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-cpu",
  "apxinf-loader",
  "apxinf-tokenizer",
+ "cc",
  "half",
  "serde_json",
 ]
@@ -165,7 +154,6 @@ version = "0.1.0"
 dependencies = [
  "apxinf-core",
  "apxinf-cpu",
- "apxinf-cuda",
  "apxinf-cuda-new",
  "apxinf-hip",
  "apxinf-loader",
