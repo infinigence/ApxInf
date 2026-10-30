@@ -300,11 +300,11 @@ impl CpuPi05Model {
 mod tests {
     use super::*;
     #[test]
-    #[ignore = "requires APXINF_PI05_CPU_REFERENCE fixture directory"]
     fn intermediate_stages_match_independent_reference() {
-        let dir = std::path::PathBuf::from(
-            std::env::var("APXINF_PI05_CPU_REFERENCE").expect("fixture directory"),
-        );
+        let dir = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/pi05_cpu"
+        ));
         let lang = GemmaConfig {
             width: 8,
             depth: 2,

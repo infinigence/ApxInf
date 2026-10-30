@@ -1,0 +1,36 @@
+name: PI05 reference contracts
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  reference-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -p apxinf-model --test cpu_pi05
+      - run: "cargo test --locked -p apxinf-model --lib cpu_pi05::"
+      - run: cargo test --locked -p apxinf-model --example pi05_reference_gate
+      - run: python3 -m unittest discover -s tests -p test_pi05_reference_gate.py
+      - name: Validate cosine policy and forbid regressions against PR base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 scripts/check_pi05_reference_gate.py
+          if [ -n "$BASE_SHA" ]; then
+            evidence=devlocal/pi05-cpu-reference/ci-policy
+            mkdir -p "$evidence"
+            if git cat-file -e "$BASE_SHA:configs/pi05/reference-gate.json" 2>/dev/null; then
+              git show "$BASE_SHA:configs/pi05/reference-gate.json" > "$evidence/base.json"
+              git show "$BASE_SHA:scripts/check_pi05_reference_gate.py" > "$evidence/check_base.py"
+              python3 "$evidence/check_base.py" --base "$evidence/base.json" \
+                --policy configs/pi05/reference-gate.json \
+                --manifest crates/apxinf-model/tests/fixtures/pi05_gpu/manifest.json
+            fi
+          fi

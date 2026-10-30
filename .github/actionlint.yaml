@@ -1,0 +1,5 @@
+self-hosted-runner:
+  labels:
+    - thor
+    - orin
+    - pi05-ci

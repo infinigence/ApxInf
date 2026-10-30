@@ -94,3 +94,6 @@ required-features = ["cuda"]
 [[example]]
 name = "d3_decision_index"
 required-features = ["cuda"]
+
+[dev-dependencies]
+sha2 = "0.10"

@@ -1,0 +1,50 @@
+name: PI05 GPU reference
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gpu-reference:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: thor
+            variant: bf16
+            advisory: false
+          - board: thor
+            variant: fp8_static
+            advisory: false
+          - board: orin
+            variant: bf16
+            advisory: false
+          - board: orin
+            variant: int8_dynamic
+            advisory: true
+    runs-on: [self-hosted, Linux, ARM64, '${{ matrix.board }}', pi05-ci]
+    continue-on-error: ${{ matrix.advisory }}
+    timeout-minutes: 90
+    concurrency:
+      group: pi05-reference-${{ matrix.board }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run current source against fresh CPU reference
+        env:
+          PI05_CHECKPOINT: ${{ vars.PI05_CHECKPOINT }}
+          PI05_CALIBRATION: ${{ vars.PI05_CALIBRATION }}
+          BOARD: ${{ matrix.board }}
+          VARIANT: ${{ matrix.variant }}
+          OPENBLAS_NUM_THREADS: '4'
+        run: |
+          python3 scripts/run_pi05_reference_gate.py --board "$BOARD" --variant "$VARIANT" \
+            --checkpoint "$PI05_CHECKPOINT" --calibration "$PI05_CALIBRATION" \
+            --output "devlocal/pi05-cpu-reference/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$VARIANT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pi05-${{ matrix.board }}-${{ matrix.variant }}
+          path: devlocal/pi05-cpu-reference/ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.variant }}/
+          if-no-files-found: error
