@@ -109,8 +109,8 @@ fn gemm_contract_rejects_previous_spec_version() {
     let args = GemmArgs::new(&activation, &weight, &mut output);
     let mut normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
-    assert_eq!(normalized.spec.version, 9);
-    normalized.spec.version = 8;
+    assert_eq!(normalized.spec.version, 11);
+    normalized.spec.version = 10;
     let error = match super::execution::prepare(&ctx, normalized) {
         Ok(_) => panic!("previous GEMM spec must be rejected"),
         Err(error) => error,
@@ -1944,98 +1944,21 @@ fn single_round_bias_f32_split_reduction_capture_and_owner_lifetime() {
 }
 
 #[test]
-fn zero_workspace_f32_projection_fallback_capture_and_lifetime() {
+fn zero_workspace_rejects_projection_without_an_admitted_candidate() {
     let ctx = CudaContext::new_with_autotune(0, false).unwrap();
-    let (m, n, k) = (37, 32, 4096);
-    for dtype in [DType::F16, DType::BF16] {
-        let upload = |shape, values: &[f32]| {
-            if dtype == DType::F16 {
-                f16_tensor(0, shape, values)
-            } else {
-                tensor(0, shape, values)
-            }
-        };
-        let av: Vec<_> = (0..m * k).map(|i| ((i % 31) as f32 - 15.) / 16.).collect();
-        let bv: Vec<_> = (0..k * n).map(|i| ((i % 17) as f32 - 8.) / 32.).collect();
-        let a = upload(vec![m, k], &av);
-        let retained = a.clone();
-        let b = upload(vec![k, n], &bv);
-        let mut out = zeros_tensor(0, vec![m, n], dtype);
-        let mut args = GemmArgs::new(&a, &b, &mut out);
-        args.policy.cache_dir = Some(String::new());
-        args.policy.deterministic = true;
-        args.policy.workspace_limit = 0;
-        let normalized =
-            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
-                .unwrap();
-        let execution = super::execution::prepare(&ctx, normalized).unwrap();
-        assert!(
-            execution.summary().contains("cublasLt-f32-reduction"),
-            "{}",
-            execution.summary()
-        );
-        assert!(
-            execution.summary().contains("workspace=0"),
-            "{}",
-            execution.summary()
-        );
-        // Independent f64 sums also validate every admitted configuration at a
-        // nonzero workspace budget, including non-unit alpha/output scaling.
-        let round = |v: f32| {
-            if dtype == DType::F16 {
-                f16::from_f32(v).to_f32()
-            } else {
-                bf16::from_f32(v).to_f32()
-            }
-        };
-        let expected: Vec<_> = (0..m * n)
-            .map(|i| {
-                let (r, c) = (i / n, i % n);
-                let sum = (0..k)
-                    .map(|j| av[r * k + j] as f64 * bv[j * n + c] as f64)
-                    .sum::<f64>();
-                round(round((sum * 0.5) as f32) / 0.25)
-            })
-            .collect();
-        let mut scaled = GemmArgs::new(&a, &b, &mut out);
-        scaled.alpha = 0.5;
-        scaled.output_scale = 0.25;
-        scaled.policy.cache_dir = Some(String::new());
-        scaled.policy.workspace_limit = 16 << 20;
-        let normalized =
-            super::contracts::normalize(&ctx, scaled, super::contracts::Semantic::Gemm, None)
-                .unwrap();
-        super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
-        let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
-        drop(a);
-        drop(b);
-        drop(execution);
-        for sign in [1., -1.] {
-            let changed = upload(vec![m, k], &av.iter().map(|v| v * sign).collect::<Vec<_>>());
-            crate::transfers::copy_cuda_to_cuda(&ctx, &changed, &retained).unwrap();
-            drop(changed);
-            graph.replay().unwrap();
-            ctx.synchronize().unwrap();
-            let actual = crate::transfers::to_cpu(&out)
-                .unwrap()
-                .to_f32_vec()
-                .unwrap();
-            for r in 0..m {
-                for c in 0..n {
-                    let exact = (0..k)
-                        .map(|j| av[r * k + j] as f64 * bv[j * n + c] as f64)
-                        .sum::<f64>()
-                        * sign as f64;
-                    let expected = if dtype == DType::F16 {
-                        f16::from_f64(exact).to_f32()
-                    } else {
-                        bf16::from_f64(exact).to_f32()
-                    };
-                    assert_eq!(actual[r * n + c], expected, "{dtype:?} ({r},{c})");
-                }
-            }
-        }
-    }
+    let a = tensor(0, vec![37, 4096], &vec![0.5; 37 * 4096]);
+    let b = tensor(0, vec![4096, 32], &vec![0.25; 4096 * 32]);
+    let mut out = zeros_tensor(0, vec![37, 32], DType::BF16);
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.policy.workspace_limit = 0;
+    args.policy.online_tune = false;
+    args.policy.cache_dir = Some(String::new());
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    let error = super::execution::prepare(&ctx, normalized)
+        .err()
+        .expect("no zero-workspace candidate is admitted");
+    assert!(error.to_string().contains("no GEMM fallback"), "{error}");
 }
 
 /// The numerical domain must be identical across cold fallback, measured
@@ -2053,7 +1976,7 @@ fn cold_baseline_gemm_tunes_and_restores_without_changing_arithmetic() {
     for profile in 0..3 {
         let (m, k, n) = match profile {
             1 => (1760, 5120, 64), // Transposed, long-K split reduction.
-            2 => (37, 4096, 32),   // Zero-workspace projection.
+            2 => (37, 4096, 32),   // Canonical projection at its admitted workspace budget.
             _ => (7, 64, 32),
         };
         let av = |r: usize, j: usize| ((r * 7 + j) % 17) as f64 - 8.;
@@ -2094,7 +2017,7 @@ fn cold_baseline_gemm_tunes_and_restores_without_changing_arithmetic() {
             args.policy.online_tune = tune;
             args.policy.allow_fallback = fallback;
             args.policy.deterministic = true;
-            args.policy.workspace_limit = if profile == 2 { 0 } else { 1 << 20 };
+            args.policy.workspace_limit = if profile == 2 { 16 << 20 } else { 1 << 20 };
             args.policy.cache_dir = Some(cache);
             let semantic = if profile == 1 {
                 super::contracts::Semantic::GemmBias
@@ -2258,7 +2181,7 @@ fn cold_baseline_gemm_partitions_keys_and_rejects_alternate_recipes() {
     // A valid but non-baseline provider under the restricted key cannot bypass
     // eligibility, even when the persisted payload itself is well formed.
     let normalized = normalize(&mut out, GemmAlgorithmPolicy::ColdBaseline, false, false);
-    super::execution::seed_recipe(&ctx, &normalized, 2, 6, 1, 0).unwrap();
+    super::execution::seed_recipe(&ctx, &normalized, 2, 1, 1, 0).unwrap();
     let miss = super::execution::prepare(&ctx, normalized);
     assert!(miss.err().unwrap().to_string().contains("recipe miss"));
     let session = ExecutionSession::with_capacity(4096, 0).unwrap();

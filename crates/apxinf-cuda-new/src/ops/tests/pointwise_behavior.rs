@@ -181,7 +181,7 @@ fn pointwise_graph_rebinds_values_and_retains_dropped_inputs() {
 }
 
 #[test]
-fn pointwise_relu_preserves_nan_and_clamps_negative_values() {
+fn pointwise_relu_preserves_mainline_fmax_behavior() {
     let ctx = CudaContext::new(0).unwrap();
     for dtype in [DType::F16, DType::BF16, DType::F32] {
         let x = upload(
@@ -199,7 +199,8 @@ fn pointwise_relu_preserves_nan_and_clamps_negative_values() {
             [result[0], result[1], result[3], result[4]],
             [0., 2., 0., f32::INFINITY]
         );
-        assert!(result[2].is_nan());
+        // The existing L3 ReLU uses fmax(x, 0), including its NaN -> 0 rule.
+        assert_eq!(result[2], 0.);
     }
 }
 

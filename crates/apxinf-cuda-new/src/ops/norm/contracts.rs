@@ -723,6 +723,32 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         "quantized scales",
         &mut storage,
     )?;
+    if args.numerics == NormNumerics::Staged {
+        let bytes = count
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| invalid("Norm size overflow"))?;
+        let out = normalized as usize;
+        let end = out
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("Norm output range overflow"))?;
+        for (pointer, elements) in [(input_pointer, count), (weight, cols)] {
+            if pointer.is_null() {
+                continue;
+            }
+            let start = pointer as usize;
+            let input_end = start
+                .checked_add(
+                    elements
+                        .checked_mul(dtype.size_in_bytes())
+                        .ok_or_else(|| invalid("Norm input size overflow"))?,
+                )
+                .ok_or_else(|| invalid("Norm input range overflow"))?;
+            if out < input_end && start < end {
+                return Err(invalid("Staged Norm output overlaps an input"));
+            }
+        }
+    }
+
     if args.numerics == NormNumerics::StableDecode
         && operation == Operation::FusedAddNorm
         && hidden as usize != residual as usize
