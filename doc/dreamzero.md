@@ -425,6 +425,36 @@ checks and six independent 1/9/33-frame reference metrics pass. Full public
 input rebinding, robot decoding, noise/RNG and cleanup checks pass; all 12 A/B
 public metric rows are zero. Normalization and the native backend are unchanged.
 
+A seventh public A→B→B→A experiment adds per-pixel normalization/SiLU suffix
+reuse to the extended-prefix build (`65184de`, code `45697c8`). It uses the same
+validation script, raw input, joint noise and 90 byte-identical recipe files,
+with no online tuning. Each variant has two fresh processes and six warm samples.
+
+| Path | First request | First cached | First two requests | Warm median | Warm p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Published extended initial prefix | 29.843 | 20.978 | 50.821 | 20.053 | 20.091 |
+| Initial normalization/SiLU suffix reuse | 29.185 | 21.245 | 50.430 | 19.600 | 19.621 |
+
+Values are median seconds. Paired warm latency falls by 2.26% (1.023×).
+Every candidate sample (19.539–19.626 s) is below every baseline sample
+(20.013–20.096 s). All 231 warm-window observations are 1,575 MHz GPU /
+4.266 GHz EMC, with no observer timeout or sampled foreign compute PID; no
+sample is discarded. Recipes remain unchanged. Artifact offloads finish before
+A/B timing; a small completed-quality metadata read is outside every measured
+cold/warm window. First/cached values are only two default-DVFS observations per
+variant, and do not establish a cold-latency improvement, streaming speed, SLA
+or hardware minimum. This cohort is separate from the preceding comparison.
+
+The normalization path retains its original FP32 intermediates, staged operations
+and final BF16 cast; only already-identical frames are reused within a request.
+The independently normalized final frame preserves convolution partial-tile
+rounding. All nine initial latent frames and all 16 evaluations per CFG branch
+remain. The new source passes all 14 explicit and 14 implicit scenarios with
+all 56 action/video metric rows zero, five complete-output VAE bitwise comparisons,
+six independent 1/9/33-frame reference rows and full public rebind/RNG/robot-decode
+acceptance. All 12 paired public metric rows are zero. Native operators and the
+history/general VAE paths are unchanged.
+
 A separate canonical-native streaming A→B→B→A comparison exercises the same six
 history scenarios in order, with one warmup sequence followed by two measured
 sequences per fresh process. Each variant has two processes and four measured
@@ -561,8 +591,12 @@ model reuses the identical temporal suffix in the first two VAE resolutions and
 the intervening spatial-only downsampling. It computes the transient and one
 complete steady frame, then fills repeated output frames with nonoverlapping device copies. Retained
 convolution tiles keep their original GEMM row count, including the final
-partial tile. Reuse ends before temporal downsampling. Normalization and later
-VAE stages keep their full execution; all nine initial latent frames remain available to conditioning. History and
+partial tile. Per-pixel channel normalization and SiLU compute the transient
+and one steady frame with the original FP32 intermediates and final BF16 cast,
+then materialize the identical suffix. The last frame is normalized independently
+to preserve the preceding convolution's partial-tile rounding. Reuse ends before
+temporal downsampling; later VAE stages keep their full execution. All nine
+initial latent frames remain available to conditioning. History and
 general 1/9/33-frame encoding use the ordinary full path. No activation is
 reused across requests.
 

@@ -1822,6 +1822,37 @@ mod vae {
         ops::pointwise(ctx, activation)?;
         norm.reshape(x.shape().dims().to_vec())
     }
+    // These operations reduce channels independently at each pixel. An already
+    // established identical temporal suffix therefore needs only one complete
+    // steady frame. Keep the ordinary normalization precision and rounding
+    // stages, including initial FP32 intermediates and the final BF16 cast;
+    // materialize the full activation before its next consumer.
+    fn normalized_silu_prefix(
+        ctx: &Context,
+        s: &VaeWorkspace,
+        x: &Tensor,
+        gamma: &Tensor,
+        steady: Option<usize>,
+    ) -> Result<Tensor> {
+        let shape = x.shape().dims();
+        let steady = steady.filter(|&frame| frame + 2 < shape[1]);
+        let Some(first) = steady else {
+            return normalized_silu(ctx, s, x, gamma);
+        };
+        let out = s.slot(2, shape)?;
+        // A preceding convolution retains its original final partial-M tile.
+        // Its rounding may differ from a full-M steady frame, so normalize the
+        // whole last frame independently. Store it before the prefix reuses the
+        // beginning of slot 2; causal convolutions cannot affect earlier frames.
+        let last_start = (shape[1] - 1) * shape[2] * shape[3] * shape[4];
+        let last_shape = [shape[0], 1, shape[2], shape[3], shape[4]];
+        let last = normalized_silu(ctx, s, &view(x, last_start, &last_shape)?, gamma)?;
+        transfers::copy_cuda_to_cuda(ctx, &last, &view(&out, last_start, &last_shape)?)?;
+        let prefix = view(x, 0, &[shape[0], first + 1, shape[2], shape[3], shape[4]])?;
+        normalized_silu(ctx, s, &prefix, gamma)?;
+        repeat_frame_suffix(ctx, &out, first, (shape[1] - 1) * shape[2] * shape[3])?;
+        Ok(out)
+    }
     fn residual(
         ctx: &Context,
         p: &Policies,
@@ -1841,7 +1872,7 @@ mod vae {
         out: &Tensor,
         steady: Option<usize>,
     ) -> Result<()> {
-        let activated = normalized_silu(ctx, s, x, &w.norm1)?;
+        let activated = normalized_silu_prefix(ctx, s, x, &w.norm1, steady)?;
         let branch = s.slot(5, out.shape().dims())?;
         convolution_prefix(
             ctx,
@@ -1853,7 +1884,13 @@ mod vae {
             &branch,
             steady.map(|frame| frame + w.conv1.kernel[0] - 1),
         )?;
-        let activated = normalized_silu(ctx, s, &branch, &w.norm2)?;
+        let activated = normalized_silu_prefix(
+            ctx,
+            s,
+            &branch,
+            &w.norm2,
+            steady.map(|frame| frame + w.conv1.kernel[0] - 1),
+        )?;
         let projected = s.slot(6, out.shape().dims())?;
         convolution_prefix(
             ctx,
