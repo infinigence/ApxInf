@@ -1,6 +1,6 @@
 #include "../include/apxinf_cuda/reduction.h"
 #include "../framework/runtime_internal.h"
-#include "../kernels/custom/reduction.cuh"
+#include "../kernels/custom/indexed_mean.cuh"
 #include <limits>
 #include <memory>
 namespace {
