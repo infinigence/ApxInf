@@ -1462,6 +1462,90 @@ fn gpu_canonical_weight_does_not_opt_into_inplace_packing() {
 }
 
 #[test]
+fn gpu_w8a8_load_fixes_layout_before_prepare() {
+    let ctx = CudaContext::new(0).unwrap();
+    for (k, n) in [(64, 128), (63, 127)] {
+        let source = (0..k * n)
+            .map(|i| ((i / n + 3 * (i % n)) % 13) as i8 - 6)
+            .collect::<Vec<_>>();
+        let host = Tensor::from_i8(vec![k, n], &source).unwrap();
+        let (b, layout) = RepackedWeight::upload_w8a8(&ctx, &host).unwrap();
+        let physical_layout = layout.state.lock().unwrap().layout;
+        assert_eq!(
+            physical_layout,
+            if ctx.caps().sm == 87 && k % 16 == 0 && n % 8 == 0 {
+                1
+            } else {
+                4
+            }
+        );
+        let mut initial = vec![0; source.len()];
+        CudaBuffer::from_tensor(&b)
+            .unwrap()
+            .copy_to_host(&mut initial)
+            .unwrap();
+        for row in 0..k {
+            for col in 0..n {
+                let offset = if physical_layout == 1 {
+                    col * k + row
+                } else {
+                    row * n + col
+                };
+                assert_eq!(initial[offset], source[row * n + col] as u8);
+            }
+        }
+        let channels = scales(0, &vec![1.0; n]);
+        let cache = scratch_cache_dir("w8a8-load-layout");
+        for m in [1, 8, 17] {
+            let mut input = vec![0; m * k];
+            for row in 0..m {
+                input[row * k + row % k] = 1;
+            }
+            let a = bytes_tensor(0, vec![m, k], DType::I8, &input);
+            let rows = scales(0, &vec![1.0; m]);
+            // Exercise both the native NK implementation and vendor fallback.
+            for native in [false, true] {
+                if native && physical_layout != 1 {
+                    continue;
+                }
+                let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+                let mut args = GemmArgs::w8a8(&a, &rows, &b, &channels, &mut out)
+                    .with_repacked_weight(&layout);
+                args.policy.online_tune = false;
+                args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+                let mut normalized =
+                    super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                        .unwrap();
+                normalized.spec.b_layout = physical_layout;
+                if native {
+                    super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
+                }
+                let execution = super::execution::prepare(&ctx, normalized).unwrap();
+                if native {
+                    assert!(execution.summary().starts_with("cutlass-w8a8-sm87 config=0 "));
+                }
+                execution.enqueue().unwrap();
+                ctx.synchronize().unwrap();
+                for (i, value) in values(&out).into_iter().enumerate() {
+                    assert_eq!(value, source[(i / n) % k * n + i % n] as f32);
+                }
+                assert_eq!(layout.state.lock().unwrap().layout, physical_layout);
+                let mut after = vec![0; initial.len()];
+                CudaBuffer::from_tensor(&b)
+                    .unwrap()
+                    .copy_to_host(&mut after)
+                    .unwrap();
+                assert_eq!(
+                    after, initial,
+                    "prepare must not transform loaded W8A8 weights"
+                );
+            }
+        }
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+}
+
+#[test]
 fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
     let ctx = CudaContext::new(0).unwrap();
     if ctx.caps().sm != 87 {

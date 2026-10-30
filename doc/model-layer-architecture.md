@@ -116,7 +116,15 @@ wrapper merely to reproduce the names in this table.
 ### Repacked GEMM weight ownership
 
 PI0.5 device linear weights retain cuda-new `RepackedWeight` layout state next
-to their allocation. Loading only uploads canonical bytes and creates this state.
+to their allocation. INT8 row/channel W8A8 loading uses
+`RepackedWeight::upload_w8a8`: the backend checks compiled device capabilities and
+K/N geometry, converts canonical CPU bytes to fixed NK layout when supported,
+and uploads only that representation. Otherwise it uploads canonical bytes.
+The layout is committed before any execution exists and does not depend on M;
+prepare only selects compatible execution recipes. GR00T's separate W8A8 path
+already generates output-major weights during loading.
+
+Other PI0.5 weights initially upload canonical bytes and create layout state.
 The first native GEMM preparation selects a recipe, then repacks through a local
 RAII temporary, copies back to the original weight address, and frees the temporary
 before returning. There is no separate commit call and no packed-weight buffer,

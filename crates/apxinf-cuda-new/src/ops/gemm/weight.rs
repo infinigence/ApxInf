@@ -150,6 +150,107 @@ impl std::fmt::Debug for RepackedWeight {
 }
 
 impl RepackedWeight {
+    /// Upload canonical CPU `[K, N]` INT8 weights for row/channel W8A8 GEMM.
+    /// The compiled device backend fixes NK or canonical layout at load time,
+    /// independently of activation rows. Only the final representation is
+    /// uploaded; all consumers must attach the returned shared layout state.
+    pub fn upload_w8a8(ctx: &crate::CudaContext, weight: &Tensor) -> Result<(Tensor, Self)> {
+        use crate::ffi::abi::{gemm as abi, status};
+        use apxinf_core::{DType, Device};
+
+        if weight.device() != Device::Cpu || weight.dtype() != DType::I8 {
+            return Err(Error::Other("W8A8 upload requires CPU INT8 weights".into()));
+        }
+        let [k, n] = weight.shape().dims() else {
+            return Err(Error::Other("W8A8 upload requires a [K, N] matrix".into()));
+        };
+        let k64 = i64::try_from(*k).map_err(|_| Error::Other("W8A8 K overflow".into()))?;
+        let n64 = i64::try_from(*n).map_err(|_| Error::Other("W8A8 N overflow".into()))?;
+        if *k == 0 || *n == 0 {
+            return Err(Error::Other("W8A8 dimensions must be positive".into()));
+        }
+        // This queries capability, not a tactic: the SM87 W8A8 layout contract
+        // depends on dtype/K/N and device features, never M. Future providers
+        // with shape-dependent layouts must not be added to this fixed policy.
+        let spec = abi::Spec {
+            version: 8,
+            semantic: super::contracts::Semantic::Gemm as u32,
+            a_dtype: 4,
+            b_dtype: 4,
+            accumulation_dtype: 5,
+            output_dtype: 2,
+            quantization: 3,
+            b_is_immutable: 1,
+            b_layout: 0,
+            a_alignment: 16,
+            b_alignment: 16,
+            output_alignment: 16,
+            a_scales_alignment: 4,
+            b_scales_alignment: 4,
+            bias_alignment: 0,
+            residual_alignment: 0,
+            a_block_scales_alignment: 0,
+            b_block_scales_alignment: 0,
+            sf_vec_size: 0,
+            m: 1,
+            n: n64,
+            k: k64,
+            alpha_is_unit: 1,
+            output_scale_is_unit: 1,
+        };
+        let policy = abi::Policy {
+            workspace_limit: u64::MAX,
+            online_tune: 0,
+            allow_fallback: 1,
+            graph_safe: 1,
+            deterministic: 0,
+            cache_dir: std::ptr::null(),
+        };
+        let mut layouts = 0;
+        unsafe {
+            status::check(abi::apxinf_gemm_candidate_layouts(
+                ctx.runtime(),
+                &spec,
+                &policy,
+                &mut layouts,
+            ))?;
+        }
+        let layout = if layouts & (1 << 1) != 0 { 1 } else { 4 };
+        let source = weight
+            .storage()
+            .as_cpu()
+            .ok_or_else(|| Error::Other("expected CPU weight storage".into()))?;
+        if k.checked_mul(*n) != Some(source.len()) {
+            return Err(Error::Other("W8A8 weight storage size mismatch".into()));
+        }
+        let buffer = CudaBuffer::alloc(source.len(), ctx.device_id()).map_err(Error::Cuda)?;
+        if layout == 1 {
+            let mut packed = vec![0u8; source.len()];
+            // Tile the host transpose to bound strided cache traffic for large
+            // gate/up matrices. Preserve quantized bytes and channel scales.
+            for kb in (0..*k).step_by(64) {
+                for nb in (0..*n).step_by(64) {
+                    for row in kb..(kb + 64).min(*k) {
+                        for col in nb..(nb + 64).min(*n) {
+                            packed[col * k + row] = source[row * n + col];
+                        }
+                    }
+                }
+            }
+            buffer.copy_from_host(&packed).map_err(Error::Cuda)?;
+        } else {
+            buffer.copy_from_host(source).map_err(Error::Cuda)?;
+        }
+        let tensor = buffer.into_tensor(weight.shape().clone(), DType::I8);
+        let state = Self::new(&tensor)?;
+        state
+            .state
+            .lock()
+            .map_err(|_| Error::Cuda("weight state lock poisoned".into()))?
+            .layout = layout;
+        Ok((tensor, state))
+    }
+
     /// Allow independent shape/semantic choices while sharing each physical
     /// layout across live executions. A base with no live execution lease can
     /// change layout during prepare; leased allocations remain immutable.

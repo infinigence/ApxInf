@@ -24,6 +24,15 @@ GEMM uses `A=[M,K]` and `B=[K,N]`. `alpha` applies to the projection, and the fi
 - `Fp8UnitScale`: A/B are both E4M3 tensors with the expected scaling already applied.
 - `Fp8`: A/B are both E4M3; FP32 `row_scales=[M]` and `channel_scales=[N]` dequantize rows of A and columns of B, respectively.
 - `W8A8`: A/B are both INT8 and use FP32 row/channel scales with the same shapes; output is BF16, `K <= 131071`, and the mode applies only to `gemm` and `gemm_bias`.
+
+`RepackedWeight::upload_w8a8(ctx, host_weight)` accepts canonical CPU INT8
+`[K,N]` storage and returns the device tensor together with its shared layout
+state. It uploads fixed NK bytes when the compiled device backend supports the
+row/channel W8A8 contract, otherwise canonical bytes. This choice is independent
+of M and occurs before prepare; only one device representation is allocated.
+Attach the returned state to every consumer, including vendor fallback paths.
+The tensor retains its logical `[K,N]` shape and must not be read as canonical
+storage after upload. Channel scales retain their original output-channel order.
 - `Nvfp4`: A/B are both packed FP4 (`DType::E2M1Pair`, two E2M1 values per byte, low nibble first) with one unsigned-E4M3 scale per `block_size` elements along K. Output is BF16, `K` is a multiple of `block_size`, and the mode applies only to `gemm`.
 
 `Nvfp4` is the one contract whose operand storage is not the canonical `A=[M,K]`, `B=[K,N]`: both operands are K-packed, so `A` is stored `[M, K/2]` and `B` is stored `[N, K/2]`. That is the orientation a ModelOpt checkpoint already uses and the one the block-scaled kernel consumes, so requiring the usual layout would force a transpose that buys nothing. Any per-tensor scale a checkpoint carries alongside the block scales (ModelOpt's `weight_scale_2` and `input_scale`) multiplies the whole projection and therefore belongs in `alpha`, which also keeps it out of the tuning key.
