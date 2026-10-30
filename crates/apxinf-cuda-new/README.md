@@ -258,5 +258,6 @@ without a session keep their own temporary storage.
 Vendor GEMM workspace/unpack/dequantization/projection and custom/FA2/CUTLASS
 FMHA attention scratch participate. Constants and the opaque NVFP4 GEMM
 workspace remain private. Candidate tuning uses isolated temporary allocations.
-A new `prepare` traversal replaces the session's previous binding cache; old
-captured graphs retain the executions and buffers they actually reference.
+A new `prepare` traversal reuses matching cached executions and retires unused
+bindings after traversal; old captured graphs retain the executions and buffers
+they actually reference.

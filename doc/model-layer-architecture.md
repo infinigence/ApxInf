@@ -181,10 +181,11 @@ launch state supports external rebinding.
 
 Tuning candidates use private scratch. Final prepared executions borrow runner
 storage after selection and retain the actual block for graph lifetime.
-Repeated `ExecutionSession::prepare` replaces its previous binding cache;
-captured graphs retain their own executions. Changing eager IO addresses cannot
-accumulate obsolete executions in that cache. This does not migrate PI0FAST:
-its current CUDA implementation still uses the legacy eager arena/lease path.
+Repeated `ExecutionSession::prepare` reuses matching cached executions and
+retires unused bindings after traversal; captured graphs retain their own
+executions. Changing eager IO addresses cannot
+accumulate obsolete executions in that cache. Stable eager arena bindings remain cache hits across repeated preparation;
+this reuse does not require enabling CUDA Graphs.
 
 Kernel weight layout is an explicit property of each native `Implementation`
 registry entry. Implementation IDs are local to a semantic registry and must

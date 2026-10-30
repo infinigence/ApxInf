@@ -2598,3 +2598,36 @@ fn repeated_prepare_retires_eager_bindings_and_preserves_captured_graph() {
     ctx.synchronize().unwrap();
     assert_eq!(values(&old_output), vec![1.0, 2.0, 3.0, 4.0]);
 }
+
+#[test]
+fn repeated_eager_prepare_reuses_stable_arena_bindings() {
+    let ctx = CudaContext::new(0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let a = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    super::execution::reset_execution_create_count();
+    for _ in 0..64 {
+        let output = session
+            .prepare(|| {
+                let buffer = crate::workspace::output_buffer(&ctx, 8)?;
+                let mut output = buffer
+                    .as_tensor(Shape::new(vec![2, 2]), DType::BF16)
+                    .map_err(apxinf_core::Error::Cuda)?;
+                let mut args = GemmArgs::new(&a, &b, &mut output);
+                args.policy.online_tune = false;
+                args.policy.cache_dir = Some(String::new());
+                gemm(&ctx, args)?;
+                Ok(output)
+            })
+            .unwrap();
+        // Prepared GEMMs are ordered on the session stream without a per-call
+        // host synchronization; observe the result at the session boundary.
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&output), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            super::execution::execution_create_count(),
+            1,
+            "warm eager request recreated a prepared Execution"
+        );
+    }
+}
