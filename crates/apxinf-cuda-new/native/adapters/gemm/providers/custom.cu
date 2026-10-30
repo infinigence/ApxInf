@@ -75,6 +75,7 @@ uint32_t binding_projection_dtype(const Spec& spec) {
 }  // namespace
 
 uint32_t common_projection_dtype(const Spec& spec) {
+  if (spec.numerics == APXINF_GEMM_NUMERICS_STAGED_BIAS) return APXINF_DTYPE_F32;
   if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
       spec.a_dtype == APXINF_DTYPE_BF16 &&
       spec.b_dtype == APXINF_DTYPE_BF16 &&
@@ -268,7 +269,7 @@ cudaError_t launch_postprocess(const Spec& spec,
   const int blocks = static_cast<int>(
       std::min<int64_t>((count + 255) / 256, 4096));
   const uint32_t bias_dtype =
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ? spec.a_dtype :
+      spec.numerics == APXINF_GEMM_NUMERICS_STAGED_BIAS ? spec.a_dtype :
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU &&
               spec.a_dtype == APXINF_DTYPE_E4M3 &&
               spec.output_dtype == APXINF_DTYPE_E4M3

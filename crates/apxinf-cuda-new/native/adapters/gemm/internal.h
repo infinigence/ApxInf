@@ -96,7 +96,7 @@ inline bool supports_alignment(const Implementation& implementation,
                                const Spec& spec) {
   const auto required = implementation.alignment_requirements(spec);
   const bool has_bias =
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ||
+      spec.numerics == APXINF_GEMM_NUMERICS_STAGED_BIAS ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU ||
       (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL &&
@@ -163,7 +163,6 @@ size_t cublas_resource_requirements(const Spec& spec);
 void destroy_cublas(Execution& execution) noexcept;
 cudaError_t launch_cublas(Execution& execution);
 void prepare_cublaslt(Execution& execution);
-void prepare_cublaslt_f32_reduction(Execution& state);
 void prepare_cublaslt_direct_bias(Execution& execution);
 size_t cublaslt_direct_bias_resource_requirements(const Spec& spec);
 void prepare_cublaslt_native_fp8(Execution& execution);

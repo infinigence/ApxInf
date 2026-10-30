@@ -29,21 +29,14 @@ bool supports_vendor_math(const Spec& spec) {
            spec.accumulation_dtype == APXINF_DTYPE_F32));
 }
 
-bool supports_f32_projection(const Spec& spec) {
-  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
-         (spec.a_dtype == APXINF_DTYPE_BF16 || spec.a_dtype == APXINF_DTYPE_F16) &&
-         spec.b_dtype == spec.a_dtype && spec.output_dtype == spec.a_dtype &&
-         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
-         spec.quantization == APXINF_GEMM_QUANT_NONE;
-}
-
 bool supports_direct_bias(const Spec& spec) {
-  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND &&
+  return spec.numerics == APXINF_GEMM_NUMERICS_STAGED_BIAS &&
          (spec.a_dtype == APXINF_DTYPE_BF16 || spec.a_dtype == APXINF_DTYPE_F16) &&
          spec.b_dtype == spec.a_dtype && spec.output_dtype == spec.a_dtype &&
          spec.accumulation_dtype == APXINF_DTYPE_F32 &&
          spec.quantization == APXINF_GEMM_QUANT_NONE &&
          spec.output_scale_is_unit != 0;
+}
 bool supports_cublas(const Spec& spec) {
   return supports_vendor_math(spec);
 }
@@ -454,6 +447,11 @@ const ImplementationRegistry& registry(uint32_t semantic) {
   // Keep GEMM+bias as a separate L3 tuning domain even though its current L1
   // candidates happen to be the same vendor implementations.
   static const ImplementationRegistry gemm_bias_entries = {
+      {kProviderCublasLt, 9, 1, "cublasLt-single-round-bias", 0, true, true, true,
+       supports_direct_bias, direct_bias_alignment,
+       cublaslt_direct_bias_resource_requirements, cublaslt_configurations,
+       prepare_cublaslt_direct_bias, launch_cublaslt, destroy_cublaslt},
+
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
@@ -475,19 +473,6 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        launch_cutlass_w8a8_bias_m41_n4608_k1536, destroy_cutlass},
 #endif
   };
-  static const ImplementationRegistry single_round_bias_entries = {
-      {kProviderCublasLt, 9, 1, "cublasLt-single-round-bias", 0, true, true, true,
-       supports_direct_bias, direct_bias_alignment,
-       cublaslt_direct_bias_resource_requirements, cublaslt_configurations,
-       prepare_cublaslt_direct_bias, launch_cublaslt, destroy_cublaslt},
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
-       supports_vendor, vendor_alignment, cublas_resource_requirements,
-       one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
-       supports_vendor, cublaslt_alignment, cublaslt_resource_requirements,
-       cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
-       destroy_cublaslt},
-  };
   static const ImplementationRegistry gemm_bias_residual_entries = {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
@@ -506,10 +491,6 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 6, 1, "cublasLt-f32-reduction", 0, true, true, true,
-       supports_f32_projection, cublaslt_alignment, cublaslt_resource_requirements,
-       cublaslt_configurations, prepare_cublaslt_f32_reduction, launch_cublaslt,
-       destroy_cublaslt},
       {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
@@ -623,9 +604,6 @@ const ImplementationRegistry& registry(uint32_t semantic) {
     case APXINF_GEMM_SEMANTIC_GEMM_GEGLU:
       selected = &gemm_geglu_entries;
       break;
-    case APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND:
-      selected = &single_round_bias_entries;
-      break;
     case APXINF_GEMM_SEMANTIC_GEMM_BIAS:
       selected = &gemm_bias_entries;
       break;
@@ -645,8 +623,7 @@ const ImplementationRegistry& registry(uint32_t semantic) {
         return implementation.fallback;
       });
   const int expected_fallbacks =
-      (semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ||
-       semantic == APXINF_GEMM_SEMANTIC_GEMM) ? 2 : 1;
+      semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ? 2 : 1;
   if (fallback_count != expected_fallbacks) {
     throw Failure(APXINF_STATUS_INTERNAL_ERROR,
                   "GEMM semantic fallback registry is inconsistent");

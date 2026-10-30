@@ -28,6 +28,7 @@ typedef enum {
 typedef enum {
   APXINF_GEMM_NUMERICS_DEFAULT = 0,
   APXINF_GEMM_NUMERICS_LEGACY_CUBLAS = 1,
+  APXINF_GEMM_NUMERICS_STAGED_BIAS = 2,
 } apxinf_gemm_numerics_t;
 
 typedef enum {
@@ -51,7 +52,6 @@ typedef enum {
   /* BF16 GEMM followed by rounded SwiGLU. The B layout describes how gate and
      up columns are encoded. Output is [M,N]. */
   APXINF_GEMM_SEMANTIC_GEMM_SWIGLU = 5,
-  APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND = 6,
 } apxinf_gemm_semantic_t;
 
 typedef struct {

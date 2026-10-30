@@ -95,6 +95,8 @@ pub enum NormNumerics {
     StablePlanning,
     /// Round the normalized RMS value before multiplying the learned weight.
     Staged,
+    /// Four-lane vector Welford LayerNorm reduction.
+    Welford,
 }
 
 impl NormNumerics {
@@ -104,6 +106,7 @@ impl NormNumerics {
             Self::StableDecode => 1,
             Self::StablePlanning => 2,
             Self::Staged => 3,
+            Self::Welford => 4,
         }
     }
 }
@@ -157,7 +160,15 @@ fn valid_contract(
     affine: AffineKind,
     gate: GateKind,
 ) -> bool {
-    matches!((operation, statistic, affine, gate), (Operation::Norm, Statistic::L2, AffineKind::None, GateKind::None)) || matches!(
+    matches!(
+        (operation, statistic, affine, gate),
+        (
+            Operation::Norm,
+            Statistic::L2,
+            AffineKind::None,
+            GateKind::None
+        )
+    ) || matches!(
         (operation, statistic, affine, gate),
         (
             Operation::Norm,
@@ -348,12 +359,32 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
             "StablePlanning numerics currently requires weight-offset affine",
         ));
     }
-    if args.numerics == NormNumerics::Staged && !(operation == Operation::Norm &&
-        matches!((statistic, affine), (Statistic::Rms, AffineKind::Weight) | (Statistic::L2, AffineKind::None)) &&
-        gate == GateKind::None && !args.weight_offset && args.quantization == Quantization::None) {
-        return Err(invalid("Staged normalization supports plain RMS or L2 without quantization"));
+    if args.numerics == NormNumerics::Welford
+        && !(operation == Operation::Norm
+            && statistic == Statistic::Layer
+            && affine == AffineKind::Weight
+            && gate == GateKind::None
+            && !args.weight_offset
+            && args.quantization == Quantization::None)
+    {
+        return Err(invalid("Welford requires plain learned LayerNorm"));
     }
-    if dtype == DType::F32 && statistic != Statistic::L2
+    if args.numerics == NormNumerics::Staged
+        && !(operation == Operation::Norm
+            && matches!(
+                (statistic, affine),
+                (Statistic::Rms, AffineKind::Weight) | (Statistic::L2, AffineKind::None)
+            )
+            && gate == GateKind::None
+            && !args.weight_offset
+            && args.quantization == Quantization::None)
+    {
+        return Err(invalid(
+            "Staged normalization supports plain RMS or L2 without quantization",
+        ));
+    }
+    if dtype == DType::F32
+        && statistic != Statistic::L2
         && !(operation == Operation::Norm
             && statistic == Statistic::Rms
             && affine == AffineKind::Weight

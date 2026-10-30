@@ -211,9 +211,7 @@ pub fn convolution3d(
 ) -> Result<()> {
     let execution = prepare(ctx, input, weight, stride, output, workspace, -1)?;
     enqueue(&execution)?;
-    if !crate::workspace::is_capturing()
-        && (crate::workspace::may_prepare_native_resources())
-    {
+    if !crate::workspace::is_capturing() && (crate::workspace::may_prepare_native_resources()) {
         ctx.synchronize().map_err(Error::Cuda)?;
     }
     Ok(())

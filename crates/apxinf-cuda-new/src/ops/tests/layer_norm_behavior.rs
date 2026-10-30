@@ -83,7 +83,7 @@ fn layer_norm_stable_moments_and_capture_lifetime() {
             let w = upload(vec![cols], &weight);
             let b = upload(vec![cols], &bias);
             let mut output = upload(vec![5, cols], &vec![0.; values.len()]);
-            norm(&ctx, NormArgs::layer(&input, &w, &b, &mut output, 1e-6)).unwrap();
+            welford(&ctx, NormArgs::layer(&input, &w, &b, &mut output, 1e-6)).unwrap();
             ctx.synchronize().unwrap();
             let actual = transfers::to_cpu(&output).unwrap().to_f32_vec().unwrap();
             let tolerance = if dtype == DType::BF16 { 0.008 } else { 0.001 };
@@ -94,7 +94,7 @@ fn layer_norm_stable_moments_and_capture_lifetime() {
                 );
             }
             let graph = capture(&ctx, || {
-                norm(&ctx, NormArgs::layer(&input, &w, &b, &mut output, 1e-6))
+                welford(&ctx, NormArgs::layer(&input, &w, &b, &mut output, 1e-6))
             })
             .unwrap();
             drop(input);
@@ -110,4 +110,9 @@ fn layer_norm_stable_moments_and_capture_lifetime() {
             }
         }
     }
+}
+
+fn welford(ctx: &CudaContext, mut args: NormArgs<'_>) -> apxinf_core::Result<()> {
+    args.numerics = NormNumerics::Welford;
+    norm(ctx,args)
 }

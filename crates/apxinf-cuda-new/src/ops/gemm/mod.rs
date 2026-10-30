@@ -12,11 +12,12 @@ pub(crate) mod nvfp4_scales;
 mod observer;
 
 pub use contracts::{
-    GemmAlgorithmPolicy, GemmArgs, GemmNumerics, GemmPolicy, GemmQuantization, GemmWeightLayout, WeightVersion,
+    GemmAlgorithmPolicy, GemmArgs, GemmNumerics, GemmPolicy, GemmQuantization, GemmWeightLayout,
+    WeightVersion,
 };
 pub use fixed::*;
 pub use gemm::gemm;
-pub use gemm_bias::{gemm_bias, gemm_bias_single_round, GemmBiasArgs};
+pub use gemm_bias::{gemm_bias, GemmBiasArgs};
 pub use gemm_bias_residual::{gemm_bias_residual, GemmBiasResidualArgs};
 pub use gemm_geglu::{gemm_geglu, GemmGegluArgs};
 pub use gemm_gelu::{gemm_bias_gelu, GemmBiasGeluArgs};

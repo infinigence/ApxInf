@@ -32,9 +32,32 @@ mod efficient_attention_behavior;
 
 fn staged_rms(ctx: &crate::CudaContext, mut args: NormArgs<'_>) -> apxinf_core::Result<()> {
     args.numerics = NormNumerics::Staged;
-    norm(ctx,args)
+    norm(ctx, args)
 }
-fn staged_l2(ctx: &crate::CudaContext, input: &apxinf_core::Tensor, output: &mut apxinf_core::Tensor, eps: f32) -> apxinf_core::Result<()> {
-    norm(ctx,NormArgs { input, output:Some(output), kind:NormKind::L2, affine:Affine::None,
-        quantized:None,numerics:NormNumerics::Staged,eps })
+fn staged_l2(
+    ctx: &crate::CudaContext,
+    input: &apxinf_core::Tensor,
+    output: &mut apxinf_core::Tensor,
+    eps: f32,
+) -> apxinf_core::Result<()> {
+    norm(
+        ctx,
+        NormArgs {
+            input,
+            output: Some(output),
+            kind: NormKind::L2,
+            affine: Affine::None,
+            quantized: None,
+            numerics: NormNumerics::Staged,
+            eps,
+        },
+    )
+}
+
+fn gemm_bias_single_round(
+    ctx: &crate::CudaContext,
+    mut args: GemmBiasArgs<'_>,
+) -> apxinf_core::Result<()> {
+    args.gemm.policy.numerics = GemmNumerics::StagedBias;
+    gemm_bias(ctx, args)
 }

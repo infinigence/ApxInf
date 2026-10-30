@@ -32,14 +32,14 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
   if (spec.version != 11 ||
-      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ||
+      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_SWIGLU ||
       spec.a_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.b_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.accumulation_dtype > APXINF_DTYPE_I32 ||
       spec.output_dtype > APXINF_DTYPE_E4M3 ||
       spec.quantization > APXINF_GEMM_QUANT_NVFP4_BLOCK ||
       spec.b_layout > APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256 ||
-      spec.numerics > APXINF_GEMM_NUMERICS_LEGACY_CUBLAS || spec.m <= 0 ||
+      spec.numerics > APXINF_GEMM_NUMERICS_STAGED_BIAS || spec.m <= 0 ||
       spec.n <= 0 || spec.k <= 0 || spec.m > INT32_MAX ||
       spec.n > INT32_MAX || spec.k > INT32_MAX ||
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
@@ -75,8 +75,8 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
         spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU))) {
     throw Failure(APXINF_STATUS_UNSUPPORTED, "invalid INT8 GEMM contract");
   }
-  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND &&
-      (spec.quantization != APXINF_GEMM_QUANT_NONE ||
+  if (spec.numerics == APXINF_GEMM_NUMERICS_STAGED_BIAS &&
+      (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_BIAS || spec.quantization != APXINF_GEMM_QUANT_NONE ||
        (spec.a_dtype != APXINF_DTYPE_F16 && spec.a_dtype != APXINF_DTYPE_BF16) ||
        spec.b_dtype != spec.a_dtype || spec.output_dtype != spec.a_dtype)) {
     throw Failure(APXINF_STATUS_UNSUPPORTED, "invalid single-round GEMM+bias contract");
@@ -196,7 +196,7 @@ void validate_bindings(const apxinf::gemm::Spec& spec,
                        const apxinf_gemm_bindings_t& bindings,
                        bool require_output) {
   const bool needs_bias =
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND ||
+      spec.numerics == APXINF_GEMM_NUMERICS_STAGED_BIAS ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU;
   const bool allows_bias =

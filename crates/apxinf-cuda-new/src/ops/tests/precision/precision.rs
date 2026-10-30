@@ -150,12 +150,17 @@ fn gemm_bias_single_round_all_candidates_match_torch() {
             let mut out = zeros_tensor(0, vec![3, 32], dtype);
             let expected = decode(expected);
             let mut args = GemmArgs::new(&a, &b, &mut out);
-            args.weight_layout = if b_transposed { GemmWeightLayout::OutputMajor } else { GemmWeightLayout::Kn };
+            args.weight_layout = if b_transposed {
+                GemmWeightLayout::OutputMajor
+            } else {
+                GemmWeightLayout::Kn
+            };
+            args.policy.numerics = GemmNumerics::StagedBias;
             args.policy.cache_dir = Some(String::new());
             validate_all_candidates(
                 &ctx,
                 args,
-                super::contracts::Semantic::GemmBiasSingleRound,
+                super::contracts::Semantic::GemmBias,
                 Some(&bias),
                 &expected,
             )
@@ -163,7 +168,11 @@ fn gemm_bias_single_round_all_candidates_match_torch() {
             let session = crate::ExecutionSession::with_capacity(256, 0).unwrap();
             let run = |out: &mut Tensor| {
                 let mut gemm = GemmArgs::new(&a, &b, out);
-                gemm.weight_layout = if b_transposed { GemmWeightLayout::OutputMajor } else { GemmWeightLayout::Kn };
+                gemm.weight_layout = if b_transposed {
+                    GemmWeightLayout::OutputMajor
+                } else {
+                    GemmWeightLayout::Kn
+                };
                 gemm.policy.cache_dir = Some(String::new());
                 gemm_bias_single_round(&ctx, GemmBiasArgs { gemm, bias: &bias })
             };

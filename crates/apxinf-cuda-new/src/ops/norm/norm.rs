@@ -28,7 +28,9 @@ pub enum Affine<'a> {
         offset: bool,
     },
     /// Per-call `[scale; shift]` conditioning vector.
-    Adaptive { style: &'a Tensor },
+    Adaptive {
+        style: &'a Tensor,
+    },
     /// Learned RMS weight followed by independent adaptive scale and shift:
     /// `bf16(bf16(rms(x) * weight) * bf16(1 + scale) + shift)`.
     WeightedAdaptive {
@@ -207,17 +209,40 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
     let output_scale = output_scale(args.quantized);
     match args.affine {
         Affine::None => {
-            if args.kind != NormKind::L2 || args.quantized.is_some() || args.numerics != NormNumerics::Staged {
-                return Err(super::contracts::invalid("L2 requires no affine/quantization and Staged numerics"));
+            if args.kind != NormKind::L2
+                || args.quantized.is_some()
+                || args.numerics != NormNumerics::Staged
+            {
+                return Err(super::contracts::invalid(
+                    "L2 requires no affine/quantization and Staged numerics",
+                ));
             }
-            execute(ctx, RawArgs {
-                operation: Operation::Norm, statistic: Statistic::L2, affine: AffineKind::None,
-                gate: GateKind::None, quantization: Quantization::None, numerics: args.numerics,
-                bias_order: BiasOrder::SingleRound, weight_offset: false, input: args.input,
-                bias: None, residual: None, weight: None, norm_bias: None, norm_style: None,
-                gate_style: None, hidden: None, normalized: args.output,
-                quantized_output: None, quantized_scales: None, eps: args.eps, output_scale: 1.0,
-            })
+            execute(
+                ctx,
+                RawArgs {
+                    operation: Operation::Norm,
+                    statistic: Statistic::L2,
+                    affine: AffineKind::None,
+                    gate: GateKind::None,
+                    quantization: Quantization::None,
+                    numerics: args.numerics,
+                    bias_order: BiasOrder::SingleRound,
+                    weight_offset: false,
+                    input: args.input,
+                    bias: None,
+                    residual: None,
+                    weight: None,
+                    norm_bias: None,
+                    norm_style: None,
+                    gate_style: None,
+                    hidden: None,
+                    normalized: args.output,
+                    quantized_output: None,
+                    quantized_scales: None,
+                    eps: args.eps,
+                    output_scale: 1.0,
+                },
+            )
         }
 
         Affine::Weight {
@@ -273,7 +298,9 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
             match args.kind {
                 NormKind::Rms if bias.is_none() => {}
                 NormKind::Layer if bias.is_some() => {}
-                NormKind::L2 => return Err(super::contracts::invalid("L2 does not take learned affine")),
+                NormKind::L2 => {
+                    return Err(super::contracts::invalid("L2 does not take learned affine"))
+                }
                 NormKind::Rms => {
                     return Err(super::contracts::invalid(
                         "RMSNorm does not take an affine bias",

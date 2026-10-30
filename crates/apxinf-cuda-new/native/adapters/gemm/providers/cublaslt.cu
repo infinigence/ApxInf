@@ -89,8 +89,7 @@ size_t common_requirement(const Spec& spec, bool native_fp8) {
 
 void prepare_cublaslt_impl(Execution& state, bool native_fp8,
                            bool direct_fp8_gelu, bool split_geglu = false,
-                           bool native_fp4 = false, bool direct_bias = false,
-                           bool f32_reduction = false) {
+                           bool native_fp4 = false, bool direct_bias = false) {
   auto resources = std::make_unique<CublasLtState>();
   const auto& spec = state.spec;
   resources->native_fp4 = native_fp4;
@@ -122,7 +121,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
       spec.a_dtype == APXINF_DTYPE_I8
           ? CUDA_R_8I
           : native_fp8 ? CUDA_R_8F_E4M3 : projection_type;
-  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND) {
+  if (spec.numerics == APXINF_GEMM_NUMERICS_STAGED_BIAS) {
     input_type = spec.a_dtype == APXINF_DTYPE_F16 ? CUDA_R_16F : CUDA_R_16BF;
   }
   const cublasComputeType_t compute_type =
@@ -234,7 +233,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     cublasLtMatmulPreferenceDestroy(preference);
     check_cublas(status);
   }
-  if (direct_bias || f32_reduction) {
+  if (direct_bias) {
     // A split-K partial may remain in F32 before the bias epilogue and sole
     // output conversion. Exclude reductions through the F16/BF16 output type.
     const uint32_t mask = CUBLASLT_REDUCTION_SCHEME_NONE |
@@ -260,7 +259,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "cuBLASLt heuristic is unavailable");
   }
-  if (direct_bias || f32_reduction) {
+  if (direct_bias) {
     // Validate the returned reduction as well as the preference: intermediate
     // F16/BF16 partials would violate the single output-rounding contract.
     uint32_t split_k = 0, reduction = 0;
@@ -357,9 +356,7 @@ void prepare_cublaslt_direct_bias(Execution& state) {
   prepare_cublaslt_impl(state, false, false, false, false, true);
 }
 
-void prepare_cublaslt_f32_reduction(Execution& state) {
-  prepare_cublaslt_impl(state, false, false, false, false, false, true);
-}
+
 
 void prepare_cublaslt(Execution& state) {
   prepare_cublaslt_impl(state, false, false);

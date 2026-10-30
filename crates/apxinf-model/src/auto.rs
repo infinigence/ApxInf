@@ -409,7 +409,7 @@ impl AutoModel {
 
         if matches!(model_name, "dreamzero" | "dreamzero_droid") {
             #[cfg(feature = "cuda")]
-            return crate::dreamzero::load::load_with_cuda_new(path, device, options);
+            return crate::cuda_dreamzero::load::load_with_cuda_new(path, device, options);
 
             #[cfg(not(feature = "cuda"))]
             return Err(Error::Other("DreamZero requires CUDA support".into()));
@@ -799,7 +799,7 @@ mod tests {
     fn dreamzero_joint_head_resolves_before_generic_vla_type() {
         let directory = temporary_directory("dreamzero-detection");
         let mut config: serde_json::Value =
-            serde_json::from_str(include_str!("dreamzero/config_fixture.json")).unwrap();
+            serde_json::from_str(include_str!("cuda_dreamzero/config_fixture.json")).unwrap();
         config["model_type"] = serde_json::json!("vla");
         std::fs::write(directory.join("config.json"), config.to_string()).unwrap();
         assert_eq!(

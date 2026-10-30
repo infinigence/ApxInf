@@ -409,7 +409,7 @@ cudaError_t launch_split(const apxinf_rope_spec_t& spec,
     case APXINF_ROPE_SEMANTIC_COMPLEX_TABLE:
       kernels::complex_table<T><<<dim3(tokens,q_heads),128,0,stream>>>(
           static_cast<const T*>(bindings.qkv), static_cast<const double*>(bindings.bias),
-          static_cast<T*>(bindings.q), tokens,q_heads,head_dim);
+          static_cast<T*>(bindings.q), q_heads,head_dim);
       break;
     case APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE: {
       const dim3 grid(static_cast<unsigned>(tokens),

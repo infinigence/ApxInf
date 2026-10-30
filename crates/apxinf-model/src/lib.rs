@@ -3,9 +3,9 @@
 mod accelerator;
 pub mod auto;
 pub mod builtin;
+pub mod cuda_dreamzero;
 pub mod d3;
 pub mod debug;
-pub mod dreamzero;
 mod generation_config;
 pub mod gr00t;
 #[cfg(feature = "hip")]

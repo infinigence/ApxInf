@@ -221,3 +221,37 @@ impl DreamZeroConfig {
         self.video_noise_elements() + self.action_horizon * self.action_dim
     }
 }
+
+#[cfg(feature = "cuda")]
+mod execution {
+    use super::super::backend::ops;
+    #[derive(Clone)]
+    pub(in crate::cuda_dreamzero) struct Policies {
+        pub gemm: ops::GemmPolicy,
+        pub attention: ops::AttentionPolicy,
+    }
+
+    impl Default for Policies {
+        fn default() -> Self {
+            Self {
+                gemm: ops::GemmPolicy {
+                    deterministic: true,
+                    algorithm: ops::GemmAlgorithmPolicy::ColdBaseline,
+                    // Bound per-projection retained scratch across all DiT blocks.
+                    workspace_limit: 16 * 1024 * 1024,
+                    ..Default::default()
+                },
+                attention: ops::AttentionPolicy {
+                    deterministic: true,
+                    // UMT5's materialized rounded attention needs 40 MiB. Bound
+                    // each prepared execution so joint DiT attention chooses the
+                    // existing linear-memory FA2 fallback on a cold recipe store.
+                    workspace_limit: 64 * 1024 * 1024,
+                    ..Default::default()
+                },
+            }
+        }
+    }
+}
+#[cfg(feature = "cuda")]
+pub(super) use execution::Policies;

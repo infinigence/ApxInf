@@ -51,6 +51,13 @@ For PI0.5 these are `model/`, `model_runner/`, `weights/`, `load.rs` and the
 existing policy. `ModelVariant` is private precision dispatch; `LoadedModel`
 remains the common loader result. `StepModulation` names computed per-step
 scale/shift/gate tensors. Use current source symbols for unmigrated families.
+CUDA-native ports use `cuda_<family>` (see the model architecture document).
+For a single precision path, keep operator composition and physical intermediates
+in one `model/blocks/bf16.rs` behind `Bf16Blocks`; model owns stage/sampling
+order, `weights/host.rs` validates source tensors and `weights/bf16.rs` constructs
+device representations. Keep runner and preparation in their existing separate
+owners. Express rounding/accumulation requirements through explicit L3 parameters
+with unchanged defaults; qualify the opt-in path against the independent fixtures.
 A single-implementation model does not need a variant enum, generic Blocks or
 additional wrapper just to match PI0.5. Keep model and weights independent of
 runner/capture types; keep concrete precision dispatch out of the runner.

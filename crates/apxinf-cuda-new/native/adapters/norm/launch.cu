@@ -255,17 +255,18 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
       spec.output_dtype == spec.dtype && spec.quantized_cols == 0 &&
       spec.output_scale_is_unit != 0 &&
       spec.has_native_output == static_cast<uint32_t>(writes_normalized(spec));
+  const bool welford = spec.numerics == APXINF_NORM_NUMERICS_WELFORD;
   const bool staged = spec.numerics == APXINF_NORM_NUMERICS_STAGED;
   const bool staged_contract = spec.operation == APXINF_NORM_OPERATION_NORM &&
       spec.gate == APXINF_NORM_GATE_NONE && spec.weight_offset == 0 &&
       spec.quantization == APXINF_NORM_QUANTIZATION_NONE &&
       ((spec.statistic == APXINF_NORM_STATISTIC_RMS && spec.affine == APXINF_NORM_AFFINE_WEIGHT) ||
        (spec.statistic == APXINF_NORM_STATISTIC_L2 && spec.affine == APXINF_NORM_AFFINE_NONE));
-  if ((staged && !staged_contract) || (spec.statistic == APXINF_NORM_STATISTIC_L2 && !staged) ||
+  if ((welford && !(spec.operation == APXINF_NORM_OPERATION_NORM && spec.statistic == APXINF_NORM_STATISTIC_LAYER && spec.affine == APXINF_NORM_AFFINE_WEIGHT && spec.gate == APXINF_NORM_GATE_NONE && spec.weight_offset == 0 && spec.quantization == APXINF_NORM_QUANTIZATION_NONE)) || (staged && !staged_contract) || (spec.statistic == APXINF_NORM_STATISTIC_L2 && !staged) ||
       spec.version != APXINF_NORM_SPEC_VERSION ||
       !valid_contract(spec) ||
       spec.quantization > APXINF_NORM_QUANTIZATION_ROWWISE_I8 ||
-      spec.numerics > APXINF_NORM_NUMERICS_STAGED ||
+      spec.numerics > APXINF_NORM_NUMERICS_WELFORD ||
       spec.weight_offset > 1 ||
       (spec.weight_offset != 0 &&
        !weight_offset_plain && !weight_offset_fused) ||
@@ -746,6 +747,11 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
   const int cols = static_cast<int>(spec.cols);
   const int64_t count = spec.rows * spec.cols;
   auto stream = static_cast<cudaStream_t>(bindings.stream);
+  if (spec.numerics == APXINF_NORM_NUMERICS_WELFORD) {
+    if (cols%4 == 0 && cols <= (1<<24)) kernels::layer_norm_welford<T><<<rows,dim3(32,4),0,stream>>>(input,weight,norm_bias,normalized,rows,cols,bindings.eps);
+    else kernels::layer_norm<T><<<rows,kThreads,0,stream>>>(input,weight,norm_bias,normalized,rows,cols,bindings.eps);
+    return cudaGetLastError();
+  }
   if (spec.numerics == APXINF_NORM_NUMERICS_STAGED) {
     if (spec.statistic == APXINF_NORM_STATISTIC_L2) {
       kernels::rounded_l2_rows<T><<<(static_cast<unsigned>(rows)+15u)/16,256,0,stream>>>(input,normalized,rows,cols,bindings.eps);
@@ -827,13 +833,13 @@ extern "C" apxinf_status_t apxinf_norm_launch(
     }
     validate_spec(*spec);
     validate_bindings(*spec, *bindings);
-    if (spec->numerics == APXINF_NORM_NUMERICS_STAGED) {
+    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
+    if (spec->numerics == APXINF_NORM_NUMERICS_STAGED || spec->numerics == APXINF_NORM_NUMERICS_WELFORD) {
       if (spec->dtype == APXINF_DTYPE_BF16) apxinf::framework::check_cuda(launch<__nv_bfloat16>(*spec, *bindings));
       else if (spec->dtype == APXINF_DTYPE_F16) apxinf::framework::check_cuda(launch<__half>(*spec, *bindings));
       else apxinf::framework::check_cuda(launch<float>(*spec, *bindings));
       return;
     }
-    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
     apxinf::framework::check_cuda(
         spec->weight_offset != 0
             ? launch_weight_offset(*spec, *bindings)

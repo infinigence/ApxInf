@@ -1,8 +1,9 @@
 use super::{
-    backend::{ops, Context, Policies},
+    backend::{ops, Context},
+    config::Policies,
     model::DreamZeroModel,
     model_runner::DreamZeroModelRunner,
-    weights::DreamZeroWeights,
+    weights::Bf16Weights,
     DreamZeroConfig,
 };
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
@@ -58,7 +59,7 @@ pub(crate) fn load_with_cuda_new(
     let mut policies = Policies::default();
     policies.gemm.cache_dir = recipes.cache_dir.clone();
     policies.attention.cache_dir = recipes.cache_dir;
-    let weights = DreamZeroWeights::from_safetensors(&ctx, path)?;
+    let weights = Bf16Weights::from_safetensors(&ctx, path)?;
     let model = DreamZeroModel::new(ctx, weights, policies);
     Ok(LoadedModel::Vla(Box::new(DreamZeroModelRunner::new(model))))
 }

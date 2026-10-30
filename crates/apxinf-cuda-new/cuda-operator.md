@@ -29,7 +29,7 @@ before persisting a recipe. It is not a search for a faster algorithm.
 Restoration revalidates the same domain; another supported algorithm under its
 key is a miss. Both the persistent recipe and session execution keys include
 the policy. The GEMM-specific policy ABI is version 1 and requires Spec version
-9; Attention's policy ABI is unchanged.
+11; Attention's policy ABI is unchanged.
 
 This preserves the chosen reduction order across cold, tuned and restored runs
 within a compatible device/build/library/policy domain. It does not promise
@@ -93,18 +93,15 @@ including nonunit alpha/output scaling and retained changed-input graph replay.
 | Constraints | bias dtype matches the projection dtype; W8A8 output must be BF16 |
 | Reference test | `gemm_bias_all_candidates_match_torch`, `gemm_bias_accepts_output_major_checkpoint_weights_and_replays` |
 
-<!-- l3-operator:gemm_bias_single_round -->
-### `gemm_bias_single_round`
-
-| Item | Contract |
-| --- | --- |
-| Rust API | `ops::gemm_bias_single_round(ctx, GemmBiasArgs { gemm, bias })` |
-| Semantics | `cast_output(alpha * (A @ B) + bias)`; F32 accumulation and bias addition, with no intervening F16/BF16 projection rounding |
-| Inputs/output | Contiguous `A[M,K]`, `B[K,N]` (or `B[N,K]` with `GemmArgs.b_transposed=true`), `bias[N]`, output `[M,N]`; matching F16 or BF16; unquantized only |
-| Compatibility | Existing `gemm_bias` preserves its projection-rounding behavior; this semantic has its own ABI/cache identity |
-| Providers | Cold fallback first tries a cuBLASLt bias epilogue with direct output and F32 partial reduction (including split-K), then cuBLAS F32 projection plus typed bias; F16/BF16 partial reductions are excluded; cuBLASLt projection remains a tuning candidate |
-| Lifecycle | Scratch owned by prepared execution; graph-safe replay retains operands and scratch; alias and workspace checks follow GEMM |
-| Reference test | `gemm_bias_single_round_all_candidates_match_torch` covers both dtypes and weight layouts with nonsquare matrices, all candidates, repeated/changed-input replay and retained resources; `single_round_bias_cold_fallback_fits_without_full_f32_projection` bounds retained scratch |
+`GemmPolicy.numerics = GemmNumerics::StagedBias` selects a single F16/BF16
+output cast after FP32 GEMM and bias addition. It uses `gemm_bias`, accepts
+unquantized matching F16/BF16 operands with unit output scale, and reuses
+`GemmWeightLayout::{Kn,OutputMajor}`. The numerical selection participates in
+both recipe and session identity; the default selection is unchanged. Its
+native candidates are the direct cuBLASLt bias epilogue with FP32 split-K
+partials and the cuBLAS FP32 projection plus typed bias epilogue. Existing
+single-round golden, cold/tuned/restored, workspace and Graph lifetime tests
+exercise this opt-in parameter.
 
 <!-- l3-operator:gemm_bias_residual -->
 ### `gemm_bias_residual`
@@ -290,42 +287,29 @@ up to 2048. This operation does not infer modality positions or construct tables
 
 ## Row normalization
 
-<!-- l3-operator:rms_norm -->
-<!-- l3-operator:layer_norm -->
-<!-- l3-operator:adaptive_rms_norm -->
-<!-- l3-operator:bias_residual -->
-<!-- l3-operator:bias_residual_rms_norm -->
-<!-- l3-operator:bias_residual_layer_norm -->
-<!-- l3-operator:ada_gate_residual -->
-<!-- l3-operator:ada_gate_residual_rms_norm -->
-<!-- l3-operator:bias_then_residual -->
-<!-- l3-operator:rms_norm_rounded -->
-<!-- l3-operator:l2_norm_rounded -->
+<!-- l3-operator:norm -->
+<!-- l3-operator:fused_add_norm -->
+<!-- l3-operator:residual_add -->
 
-The row normalization family uses `[rows,cols]` F16/BF16 matrices, FP32
-reductions and finite positive epsilon. `rms_norm` and `layer_norm` apply
-learned `[cols]` weight (and bias for LayerNorm). Adaptive RMS uses a
-`[2*cols]` scale/shift vector; adaptive gate/residual uses the third segment
-of a `[3*cols]` gate vector. The corresponding residual variants produce a
-hidden sum and optionally a normalized output. `bias_then_residual` rounds
-input plus bias to BF16 before adding residual; ordinary bias/residual rounds
-the final sum. Existing F16 normalization can optionally emit scaled E4M3.
+Use the existing `norm`, `fused_add_norm` and `residual_add` contracts with
+`NormArgs`, `FusedAddNormArgs` and `ResidualAddArgs`. Norm kind, affine,
+quantization and residual bias order remain independent parameters. Existing
+`Flexible`, `StableDecode` and `StablePlanning` selections retain their paths.
 
-`rms_norm_rounded(ctx, RmsNormArgs)` additionally rounds `x/√(mean(x²)+eps)`
-to the input dtype before multiplying by weight. It does not permit E4M3.
-`l2_norm_rounded(ctx, input, output, eps)` computes the FP32 row L2 norm,
-rounds that norm to the input dtype, clamps it by epsilon represented in that
-dtype, then divides x and rounds the output. Epsilon is a denominator floor;
-it is not added to the sum of squares. L2 also admits F32 matrices, preserving
-promoted normalization arithmetic through the output. Its channel-row kernel
-uses sixteen F32 partials, a fixed four-group combine, and no low-precision
-partial reduction. Other normalization
-semantics retain their existing dtype admission. Both new semantics require matching
-matrix shapes and distinct input/output storage. Graph capture retains their
-device allocations. `rounded_norm_matches_independent_reference_and_replays`
-checks arithmetic, graph lifetime and shape/alias failures.
-`l2_f32_preserves_promoted_precision_and_replays` checks FP32 row normalization
-against an independent f64 oracle, zero rows and retained-resource replay.
+`NormNumerics::Staged` is an explicit unquantized plain-normalization choice.
+For learned RMSNorm it rounds the normalized value to the input dtype before
+multiplying the learned weight. For `NormKind::L2` with `Affine::None`, it
+computes the FP32 row L2 norm, rounds that norm to the input dtype, clamps by
+epsilon represented in that dtype, divides x, and rounds the output. L2
+supports F32/F16/BF16 and epsilon is a denominator floor, not a variance term.
+Staged RMS supports matching F16/BF16. Output matrices have the input shape;
+input/output overlap is rejected and Graph capture retains their allocations.
+
+`NormNumerics::Welford` selects the vector-four Welford LayerNorm reduction
+for unquantized learned F16/BF16 LayerNorm; non-vector widths use its scalar
+fallback. It does not change the default LayerNorm candidate. Independent
+normalization fixtures, shape/alias rejection and retained-resource replay
+cover both choices. Norm ABI version 8 encodes these numeric/statistic values.
 
 <!-- l3-operator:rounded_additive_attention -->
 ## Rounded additive attention
@@ -423,3 +407,11 @@ D256 attention and the 624/2200 vision schedule are candidates in the existing
 Attention registries. BF16 SwiGLU is the GEMM semantic above. First-prefill GDN
 is `ops::gdn_first_prefill`; it owns both the fixed SM110 launch and the generic
 decomposition, so candidate misses never escape to model code.
+
+<!-- l3-operator:pointwise_swiglu -->
+<!-- l3-operator:pointwise_add_into -->
+<!-- l3-operator:pointwise_swiglu_rowwise_e4m3 -->
+
+The pre-existing BF16 SwiGLU, in-place addition, and rowwise E4M3 SwiGLU
+contracts retain their original defaults and arithmetic. The new scalar and
+broadcast operations extend this family without changing these encodings.

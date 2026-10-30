@@ -26,8 +26,8 @@ bool valid_alignment(uint32_t alignment) {
 }
 
 bool reads_secondary(uint32_t semantic) {
-  return semantic >= APXINF_POINTWISE_SEMANTIC_EULER_UPDATE &&
-         semantic <= APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY;
+  return semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE ||
+         (semantic >= APXINF_POINTWISE_SEMANTIC_ADD && semantic <= APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY);
 }
 
 bool may_have_bias(uint32_t semantic) {
@@ -299,6 +299,8 @@ cudaError_t launch(const apxinf_pointwise_spec_t& spec,
 
 cudaError_t launch_bf16(const apxinf_pointwise_spec_t& spec,
                         const apxinf_pointwise_bindings_t& bindings) {
+  if (spec.semantic >= APXINF_POINTWISE_SEMANTIC_ADD) return launch<__nv_bfloat16>(spec,bindings);
+
   const auto* input = static_cast<const __nv_bfloat16*>(bindings.input);
   const auto* bias = static_cast<const __nv_bfloat16*>(bindings.bias);
   auto* output = static_cast<__nv_bfloat16*>(bindings.output);

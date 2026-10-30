@@ -39,7 +39,6 @@ __device__ inline __nv_bfloat16 from_float(float value) {
   return __float2bfloat16(value);
 }
 
-template <> __device__ inline float to_float(float x) { return x; }
 template <>
 __device__ inline float from_float(float value) {
   return value;

@@ -35,15 +35,21 @@ validation. No released official Flash checkpoint was verified for this port.
 
 | Owner | Responsibility |
 | --- | --- |
-| `dreamzero/config.rs`, `load.rs` | Strict architecture/profile admission, cuda-new recipe options, construction |
-| `dreamzero/weights/` | Complete checkpoint mapping, BF16 transposes and convolution packing, fixed relative-position tables |
-| `dreamzero/model/` | UMT5, CLIP, causal temporal VAE, joint DiT, independent video/action UniPC and observed-history computation |
-| `dreamzero/model_runner.rs` | Request validation, RNG binding, history identity/transaction, stable workspaces, three graph stages |
+| `cuda_dreamzero/config.rs`, `load.rs` | Strict architecture/profile admission, execution policy defaults, recipe options and construction |
+| `cuda_dreamzero/weights/host.rs` | CPU checkpoint read, name/shape/dtype validation and unused decoder validation; loading only |
+| `cuda_dreamzero/weights/bf16.rs` | One BF16 device representation, one-time transposes, convolution packing and fixed position tables |
+| `cuda_dreamzero/model/mod.rs` | Model-domain profile, vision/language/action topology, standard denoising loop and opaque workspace interface |
+| `cuda_dreamzero/model/blocks/bf16.rs` | Single `Bf16Blocks` implementation: UMT5, CLIP, temporal VAE, joint DiT, UniPC tensor operations and physical intermediate storage |
+| `cuda_dreamzero/model_runner/runner.rs` | `VlaRuntime`, request validation, RNG binding, transactional episode history and bounded implicit plan cache |
+| `cuda_dreamzero/model_runner/prepare.rs` | Stable buffers, real warmup, three graph captures and retained prepared resources |
 | `policies/impls/dreamzero.py` | DROID camera/task/state mapping, UMT5 tokenizer, q99 normalization, relative joint-action decoding |
 
 The family imports model-neutral safe operations through its `backend.rs`.
 `check_dreamzero_module_boundaries.py` checks the model/runner/weights direction.
-The model owns computation and the runner owns graph preparation. Neither the
+The model owns stage and sampling order; Blocks owns numerical/operator composition.
+The runner owns graph preparation. The single BF16 file uses private modality
+namespaces to distinguish tensor/weight types, rather than separate implementations.
+Host weight code is never part of forward execution. Neither the
 backend nor another family owns DreamZero-specific execution.
 
 The policy accepts uint8 camera arrays `[T,H,W,3]`, with `T` equal to 1, 4, or 9.
@@ -260,3 +266,19 @@ MLX feature isolation, opaque storage and both tokenizer CI commands pass.
 Model-family boundaries and diff checks pass. Opt-in real-checkpoint tests require
 external weights and fixed official captures; compilation or ordinary unit tests
 alone do not establish this device qualification.
+
+## Architecture revision
+
+The `cuda_dreamzero` layout follows the Fast-WAM/Cosmos review contract and
+uses the current cuda-new interfaces after merging main. Precision choices are
+explicit L3 parameters: `GemmNumerics::StagedBias` on existing GEMM+bias,
+`NormNumerics::Staged` for RMS/L2 and `NormNumerics::Welford` for LayerNorm.
+The separate additive-attention contract supplies UMT5's learned bias and
+materialized logits/probabilities; ordinary attention has no additive-bias input.
+The existing default numerical paths remain the choices for other callers.
+The unused FP32-reduction GEMM candidate was removed.
+
+The joint noise shape, native action shape, Python policy/registry names,
+history transaction and separate `reset_history`/`clear_prepared` operations
+remain the public contract. Historical measurements above are tied to their
+recorded source; they do not by themselves validate this revision.

@@ -138,18 +138,18 @@ __global__ void binary_scalar(const T* input, const T* secondary, T* output,
   for (; index < count; index += stride) {
     const float x = to_float(input[index]);
     float value;
-    if (semantic == 9) value = __fmul_rn(x, scalar);
-    else if (semantic == 10) value = __fadd_rn(x, scalar);
-    else if (semantic == 11) value = __fdiv_rn(x, scalar);
-    else if (semantic == 12) value = expf(x);
-    else if (semantic == 13) value = sinf(x);
-    else if (semantic == 14) value = cosf(x);
+    if (semantic == 12) value = __fmul_rn(x, scalar);
+    else if (semantic == 13) value = __fadd_rn(x, scalar);
+    else if (semantic == 14) value = __fdiv_rn(x, scalar);
+    else if (semantic == 15) value = expf(x);
+    else if (semantic == 16) value = sinf(x);
+    else if (semantic == 17) value = cosf(x);
     else {
-      const int64_t j = (semantic == 6 || semantic == 7) ? index % cols
-                         : semantic == 8 ? index / cols : index;
+      const int64_t j = (semantic == 9 || semantic == 10) ? index % cols
+                         : semantic == 11 ? index / cols : index;
       const float y = to_float(secondary[j]);
-      value = (semantic == 3 || semantic == 6) ? __fadd_rn(x, y)
-               : semantic == 4 ? __fsub_rn(x, y) : __fmul_rn(x, y);
+      value = (semantic == 6 || semantic == 9) ? __fadd_rn(x, y)
+               : semantic == 7 ? __fsub_rn(x, y) : __fmul_rn(x, y);
     }
     output[index] = from_float<T>(value);
   }

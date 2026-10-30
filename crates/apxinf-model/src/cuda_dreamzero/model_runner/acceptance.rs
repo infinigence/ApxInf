@@ -64,15 +64,20 @@ fn joint_checkpoint(selection: CheckpointCases) {
     let config = DreamZeroConfig::from_json_file(&checkpoint.join("config.json")).unwrap();
     drop(config);
     let ctx = Rc::new(
-        super::super::backend::Context::new_with_autotune(
+        crate::cuda_dreamzero::backend::Context::new_with_autotune(
             0,
             std::env::var_os("APXINF_DREAMZERO_AUTOTUNE").is_some(),
         )
         .unwrap(),
     );
     let weights =
-        super::super::weights::DreamZeroWeights::from_safetensors(&ctx, &checkpoint).unwrap();
-    let model = DreamZeroModel::new(ctx, weights, super::super::backend::Policies::default());
+        crate::cuda_dreamzero::weights::Bf16Weights::from_safetensors(&ctx, &checkpoint)
+            .unwrap();
+    let model = DreamZeroModel::new(
+        ctx,
+        weights,
+        crate::cuda_dreamzero::config::Policies::default(),
+    );
     let runner = DreamZeroModelRunner::new(model);
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(fixtures.join("report.json")).unwrap()).unwrap();
@@ -190,13 +195,13 @@ fn joint_checkpoint(selection: CheckpointCases) {
                 ..
             }
         ));
-        let eager_action = host(&runner, &plan.work.borrow().joint.action.sample);
-        let eager_video = host(&runner, &plan.work.borrow().joint.video.sample);
+        let eager_action = host(&runner, &plan.work.borrow().actions());
+        let eager_video = host(&runner, &plan.work.borrow().video());
         let prepared_seconds = start.elapsed().as_secs_f64();
         let start = std::time::Instant::now();
         let action = plan.run(&request).unwrap();
         let values = host(&runner, action.tensor());
-        let video = host(&runner, &plan.work.borrow().joint.video.sample);
+        let video = host(&runner, &plan.work.borrow().video());
         let replay_seconds = start.elapsed().as_secs_f64();
         assert_eq!(values, eager_action, "{name} action eager/graph parity");
         assert_eq!(video, eager_video, "{name} video eager/graph parity");
@@ -260,22 +265,16 @@ fn joint_checkpoint(selection: CheckpointCases) {
                 request.metadata,
             );
             let first = host(&runner, plan.run(&seeded).unwrap().tensor());
-            let first_future = host(&runner, &plan.work.borrow().joint.video.sample);
+            let first_future = host(&runner, &plan.work.borrow().video());
             assert_eq!(first, host(&runner, plan.run(&seeded).unwrap().tensor()));
-            assert_eq!(
-                first_future,
-                host(&runner, &plan.work.borrow().joint.video.sample)
-            );
+            assert_eq!(first_future, host(&runner, &plan.work.borrow().video()));
             let next = VlaRequest::generated_with_metadata(
                 &observation,
                 apxinf_core::RngKey::new(71, 0, 1),
                 request.metadata,
             );
             assert_ne!(first, host(&runner, plan.run(&next).unwrap().tensor()));
-            assert_ne!(
-                first_future,
-                host(&runner, &plan.work.borrow().joint.video.sample)
-            );
+            assert_ne!(first_future, host(&runner, &plan.work.borrow().video()));
             assert_eq!(values, host(&runner, plan.run(&request).unwrap().tensor()));
         }
         if name == "repeat" {

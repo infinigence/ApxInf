@@ -76,6 +76,8 @@ pub enum GemmNumerics {
     /// Preserve the established shared-cuBLAS BF16 reduction path. This is a
     /// semantic constraint; native dispatch still owns the provider choice.
     LegacyCublas,
+    /// Accumulate GEMM+bias before the only output-dtype cast.
+    StagedBias,
 }
 
 /// Parameters common to the GEMM semantic operators.
@@ -99,7 +101,6 @@ pub struct GemmArgs<'a> {
     /// identity: both the tensor address and this version identify a prepared
     /// weight.
     pub weight_version: Option<WeightVersion>,
-
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -269,7 +270,6 @@ pub(crate) enum Semantic {
     GemmBias = 3,
     GemmBiasResidual = 4,
     GemmSwiGlu = 5,
-    GemmBiasSingleRound = 6,
 }
 
 #[cfg(test)]
@@ -283,7 +283,6 @@ impl Semantic {
         Self::GemmGeglu,
         Self::GemmBiasResidual,
         Self::GemmSwiGlu,
-        Self::GemmBiasSingleRound,
     ];
 
     /// Stable identifier used by the operator catalog's machine-readable
@@ -297,7 +296,6 @@ impl Semantic {
             Self::GemmGeglu => "gemm_geglu",
             Self::GemmBiasResidual => "gemm_bias_residual",
             Self::GemmSwiGlu => "gemm_swiglu",
-            Self::GemmBiasSingleRound => "gemm_bias_single_round",
         }
     }
 }
@@ -508,7 +506,7 @@ fn normalize_fused<'a>(
             "legacy cuBLAS numerics require unit-scale canonical BF16 GEMM",
         ));
     }
-    let needs_bias = matches!(semantic, Semantic::GemmBias | Semantic::GemmBiasGelu | Semantic::GemmBiasSingleRound);
+    let needs_bias = matches!(semantic, Semantic::GemmBias | Semantic::GemmBiasGelu);
     let allows_bias = needs_bias || semantic == Semantic::GemmBiasResidual;
     if (bias.is_some() && !allows_bias) || (bias.is_none() && needs_bias) {
         return Err(invalid("fused operands do not match the semantic operator"));
@@ -583,8 +581,10 @@ fn normalize_fused<'a>(
             (4, None, None)
         }
     };
-    if semantic == Semantic::GemmBiasSingleRound
-        && (quantization != 0
+    if args.policy.numerics == GemmNumerics::StagedBias
+        && (semantic != Semantic::GemmBias
+            || args.output_scale != 1.0
+            || quantization != 0
             || !matches!(args.a.dtype(), DType::F16 | DType::BF16)
             || args.out.dtype() != args.a.dtype())
     {
@@ -761,6 +761,7 @@ fn normalize_fused<'a>(
             numerics: match args.policy.numerics {
                 GemmNumerics::Default => 0,
                 GemmNumerics::LegacyCublas => 1,
+                GemmNumerics::StagedBias => 2,
             },
             b_is_immutable: bindings.b_is_immutable,
             a_alignment: alignment_class(bindings.a),

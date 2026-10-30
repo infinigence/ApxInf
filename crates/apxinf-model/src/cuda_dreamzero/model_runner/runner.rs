@@ -1,10 +1,10 @@
-//! Request ownership, transactional observation history, and three captured stages.
-use super::{
+use super::prepare::Plan;
+// Request ownership, transactional observation history, and three captured stages.
+use crate::cuda_dreamzero::{
     backend::transfers,
     model::{DreamZeroModel, History, Profile, Workspace},
     DreamZeroConfig,
 };
-use crate::dreamzero::backend;
 use crate::vla::{
     Action, ExecutionMode, ExecutionPolicy, InferenceSpec, InitialLatent, PreparationStatus,
     PreparedInference, VisionObservation, VlaContract, VlaRequest, VlaRuntime,
@@ -13,29 +13,29 @@ use apxinf_core::{DType, Device, Error, NormalGenerator, Result, Tensor};
 use std::{cell::RefCell, rc::Rc};
 
 const NOISE: usize = 16 * 2 * 44 * 80 + 24 * 32;
-type Session = Rc<RefCell<Option<Episode>>>;
+pub(super) type Session = Rc<RefCell<Option<Episode>>>;
 #[derive(Clone)]
-struct HistoryIdentity {
-    identity: (String, String),
-    tokens: Vec<u32>,
-    mask: Vec<u8>,
-    next_frame: usize,
+pub(super) struct HistoryIdentity {
+    pub(super) identity: (String, String),
+    pub(super) tokens: Vec<u32>,
+    pub(super) mask: Vec<u8>,
+    pub(super) next_frame: usize,
 }
 #[derive(Clone)]
-struct Episode {
-    key: HistoryIdentity,
-    history: History,
+pub(super) struct Episode {
+    pub(super) key: HistoryIdentity,
+    pub(super) history: History,
 }
-struct HostInputs {
-    images: Tensor,
-    state: Tensor,
-    noise: Option<Tensor>,
-    ids: [Tensor; 2],
-    masks: [Tensor; 2],
-    valid: [Tensor; 2],
-    frames: usize,
-    identity: Option<(String, String)>,
-    mask: Vec<u8>,
+pub(super) struct HostInputs {
+    pub(super) images: Tensor,
+    pub(super) state: Tensor,
+    pub(super) noise: Option<Tensor>,
+    pub(super) ids: [Tensor; 2],
+    pub(super) masks: [Tensor; 2],
+    pub(super) valid: [Tensor; 2],
+    pub(super) frames: usize,
+    pub(super) identity: Option<(String, String)>,
+    pub(super) mask: Vec<u8>,
 }
 fn bf16_input(t: &Tensor, shape: &[usize], name: &str) -> Result<Tensor> {
     if t.device() != Device::Cpu
@@ -168,7 +168,11 @@ fn validate(request: &VlaRequest<'_>) -> Result<HostInputs> {
         mask: mask.to_vec(),
     })
 }
-fn profile(host: &HostInputs, tokens: &[u32], episode: Option<&HistoryIdentity>) -> Profile {
+pub(super) fn profile(
+    host: &HostInputs,
+    tokens: &[u32],
+    episode: Option<&HistoryIdentity>,
+) -> Profile {
     let next = episode
         .filter(|e| {
             host.identity.as_ref() == Some(&e.identity)
@@ -185,92 +189,21 @@ fn profile(host: &HostInputs, tokens: &[u32], episode: Option<&HistoryIdentity>)
 }
 
 pub struct DreamZeroModelRunner {
-    model: Rc<DreamZeroModel>,
-    session: Session,
+    pub(super) model: Rc<DreamZeroModel>,
+    pub(super) session: Session,
     implicit: RefCell<Option<Rc<Plan>>>,
 }
 impl DreamZeroModelRunner {
-    pub(super) fn new(model: DreamZeroModel) -> Self {
+    pub(in crate::cuda_dreamzero) fn new(model: DreamZeroModel) -> Self {
         Self {
             model: Rc::new(model),
             session: Rc::new(RefCell::new(None)),
             implicit: RefCell::new(None),
         }
     }
-    fn make_plan(
-        &self,
-        request: &VlaRequest<'_>,
-        host: &HostInputs,
-        policy: ExecutionPolicy,
-    ) -> Result<Plan> {
-        let episode = self.session.borrow();
-        let profile = profile(
-            host,
-            &request.observation.token_ids,
-            episode.as_ref().map(|e| &e.key),
-        );
-        let mut work = self.model.workspace(profile)?;
-        let mut normal = backend::sampling::create_normal_generator(
-            &self.model.ctx,
-            work.joint.joint_noise.clone(),
-        )?;
-        bind(&self.model, &work, host, request, &mut *normal)?;
-        self.model.bind_history(
-            &work,
-            if profile.initial() {
-                None
-            } else {
-                episode.as_ref().map(|e| &e.history)
-            },
-        )?;
-        let scratch = self.model.phase_scratch_bytes();
-        let sessions = [
-            backend::ExecutionSession::with_capacity(scratch[0], self.model.ctx.device_id())?,
-            backend::ExecutionSession::with_capacity(scratch[1], self.model.ctx.device_id())?,
-            backend::ExecutionSession::with_capacity(scratch[2], self.model.ctx.device_id())?,
-        ];
-        // Resolve each operator and its workspace on real input, without publishing history.
-        sessions[0].prepare(|| self.model.vision(&mut work, true))?;
-        sessions[1].prepare(|| self.model.language(&mut work, true))?;
-        sessions[2].prepare(|| self.model.action(&mut work, true))?;
-        self.model.ctx.synchronize().map_err(Error::Cuda)?;
-        let mut graphs = None;
-        let mut fallback_reason = None;
-        if policy != ExecutionPolicy::Eager {
-            let capture = (|| {
-                let vision = sessions[0].run(|| {
-                    backend::capture(&self.model.ctx, || self.model.vision(&mut work, false))
-                })?;
-                let language = sessions[1].run(|| {
-                    backend::capture(&self.model.ctx, || self.model.language(&mut work, false))
-                })?;
-                let action = sessions[2].run(|| {
-                    backend::capture(&self.model.ctx, || self.model.action(&mut work, false))
-                })?;
-                Ok::<_, Error>([vision, language, action])
-            })();
-            match capture {
-                Ok(g) => graphs = Some(g),
-                Err(e) if policy == ExecutionPolicy::PreferGraph => {
-                    fallback_reason = Some(e.to_string())
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(Plan {
-            spec: request.observation.inference_spec(),
-            model: self.model.clone(),
-            session: self.session.clone(),
-            profile,
-            work: RefCell::new(work),
-            normal: RefCell::new(normal),
-            graphs,
-            sessions,
-            fallback_reason,
-        })
-    }
 }
-fn bind(
+
+pub(super) fn bind(
     model: &DreamZeroModel,
     work: &Workspace,
     host: &HostInputs,
@@ -279,34 +212,21 @@ fn bind(
 ) -> Result<()> {
     // Previous execution is complete before stable public-input storage is changed.
     model.ctx.synchronize().map_err(Error::Cuda)?;
-    transfers::copy_cpu_to_cuda(&host.images, &work.vision.images)?;
-    transfers::copy_cpu_to_cuda(&host.state, &work.joint.state)?;
+    transfers::copy_cpu_to_cuda(&host.images, &work.images())?;
+    transfers::copy_cpu_to_cuda(&host.state, &work.state())?;
     for i in 0..2 {
-        transfers::copy_cpu_to_cuda(&host.ids[i], &work.ids[i])?;
-        transfers::copy_cpu_to_cuda(&host.masks[i], &work.masks[i])?;
-        transfers::copy_cpu_to_cuda(&host.valid[i], &work.valid_rows[i])?;
+        transfers::copy_cpu_to_cuda(&host.ids[i], &work.ids(i))?;
+        transfers::copy_cpu_to_cuda(&host.masks[i], &work.mask(i))?;
+        transfers::copy_cpu_to_cuda(&host.valid[i], &work.valid_rows(i))?;
     }
     match (&host.noise, request.initial_latent) {
-        (Some(t), InitialLatent::Provided(_)) => {
-            transfers::copy_cpu_to_cuda(t, &work.joint.joint_noise)?
-        }
+        (Some(t), InitialLatent::Provided(_)) => transfers::copy_cpu_to_cuda(t, &work.noise())?,
         (None, InitialLatent::Generate { rng }) => {
             normal.generate(rng)?;
         }
         _ => return Err(Error::Other("DreamZero latent binding changed".into())),
     }
     Ok(())
-}
-struct Plan {
-    spec: InferenceSpec,
-    model: Rc<DreamZeroModel>,
-    session: Session,
-    profile: Profile,
-    work: RefCell<Workspace>,
-    normal: RefCell<Box<dyn NormalGenerator>>,
-    graphs: Option<[backend::CapturedGraph; 3]>,
-    sessions: [backend::ExecutionSession; 3],
-    fallback_reason: Option<String>,
 }
 impl Plan {
     fn execute(&self, request: &VlaRequest<'_>, host: HostInputs) -> Result<Action> {
@@ -366,7 +286,7 @@ impl Plan {
         // Sole publication point: invalid inputs, warmup, capture, or failed work
         // leave the previously committed episode intact.
         *episode = next;
-        Ok(Action::new(work.joint.action.sample.clone()))
+        Ok(Action::new(work.actions().clone()))
     }
 }
 impl PreparedInference for Plan {
@@ -590,5 +510,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "model_runner/acceptance.rs"]
+#[path = "acceptance.rs"]
 mod acceptance;

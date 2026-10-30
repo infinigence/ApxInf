@@ -1732,7 +1732,12 @@ fn single_round_bias_cold_fallback_fits_without_full_f32_projection() {
             let bias = upload(vec![4096], &vec![0.125; 4096]);
             let mut out = zeros_tensor(0, vec![128, 4096], dtype);
             let mut args = GemmArgs::new(&a, &b, &mut out);
-            args.weight_layout = if b_transposed { GemmWeightLayout::OutputMajor } else { GemmWeightLayout::Kn };
+            args.weight_layout = if b_transposed {
+                GemmWeightLayout::OutputMajor
+            } else {
+                GemmWeightLayout::Kn
+            };
+            args.policy.numerics = GemmNumerics::StagedBias;
             args.policy.cache_dir = Some(String::new());
             args.policy.deterministic = true;
             // A full FP32 projection alone requires 2 MiB.
@@ -1740,7 +1745,7 @@ fn single_round_bias_cold_fallback_fits_without_full_f32_projection() {
             let normalized = super::contracts::normalize(
                 &ctx,
                 args,
-                super::contracts::Semantic::GemmBiasSingleRound,
+                super::contracts::Semantic::GemmBias,
                 Some(&bias),
             )
             .unwrap();
@@ -1784,26 +1789,28 @@ fn single_round_transposed_weight_contract_rejects_other_semantics_and_wrong_sha
     let mut out = zeros_tensor(0, vec![3, 32], DType::BF16);
     for semantic in [
         super::contracts::Semantic::Gemm,
-        super::contracts::Semantic::GemmBias,
+        super::contracts::Semantic::GemmBiasGelu,
     ] {
         let mut args = GemmArgs::new(&a, &b, &mut out);
         args.weight_layout = GemmWeightLayout::OutputMajor;
+        args.policy.numerics = GemmNumerics::StagedBias;
         assert!(super::contracts::normalize(&ctx, args, semantic, Some(&bias)).is_err());
     }
     // The default KN contract must not silently reinterpret a nonsquare NK tensor.
     assert!(super::contracts::normalize(
         &ctx,
         GemmArgs::new(&a, &b, &mut out),
-        super::contracts::Semantic::GemmBiasSingleRound,
+        super::contracts::Semantic::GemmBias,
         Some(&bias)
     )
     .is_err());
     let mut args = GemmArgs::new(&a, &b, &mut out);
     args.weight_layout = GemmWeightLayout::OutputMajor;
+    args.policy.numerics = GemmNumerics::StagedBias;
     let normalized = super::contracts::normalize(
         &ctx,
         args,
-        super::contracts::Semantic::GemmBiasSingleRound,
+        super::contracts::Semantic::GemmBias,
         Some(&bias),
     )
     .unwrap();
@@ -1845,13 +1852,14 @@ fn single_round_bias_f32_split_reduction_capture_and_owner_lifetime() {
         let mut out = zeros_tensor(0, vec![m, n], dtype);
         let mut args = GemmArgs::new(&a, &b, &mut out);
         args.weight_layout = GemmWeightLayout::OutputMajor;
+        args.policy.numerics = GemmNumerics::StagedBias;
         args.policy.cache_dir = Some(String::new());
         args.policy.deterministic = true;
         args.policy.workspace_limit = 1 << 20;
         let normalized = super::contracts::normalize(
             &ctx,
             args,
-            super::contracts::Semantic::GemmBiasSingleRound,
+            super::contracts::Semantic::GemmBias,
             Some(&bias),
         )
         .unwrap();
@@ -2074,7 +2082,14 @@ fn cold_baseline_gemm_tunes_and_restores_without_changing_arithmetic() {
         let mut out = zeros_tensor(0, vec![m, n], dtype);
         let prepare = |out: &mut Tensor, algorithm, tune, fallback, cache: String| {
             let mut args = GemmArgs::new(&a, &b, out);
-            args.weight_layout = if profile == 1 { GemmWeightLayout::OutputMajor } else { GemmWeightLayout::Kn };
+            args.weight_layout = if profile == 1 {
+                GemmWeightLayout::OutputMajor
+            } else {
+                GemmWeightLayout::Kn
+            };
+            if profile == 1 {
+                args.policy.numerics = GemmNumerics::StagedBias;
+            }
             args.policy.algorithm = algorithm;
             args.policy.online_tune = tune;
             args.policy.allow_fallback = fallback;
@@ -2082,7 +2097,7 @@ fn cold_baseline_gemm_tunes_and_restores_without_changing_arithmetic() {
             args.policy.workspace_limit = if profile == 2 { 0 } else { 1 << 20 };
             args.policy.cache_dir = Some(cache);
             let semantic = if profile == 1 {
-                super::contracts::Semantic::GemmBiasSingleRound
+                super::contracts::Semantic::GemmBias
             } else {
                 super::contracts::Semantic::Gemm
             };
