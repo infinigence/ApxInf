@@ -93,3 +93,31 @@ because arbitrary source can perform out-of-bounds access. Public fusions belong
 in this crate with complete shape/dtype/index guards and provenance. A source
 kernel and compile success alone do not establish numerical or performance
 acceptance; model and hardware qualification remain separate.
+
+Kernel templates take dtype, integer and boolean arguments (`TemplateArg`).
+An integer template is a specialization fact: each distinct value builds and
+caches a separate Metal pipeline the first time it is used.
+
+The Clef-derived fusions are `Q4TransposeDecode`, `PadRowsF16`,
+`SplitF16Gemm`, `GatedDeltaRecurrence` and `HalfSplitRope`. They decode affine Q4 group-64
+weights to FP16 for one call only; they keep no decoded weight resident.
+Their tests compare each kernel with MLX operators or a host reference on
+small shapes. They do not qualify the Clef model.
+
+`InterleavedQkNormRope` adapts the mflux Qwen-Image attention prologue:
+per-head RMSNorm, interleaved-pair RoPE from FP32 tables and the
+`[B, L, H * D]` to `[B, H, L, D]` layout change in one kernel.
+`Array::random_key` and `Array::random_normal` expose the MLX threefry
+generator, so seeded noise matches `mx.random.normal(..., key=mx.random.key(seed))`.
+
+Sampling families use `Array::random_split` and `Array::categorical`. MLX's
+global key sequence (`mx.random.seed`, then key-less random calls) splits the
+state key before each call, passes the second key to the call and keeps the
+first; a family that owns the key reproduces the same stream by doing the
+same. MLX 0.32.3 samples a single row of logits by inverse CDF, whereas 0.31.2
+used Gumbel-max, so seeded samples depend on the pinned MLX version.
+`top_k_mask` keeps partition-generated indices on the device. `put_along_axis`
+accepts a host index slice and its shape, validates every index before upload,
+and rejects out-of-range indices instead of forwarding unchecked device indices
+to MLX. Negative indices count from the end. `pad` and
+`conv_transpose1d` cover causal audio codecs.
