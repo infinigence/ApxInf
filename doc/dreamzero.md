@@ -396,6 +396,35 @@ lifetime checks pass, and all 12 A/B action metric rows are zero. The native
 backend revision is unchanged; this comparison adds only model-owned VAE work
 reuse while retaining all nine initial latent frames.
 
+A sixth public A→B→B→A experiment extends that reuse through the first
+spatial-only downsample and following 192-channel residual blocks (`45697c8`),
+against the published initial-prefix build (`75afbb1`, code `f042a56`). The
+validation script, raw input, joint noise and all 90 recipe files are identical;
+recipe files remain unchanged afterward. Two fresh processes per variant each
+record three warm samples, with online tuning disabled.
+
+| Path | First request | First cached | First two requests | Warm median | Warm p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Published initial-prefix build | 30.204 | 21.425 | 51.628 | 20.322 | 20.366 |
+| Extended initial VAE prefix | 30.205 | 21.588 | 51.793 | 19.987 | 20.039 |
+
+Values are median seconds. Paired warm latency falls by
+1.65% (1.017×). Every candidate sample
+(19.957–20.043 s) is below every baseline sample
+(20.267–20.377 s). All 237 warm-window GPU/EMC
+observations are 1,575 MHz / 4.266 GHz, with no warm observer timeout or sampled
+foreign compute PID. No sample is discarded; all artifact offloads finish
+before the first A/B process. First/cached observations use default DVFS and
+show no established improvement; their two observations per variant and the
+empirical warm p95 do not establish an SLA, streaming speed or a hardware minimum.
+
+This extended build independently passes all 14 explicit and 14 implicit
+checkpoint scenarios: all 56 action/video metric rows are zero, with the original
+16-evaluation-per-CFG-branch schedule. All five complete-output VAE bitwise
+checks and six independent 1/9/33-frame reference metrics pass. Full public
+input rebinding, robot decoding, noise/RNG and cleanup checks pass; all 12 A/B
+public metric rows are zero. Normalization and the native backend are unchanged.
+
 A separate canonical-native streaming A→B→B→A comparison exercises the same six
 history scenarios in order, with one warmup sequence followed by two measured
 sequences per fresh process. Each variant has two processes and four measured
@@ -502,8 +531,8 @@ managed allocation API or managed allocation event was recorded, but physical
 page migration, page faults and mapped-host accesses were not measured. Explicit
 CUDA copies and allocation events do not establish total physical memory traffic.
 
-Performance status is **best effort with remaining debt**. The optimized path
-is about 1.90× faster than the matched original native public path. A physical
+Performance status remains **best effort with remaining debt**. The paired public
+comparisons above identify each source and measurement scope. A physical
 DRAM-counter roofline and a complete-model hardware minimum have not been
 established; the earlier optimistic DiT-only arithmetic floor is not an achieved
 whole-model latency. The historical native/reference allocation figures use
@@ -530,12 +559,10 @@ and the 1 MiB bound; a workspace limit alone does not specify a reduction order.
 Initial vision binds one real RGB montage followed by 32 zero frames. The
 model reuses the identical temporal suffix in the first two VAE resolutions and
 the intervening spatial-only downsampling. It computes the transient and one
-complete steady frame,
-then fills repeated output frames with nonoverlapping device copies. Retained
+complete steady frame, then fills repeated output frames with nonoverlapping device copies. Retained
 convolution tiles keep their original GEMM row count, including the final
 partial tile. Reuse ends before temporal downsampling. Normalization and later
-VAE stages keep their full execution;
-all nine initial latent frames remain available to conditioning. History and
+VAE stages keep their full execution; all nine initial latent frames remain available to conditioning. History and
 general 1/9/33-frame encoding use the ordinary full path. No activation is
 reused across requests.
 
