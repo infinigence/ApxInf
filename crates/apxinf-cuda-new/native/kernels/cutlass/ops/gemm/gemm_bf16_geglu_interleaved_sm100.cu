@@ -1,6 +1,18 @@
 // Copyright 2026 ApxInf contributors.
 // SM100 BF16 widened paired gate/up projection with a TMEM-to-register epilogue.
 //
+// Two specializations share this mainloop, selected by the `Contract` template
+// parameter and differing only in the shape they accept, the activation their
+// epilogue applies and how many times a value is rounded on the way to global
+// memory:
+//
+//   GegluContract   M in {522,533}, K=2048, I=16384  tanh GeGLU, two roundings
+//   SwigluContract  M == 3387,      K=2560, I=9216   SwiGLU,     one rounding
+//
+// Do not "unify" the two activations or the rendezvous element type: each is
+// pinned bit-for-bit against a different AOT reference kernel. See
+// `SwigluContract` for the exact constants that are load-bearing.
+//
 // The static weight is tiled as [gate256, up256].  A single explicit-2SM
 // 128x512x64 SM100 GEMM therefore consumes each A K-stage once and computes
 // adjacent gate/up accumulator regions. Each small epilogue subtile loads
@@ -99,6 +111,17 @@ static_assert(!valid_production_m(534));
 #endif
 #ifndef APXINF_DUAL_GEGLU_WIDE_STAGE_COUNT
 #define APXINF_DUAL_GEGLU_WIDE_STAGE_COUNT 3
+#endif
+// MMA tile M for each contract's N512 paired tile. The atom's M follows it;
+// `WidePairGemm::LegalAtomTile` derives (M, N/2, K) from the tile.
+#ifndef APXINF_DUAL_GEGLU_WIDE_TILE_M
+#define APXINF_DUAL_GEGLU_WIDE_TILE_M 128
+#endif
+#ifndef APXINF_DUAL_GEGLU_SWIGLU_TILE_M
+#define APXINF_DUAL_GEGLU_SWIGLU_TILE_M 256
+#endif
+#ifndef APXINF_DUAL_GEGLU_SWIGLU_STAGE_COUNT
+#define APXINF_DUAL_GEGLU_SWIGLU_STAGE_COUNT 3
 #endif
 #ifndef APXINF_DUAL_GEGLU_EPI_M
 #define APXINF_DUAL_GEGLU_EPI_M 64
@@ -206,6 +229,59 @@ __device__ __forceinline__ float production_gelu(float value) {
   constexpr float kAlpha = 0.7978845608028654f;
   return 0.5f * value *
          (1.0f + tanhf(kAlpha * (value + 0.044715f * value * value * value)));
+}
+
+// --- SwiGLU, transcribed from the gemm-swiglu-bf16 AOT kernel's SASS --------
+// FMUL g,-1.4426950216293334961 ; MUFU.EX2 ; FADD +1 ; MUFU.RCP ;
+// FMUL g*s ; FMUL u*silu ; F2FP.BF16.F32.PACK_AB
+//
+// Every constant and every instruction choice below is load-bearing. The
+// reference was reproduced at 100.000000% bit-exactness over all 31,214,592
+// outputs only with exactly this form:
+//   * the multiplier is the f32 value of -log2(e). It is NOT the f64
+//     1.4426950408889634 narrowed at compile time.
+//   * `ex2.approx`/`rcp.approx` are the MUFU units. `expf`, `exp2f` and
+//     `1.0f / x` all take the correctly-rounded libdevice path instead and do
+//     not match.
+//   * gate and up stay FP32 until the single store rounding.
+//   * **`.ftz` is part of the reference, not an optimization.** The AOT
+//     kernel's SASS contains 128 bare `MUFU.EX2` and 128 bare `MUFU.RCP` and
+//     *zero* `FSETP`/`FSEL` (report 28).  Without `.ftz`, ptxas must preserve
+//     IEEE subnormal behaviour that the MUFU unit does not have, and wraps
+//     each one in a software range reduction:
+//       ex2: `FSETP.GEU x,-126` + `@!P FMUL x,x,0.5` + `@!P FMUL r,r,r`
+//       rcp: `FSETP.GT x,8.5e37` + `FSEL s,1,0.25` + `FMUL x,x,s` + `FMUL r,r,s`
+//     i.e. 4 FMUL + 2 FSETP + 1 FSEL of pure overhead per output element,
+//     which measured as `pipe_fma` 1.99x and `pipe_alu` 3.19x against the AOT
+//     while `pipe_xu` was already exactly 1.000x.  Writing `.ftz` does not
+//     relax the reference; it stops emulating something the reference never
+//     did.
+__device__ __forceinline__ float ex2_approx(float x) {
+  float r;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+  return r;
+}
+
+__device__ __forceinline__ float rcp_approx(float x) {
+  float r;
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+  return r;
+}
+
+__device__ __forceinline__ float quack_swiglu(float gate, float up) {
+  const float t = ex2_approx(gate * -1.4426950216293334961f);
+  const float s = rcp_approx(t + 1.0f);
+  return up * (gate * s);
+}
+
+// CUTLASS's bfloat16_t(float) converter compiles to F2F plus a software
+// NaN/inf guard. The AOT kernel uses F2FP.BF16.F32.PACK, which does the same
+// round-to-nearest-even in hardware two elements at a time: same numerics,
+// fewer instructions.
+__device__ __forceinline__ cutlass::bfloat16_t swiglu_store(float value) {
+  __nv_bfloat16 h = __float2bfloat16(value);
+  return cutlass::bfloat16_t::bitcast(
+      *reinterpret_cast<uint16_t const*>(&h));
 }
 
 __device__ __forceinline__ float candidate_gelu(float value) {
@@ -548,7 +624,79 @@ struct FusedUpGeGlu {
   using Device = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 
-template <class TileShape, class ClusterShape>
+// --- The two epilogue contracts --------------------------------------------
+//
+// Both consume the same N512 two-region TMEM accumulator and the same
+// physically interleaved `[K, 2I]` B operand. They differ in the accepted
+// problem shape, the rendezvous element type (which fixes how many roundings
+// happen) and the activation.
+
+struct GegluContract {
+  static constexpr int kI = kN;
+  static constexpr int kFullI = kFullN;
+  static constexpr int kDepth = kK;
+  // M128 x N512, pinned: this contract is bit-pinned against a different AOT
+  // reference and has not been re-verified at M256. See `SwigluContract`.
+  static constexpr int kTileM = APXINF_DUAL_GEGLU_WIDE_TILE_M;
+  static constexpr int kStages = APXINF_DUAL_GEGLU_WIDE_STAGE_COUNT;
+  // Off, deliberately. The hoist is semantically neutral (it replaces an
+  // all-true `copy_if` with a `copy`), but this contract's only gate is a
+  // pi0fast end-to-end run that report 28 could not execute, so it keeps the
+  // exact store path it was last verified with.
+  static constexpr bool kHoistFullTilePredicate = false;
+  static constexpr bool valid_m(int m) { return valid_production_m(m); }
+  // GeGLU rounds gate and up to BF16 on the way out of TMEM and rounds the
+  // product again at the store: two roundings, which is what its reference
+  // does.
+  using ElementRendezvous = cutlass::bfloat16_t;
+  CUTLASS_DEVICE static ElementRendezvous widen(float accumulator, float alpha) {
+    return cutlass::bfloat16_t(accumulator * alpha);
+  }
+  CUTLASS_DEVICE static ElementOutput combine(ElementRendezvous gate,
+                                              ElementRendezvous up) {
+    return ElementOutput(production_gelu(static_cast<float>(gate)) *
+                         static_cast<float>(up));
+  }
+};
+
+struct SwigluContract {
+  // Fixed-shape BF16 SwiGLU: y[3387,9216] from x[3387,2560] and
+  // W[18432,2560], with the weight's gate half followed by its up half.
+  static constexpr int kI = 9216;
+  static constexpr int kFullI = 2 * kI;
+  static constexpr int kDepth = 2560;
+  static_assert(kI % kPairColumns == 0, "interleave must divide I");
+  // M256 x N512, i.e. the AOT kernel's MMA_M.  The 2SM BF16 UMMA atom issues
+  // one `UTCHMMA.2CTA` per (K-step x MMA_N) whatever its M, so an M256 atom
+  // retires twice the FLOPs per tensor-pipe instruction that an M128 one does.
+  // At M128 this operator issued 311,040 tensor instructions against the AOT
+  // kernel's 161,280 for the same GEMM; at M256 it issues 161,280. Report 28.
+  static constexpr int kTileM = APXINF_DUAL_GEGLU_SWIGLU_TILE_M;
+  static constexpr int kStages = APXINF_DUAL_GEGLU_SWIGLU_STAGE_COUNT;
+  // On. Both branches are covered by `qwen_drive_bf16_swiglu_equivalence`: at
+  // M=3387 over a 256-row tile, M tiles 0-12 take the unpredicated store and
+  // tile 13 (rows 3328-3583) takes the predicated one, which is what leaves
+  // `[3387, 3584)` at zero.
+  static constexpr bool kHoistFullTilePredicate = true;
+  static constexpr bool valid_m(int m) { return m == 3387; }
+  // SwiGLU keeps both operands in FP32 through the rendezvous: the reference
+  // rounds exactly once, at the store. Rounding here as GeGLU does would be a
+  // second rounding and is not bit-exact.
+  using ElementRendezvous = float;
+  CUTLASS_DEVICE static ElementRendezvous widen(float accumulator, float) {
+    return accumulator;
+  }
+  CUTLASS_DEVICE static ElementOutput combine(ElementRendezvous gate,
+                                              ElementRendezvous up) {
+    return swiglu_store(quack_swiglu(gate, up));
+  }
+};
+
+static_assert(SwigluContract::valid_m(3387));
+static_assert(!SwigluContract::valid_m(3386));
+static_assert(!SwigluContract::valid_m(3388));
+
+template <class TileShape, class ClusterShape, class Contract = GegluContract>
 struct WidePairGemm {
   using LayoutA = cutlass::layout::RowMajor;
   using LayoutB = cutlass::layout::RowMajor;
@@ -560,7 +708,28 @@ struct WidePairGemm {
   // Build a legal N256 atom first, then let CollectiveMma partition the N512
   // tile into two MMA_N regions.  One shared A descriptor/stage feeds both
   // N256 B regions and cute::gemm iterates the resulting MMA_N mode.
-  using LegalAtomTile = Shape<Int<128>, Int<256>, Int<64>>;
+  //
+  // The atom's M must track the tile's M, not be pinned at 128.  `UTCHMMA`
+  // issue count is one per (k-step x MMA_N) regardless of the atom's M, so an
+  // M128 atom under an M256 tile would double MMA_M and double the tensor-pipe
+  // instruction count for identical FLOPs.  Report 28 measured exactly that:
+  // the pinned M128 atom issued 1.93x the AOT kernel's `UTCHMMA.2CTA`.
+  static constexpr int kTileM = size<0>(TileShape{});
+  static constexpr int kTileN = size<1>(TileShape{});
+  static constexpr int kTileK = size<2>(TileShape{});
+  using LegalAtomTile = Shape<Int<kTileM>, Int<kTileN / 2>, Int<kTileK>>;
+  static_assert(kTileM == 128 || kTileM == 256,
+                "the SM100 BF16 2SM UMMA atom accepts only M128 or M256");
+  static_assert(kTileN / 2 <= 256,
+                "the SM100 BF16 2SM UMMA atom is limited to N<=256");
+  // TMEM is 128 rows x 512 columns of 32 bits and the FP32 accumulator costs
+  // one column per logical N.  A CTA of a 2SM pair owns TileM/2 x TileN of it,
+  // so the number of accumulator stages that fit is fixed by the tile and must
+  // not be hard-coded: an M256 x N512 tile fills TMEM exactly once.
+  static constexpr int kAccumulatorStages =
+      (128 * 512) / ((kTileM / 2) * kTileN);
+  static_assert(kAccumulatorStages >= 1,
+                "the accumulator for this tile does not fit in TMEM");
   // D8 streamed tile: one owner warp holds only eight FP32 accumulator values
   // per lane at a time. Gate and up rendezvous as FP16 in 1 KiB of shared
   // memory instead of co-residing as complete 64x64 register fragments.
@@ -604,10 +773,14 @@ struct WidePairGemm {
         APXINF_DUAL_GEGLU_REGISTER_RENDEZVOUS ? 1 : size(EpilogueTile{});
     static constexpr int RendezvousStages = APXINF_DUAL_GEGLU_DOUBLE_BUFFER ? 2 : 1;
     struct SharedStorage {
+      // The rendezvous element type comes from the contract: GeGLU may round
+      // to BF16 here, SwiGLU must not (it would be a second rounding).
       alignas(128) cutlass::Array<
-          cutlass::bfloat16_t, RendezvousElements * RendezvousStages> gate;
+          typename Contract::ElementRendezvous,
+          RendezvousElements * RendezvousStages> gate;
       alignas(128) cutlass::Array<
-          cutlass::bfloat16_t, RendezvousElements * RendezvousStages> up;
+          typename Contract::ElementRendezvous,
+          RendezvousElements * RendezvousStages> up;
     };
 
     struct Arguments {
@@ -638,7 +811,9 @@ struct WidePairGemm {
                               Arguments const& args) {
       auto shape = append<4>(problem_shape, 1);
       auto [m, n, k, l] = shape;
-      bool exact_shape = valid_production_m(m) && n == kFullN && k == kK && l == 1;
+      // `n` is the logical full N of the paired problem, i.e. 2 * I.
+      bool exact_shape = Contract::valid_m(m) && n == Contract::kFullI &&
+                         k == Contract::kDepth && l == 1;
       bool valid_args = args.ptr_D != nullptr && std::isfinite(args.alpha) &&
                         std::isfinite(args.inverse_scale);
       return exact_shape && valid_args;
@@ -708,8 +883,8 @@ struct WidePairGemm {
       Tensor tTR_gD = thread_t2r.partition_D(gD_epi);
       Tensor rAcc = make_tensor<Accumulator>(
           shape(tTR_gD(_, _, _, _0{}, _0{})));
-      Tensor rGate = make_tensor<cutlass::bfloat16_t>(shape(rAcc));
-      Tensor rUp = make_tensor<cutlass::bfloat16_t>(shape(rAcc));
+      Tensor rGate = make_tensor<typename Contract::ElementRendezvous>(shape(rAcc));
+      Tensor rUp = make_tensor<typename Contract::ElementRendezvous>(shape(rAcc));
       Tensor rD = make_tensor<ElementD>(shape(rAcc));
 
       Tensor coordD = make_identity_tensor(compact_problem);
@@ -723,6 +898,23 @@ struct WidePairGemm {
 
       constexpr int NumEpiM = CUTE_STATIC_V(size<3>(tTR_tGate));
       constexpr int NumEpiN = CUTE_STATIC_V(size<4>(tTR_tGate));
+      // Whether every element of this CTA's output tile is inside the problem,
+      // decided once from the tile's own last coordinate rather than from an
+      // arithmetic restatement of the tiling.
+      //
+      // Measured, not assumed, why this is worth a branch: with the
+      // per-element `elem_less` predicate always built, the epilogue's
+      // coordinate and compare arithmetic costs ~6.9 extra instructions per
+      // output element against the AOT kernel's store path -- report 28's pipe
+      // breakdown is pipe_alu 3.19x and pipe_fma 1.98x with pipe_xu at exactly
+      // 1.000x, i.e. the activation itself is already at parity and all of the
+      // excess is addressing.  At M=3387 over a 256-row tile only 1 of 14 M
+      // tiles is partial and N divides exactly, so 13 of 14 CTAs can store
+      // unpredicated.  The partial tile keeps the predicate, and that is what
+      // leaves the `[M, PADDED_M)` tail the down projection reads at zero.
+      const bool whole_tile_in_bounds =
+          Contract::kHoistFullTilePredicate &&
+          elem_less(cD(size(cD) - 1), compact_problem);
       auto synchronize = []() CUTLASS_LAMBDA_FUNC_INLINE {
         cutlass::arch::NamedBarrier::sync(
             ThreadCount,
@@ -767,39 +959,40 @@ struct WidePairGemm {
             copy(tiled_t2r, tGateTile, rAcc);
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(rAcc); ++i) {
-              rGate(i) = cutlass::bfloat16_t(rAcc(i) * params_.alpha);
+              rGate(i) = Contract::widen(rAcc(i), params_.alpha);
             }
             copy(tiled_t2r, tUpTile, rAcc);
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(rAcc); ++i) {
-              rUp(i) = cutlass::bfloat16_t(rAcc(i) * params_.alpha);
+              rUp(i) = Contract::widen(rAcc(i), params_.alpha);
             }
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(rD); ++i) {
-              float gate = static_cast<float>(rGate(i));
-              float up = static_cast<float>(rUp(i));
-              float value = production_gelu(gate) * up;
-              rD(i) = ElementD(value);
+              rD(i) = Contract::combine(rGate(i), rUp(i));
             }
 
-            Tensor coord = tTR_cD(_, _, _, epi_m, epi_n);
-            Tensor pred = lazy::transform(
-                coord, [&](auto const& c) CUTLASS_LAMBDA_FUNC_INLINE {
-                  return elem_less(c, compact_problem);
-                });
             Tensor dst = recast<VectorType>(
                 coalesce(tTR_gD(_, _, _, epi_m, epi_n)));
             Tensor src = recast<VectorType>(coalesce(rD));
-            Tensor vec_pred = tensor<1>(zipped_divide(
-                coalesce(pred), common_layout.compose(Int<Vector>{})));
-            copy_if(vec_pred, src, dst);
+            if (whole_tile_in_bounds) {
+              copy(src, dst);
+            } else {
+              Tensor coord = tTR_cD(_, _, _, epi_m, epi_n);
+              Tensor pred = lazy::transform(
+                  coord, [&](auto const& c) CUTLASS_LAMBDA_FUNC_INLINE {
+                    return elem_less(c, compact_problem);
+                  });
+              Tensor vec_pred = tensor<1>(zipped_divide(
+                  coalesce(pred), common_layout.compose(Int<Vector>{})));
+              copy_if(vec_pred, src, dst);
+            }
           }
 #else
           if (warp_idx == gate_owner) {
             copy(tiled_t2r, tGateTile, rAcc);
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(rAcc); ++i) {
-              rGate(i) = cutlass::bfloat16_t(rAcc(i) * params_.alpha);
+              rGate(i) = Contract::widen(rAcc(i), params_.alpha);
             }
             copy(rGate, tTR_sGate);
           }
@@ -807,7 +1000,7 @@ struct WidePairGemm {
             copy(tiled_t2r, tUpTile, rAcc);
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(rAcc); ++i) {
-              rUp(i) = cutlass::bfloat16_t(rAcc(i) * params_.alpha);
+              rUp(i) = Contract::widen(rAcc(i), params_.alpha);
             }
             copy(rUp, tTR_sUp);
           }
@@ -828,23 +1021,24 @@ struct WidePairGemm {
             copy(tTR_sUp, rUp);
             CUTLASS_PRAGMA_UNROLL
             for (int i = 0; i < size(rD); ++i) {
-              float gate = static_cast<float>(rGate(i));
-              float up = static_cast<float>(rUp(i));
-              float value = production_gelu(gate) * up;
-              rD(i) = ElementD(value);
+              rD(i) = Contract::combine(rGate(i), rUp(i));
             }
 
-            Tensor coord = tTR_cD(_, _, _, epi_m, epi_n);
-            Tensor pred = lazy::transform(
-                coord, [&](auto const& c) CUTLASS_LAMBDA_FUNC_INLINE {
-                  return elem_less(c, compact_problem);
-                });
             Tensor dst = recast<VectorType>(
                 coalesce(tTR_gD(_, _, _, epi_m, epi_n)));
             Tensor src = recast<VectorType>(coalesce(rD));
-            Tensor vec_pred = tensor<1>(zipped_divide(
-                coalesce(pred), common_layout.compose(Int<Vector>{})));
-            copy_if(vec_pred, src, dst);
+            if (whole_tile_in_bounds) {
+              copy(src, dst);
+            } else {
+              Tensor coord = tTR_cD(_, _, _, epi_m, epi_n);
+              Tensor pred = lazy::transform(
+                  coord, [&](auto const& c) CUTLASS_LAMBDA_FUNC_INLINE {
+                    return elem_less(c, compact_problem);
+                  });
+              Tensor vec_pred = tensor<1>(zipped_divide(
+                  coalesce(pred), common_layout.compose(Int<Vector>{})));
+              copy_if(vec_pred, src, dst);
+            }
           }
           if constexpr (!APXINF_DUAL_GEGLU_DOUBLE_BUFFER) {
             synchronize();
@@ -885,10 +1079,10 @@ struct WidePairGemm {
           cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp, ElementInput,
           LayoutA, AlignmentInput, ElementInput, LayoutB, AlignmentInput,
           float, LegalAtomTile, ClusterShape,
-          cutlass::gemm::collective::StageCount<APXINF_DUAL_GEGLU_WIDE_STAGE_COUNT>,
+          cutlass::gemm::collective::StageCount<Contract::kStages>,
           cutlass::gemm::KernelTmaWarpSpecialized2SmSm100>::CollectiveOp;
   using DispatchPolicy = cutlass::gemm::MainloopSm100TmaUmmaWarpSpecialized<
-      APXINF_DUAL_GEGLU_WIDE_STAGE_COUNT, 2, 2, ClusterShape>;
+      Contract::kStages, 2, kAccumulatorStages, ClusterShape>;
   using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
       DispatchPolicy, TileShape,
       ElementInput, typename AtomCollective::StrideA,
@@ -907,23 +1101,14 @@ struct WidePairGemm {
   using Device = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 };
 
-// Production entry: exact BF16 M522/M533 language Gate/Up only. The input weight
-// must already use the physical [gate256,up256] column order validated by the
-// load-time raw-bit oracle. This path allocates no workspace and launches one
-// graph-capturable node.
-int production_dual_geglu_bf16(
+// One launch body for both contracts. Every operand pointer is captured by
+// `initialize`, so the adapter is constructed per call rather than cached.
+template <class Contract, class ClusterShape>
+int launch_wide_pair(
     const void* activation, const void* interleaved_weight, void* output,
     int m, int n, int k, int full_n, cudaStream_t stream) {
-  if (activation == nullptr || interleaved_weight == nullptr || output == nullptr ||
-      stream == nullptr || !valid_production_m(m) || n != kN || k != kK ||
-      full_n != kFullN || full_n != 2 * n ||
-      (reinterpret_cast<uintptr_t>(activation) & 0xf) != 0 ||
-      (reinterpret_cast<uintptr_t>(interleaved_weight) & 0xf) != 0 ||
-      (reinterpret_cast<uintptr_t>(output) & 0xf) != 0) {
-    return -6;
-  }
-
-  using Gemm = WidePairGemm<Shape<_128, _512, _64>, Shape<_2, _2, _1>>;
+  using Gemm = WidePairGemm<Shape<Int<Contract::kTileM>, _512, _64>,
+                            ClusterShape, Contract>;
   using Device = typename Gemm::Device;
   using Kernel = typename Gemm::Kernel;
   using StrideA = typename Kernel::StrideA;
@@ -953,6 +1138,48 @@ int production_dual_geglu_bf16(
   if (operation.initialize(arguments, nullptr, stream) != cutlass::Status::kSuccess)
     return -2;
   return operation.run(stream) == cutlass::Status::kSuccess ? 0 : -3;
+}
+
+// Production entry: exact BF16 M522/M533 language Gate/Up only. The input weight
+// must already use the physical [gate256,up256] column order validated by the
+// load-time raw-bit oracle. This path allocates no workspace and launches one
+// graph-capturable node.
+int production_dual_geglu_bf16(
+    const void* activation, const void* interleaved_weight, void* output,
+    int m, int n, int k, int full_n, cudaStream_t stream) {
+  if (activation == nullptr || interleaved_weight == nullptr || output == nullptr ||
+      stream == nullptr || !valid_production_m(m) || n != kN || k != kK ||
+      full_n != kFullN || full_n != 2 * n ||
+      (reinterpret_cast<uintptr_t>(activation) & 0xf) != 0 ||
+      (reinterpret_cast<uintptr_t>(interleaved_weight) & 0xf) != 0 ||
+      (reinterpret_cast<uintptr_t>(output) & 0xf) != 0) {
+    return -6;
+  }
+  return launch_wide_pair<GegluContract, Shape<_2, _2, _1>>(
+      activation, interleaved_weight, output, m, n, k, full_n, stream);
+}
+
+// Production entry: exact BF16 M3387 SwiGLU only. Same weight
+// contract as the GeGLU entry -- physical `[K, 2I]` with `[gate256, up256]`
+// column tiles -- and the same no-workspace single-node launch.
+//
+// Cluster (2,1), not (2,2). The (2,2) cluster was measured at 3.37x the
+// duration with a bit-identical result, so this is a free choice numerically
+// and an expensive one otherwise. Do not "align" it with the GeGLU entry.
+int production_dual_swiglu_bf16(
+    const void* activation, const void* interleaved_weight, void* output,
+    int m, int n, int k, int full_n, cudaStream_t stream) {
+  if (activation == nullptr || interleaved_weight == nullptr || output == nullptr ||
+      stream == nullptr || !SwigluContract::valid_m(m) ||
+      n != SwigluContract::kI || k != SwigluContract::kDepth ||
+      full_n != SwigluContract::kFullI || full_n != 2 * n ||
+      (reinterpret_cast<uintptr_t>(activation) & 0xf) != 0 ||
+      (reinterpret_cast<uintptr_t>(interleaved_weight) & 0xf) != 0 ||
+      (reinterpret_cast<uintptr_t>(output) & 0xf) != 0) {
+    return -6;
+  }
+  return launch_wide_pair<SwigluContract, Shape<_2, _1, _1>>(
+      activation, interleaved_weight, output, m, n, k, full_n, stream);
 }
 
 }  // namespace apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail

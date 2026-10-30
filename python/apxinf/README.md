@@ -78,7 +78,7 @@ Two layers of `ProcessorStep` live here, and they extend differently:
 
 WallOSS also accepts a callable `processor=` in `WallossPolicy.from_pretrained`.
 It must return `(patches_f32, token_ids_u32, action_mask_f32)` using the model's
-canonical shapes. The built-in processor remains the checkpoint-compatible
+canonical shapes (the default profile: two views, `18x18` patch grids). The built-in processor remains the checkpoint-compatible
 default and sends resized RGB to runtimes that advertise that capability, so
 normalization and patchification run in the CUDA graph. This seam lets Python
 applications customize observation handling without forking the Rust runtime.
@@ -260,7 +260,7 @@ postprocessing remain Python. The shared lifecycle and ownership rules are in
 | --- | --- | --- |
 | State encoding | optional 256-bin encoding, preserving underflow bin `-1`; normalization dtype is significant | required configured bins, clipping to range and selecting active state dimensions |
 | Token sequence | SentencePiece BOS; without state, append a separately encoded newline | HF added tokens, camera labels, image placeholder expansion and action tokens |
-| Image/model input | configured resized RGB views and token IDs | built-in resized RGB with two `18x18` grids; custom processor returns canonical patches, token IDs and action mask |
+| Image/model input | configured resized RGB views and token IDs | any number of views resized like wall-x (per-camera training `resolution` from `config.yml`, then smart_resize) to one shared size, sent with `image_grid_thw`; custom processor returns patches for the default two-view `18x18` profile, token IDs and action mask |
 | Output | trimmed, checkpoint-transformed actions plus normalized model actions | trimmed, inverse-normalized actions plus normalized model actions |
 | Customization | replaceable Python input/output pipelines | explicit `processor=` callable; custom processing does not implicitly select native RGB |
 

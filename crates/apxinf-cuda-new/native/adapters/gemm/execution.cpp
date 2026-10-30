@@ -1,6 +1,7 @@
 #include "internal.h"
 
 #ifdef APXINF_GEMM_CUTLASS
+#include "../../kernels/cutlass/ops/gemm/gemm_bf16_sm100.h"
 #include "../../kernels/cutlass/ops/gemm/gemm_nvfp4_sm100.h"
 #endif
 
@@ -30,13 +31,15 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 }
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
-  if (spec.version != 6 ||
-      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL ||
+  if (spec.version != 9 ||
+      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_SWIGLU ||
       spec.a_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.b_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.accumulation_dtype > APXINF_DTYPE_I32 ||
       spec.output_dtype > APXINF_DTYPE_E4M3 ||
-      spec.quantization > APXINF_GEMM_QUANT_NVFP4_BLOCK || spec.m <= 0 ||
+      spec.quantization > APXINF_GEMM_QUANT_NVFP4_BLOCK ||
+      spec.b_layout > APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256 ||
+      spec.numerics > APXINF_GEMM_NUMERICS_LEGACY_CUBLAS || spec.m <= 0 ||
       spec.n <= 0 || spec.k <= 0 || spec.m > INT32_MAX ||
       spec.n > INT32_MAX || spec.k > INT32_MAX ||
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
@@ -68,13 +71,40 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
        spec.quantization != APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL ||
        spec.output_dtype != APXINF_DTYPE_BF16 || spec.k > 131071 ||
        (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM &&
-        spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_BIAS))) {
+        spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+        spec.semantic != APXINF_GEMM_SEMANTIC_GEMM_BIAS_GELU))) {
     throw Failure(APXINF_STATUS_UNSUPPORTED, "invalid INT8 GEMM contract");
+  }
+  if (spec.b_layout == APXINF_GEMM_LAYOUT_NK &&
+      spec.quantization != APXINF_GEMM_QUANT_NONE &&
+      spec.quantization != APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL &&
+      spec.quantization != APXINF_GEMM_QUANT_NVFP4_BLOCK) {
+    throw Failure(APXINF_STATUS_UNSUPPORTED,
+                  "output-major B requires plain, W8A8, or NVFP4 operands");
+  }
+  const bool swiglu =
+      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_SWIGLU;
+  const bool gate_up_pairs =
+      spec.b_layout == APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256;
+  if (swiglu != gate_up_pairs) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "GEMM+SwiGLU requires the gate/up-pair B layout");
   }
   if (spec.a_dtype != APXINF_DTYPE_I8 &&
       spec.accumulation_dtype != APXINF_DTYPE_F32) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "floating-point GEMM requires F32 accumulation");
+  }
+  if (spec.numerics == APXINF_GEMM_NUMERICS_LEGACY_CUBLAS &&
+      (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM ||
+       spec.quantization != APXINF_GEMM_QUANT_NONE ||
+       spec.b_layout != APXINF_GEMM_LAYOUT_KN ||
+       spec.a_dtype != APXINF_DTYPE_BF16 ||
+       spec.b_dtype != APXINF_DTYPE_BF16 ||
+       spec.output_dtype != APXINF_DTYPE_BF16 ||
+       spec.alpha_is_unit == 0 || spec.output_scale_is_unit == 0)) {
+    throw Failure(APXINF_STATUS_UNSUPPORTED,
+                  "legacy cuBLAS numerics require unit-scale canonical BF16 GEMM");
   }
   if ((spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE ||
        spec.quantization == APXINF_GEMM_QUANT_FP8_ROW_CHANNEL) &&
@@ -94,7 +124,8 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
   if (spec.quantization == APXINF_GEMM_QUANT_NVFP4_BLOCK) {
     if (spec.a_dtype != APXINF_DTYPE_E2M1_PAIR ||
         spec.b_dtype != APXINF_DTYPE_E2M1_PAIR ||
-        spec.semantic != APXINF_GEMM_SEMANTIC_GEMM) {
+        spec.semantic != APXINF_GEMM_SEMANTIC_GEMM ||
+        spec.b_layout != APXINF_GEMM_LAYOUT_NK) {
       throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                     "NVFP4 quantization requires two packed E2M1 inputs");
     }
@@ -108,14 +139,28 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "packed E2M1 operands require the NVFP4 contract");
   }
-  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU && spec.n % 2 != 0) {
+  if ((spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU ||
+       spec.semantic ==
+           APXINF_GEMM_SEMANTIC_GEMM_SWIGLU) &&
+      spec.n % 2 != 0) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
-                  "GEMM+GeGLU requires an even projection width");
+                  "gated GEMM requires an even projection width");
+  }
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_SWIGLU &&
+      (spec.a_dtype != APXINF_DTYPE_BF16 ||
+       spec.b_dtype != APXINF_DTYPE_BF16 ||
+       spec.output_dtype != APXINF_DTYPE_BF16 || spec.n % 512 != 0 ||
+       spec.alpha_is_unit == 0 || spec.output_scale_is_unit == 0 ||
+       spec.quantization != APXINF_GEMM_QUANT_NONE)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid pair-interleaved BF16 SwiGLU contract");
   }
   if (apxinf::gemm::has_row_channel_scales(spec) &&
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU) {
+      (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU ||
+       spec.semantic ==
+           APXINF_GEMM_SEMANTIC_GEMM_SWIGLU)) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
-                  "rowwise GEMM+GeGLU is not implemented");
+                  "rowwise gated GEMM is not implemented");
   }
   if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL &&
       (spec.quantization != APXINF_GEMM_QUANT_FP8_UNIT_SCALE ||
@@ -240,25 +285,71 @@ const apxinf::gemm::Implementation* find_implementation(const Recipe& recipe,
 std::unique_ptr<Execution> fallback(
     const apxinf::gemm::Spec& spec, const apxinf_gemm_policy_t& policy,
     const apxinf_gemm_bindings_t& bindings, int device) {
-  for (const auto& implementation :
-       apxinf::gemm::registry(spec.semantic)) {
-    if (!implementation.fallback ||
-        !apxinf::gemm::supports_device(implementation, device) ||
-        !implementation.supports(spec) ||
-        (policy.graph_safe && !implementation.graph_safe) ||
-        (policy.deterministic && !implementation.deterministic)) {
-      continue;
-    }
-    std::vector<int> configurations;
-    implementation.enumerate_configs(spec, configurations);
-    for (int configuration : configurations) {
-      try {
-        return apxinf::gemm::prepare(
-            implementation, configuration, spec, policy, bindings, device);
-      } catch (const Failure&) {
-        cudaGetLastError();
+  constexpr uint32_t kProviderCublasLt = 2;
+  constexpr uint32_t kProviderCutlass = 3;
+  const auto& implementations = apxinf::gemm::registry(spec.semantic);
+  auto prepare_first_supported = [&](bool designated_only,
+                                     uint32_t provider_id)
+      -> std::unique_ptr<Execution> {
+    for (const auto& implementation : implementations) {
+      if ((designated_only && !implementation.fallback) ||
+          (!designated_only && implementation.fallback) ||
+          (provider_id != 0 && implementation.provider_id != provider_id) ||
+          !apxinf::gemm::supports_device(implementation, device) ||
+          !implementation.supports(spec) ||
+          (policy.graph_safe && !implementation.graph_safe) ||
+          (policy.deterministic && !implementation.deterministic)) {
+        continue;
+      }
+      std::vector<int> configurations;
+      implementation.enumerate_configs(spec, configurations);
+      for (int configuration : configurations) {
+        try {
+          return apxinf::gemm::prepare(
+              implementation, configuration, spec, policy, bindings, device);
+        } catch (const Failure&) {
+          cudaGetLastError();
+        }
       }
     }
+    return nullptr;
+  };
+
+  // Dynamic row/channel quantization needs the provider that consumes its
+  // scale tensors in the mainloop/epilogue.  The generic cuBLAS baseline is
+  // correct but several times slower, which makes a missing recipe a silent
+  // model-level regression.
+  // The validated Orin W8A8 baseline is cuBLASLt.  The fixed-shape CUTLASS
+  // implementations remain regular candidates (and may be restored from an
+  // exact recipe), but choosing them merely because a recipe is absent changes
+  // GR00T's accumulated action numerics beyond its migration reference gate.
+  if (spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL) {
+    if (auto execution =
+            prepare_first_supported(false, kProviderCublasLt)) {
+      return execution;
+    }
+  }
+
+  const bool prefer_cutlass =
+      spec.quantization == APXINF_GEMM_QUANT_FP8_ROW_CHANNEL ||
+      spec.quantization == APXINF_GEMM_QUANT_NVFP4_BLOCK;
+  if (prefer_cutlass) {
+    if (auto execution =
+            prepare_first_supported(false, kProviderCutlass)) {
+      return execution;
+    }
+  }
+
+  if (auto execution = prepare_first_supported(true, 0)) {
+    return execution;
+  }
+  // The designated cuBLAS baseline deliberately rejects packed formats such
+  // as NVFP4. A recipe miss must still be runnable with online tuning disabled,
+  // so use the first graph-safe candidate/configuration that supports the Spec
+  // as the format-specific baseline. This performs no timing and persists no
+  // recipe; normal warmup/autotune remains responsible for choosing the winner.
+  if (auto execution = prepare_first_supported(false, 0)) {
+    return execution;
   }
   throw Failure(APXINF_STATUS_UNSUPPORTED,
                 "no GEMM fallback satisfies the Spec and Policy");
@@ -594,35 +685,32 @@ extern "C" apxinf_status_t apxinf_gemm_nvfp4_quantize_swiglu(
 #endif
 }
 
-extern "C" apxinf_status_t apxinf_gemm_nvfp4_dense_swiglu_aot(
+extern "C" apxinf_status_t apxinf_gemm_nvfp4_swiglu(
     const void* activation, const void* weight,
     const void* activation_scales, const void* weight_scales,
     void* output, void* output_scales, const void* alpha,
     const void* input_global_scale, const void* down_inverse_global_scale,
-    const void* tile_groups, const void* tile_limits,
-    const void* token_map, const void* tile_count,
     int64_t rows, int64_t n, int64_t k, apxinf_cuda_stream_t stream) {
-#if defined(APXINF_GEMM_CUTLASS) && defined(APXINF_QWEN38_DENSE_SWIGLU_AOT)
+#if defined(APXINF_GEMM_CUTLASS) && defined(APXINF_NVFP4_GEMM_SWIGLU)
   return apxinf::framework::abi_boundary([&] {
     if (activation == nullptr || weight == nullptr ||
         activation_scales == nullptr || weight_scales == nullptr ||
         output == nullptr || output_scales == nullptr || alpha == nullptr ||
         input_global_scale == nullptr || down_inverse_global_scale == nullptr ||
-        tile_groups == nullptr || tile_limits == nullptr || token_map == nullptr ||
-        tile_count == nullptr || rows <= 0 || n <= 0 || k <= 0 ||
+        rows != 2048 || n != 17408 || k != 5120 ||
         rows > INT32_MAX || n > INT32_MAX || k > INT32_MAX) {
       throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                     "invalid fused NVFP4 dense SwiGLU arguments");
     }
-    const int status = apxinf::cuda_new::cutlass_ops::nvfp4_dense_swiglu_aot(
+    const int status = apxinf::cuda_new::cutlass_ops::nvfp4_gemm_swiglu(
         activation, weight, activation_scales, weight_scales, output,
         output_scales, alpha, input_global_scale, down_inverse_global_scale,
-        tile_groups, tile_limits, token_map, tile_count,
-        static_cast<int>(rows), static_cast<int>(n), static_cast<int>(k),
+        /*workspace=*/nullptr, /*workspace_bytes=*/0, static_cast<int>(rows),
+        static_cast<int>(n), static_cast<int>(k),
         static_cast<cudaStream_t>(stream));
     if (status != 0) {
       throw Failure(APXINF_STATUS_PROVIDER_ERROR,
-                    "fused NVFP4 dense SwiGLU failed with status " +
+                    "NVFP4 GEMM SwiGLU failed with status " +
                         std::to_string(status));
     }
   });
@@ -630,7 +718,6 @@ extern "C" apxinf_status_t apxinf_gemm_nvfp4_dense_swiglu_aot(
   (void)activation; (void)weight; (void)activation_scales;
   (void)weight_scales; (void)output; (void)output_scales; (void)alpha;
   (void)input_global_scale; (void)down_inverse_global_scale;
-  (void)tile_groups; (void)tile_limits; (void)token_map; (void)tile_count;
   (void)rows; (void)n; (void)k; (void)stream;
   return APXINF_STATUS_UNSUPPORTED;
 #endif

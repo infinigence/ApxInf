@@ -1,196 +1,588 @@
 use apxinf_core::{DType, Result, Tensor};
 
-use super::contracts::{normalize, RawArgs, Semantic};
+use super::contracts::{
+    normalize, AffineKind, BiasOrder, GateKind, NormNumerics, Operation, Quantization, RawArgs,
+    Statistic,
+};
 use super::launch;
 use crate::CudaContext;
 
-/// Inputs for ordinary RMS normalization.
-pub struct RmsNormArgs<'a> {
-    /// F32 keeps the fused baseline; input dtype rounds normalized values before weight multiplication.
+/// Statistic computed by the normalization core.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NormKind {
+    Rms,
+    Layer,
+}
+
+/// Affine transform applied after the normalization statistic.
+#[derive(Clone, Copy)]
+pub enum Affine<'a> {
+    /// Learned weight and optional LayerNorm bias. `offset` means the stored
+    /// checkpoint weight is zero-centered and the effective multiplier is
+    /// `1 + weight`.
+    Weight {
+        weight: &'a Tensor,
+        bias: Option<&'a Tensor>,
+        offset: bool,
+    },
+    /// Per-call `[scale; shift]` conditioning vector.
+    Adaptive { style: &'a Tensor },
+    /// Learned RMS weight followed by independent adaptive scale and shift:
+    /// `bf16(bf16(rms(x) * weight) * bf16(1 + scale) + shift)`.
+    WeightedAdaptive {
+        weight: &'a Tensor,
+        scale: &'a Tensor,
+        shift: &'a Tensor,
+    },
+}
+
+/// Optional gate applied by the residual prologue.
+#[derive(Clone, Copy)]
+pub enum ResidualGate<'a> {
+    /// Packed modulation `[scale; shift; gate]`; the third segment is the
+    /// direct multiplier used by the existing adaptive Norm contract.
+    PackedStyle(&'a Tensor),
+    /// Per-column gate whose effective multiplier is BF16-rounded `1 + gate`.
+    UnitOffset(&'a Tensor),
+}
+
+/// Quantization epilogue for a normalized output.
+#[derive(Clone, Copy, Debug)]
+pub enum QuantOut<'a> {
+    /// Store a calibrated E4M3 copy of the normalized result. `NormArgs::output`
+    /// or `FusedAddNormArgs::normalized` may independently retain the native
+    /// normalized result; this binding always owns the quantized epilogue.
+    StaticE4m3 { output: &'a Tensor, scale: f32 },
+    /// Store one dynamically scaled E4M3 row per input row. `values` may pad
+    /// the column dimension; padding values are zero. `scales` is F32 `[rows]`.
+    RowwiseE4m3 {
+        values: &'a Tensor,
+        scales: &'a Tensor,
+    },
+    /// Store one dynamically scaled signed-INT8 row per input row. The native
+    /// BF16 normalized output is retained independently by `output`.
+    RowwiseI8 {
+        values: &'a Tensor,
+        scales: &'a Tensor,
+    },
+}
+
+/// Plain normalization with caller-owned native and/or quantized outputs.
+pub struct NormArgs<'a> {
+    /// Materialization before affine weighting; reduction accumulation remains F32.
     pub intermediate_dtype: DType,
     pub input: &'a Tensor,
-    pub weight: &'a Tensor,
-    pub normalized: &'a mut Tensor,
+    pub output: Option<&'a Tensor>,
+    pub kind: NormKind,
+    pub affine: Affine<'a>,
+    pub quantized: Option<QuantOut<'a>>,
+    pub numerics: NormNumerics,
     pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
 }
 
-impl<'a> RmsNormArgs<'a> {
-    pub fn new(input: &'a Tensor, weight: &'a Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, weight, normalized, eps, output_scale: 1.0, intermediate_dtype: DType::F32 }
+impl<'a> NormArgs<'a> {
+    pub fn rms(input: &'a Tensor, weight: &'a Tensor, output: &'a Tensor, eps: f32) -> Self {
+        Self {
+            input,
+            output: Some(output),
+            kind: NormKind::Rms,
+            affine: Affine::Weight {
+                weight,
+                bias: None,
+                offset: false,
+            },
+            quantized: None,
+            intermediate_dtype: DType::F32,
+            numerics: NormNumerics::Flexible,
+            eps,
+        }
+    }
+
+    pub fn layer(
+        input: &'a Tensor,
+        weight: &'a Tensor,
+        bias: &'a Tensor,
+        output: &'a Tensor,
+        eps: f32,
+    ) -> Self {
+        Self {
+            input,
+            output: Some(output),
+            kind: NormKind::Layer,
+            affine: Affine::Weight {
+                weight,
+                bias: Some(bias),
+                offset: false,
+            },
+            quantized: None,
+            intermediate_dtype: DType::F32,
+            numerics: NormNumerics::Flexible,
+            eps,
+        }
+    }
+
+    pub fn with_weight_offset(mut self) -> Self {
+        match &mut self.affine {
+            Affine::Weight { offset, .. } => *offset = true,
+            Affine::Adaptive { .. } | Affine::WeightedAdaptive { .. } => {}
+        }
+        self
     }
 }
 
-/// Inputs for ordinary layer normalization.
-pub struct LayerNormArgs<'a> {
-    pub input: &'a Tensor,
-    pub weight: &'a Tensor,
-    pub bias: &'a Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
-}
-
-impl<'a> LayerNormArgs<'a> {
-    pub fn new(input: &'a Tensor, weight: &'a Tensor, bias: &'a Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, weight, bias, normalized, eps, output_scale: 1.0 }
-    }
-}
-
-/// Inputs for adaptive RMS normalization. `norm_style` is `[2 * cols]`.
-pub struct AdaptiveRmsNormArgs<'a> {
-    pub input: &'a Tensor,
-    pub norm_style: &'a Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
-}
-
-impl<'a> AdaptiveRmsNormArgs<'a> {
-    pub fn new(input: &'a Tensor, norm_style: &'a Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, norm_style, normalized, eps, output_scale: 1.0 }
-    }
-}
-
-/// Inputs for bias plus residual. Bias is optional by contract.
-pub struct BiasResidualArgs<'a> {
+/// Residual prologue followed by normalization. The pre-normalization hidden
+/// stream and normalized result are both caller-owned.
+pub struct FusedAddNormArgs<'a> {
     pub input: &'a Tensor,
     pub bias: Option<&'a Tensor>,
     pub residual: &'a Tensor,
-    pub hidden: &'a mut Tensor,
+    pub gate: Option<ResidualGate<'a>>,
+    pub hidden: &'a Tensor,
+    pub normalized: Option<&'a Tensor>,
+    pub kind: NormKind,
+    pub affine: Affine<'a>,
+    pub quantized: Option<QuantOut<'a>>,
+    pub numerics: NormNumerics,
+    pub bias_order: BiasOrder,
+    pub eps: f32,
 }
 
-impl<'a> BiasResidualArgs<'a> {
-    pub fn new(input: &'a Tensor, bias: Option<&'a Tensor>, residual: &'a Tensor, hidden: &'a mut Tensor) -> Self {
-        Self { input, bias, residual, hidden }
-    }
-}
-
-pub struct BiasResidualRmsNormArgs<'a> {
+/// Residual prologue without a normalization core.
+pub struct ResidualAddArgs<'a> {
     pub input: &'a Tensor,
     pub bias: Option<&'a Tensor>,
     pub residual: &'a Tensor,
-    pub weight: &'a Tensor,
-    pub hidden: &'a mut Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
-}
-
-impl<'a> BiasResidualRmsNormArgs<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(input: &'a Tensor, bias: Option<&'a Tensor>, residual: &'a Tensor, weight: &'a Tensor, hidden: &'a mut Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, bias, residual, weight, hidden, normalized, eps, output_scale: 1.0 }
-    }
-}
-
-pub struct BiasResidualLayerNormArgs<'a> {
-    pub input: &'a Tensor,
-    pub bias: Option<&'a Tensor>,
-    pub residual: &'a Tensor,
-    pub weight: &'a Tensor,
-    pub norm_bias: &'a Tensor,
-    pub hidden: &'a mut Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
-}
-
-impl<'a> BiasResidualLayerNormArgs<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(input: &'a Tensor, bias: Option<&'a Tensor>, residual: &'a Tensor, weight: &'a Tensor, norm_bias: &'a Tensor, hidden: &'a mut Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, bias, residual, weight, norm_bias, hidden, normalized, eps, output_scale: 1.0 }
-    }
-}
-
-/// Inputs for adaptive gate plus residual. `gate_style` is `[3 * cols]`.
-pub struct AdaGateResidualArgs<'a> {
-    pub input: &'a Tensor,
-    pub residual: &'a Tensor,
-    pub gate_style: &'a Tensor,
-    pub hidden: &'a mut Tensor,
-}
-
-impl<'a> AdaGateResidualArgs<'a> {
-    pub fn new(input: &'a Tensor, residual: &'a Tensor, gate_style: &'a Tensor, hidden: &'a mut Tensor) -> Self {
-        Self { input, residual, gate_style, hidden }
-    }
-}
-
-pub struct AdaGateResidualRmsNormArgs<'a> {
-    pub input: &'a Tensor,
-    pub residual: &'a Tensor,
-    pub norm_style: &'a Tensor,
-    pub gate_style: &'a Tensor,
-    pub hidden: &'a mut Tensor,
-    pub normalized: &'a mut Tensor,
-    pub eps: f32,
-    /// Static dequantization scale when `normalized` is E4M3.
-    pub output_scale: f32,
-}
-
-impl<'a> AdaGateResidualRmsNormArgs<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(input: &'a Tensor, residual: &'a Tensor, norm_style: &'a Tensor, gate_style: &'a Tensor, hidden: &'a mut Tensor, normalized: &'a mut Tensor, eps: f32) -> Self {
-        Self { input, residual, norm_style, gate_style, hidden, normalized, eps, output_scale: 1.0 }
-    }
-}
-
-/// BF16-only two-rounding bias-then-residual contract.
-pub struct BiasThenResidualArgs<'a> {
-    pub input: &'a Tensor,
-    pub bias: Option<&'a Tensor>,
-    pub residual: &'a Tensor,
-    pub hidden: &'a mut Tensor,
-}
-
-impl<'a> BiasThenResidualArgs<'a> {
-    pub fn new(input: &'a Tensor, bias: Option<&'a Tensor>, residual: &'a Tensor, hidden: &'a mut Tensor) -> Self {
-        Self { input, bias, residual, hidden }
-    }
+    pub gate: Option<ResidualGate<'a>>,
+    pub hidden: &'a Tensor,
+    pub bias_order: BiasOrder,
 }
 
 fn execute(ctx: &CudaContext, args: RawArgs<'_>) -> Result<()> {
     launch::execute(ctx, normalize(ctx, args)?)
 }
 
-pub fn rms_norm(ctx: &CudaContext, args: RmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { intermediate_dtype: args.intermediate_dtype, semantic: Semantic::Rms, input: args.input, bias: None, residual: None, weight: Some(args.weight), norm_bias: None, norm_style: None, gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+fn statistic(kind: NormKind) -> Statistic {
+    match kind {
+        NormKind::Rms => Statistic::Rms,
+        NormKind::Layer => Statistic::Layer,
+    }
 }
 
-pub fn layer_norm(ctx: &CudaContext, args: LayerNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::Layer, input: args.input, bias: None, residual: None, weight: Some(args.weight), norm_bias: Some(args.bias), norm_style: None, gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+fn quantization(value: Option<QuantOut<'_>>) -> Quantization {
+    match value {
+        None => Quantization::None,
+        Some(QuantOut::StaticE4m3 { .. }) => Quantization::StaticE4m3,
+        Some(QuantOut::RowwiseE4m3 { .. }) => Quantization::RowwiseE4m3,
+        Some(QuantOut::RowwiseI8 { .. }) => Quantization::RowwiseI8,
+    }
 }
 
-pub fn adaptive_rms_norm(ctx: &CudaContext, args: AdaptiveRmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::AdaptiveRms, input: args.input, bias: None, residual: None, weight: None, norm_bias: None, norm_style: Some(args.norm_style), gate_style: None, hidden: None, normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+fn quantized_output(value: Option<QuantOut<'_>>) -> Option<&Tensor> {
+    match value {
+        None => None,
+        Some(QuantOut::StaticE4m3 { output, .. }) => Some(output),
+        Some(QuantOut::RowwiseE4m3 { values, .. }) | Some(QuantOut::RowwiseI8 { values, .. }) => {
+            Some(values)
+        }
+    }
 }
 
-pub fn bias_residual(ctx: &CudaContext, args: BiasResidualArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::BiasResidual, input: args.input, bias: args.bias, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
+fn quantized_scales(value: Option<QuantOut<'_>>) -> Option<&Tensor> {
+    match value {
+        Some(QuantOut::RowwiseE4m3 { scales, .. }) | Some(QuantOut::RowwiseI8 { scales, .. }) => {
+            Some(scales)
+        }
+        None | Some(QuantOut::StaticE4m3 { .. }) => None,
+    }
 }
 
-pub fn bias_residual_rms_norm(ctx: &CudaContext, args: BiasResidualRmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::BiasResidualRms, input: args.input, bias: args.bias, residual: Some(args.residual), weight: Some(args.weight), norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+fn output_scale(value: Option<QuantOut<'_>>) -> f32 {
+    match value {
+        Some(QuantOut::StaticE4m3 { scale, .. }) => scale,
+        None | Some(QuantOut::RowwiseE4m3 { .. }) | Some(QuantOut::RowwiseI8 { .. }) => 1.0,
+    }
 }
 
-pub fn bias_residual_layer_norm(ctx: &CudaContext, args: BiasResidualLayerNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::BiasResidualLayer, input: args.input, bias: args.bias, residual: Some(args.residual), weight: Some(args.weight), norm_bias: Some(args.norm_bias), norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
+/// Execute plain RMSNorm/LayerNorm through the normalization family.
+pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
+    if args.intermediate_dtype != DType::F32
+        && !(args.kind == NormKind::Rms && matches!(args.affine, Affine::Weight { bias: None, offset: false, .. })
+            && args.quantized.is_none() && args.numerics == NormNumerics::Flexible)
+    {
+        return Err(super::contracts::invalid("intermediate dtype requires plain unquantized weighted RMSNorm"));
+    }
+    let output_scale = output_scale(args.quantized);
+    match args.affine {
+        Affine::Weight {
+            weight,
+            bias,
+            offset: true,
+        } => {
+            if args.kind != NormKind::Rms || bias.is_some() || args.quantized.is_some() {
+                return Err(super::contracts::invalid(
+                    "weight-offset affine currently supports unquantized RMSNorm only",
+                ));
+            }
+            let output = args.output.ok_or_else(|| {
+                super::contracts::invalid("weight-offset RMSNorm requires a native output")
+            })?;
+            if args.numerics == NormNumerics::StableDecode {
+                return Err(super::contracts::invalid(
+                    "weight-offset RMSNorm does not support StableDecode numerics",
+                ));
+            }
+            execute(
+                ctx,
+                RawArgs {
+                    intermediate_dtype: args.intermediate_dtype,
+            operation: Operation::Norm,
+                    statistic: Statistic::Rms,
+                    affine: AffineKind::Weight,
+                    gate: GateKind::None,
+                    quantization: Quantization::None,
+                    numerics: args.numerics,
+                    bias_order: BiasOrder::SingleRound,
+                    weight_offset: true,
+                    input: args.input,
+                    bias: None,
+                    residual: None,
+                    weight: Some(weight),
+                    norm_bias: None,
+                    norm_style: None,
+                    gate_style: None,
+                    hidden: None,
+                    normalized: Some(output),
+                    quantized_output: None,
+                    quantized_scales: None,
+                    eps: args.eps,
+                    output_scale: 1.0,
+                },
+            )
+        }
+        Affine::Weight {
+            weight,
+            bias,
+            offset: false,
+        } => {
+            match args.kind {
+                NormKind::Rms if bias.is_none() => {}
+                NormKind::Layer if bias.is_some() => {}
+                NormKind::Rms => {
+                    return Err(super::contracts::invalid(
+                        "RMSNorm does not take an affine bias",
+                    ))
+                }
+                NormKind::Layer => {
+                    return Err(super::contracts::invalid(
+                        "LayerNorm requires an affine bias",
+                    ))
+                }
+            }
+            execute(
+                ctx,
+                RawArgs {
+                    intermediate_dtype: args.intermediate_dtype,
+            operation: Operation::Norm,
+                    statistic: statistic(args.kind),
+                    affine: AffineKind::Weight,
+                    gate: GateKind::None,
+                    quantization: quantization(args.quantized),
+                    numerics: args.numerics,
+                    bias_order: BiasOrder::SingleRound,
+                    weight_offset: false,
+                    input: args.input,
+                    bias: None,
+                    residual: None,
+                    weight: Some(weight),
+                    norm_bias: bias,
+                    norm_style: None,
+                    gate_style: None,
+                    hidden: None,
+                    normalized: args.output,
+                    quantized_output: quantized_output(args.quantized),
+                    quantized_scales: quantized_scales(args.quantized),
+                    eps: args.eps,
+                    output_scale,
+                },
+            )
+        }
+        Affine::Adaptive { style } => execute(
+            ctx,
+            RawArgs {
+                intermediate_dtype: args.intermediate_dtype,
+            operation: Operation::Norm,
+                statistic: statistic(args.kind),
+                affine: AffineKind::Adaptive,
+                gate: GateKind::None,
+                quantization: quantization(args.quantized),
+                numerics: args.numerics,
+                bias_order: BiasOrder::SingleRound,
+                weight_offset: false,
+                input: args.input,
+                bias: None,
+                residual: None,
+                weight: None,
+                norm_bias: None,
+                norm_style: Some(style),
+                gate_style: None,
+                hidden: None,
+                normalized: args.output,
+                quantized_output: quantized_output(args.quantized),
+                quantized_scales: quantized_scales(args.quantized),
+                eps: args.eps,
+                output_scale,
+            },
+        ),
+        Affine::WeightedAdaptive {
+            weight,
+            scale,
+            shift,
+        } => {
+            if args.kind != NormKind::Rms
+                || args.quantized.is_some()
+                || args.numerics != NormNumerics::Flexible
+            {
+                return Err(super::contracts::invalid(
+                    "weighted adaptive affine supports unquantized flexible RMSNorm only",
+                ));
+            }
+            let output = args.output.ok_or_else(|| {
+                super::contracts::invalid("weighted adaptive RMSNorm requires a native output")
+            })?;
+            super::candidates::weighted_adaptive(
+                ctx, args.input, weight, scale, shift, output, args.eps,
+            )
+        }
+    }
 }
 
-pub fn ada_gate_residual(ctx: &CudaContext, args: AdaGateResidualArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::AdaGateResidual, input: args.input, bias: None, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: Some(args.gate_style), hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
+/// Execute a residual prologue followed by RMSNorm/LayerNorm.
+pub fn fused_add_norm(ctx: &CudaContext, args: FusedAddNormArgs<'_>) -> Result<()> {
+    if let (
+        NormKind::Rms,
+        Affine::Weight {
+            weight,
+            bias: None,
+            offset: true,
+        },
+        None,
+    ) = (args.kind, args.affine, args.gate)
+    {
+        if args.bias.is_some()
+            || args.quantized.is_some()
+            || args.numerics != NormNumerics::StablePlanning
+            || args.bias_order != BiasOrder::SingleRound
+        {
+            return Err(super::contracts::invalid(
+                "weight-offset fused RMSNorm requires no bias/quantization, SingleRound, and StablePlanning numerics",
+            ));
+        }
+        let normalized = args.normalized.ok_or_else(|| {
+            super::contracts::invalid("weight-offset fused RMSNorm requires a native output")
+        })?;
+        return execute(
+            ctx,
+            RawArgs {
+                intermediate_dtype: DType::F32,
+            operation: Operation::FusedAddNorm,
+                statistic: Statistic::Rms,
+                affine: AffineKind::Weight,
+                gate: GateKind::None,
+                quantization: Quantization::None,
+                numerics: NormNumerics::StablePlanning,
+                bias_order: BiasOrder::SingleRound,
+                weight_offset: true,
+                input: args.input,
+                bias: None,
+                residual: Some(args.residual),
+                weight: Some(weight),
+                norm_bias: None,
+                norm_style: None,
+                gate_style: None,
+                hidden: Some(args.hidden),
+                normalized: Some(normalized),
+                quantized_output: None,
+                quantized_scales: None,
+                eps: args.eps,
+                output_scale: 1.0,
+            },
+        );
+    }
+    if let (
+        NormKind::Rms,
+        Affine::WeightedAdaptive {
+            weight,
+            scale,
+            shift,
+        },
+        Some(ResidualGate::UnitOffset(gate)),
+    ) = (args.kind, args.affine, args.gate)
+    {
+        if args.bias.is_some()
+            || args.quantized.is_some()
+            || args.numerics != NormNumerics::Flexible
+            || args.bias_order != BiasOrder::SingleRound
+        {
+            return Err(super::contracts::invalid(
+                "unit-offset weighted adaptive RMSNorm requires no bias/quantization and SingleRound flexible numerics",
+            ));
+        }
+        let normalized = args.normalized.ok_or_else(|| {
+            super::contracts::invalid(
+                "unit-offset weighted adaptive RMSNorm requires a native output",
+            )
+        })?;
+        return super::candidates::unit_offset_residual_norm(
+            ctx,
+            args.input,
+            args.residual,
+            gate,
+            weight,
+            scale,
+            shift,
+            args.hidden,
+            normalized,
+            args.eps,
+        );
+    }
+    let output_scale = output_scale(args.quantized);
+    let (affine, gate, weight, norm_bias, norm_style, gate_style) =
+        match (args.kind, args.affine, args.gate) {
+            (
+                NormKind::Rms,
+                Affine::Weight {
+                    weight,
+                    bias: None,
+                    offset: false,
+                },
+                None,
+            ) => (
+                AffineKind::Weight,
+                GateKind::None,
+                Some(weight),
+                None,
+                None,
+                None,
+            ),
+            (
+                NormKind::Layer,
+                Affine::Weight {
+                    weight,
+                    bias: Some(norm_bias),
+                    offset: false,
+                },
+                None,
+            ) => (
+                AffineKind::Weight,
+                GateKind::None,
+                Some(weight),
+                Some(norm_bias),
+                None,
+                None,
+            ),
+            (NormKind::Layer, Affine::Adaptive { style }, None) => (
+                AffineKind::Adaptive,
+                GateKind::None,
+                None,
+                None,
+                Some(style),
+                None,
+            ),
+            (NormKind::Rms, Affine::Adaptive { style }, Some(ResidualGate::PackedStyle(gate))) => (
+                AffineKind::Adaptive,
+                GateKind::Style,
+                None,
+                None,
+                Some(style),
+                Some(gate),
+            ),
+            _ => {
+                return Err(super::contracts::invalid(
+                    "unsupported fused-add NormKind/Affine/gate combination",
+                ))
+            }
+        };
+    execute(
+        ctx,
+        RawArgs {
+            intermediate_dtype: DType::F32,
+            operation: Operation::FusedAddNorm,
+            statistic: statistic(args.kind),
+            affine,
+            gate,
+            quantization: quantization(args.quantized),
+            numerics: args.numerics,
+            bias_order: args.bias_order,
+            weight_offset: false,
+            input: args.input,
+            bias: args.bias,
+            residual: Some(args.residual),
+            weight,
+            norm_bias,
+            norm_style,
+            gate_style,
+            hidden: Some(args.hidden),
+            normalized: args.normalized,
+            quantized_output: quantized_output(args.quantized),
+            quantized_scales: quantized_scales(args.quantized),
+            eps: args.eps,
+            output_scale,
+        },
+    )
 }
-
-pub fn ada_gate_residual_rms_norm(ctx: &CudaContext, args: AdaGateResidualRmsNormArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::AdaGateResidualRms, input: args.input, bias: None, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: Some(args.norm_style), gate_style: Some(args.gate_style), hidden: Some(args.hidden), normalized: Some(args.normalized), eps: args.eps, output_scale: args.output_scale })
-}
-
-pub fn bias_then_residual(ctx: &CudaContext, args: BiasThenResidualArgs<'_>) -> Result<()> {
-    execute(ctx, RawArgs { intermediate_dtype: DType::F32, semantic: Semantic::BiasThenResidual, input: args.input, bias: args.bias, residual: Some(args.residual), weight: None, norm_bias: None, norm_style: None, gate_style: None, hidden: Some(args.hidden), normalized: None, eps: 1e-6, output_scale: 1.0 })
+/// Execute only the residual prologue.
+pub fn residual_add(ctx: &CudaContext, args: ResidualAddArgs<'_>) -> Result<()> {
+    if let Some(ResidualGate::UnitOffset(gate)) = args.gate {
+        if args.bias.is_some() || args.bias_order != BiasOrder::SingleRound {
+            return Err(super::contracts::invalid(
+                "gated residual add does not take bias or BiasThenResidual",
+            ));
+        }
+        return super::candidates::unit_offset_residual(
+            ctx,
+            args.input,
+            args.residual,
+            gate,
+            args.hidden,
+        );
+    }
+    let (gate, gate_style) = match args.gate {
+        Some(ResidualGate::PackedStyle(gate)) => {
+            if args.bias.is_some() || args.bias_order != BiasOrder::SingleRound {
+                return Err(super::contracts::invalid(
+                    "gated residual add does not take bias or BiasThenResidual",
+                ));
+            }
+            (GateKind::Style, Some(gate))
+        }
+        None => (GateKind::None, None),
+        Some(ResidualGate::UnitOffset(_)) => unreachable!("handled above"),
+    };
+    execute(
+        ctx,
+        RawArgs {
+            intermediate_dtype: DType::F32,
+            operation: Operation::ResidualAdd,
+            statistic: Statistic::None,
+            affine: AffineKind::None,
+            gate,
+            quantization: Quantization::None,
+            numerics: NormNumerics::Flexible,
+            bias_order: args.bias_order,
+            weight_offset: false,
+            input: args.input,
+            bias: args.bias,
+            residual: Some(args.residual),
+            weight: None,
+            norm_bias: None,
+            norm_style: None,
+            gate_style,
+            hidden: Some(args.hidden),
+            normalized: None,
+            quantized_output: None,
+            quantized_scales: None,
+            eps: 1e-6,
+            output_scale: 1.0,
+        },
+    )
 }

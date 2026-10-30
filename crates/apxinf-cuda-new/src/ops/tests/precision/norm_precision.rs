@@ -88,12 +88,12 @@ fn layer_norm_f32_real_shapes_match_independent_f64_eager_and_graph() {
             let mut output = ctx
                 .allocate_output(input.shape().clone(), DType::F32)
                 .unwrap();
-            layer_norm(&ctx, LayerNormArgs::new(&input, &w, &b, &mut output, 1e-6)).unwrap();
+            crate::ops::norm::norm(&ctx, NormArgs::layer(&input, &w, &b, &mut output, 1e-6)).unwrap();
             ctx.synchronize().unwrap();
             let eager = values(&output);
             check(&eager, &reference(&host, &weight, &bias, 1e-6));
             let graph = crate::capture(&ctx, || {
-                layer_norm(&ctx, LayerNormArgs::new(&input, &w, &b, &mut output, 1e-6))
+                crate::ops::norm::norm(&ctx, NormArgs::layer(&input, &w, &b, &mut output, 1e-6))
             })
             .unwrap();
             graph.replay().unwrap();
@@ -130,35 +130,35 @@ fn layer_norm_f32_rejects_mixed_dtypes_aliases_and_other_norm_semantics() {
     let bad = ctx
         .allocate_output(weight.shape().clone(), DType::BF16)
         .unwrap();
-    assert!(layer_norm(
+    assert!(crate::ops::norm::norm(
         &ctx,
-        LayerNormArgs::new(&input, &bad, &bias, &mut output, 1e-6)
+        NormArgs::layer(&input, &bad, &bias, &mut output, 1e-6)
     )
     .is_err());
-    assert!(layer_norm(
+    assert!(crate::ops::norm::norm(
         &ctx,
-        LayerNormArgs::new(&input, &weight, &bad, &mut output, 1e-6)
+        NormArgs::layer(&input, &weight, &bad, &mut output, 1e-6)
     )
     .is_err());
     let mut bad_output = ctx
         .allocate_output(input.shape().clone(), DType::BF16)
         .unwrap();
-    assert!(layer_norm(
+    assert!(crate::ops::norm::norm(
         &ctx,
-        LayerNormArgs::new(&input, &weight, &bias, &mut bad_output, 1e-6)
+        NormArgs::layer(&input, &weight, &bias, &mut bad_output, 1e-6)
     )
     .is_err());
     for eps in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-        assert!(layer_norm(
+        assert!(crate::ops::norm::norm(
             &ctx,
-            LayerNormArgs::new(&input, &weight, &bias, &mut output, eps)
+            NormArgs::layer(&input, &weight, &bias, &mut output, eps)
         )
         .is_err());
     }
     let mut aliased = input.clone();
-    assert!(layer_norm(
+    assert!(crate::ops::norm::norm(
         &ctx,
-        LayerNormArgs::new(&input, &weight, &bias, &mut aliased, 1e-6)
+        NormArgs::layer(&input, &weight, &bias, &mut aliased, 1e-6)
     )
     .is_err());
     let allocation = ctx.allocate_output(vec![2049].into(), DType::F32).unwrap();
@@ -173,9 +173,9 @@ fn layer_norm_f32_rejects_mixed_dtypes_aliases_and_other_norm_semantics() {
         .unwrap()
         .as_tensor(vec![2, 1024].into(), DType::F32)
         .unwrap();
-    assert!(layer_norm(
+    assert!(crate::ops::norm::norm(
         &ctx,
-        LayerNormArgs::new(&read, &weight, &bias, &mut write, 1e-6)
+        NormArgs::layer(&read, &weight, &bias, &mut write, 1e-6)
     )
     .is_err());
     let alias_weight = CudaBuffer::from_tensor(&output)
@@ -184,20 +184,20 @@ fn layer_norm_f32_rejects_mixed_dtypes_aliases_and_other_norm_semantics() {
         .unwrap()
         .as_tensor(vec![1024].into(), DType::F32)
         .unwrap();
-    assert!(layer_norm(
+    assert!(crate::ops::norm::norm(
         &ctx,
-        LayerNormArgs::new(&input, &alias_weight, &bias, &mut output, 1e-6)
+        NormArgs::layer(&input, &alias_weight, &bias, &mut output, 1e-6)
     )
     .is_err());
-    assert!(layer_norm(
+    assert!(crate::ops::norm::norm(
         &ctx,
-        LayerNormArgs::new(&input, &weight, &alias_weight, &mut output, 1e-6)
+        NormArgs::layer(&input, &weight, &alias_weight, &mut output, 1e-6)
     )
     .is_err());
-    assert!(rms_norm(&ctx, RmsNormArgs::new(&input, &weight, &mut output, 1e-6)).is_err());
-    assert!(bias_residual(
+    assert!(crate::ops::norm::norm(&ctx, NormArgs::rms(&input, &weight, &mut output, 1e-6)).is_err());
+    assert!(residual_add(
         &ctx,
-        BiasResidualArgs::new(&input, None, &input, &mut output)
+        ResidualAddArgs { input: &input, bias: None, residual: &input, gate: None, hidden: &output, bias_order: BiasOrder::SingleRound }
     )
     .is_err());
 }

@@ -122,6 +122,34 @@ struct ResidualMask : NoMask {
     // d % kHeadDim != 0 or seqlen_q % kBlockM do not suffer from similar
     // issues as they are transparently taken care of by TMA and the
     // epilogue, if it is instantiated with predication support.
+#if defined(APXINF_MASK_R2P) && APXINF_MASK_R2P
+    // AOT parity (flash_attn/cute/mask.py::mask_r2p_lambda + r2p_bitmask_below).
+    // In this fragment each thread owns a single row, so the flat element index
+    // IS the column offset within the tile: column(i) = col_base + i.  The
+    // generic loop below re-derives the full ArithmeticTuple coordinate for all
+    // 128 elements, costing one ISETP plus address arithmetic each.  FA4 instead
+    // builds a 32-bit keep-bitmask per 32-column chunk and lets ptxas fold the
+    // 32 boolean selects into a single R2P (the AOT SASS has R2P and zero
+    // ISETP.GE in the softmax warps).
+    {
+      static_assert(size(AccQK{}) % 32 == 0, "R2P mask path wants 32-column chunks");
+      int const col_base  = get<1>(index_qk(_0{}));
+      int const col_limit = get<1>(problem_size) - col_base;   // keep i < col_limit
+      CUTLASS_PRAGMA_UNROLL
+      for (int s = 0; s < size(acc_qk) / 32; ++s) {
+        // shr.u32 clamps shift counts >= 32 (result 0) -- exactly the saturating
+        // behaviour we want; a C++ >> by 32 would be UB.
+        uint32_t keep;
+        int const sh = (s + 1) * 32 - col_limit;
+        asm("shr.u32 %0, 0xffffffff, %1;" : "=r"(keep) : "r"(sh < 0 ? 0 : sh));
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < 32; ++i) {
+          bool const in_bound = (keep & (uint32_t(1) << i)) != 0u;
+          acc_qk(s * 32 + i) = in_bound ? acc_qk(s * 32 + i) : -INFINITY;
+        }
+      }
+    }
+#else
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(acc_qk); i++) {
       auto pos = index_qk(i);
@@ -129,6 +157,7 @@ struct ResidualMask : NoMask {
         acc_qk(i) = -INFINITY;
       }
     }
+#endif
   }
 };
 

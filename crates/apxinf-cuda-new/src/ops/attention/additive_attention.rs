@@ -32,13 +32,20 @@ pub(crate) fn normalize_additive(
     ctx: &CudaContext,
     args: AttentionBiasArgs<'_>,
 ) -> Result<Normalized> {
-    if args.attention.out.dtype() != args.attention.query.dtype() {
+    let query = match args.attention.input {
+        super::contracts::AttentionInput::Separate { query, .. } => query,
+        _ => return Err(invalid("additive Attention requires separate Q/K/V")),
+    };
+    if args.attention.numerics != super::contracts::AttentionNumerics::Flexible {
+        return Err(invalid("additive Attention requires flexible numerics"));
+    }
+    if args.attention.out.dtype() != query.dtype() {
         return Err(invalid(
             "additive Attention requires input/output dtype equality",
         ));
     }
     if args.intermediate_dtype != DType::F32
-        && (args.intermediate_dtype != DType::BF16 || args.attention.query.dtype() != DType::BF16)
+        && (args.intermediate_dtype != DType::BF16 || query.dtype() != DType::BF16)
     {
         return Err(invalid(
             "additive Attention intermediate dtype must be F32 or BF16 with BF16 operands",

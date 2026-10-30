@@ -215,15 +215,15 @@ mod dit {
     }
     fn norm(ctx: &Context, x: &Tensor, weight: &Tensor, bias: &Tensor) -> Result<Tensor> {
         let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
-        ops::layer_norm(
+        ops::norm::norm(
             ctx,
-            ops::LayerNormArgs::new(x, weight, bias, &mut out, 1e-6),
+            ops::NormArgs::layer(x, weight, bias, &mut out, 1e-6),
         )?;
         cast(ctx, &out, DType::BF16)
     }
     fn rms(ctx: &Context, x: &Tensor, weight: &Tensor) -> Result<Tensor> {
         let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
-        ops::rms_norm(ctx, ops::RmsNormArgs::new(x, weight, &mut out, 1e-6))?;
+        ops::norm::norm(ctx, ops::NormArgs::rms(x, weight, &mut out, 1e-6))?;
         Ok(out)
     }
     fn attend(
@@ -445,9 +445,9 @@ mod text {
 
     fn rms(ctx: &Context, x: &Tensor, w: &Tensor) -> Result<Tensor> {
         let mut out = ctx.allocate_output(x.shape().clone(), x.dtype())?;
-        let mut args = ops::RmsNormArgs::new(x, w, &mut out, 1e-6);
+        let mut args = ops::NormArgs::rms(x, w, &mut out, 1e-6);
         args.intermediate_dtype = DType::BF16;
-        ops::rms_norm(ctx, args)?;
+        ops::norm::norm(ctx, args)?;
         Ok(out)
     }
     pub(in crate::cuda_fastwam::model::blocks::bf16) struct TextEncoder {

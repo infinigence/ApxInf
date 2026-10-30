@@ -3,81 +3,207 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 use crate::ffi::abi::norm as abi;
 use crate::{CudaBuffer, CudaContext};
 
-/// Which row-wise operation the bindings describe. See `norm_types.h` for the
-/// binding table; every variant here matches one native semantic.
+/// Public L3 operation selected by the call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Semantic {
+pub(crate) enum Operation {
+    Norm,
+    FusedAddNorm,
+    ResidualAdd,
+}
+
+impl Operation {
+    fn code(self) -> u32 {
+        match self {
+            Self::Norm => 0,
+            Self::FusedAddNorm => 1,
+            Self::ResidualAdd => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Statistic {
+    None,
     Rms,
     Layer,
-    AdaptiveRms,
-    BiasResidual,
-    BiasResidualRms,
-    BiasResidualLayer,
-    AdaGateResidual,
-    AdaGateResidualRms,
-    /// Adds the optional bias, rounds that intermediate to BF16, then adds the
-    /// residual and rounds again. This is deliberately distinct from
-    /// [`Self::BiasResidual`], which rounds only the final sum.
+}
+
+impl Statistic {
+    fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Rms => 1,
+            Self::Layer => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AffineKind {
+    None,
+    Weight,
+    Adaptive,
+}
+
+impl AffineKind {
+    fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Weight => 1,
+            Self::Adaptive => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum GateKind {
+    None,
+    Style,
+}
+
+impl GateKind {
+    fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Style => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Quantization {
+    None,
+    StaticE4m3,
+    RowwiseE4m3,
+    RowwiseI8,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum NormNumerics {
+    /// The family may select any candidate that satisfies the mathematical
+    /// contract.
+    #[default]
+    Flexible,
+    /// Preserve the reduction and BF16 update order used by the decode
+    /// kernels. This is a numerical contract, not a provider request.
+    StableDecode,
+    /// Preserve the reduction and explicitly staged BF16 rounding used by
+    /// the planning kernels. This is a numerical contract, not a provider
+    /// request.
+    StablePlanning,
+}
+
+impl NormNumerics {
+    fn code(self) -> u32 {
+        match self {
+            Self::Flexible => 0,
+            Self::StableDecode => 1,
+            Self::StablePlanning => 2,
+        }
+    }
+}
+
+impl Quantization {
+    fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::StaticE4m3 => 1,
+            Self::RowwiseE4m3 => 2,
+            Self::RowwiseI8 => 3,
+        }
+    }
+}
+
+fn writes_hidden(operation: Operation) -> bool {
+    operation != Operation::Norm
+}
+
+fn writes_normalized(operation: Operation) -> bool {
+    operation != Operation::ResidualAdd
+}
+
+fn reads_residual(operation: Operation) -> bool {
+    writes_hidden(operation)
+}
+
+fn reads_weight(affine: AffineKind) -> bool {
+    affine == AffineKind::Weight
+}
+
+fn reads_norm_bias(statistic: Statistic, affine: AffineKind) -> bool {
+    statistic == Statistic::Layer && affine == AffineKind::Weight
+}
+
+fn reads_norm_style(operation: Operation, affine: AffineKind) -> bool {
+    writes_normalized(operation) && affine == AffineKind::Adaptive
+}
+
+fn reads_gate_style(gate: GateKind) -> bool {
+    gate == GateKind::Style
+}
+
+fn may_have_bias(operation: Operation, gate: GateKind) -> bool {
+    writes_hidden(operation) && gate == GateKind::None
+}
+
+fn valid_contract(
+    operation: Operation,
+    statistic: Statistic,
+    affine: AffineKind,
+    gate: GateKind,
+) -> bool {
+    matches!(
+        (operation, statistic, affine, gate),
+        (
+            Operation::Norm,
+            Statistic::Rms | Statistic::Layer,
+            AffineKind::Weight,
+            GateKind::None
+        ) | (
+            Operation::Norm,
+            Statistic::Rms | Statistic::Layer,
+            AffineKind::Adaptive,
+            GateKind::None
+        ) | (
+            Operation::ResidualAdd,
+            Statistic::None,
+            AffineKind::None,
+            GateKind::None | GateKind::Style
+        ) | (
+            Operation::FusedAddNorm,
+            Statistic::Rms | Statistic::Layer,
+            AffineKind::Weight,
+            GateKind::None
+        ) | (
+            Operation::FusedAddNorm,
+            Statistic::Rms,
+            AffineKind::Adaptive,
+            GateKind::Style
+        ) | (
+            Operation::FusedAddNorm,
+            Statistic::Layer,
+            AffineKind::Adaptive,
+            GateKind::None
+        )
+    )
+}
+
+/// Rounding order for the optional bias and residual combination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BiasOrder {
+    /// Accumulate input, bias, and residual before rounding to the output dtype.
+    #[default]
+    SingleRound,
+    /// Round input plus bias to BF16 before adding the residual and rounding again.
     BiasThenResidual,
 }
 
-impl Semantic {
+impl BiasOrder {
     fn code(self) -> u32 {
         match self {
-            Self::Rms => 0,
-            Self::Layer => 1,
-            Self::AdaptiveRms => 2,
-            Self::BiasResidual => 3,
-            Self::BiasResidualRms => 4,
-            Self::BiasResidualLayer => 5,
-            Self::AdaGateResidual => 6,
-            Self::AdaGateResidualRms => 7,
-            Self::BiasThenResidual => 8,
+            Self::SingleRound => 0,
+            Self::BiasThenResidual => 1,
         }
-    }
-
-    fn writes_hidden(self) -> bool {
-        !matches!(self, Self::Rms | Self::Layer | Self::AdaptiveRms)
-    }
-
-    fn writes_normalized(self) -> bool {
-        !matches!(
-            self,
-            Self::BiasResidual | Self::AdaGateResidual | Self::BiasThenResidual
-        )
-    }
-
-    fn reads_residual(self) -> bool {
-        self.writes_hidden()
-    }
-
-    fn reads_weight(self) -> bool {
-        matches!(
-            self,
-            Self::Rms | Self::Layer | Self::BiasResidualRms | Self::BiasResidualLayer
-        )
-    }
-
-    fn reads_norm_bias(self) -> bool {
-        matches!(self, Self::Layer | Self::BiasResidualLayer)
-    }
-
-    fn reads_norm_style(self) -> bool {
-        matches!(self, Self::AdaptiveRms | Self::AdaGateResidualRms)
-    }
-
-    fn reads_gate_style(self) -> bool {
-        matches!(self, Self::AdaGateResidual | Self::AdaGateResidualRms)
-    }
-
-    fn may_have_bias(self) -> bool {
-        matches!(
-            self,
-            Self::BiasResidual
-                | Self::BiasResidualRms
-                | Self::BiasResidualLayer
-                | Self::BiasThenResidual
-        )
     }
 }
 
@@ -87,7 +213,14 @@ impl Semantic {
 /// `[3 * cols]` whose third segment is the gate; they are not interchangeable.
 pub(crate) struct RawArgs<'a> {
     pub(crate) intermediate_dtype: DType,
-    pub(crate) semantic: Semantic,
+    pub(crate) operation: Operation,
+    pub(crate) statistic: Statistic,
+    pub(crate) affine: AffineKind,
+    pub(crate) gate: GateKind,
+    pub(crate) quantization: Quantization,
+    pub(crate) numerics: NormNumerics,
+    pub(crate) bias_order: BiasOrder,
+    pub(crate) weight_offset: bool,
     pub(crate) input: &'a Tensor,
     pub(crate) bias: Option<&'a Tensor>,
     pub(crate) residual: Option<&'a Tensor>,
@@ -95,8 +228,10 @@ pub(crate) struct RawArgs<'a> {
     pub(crate) norm_bias: Option<&'a Tensor>,
     pub(crate) norm_style: Option<&'a Tensor>,
     pub(crate) gate_style: Option<&'a Tensor>,
-    pub(crate) hidden: Option<&'a mut Tensor>,
-    pub(crate) normalized: Option<&'a mut Tensor>,
+    pub(crate) hidden: Option<&'a Tensor>,
+    pub(crate) normalized: Option<&'a Tensor>,
+    pub(crate) quantized_output: Option<&'a Tensor>,
+    pub(crate) quantized_scales: Option<&'a Tensor>,
     pub(crate) eps: f32,
     pub(crate) output_scale: f32,
 }
@@ -111,26 +246,23 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::Other(message.into())
 }
 
-fn dtype_code(dtype: DType, semantic: Semantic) -> Result<u32> {
+fn dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
-        DType::F32 if semantic == Semantic::Layer => Ok(0),
-        _ => Err(invalid(
-            "Norm supports F16/BF16; only LayerNorm also supports F32",
-        )),
+        _ => Err(invalid("Norm currently supports F32, F16 and BF16")),
     }
 }
 
 fn output_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
         DType::F8E4M3 => Ok(3),
-        DType::F32 => Ok(0),
-        _ => Err(invalid(
-            "Norm output supports F16, BF16, E4M3 and LayerNorm F32",
-        )),
+        DType::I8 => Ok(4),
+        _ => Err(invalid("Norm output supports F32, F16, BF16, E4M3 and I8")),
     }
 }
 
@@ -167,17 +299,15 @@ fn tensor_storage(
 }
 
 pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normalized> {
-    if args.intermediate_dtype != DType::F32
-        && (args.semantic != Semantic::Rms
-            || args.intermediate_dtype != args.input.dtype()
-            || args.output_scale != 1.0
-            || args.normalized.as_ref().map(|x| x.dtype()) != Some(args.input.dtype()))
-    {
+    let operation = args.operation;
+    let statistic = args.statistic;
+    let affine = args.affine;
+    let gate = args.gate;
+    if !valid_contract(operation, statistic, affine, gate) {
         return Err(invalid(
-            "RMS intermediate dtype must be F32 or the unquantized input dtype",
+            "unsupported Norm operation/statistic/affine/gate contract",
         ));
     }
-    let semantic = args.semantic;
     let dims = args.input.shape().dims();
     if dims.len() != 2 {
         return Err(invalid("Norm input must be rank 2 [rows, cols]"));
@@ -191,10 +321,85 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let cols_abi = i32::try_from(cols)
         .map_err(|_| invalid("Norm column count exceeds the CUDA kernel range"))?;
     let dtype = args.input.dtype();
-    let dtype_value = dtype_code(dtype, semantic)?;
-    if semantic == Semantic::BiasThenResidual && dtype != DType::BF16 {
+    if args.weight_offset {
+        let plain = operation == Operation::Norm && args.numerics != NormNumerics::StableDecode;
+        let fused =
+            operation == Operation::FusedAddNorm && args.numerics == NormNumerics::StablePlanning;
+        if statistic != Statistic::Rms
+            || affine != AffineKind::Weight
+            || gate != GateKind::None
+            || dtype != DType::BF16
+            || args.quantization != Quantization::None
+            || args.bias.is_some()
+            || args.norm_bias.is_some()
+            || args.bias_order != BiasOrder::SingleRound
+            || (!plain && !fused)
+        {
+            return Err(invalid(
+                "weight-offset affine requires unquantized BF16 RMSNorm, no bias/gate, SingleRound order, and Flexible/StablePlanning numerics",
+            ));
+        }
+    } else if args.numerics == NormNumerics::StablePlanning {
         return Err(invalid(
-            "BiasThenResidual is a BF16-only semantic because its intermediate rounding is part of the contract",
+            "StablePlanning numerics currently requires weight-offset affine",
+        ));
+    }
+    if args.intermediate_dtype != DType::F32
+        && !(operation == Operation::Norm && statistic == Statistic::Rms
+            && affine == AffineKind::Weight && gate == GateKind::None
+            && !args.weight_offset && args.quantization == Quantization::None
+            && args.numerics == NormNumerics::Flexible
+            && args.intermediate_dtype == dtype && matches!(dtype, DType::F16 | DType::BF16)) {
+        return Err(invalid("unsupported RMS intermediate dtype contract"));
+    }
+    let plain_f32_layer = operation == Operation::Norm && statistic == Statistic::Layer
+        && affine == AffineKind::Weight && gate == GateKind::None && !args.weight_offset
+        && args.quantization == Quantization::None && args.numerics == NormNumerics::Flexible;
+    if dtype == DType::F32 && !plain_f32_layer
+        && !(operation == Operation::Norm
+            && statistic == Statistic::Rms
+            && affine == AffineKind::Weight
+            && gate == GateKind::None
+            && !args.weight_offset
+            && args.quantization == Quantization::None
+            && args.numerics == NormNumerics::StableDecode)
+    {
+        return Err(invalid(
+            "F32 Norm is supported only for stable decode RMSNorm",
+        ));
+    }
+    if args.numerics == NormNumerics::StableDecode
+        && !((operation == Operation::Norm
+            && statistic == Statistic::Rms
+            && affine == AffineKind::Weight
+            && gate == GateKind::None)
+            || (operation == Operation::FusedAddNorm
+                && statistic == Statistic::Rms
+                && affine == AffineKind::Weight
+                && gate == GateKind::None
+                && dtype == DType::BF16
+                && !args.weight_offset
+                && args.bias.is_none()))
+    {
+        return Err(invalid(
+            "StableDecode numerics supports plain RMSNorm or unbiased BF16 residual RMSNorm only",
+        ));
+    }
+    if args.bias_order == BiasOrder::BiasThenResidual && dtype != DType::BF16 {
+        return Err(invalid(
+            "BiasThenResidual order is BF16-only because its intermediate rounding is part of the contract",
+        ));
+    }
+    if statistic == Statistic::Layer && affine == AffineKind::Adaptive && dtype != DType::BF16 {
+        return Err(invalid(
+            "adaptive LayerNorm currently requires BF16 input and output",
+        ));
+    }
+    if args.bias_order == BiasOrder::BiasThenResidual
+        && (operation == Operation::Norm || gate != GateKind::None || statistic == Statistic::Rms)
+    {
+        return Err(invalid(
+            "BiasThenResidual requires ungated residual add or fused LayerNorm",
         ));
     }
     let count = rows
@@ -207,29 +412,32 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     if !(args.output_scale.is_finite() && args.output_scale > 0.0) {
         return Err(invalid("Norm output_scale must be finite and positive"));
     }
-    if args.bias.is_some() && !semantic.may_have_bias() {
-        return Err(invalid("Norm semantic does not take a bias"));
+    if args.bias.is_some() && !may_have_bias(operation, gate) {
+        return Err(invalid("Norm contract does not take a bias"));
     }
-    if args.residual.is_some() && !semantic.reads_residual() {
-        return Err(invalid("Norm semantic does not take a residual"));
+    if args.residual.is_some() && !reads_residual(operation) {
+        return Err(invalid("Norm contract does not take a residual"));
     }
-    if args.weight.is_some() && !semantic.reads_weight() {
-        return Err(invalid("Norm semantic does not take a weight"));
+    if args.weight.is_some() && !reads_weight(affine) {
+        return Err(invalid("Norm contract does not take a weight"));
     }
-    if args.norm_bias.is_some() && !semantic.reads_norm_bias() {
-        return Err(invalid("Norm semantic does not take a norm bias"));
+    if args.norm_bias.is_some() && !reads_norm_bias(statistic, affine) {
+        return Err(invalid("Norm contract does not take a norm bias"));
     }
-    if args.norm_style.is_some() && !semantic.reads_norm_style() {
-        return Err(invalid("Norm semantic does not take a norm style"));
+    if args.norm_style.is_some() && !reads_norm_style(operation, affine) {
+        return Err(invalid("Norm contract does not take a norm style"));
     }
-    if args.gate_style.is_some() && !semantic.reads_gate_style() {
-        return Err(invalid("Norm semantic does not take a gate style"));
+    if args.gate_style.is_some() && !reads_gate_style(gate) {
+        return Err(invalid("Norm contract does not take a gate style"));
     }
-    if args.hidden.is_some() && !semantic.writes_hidden() {
-        return Err(invalid("Norm semantic does not write a hidden output"));
+    if args.hidden.is_some() && !writes_hidden(operation) {
+        return Err(invalid("Norm contract does not write a hidden output"));
     }
-    if args.normalized.is_some() && !semantic.writes_normalized() {
-        return Err(invalid("Norm semantic does not write a normalized output"));
+    if args.normalized.is_some() && !writes_normalized(operation) {
+        return Err(invalid("Norm contract does not write a normalized output"));
+    }
+    if args.quantized_output.is_some() && !writes_normalized(operation) {
+        return Err(invalid("Norm contract does not write a quantized output"));
     }
 
     let mut storage = Vec::new();
@@ -247,7 +455,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
                 storage.push(buffer);
                 Ok((pointer, alignment))
             }
-            None if required => Err(invalid(format!("Norm semantic requires {label}"))),
+            None if required => Err(invalid(format!("Norm contract requires {label}"))),
             None => Ok((std::ptr::null(), 256)),
         }
     };
@@ -260,21 +468,21 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let (bias, bias_alignment) = bind_vector(args.bias, false, cols, "bias", &mut storage)?;
     let (residual, residual_alignment) = bind_vector(
         args.residual,
-        semantic.reads_residual(),
+        reads_residual(operation),
         count,
         "residual",
         &mut storage,
     )?;
     let (weight, weight_alignment) = bind_vector(
         args.weight,
-        semantic.reads_weight(),
+        reads_weight(affine),
         cols,
         "weight",
         &mut storage,
     )?;
     let (norm_bias, norm_bias_alignment) = bind_vector(
         args.norm_bias,
-        semantic.reads_norm_bias(),
+        reads_norm_bias(statistic, affine),
         cols,
         "norm_bias",
         &mut storage,
@@ -284,7 +492,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         .ok_or_else(|| invalid("Norm style size overflow"))?;
     let (norm_style, norm_style_alignment) = bind_vector(
         args.norm_style,
-        semantic.reads_norm_style(),
+        reads_norm_style(operation, affine),
         norm_style_elements,
         "norm_style",
         &mut storage,
@@ -294,93 +502,223 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         .ok_or_else(|| invalid("Norm gate style size overflow"))?;
     let (gate_style, gate_style_alignment) = bind_vector(
         args.gate_style,
-        semantic.reads_gate_style(),
+        reads_gate_style(gate),
         gate_style_elements,
         "gate_style",
         &mut storage,
     )?;
 
-    let bind_output = |tensor: Option<&mut Tensor>,
+    let bind_output = |tensor: Option<&Tensor>,
                        required: bool,
                        output_dtype: DType,
+                       elements: usize,
                        label: &str,
                        storage: &mut Vec<CudaBuffer>|
      -> Result<(*mut std::ffi::c_void, u32)> {
         match tensor {
             Some(tensor) => {
-                let buffer = tensor_storage(ctx, tensor, output_dtype, count)?;
+                let buffer = tensor_storage(ctx, tensor, output_dtype, elements)?;
                 let pointer = buffer.ptr() as *mut std::ffi::c_void;
                 let alignment = alignment_of(buffer.ptr() as usize);
                 storage.push(buffer);
                 Ok((pointer, alignment))
             }
-            None if required => Err(invalid(format!("Norm semantic requires {label}"))),
+            None if required => Err(invalid(format!("Norm contract requires {label}"))),
             None => Ok((std::ptr::null_mut(), 256)),
         }
     };
 
     let (hidden, hidden_alignment) = bind_output(
         args.hidden,
-        semantic.writes_hidden(),
+        writes_hidden(operation),
         dtype,
+        count,
         "hidden",
         &mut storage,
     )?;
-    let output_dtype = args
-        .normalized
-        .as_ref()
-        .map_or(dtype, |tensor| tensor.dtype());
-
-    if output_dtype == DType::F8E4M3 {
-        if dtype != DType::F16 || !semantic.writes_normalized() {
-            return Err(invalid(
-                "Quantized Norm output requires an F16 normalization semantic",
-            ));
+    let has_native_output = args.normalized.is_some();
+    let contract = (operation, statistic, affine, gate);
+    let (output_dtype, quantized_cols, quantized_elements) = match args.quantization {
+        Quantization::None => {
+            if has_native_output != writes_normalized(operation)
+                || args.quantized_output.is_some()
+                || args.quantized_scales.is_some()
+                || args.output_scale != 1.0
+            {
+                return Err(invalid(
+                    "Non-quantized Norm requires a native output, no quantized bindings, and unit output_scale",
+                ));
+            }
+            (dtype, 0, 0)
         }
-    } else if output_dtype != dtype || args.output_scale != 1.0 {
-        return Err(invalid(
-            "Non-quantized Norm output must preserve dtype and use unit output_scale",
-        ));
-    }
+        Quantization::StaticE4m3 => {
+            let bf16_contract = dtype == DType::BF16
+                && matches!(
+                    contract,
+                    (
+                        Operation::Norm,
+                        Statistic::Rms | Statistic::Layer,
+                        AffineKind::Weight,
+                        GateKind::None
+                    ) | (
+                        Operation::FusedAddNorm,
+                        Statistic::Layer,
+                        AffineKind::Weight,
+                        GateKind::None
+                    ) | (
+                        Operation::Norm,
+                        Statistic::Layer,
+                        AffineKind::Adaptive,
+                        GateKind::None
+                    )
+                );
+            let dual_output_contract = dtype == DType::BF16
+                && matches!(
+                    contract,
+                    (
+                        Operation::Norm,
+                        Statistic::Layer,
+                        AffineKind::Adaptive,
+                        GateKind::None
+                    )
+                );
+            if (dtype != DType::F16 && !bf16_contract)
+                || !writes_normalized(operation)
+                || args.quantized_output.is_none()
+                || args.quantized_scales.is_some()
+                || (has_native_output && !dual_output_contract)
+            {
+                return Err(invalid(
+                    "Static E4M3 Norm output has an unsupported dtype or semantic contract",
+                ));
+            }
+            (DType::F8E4M3, cols, count)
+        }
+        Quantization::RowwiseE4m3 => {
+            if dtype != DType::BF16
+                || !matches!(
+                    contract,
+                    (
+                        Operation::Norm,
+                        Statistic::Rms,
+                        AffineKind::Weight,
+                        GateKind::None
+                    ) | (
+                        Operation::FusedAddNorm,
+                        Statistic::Rms,
+                        AffineKind::Weight,
+                        GateKind::None
+                    )
+                )
+                || has_native_output
+                || args.quantized_output.is_none()
+                || args.quantized_scales.is_none()
+                || args.output_scale != 1.0
+            {
+                return Err(invalid(
+                    "Rowwise E4M3 Norm requires the BF16 weighted RMS contract, values/scales bindings, no native output, and unit output_scale",
+                ));
+            }
+            let dims = args
+                .quantized_output
+                .expect("validated rowwise output binding")
+                .shape()
+                .dims();
+            if dims.len() != 2 || dims[0] != rows || dims[1] < cols {
+                return Err(invalid(
+                    "Rowwise E4M3 Norm output must be [rows, output_cols] with output_cols >= input cols",
+                ));
+            }
+            let elements = rows
+                .checked_mul(dims[1])
+                .ok_or_else(|| invalid("rowwise Norm output size overflow"))?;
+            (DType::F8E4M3, dims[1], elements)
+        }
+        Quantization::RowwiseI8 => {
+            if dtype != DType::BF16
+                || !matches!(
+                    contract,
+                    (
+                        Operation::Norm,
+                        Statistic::Layer,
+                        AffineKind::Weight | AffineKind::Adaptive,
+                        GateKind::None
+                    )
+                )
+                || !has_native_output
+                || args.quantized_output.is_none()
+                || args.quantized_scales.is_none()
+                || args.output_scale != 1.0
+            {
+                return Err(invalid(
+                    "Rowwise I8 Norm requires BF16 LayerNorm, native/values/scales outputs, and unit output_scale",
+                ));
+            }
+            let dims = args
+                .quantized_output
+                .expect("validated rowwise output binding")
+                .shape()
+                .dims();
+            if dims != [rows, cols] {
+                return Err(invalid(
+                    "Rowwise I8 Norm output must match the input [rows, cols] shape",
+                ));
+            }
+            (DType::I8, cols, count)
+        }
+    };
     let (normalized, normalized_alignment) = bind_output(
         args.normalized,
-        semantic.writes_normalized(),
-        output_dtype,
+        writes_normalized(operation) && args.quantization == Quantization::None,
+        dtype,
+        count,
         "normalized",
         &mut storage,
     )?;
-
-    if semantic == Semantic::Layer && dtype == DType::F32 {
-        let output_start = normalized as usize;
-        let output_end = output_start
-            .checked_add(
-                count
-                    .checked_mul(4)
-                    .ok_or_else(|| invalid("LayerNorm size overflow"))?,
-            )
-            .ok_or_else(|| invalid("LayerNorm address overflow"))?;
-        for (pointer, elements) in [(input_pointer, count), (weight, cols), (norm_bias, cols)] {
-            let start = pointer as usize;
-            let end = start
-                .checked_add(
-                    elements
-                        .checked_mul(4)
-                        .ok_or_else(|| invalid("LayerNorm size overflow"))?,
-                )
-                .ok_or_else(|| invalid("LayerNorm address overflow"))?;
-            if start < output_end && output_start < end {
-                return Err(invalid(
-                    "F32 LayerNorm output overlaps an input, weight or bias",
-                ));
-            }
-        }
+    let (quantized, quantized_alignment) = bind_output(
+        args.quantized_output,
+        args.quantization != Quantization::None,
+        output_dtype,
+        quantized_elements,
+        "quantized",
+        &mut storage,
+    )?;
+    let (quantized_scales, quantized_scales_alignment) = bind_output(
+        args.quantized_scales,
+        matches!(
+            args.quantization,
+            Quantization::RowwiseE4m3 | Quantization::RowwiseI8
+        ),
+        DType::F32,
+        rows,
+        "quantized scales",
+        &mut storage,
+    )?;
+    if args.numerics == NormNumerics::StableDecode
+        && operation == Operation::FusedAddNorm
+        && hidden as usize != residual as usize
+    {
+        return Err(invalid(
+            "stable decode residual RMSNorm must update residual in place",
+        ));
     }
+
+    let dtype_value = dtype_code(dtype)?;
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
-        semantic: semantic.code(),
+        intermediate_dtype: dtype_code(args.intermediate_dtype)?,
+        operation: operation.code(),
+        statistic: statistic.code(),
+        affine: affine.code(),
+        gate: gate.code(),
+        quantization: args.quantization.code(),
+        numerics: args.numerics.code(),
         dtype: dtype_value,
         output_dtype: output_dtype_code(output_dtype)?,
+        has_native_output: u32::from(has_native_output),
         has_bias: u32::from(!bias.is_null()),
+        bias_order: args.bias_order.code(),
+        weight_offset: u32::from(args.weight_offset),
         input_alignment,
         weight_alignment,
         bias_alignment: bias_alignment.min(norm_bias_alignment),
@@ -388,15 +726,13 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         style_alignment: norm_style_alignment.min(gate_style_alignment),
         hidden_alignment,
         normalized_alignment,
+        quantized_alignment,
+        quantized_scales_alignment,
         rows: i64::from(rows_abi),
         cols: i64::from(cols_abi),
+        quantized_cols: i64::try_from(quantized_cols)
+            .map_err(|_| invalid("Norm quantized column count exceeds the ABI range"))?,
         output_scale_is_unit: u32::from(args.output_scale == 1.0),
-        intermediate_dtype: match args.intermediate_dtype {
-            DType::F32 => 0,
-            DType::F16 => 1,
-            DType::BF16 => 2,
-            _ => return Err(invalid("unsupported RMS intermediate dtype")),
-        },
     };
 
     let bindings = abi::Bindings {
@@ -409,6 +745,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         gate_style,
         hidden,
         normalized,
+        quantized,
+        quantized_scales,
         stream: ctx.stream().handle() as abi::CudaStream,
         eps: args.eps,
         output_scale: args.output_scale,

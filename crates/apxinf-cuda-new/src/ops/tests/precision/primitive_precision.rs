@@ -191,10 +191,10 @@ fn rms_intermediate_dtype_preserves_default_and_explicit_boundary() {
     let mut baseline = Vec::new();
     for intermediate_dtype in [DType::F32, DType::BF16] {
         let run = |out: &mut Tensor| {
-            let mut args = RmsNormArgs::new(&input, &weight, out, 1e-6);
+            let mut args = NormArgs::rms(&input, &weight, out, 1e-6);
             assert_eq!(args.intermediate_dtype, DType::F32);
             args.intermediate_dtype = intermediate_dtype;
-            rms_norm(&ctx, args)
+            crate::ops::norm::norm(&ctx, args)
         };
         run(&mut out).unwrap();
         ctx.synchronize().unwrap();
@@ -241,7 +241,7 @@ fn rms_intermediate_dtype_preserves_default_and_explicit_boundary() {
             started.elapsed().as_secs_f64() * 1e4
         );
     }
-    let mut invalid = RmsNormArgs::new(&input, &weight, &mut out, 1e-6);
+    let mut invalid = NormArgs::rms(&input, &weight, &mut out, 1e-6);
     invalid.intermediate_dtype = DType::F16;
-    assert!(rms_norm(&ctx, invalid).is_err());
+    assert!(crate::ops::norm::norm(&ctx, invalid).is_err());
 }

@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <utility>
+#include <tuple>
 
 namespace apxinf::providers {
 
@@ -31,12 +32,12 @@ struct CublasStreamResources {
 };
 
 inline std::shared_ptr<CublasStreamResources> acquire_cublas_stream_resources(
-    int device, cudaStream_t stream) {
+    int device, cudaStream_t stream, cublasMath_t math_mode = CUBLAS_PEDANTIC_MATH) {
   using namespace apxinf::framework;
-  using Key = std::pair<int, uintptr_t>;
+  using Key = std::tuple<int, uintptr_t, int>;
   static std::mutex cache_mutex;
   static std::map<Key, std::weak_ptr<CublasStreamResources>> cache;
-  const Key key{device, reinterpret_cast<uintptr_t>(stream)};
+  const Key key{device, reinterpret_cast<uintptr_t>(stream), static_cast<int>(math_mode)};
   std::lock_guard<std::mutex> lock(cache_mutex);
   for (auto it = cache.begin(); it != cache.end();) {
     if (it->second.expired()) it = cache.erase(it);
@@ -56,7 +57,7 @@ inline std::shared_ptr<CublasStreamResources> acquire_cublas_stream_resources(
   check_cuda(cudaSetDevice(device));
   check_cublas(cublasCreate(&resources->handle));
   check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
-  check_cublas(cublasSetMathMode(resources->handle, CUBLAS_PEDANTIC_MATH));
+  check_cublas(cublasSetMathMode(resources->handle, math_mode));
   check_cublas(cublasSetPointerMode(resources->handle, CUBLAS_POINTER_MODE_HOST));
   check_cublas(cublasSetStream(resources->handle, stream));
   check_cublas(cublasSetWorkspace(resources->handle, resources->workspace,

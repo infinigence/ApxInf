@@ -166,9 +166,12 @@ specialized fast path may recover a concrete backend for capabilities that do
 not belong on the portable trait. Trait is the floor; concrete types are the
 ceiling.
 
-For native backend composition, use a `<backend>_<family>` module (`cuda_`,
-`metal_`, or `hip_`) and registration;
-the provisional cross-backend design is not a prerequisite. Preserve measured
+A port written directly against one backend's native API goes in a
+self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`) that
+copies, rather than imports, any config, checkpoint or math code it shares with
+another backend's port; see
+[where backend-native model code lives](model-layer-architecture.md#where-backend-native-model-code-lives).
+The provisional cross-backend design is not a prerequisite. Preserve measured
 performance and reference semantics when choosing the boundary.
 
 For MLX, the concrete safe seam is `MlxBackend` with `Array`, `Stream` and
@@ -241,11 +244,6 @@ Complete these steps in the new family's own code and the existing registries:
    `builtin::register_builtin_models`, with the correct feature gate and names.
    `AutoModel::load_model` resolves `LoadOptions.model_name` or checkpoint
    metadata; test both explicit selection and the supported detection path.
-   Families using cuda-new directly (currently PI0.5, D3 and Fast-WAM) also
-   have a dedicated `AutoModel` loader dispatch before legacy `Backend`
-   construction. Keep that dispatch family-local and route its registry
-   factory to the same loader; do not construct an unused legacy backend for
-   the public CUDA path. This preserves the existing factory contract.
    For Metal, the current `mlx` feature registers `metal_qwen3` and
    `metal_minicpm5`; `AutoModel` resolves the Metal prefix. MiniCPM5 must be
    explicitly named because its official checkpoint identifies as `llama`.
@@ -273,8 +271,7 @@ Complete these steps in the new family's own code and the existing registries:
 
 ```text
 AutoPolicy → <Family>Policy → apxinf.ModelRunner (= apxinf_py.ModelRunner)
-  → Rust AutoModel → family loader (registry or dedicated cuda-new dispatch)
-  → LoadedModel::Vla(<Family>ModelRunner)
+  → Rust AutoModel → registry loader → LoadedModel::Vla(<Family>ModelRunner)
   → <Family>Model / Blocks → safe backend operations
 ```
 

@@ -78,6 +78,9 @@ void write_recipe(const std::string& directory, const std::string& key,
 
 struct apxinf_runtime {
   int device = 0;
+  int compute_major = 0;
+  int compute_minor = 0;
+  int multiprocessor_count = 0;
   std::mutex gemm_mutex;
   std::map<std::string, apxinf::framework::Recipe> gemm_recipes;
   std::mutex attention_mutex;

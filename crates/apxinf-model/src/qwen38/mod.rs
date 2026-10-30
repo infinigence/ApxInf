@@ -28,6 +28,10 @@ mod model;
 #[cfg(feature = "cuda")]
 mod model_runner;
 #[cfg(feature = "cuda")]
+mod vision;
+#[cfg(feature = "cuda")]
+mod vision_weights;
+#[cfg(feature = "cuda")]
 mod weights;
 
 #[cfg(feature = "cuda")]

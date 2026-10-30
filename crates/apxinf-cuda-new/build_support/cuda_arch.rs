@@ -64,6 +64,7 @@ pub const DEVICE_FEATURE_CUTLASS_SM100: u64 = 1 << 1;
 pub const DEVICE_FEATURE_FA2: u64 = 1 << 2;
 pub const DEVICE_FEATURE_CUTLASS_SM89_BF16_GEGLU: u64 = 1 << 3;
 pub const DEVICE_FEATURE_CUTLASS_SM87_W8A8: u64 = 1 << 4;
+pub const DEVICE_FEATURE_QWEN_DRIVE_SM110: u64 = 1 << 5;
 
 pub fn is_cutlass_sm100_family(arch: &str) -> bool {
     matches!(
@@ -108,6 +109,9 @@ pub fn target_features(target: &ArchTarget) -> u64 {
     }
     if target.cutlass_arch == "sm_87" {
         features |= DEVICE_FEATURE_CUTLASS_SM87_W8A8;
+    }
+    if target.sm() == 110 {
+        features |= DEVICE_FEATURE_QWEN_DRIVE_SM110;
     }
     features
 }
@@ -322,7 +326,9 @@ fn validate_nvcc_arch(nvcc: &Path, out_dir: &Path, arch: &str) -> Result<(), Str
         .arg(&source)
         .arg("-o")
         .arg(&object)
-        .arg(format!("-arch={arch}"))
+        // Validate the same flag spelling the real compiles use, so a target
+        // that only works under `-arch=` never reaches the kernel build.
+        .args(gencode_args([arch.to_owned()]))
         .output()
         .map_err(|error| format!("run {} to validate {arch}: {error}", nvcc.display()))?;
     ensure_success(&format!("validate CUDA architecture {arch}"), &output)
@@ -426,11 +432,7 @@ mod tests {
             89,
             DEVICE_FEATURE_FA2 | DEVICE_FEATURE_CUTLASS_SM89_BF16_GEGLU
         ));
-        assert!(!supports_target(
-            &targets,
-            89,
-            DEVICE_FEATURE_CUTLASS_SM100
-        ));
+        assert!(!supports_target(&targets, 89, DEVICE_FEATURE_CUTLASS_SM100));
         assert!(supports_target(
             &targets,
             110,

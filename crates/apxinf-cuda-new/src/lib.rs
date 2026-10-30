@@ -1,59 +1,61 @@
+pub mod backend;
 pub mod buffer;
 pub mod context;
+pub mod cublas;
 pub mod device_caps;
 mod ffi;
 mod graph;
+mod kv_cache;
+pub mod nvtx;
 pub mod phase;
+pub mod profiler;
+pub mod runtime;
 pub mod sampling;
 pub mod stream;
 pub mod transfers;
 mod workspace;
 
+#[cfg(test)]
+pub(crate) static CUDA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub use backend::CudaNewBackend;
 pub use buffer::{CudaBuffer, CudaDeviceAddress, HostMappedBuffer};
 pub use context::CudaContext;
+pub use cublas::{CublasHandle, CublasTranspose};
 pub use device_caps::{CudaArchFamily, CudaDeviceCaps};
 pub use graph::{capture, CapturedGraph};
+pub use kv_cache::CudaKvCache;
+pub use ops::norm::norm;
 pub use ops::{
-    ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm, additive_attention,
-    attention, bias_residual, bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual,
-    concat_rows, decode_rope, gather, kv_cache_attention, layer_norm, multimodal_rope,
-    packed_qkv_attention, pairwise_rope, pointwise, quantization, reserve_prefix, rms_norm, rope,
-    segmented_attention, split_qkv_axial_rope, AdaGateResidualArgs, AdaGateResidualRmsNormArgs,
-    AdaptiveRmsNormArgs, AttentionArgs, AttentionBiasArgs, AttentionMask, AttentionPolicy,
-    AxialRopeArgs, BiasResidualArgs, BiasResidualLayerNormArgs, BiasResidualRmsNormArgs,
-    BiasThenResidualArgs, DecodeRopeArgs, ExecutionSession, GatherArgs, GatherPatchGeometry,
-    GatherSemantic, GraphWorkspace, KvCacheAttentionArgs, KvCacheDecodeMeta, LayerNormArgs,
-    MultimodalRopeArgs, PackedQkvAttentionArgs, PairwiseRopeArgs, PairwiseRopeTable,
-    PointwiseActivation, PointwiseArgs, PointwiseSemantic, QuantizationArgs, QuantizationSemantic,
-    RmsNormArgs, RopeArgs, RopeSemantic, SegmentedAttentionArgs,
-};
-pub use ops::{
-    channel_l2_normalize, channel_standardize, image_grouped_average, image_im2col,
-    image_rgb_indices, image_space_to_depth, ImageMemoryLayout,
+    attention, concat_rows, decode_rope, decode_rotation, fused_add_norm, gather,
+    kv_cache_attention, multimodal_rope, pointwise, quantization, reserve_prefix, residual_add,
+    rope, segmented_attention, split_grouped_qkv, split_qkv_axial_rope, split_qkv_cache,
+    split_qkv_mrope_cache, vision_position, Affine, ArgmaxArgs, AttentionArgs, AttentionInput,
+    AttentionMask, AttentionPolicy, AxialRopeArgs, AxialRopeNumerics, BiasOrder, DecodeRopeArgs,
+    DecodeRotationArgs, DecodeRotationPosition, EmbeddingScale, ExecutionSession, FusedAddNormArgs,
+    GatherArgs, GatherPatchGeometry, GatherSemantic, GraphWorkspace, GroupedQkvRopeArgs,
+    KvCacheAttentionArgs, KvCacheDecodeMeta, MropeCacheArgs, MultimodalRopeArgs, NormArgs,
+    NormKind, NormNumerics, PointwiseActivation, PointwiseArgs, PointwiseSemantic,
+    QkvCacheRopeArgs, QuantOut, QuantizationArgs, QuantizationSemantic, ResidualAddArgs, RopeArgs,
+    RopeSemantic, SegmentedAttentionArgs, VisionPositionArgs,
 };
 pub use phase::PreparedPhase;
 pub use stream::CudaStream;
 
 pub mod ops;
 
-/// Whether this build linked the shape-specialized Qwen3.8 NVFP4 dense SwiGLU
-/// AOT object (`crates/apxinf-cuda/aot/qwen38.json`, exported through the
-/// bundle named by `APXINF_CUDA_AOT_MANIFEST` at build time).
+/// Whether the SM110 native NVFP4 GEMM+SwiGLU implementation is available.
 ///
-/// When `false`, the C ABI `apxinf_gemm_nvfp4_dense_swiglu_aot` is a stub that
-/// returns `APXINF_STATUS_UNSUPPORTED`, so callers must take the generic path
-/// instead.
-///
-/// This is a compile-time constant: `build.rs` sets the internal
-/// `apxinf_qwen38_dense_swiglu_aot` cfg, which a dependent crate cannot observe
-/// directly (cfgs do not cross crate boundaries), so it is folded into a
-/// `pub const` that any dependent crate can branch on with zero runtime cost.
-pub const QWEN38_DENSE_SWIGLU_AOT: bool = cfg!(apxinf_qwen38_dense_swiglu_aot);
+/// The name describes the mathematical operator rather than its current model
+/// consumer. Unsupported targets use the unfused GEMM + SwiGLU fallback.
+pub const NVFP4_GEMM_SWIGLU: bool = cfg!(apxinf_nvfp4_gemm_swiglu);
 
 /// Whether this build compiled the allocation-free FA2 decode kernel
 /// (`apxinf_decode_attention`). When `false` that ABI returns
 /// `APXINF_STATUS_UNSUPPORTED`, so callers must use the generic attention path.
 ///
-/// Like [`QWEN38_DENSE_SWIGLU_AOT`], this is a zero-cost compile-time constant
+/// Like [`NVFP4_GEMM_SWIGLU`], this is a zero-cost compile-time constant
 /// carrying a build-time cfg across the crate boundary.
 pub const FA2_DECODE: bool = cfg!(apxinf_fa2_decode);
+
+pub use ops::{additive_attention, AttentionBiasArgs, pairwise_rope, PairwiseRopeArgs, PairwiseRopeTable, channel_l2_normalize, channel_standardize, image_grouped_average, image_im2col, image_rgb_indices, image_space_to_depth, ImageMemoryLayout};

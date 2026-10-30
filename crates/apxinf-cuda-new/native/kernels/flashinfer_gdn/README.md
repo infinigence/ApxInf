@@ -3,6 +3,31 @@
 Source: https://github.com/flashinfer-ai/flashinfer, `csrc/gdn/cake/cuda/`.
 Licence: Apache-2.0 (repository-wide; the per-file headers carry the notice).
 
+## BF16 full-DV provenance
+
+The Qwen Drive translation uses the following pinned upstream snapshot:
+
+- Revision: `f63b2e7cbfb9a008a3880ebf00f2bbf3721176fe` (`main`,
+  2026-10-12T10:16:52Z).
+- Original path:
+  `csrc/gdn/cake/cuda/cake_gdn_prefill_b384fd71263b.cu`.
+- Local path:
+  `cake_gdn_prefill_bf16_fulldv_sm110.cu`.
+- SHA-256:
+  `b384fd71263b4eddd3da5f2cf5781cfc07c25057792212de722379b511387581`.
+- Local modifications: none to the generated source contents. The file was
+  renamed to describe its BF16-I/O, full-DV, SM110 role. The separate
+  `gdn_bf16_prefill_sm110_launch.cu` wrapper supplies the required head-count
+  macros and renames the kernel symbol so it can coexist with the FP16 variant.
+
+The shared upstream helper comes from the same revision and original path
+`csrc/gdn/cake/cuda/gdn_prefill_generated.cuh`. Its local file is byte-identical
+to upstream, with SHA-256
+`3beb2a81f173db4f130a1ffa0d653832f863d813a522dd0d0a0546afeb095d47`.
+Both files retain FlashInfer's Apache-2.0 copyright and license notice.
+
+## FP16 dv-split variant
+
 Two files are vendored verbatim apart from one documented patch:
 
   gdn_prefill_generated.cuh

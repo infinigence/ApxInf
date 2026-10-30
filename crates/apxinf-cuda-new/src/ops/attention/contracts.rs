@@ -12,7 +12,6 @@ pub(crate) enum Semantic {
     Additive = abi::SEMANTIC_ADDITIVE,
     KvCache = abi::SEMANTIC_KV_CACHE,
     Segmented = abi::SEMANTIC_SEGMENTED,
-    PackedQkv = abi::SEMANTIC_PACKED_QKV,
 }
 
 impl Semantic {
@@ -31,9 +30,6 @@ impl Semantic {
             Self::Additive => "additive_attention",
             Self::KvCache => "kv_cache_attention",
             Self::Segmented => "segmented_attention",
-            // Packed QKV is a storage layout for the dense mathematical
-            // semantic, not a separate public operator family.
-            Self::PackedQkv => "attention",
         }
     }
 }
@@ -42,6 +38,19 @@ impl Semantic {
 pub enum AttentionMask {
     None,
     Causal,
+}
+
+/// Numerical compatibility required from an Attention candidate.
+///
+/// `Stable` preserves the reduction and rounding behavior used by the
+/// validated model baseline. It deliberately does not name a provider: native
+/// candidates opt in only after they pass the model-level compatibility gate.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AttentionNumerics {
+    #[default]
+    Flexible = 0,
+    Stable = 1,
 }
 
 #[derive(Clone, Debug)]
@@ -68,13 +77,24 @@ impl Default for AttentionPolicy {
     }
 }
 
-/// Canonical dense attention contract. Tensors are contiguous row-major:
-/// Q `[batch, query_tokens, query_heads, head_dim]`, K/V
-/// `[batch, key_tokens, kv_heads, head_dim]`, and output has Q's shape.
+/// Dense Attention input layout.
+#[derive(Clone, Copy, Debug)]
+pub enum AttentionInput<'a> {
+    /// Contiguous row-major Q `[batch, query_tokens, query_heads, head_dim]`
+    /// and K/V `[batch, key_tokens, kv_heads, head_dim]`.
+    Separate {
+        query: &'a Tensor,
+        key: &'a Tensor,
+        value: &'a Tensor,
+    },
+    /// Zero-copy `[batch, tokens, 3, heads, head_dim]` token-major QKV.
+    PackedQkv(&'a Tensor),
+}
+
+/// Canonical dense attention contract. The input layout is data semantics;
+/// provider and shape specialization remain private native candidates.
 pub struct AttentionArgs<'a> {
-    pub query: &'a Tensor,
-    pub key: &'a Tensor,
-    pub value: &'a Tensor,
+    pub input: AttentionInput<'a>,
     pub out: &'a mut Tensor,
     pub mask: AttentionMask,
     pub scale: f32,
@@ -82,6 +102,7 @@ pub struct AttentionArgs<'a> {
     /// `round_to_e4m3(attention / output_scale)`. Must remain `1.0` for
     /// ordinary F16/BF16/F32 output.
     pub output_scale: f32,
+    pub numerics: AttentionNumerics,
     pub policy: AttentionPolicy,
 }
 
@@ -89,13 +110,25 @@ impl<'a> AttentionArgs<'a> {
     pub fn new(query: &'a Tensor, key: &'a Tensor, value: &'a Tensor, out: &'a mut Tensor) -> Self {
         let head_dim = query.shape().dims().get(3).copied().unwrap_or(1);
         Self {
-            query,
-            key,
-            value,
+            input: AttentionInput::Separate { query, key, value },
             out,
             mask: AttentionMask::None,
             scale: 1.0 / (head_dim as f32).sqrt(),
             output_scale: 1.0,
+            numerics: AttentionNumerics::Flexible,
+            policy: AttentionPolicy::default(),
+        }
+    }
+
+    pub fn from_packed_qkv(qkv: &'a Tensor, out: &'a mut Tensor) -> Self {
+        let head_dim = qkv.shape().dims().get(4).copied().unwrap_or(1);
+        Self {
+            input: AttentionInput::PackedQkv(qkv),
+            out,
+            mask: AttentionMask::None,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            output_scale: 1.0,
+            numerics: AttentionNumerics::Flexible,
             policy: AttentionPolicy::default(),
         }
     }
@@ -103,31 +136,6 @@ impl<'a> AttentionArgs<'a> {
     pub fn causal(mut self) -> Self {
         self.mask = AttentionMask::Causal;
         self
-    }
-}
-
-/// Dense self-attention over a zero-copy packed QKV projection.
-///
-/// `qkv` is contiguous `[batch, tokens, 3, heads, head_dim]`, with Q/K/V
-/// adjacent inside each token row. The provider consumes the token-row stride
-/// directly, so this operation does not materialize three separate tensors.
-/// The current kernel is the production SigLIP shape `[batch, 256, 3, 16, 72]`.
-pub struct PackedQkvAttentionArgs<'a> {
-    pub qkv: &'a Tensor,
-    pub out: &'a mut Tensor,
-    pub scale: f32,
-    pub policy: AttentionPolicy,
-}
-
-impl<'a> PackedQkvAttentionArgs<'a> {
-    pub fn new(qkv: &'a Tensor, out: &'a mut Tensor) -> Self {
-        let head_dim = qkv.shape().dims().get(4).copied().unwrap_or(1);
-        Self {
-            qkv,
-            out,
-            scale: 1.0 / (head_dim as f32).sqrt(),
-            policy: AttentionPolicy::default(),
-        }
     }
 }
 
@@ -207,9 +215,24 @@ pub(crate) fn alignment(pointer: *const std::ffi::c_void) -> u32 {
 }
 
 pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<Normalized> {
-    let q_shape = args.query.shape().dims();
-    let k_shape = args.key.shape().dims();
-    let v_shape = args.value.shape().dims();
+    match args.input {
+        AttentionInput::Separate { query, key, value } => {
+            normalize_separate(ctx, args, query, key, value)
+        }
+        AttentionInput::PackedQkv(qkv) => normalize_packed_qkv(ctx, args, qkv),
+    }
+}
+
+fn normalize_separate(
+    ctx: &CudaContext,
+    args: AttentionArgs<'_>,
+    query: &Tensor,
+    key: &Tensor,
+    value: &Tensor,
+) -> Result<Normalized> {
+    let q_shape = query.shape().dims();
+    let k_shape = key.shape().dims();
+    let v_shape = value.shape().dims();
     if q_shape.len() != 4 || k_shape.len() != 4 || v_shape.len() != 4 {
         return Err(invalid("Attention requires rank-4 Q/K/V tensors"));
     }
@@ -231,10 +254,10 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
         || head_dim != key_head_dim
         || query_heads % kv_heads != 0
         || args.out.shape().dims() != q_shape
-        || args.query.dtype() != args.key.dtype()
-        || args.query.dtype() != args.value.dtype()
-        || (args.out.dtype() != args.query.dtype()
-            && !(args.query.dtype() == DType::F16 && args.out.dtype() == DType::F8E4M3))
+        || query.dtype() != key.dtype()
+        || query.dtype() != value.dtype()
+        || (args.out.dtype() != query.dtype()
+            && !(query.dtype() == DType::F16 && args.out.dtype() == DType::F8E4M3))
         || (args.mask == AttentionMask::Causal && key_tokens < query_tokens)
     {
         return Err(invalid("invalid Attention shape or dtype contract"));
@@ -264,10 +287,10 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
         return Err(invalid("Attention dimension exceeds native limits"));
     }
 
-    let dtype = args.query.dtype();
-    let q = tensor_storage(ctx, args.query, dtype, q_shape)?;
-    let k = tensor_storage(ctx, args.key, dtype, k_shape)?;
-    let v = tensor_storage(ctx, args.value, dtype, v_shape)?;
+    let dtype = query.dtype();
+    let q = tensor_storage(ctx, query, dtype, q_shape)?;
+    let k = tensor_storage(ctx, key, dtype, k_shape)?;
+    let v = tensor_storage(ctx, value, dtype, v_shape)?;
     let output_dtype = args.out.dtype();
     let out = tensor_storage(ctx, args.out, output_dtype, q_shape)?;
     let out_range = range(&out, required_bytes(output_dtype, q_shape)?)?;
@@ -296,6 +319,10 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
         scale: args.scale,
         output_scale: args.output_scale,
     };
+    let mut policy = args.policy;
+    if policy.cache_dir.is_none() {
+        policy.cache_dir = ctx.recipe_cache_dir().map(str::to_owned);
+    }
     Ok(Normalized {
         spec: abi::Spec {
             bias_alignment: 0,
@@ -307,6 +334,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
             dtype: dtype_code(dtype)?,
             output_dtype: output_dtype_code(output_dtype)?,
             mask: args.mask as u32,
+            qkv_layout: abi::QKV_LAYOUT_SEPARATE,
             q_alignment: alignment(bindings.query),
             k_alignment: alignment(bindings.key),
             v_alignment: alignment(bindings.value),
@@ -329,19 +357,21 @@ pub(crate) fn normalize(ctx: &CudaContext, args: AttentionArgs<'_>) -> Result<No
             offsets_hash: 0,
             scale_is_default: u32::from(args.scale == default_scale),
             dynamic_decode: 0,
+            numerics: args.numerics as u32,
         },
-        policy: args.policy,
+        policy,
         bindings,
         storage: vec![q, k, v, out],
         resources: Vec::new(),
     })
 }
 
-pub(crate) fn normalize_packed_qkv(
+fn normalize_packed_qkv(
     ctx: &CudaContext,
-    args: PackedQkvAttentionArgs<'_>,
+    args: AttentionArgs<'_>,
+    qkv_tensor: &Tensor,
 ) -> Result<Normalized> {
-    let shape = args.qkv.shape().dims();
+    let shape = qkv_tensor.shape().dims();
     if shape.len() != 5 || shape[2] != 3 {
         return Err(invalid(
             "Packed QKV Attention requires [batch, tokens, 3, heads, head_dim] input",
@@ -354,8 +384,10 @@ pub(crate) fn normalize_packed_qkv(
         || heads != 16
         || head_dim != 72
         || args.out.shape().dims() != out_shape
-        || args.out.dtype() != args.qkv.dtype()
-        || args.qkv.dtype() != DType::F16
+        || args.out.dtype() != qkv_tensor.dtype()
+        || qkv_tensor.dtype() != DType::F16
+        || args.mask != AttentionMask::None
+        || args.output_scale != 1.0
     {
         return Err(invalid(
             "invalid packed QKV Attention shape or dtype contract",
@@ -371,8 +403,8 @@ pub(crate) fn normalize_packed_qkv(
         return Err(invalid("Attention scale must be finite and positive"));
     }
 
-    let dtype = args.qkv.dtype();
-    let qkv = tensor_storage(ctx, args.qkv, dtype, shape)?;
+    let dtype = qkv_tensor.dtype();
+    let qkv = tensor_storage(ctx, qkv_tensor, dtype, shape)?;
     let out = tensor_storage(ctx, args.out, dtype, &out_shape)?;
     let qkv_range = range(&qkv, required_bytes(dtype, shape)?)?;
     let out_range = range(&out, required_bytes(dtype, &out_shape)?)?;
@@ -408,6 +440,10 @@ pub(crate) fn normalize_packed_qkv(
         scale: args.scale,
         output_scale: 1.0,
     };
+    let mut policy = args.policy;
+    if policy.cache_dir.is_none() {
+        policy.cache_dir = ctx.recipe_cache_dir().map(str::to_owned);
+    }
     Ok(Normalized {
         spec: abi::Spec {
             bias_alignment: 0,
@@ -415,10 +451,11 @@ pub(crate) fn normalize_packed_qkv(
             input_precision: 0,
             reserved: 0,
             version: abi::SPEC_VERSION,
-            semantic: Semantic::PackedQkv.abi_value(),
+            semantic: Semantic::Dense.abi_value(),
             dtype: dtype_code(dtype)?,
             output_dtype: dtype_code(dtype)?,
             mask: AttentionMask::None as u32,
+            qkv_layout: abi::QKV_LAYOUT_PACKED_TOKEN,
             q_alignment: alignment(bindings.query),
             k_alignment: alignment(bindings.key),
             v_alignment: alignment(bindings.value),
@@ -437,8 +474,9 @@ pub(crate) fn normalize_packed_qkv(
             offsets_hash: 0,
             scale_is_default: u32::from(args.scale == default_scale),
             dynamic_decode: 0,
+            numerics: args.numerics as u32,
         },
-        policy: args.policy,
+        policy,
         bindings,
         storage: vec![qkv, key, value, out],
         resources: Vec::new(),

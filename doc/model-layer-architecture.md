@@ -32,7 +32,7 @@ apxinf-model
   architecture, weights, schedules and execution orchestration
                          |
                          v
-apxinf-core / apxinf-cuda / apxinf-mlx
+apxinf-core / apxinf-cuda-new / apxinf-mlx
   tensors, devices, model-neutral operators, kernel APIs
 ```
 
@@ -43,12 +43,11 @@ implemented. The selection table defines each family's supported geometry,
 precision and compilation scopes; a compiled callable alone does not establish
 hardware or workload acceptance.
 
-Within the legacy CUDA backend, safe Rust operators in `src/kernels/` call
-private `src/ffi/` declarations. The C/C++ boundary in
-[`adapters/`](../crates/apxinf-cuda/adapters/README.md) integrates vendor/AOT
-launches; device implementations belong in `kernels/`, and offline CuTe export
-belongs in `aot/`. These are backend implementation details, not additional
-model-layer interfaces.
+Within the CUDA backend, safe Rust L3 operators call private `src/ffi/`
+declarations. The C/C++ L1 boundary in
+[`native/adapters/`](../crates/apxinf-cuda-new/native/adapters) selects and
+launches in-tree L0 kernels from `native/kernels/`. These are backend
+implementation details, not additional model-layer interfaces.
 
 ## Runtime contracts
 
@@ -95,7 +94,7 @@ not a port requirement.
 | `weights/` | Checkpoint mapping, model-local packing, device weight trees and fixed calibration scales; fixed weight operations stay with their physical representation | [weights/mod.rs](../crates/apxinf-model/src/pi05/weights/mod.rs) |
 | `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
-| `apxinf-cuda` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda/src/lib.rs) |
+| `apxinf-cuda-new` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda-new/src/lib.rs) |
 | `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
 
 `model_variant` is the shared loading field and CLI option `--model-variant`.
@@ -130,6 +129,45 @@ formula. Config and resource descriptions are leaf data. PI0.5 enforces these
 directions with [check_pi05_module_boundaries.py](../scripts/check_pi05_module_boundaries.py).
 That guard checks PI0.5 only; a new family must enforce its own declared boundaries.
 
+### Where backend-native model code lives
+
+A model written directly against one backend's native API (cuda-new, MLX, HIP),
+rather than through `dyn Backend`, is a **port**. Ports follow one rule, whether
+or not another backend already implements the same family:
+
+1. **A port is a top-level module `<backend>_<family>/`** in `apxinf-model/src/`,
+   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`. For example
+   `metal_qwen3/` is the Metal port of Qwen3; a CUDA port of the same family would
+   be `cuda_qwen3/`, beside it rather than inside it.
+2. **A port is self-contained.** It depends only on the core crates
+   (`apxinf-core`, `apxinf-loader`), its backend crate, and the cross-model
+   interfaces (`vla`, `llm_trait`, `auto`/`registry`, `LoadOptions`). It never
+   imports another model module, including a port of the same family to another
+   backend.
+3. **Copy instead of sharing.** Config parsing, checkpoint interpretation,
+   weight packing and model math are duplicated into each port that needs them.
+   A copy belongs to its port, which may simplify or change it; there is no
+   obligation to keep copies in sync.
+4. **What ports of one family share is acceptance, not code**: the same accuracy
+   fixtures, independent reference outputs and gates. A copy is correct when it
+   passes them.
+5. **The user-facing contract is defined once**: registry and CLI names, the
+   meaning of shared load options, the Python policy and `VlaContract`. Ports
+   honor it; tests enforce it.
+
+The rule is what lets several agents work on different backends at once. Code
+shared between ports accumulates whatever its most active user needs — a
+checkpoint loader that folds norms "before FP8 quantization", a config that
+carries one backend's workspace sizing — and a change made for one backend then
+silently changes another's results. With one copy per port, a change stays in
+the port that made it, and the shared fixtures catch a copy that is wrong.
+Coding is cheap; redundancy here is a feature.
+
+Paths are independent of user-facing names: moving or adding a port never
+changes a registry name or CLI option. Existing CUDA families (`pi05/`,
+`gr00t/`, `walloss/`, …) predate the rule and keep their paths; they are not
+renamed as part of unrelated work.
+
 ### Current coverage and port decisions
 
 | Family / contract | Current organization and limits |
@@ -138,7 +176,7 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 | Fast-WAM / `VlaRuntime` | `cuda_fastwam/model/blocks/bf16.rs` owns layer composition and fixed modulation preparation; `model/` connects modalities and the schedule, `weights/host.rs` reads checkpoint data, `weights/bf16.rs` materializes `Bf16Weights` and named weight data before model construction; Blocks functions own activation conversion and consume that data without adding inherent methods to weight types, and `model_runner/{runner,prepare}.rs` owns execution; CUDA BF16 action-only fixed profile with native Wan VAE/UMT5, two resized RGB views and ten flow steps; [qualification and limits](fastwam.md) |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
-| WallOSS / `VlaRuntime` | Existing `bf16_runtime.rs`, `bf16_executor.rs`, `fp8.rs` and weight files; not migrated to PI0.5's runner/variant or explicit preparation contract |
+| WallOSS / `VlaRuntime` | `model/` (`WallossModel` + `ModelVariant` over BF16 and dynamic FP8, `blocks/`), `model_runner/` (`WallossModelRunner`, `prepare.rs`: explicit preparation policy/status, capture during preparation, one implicit plan replaced on shape change), `weights/`; per-request grids via `VlaMetadata::image_grid_thw` kept in the family's plan key; model-reported workspace backed by the config-only `workspace.rs` budget; rejected host requests preserve the cached plan; `check_walloss_module_boundaries.py`. See [WallOSS](walloss.md). |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
 | Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
@@ -152,10 +190,12 @@ separately migrated; do not rename or import them as part of an unrelated port.
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
 The common loader accepts `model_variant` for PI0.5, Qwen-Drive, SmolVLA and Fast-WAM registry
-names, and for Qwen3/MiniCPM5 names when the device is Metal. Each MLX family
-parses its variants locally; the common loader does not infer quantization from
-a shared CUDA precision choice. Supporting it for a new family requires updating that admission check
-and implementing family-local parsing/validation; registration alone is not
+names, and for every Metal request. Metal admission reaches only a registered
+`metal_` factory, and each MLX family parses its variants locally; the common
+loader does not infer quantization from a shared CUDA precision choice. A new
+Metal family needs no central admission edit. Supporting it for a new non-Metal
+family requires updating that admission check and implementing family-local
+parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and
@@ -247,7 +287,7 @@ library. During an initial port, dependencies follow this matrix:
 | Dependency | Allowed |
 |---|---|
 | `<new_model>` → `apxinf-core` contracts | yes |
-| `<new_model>` → safe `apxinf-cuda` kernel interfaces | yes |
+| `<new_model>` → safe `apxinf-cuda-new` kernel interfaces | yes |
 | `<new_model>` → explicitly shared top-level model modules | yes |
 | `<new_model>` → another model-family directory | no |
 | another model-family directory changed to accommodate `<new_model>` | no by default; requires a separate shared-seam design and review |
@@ -376,12 +416,5 @@ construction entry points; `LoadedModel` remains the Rust loading-result enum.
 See the [implemented component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2),
 [callable lifecycle contract](model-lifecycle/lifecycle.md#implemented-pi05-preparation-contract)
 and [migration tracker](model-lifecycle/migration.md) for qualification and scope.
-WallOSS and GR00T retain their previous implementations pending their own stages.
-
-### Backend-native family modules
-
-A new implementation written directly against a backend native API lives in
-`<backend>_<family>/` (`cuda_`, `metal_`, or `hip_`). Fast-WAM uses
-`cuda_fastwam/`; its public policy name remains `fastwam`. Keep each backend
-implementation self-contained and preserve the model/blocks, weights and runner
-ownership boundaries within it.
+WallOSS follows the same model/, model_runner/ and weights/ split ([WallOSS](walloss.md)).
+GR00T retains its previous implementation pending its own stage.
