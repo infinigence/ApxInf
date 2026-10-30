@@ -360,6 +360,42 @@ GHz EMC. These observations establish neither a serving SLA nor a hardware
 minimum. The first canonical streaming comparison below predates preparation-result
 reuse and measures the separately identified revisions.
 
+A fifth public A→B→B→A experiment isolates initial VAE suffix reuse
+(`f042a56`) against the published preparation-result build (`f9c6ba4`). Both
+use the same raw observation, fixed joint noise, frozen extensions/recipes and
+validation script, with online tuning disabled. Each variant has two fresh
+processes, two first/first-cached observations and six warm samples. Values below
+are median seconds; warm p95 is an empirical small-sample percentile.
+
+| Path | First request | First cached | First two requests | Warm median | Warm p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Published preparation-result build | 33.330 | 22.936 | 56.265 | 21.588 | 21.738 |
+| Initial VAE suffix reuse | 29.408 | 21.815 | 51.223 | 20.504 | 20.562 |
+
+Observed warm latency falls by 5.0% (1.053×). Every candidate warm sample
+(20.346–20.565 s) is below every baseline sample
+(21.518–21.741 s). All 246 warm-window GPU/EMC observations are
+1,575 MHz / 4.266 GHz; no observer timeout or foreign compute PID is observed.
+Recipes are unchanged after the experiment, and artifact offloads finish before
+the first A/B process. No profiler or inference hook is loaded.
+
+First/cached observations remain limited and use default DVFS: baseline ranges
+are 31.537–35.122 / 22.395–23.477 s, and candidate ranges are
+28.706–30.111 / 21.664–21.967 s. These windows include CPU work and sample GPU
+315–1,575 MHz / EMC 2.75–4.266 GHz. First-two totals include the first graph
+replay. This standalone T=1 comparison does not establish streaming speed or a
+hardware minimum, and is separate from earlier matched experiments.
+
+The unchanged BF16 joint schedule still runs 16 evaluations per CFG branch.
+Explicit and implicit complete-checkpoint suites each pass all 14 scenarios,
+with all 56 action/video metric rows zero. Five full-output VAE comparisons
+(each 506,880 raw BF16 elements) are bitwise exact across changed RGB input and
+retained graph replay; six independent 1/9/33-frame reference comparisons are
+zero. Full public rebind, robot decoding, leading-batch noise, RNG and resource
+lifetime checks pass, and all 12 A/B action metric rows are zero. The native
+backend revision is unchanged; this comparison adds only model-owned VAE work
+reuse while retaining all nine initial latent frames.
+
 A separate canonical-native streaming A→B→B→A comparison exercises the same six
 history scenarios in order, with one warmup sequence followed by two measured
 sequences per fresh process. Each variant has two processes and four measured
