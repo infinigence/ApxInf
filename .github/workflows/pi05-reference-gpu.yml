@@ -39,7 +39,7 @@ jobs:
           VARIANT: ${{ matrix.variant }}
           OPENBLAS_NUM_THREADS: '4'
         run: |
-          python3 scripts/run_pi05_reference_gate.py --board "$BOARD" --variant "$VARIANT" \
+          python3 crates/apxinf-model/tests/pi05_reference/run.py --board "$BOARD" --variant "$VARIANT" \
             --checkpoint "$PI05_CHECKPOINT" --calibration "$PI05_CALIBRATION" \
             --output "devlocal/pi05-cpu-reference/ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$VARIANT"
       - uses: actions/upload-artifact@v4

@@ -6,8 +6,8 @@ import json
 import math
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-POLICY = ROOT / "configs/pi05/reference-gate.json"
+ROOT = Path(__file__).resolve().parents[4]
+POLICY = Path(__file__).with_name("policy.json")
 MANIFEST = ROOT / "crates/apxinf-model/tests/fixtures/pi05_gpu/manifest.json"
 
 

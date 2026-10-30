@@ -1,5 +1,5 @@
 //! CPU FP32 vs CUDA precision and eager vs graph regression, using pinned inputs.
-//! See doc/pi05-cpu-reference.md. Measurement mode never reports a passing gate.
+//! See tests/pi05_reference/README.md. Measurement mode never reports a passing gate.
 use apxinf_core::{Device, Tensor};
 use apxinf_model::{
     AutoModel, ImageLayout, LoadOptions, Observation, Pi05Config, VisionObservation, VlaRequest,
@@ -102,8 +102,7 @@ fn metrics(actual: &[f32], expected: &[f32]) -> Result<serde_json::Value> {
         serde_json::json!({"cosine": dot / (aa*ee).sqrt(), "relative_l2": (err2/ee).sqrt(), "max_abs": max_abs}),
     )
 }
-fn main() -> Result<()> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+fn run(args: Vec<String>) -> Result<()> {
     if args.len() < 4 {
         return Err("usage: pi05_reference_gate CHECKPOINT.safetensors MANIFEST.json cpu|bf16|fp8_static|int8_dynamic REPORT.json [--calibration FILE] [--cpu-reference FILE] [--tuning DIR] [--autotune] [--measure]".into());
     }
@@ -355,6 +354,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// External checkpoint and GPU execution are explicitly requested by run.py.
+#[test]
+#[ignore = "requires external checkpoint; use tests/pi05_reference/run.py on Thor/Orin"]
+fn full_checkpoint_reference() {
+    let args = std::env::var("APXINF_PI05_GATE_ARGS")
+        .expect("use tests/pi05_reference/run.py to configure the full-checkpoint test");
+    let args: Vec<String> = serde_json::from_str(&args).expect("JSON argument array");
+    run(args).expect("full-checkpoint reference execution failed");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,7 +371,7 @@ mod tests {
     #[test]
     fn tracked_diagnostic_requests_have_pinned_inputs() {
         let manifest: Manifest =
-            serde_json::from_str(include_str!("../tests/fixtures/pi05_gpu/manifest.json")).unwrap();
+            serde_json::from_str(include_str!("fixtures/pi05_gpu/manifest.json")).unwrap();
         let mut rgb = Vec::new();
         for view in 0..2 {
             for y in 0..224 {

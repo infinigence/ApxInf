@@ -4,8 +4,7 @@ import json
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("gate", ROOT / "scripts/check_pi05_reference_gate.py")
+spec = importlib.util.spec_from_file_location("gate", Path(__file__).with_name("gate.py"))
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
