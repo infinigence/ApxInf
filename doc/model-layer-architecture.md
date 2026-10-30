@@ -161,8 +161,16 @@ different implementations for GEMM and GeGLU.
 ### Shared layouts for heterogeneous consumers
 
 `RepackedWeight::new` commits one layout for consumers known to share a physical
-representation. `RepackedWeight::with_layout_cache` instead caches profile
-choices separately from physical layouts. PI0.5 BF16/FP8 language gate/up uses this
+representation. Every weight retains CPU profile choices independently of any
+GPU layout-copy budget. The key covers the full logical Spec and policy and
+normalizes layout discovery, so committing canonical layout 0 to 4 does not
+retune the same operation for later IO bindings. Rebinding preserves the full
+implementation identity, configuration and effective resource limit. This
+prevents later denoising steps from switching providers and retaining different
+per-execution workspaces merely because the first binding committed a layout.
+
+`RepackedWeight::with_layout_cache` additionally permits independently selected
+physical layouts for heterogeneous profiles. PI0.5 BF16/FP8 language gate/up uses this
 mode: fixed two-view input with T=10 has M=522 (fused GeGLU), whereas T=11 has
 M=523 (plain GEMM plus pointwise). Camera count remains fixed per instance.
 

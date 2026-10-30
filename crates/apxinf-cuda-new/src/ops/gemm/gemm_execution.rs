@@ -297,12 +297,7 @@ fn prepare_weight(
     bindings: &mut abi::Bindings,
     storage: &mut Vec<CudaBuffer>,
 ) -> Result<(NativeExecution, Arc<super::weight::WeightStorage>)> {
-    if let Some(choice) = weight
-        .cache
-        .as_ref()
-        .and_then(|cache| cache.choices.get(&key))
-        .copied()
-    {
+    if let Some(choice) = weight.choices.get(&key).copied() {
         let layout = choice.weight_layout;
         let lease = if layout == weight.layout {
             Some(weight.lease_base())
@@ -412,12 +407,7 @@ fn prepare_weight(
             let selected =
                 prepare_native(ctx, &trial_spec, policy, &trial_bindings, Some(&mut layout))?;
             let choice = execution_choice(&selected)?;
-            weight
-                .cache
-                .as_mut()
-                .expect("layout choices")
-                .choices
-                .insert(key.clone(), choice);
+            weight.choices.insert(key.clone(), choice);
             if layout == weight.layout {
                 lease = weight.lease_base();
                 bind_storage(&lease, spec, bindings, storage);
@@ -460,15 +450,8 @@ fn prepare_weight(
         spec.b_layout = weight.layout;
         lease = weight.lease_base();
     }
-    if weight.cache.is_some() {
-        let choice = execution_choice(&execution)?;
-        weight
-            .cache
-            .as_mut()
-            .expect("layout choices")
-            .choices
-            .insert(key, choice);
-    }
+    let choice = execution_choice(&execution)?;
+    weight.choices.insert(key, choice);
     Ok((execution, lease))
 }
 
@@ -524,9 +507,8 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
         }
         weight.prune_layouts();
         let layout = weight
-            .cache
-            .as_ref()
-            .and_then(|cache| cache.choices.get(&choice_key))
+            .choices
+            .get(&choice_key)
             .map(|choice| choice.weight_layout)
             .unwrap_or(weight.layout);
         spec.b_layout = weight.layout;

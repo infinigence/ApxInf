@@ -1462,6 +1462,46 @@ fn gpu_canonical_weight_does_not_opt_into_inplace_packing() {
 }
 
 #[test]
+fn gpu_fixed_weight_keeps_choice_after_canonical_commit() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (10, 1024, 2560);
+    let b = zeros_tensor(0, vec![k, n], DType::BF16);
+    let weight = RepackedWeight::new(&b).unwrap();
+    let cache = scratch_cache_dir("fixed-weight-choice");
+    // Distinct live IO allocations force two native executions for one weight.
+    let inputs = [
+        zeros_tensor(0, vec![m, k], DType::BF16),
+        zeros_tensor(0, vec![m, k], DType::BF16),
+    ];
+    for (step, a) in inputs.iter().enumerate() {
+        let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+        let mut args = GemmArgs::new(a, &b, &mut out).with_repacked_weight(&weight);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+        let mut normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        normalized.spec.b_layout = weight.state.lock().unwrap().layout;
+        // Before canonical commit the request uses layout=0. Afterwards it
+        // uses layout=4, but that must not discard the already selected tactic.
+        let provider = if step == 0 { 2 } else { 1 };
+        super::execution::seed_recipe(&ctx, &normalized, provider, 1, 1, 0).unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        assert!(
+            execution
+                .summary()
+                .starts_with("cublasLt+custom-epilogue config=0 "),
+            "new IO must preserve the weight's first choice, got {}",
+            execution.summary(),
+        );
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(weight.state.lock().unwrap().layout, 4);
+    }
+    std::fs::remove_dir_all(cache).unwrap();
+}
+
+#[test]
 fn gpu_w8a8_load_fixes_layout_before_prepare() {
     let ctx = CudaContext::new(0).unwrap();
     for (k, n) in [(64, 128), (63, 127)] {
@@ -1894,7 +1934,7 @@ fn gpu_shared_weight_layouts_are_deduplicated_and_graph_safe() {
                 "four profiles need only two physical layouts"
             );
             assert_eq!(cache.extra_bytes(), k * n);
-            assert_eq!(cache.choices.len(), 4);
+            assert_eq!(state.choices.len(), 4);
         }
         // Both layouts coexist inside one graph, and an older graph remains valid.
         let graph = crate::capture(&ctx, || {

@@ -66,6 +66,10 @@ pub(crate) struct WeightState {
     pub dtype: apxinf_core::DType,
     pub layout: u32,
     pub base_lease: Weak<WeightStorage>,
+    // Recipe reuse is independent of permission to retain extra GPU layouts.
+    // In particular, committing canonical layout 0 -> 4 must not retune the
+    // same logical operation merely because it binds new activation/output IO.
+    pub choices: HashMap<LayoutChoiceKey, crate::ffi::abi::gemm::Choice>,
     pub cache: Option<LayoutCache>,
 }
 
@@ -130,7 +134,6 @@ impl LayoutChoiceKey {
 pub(crate) struct LayoutCache {
     pub budget: usize,
     pub buffers: HashMap<u32, Weak<WeightStorage>>,
-    pub choices: HashMap<LayoutChoiceKey, crate::ffi::abi::gemm::Choice>,
 }
 
 impl LayoutCache {
@@ -271,7 +274,6 @@ impl RepackedWeight {
             state.cache = Some(LayoutCache {
                 budget: extra_bytes,
                 buffers: HashMap::new(),
-                choices: HashMap::new(),
             });
         }
         Ok(result)
@@ -302,6 +304,7 @@ impl RepackedWeight {
                 dtype: weight.dtype(),
                 layout: 0,
                 base_lease: Weak::new(),
+                choices: HashMap::new(),
                 cache: None,
             })),
         })
