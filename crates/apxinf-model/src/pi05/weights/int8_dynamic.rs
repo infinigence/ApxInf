@@ -49,7 +49,7 @@ mod linear {
                     .collect::<Vec<_>>(),
             )?;
             let (quantized, scales, input_dim, output_dim) = quantize_output_channels(&packed)?;
-            let weight = backend::to_device(
+            let (weight, layout) = ops::RepackedWeight::upload_w8a8(
                 backend,
                 &Tensor::from_i8(vec![input_dim, output_dim], &quantized)?,
             )?;
@@ -73,7 +73,7 @@ mod linear {
                 ));
             };
             Ok(Self {
-                layout: crate::pi05::backend::ops::RepackedWeight::new(&weight)?,
+                layout,
                 weight,
                 channel_scales,
                 bias,
