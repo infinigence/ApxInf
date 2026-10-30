@@ -718,3 +718,299 @@ fn l2_channel_rows_match_torch_and_changed_input_capture() {
         );
     }
 }
+
+fn staged_affine_bits(ctx: &CudaContext, x: &Tensor) -> Vec<u32> {
+    ctx.synchronize().unwrap();
+    let h = transfers::to_cpu(x).unwrap();
+    match h.dtype() {
+        DType::BF16 => h
+            .as_bf16()
+            .unwrap()
+            .iter()
+            .map(|x| u32::from(x.to_bits()))
+            .collect(),
+        DType::F16 => h
+            .as_f16()
+            .unwrap()
+            .iter()
+            .map(|x| u32::from(x.to_bits()))
+            .collect(),
+        DType::F32 => h
+            .to_f32_vec()
+            .unwrap()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect(),
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn staged_affine_matches_composition_oracle_aliases_and_retained_graph() {
+    let ctx = CudaContext::new(0).unwrap();
+    for dtype in [DType::BF16, DType::F16, DType::F32] {
+        for (rows, cols, raw_bits) in [
+            (3, 7, false),
+            (1, 128, false),
+            (17, 128, false),
+            (25, 5120, false),
+            (128, 512, true),
+        ] {
+            if raw_bits && dtype == DType::F32 {
+                continue;
+            }
+            let values: Vec<_> = (0..rows * cols)
+                .map(|i| (i % 257) as f32 / 32. - 4.)
+                .collect();
+            let x = if raw_bits {
+                let bytes: Vec<_> = (0..rows * cols)
+                    .flat_map(|i| (i as u16).to_ne_bytes())
+                    .collect();
+                transfers::to_cuda(
+                    &Tensor::from_raw(
+                        apxinf_core::Shape::new(vec![rows, cols]),
+                        dtype,
+                        apxinf_core::Device::Cpu,
+                        bytes,
+                    )
+                    .unwrap(),
+                    0,
+                )
+                .unwrap()
+            } else {
+                upload(vec![rows, cols], &values, dtype)
+            };
+            let original = transfers::to_cpu(&x).unwrap();
+            let scale_values: Vec<_> = (0..cols).map(|i| (i % 73) as f32 / 32. - 1.).collect();
+            let column_values: Vec<_> = (0..cols).map(|i| (i % 53) as f32 / 32. - 0.5).collect();
+            for gate in [false, true] {
+                let secondary = if gate {
+                    upload(
+                        vec![rows, cols],
+                        &values.iter().rev().copied().collect::<Vec<_>>(),
+                        dtype,
+                    )
+                } else {
+                    upload(vec![1, cols], &scale_values, dtype)
+                };
+                let column = upload(vec![cols], &column_values, dtype);
+                let secondary_original = transfers::to_cpu(&secondary).unwrap();
+                let mut expected = ctx
+                    .allocate_output(apxinf_core::Shape::new(vec![rows, cols]), dtype)
+                    .unwrap();
+                let mut actual = ctx
+                    .allocate_output(apxinf_core::Shape::new(vec![rows, cols]), dtype)
+                    .unwrap();
+                let mut scratch = ctx
+                    .allocate_output(apxinf_core::Shape::new(vec![rows, cols]), dtype)
+                    .unwrap();
+                let mut unit_scale = ctx
+                    .allocate_output(apxinf_core::Shape::new(vec![1, cols]), dtype)
+                    .unwrap();
+                let mut compose = |out: &mut Tensor| {
+                    if gate {
+                        let mut a = PointwiseArgs::new(
+                            PointwiseSemantic::BroadcastMultiply,
+                            &x,
+                            &mut scratch,
+                        );
+                        let c = column.reshape(vec![1, cols]).unwrap();
+                        a.secondary = Some(&c);
+                        pointwise(&ctx, a).unwrap();
+                        let mut a = PointwiseArgs::new(PointwiseSemantic::Add, &secondary, out);
+                        a.secondary = Some(&scratch);
+                        pointwise(&ctx, a).unwrap();
+                    } else {
+                        let mut a = PointwiseArgs::new(
+                            PointwiseSemantic::ScalarAdd,
+                            &secondary,
+                            &mut unit_scale,
+                        );
+                        a.dt = 1.;
+                        pointwise(&ctx, a).unwrap();
+                        let mut a = PointwiseArgs::new(
+                            PointwiseSemantic::BroadcastMultiply,
+                            &x,
+                            &mut scratch,
+                        );
+                        a.secondary = Some(&unit_scale);
+                        pointwise(&ctx, a).unwrap();
+                        let mut a =
+                            PointwiseArgs::new(PointwiseSemantic::BroadcastAdd, &scratch, out);
+                        let c = column.reshape(vec![1, cols]).unwrap();
+                        a.secondary = Some(&c);
+                        pointwise(&ctx, a).unwrap();
+                    }
+                };
+                let semantic = if gate {
+                    PointwiseSemantic::StagedGatedResidual
+                } else {
+                    PointwiseSemantic::StagedModulation
+                };
+                let fused = |out: &mut Tensor| {
+                    let mut a = PointwiseArgs::new(semantic, &x, out);
+                    a.secondary = Some(&secondary);
+                    a.bias = Some(&column);
+                    pointwise(&ctx, a)
+                };
+                compose(&mut expected);
+                fused(&mut actual).unwrap();
+                assert_eq!(
+                    staged_affine_bits(&ctx, &actual),
+                    staged_affine_bits(&ctx, &expected)
+                );
+                // An independent F64 oracle explicitly rounds each F32 elementary
+                // operation, then the dtype materialization, for finite inputs.
+                if !raw_bits {
+                    let xx = transfers::to_cpu(&x).unwrap().to_f32_vec().unwrap();
+                    let yy = secondary_original.to_f32_vec().unwrap();
+                    let cc = transfers::to_cpu(&column).unwrap().to_f32_vec().unwrap();
+                    let reference: Vec<_> = xx
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &v)| {
+                            let c = i % cols;
+                            let factor = if gate {
+                                cc[c]
+                            } else {
+                                rounded(f64::from((f64::from(yy[c]) + 1.) as f32), dtype)
+                            };
+                            let product = rounded(
+                                f64::from((f64::from(v) * f64::from(factor)) as f32),
+                                dtype,
+                            );
+                            rounded(
+                                f64::from(
+                                    (if gate {
+                                        f64::from(yy[i]) + f64::from(product)
+                                    } else {
+                                        f64::from(product) + f64::from(cc[c])
+                                    }) as f32,
+                                ),
+                                dtype,
+                            )
+                        })
+                        .collect();
+                    let oracle = upload(vec![rows, cols], &reference, dtype);
+                    assert_eq!(
+                        staged_affine_bits(&ctx, &actual),
+                        staged_affine_bits(&ctx, &oracle)
+                    );
+                }
+                let mut alias = x.clone();
+                fused(&mut alias).unwrap();
+                assert_eq!(
+                    staged_affine_bits(&ctx, &alias),
+                    staged_affine_bits(&ctx, &expected)
+                );
+                transfers::copy_cpu_to_cuda(&original, &x).unwrap();
+                if gate {
+                    let mut alias = secondary.clone();
+                    fused(&mut alias).unwrap();
+                    assert_eq!(
+                        staged_affine_bits(&ctx, &alias),
+                        staged_affine_bits(&ctx, &expected)
+                    );
+                    transfers::copy_cpu_to_cuda(&secondary_original, &secondary).unwrap();
+                }
+                let graph = capture(&ctx, || fused(&mut actual)).unwrap();
+                let changed = upload(
+                    vec![rows, cols],
+                    &values.iter().map(|x| -x).collect::<Vec<_>>(),
+                    dtype,
+                );
+                let changed_column = upload(
+                    vec![cols],
+                    &column_values.iter().map(|x| x * 0.5).collect::<Vec<_>>(),
+                    dtype,
+                );
+                transfers::copy_cuda_to_cuda(&ctx, &changed, &x).unwrap();
+                transfers::copy_cuda_to_cuda(&ctx, &changed_column, &column).unwrap();
+                let changed_secondary = upload(
+                    secondary.shape().dims().to_vec(),
+                    &secondary_original
+                        .to_f32_vec()
+                        .unwrap()
+                        .iter()
+                        .map(|x| -x * 0.5)
+                        .collect::<Vec<_>>(),
+                    dtype,
+                );
+                transfers::copy_cuda_to_cuda(&ctx, &changed_secondary, &secondary).unwrap();
+                compose(&mut expected);
+                let bits = staged_affine_bits(&ctx, &expected);
+                drop(secondary);
+                drop(column);
+                drop(changed);
+                drop(changed_column);
+                drop(changed_secondary);
+                for _ in 0..3 {
+                    graph.replay().unwrap();
+                    assert_eq!(staged_affine_bits(&ctx, &actual), bits);
+                }
+                transfers::copy_cpu_to_cuda(&original, &x).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn staged_affine_rejects_missing_broadcast_and_partial_alias_bindings() {
+    let ctx = CudaContext::new(0).unwrap();
+    let x = upload(vec![3, 7], &[1.; 21], DType::BF16);
+    let scale = upload(vec![1, 7], &[1.; 7], DType::BF16);
+    let residual = upload(vec![3, 7], &[1.; 21], DType::BF16);
+    let col = upload(vec![7], &[1.; 7], DType::BF16);
+    let mut out = upload(vec![3, 7], &[0.; 21], DType::BF16);
+    for semantic in [
+        PointwiseSemantic::StagedModulation,
+        PointwiseSemantic::StagedGatedResidual,
+    ] {
+        let secondary = if semantic == PointwiseSemantic::StagedModulation {
+            &scale
+        } else {
+            &residual
+        };
+        let mut a = PointwiseArgs::new(semantic, &x, &mut out);
+        a.secondary = Some(secondary);
+        assert!(pointwise(&ctx, a).is_err());
+        let mut a = PointwiseArgs::new(semantic, &x, &mut out);
+        a.bias = Some(&col);
+        assert!(pointwise(&ctx, a).is_err());
+        let mut a = PointwiseArgs::new(semantic, &x, &mut out);
+        a.secondary = Some(if semantic == PointwiseSemantic::StagedModulation {
+            &residual
+        } else {
+            &scale
+        });
+        a.bias = Some(&col);
+        assert!(pointwise(&ctx, a).is_err());
+        let wrong = col.reshape(vec![1, 7]).unwrap();
+        let mut a = PointwiseArgs::new(semantic, &x, &mut out);
+        a.secondary = Some(secondary);
+        a.bias = Some(&wrong);
+        assert!(pointwise(&ctx, a).is_err());
+        let backing = CudaBuffer::alloc(44, 0).unwrap();
+        let input = backing
+            .view(0, 42)
+            .unwrap()
+            .as_tensor(apxinf_core::Shape::new(vec![3, 7]), DType::BF16)
+            .unwrap();
+        let mut overlap = backing
+            .view(2, 42)
+            .unwrap()
+            .as_tensor(apxinf_core::Shape::new(vec![3, 7]), DType::BF16)
+            .unwrap();
+        let mut a = PointwiseArgs::new(semantic, &input, &mut overlap);
+        a.secondary = Some(secondary);
+        a.bias = Some(&col);
+        assert!(pointwise(&ctx, a).is_err());
+        let one = x.reshape(vec![1, 21]).unwrap();
+        let broadcast = one.reshape(vec![21]).unwrap();
+        let mut alias = one.clone();
+        let mut a = PointwiseArgs::new(semantic, &one, &mut alias);
+        a.secondary = Some(&one);
+        a.bias = Some(&broadcast);
+        assert!(pointwise(&ctx, a).is_err());
+    }
+}

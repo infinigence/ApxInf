@@ -137,6 +137,47 @@ union BinaryVectorPack {
   T lane[16/sizeof(T)];
 };
 
+// The intermediate casts are part of the operation, including for F16/BF16
+// ties, subnormals and nonfinite values. Never replace them with a single FMA.
+template<class T, bool Gate>
+__device__ __forceinline__ T staged_affine_value(T input, T secondary, T column) {
+  float factor = Gate ? to_float(column) : rounded<T>(__fadd_rn(to_float(secondary), 1.f));
+  const float product = rounded<T>(__fmul_rn(to_float(input), factor));
+  if constexpr (Gate) return from_float<T>(__fadd_rn(to_float(secondary), product));
+  else return from_float<T>(__fadd_rn(product, to_float(column)));
+}
+
+template<class T, bool Gate>
+__global__ void staged_affine_scalar(const T* input, const T* secondary,
+                                     const T* column, T* output,
+                                     int64_t count, int cols) {
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += stride) {
+    const int col = static_cast<int>(i % cols);
+    output[i] = staged_affine_value<T,Gate>(input[i], secondary[Gate ? i : col], column[col]);
+  }
+}
+
+template<class T, bool Gate>
+__global__ void staged_affine_vector(const T* input, const T* secondary,
+                                     const T* column, T* output,
+                                     int count, cutlass::FastDivmod columns) {
+  constexpr int unit = 16 / sizeof(T);
+  for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+       i < static_cast<uint32_t>(count); i += gridDim.x * blockDim.x) {
+    int row, col; columns(row,col,i);
+    BinaryVectorPack<T> x, y, c, result;
+    x.bits = reinterpret_cast<const uint4*>(input)[i];
+    y.bits = reinterpret_cast<const uint4*>(secondary)[Gate ? i : col];
+    c.bits = reinterpret_cast<const uint4*>(column)[col];
+    #pragma unroll
+    for (int j=0; j<unit; ++j)
+      result.lane[j] = staged_affine_value<T,Gate>(x.lane[j], y.lane[j], c.lane[j]);
+    reinterpret_cast<uint4*>(output)[i] = result.bits;
+  }
+}
+
 template<int Semantic>
 __device__ float binary_vector_value(float x, float y, float scalar) {
   if constexpr (Semantic==12) return __fmul_rn(x,scalar);

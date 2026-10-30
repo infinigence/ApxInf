@@ -1166,20 +1166,16 @@ mod dit_block {
         normed: Tensor,
         shifted: Tensor,
         q_raw: Tensor,
-        k_raw: Tensor,
         q: Tensor,
-        v: Tensor,
         attended: Tensor,
         projected: Tensor,
         residual: Tensor,
-        gated: Tensor,
         up: Tensor,
         activated: Tensor,
         kv_k: Tensor,
         kv_v: Tensor,
         image_attended: Tensor,
         modulation: Tensor,
-        scale: Tensor,
         unit_norm: Norm,
     }
     impl BlockWorkspace {
@@ -1206,20 +1202,16 @@ mod dit_block {
                 normed: h()?,
                 shifted: h()?,
                 q_raw: h()?,
-                k_raw: h()?,
                 q: h()?,
-                v: h()?,
                 attended: h()?,
                 projected: h()?,
                 residual: h()?,
-                gated: h()?,
                 up: allocate(ctx, &[n, FFN])?,
                 activated: allocate(ctx, &[n, FFN])?,
                 kv_k: allocate(ctx, &[history_rows + n, DIM])?,
                 kv_v: allocate(ctx, &[history_rows + n, DIM])?,
                 image_attended: h()?,
                 modulation: allocate(ctx, &[12, DIM])?,
-                scale: allocate(ctx, &[1, DIM])?,
                 unit_norm: Norm {
                     weight: transfers::to_cuda(
                         &Tensor::from_bf16(vec![DIM], &vec![half::bf16::ONE; DIM])?,
@@ -1259,32 +1251,22 @@ mod dit_block {
                 if count == 0 {
                     continue;
                 }
-                let scale_input = rows(&self.modulation, group * 6 + scale, 1)?;
+                let scale = rows(&self.modulation, group * 6 + scale, 1)?;
+                let shift = rows(&self.modulation, group * 6 + shift, 1)?.reshape(vec![DIM])?;
+                let input = rows(&self.normed, start, count)?;
+                let mut output = rows(&self.shifted, start, count)?;
                 let mut args = ops::PointwiseArgs::new(
-                    ops::PointwiseSemantic::ScalarAdd,
-                    &scale_input,
-                    &mut self.scale,
+                    ops::PointwiseSemantic::StagedModulation,
+                    &input,
+                    &mut output,
                 );
-                args.dt = 1.;
+                args.secondary = Some(&scale);
+                args.bias = Some(&shift);
                 ops::pointwise(ctx, args)?;
-                binary(
-                    ctx,
-                    ops::PointwiseSemantic::BroadcastMultiply,
-                    &rows(&self.normed, start, count)?,
-                    &self.scale,
-                    &mut rows(&self.gated, start, count)?,
-                )?;
-                binary(
-                    ctx,
-                    ops::PointwiseSemantic::BroadcastAdd,
-                    &rows(&self.gated, start, count)?,
-                    &rows(&self.modulation, group * 6 + shift, 1)?,
-                    &mut rows(&self.shifted, start, count)?,
-                )?;
             }
             Ok(())
         }
-        fn gate(&mut self, ctx: &Context, gate: usize) -> Result<()> {
+        fn gate_residual(&self, ctx: &Context, gate: usize, output: &Tensor) -> Result<()> {
             for (group, start, count) in [
                 (0, 0, self.video_rows),
                 (1, self.video_rows, self.rows - self.video_rows),
@@ -1292,13 +1274,18 @@ mod dit_block {
                 if count == 0 {
                     continue;
                 }
-                binary(
-                    ctx,
-                    ops::PointwiseSemantic::BroadcastMultiply,
-                    &rows(&self.projected, start, count)?,
-                    &rows(&self.modulation, group * 6 + gate, 1)?,
-                    &mut rows(&self.gated, start, count)?,
-                )?;
+                let input = rows(&self.projected, start, count)?;
+                let residual = rows(&self.hidden, start, count)?;
+                let gate = rows(&self.modulation, group * 6 + gate, 1)?.reshape(vec![DIM])?;
+                let mut out = rows(output, start, count)?;
+                let mut args = ops::PointwiseArgs::new(
+                    ops::PointwiseSemantic::StagedGatedResidual,
+                    &input,
+                    &mut out,
+                );
+                args.secondary = Some(&residual);
+                args.bias = Some(&gate);
+                ops::pointwise(ctx, args)?;
             }
             Ok(())
         }
@@ -1349,10 +1336,15 @@ mod dit_block {
         s.modulate(ctx, 0, 1)?;
         let a = &w.self_attention;
         projection(ctx, p, &s.shifted, &a.q, &mut s.q_raw)?;
-        projection(ctx, p, &s.shifted, &a.k, &mut s.k_raw)?;
-        projection(ctx, p, &s.shifted, &a.v, &mut s.v)?;
+        // The history prefix was populated above. Project current tokens into
+        // the final contiguous attention buffers, then normalize/rotate only K's
+        // current-token view. No current K/V staging copy or scratch is needed.
+        let mut current_k = rows(&s.kv_k, s.history_rows, s.rows)?;
+        let mut current_v = rows(&s.kv_v, s.history_rows, s.rows)?;
+        projection(ctx, p, &s.shifted, &a.k, &mut current_k)?;
+        projection(ctx, p, &s.shifted, &a.v, &mut current_v)?;
         let shape = vec![s.rows, HEADS, DIM / HEADS];
-        for (input, weight) in [(&s.q_raw, &a.norm_q), (&s.k_raw, &a.norm_k)] {
+        for (input, weight) in [(&s.q_raw, &a.norm_q), (&current_k, &a.norm_k)] {
             ops::rms_complex_rotary(
                 ctx,
                 rotary,
@@ -1365,8 +1357,6 @@ mod dit_block {
                 },
             )?;
         }
-        transfers::copy_cuda_to_cuda(ctx, &s.k_raw, &rows(&s.kv_k, s.history_rows, s.rows)?)?;
-        transfers::copy_cuda_to_cuda(ctx, &s.v, &rows(&s.kv_v, s.history_rows, s.rows)?)?;
         if let Some((next_k, next_v)) = observed_cache {
             let observed_rows = s.history_rows + s.video_rows;
             transfers::copy_cuda_to_cuda(ctx, &rows(&s.kv_k, 0, observed_rows)?, next_k)?;
@@ -1374,14 +1364,7 @@ mod dit_block {
         }
         attend(ctx, p, &s.q_raw, &s.kv_k, &s.kv_v, &mut s.attended)?;
         projection(ctx, p, &s.attended, &a.o, &mut s.projected)?;
-        s.gate(ctx, 2)?;
-        binary(
-            ctx,
-            ops::PointwiseSemantic::Add,
-            &s.hidden,
-            &s.gated,
-            &mut s.residual,
-        )?;
+        s.gate_residual(ctx, 2, &s.residual)?;
 
         norm(ctx, &s.residual, &w.norm3, &mut s.normed)?;
         let a = &w.cross_attention;
@@ -1430,15 +1413,7 @@ mod dit_block {
         activation.activation = ops::PointwiseActivation::Gelu;
         ops::pointwise(ctx, activation)?;
         projection(ctx, p, &s.activated, &w.down, &mut s.projected)?;
-        s.gate(ctx, 5)?;
-        binary(
-            ctx,
-            ops::PointwiseSemantic::Add,
-            &s.hidden,
-            &s.gated,
-            &mut s.residual,
-        )?;
-        transfers::copy_cuda_to_cuda(ctx, &s.residual, &s.hidden)
+        s.gate_residual(ctx, 5, &s.hidden)
     }
 }
 mod vae {

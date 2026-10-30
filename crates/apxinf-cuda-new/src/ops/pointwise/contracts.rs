@@ -35,6 +35,14 @@ pub enum PointwiseSemantic {
     Sin,
     /// FP32 cosine in radians, cast once to the output dtype.
     Cos,
+    /// Dtype-rounded `input * (1 + scale) + shift`. `secondary` is [1,cols]
+    /// scale and the required `bias` binding is [cols] shift. Every elementary
+    /// operation rounds to the input dtype; exact input/output alias is allowed.
+    StagedModulation,
+    /// Dtype-rounded `residual + input * gate`. `secondary` is [rows,cols]
+    /// residual and the required `bias` binding is [cols] gate. The product
+    /// rounds before addition; exact output alias with either matrix is allowed.
+    StagedGatedResidual,
 }
 
 impl PointwiseSemantic {
@@ -58,6 +66,8 @@ impl PointwiseSemantic {
         Self::Exp,
         Self::Sin,
         Self::Cos,
+        Self::StagedModulation,
+        Self::StagedGatedResidual,
     ];
 
     #[cfg(test)]
@@ -81,6 +91,8 @@ impl PointwiseSemantic {
             Self::Exp => "pointwise_exp",
             Self::Sin => "pointwise_sin",
             Self::Cos => "pointwise_cos",
+            Self::StagedModulation => "pointwise_staged_modulation",
+            Self::StagedGatedResidual => "pointwise_staged_gated_residual",
         }
     }
 
@@ -104,6 +116,8 @@ impl PointwiseSemantic {
             Self::Exp => 15,
             Self::Sin => 16,
             Self::Cos => 17,
+            Self::StagedModulation => 18,
+            Self::StagedGatedResidual => 19,
         }
     }
 
@@ -117,11 +131,19 @@ impl PointwiseSemantic {
                 | Self::BroadcastAdd
                 | Self::BroadcastMultiply
                 | Self::RowMultiply
+                | Self::StagedModulation
+                | Self::StagedGatedResidual
         )
     }
 
     fn may_have_bias(self) -> bool {
-        matches!(self, Self::BiasActivation | Self::SwigluRowwiseE4m3)
+        matches!(
+            self,
+            Self::BiasActivation
+                | Self::SwigluRowwiseE4m3
+                | Self::StagedModulation
+                | Self::StagedGatedResidual
+        )
     }
 }
 
@@ -160,6 +182,7 @@ pub struct PointwiseArgs<'a> {
     pub input: &'a Tensor,
     /// Binary operand; broadcasting follows the selected semantic.
     pub secondary: Option<&'a Tensor>,
+    /// Per-column bias, or shift/gate for the two staged affine semantics.
     pub bias: Option<&'a Tensor>,
     pub out: &'a mut Tensor,
     /// One F32 scale per row for dynamic rowwise quantization.
@@ -369,6 +392,15 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     if quantized_geglu && cols % 2 != 0 {
         return Err(invalid("F16-to-E4M3 GeGLU requires an even output width"));
     }
+    let staged_affine = matches!(
+        semantic,
+        PointwiseSemantic::StagedModulation | PointwiseSemantic::StagedGatedResidual
+    );
+    if staged_affine && args.bias.is_none() {
+        return Err(invalid(
+            "Staged affine requires a per-column shift/gate binding",
+        ));
+    }
     if args.bias.is_some() && !semantic.may_have_bias() {
         return Err(invalid("Pointwise semantic does not take a bias"));
     }
@@ -402,7 +434,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     storage.push(input_buffer);
 
     let (secondary_count, secondary_shape) = match semantic {
-        PointwiseSemantic::BroadcastAdd | PointwiseSemantic::BroadcastMultiply => (cols, [1, cols]),
+        PointwiseSemantic::BroadcastAdd
+        | PointwiseSemantic::BroadcastMultiply
+        | PointwiseSemantic::StagedModulation => (cols, [1, cols]),
         PointwiseSemantic::RowMultiply => (rows, [rows, 1]),
         _ => (count, [rows, cols]),
     };
@@ -429,6 +463,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
 
     let (bias, bias_alignment) = match args.bias {
         Some(tensor) => {
+            if staged_affine && tensor.shape().dims() != [cols] {
+                return Err(invalid("Staged affine shift/gate must have shape [cols]"));
+            }
             let bias_elements = if matches!(semantic, PointwiseSemantic::SwigluRowwiseE4m3) {
                 logical_cols
                     .checked_mul(2)
@@ -449,8 +486,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     let output = output_buffer.ptr() as *mut std::ffi::c_void;
     let output_alignment = alignment_of(output_buffer.ptr() as usize);
     // Broadcast operands may be reused by many threads. Reject overlap rather
-    // than allowing an order-dependent in-place update. New elementwise
-    // semantics use the same explicit no-alias contract.
+    // than allowing an order-dependent in-place update. Only the two staged
+    // affine semantics permit exact aliases with their full-size matrices.
     if semantic.code() >= PointwiseSemantic::Add.code() {
         if args.input.shape().dims() != [rows, cols] {
             return Err(invalid("Pointwise input must match output [rows, cols]"));
@@ -458,8 +495,28 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         let bytes = count
             .checked_mul(output_dtype.size_in_bytes())
             .ok_or_else(|| invalid("Pointwise output size overflow"))?;
-        for buffer in &storage {
-            if storage_ranges_overlap(buffer.ptr() as usize, buffer.len(), output as usize, bytes)?
+        for (index, buffer) in storage.iter().enumerate() {
+            let read_bytes = if staged_affine {
+                (match index {
+                    0 => count,
+                    1 => secondary_count,
+                    _ => cols,
+                }) * input_dtype.size_in_bytes()
+            } else {
+                buffer.len()
+            };
+            let exact_matrix_alias = staged_affine
+                && (index == 0
+                    || (index == 1 && semantic == PointwiseSemantic::StagedGatedResidual))
+                && buffer.ptr() as usize == output as usize
+                && read_bytes == bytes;
+            if !exact_matrix_alias
+                && storage_ranges_overlap(
+                    buffer.ptr() as usize,
+                    read_bytes,
+                    output as usize,
+                    bytes,
+                )?
             {
                 return Err(invalid(
                     "Pointwise binary/scalar input and output storage must not overlap",

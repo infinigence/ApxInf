@@ -27,12 +27,16 @@ bool valid_alignment(uint32_t alignment) {
 
 bool reads_secondary(uint32_t semantic) {
   return semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE ||
-         (semantic >= APXINF_POINTWISE_SEMANTIC_ADD && semantic <= APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY);
+         (semantic >= APXINF_POINTWISE_SEMANTIC_ADD && semantic <= APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY) ||
+         semantic == APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION ||
+         semantic == APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL;
 }
 
 bool may_have_bias(uint32_t semantic) {
   return semantic == APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION ||
-         semantic == APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3;
+         semantic == APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3 ||
+         semantic == APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION ||
+         semantic == APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL;
 }
 
 void validate_spec(const apxinf_pointwise_spec_t& spec) {
@@ -45,7 +49,7 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
       spec.dtype == APXINF_DTYPE_BF16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
   if (spec.version != APXINF_POINTWISE_SPEC_VERSION ||
-      spec.semantic > APXINF_POINTWISE_SEMANTIC_COS ||
+      spec.semantic > APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL ||
       (spec.dtype != APXINF_DTYPE_F32 && spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!quantized_geglu && !quantized_swiglu &&
        spec.output_dtype != spec.dtype) ||
@@ -83,6 +87,11 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
        spec.cols < spec.logical_cols)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid Pointwise rowwise SwiGLU contract");
+  }
+  if ((spec.semantic == APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION ||
+       spec.semantic == APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL) &&
+      (spec.has_bias != 1 || spec.input_cols != spec.cols || spec.logical_cols != spec.cols)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid staged affine contract");
   }
   if (spec.has_bias != 0 && !may_have_bias(spec.semantic)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -276,6 +285,21 @@ cudaError_t launch(const apxinf_pointwise_spec_t& spec,
       kernels::euler_update<T><<<grid, kDirectThreads, 0, stream>>>(
           input, secondary, output, count, bindings.dt);
       break;
+    case APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION:
+    case APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL: {
+      constexpr int unit = 16 / sizeof(T);
+      const bool vectorized = count >= 8192 && cols % unit == 0 && count / unit <= INT_MAX &&
+          reinterpret_cast<uintptr_t>(input) % 16 == 0 && reinterpret_cast<uintptr_t>(secondary) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(bias) % 16 == 0 && reinterpret_cast<uintptr_t>(output) % 16 == 0;
+#define APXINF_STAGED_AFFINE(GATE) \
+      if (vectorized) kernels::staged_affine_vector<T,GATE><<<blocks_for(count/unit),kDirectThreads,0,stream>>>( \
+          input,secondary,bias,output,static_cast<int>(count/unit),cutlass::FastDivmod(cols/unit)); \
+      else kernels::staged_affine_scalar<T,GATE><<<grid,kDirectThreads,0,stream>>>(input,secondary,bias,output,count,cols)
+      if (spec.semantic == APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL) { APXINF_STAGED_AFFINE(true); }
+      else { APXINF_STAGED_AFFINE(false); }
+#undef APXINF_STAGED_AFFINE
+      break;
+    }
     case APXINF_POINTWISE_SEMANTIC_ADD:
     case APXINF_POINTWISE_SEMANTIC_SUBTRACT:
     case APXINF_POINTWISE_SEMANTIC_MULTIPLY:

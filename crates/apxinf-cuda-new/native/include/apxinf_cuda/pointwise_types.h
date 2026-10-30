@@ -41,6 +41,12 @@ typedef enum {
   APXINF_POINTWISE_SEMANTIC_EXP = 15,
   APXINF_POINTWISE_SEMANTIC_SIN = 16,
   APXINF_POINTWISE_SEMANTIC_COS = 17,
+  /* secondary [1,cols] = scale; bias [cols] = shift. Round 1+scale,
+   * multiplication, then addition separately to dtype. */
+  APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION = 18,
+  /* secondary [rows,cols] = residual; bias [cols] = gate. Round the
+   * multiplication before adding residual and rounding again. */
+  APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL = 19,
 } apxinf_pointwise_semantic_t;
 
 /* Stable pointwise activation ABI encoding. */
@@ -84,6 +90,7 @@ typedef struct {
   const void* input;
   /* Binary operand: full shape, [1,cols] for BROADCAST_*, [rows,1] for ROW_*. */
   const void* secondary;
+  /* Per-column bias, or required shift/gate for staged affine semantics. */
   const void* bias;
   void* output;
   /* SWIGLU_ROWWISE_E4M3 writes one F32 scale per row. */

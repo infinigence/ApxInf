@@ -124,6 +124,20 @@ per-layer text/image cross-attention K/V), and
 Action (observed K/V computation plus joint denoising). A compatible prepared
 run rebinds stable inputs and executes without capture or autotuning. The
 implicit cache holds one profile; switching profiles replaces it.
+Self-attention K/V projections write directly into the current-token rows of
+the contiguous attention buffers. Only that K view receives staged RMS/complex
+RoPE; committed history is copied into the separate prefix before projection
+and is never normalized or overwritten. Observed K/V publication still copies
+only observed rows into independent history storage. This removes the temporary
+current K/V matrices and their two copies per block evaluation.
+
+DiT modulation and gated residual updates use staged pointwise fusions. Each
+operation retains the original dtype casts, including `1 + scale` and the
+product before shift/residual addition. Video and action/state keep independent
+modulation vectors. The final FFN residual writes hidden directly; no full
+hidden copy is needed. These operations remove the two block workspaces' gated
+matrix and scale-vector scratch, without changing LayerNorm reduction order.
+
 Language recomputes both CFG branches' cross-attention K/V on every request.
 Each layer retains its own four BF16 tensors; observed and denoising evaluations
 only read them. Raw key-projection scratch is shared across layers within each
@@ -211,7 +225,7 @@ inference with 16 evaluations per CFG branch. Its full real-checkpoint test
 passes all 14 scenarios and 28 action/video metrics with relative L2, RMSE and
 max-absolute error zero, using the maintained gates directly. History rollover,
 request rebinding, graph ownership, RNG and failed-call rollback checks pass.
-The CUDA backend suite passes 165 tests (2 ignored; the unchanged long
+The CUDA backend suite passes 167 tests (2 ignored; the unchanged long
 convolution-candidate test is filtered); all 9 family contract tests pass.
 These are results for the frozen performance build, rather than a new run of
 the historical 122 component checkpoints above.
@@ -221,6 +235,10 @@ certified FP32 intervals with the original FP64 fallback for complex rotation.
 Staged RMS and complex RoPE are fused for self-attention Q/K, retaining both
 normalization casts and the FP64 fallback. Language computes all layers' text/image
 K/V once per request; observed and denoising blocks reuse those exact tensors.
+Staged modulation and gated residual fuse the existing elementwise operations,
+preserving each BF16 cast. Current self-attention K/V projections write directly
+to their final history-concatenated buffer views; only current K is normalized
+and rotated. FFN residuals write directly to hidden storage.
 A same-profile public/canonical input rebind matches an independent capture with
 zero action error, then restores the original public output exactly. CUDA capture
 counts remain 3 before rebind, after changed input and after restoration.
@@ -242,6 +260,14 @@ kernels and three graph launches; public outputs remain exact and the strict
 copy/helper/event-loss audit passes. Relative to the RMS/RoPE-only intermediate
 trace (81,082 kernels), K/V reuse removes exactly 7,680 kernel launches. These
 instrumented timings are separate from the matched uninstrumented results below.
+
+The staged-affine/direct-KV revision has an accepted full-request trace with a
+21.611 s diagnostic window, 60,122 kernels and three graph launches. Relative to
+the preceding request-KV trace, it removes exactly 13,280 arithmetic kernels and
+4,080 D2D copies. D2D payload falls from 109,428,796,032 to 37,077,052,032 bytes
+(10,063 remaining copies). Kernel and copy counts match the source-derived
+schedule independently; payload is not measured physical DRAM traffic. Public
+outputs and the strict copy/helper/event-loss audit pass.
 
 ## Measured performance and residency
 
@@ -278,6 +304,23 @@ checks. During measured windows, all GPU frequency samples are 1,575 MHz and all
 EMC samples are 4.266 GHz for both variants; clocks were not reconfigured. The
 old 47.541→24.975 s comparison and this 25.085→22.650 s comparison are separate
 experiments and should not be combined into a new matched-baseline speedup.
+
+A third matched A→B→B→A experiment compares the published request-KV revision
+(`2f6be45`) with staged-affine fusion and direct current-KV placement. The same
+public script, frozen extensions/recipes and fixed joint workload are used, with
+no online tuning and six warm samples per variant across two fresh processes.
+
+| Path | Warm median | Warm p95 | Warm samples |
+| --- | ---: | ---: | ---: |
+| Published request-KV revision (`2f6be45`) | 22.604 | 22.857 | 6 |
+| Staged affine + direct current-KV placement | 21.670 | 21.765 | 6 |
+
+This matched improvement is 1.043×, or 4.1% less latency. All public action
+metrics are zero, with exact replay and leading-batch noise checks. All measured
+GPU/EMC samples remain 1,575 MHz / 4.266 GHz for both variants. This is a separate
+experiment from the earlier comparisons. These warm T=1 measurements do not
+establish streaming history performance: single first-replay history timers in
+the full acceptance runs vary substantially and require a controlled comparison.
 
 Earlier pre-performance runs measured 47.617 s cold and 47.756 s restored public
 medians (5 samples each). The historical official preprocessed BF16-head median

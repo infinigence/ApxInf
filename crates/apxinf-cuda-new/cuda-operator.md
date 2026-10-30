@@ -224,7 +224,7 @@ all admitted candidates and changed-input graph replay after owner release.
 
 `ops::pointwise(ctx, PointwiseArgs)` uses contiguous `[rows, cols]` tensors.
 F16, BF16 and F32 inputs/outputs have matching dtypes. Each binary or scalar
-operation rounds once to that dtype. New binary/scalar semantics reject all
+operation rounds once to that dtype. The ordinary binary/scalar semantics reject all
 input/output overlap and validate the exact secondary shape, including the
 broadcast axis. All scalar bindings must be finite. There is no workspace or
 tuning recipe; direct stream launches are capture-safe and the graph retains
@@ -273,6 +273,34 @@ requires even cols, four-byte input alignment and two-byte output alignment;
 other semantics require `output_scale=1`. Precision and binding tests are in
 `pointwise_behavior.rs`; captured changed-input and dropped-owner replay are
 required for the direct launch path.
+
+<!-- l3-operator:pointwise_staged_modulation -->
+### `pointwise_staged_modulation`
+
+`PointwiseSemantic::StagedModulation` computes
+`R(R(input * R(1 + scale)) + shift)`, where `R` rounds to the common F16,
+BF16 or F32 dtype after each F32 elementary operation. Input/output are
+`[rows,cols]`; `secondary=[1,cols]` supplies scale and required `bias=[cols]`
+supplies shift. Exact input/output alias is allowed. Partial matrix overlap and
+any output overlap with scale/shift are rejected.
+
+<!-- l3-operator:pointwise_staged_gated_residual -->
+### `pointwise_staged_gated_residual`
+
+`PointwiseSemantic::StagedGatedResidual` computes
+`R(residual + R(input * gate))`, preserving the intermediate product cast.
+Input, `secondary` residual and output are `[rows,cols]`; required `bias=[cols]`
+supplies gate. F16, BF16 and F32 are supported. Output may exactly alias either
+matrix; partial matrix overlap and output/gate overlap are rejected.
+
+Both operations use safe `ops::pointwise` bindings, no tuning or workspace,
+and retain input/output allocations through CUDA Graph lifetime. Aligned
+16-byte transport has a scalar fallback for small, tail or unaligned shapes.
+`staged_affine_matches_composition_oracle_aliases_and_retained_graph` covers
+both semantics, all dtypes, a finite independent oracle, all 16-bit encodings,
+exact aliases and changed-input/scale/shift/gate/residual graph replay after column/secondary
+owners are dropped. `staged_affine_rejects_missing_broadcast_and_partial_alias_bindings`
+covers invalid bindings and broadcast/partial aliases.
 
 ## FP64 complex rotary embedding
 
