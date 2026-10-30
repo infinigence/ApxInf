@@ -1,13 +1,13 @@
 //! W8A8 INT8 GR00T device weights for Orin-class GPUs.
 
-use apxinf_core::{Backend, DType, Error, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 use super::action_weights::Gr00tLinearWeights;
-use super::backend::{kernels, DeviceBuffer, RuntimeBackend};
+use super::backend::{ops, RuntimeBackend};
 use super::device_weights::DeviceLinearWeights;
 
 pub(super) struct Gr00tInt8LinearWeights {
-    weight_output_major: DeviceBuffer,
+    weight_output_major: Tensor,
     weight_scales: Tensor,
     bias: Option<Tensor>,
     input_dim: usize,
@@ -18,7 +18,7 @@ impl std::fmt::Debug for Gr00tInt8LinearWeights {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Gr00tInt8LinearWeights")
-            .field("weight_bytes", &self.weight_output_major.len())
+            .field("weight_shape", &self.weight_output_major.shape().dims())
             .field("weight_scales", &self.weight_scales.shape().dims())
             .field("has_bias", &self.bias.is_some())
             .field("input_dim", &self.input_dim)
@@ -34,15 +34,8 @@ impl Gr00tInt8LinearWeights {
         backend: &RuntimeBackend,
     ) -> Result<Self> {
         let (quantized, scales, input_dim, output_dim) = quantize_output_channels(weight)?;
-        let bytes = quantized
-            .into_iter()
-            .map(|value| value as u8)
-            .collect::<Vec<_>>();
         let weight_output_major =
-            DeviceBuffer::alloc(bytes.len(), backend.device_id()).map_err(Error::Cuda)?;
-        weight_output_major
-            .copy_from_host(&bytes)
-            .map_err(Error::Cuda)?;
+            backend.to_device(&Tensor::from_i8(vec![output_dim, input_dim], &quantized)?)?;
         let weight_scales = backend.to_device(&Tensor::from_f32(vec![output_dim], &scales)?)?;
         let bias = bias
             .map(|tensor| {
@@ -78,32 +71,36 @@ impl Gr00tInt8LinearWeights {
         Self::from_host(weight, None, backend)
     }
 
-    fn as_kernel_view(&self) -> kernels::gemm::W8A8WeightView<'_> {
-        kernels::gemm::W8A8WeightView {
-            values_i8: &self.weight_output_major,
-            scales_f32: &self.weight_scales,
-            input_dim: self.input_dim,
-            output_dim: self.output_dim,
-            scale_mode: kernels::gemm::W8A8ScaleMode::DynamicRowPerOutputChannel,
-            layout: kernels::gemm::W8A8Layout::OutputMajor,
-        }
+    fn gemm_args<'a>(
+        &'a self,
+        input: &'a ops::quantization::DynamicI8Tensor,
+        output: &'a mut Tensor,
+    ) -> ops::gemm::GemmArgs<'a> {
+        ops::gemm::GemmArgs::row_channel_quantized(
+            &input.values,
+            &input.scales,
+            &self.weight_output_major,
+            &self.weight_scales,
+            output,
+        )
+        .with_output_major_weight()
+        .with_immutable_weight(ops::gemm::WeightVersion::new(0))
+    }
+
+    fn output(&self, rows: usize, backend: &RuntimeBackend) -> Result<Tensor> {
+        backend.context().allocate_output(
+            apxinf_core::Shape::new(vec![rows, self.output_dim]),
+            DType::BF16,
+        )
     }
 }
 
 impl DeviceLinearWeights for Gr00tInt8LinearWeights {
-    type ReusableInput = kernels::gemm::W8A8Activation;
+    type ReusableInput = ops::quantization::DynamicI8Tensor;
 
     fn forward(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
-        if backend.context().caps().sm == 87 && self.input_dim == 1536 && self.output_dim == 6144 {
-            if let Some(output) = kernels::gemm::try_gemm_w8a8_m41_n6144_k1536(
-                backend.context(),
-                input,
-                self.as_kernel_view(),
-            )? {
-                return Ok(output);
-            }
-        }
-        kernels::gemm::w8a8(backend.context(), input, self.as_kernel_view())
+        let quantized = ops::quantization::quantize_rows_i8(backend.context(), input)?;
+        self.forward_reusable_quantized(&quantized, backend)
     }
 
     fn bias(&self) -> Option<&Tensor> {
@@ -119,7 +116,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         input: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Self::ReusableInput>> {
-        Ok(Some(kernels::gemm::quantize_w8a8_activation(
+        Ok(Some(ops::quantization::quantize_rows_i8(
             backend.context(),
             input,
         )?))
@@ -131,7 +128,7 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         bias: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Self::ReusableInput>> {
-        Ok(Some(kernels::gemm::bias_gelu_quantize_w8a8_activation(
+        Ok(Some(ops::pointwise::bias_gelu_quantize_rows(
             backend.context(),
             input,
             bias,
@@ -147,19 +144,10 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         input: &Self::ReusableInput,
         backend: &RuntimeBackend,
     ) -> Result<Tensor> {
-        // Production M41 FC1 normally uses the fused bias-GELU producer.
-        // Its decomposed/legacy path keeps the measured plain INT8 schedule
-        // through an explicit model choice, without changing generic tactics.
-        if backend.context().caps().sm == 87 && self.input_dim == 1536 && self.output_dim == 6144 {
-            if let Some(output) = kernels::gemm::try_gemm_quantized_w8a8_m41_n6144_k1536(
-                backend.context(),
-                input,
-                self.as_kernel_view(),
-            )? {
-                return Ok(output);
-            }
-        }
-        kernels::gemm::gemm_quantized_w8a8(backend.context(), input, self.as_kernel_view())
+        let rows = input.values.shape().dims().first().copied().unwrap_or(0);
+        let mut output = self.output(rows, backend)?;
+        ops::gemm::gemm(backend.context(), self.gemm_args(input, &mut output))?;
+        Ok(output)
     }
 
     fn forward_reusable_quantized_bias_gelu_quantized(
@@ -168,20 +156,20 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         bias: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
-        if backend.context().caps().sm != 87 {
-            return Ok(None);
-        }
         if !w8a8_fc1_producer_fusion_enabled(
             std::env::var_os("APXINF_GR00T_W8A8_LEGACY_FC1_GELU_QUANT").is_some(),
         ) {
             return Ok(None);
         }
-        kernels::gemm::try_gemm_quantized_w8a8_bias_gelu_quantized(
+        let rows = input.values.shape().dims().first().copied().unwrap_or(0);
+        let mut activated = self.output(rows, backend)?;
+        let gemm = self.gemm_args(input, &mut activated);
+        ops::gemm::gemm_bias_gelu(
             backend.context(),
-            input,
-            self.as_kernel_view(),
-            bias,
-        )
+            ops::gemm::GemmBiasGeluArgs { gemm, bias },
+        )?;
+        let quantized = ops::quantization::quantize_rows_i8(backend.context(), &activated)?;
+        Ok(Some((activated, quantized)))
     }
 
     fn forward_reusable_quantized_with_bias(
@@ -189,24 +177,17 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         input: &Self::ReusableInput,
         backend: &RuntimeBackend,
     ) -> Result<Option<Tensor>> {
-        if backend.context().caps().sm != 87 {
-            return Ok(None);
-        }
         let Some(bias) = self.bias.as_ref() else {
             return Ok(None);
         };
-        if std::env::var_os("APXINF_GR00T_W8A8_LEGACY_QKV_GEMM_BIAS").is_some()
-            || self.input_dim != 1536
-            || self.output_dim != 4608
-        {
+        if std::env::var_os("APXINF_GR00T_W8A8_LEGACY_QKV_GEMM_BIAS").is_some() {
             return Ok(None);
         }
-        kernels::gemm::try_gemm_quantized_w8a8_bias(
-            backend.context(),
-            input,
-            self.as_kernel_view(),
-            bias,
-        )
+        let rows = input.values.shape().dims().first().copied().unwrap_or(0);
+        let mut output = self.output(rows, backend)?;
+        let gemm = self.gemm_args(input, &mut output);
+        ops::gemm::gemm_bias(backend.context(), ops::gemm::GemmBiasArgs { gemm, bias })?;
+        Ok(Some(output))
     }
 
     fn fused_silu_mul(
@@ -215,42 +196,8 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         up: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Tensor>> {
-        let activation = if backend.context().caps().sm == 87
-            && gate.shape().dims() == [156, 6144]
-            && std::env::var_os("APXINF_GR00T_W8A8_LEGACY_SILU_MUL_PACKED4").is_none()
-        {
-            kernels::gemm::quantize_w8a8_silu_mul_activation_packed4(backend.context(), gate, up)?
-        } else {
-            kernels::gemm::quantize_w8a8_silu_mul_activation(backend.context(), gate, up)?
-        };
-        Ok(Some(kernels::gemm::gemm_quantized_w8a8(
-            backend.context(),
-            &activation,
-            self.as_kernel_view(),
-        )?))
-    }
-
-    fn packed_bias_then_residual(
-        &self,
-        projection: &Tensor,
-        bias: Option<&Tensor>,
-        residual: &Tensor,
-        backend: &RuntimeBackend,
-    ) -> Result<Option<Tensor>> {
-        if backend.context().caps().sm != 87 {
-            return Ok(None);
-        }
-        if std::env::var_os("APXINF_GR00T_W8A8_LEGACY_BIAS_RESIDUAL").is_some()
-            || self.output_dim % 4 != 0
-        {
-            return Ok(None);
-        }
-        Ok(Some(kernels::fused::bias_then_residual_bf16_packed4(
-            backend.context(),
-            projection,
-            bias,
-            residual,
-        )?))
+        let activation = ops::pointwise::silu_mul_quantize_rows(backend.context(), gate, up)?;
+        Ok(Some(self.forward_reusable_quantized(&activation, backend)?))
     }
 
     fn adaptive_layer_norm_quantized(
@@ -263,12 +210,33 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         if backend.context().caps().sm != 87 {
             return Ok(None);
         }
-        let (normalized, quantized) = kernels::gemm::adaptive_layer_norm_quantize_w8a8_activation(
+        let dims = input.shape().dims();
+        let rows = dims[0];
+        let normalized = backend
+            .context()
+            .allocate_output(input.shape().clone(), DType::BF16)?;
+        let values = backend
+            .context()
+            .allocate_output(input.shape().clone(), DType::I8)?;
+        let scales = backend
+            .context()
+            .allocate_output(Shape::new(vec![rows]), DType::F32)?;
+        ops::norm::norm(
             backend.context(),
-            input,
-            modulation,
-            eps,
+            ops::norm::NormArgs {
+                input,
+                output: Some(&normalized),
+                kind: ops::norm::NormKind::Layer,
+                affine: ops::norm::Affine::Adaptive { style: modulation },
+                quantized: Some(ops::norm::QuantOut::RowwiseI8 {
+                    values: &values,
+                    scales: &scales,
+                }),
+                numerics: ops::norm::NormNumerics::Flexible,
+                eps,
+            },
         )?;
+        let quantized = ops::quantization::DynamicI8Tensor { values, scales };
         Ok(Some((normalized, quantized)))
     }
 
@@ -288,13 +256,37 @@ impl DeviceLinearWeights for Gr00tInt8LinearWeights {
         {
             return Ok(None);
         }
-        let (normalized, quantized) = kernels::gemm::layer_norm_quantize_w8a8_activation(
+        let dims = input.shape().dims();
+        let rows = dims[0];
+        let normalized = backend
+            .context()
+            .allocate_output(input.shape().clone(), DType::BF16)?;
+        let values = backend
+            .context()
+            .allocate_output(input.shape().clone(), DType::I8)?;
+        let scales = backend
+            .context()
+            .allocate_output(Shape::new(vec![rows]), DType::F32)?;
+        ops::norm::norm(
             backend.context(),
-            input,
-            weight,
-            bias,
-            eps,
+            ops::norm::NormArgs {
+                input,
+                output: Some(&normalized),
+                kind: ops::norm::NormKind::Layer,
+                affine: ops::norm::Affine::Weight {
+                    weight,
+                    bias: Some(bias),
+                    offset: false,
+                },
+                quantized: Some(ops::norm::QuantOut::RowwiseI8 {
+                    values: &values,
+                    scales: &scales,
+                }),
+                numerics: ops::norm::NormNumerics::Flexible,
+                eps,
+            },
         )?;
+        let quantized = ops::quantization::DynamicI8Tensor { values, scales };
         Ok(Some((normalized, quantized)))
     }
 

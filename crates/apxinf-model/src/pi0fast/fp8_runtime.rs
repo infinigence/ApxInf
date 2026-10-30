@@ -3,14 +3,14 @@
 //! Identical structure to `bf16_runtime`: one prefix pass (SigLIP tower +
 //! projector + prompt prefill, K/V parked in a cache) followed by an
 //! autoregressive decode that keeps the token on device. Only the projection
-//! dispatch differs — `gemm::fp8_bf16` with E4M3 weights and calibrated
-//! activation scales.
+//! dispatch differs — formal GEMM with E4M3 operands, unit-scale quantization
+//! semantics and calibrated activation scales.
 
 use std::sync::{Arc, Mutex};
 
-use super::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
-use apxinf_core::{Error, Result, Tensor};
-use kernels::{cache, elementwise, embedding, norm, sampling, GraphWorkspace};
+use super::backend::{ops, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
+use ops::{cache, elementwise, sampling, ExecutionSession};
 
 use super::bf16_executor::vision_patch_embed_f32_bf16;
 use super::fp8_executor::fp8_projection;
@@ -18,6 +18,40 @@ use super::{
     language_layer_cached_decode_fp8, language_layer_fp8, vision_layer_fp8, Pi0FastConfig,
     Pi0FastFp8Scales, StaticFp8Pi0FastWeights,
 };
+
+fn add_optional_bias(ctx: &Context, input: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let Some(bias) = bias else {
+        return Ok(input.clone());
+    };
+    let mut output = ctx.allocate_output(input.shape().clone(), input.dtype())?;
+    let mut args =
+        ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, input, &mut output);
+    args.bias = Some(bias);
+    args.activation = ops::PointwiseActivation::None;
+    ops::pointwise(ctx, args)?;
+    Ok(output)
+}
+
+fn embedding_lookup(
+    ctx: &Context,
+    table: &Tensor,
+    ids: &CudaBuffer,
+    tokens: usize,
+) -> Result<Tensor> {
+    let dims = table.shape().dims();
+    if dims.len() != 2 {
+        return Err(Error::Other(
+            "PI0-FAST embedding table must be rank 2".into(),
+        ));
+    }
+    let mut output = ctx.allocate_output(Shape::new(vec![tokens, dims[1]]), table.dtype())?;
+    let mut args = ops::GatherArgs::new(ops::GatherSemantic::EmbeddingLookup, table, &mut output);
+    args.ids = Some(ids);
+    args.vocab_size = dims[0];
+    args.embedding_scale = ops::EmbeddingScale::None;
+    ops::gather(ctx, args)?;
+    Ok(output)
+}
 
 /// Conservative arena reservation for one FP8 `infer` traversal.
 ///
@@ -94,8 +128,13 @@ pub struct Pi0FastFp8Runtime {
     scales: Arc<Pi0FastFp8Scales>,
     /// Maps the pruned LM-head columns back to global token ids; see
     /// [`super::action_head_remap`].
-    lm_head_remap: CudaBuffer,
-    arena: Mutex<Option<GraphWorkspace>>,
+    lm_head_remap: Tensor,
+    arena: Mutex<Option<ArenaState>>,
+}
+
+struct ArenaState {
+    token_count: usize,
+    session: ExecutionSession,
 }
 
 impl Pi0FastFp8Runtime {
@@ -145,13 +184,16 @@ impl Pi0FastFp8Runtime {
             .arena
             .lock()
             .map_err(|_| Error::Other("π0-FAST FP8 arena mutex is poisoned".into()))?;
-        if arena
-            .as_ref()
-            .is_none_or(|workspace| workspace.capacity() < capacity)
-        {
-            *arena = Some(GraphWorkspace::new(capacity, self.ctx().device_id())?);
+        if arena.as_ref().is_none_or(|state| {
+            state.token_count != token_count || state.session.capacity() < capacity
+        }) {
+            *arena = Some(ArenaState {
+                token_count,
+                session: ExecutionSession::with_capacity(capacity, self.ctx().device_id())?,
+            });
         }
-        kernels::with_workspace_eager(arena.as_ref().expect("arena is populated above"), operation)
+        let state = arena.as_ref().expect("arena is populated above");
+        ops::prepare_with_session(&state.session, operation)
     }
 
     pub fn max_sequence(&self, token_count: usize) -> usize {
@@ -180,20 +222,26 @@ impl Pi0FastFp8Runtime {
                 config.layer_norm_eps,
             )?;
         }
-        let hidden = norm::layer_bf16(
+        let normalized = self
+            .ctx()
+            .allocate_output(hidden.shape().clone(), hidden.dtype())?;
+        ops::norm::norm(
             self.ctx(),
-            &hidden,
-            &weights.vision_post_norm.weight,
-            &weights.vision_post_norm.bias,
-            config.layer_norm_eps,
+            ops::NormArgs::layer(
+                &hidden,
+                &weights.vision_post_norm.weight,
+                &weights.vision_post_norm.bias,
+                &normalized,
+                config.layer_norm_eps,
+            ),
         )?;
         let projected = fp8_projection(
             self.ctx(),
-            &hidden,
+            &normalized,
             &weights.multimodal_projector,
             self.scales.multimodal_projector,
         )?;
-        elementwise::bias_bf16(
+        add_optional_bias(
             self.ctx(),
             &projected,
             weights.multimodal_projector.bias.as_ref(),
@@ -244,7 +292,7 @@ impl Pi0FastFp8Runtime {
 
         let image = self.embed_images(patches)?;
         let language = self.embed_tokens(token_ids, token_count)?;
-        let prefix = elementwise::concat_rows_bf16(self.ctx(), &image, &language)?;
+        let prefix = elementwise::concat_rows(self.ctx(), &image, &language)?;
 
         let (hidden, keys, values) = self.decode_prefix(prefix, max_sequence)?;
         let prefix_len = token_count + config.patch_tokens();
@@ -262,8 +310,17 @@ impl Pi0FastFp8Runtime {
             let slot = tokens
                 .view(step * step_bytes, step_bytes)
                 .map_err(Error::Cuda)?;
-            sampling::argmax_bf16_remapped_into(self.ctx(), &logits, &self.lm_head_remap, &slot)?;
+            let slot_tensor = slot
+                .as_tensor(Shape::new(vec![1]), DType::I32)
+                .map_err(Error::Cuda)?;
+            sampling::argmax(
+                self.ctx(),
+                sampling::ArgmaxArgs::new(&logits, &slot_tensor).with_remap(&self.lm_head_remap),
+            )?;
             if let Some(stop) = stop_token {
+                // See the BF16 path: the host stop-token read must wait for
+                // argmax on cuda-new's non-default context stream.
+                self.ctx().synchronize().map_err(Error::Cuda)?;
                 let mut raw = [0u8; 4];
                 slot.copy_to_host(&mut raw).map_err(Error::Cuda)?;
                 if u32::from_ne_bytes(raw) == stop {
@@ -293,7 +350,9 @@ impl Pi0FastFp8Runtime {
         }
 
         let mut bytes = vec![0u8; produced * step_bytes];
-        tokens.copy_to_host(&mut bytes).map_err(Error::Cuda)?;
+        tokens
+            .copy_to_host_on(&mut bytes, self.ctx().stream())
+            .map_err(Error::Cuda)?;
         Ok(bytes
             .chunks_exact(4)
             .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -323,12 +382,12 @@ impl Pi0FastFp8Runtime {
                 config.rope_theta,
             )?;
             hidden = output.hidden;
-            keys.push(cache::reserve_prefix_bf16(
+            keys.push(cache::reserve_prefix(
                 self.ctx(),
                 &output.key,
                 max_sequence,
             )?);
-            values.push(cache::reserve_prefix_bf16(
+            values.push(cache::reserve_prefix(
                 self.ctx(),
                 &output.value,
                 max_sequence,
@@ -340,16 +399,22 @@ impl Pi0FastFp8Runtime {
         index
             .copy_from_host(&((rows - 1) as u32).to_ne_bytes())
             .map_err(Error::Cuda)?;
-        let last = elementwise::gather_rows_bf16(self.ctx(), &hidden, &index, 1)?;
+        let last = elementwise::gather_rows(self.ctx(), &hidden, &index, 1)?;
         Ok((last, keys, values))
     }
 
     fn lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
-        let normalized = norm::rms_bf16(
+        let normalized = self
+            .ctx()
+            .allocate_output(hidden.shape().clone(), hidden.dtype())?;
+        ops::norm::norm(
             self.ctx(),
-            hidden,
-            &self.weights.language_final_norm_scale,
-            self.config.rms_norm_eps,
+            ops::NormArgs::rms(
+                hidden,
+                &self.weights.language_final_norm_scale,
+                &normalized,
+                self.config.rms_norm_eps,
+            ),
         )?;
         fp8_projection(
             self.ctx(),
@@ -361,8 +426,11 @@ impl Pi0FastFp8Runtime {
 
     fn embed_tokens(&self, ids: &CudaBuffer, token_count: usize) -> Result<Tensor> {
         let width = self.config.language.width;
-        let tensor =
-            embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
-        elementwise::scale(self.ctx(), &tensor, (width as f32).sqrt())
+        let tensor = embedding_lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
+        let output = self
+            .ctx()
+            .allocate_output(tensor.shape().clone(), tensor.dtype())?;
+        elementwise::scale(self.ctx(), &tensor, &output, (width as f32).sqrt())?;
+        Ok(output)
     }
 }

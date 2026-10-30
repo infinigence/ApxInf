@@ -160,3 +160,70 @@ def test_fixed_decode_rejects_invalid_cli_counts(monkeypatch, lengths):
                                    '--mode', 'fixed', '--decode-lengths', *lengths])
     with pytest.raises(SystemExit):
         bench.parse_args()
+
+
+@pytest.mark.parametrize('legacy_json_exists', [False, True])
+def test_provenance_records_native_recipe_sidecar(tmp_path, monkeypatch, legacy_json_exists):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    requested = tmp_path / 'tactics.json'
+    if legacy_json_exists:
+        requested.write_text('{"legacy": true}')
+    recipes = tmp_path / 'tactics.recipes'
+    recipes.mkdir()
+    (recipes / 'gemm.json').write_text('{"candidate": 3}')
+    result = bench.provenance(tmp_path, tmp_path, tactics=requested)['tactics']
+    assert result['path'] == str(recipes)
+    assert result['sha256'] == bench.artifact(recipes)['sha256']
+    assert result['file_count'] == 1
+
+
+def test_provenance_accepts_recipe_directory_and_detects_recipe_changes(tmp_path, monkeypatch):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    recipes = tmp_path / 'recipes'
+    recipes.mkdir()
+    recipe = recipes / 'gemm.json'
+    recipe.write_text('{"candidate": 3}')
+    before = bench.provenance(tmp_path, tmp_path, tactics=recipes)['tactics']
+    assert before['path'] == str(recipes)
+    assert before == bench.provenance(tmp_path, tmp_path, tactics=recipes)['tactics']
+    recipe.write_text('{"candidate": 4}')
+    assert before['sha256'] != bench.provenance(tmp_path, tmp_path, tactics=recipes)['tactics']['sha256']
+
+
+def test_provenance_records_missing_cache_without_claiming_a_hash(tmp_path, monkeypatch):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    result = bench.provenance(tmp_path, tmp_path, tactics=tmp_path / 'empty.json')['tactics']
+    assert result == {'path': str(tmp_path / 'empty.recipes'), 'exists': False}
+
+
+def test_provenance_does_not_label_ignored_source_tactics_as_active(tmp_path, monkeypatch):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    requested = tmp_path / 'configs/tuning/nvidia/thor-sm110/tactics.json'
+    requested.parent.mkdir(parents=True)
+    requested.write_text('{"legacy": true}')
+    result = bench.provenance(tmp_path, tmp_path, tactics=requested)['tactics']
+    assert result == {'requested_path': str(requested), 'selection': 'native_default'}
+
+
+def test_provenance_resolves_recipe_sidecar_before_following_json_symlinks(tmp_path, monkeypatch):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    old = tmp_path / 'archived.json'
+    old.write_text('{}')
+    requested = tmp_path / 'active.json'
+    requested.symlink_to(old)
+    recipes = tmp_path / 'active.recipes'
+    recipes.mkdir()
+    (recipes / 'gemm.json').write_text('{"candidate": 3}')
+    result = bench.provenance(tmp_path, tmp_path, tactics=requested)['tactics']
+    assert result['path'] == str(recipes)
+    assert result['file_count'] == 1

@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -19,6 +21,31 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _APXINF_PKG = _REPO_ROOT / "python" / "apxinf"
 if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
     sys.path.insert(0, str(_APXINF_PKG))
+
+
+@contextlib.contextmanager
+def _cuda_profiler_capture():
+    """Optionally delimit steady-state CUDA work for Nsight Systems."""
+    if os.environ.get("APXINF_BENCH_CUDA_PROFILER_API") != "1":
+        yield
+        return
+
+    cudart = ctypes.CDLL("libcudart.so")
+    start = cudart.cudaProfilerStart
+    stop = cudart.cudaProfilerStop
+    start.argtypes = []
+    start.restype = ctypes.c_int
+    stop.argtypes = []
+    stop.restype = ctypes.c_int
+    status = start()
+    if status != 0:
+        raise RuntimeError(f"cudaProfilerStart failed with status {status}")
+    try:
+        yield
+    finally:
+        status = stop()
+        if status != 0:
+            raise RuntimeError(f"cudaProfilerStop failed with status {status}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,10 +148,11 @@ def main() -> None:
     for _ in range(args.warmup):
         policy.infer(observation, noise=noise)
     latencies = []
-    for _ in range(args.iterations):
-        started = time.perf_counter()
-        policy.infer(observation, noise=noise)
-        latencies.append((time.perf_counter() - started) * 1e3)
+    with _cuda_profiler_capture():
+        for _ in range(args.iterations):
+            started = time.perf_counter()
+            policy.infer(observation, noise=noise)
+            latencies.append((time.perf_counter() - started) * 1e3)
 
     report = {
         "commit": git_commit(),

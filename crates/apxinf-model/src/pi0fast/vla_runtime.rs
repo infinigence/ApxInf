@@ -20,7 +20,7 @@ use crate::vla::{
 };
 
 use super::backend::{
-    kernels, DeviceBuffer as CudaBuffer, ImageLayout as KernelImageLayout, RuntimeBackend,
+    ops, DeviceBuffer as CudaBuffer, ImageLayout as KernelImageLayout, RuntimeBackend,
 };
 use super::fp8_calibration::{checkpoint_identity, Pi0FastFp8Calibration};
 use super::{
@@ -136,7 +136,9 @@ impl Pi0FastVlaRuntime {
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_ne_bytes()).collect();
         let buffer =
             CudaBuffer::alloc(bytes.len(), self.backend.device_id()).map_err(Error::Cuda)?;
-        buffer.copy_from_host(&bytes).map_err(Error::Cuda)?;
+        buffer
+            .copy_from_host_on(&bytes, self.backend.context().stream())
+            .map_err(Error::Cuda)?;
         Ok(buffer)
     }
 
@@ -162,15 +164,28 @@ impl Pi0FastVlaRuntime {
                     .to_device(&Tensor::zeros(self.patch_shape().to_vec(), DType::F32))?;
                 let images = CudaBuffer::alloc(bytes.len(), self.backend.device_id())
                     .map_err(Error::Cuda)?;
-                images.copy_from_host(bytes).map_err(Error::Cuda)?;
-                kernels::preprocess::rgb_u8_to_patches_f32(
+                images
+                    .copy_from_host_on(bytes, self.backend.context().stream())
+                    .map_err(Error::Cuda)?;
+                ops::preprocess::preprocess(
                     self.backend.context(),
-                    &images,
-                    &patches,
-                    config.effective_views(),
-                    config.image_size,
-                    config.patch_size,
-                    kernel_image_layout(*layout),
+                    ops::preprocess::PreprocessArgs {
+                        images: &images,
+                        patches: &patches,
+                        lookup_table: None,
+                        spec: ops::preprocess::PreprocessSpec {
+                            layout: kernel_image_layout(*layout),
+                            geometry: ops::preprocess::PatchGeometry::Uniform {
+                                views: config.effective_views(),
+                                image_height: config.image_size,
+                                image_width: config.image_size,
+                                patch_size: config.patch_size,
+                                temporal_patch_size: 1,
+                                merge_size: 1,
+                            },
+                            normalization: ops::preprocess::PatchNormalization::UnitRange,
+                        },
+                    },
                 )?;
                 Ok(patches)
             }
@@ -401,7 +416,7 @@ pub(super) fn load_registered(
     backend: Arc<dyn Backend>,
     options: &LoadOptions,
 ) -> Result<LoadedModel> {
-    let backend = crate::accelerator::cuda::downcast_arc(backend)
+    let backend = crate::accelerator::downcast_cuda_new_arc(backend)
         .ok_or_else(|| Error::Other("π0-FAST is only registered for CUDA".into()))?;
     if options.config.is_some() {
         return Err(Error::Other(

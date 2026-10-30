@@ -4,10 +4,10 @@ use std::env;
 use std::sync::Arc;
 use std::time::Instant;
 
-use apxinf_core::{Backend, Error, Graph, NormalGenerator, Result, SamplingBackend, Tensor};
+use apxinf_core::{Error, Graph, NormalGenerator, Result, SamplingBackend, Tensor};
 use half::{bf16, f16};
 
-use crate::accelerator::cuda::{kernels, transfers, DeviceBuffer};
+use super::backend::{ops, transfers, DeviceBuffer};
 use crate::vla::{
     Action, ExecutionMode, ExecutionPolicy, ImageLayout, InferenceSpec, InitialLatent,
     Observation, PreparationStatus, PreparedInference, VisionObservation, VlaContract,
@@ -16,7 +16,19 @@ use crate::vla::{
 
 use super::{SmolVlaConfig, SmolVlaModel};
 
-const GRAPH_WORKSPACE_CAPACITIES_BYTES: [usize; 2] = [64 << 20, 96 << 20];
+// Direct-launch outputs use lease-backed arena slices, so temporaries can be
+// reused after their last tensor owner drops while graph addresses stay stable.
+// Retry with bounded capacities instead of silently falling back to eager.
+const GRAPH_WORKSPACE_CAPACITIES_BYTES: [usize; 8] = [
+    64 << 20,
+    96 << 20,
+    128 << 20,
+    160 << 20,
+    192 << 20,
+    256 << 20,
+    320 << 20,
+    384 << 20,
+];
 
 pub struct SmolVlaModelRunner {
     model: Arc<SmolVlaModel>,
@@ -228,7 +240,7 @@ struct SmolVlaCapturedGraph {
     _time_embeddings: Vec<Tensor>,
     model: Arc<SmolVlaModel>,
     normal_generator: RefCell<Box<dyn NormalGenerator>>,
-    _workspace: kernels::GraphWorkspace,
+    _workspace: ops::ExecutionSession,
 }
 
 impl SmolVlaCapturedGraph {
@@ -281,8 +293,8 @@ impl SmolVlaCapturedGraph {
         let mut last_workspace_error = None;
         for capacity in GRAPH_WORKSPACE_CAPACITIES_BYTES {
             let workspace =
-                kernels::GraphWorkspace::new(capacity, device_id)?;
-            let preflight = kernels::prepare_with_workspace(&workspace, || {
+                ops::ExecutionSession::with_capacity(capacity, device_id)?;
+            let preflight = ops::prepare_with_session(&workspace, || {
                 model.infer_fixed(
                     raw_images.as_ref(),
                     &patches,
@@ -312,7 +324,7 @@ impl SmolVlaCapturedGraph {
             drop(expected_output);
 
             let (graph, output) = backend.capture_graph(|| {
-                kernels::with_workspace(&workspace, || {
+                ops::with_session(&workspace, || {
                     model.infer_fixed(
                         raw_images.as_ref(),
                         &patches,
@@ -335,7 +347,7 @@ impl SmolVlaCapturedGraph {
             }
             eprintln!(
                 "[apxinf] SmolVLA CUDA Graph captured with {}/{} workspace bytes",
-                workspace.peak_used(),
+                workspace.used(),
                 workspace.capacity()
             );
 

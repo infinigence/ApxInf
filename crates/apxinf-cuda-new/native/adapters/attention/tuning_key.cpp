@@ -31,19 +31,26 @@ TuningKeys tuning_keys(const Spec& spec,
   // One exact key: the namespace prefix captures the candidate/toolchain/GPU
   // identity and the suffix captures the normalized operation and policy.
   // There is no compatible fallback key; a miss runs the full autotuner.
+  const bool stable =
+      spec.numerics == APXINF_ATTENTION_NUMERICS_STABLE;
   std::ostringstream key;
-  key << "attention-recipe-v5|ns|" << APXINF_ATTENTION_BUILD_ID << '|'
+  key << (stable ? "attention-recipe-v8|ns|" : "attention-recipe-v7|ns|")
+      << APXINF_ATTENTION_BUILD_ID << '|'
       << "toolkit=" << CUDART_VERSION << '|'
       << "cc=" << properties.major * 10 + properties.minor
       << "|sms=" << properties.multiProcessorCount
       << "|cuda=" << cuda_compat_version(runtime_version)
       << "|driver=" << cuda_compat_version(driver_version)
+      // Flexible numerics retains the pre-v5 normalized suffix. The build
+      // fingerprint still invalidates recipes when candidate code changes.
       << "|op|" << spec.version << '|' << spec.semantic << '|'
-      << spec.dtype << '|' << spec.output_dtype << '|' << spec.mask << '|'
+      << spec.qkv_layout << '|' << spec.dtype << '|' << spec.output_dtype << '|'
+      << spec.mask << '|'
       << spec.batch << '|' << spec.query_tokens << '|' << spec.key_tokens << '|'
       << spec.key_capacity << '|' << spec.query_heads << '|' << spec.kv_heads
       << '|' << spec.head_dim << '|';
   key << spec.dynamic_decode << '|';
+  if (stable) key << spec.numerics << '|';
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
       spec.dynamic_decode != 0) {
     key << "decode-meta|";

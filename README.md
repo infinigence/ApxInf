@@ -75,7 +75,7 @@ Make sure you have ApxInf built and installed, see [Build ApxInf](#build-apxinf)
 ### Native Apple Silicon text inference
 
 The optional `mlx` feature runs Qwen3-0.6B and MiniCPM5-2B through native Rust
-models and the MLX 0.31.2 C++/Metal runtime. Native model composition lives in
+models and the MLX 0.32.3 C++/Metal runtime. Native model composition lives in
 `metal_qwen3` and `metal_minicpm5`, independent of the evolving multi-backend
 contract. It does not run a Python model.
 Qwen3 offers BF16 and mixed W8 selections; MiniCPM5 offers BF16 and an explicit
@@ -83,7 +83,7 @@ DSpark drafter selection. Existing CUDA VLA families retain their own support
 scope.
 
 ```sh
-export MLX_ROOT=/path/to/mlx-0.31.2
+export MLX_ROOT=/path/to/mlx-0.32.3
 export DYLD_LIBRARY_PATH="$MLX_ROOT/lib"
 export CARGO_TARGET_DIR=devlocal/apxinf-mlx/cargo-target
 cargo build --release --features mlx
@@ -599,7 +599,9 @@ entry point — the raw tokens — and L2 turns them into actions:
 ```python
 from apxinf import AutoPolicy
 
-policy = AutoPolicy.from_pretrained("<path-to-model>", model_variant="bf16")
+policy = AutoPolicy.from_pretrained(
+    "<path-to-model>", model_variant="bf16", state_key="observation/state",
+)
 
 # L1: raw FAST action tokens, uint32 [max_action_tokens]
 tokens = policy.model.infer_action_tokens_rgb(rgb, "nhwc", token_ids)

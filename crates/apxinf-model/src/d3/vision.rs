@@ -192,13 +192,13 @@ pub(crate) fn forward_vision_device(
     trace_vision(ctx, "input", &scratch.hidden)?;
 
     for (block_index, block) in weights.blocks.iter().enumerate() {
-        ops::layer_norm(
+        ops::norm::norm(
             ctx,
-            ops::LayerNormArgs::new(
+            ops::NormArgs::layer(
                 &scratch.hidden,
                 &block.norm1_w,
                 &block.norm1_b,
-                &mut scratch.normalized,
+                &scratch.normalized,
                 eps,
             ),
         )?;
@@ -225,6 +225,7 @@ pub(crate) fn forward_vision_device(
                 key: &mut key,
                 value: &mut value,
                 theta: VISION_THETA,
+                numerics: ops::AxialRopeNumerics::Flexible,
             },
         )?;
         let offsets = CudaBuffer::from_tensor(&scratch.offsets).map_err(Error::Cuda)?;
@@ -268,13 +269,13 @@ pub(crate) fn forward_vision_device(
             )?;
         }
 
-        ops::layer_norm(
+        ops::norm::norm(
             ctx,
-            ops::LayerNormArgs::new(
+            ops::NormArgs::layer(
                 &scratch.hidden,
                 &block.norm2_w,
                 &block.norm2_b,
-                &mut scratch.normalized,
+                &scratch.normalized,
                 eps,
             ),
         )?;
@@ -315,13 +316,13 @@ pub(crate) fn forward_vision_device(
         }
     }
 
-    ops::layer_norm(
+    ops::norm::norm(
         ctx,
-        ops::LayerNormArgs::new(
+        ops::NormArgs::layer(
             &scratch.hidden,
             &weights.merger_norm_w,
             &weights.merger_norm_b,
-            &mut scratch.normalized,
+            &scratch.normalized,
             eps,
         ),
     )?;

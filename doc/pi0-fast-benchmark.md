@@ -22,39 +22,44 @@ accepting its upstream access terms. Benchmarking never downloads resources.
 Use a real checkpoint with constructed images/state to measure exact decode
 lengths. This requires a native binding built with `max_new_tokens` support.
 
-First prepare a device/precision-specific tactic database with the same input
+First prepare a device/precision-specific recipe cache with the same input
 shapes. Run from the repository root. Keep `--seed 0` and the decode lengths
 unchanged between preparation and measurement:
 
 ```sh
-# Prepare tactics once; do not use this run as the reported performance result.
+# Prepare recipes once; do not use this run as the reported performance result.
 python scripts/bench_pi0_fast.py \
   --model-dir /models/pi0fast-libero-v044 --model-variant bf16 \
   --state-key observation/state --layer l1 --mode fixed --seed 0 \
   --warmup 10 --samples 30 \
-  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-tactics.json --autotune \
+  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-recipes --autotune \
   --out devlocal/model-bench-inputs/pi0fast/prepare-bf16.json
 
-# Measure in a new process with online tuning disabled, reusing that database.
+# Measure in a new process with online tuning disabled, reusing that cache.
 python scripts/bench_pi0_fast.py \
   --model-dir /models/pi0fast-libero-v044 --model-variant bf16 \
   --state-key observation/state --layer l1 --mode fixed --seed 0 \
   --warmup 30 --samples 30 \
-  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-tactics.json \
+  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-recipes \
   --out devlocal/model-bench-inputs/pi0fast/fixed-bf16.json
 ```
 
 No LIBERO installation, dataset, simulator, or `.npz` input is required for these
 commands. The checkpoint and its tokenizer/normalization assets are still needed.
 For FP8, use `--model-variant fp8_static --calibration /path/to/matching-calibration.json`
-in both commands, with separate FP8 tactic and output paths. Use separate tactic
+in both commands, with separate FP8 recipe and output paths. Use separate recipe
 paths for each board, precision and compatible CUDA/cuBLAS version. Reuse a
-compatible prepared database directly when one is available.
+compatible prepared cache directly when one is available.
 
-Omitting `--tactics` selects the runtime's default database or fallback algorithms;
-it does not reproduce this preparation step and can be substantially slower.
-Keep the database hash from the JSON report together with the timings. The seed
-is already 0 by default; spelling it out preserves the input contract in copied
+With cuda-new, `--tactics` names a recipe directory. A legacy `name.json`
+argument maps to the sibling `name.recipes` directory; the old JSON contents
+are not imported. Prepare new recipes after the backend migration. Earlier
+legacy-runtime measurements do not establish performance for the migrated build.
+
+Omitting `--tactics` selects the runtime's default recipe cache or fallback
+algorithms; it does not reproduce this preparation step and can be substantially
+slower. Keep the recipe-directory hash from the JSON report together with the
+timings. The seed is already 0 by default; spelling it out preserves the input contract in copied
 commands. A fixed seed stabilizes the input, but does not by itself stabilize
 machine load, clocks or kernel selection.
 The measurement command uses 30 warmups per length (the CLI default is 10).
@@ -116,7 +121,7 @@ python scripts/bench_pi0_fast.py \
   --model-dir /models/pi0fast-libero-v044 --model-variant bf16 \
   --state-key observation/state --layer l1 --mode latency \
   --frames-count 10 --warmup 10 --samples 30 \
-  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-tactics.json --autotune \
+  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-recipes --autotune \
   --out devlocal/model-bench-inputs/pi0fast/thor-bf16.json
 ```
 
@@ -125,13 +130,12 @@ the README's Prefix and Per Token values. Run it on Thor, Orin and RTX 4090 for
 the corresponding latency check. For Thor FP8, use `--model-variant fp8_static
 --calibration /path/to/matching-calibration.json` and a separate output path.
 `--calibration` supplies FP8 activation scales. `--tactics` reaches the native
-GEMV/GEMM selector. This command creates a device-specific database with
-`--autotune`; omit `--autotune` and reuse that database for subsequent
+cuda-new recipe cache selector. This command prepares device-specific recipes
+with `--autotune`; omit `--autotune` and reuse that directory for subsequent
 measurements. Use separate stores for each hardware/precision combination and
 preserve their CUDA/cuBLAS and kernel identity; never patch a stale store's
-identity. To check the original script's default tactic path, omit both tactic
-flags. That baseline can be substantially slower and can generate different
-tokens, so record which path was used and compare like with like.
+identity. To check the runtime default recipe path, omit both tuning flags.
+That baseline can be substantially slower and can generate different tokens, so record which path was used and compare like with like.
 
 To measure the original prefix/per-token fit, provide recorded LIBERO frames
 with `base_raw` or `base_flipped`, `wrist_raw` or `wrist_flipped`, `state`, and
@@ -143,7 +147,7 @@ python scripts/bench_pi0_fast.py \
   --state-key observation/state --layer l1 --mode ar \
   --frames /path/to/libero_frames.npz --frame-variant raw \
   --survey 20 --repeats 5 \
-  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-tactics.json \
+  --tactics devlocal/model-bench-inputs/pi0fast/thor-bf16-recipes \
   --out devlocal/model-bench-inputs/pi0fast/thor-bf16-ar.json
 ```
 

@@ -14,7 +14,7 @@ use apxinf_loader::ModelConfig;
 use super::weights::{LlamaWeights, TransformerLayer};
 use crate::llm_trait::LlmTrait;
 #[cfg(feature = "cuda")]
-use crate::accelerator::cuda::downcast as cuda_backend;
+use crate::accelerator::downcast_cuda_new as cuda_backend;
 use crate::accelerator::create_backend;
 #[cfg(feature = "cuda")]
 use super::decode_graph::{DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
@@ -266,9 +266,7 @@ impl LlmTrait for GeneralLlama {
 ///   `[hidden, 2*intermediate]`. One GEMM + a fused `silu_mul` kernel
 ///   replaces two GEMMs + silu + mul.
 ///
-/// Both are D2D `cudaMemcpy2DAsync` on CUDA; no-ops on backends without
-/// `concat_2d`. The original wq/wk/wv/w_gate/w_up stay in place for the
-/// fallback path and for prefill (which doesn't use the fused path yet).
+/// Both are D2D copies on CUDA; unsupported backends skip the fused weights.
 fn pack_fused_weights(weights: &mut LlamaWeights, backend: &dyn Backend) {
     for layer in &mut weights.layers {
         // qkv_packed: concat [hidden, hidden] + [hidden, kv_proj] + [hidden, kv_proj]
