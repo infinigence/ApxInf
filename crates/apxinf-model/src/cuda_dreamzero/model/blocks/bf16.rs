@@ -423,7 +423,7 @@ mod dit {
     use super::layer;
     use super::{allocate, binary, linear};
     // The same joint network serves independently specified video/action times.
-    use super::dit_block::{self, projection, rows, BlockWorkspace};
+    use super::dit_block::{self, projection, rows, BlockWorkspace, CrossAttentionContext};
     use crate::cuda_dreamzero::{
         backend::{ops, transfers, Context},
         config::Policies,
@@ -463,6 +463,9 @@ mod dit {
     pub(in crate::cuda_dreamzero::model) struct DitContext {
         pub text: Tensor,
         pub image: Tensor,
+        cross_attention: Vec<CrossAttentionContext>,
+        text_k_raw: Tensor,
+        image_k_raw: Tensor,
         text_linear: Tensor,
         text_activation: Tensor,
         image_norm: Tensor,
@@ -475,6 +478,11 @@ mod dit {
             Ok(Self {
                 text: allocate(ctx, &[512, DIM])?,
                 image: allocate(ctx, &[257, DIM])?,
+                cross_attention: (0..40)
+                    .map(|_| CrossAttentionContext::new(ctx))
+                    .collect::<Result<Vec<_>>>()?,
+                text_k_raw: allocate(ctx, &[512, DIM])?,
+                image_k_raw: allocate(ctx, &[257, DIM])?,
                 text_linear: allocate(ctx, &[512, DIM])?,
                 text_activation: allocate(ctx, &[512, DIM])?,
                 image_norm: allocate(ctx, &[257, 1280])?,
@@ -538,7 +546,22 @@ mod dit {
                     &mut self.image,
                     1e-5,
                 ),
-            )
+            )?;
+            // Context does not depend on diffusion time or observed history.
+            // Rebuild all layer K/V in the Language graph on every request,
+            // including padded rows after the biased context projections.
+            for (context, block) in self.cross_attention.iter_mut().zip(&w.blocks) {
+                context.encode(
+                    ctx,
+                    p,
+                    block,
+                    &self.text,
+                    &self.image,
+                    &mut self.text_k_raw,
+                    &mut self.image_k_raw,
+                )?;
+            }
+            Ok(())
         }
     }
 
@@ -916,8 +939,7 @@ mod dit {
                     b,
                     &mut self.block,
                     &self.time_projected.reshape(vec![12, DIM])?,
-                    &context.text,
-                    &context.image,
+                    &context.cross_attention[i],
                     &self.rotary,
                     history.map(|h| &h.keys[i]),
                     history.map(|h| &h.values[i]),
@@ -1088,6 +1110,54 @@ mod dit_block {
         Ok(())
     }
 
+    fn block_policies(p: &Policies) -> Policies {
+        // Keep bulk transformer reductions independent of encoder/output heads.
+        let mut policies = p.clone();
+        policies.gemm.algorithm = ops::GemmAlgorithmPolicy::Any;
+        policies
+    }
+
+    /// Per-request, per-layer cross-attention K/V. These tensors are produced
+    /// by Language and read by every observed/joint transformer evaluation.
+    /// This is prepared workspace, never a cache shared between requests.
+    pub(in crate::cuda_dreamzero::model) struct CrossAttentionContext {
+        text_k: Tensor,
+        text_v: Tensor,
+        image_k: Tensor,
+        image_v: Tensor,
+    }
+    impl CrossAttentionContext {
+        pub fn new(ctx: &Context) -> Result<Self> {
+            Ok(Self {
+                text_k: allocate(ctx, &[512, DIM])?,
+                text_v: allocate(ctx, &[512, DIM])?,
+                image_k: allocate(ctx, &[257, DIM])?,
+                image_v: allocate(ctx, &[257, DIM])?,
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn encode(
+            &mut self,
+            ctx: &Context,
+            p: &Policies,
+            w: &Block,
+            text: &Tensor,
+            image: &Tensor,
+            text_k_raw: &mut Tensor,
+            image_k_raw: &mut Tensor,
+        ) -> Result<()> {
+            let p = &block_policies(p);
+            let a = &w.cross_attention;
+            projection(ctx, p, text, &a.k, text_k_raw)?;
+            rms(ctx, text_k_raw, &a.norm_k, &mut self.text_k)?;
+            projection(ctx, p, text, &a.v, &mut self.text_v)?;
+            projection(ctx, p, image, &w.image_k, image_k_raw)?;
+            rms(ctx, image_k_raw, &w.image_norm_k, &mut self.image_k)?;
+            projection(ctx, p, image, &w.image_v, &mut self.image_v)
+        }
+    }
+
     pub(in crate::cuda_dreamzero::model) struct BlockWorkspace {
         rows: usize,
         video_rows: usize,
@@ -1098,7 +1168,6 @@ mod dit_block {
         q_raw: Tensor,
         k_raw: Tensor,
         q: Tensor,
-        k: Tensor,
         v: Tensor,
         attended: Tensor,
         projected: Tensor,
@@ -1108,12 +1177,6 @@ mod dit_block {
         activated: Tensor,
         kv_k: Tensor,
         kv_v: Tensor,
-        text_k_raw: Tensor,
-        text_k: Tensor,
-        text_v: Tensor,
-        image_k_raw: Tensor,
-        image_k: Tensor,
-        image_v: Tensor,
         image_attended: Tensor,
         modulation: Tensor,
         scale: Tensor,
@@ -1135,8 +1198,6 @@ mod dit_block {
             }
             let n = video_rows + action_rows;
             let h = || allocate(ctx, &[n, DIM]);
-            let text = || allocate(ctx, &[512, DIM]);
-            let image = || allocate(ctx, &[257, DIM]);
             Ok(Self {
                 rows: n,
                 video_rows,
@@ -1147,7 +1208,6 @@ mod dit_block {
                 q_raw: h()?,
                 k_raw: h()?,
                 q: h()?,
-                k: h()?,
                 v: h()?,
                 attended: h()?,
                 projected: h()?,
@@ -1157,12 +1217,6 @@ mod dit_block {
                 activated: allocate(ctx, &[n, FFN])?,
                 kv_k: allocate(ctx, &[history_rows + n, DIM])?,
                 kv_v: allocate(ctx, &[history_rows + n, DIM])?,
-                text_k_raw: text()?,
-                text_k: text()?,
-                text_v: text()?,
-                image_k_raw: image()?,
-                image_k: image()?,
-                image_v: image()?,
                 image_attended: h()?,
                 modulation: allocate(ctx, &[12, DIM])?,
                 scale: allocate(ctx, &[1, DIM])?,
@@ -1259,8 +1313,7 @@ mod dit_block {
         w: &Block,
         s: &mut BlockWorkspace,
         time: &Tensor,
-        text: &Tensor,
-        image: &Tensor,
+        context: &CrossAttentionContext,
         rotary: &ops::ComplexRotaryTable,
         history_k: Option<&Tensor>,
         history_v: Option<&Tensor>,
@@ -1269,15 +1322,10 @@ mod dit_block {
         // Tune bulk transformer projections independently of the qualified
         // encoder and output-head reduction orders. Preparation owns tuning;
         // replay uses the retained executions and the same numerical contract.
-        let mut block_policies = p.clone();
-        block_policies.gemm.algorithm = ops::GemmAlgorithmPolicy::Any;
-        let p = &block_policies;
-        if text.shape().dims() != [512, DIM]
-            || image.shape().dims() != [257, DIM]
-            || observed_cache.is_some_and(|(k, v)| {
-                k.shape().dims() != [s.history_rows + s.video_rows, DIM] || v.shape() != k.shape()
-            })
-        {
+        let p = &block_policies(p);
+        if observed_cache.is_some_and(|(k, v)| {
+            k.shape().dims() != [s.history_rows + s.video_rows, DIM] || v.shape() != k.shape()
+        }) {
             return Err(Error::Other(
                 "DreamZero block context/cache shape mismatch".into(),
             ));
@@ -1303,21 +1351,20 @@ mod dit_block {
         projection(ctx, p, &s.shifted, &a.q, &mut s.q_raw)?;
         projection(ctx, p, &s.shifted, &a.k, &mut s.k_raw)?;
         projection(ctx, p, &s.shifted, &a.v, &mut s.v)?;
-        rms(ctx, &s.q_raw, &a.norm_q, &mut s.q)?;
-        rms(ctx, &s.k_raw, &a.norm_k, &mut s.k)?;
         let shape = vec![s.rows, HEADS, DIM / HEADS];
-        ops::complex_rotary(
-            ctx,
-            rotary,
-            &s.q.reshape(shape.clone())?,
-            &mut s.q_raw.reshape(shape.clone())?,
-        )?;
-        ops::complex_rotary(
-            ctx,
-            rotary,
-            &s.k.reshape(shape.clone())?,
-            &mut s.k_raw.reshape(shape)?,
-        )?;
+        for (input, weight) in [(&s.q_raw, &a.norm_q), (&s.k_raw, &a.norm_k)] {
+            ops::rms_complex_rotary(
+                ctx,
+                rotary,
+                ops::RmsComplexRotaryArgs {
+                    input: &input.reshape(shape.clone())?,
+                    weight,
+                    output: &mut input.reshape(shape.clone())?,
+                    eps: 1e-6,
+                    numerics: ops::NormNumerics::Staged,
+                },
+            )?;
+        }
         transfers::copy_cuda_to_cuda(ctx, &s.k_raw, &rows(&s.kv_k, s.history_rows, s.rows)?)?;
         transfers::copy_cuda_to_cuda(ctx, &s.v, &rows(&s.kv_v, s.history_rows, s.rows)?)?;
         if let Some((next_k, next_v)) = observed_cache {
@@ -1340,14 +1387,22 @@ mod dit_block {
         let a = &w.cross_attention;
         projection(ctx, p, &s.normed, &a.q, &mut s.q_raw)?;
         rms(ctx, &s.q_raw, &a.norm_q, &mut s.q)?;
-        projection(ctx, p, text, &a.k, &mut s.text_k_raw)?;
-        rms(ctx, &s.text_k_raw, &a.norm_k, &mut s.text_k)?;
-        projection(ctx, p, text, &a.v, &mut s.text_v)?;
-        attend(ctx, p, &s.q, &s.text_k, &s.text_v, &mut s.attended)?;
-        projection(ctx, p, image, &w.image_k, &mut s.image_k_raw)?;
-        rms(ctx, &s.image_k_raw, &w.image_norm_k, &mut s.image_k)?;
-        projection(ctx, p, image, &w.image_v, &mut s.image_v)?;
-        attend(ctx, p, &s.q, &s.image_k, &s.image_v, &mut s.image_attended)?;
+        attend(
+            ctx,
+            p,
+            &s.q,
+            &context.text_k,
+            &context.text_v,
+            &mut s.attended,
+        )?;
+        attend(
+            ctx,
+            p,
+            &s.q,
+            &context.image_k,
+            &context.image_v,
+            &mut s.image_attended,
+        )?;
         binary(
             ctx,
             ops::PointwiseSemantic::Add,
@@ -3739,7 +3794,7 @@ mod acceptance {
     #[test]
     #[ignore = "requires official observed/joint DiT block captures and complete checkpoint"]
     fn checkpoint_dit_observed_and_joint_blocks_eager_capture() {
-        use super::dit_block::{block, BlockWorkspace};
+        use super::dit_block::{block, BlockWorkspace, CrossAttentionContext};
         let root = PathBuf::from(std::env::var("APXINF_DREAMZERO_CHECKPOINT").unwrap());
         let fixtures = PathBuf::from(std::env::var("APXINF_DREAMZERO_BLOCK_FIXTURES").unwrap());
         let index: serde_json::Value = serde_json::from_slice(
@@ -3825,6 +3880,20 @@ mod acceptance {
                 )
                 .unwrap();
                 let policies = Policies::default();
+                let mut cross = CrossAttentionContext::new(&ctx).unwrap();
+                let mut text_k_raw = super::allocate(&ctx, &[512, 5120]).unwrap();
+                let mut image_k_raw = super::allocate(&ctx, &[257, 5120]).unwrap();
+                cross
+                    .encode(
+                        &ctx,
+                        &policies,
+                        &weights,
+                        &text,
+                        &image,
+                        &mut text_k_raw,
+                        &mut image_k_raw,
+                    )
+                    .unwrap();
                 let invoke = |work: &mut BlockWorkspace| {
                     block(
                         &ctx,
@@ -3832,8 +3901,7 @@ mod acceptance {
                         &weights,
                         work,
                         &time,
-                        &text,
-                        &image,
+                        &cross,
                         &rotary,
                         history.as_ref().map(|x| &x.0),
                         history.as_ref().map(|x| &x.1),

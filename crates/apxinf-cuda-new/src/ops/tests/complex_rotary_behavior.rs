@@ -265,3 +265,283 @@ fn complex_rotary_d128_matches_fp64_path_all_encodings_and_graph_rebind() {
         }
     }
 }
+
+#[test]
+fn rms_complex_rotary_matches_staged_composition_and_retains_graph_inputs() {
+    let ctx = CudaContext::new(0).unwrap();
+    for dtype in [DType::F16, DType::BF16] {
+        for raw_bits in [false, true] {
+            for (tokens, heads, dim) in [
+                (3, 2, 8),
+                (16, 6, 128),
+                (86, 6, 128),
+                (16, 64, 128),
+                (3, 5, 128),
+                (17, 3, 64),
+                (17, 4, 256),
+                (1, 65535, 2),
+            ] {
+                let width = heads * dim;
+                let upload = |shape: Vec<usize>, values: &[f32]| {
+                    let host = match dtype {
+                        DType::F16 => Tensor::from_f16(
+                            shape,
+                            &values
+                                .iter()
+                                .copied()
+                                .map(half::f16::from_f32)
+                                .collect::<Vec<_>>(),
+                        ),
+                        DType::BF16 => Tensor::from_bf16(
+                            shape,
+                            &values
+                                .iter()
+                                .copied()
+                                .map(half::bf16::from_f32)
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => unreachable!(),
+                    }
+                    .unwrap();
+                    transfers::to_cuda(&host, 0).unwrap()
+                };
+                let raw: Vec<_> = (0..tokens * width)
+                    .map(|i| ((i * 193 % 1009) as f32 - 504.) / 128.)
+                    .collect();
+                let w: Vec<_> = (0..width).map(|i| ((i % 101) as f32 - 50.) / 48.).collect();
+                let upload_bits = |shift: u16| {
+                    let bytes: Vec<_> = (0..tokens * width)
+                        .flat_map(|i| (i as u16).wrapping_add(shift).to_ne_bytes())
+                        .collect();
+                    let host = Tensor::from_raw(
+                        Shape::new(vec![tokens, heads, dim]),
+                        dtype,
+                        apxinf_core::Device::Cpu,
+                        bytes,
+                    )
+                    .unwrap();
+                    transfers::to_cuda(&host, 0).unwrap()
+                };
+                let input = if raw_bits {
+                    upload_bits(0)
+                } else {
+                    upload(vec![tokens, heads, dim], &raw)
+                };
+                let weight = upload(vec![width], &w);
+                let co: Vec<_> = (0..tokens * dim)
+                    .map(|i| {
+                        let angle = (i / 2) as f64 * 0.013;
+                        if i % 17 == 0 {
+                            1.0039062501
+                        } else if i % 2 == 0 {
+                            angle.cos()
+                        } else {
+                            angle.sin()
+                        }
+                    })
+                    .collect();
+                let table = ComplexRotaryTable::new(&ctx, tokens, dim, &co).unwrap();
+                // Pair heads at D128 so the independent oracle uses the retained
+                // general FP64 rotation, rather than the new shared certification.
+                let oracle_dim = if dim == 128 && heads % 2 == 0 {
+                    256
+                } else {
+                    dim
+                };
+                let oracle_heads = width / oracle_dim;
+                let oracle_co: Vec<_> = if oracle_dim == dim {
+                    co.clone()
+                } else {
+                    co.chunks_exact(dim)
+                        .flat_map(|r| r.iter().chain(r.iter()).copied())
+                        .collect()
+                };
+                let oracle_table =
+                    ComplexRotaryTable::new(&ctx, tokens, oracle_dim, &oracle_co).unwrap();
+                let mut tmp = ctx
+                    .allocate_output(Shape::new(vec![tokens, width]), dtype)
+                    .unwrap();
+                let mut expected = ctx
+                    .allocate_output(Shape::new(vec![tokens, oracle_heads, oracle_dim]), dtype)
+                    .unwrap();
+                let mut actual = ctx
+                    .allocate_output(Shape::new(vec![tokens, heads, dim]), dtype)
+                    .unwrap();
+                let oracle = |tmp: &mut Tensor, expected: &mut Tensor| {
+                    // Bind the input view to outlive the Args borrow.
+                    let flat = input.reshape(vec![tokens, width]).unwrap();
+                    let mut args = NormArgs::rms(&flat, &weight, tmp, 1e-6);
+                    args.numerics = NormNumerics::Staged;
+                    norm(&ctx, args).unwrap();
+                    complex_rotary(
+                        &ctx,
+                        &oracle_table,
+                        &tmp.reshape(vec![tokens, oracle_heads, oracle_dim]).unwrap(),
+                        expected,
+                    )
+                    .unwrap();
+                };
+                let run = |out: &mut Tensor| {
+                    rms_complex_rotary(
+                        &ctx,
+                        &table,
+                        RmsComplexRotaryArgs {
+                            input: &input,
+                            weight: &weight,
+                            output: out,
+                            eps: 1e-6,
+                            numerics: NormNumerics::Staged,
+                        },
+                    )
+                };
+                let bits = |x: &Tensor| {
+                    let host = transfers::to_cpu(x).unwrap();
+                    match dtype {
+                        DType::F16 => host
+                            .as_f16()
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect::<Vec<_>>(),
+                        DType::BF16 => host
+                            .as_bf16()
+                            .unwrap()
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect::<Vec<_>>(),
+                        _ => unreachable!(),
+                    }
+                };
+                oracle(&mut tmp, &mut expected);
+                run(&mut actual).unwrap();
+                ctx.synchronize().unwrap();
+                assert_eq!(
+                    bits(&actual),
+                    bits(&expected),
+                    "{dtype:?} {tokens}x{heads}x{dim}"
+                );
+                let mut inplace = input.clone();
+                run(&mut inplace).unwrap();
+                ctx.synchronize().unwrap();
+                assert_eq!(bits(&inplace), bits(&expected));
+                // Restore input before capture. Replay later changes input and weight.
+                let restored = if raw_bits {
+                    upload_bits(0)
+                } else {
+                    upload(vec![tokens, heads, dim], &raw)
+                };
+                transfers::copy_cuda_to_cuda(&ctx, &restored, &input).unwrap();
+                let graph = crate::capture(&ctx, || run(&mut actual)).unwrap();
+                let changed = if raw_bits {
+                    upload_bits(97)
+                } else {
+                    upload(
+                        vec![tokens, heads, dim],
+                        &raw.iter().map(|x| -x).collect::<Vec<_>>(),
+                    )
+                };
+                let changed_weight =
+                    upload(vec![width], &w.iter().map(|x| x * 0.5).collect::<Vec<_>>());
+                transfers::copy_cuda_to_cuda(&ctx, &changed, &input).unwrap();
+                transfers::copy_cuda_to_cuda(&ctx, &changed_weight, &weight).unwrap();
+                oracle(&mut tmp, &mut expected);
+                ctx.synchronize().unwrap();
+                let expected_bits = bits(&expected);
+                drop(table);
+                drop(oracle_table);
+                drop(input);
+                drop(weight);
+                drop(changed);
+                drop(changed_weight);
+                drop(restored);
+                drop(inplace);
+                for _ in 0..3 {
+                    graph.replay().unwrap();
+                    ctx.synchronize().unwrap();
+                    assert_eq!(bits(&actual), expected_bits);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rms_complex_rotary_validates_numerics_weight_and_aliases() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = upload(&ctx, &golden::VALUES, DType::BF16);
+    let table = ComplexRotaryTable::new(&ctx, 3, 8, &golden::COEFFICIENTS).unwrap();
+    let weight = transfers::to_cuda(
+        &Tensor::from_bf16(vec![16], &vec![half::bf16::ONE; 16]).unwrap(),
+        0,
+    )
+    .unwrap();
+    let mut output = ctx
+        .allocate_output(Shape::new(vec![3, 2, 8]), DType::BF16)
+        .unwrap();
+    for (eps, numerics) in [
+        (0., NormNumerics::Staged),
+        (-1., NormNumerics::Staged),
+        (f32::NAN, NormNumerics::Staged),
+        (1e-6, NormNumerics::Flexible),
+    ] {
+        assert!(rms_complex_rotary(
+            &ctx,
+            &table,
+            RmsComplexRotaryArgs {
+                input: &input,
+                weight: &weight,
+                output: &mut output,
+                eps,
+                numerics
+            }
+        )
+        .is_err());
+    }
+    let wrong = transfers::to_cuda(&Tensor::from_f32(vec![16], &[1.; 16]).unwrap(), 0).unwrap();
+    assert!(rms_complex_rotary(
+        &ctx,
+        &table,
+        RmsComplexRotaryArgs {
+            input: &input,
+            weight: &wrong,
+            output: &mut output,
+            eps: 1e-6,
+            numerics: NormNumerics::Staged
+        }
+    )
+    .is_err());
+    let backing = crate::CudaBuffer::from_tensor(&input).unwrap();
+    let alias_weight = backing
+        .view(0, 32)
+        .unwrap()
+        .as_tensor(Shape::new(vec![16]), DType::BF16)
+        .unwrap();
+    let mut alias_out = input.clone();
+    assert!(rms_complex_rotary(
+        &ctx,
+        &table,
+        RmsComplexRotaryArgs {
+            input: &input,
+            weight: &alias_weight,
+            output: &mut alias_out,
+            eps: 1e-6,
+            numerics: NormNumerics::Staged
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("overlaps weight"));
+    let bad_shape = weight.reshape(vec![1, 16]).unwrap();
+    assert!(rms_complex_rotary(
+        &ctx,
+        &table,
+        RmsComplexRotaryArgs {
+            input: &input,
+            weight: &bad_shape,
+            output: &mut output,
+            eps: 1e-6,
+            numerics: NormNumerics::Staged
+        }
+    )
+    .is_err());
+}

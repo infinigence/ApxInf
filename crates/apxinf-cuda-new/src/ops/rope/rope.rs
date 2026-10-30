@@ -120,6 +120,8 @@ pub(super) fn apply_tensor(
         .map(|buffer| buffer.ptr() as *const u32)
         .unwrap_or(std::ptr::null());
     let spec = abi::Spec {
+        norm_numerics: 0,
+        norm_weight_alignment: 0,
         version: abi::SPEC_VERSION,
         semantic: abi::SEMANTIC_APPLY,
         dtype: match input.dtype() {
@@ -157,6 +159,8 @@ pub(super) fn apply_tensor(
         cache_capacity: 0,
     };
     let bindings = abi::Bindings {
+        norm_weight: std::ptr::null(),
+        norm_eps: 0.,
         qkv: input_buffer.ptr(),
         bias: std::ptr::null(),
         q: output_buffer.ptr(),

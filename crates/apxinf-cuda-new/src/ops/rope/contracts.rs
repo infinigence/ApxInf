@@ -201,6 +201,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<Normali
     storage.push(v_buffer);
 
     let spec = abi::Spec {
+        norm_numerics: 0,
+        norm_weight_alignment: 0,
         version: abi::SPEC_VERSION,
         semantic: semantic.code(),
         dtype: dtype_code(dtype)?,
@@ -240,6 +242,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<Normali
     };
 
     let bindings = abi::Bindings {
+        norm_weight: std::ptr::null(),
+        norm_eps: 0.,
         qkv,
         bias,
         q,

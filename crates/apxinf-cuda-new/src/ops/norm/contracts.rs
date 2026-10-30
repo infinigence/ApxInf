@@ -100,7 +100,7 @@ pub enum NormNumerics {
 }
 
 impl NormNumerics {
-    fn code(self) -> u32 {
+    pub(in crate::ops) fn code(self) -> u32 {
         match self {
             Self::Flexible => 0,
             Self::StableDecode => 1,

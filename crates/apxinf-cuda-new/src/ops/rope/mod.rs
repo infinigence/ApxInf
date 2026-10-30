@@ -7,7 +7,7 @@ mod multimodal;
 mod partial;
 mod qkv;
 mod rope;
-pub use complex::{complex_rotary, ComplexRotaryTable};
+pub use complex::{complex_rotary, rms_complex_rotary, ComplexRotaryTable, RmsComplexRotaryArgs};
 
 pub use contracts::{RopeArgs, RopeSemantic};
 pub use decode::{

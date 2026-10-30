@@ -1,4 +1,5 @@
 #include "../../include/apxinf_cuda/rope.h"
+#include "../../include/apxinf_cuda/norm_types.h"
 #include "../../framework/runtime_internal.h"
 #include "../../kernels/custom/rope.cuh"
 #include "../../kernels/rope/multimodal.cuh"
@@ -94,6 +95,7 @@ bool applies_rope(uint32_t semantic) {
 
 bool valid_contract_fields(const apxinf_rope_spec_t& spec) {
   switch (spec.semantic) {
+    case APXINF_ROPE_SEMANTIC_RMS_COMPLEX_TABLE:
     case APXINF_ROPE_SEMANTIC_COMPLEX_TABLE:
       return spec.layout == APXINF_ROPE_LAYOUT_SINGLE_TENSOR && spec.cache_write == APXINF_ROPE_CACHE_WRITE_NONE && spec.rotation_source == APXINF_ROPE_ROTATION_PRECOMPUTED_TABLE && spec.rotary_convention == APXINF_ROPE_CONVENTION_NONE;
     case APXINF_ROPE_SEMANTIC_SPLIT_QKV_ROPE:
@@ -162,7 +164,7 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
        spec.semantic == APXINF_ROPE_SEMANTIC_APPLY &&
        spec.rotation_source == APXINF_ROPE_ROTATION_POSITION_OFFSET);
   if (spec.version != APXINF_ROPE_SPEC_VERSION ||
-      spec.semantic > APXINF_ROPE_SEMANTIC_COMPLEX_TABLE ||
+      spec.semantic > APXINF_ROPE_SEMANTIC_RMS_COMPLEX_TABLE ||
       !dtype_ok ||
       spec.has_bias > 1 || spec.tokens <= 0 || spec.tokens > INT32_MAX ||
       spec.q_heads == 0 || spec.kv_heads == 0 || spec.head_dim == 0 ||
@@ -181,6 +183,7 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
       spec.semantic != APXINF_ROPE_SEMANTIC_PARTIAL_MROPE &&
       spec.semantic != APXINF_ROPE_SEMANTIC_APPLY &&
       spec.semantic != APXINF_ROPE_SEMANTIC_COMPLEX_TABLE &&
+      spec.semantic != APXINF_ROPE_SEMANTIC_RMS_COMPLEX_TABLE &&
       static_cast<uint64_t>(spec.q_heads) + 2ull * spec.kv_heads > 65535) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid RoPE grid");
   }
@@ -190,7 +193,7 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "unrotated QKV split requires q_heads == kv_heads");
   }
-  if (spec.semantic == APXINF_ROPE_SEMANTIC_COMPLEX_TABLE && spec.q_heads > 65535) {
+  if ((spec.semantic == APXINF_ROPE_SEMANTIC_COMPLEX_TABLE || spec.semantic == APXINF_ROPE_SEMANTIC_RMS_COMPLEX_TABLE) && spec.q_heads > 65535) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid complex rotary grid");
   }
   if (spec.semantic == APXINF_ROPE_SEMANTIC_DECODE_QKV_CACHE &&
@@ -279,7 +282,18 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
 
 void validate_bindings(const apxinf_rope_spec_t& spec,
                        const apxinf_rope_bindings_t& bindings) {
-  if (spec.semantic == APXINF_ROPE_SEMANTIC_COMPLEX_TABLE) {
+  const bool rms = spec.semantic == APXINF_ROPE_SEMANTIC_RMS_COMPLEX_TABLE;
+  if (rms) {
+    if (spec.norm_numerics != APXINF_NORM_NUMERICS_STAGED || !valid_alignment(spec.norm_weight_alignment) ||
+        spec.norm_weight_alignment < 2 || spec.qkv_alignment < 2 || spec.q_alignment < 2 ||
+        !bindings.norm_weight || !(bindings.norm_eps > 0.f) || !std::isfinite(bindings.norm_eps) ||
+        reinterpret_cast<uintptr_t>(bindings.norm_weight) % spec.norm_weight_alignment) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid staged RMS rotary binding");
+    }
+  } else if (spec.norm_numerics || spec.norm_weight_alignment || bindings.norm_weight || bindings.norm_eps != 0.f) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "RoPE received unrelated normalization fields");
+  }
+  if (spec.semantic == APXINF_ROPE_SEMANTIC_COMPLEX_TABLE || rms) {
     if (!bindings.qkv || !bindings.q || !bindings.bias || bindings.k || bindings.v || bindings.key_input || bindings.value_input || bindings.position || bindings.rotation_table != bindings.bias || spec.has_bias != 1 || spec.q_heads != spec.kv_heads || spec.head_dim % 2) {
       throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid complex rotary binding");
     }
@@ -410,6 +424,23 @@ cudaError_t launch_split(const apxinf_rope_spec_t& spec,
   auto stream = static_cast<cudaStream_t>(bindings.stream);
 
   switch (spec.semantic) {
+    case APXINF_ROPE_SEMANTIC_RMS_COMPLEX_TABLE: {
+      const int cols = q_heads * head_dim;
+      const bool warp = tokens >= 16 && cols >= 128 && cols < 8192 && cols % 4 == 0;
+#define APXINF_RMS_ROTARY(W, C) kernels::rms_complex_table<T,W,C><<<tokens,W?128:256,0,stream>>>( \
+          static_cast<const T*>(bindings.qkv), static_cast<const T*>(bindings.norm_weight), \
+          static_cast<const double*>(bindings.bias), static_cast<T*>(bindings.q), \
+          q_heads,head_dim,bindings.norm_eps)
+      if (warp) {
+        if (head_dim == 128) { APXINF_RMS_ROTARY(true,true); }
+        else { APXINF_RMS_ROTARY(true,false); }
+      } else {
+        if (head_dim == 128) { APXINF_RMS_ROTARY(false,true); }
+        else { APXINF_RMS_ROTARY(false,false); }
+      }
+#undef APXINF_RMS_ROTARY
+      break;
+    }
     case APXINF_ROPE_SEMANTIC_COMPLEX_TABLE:
       if (head_dim == 128 && q_heads >= 4) {
         kernels::complex_table_certified_128<T>

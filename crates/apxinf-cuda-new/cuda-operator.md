@@ -439,3 +439,22 @@ decomposition, so candidate misses never escape to model code.
 The pre-existing BF16 SwiGLU, in-place addition, and rowwise E4M3 SwiGLU
 contracts retain their original defaults and arithmetic. The new scalar and
 broadcast operations extend this family without changing these encodings.
+
+
+<!-- l3-operator:rms_complex_rotary -->
+
+`rms_complex_rotary(ctx, table, RmsComplexRotaryArgs)` composes full-row RMS
+normalization over `[tokens, heads*head_dim]` with `complex_rotary` over the
+corresponding `[tokens, heads, head_dim]` view. It requires explicit
+`NormNumerics::Staged`: FP32 reduction and reciprocal square root, an input-dtype
+cast after normalization, then another input-dtype cast after multiplying by
+`weight[heads*head_dim]`. Epsilon is finite and positive; weight matches the
+F16/BF16 input dtype. The complex product retains the existing FP64 rounding
+contract. Every existing complex-table geometry has a baseline; medium rows
+reuse the staged warp reduction and head_dim 128 uses certified rotation.
+
+It supports exact input/output alias, rejects partial input/output overlap and
+all output/weight overlap, and retains weight, input/output and coefficient
+storage through capture/replay. It is stateless, with no workspace, tuning,
+persistent selection or preparation inside capture. Private RoPE ABI version 8
+adds explicit normalization fields; other semantics bind them to zero/null.

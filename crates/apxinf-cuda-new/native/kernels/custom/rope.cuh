@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "norm_reduction.cuh"
 
 namespace apxinf::rope::kernels {
 
@@ -260,26 +261,11 @@ __device__ inline float2 complex_product_bounds(float a, float lo, float hi) {
                 : make_float2(__fmul_rd(a, hi), __fmul_ru(a, lo));
 }
 
-// Launch 256 threads: four heads share the 64 coefficient pairs. This translation
-// unit is compiled with FTZ disabled so directed FP32 operations enclose subnormals.
-template <class T>
-__global__ void complex_table_certified_128(const T* input,
-                                           const double* coefficients,
-                                           T* output, int heads) {
-  __shared__ float4 bounds[64];
-  const int token = blockIdx.x, lane = threadIdx.x;
-  const int pair = lane % 64, head = blockIdx.y * 4 + lane / 64;
-  const int64_t coeff = static_cast<int64_t>(token) * 128 + 2 * pair;
-  if (lane < 64) {
-    const double c = coefficients[coeff], s = coefficients[coeff + 1];
-    bounds[pair] = make_float4(__double2float_rd(c), __double2float_ru(c),
-                              __double2float_rd(s), __double2float_ru(s));
-  }
-  __syncthreads();
-  if (head >= heads) return;
-  const int64_t offset = (static_cast<int64_t>(token) * heads + head) * 128 + 2 * pair;
-  const float a = to_float(input[offset]), b = to_float(input[offset + 1]);
-  const float4 cs = bounds[pair];
+template<class T> struct ComplexValue { T real, imag; };
+
+template<class T>
+__device__ __forceinline__ ComplexValue<T> certified_complex_value(
+    float a, float b, const double* coefficients, int64_t coeff, float4 cs) {
   const float2 ac = complex_product_bounds(a, cs.x, cs.y);
   const float2 bs = complex_product_bounds(b, cs.z, cs.w);
   const float2 as = complex_product_bounds(a, cs.z, cs.w);
@@ -302,8 +288,101 @@ __global__ void complex_table_certified_128(const T* input,
     real = from_double<T>(__dsub_rn(__dmul_rn(double(a), c), __dmul_rn(double(b), s)));
     imag = from_double<T>(__dadd_rn(__dmul_rn(double(a), s), __dmul_rn(double(b), c)));
   }
-  output[offset] = real;
-  output[offset + 1] = imag;
+  return {real, imag};
+}
+
+// Launch 256 threads: four heads share the 64 coefficient pairs. This translation
+// unit is compiled with FTZ disabled so directed FP32 operations enclose subnormals.
+template <class T>
+__global__ void complex_table_certified_128(const T* input,
+                                           const double* coefficients,
+                                           T* output, int heads) {
+  __shared__ float4 bounds[64];
+  const int token = blockIdx.x, lane = threadIdx.x;
+  const int pair = lane % 64, head = blockIdx.y * 4 + lane / 64;
+  const int64_t coeff = static_cast<int64_t>(token) * 128 + 2 * pair;
+  if (lane < 64) {
+    const double c = coefficients[coeff], s = coefficients[coeff + 1];
+    bounds[pair] = make_float4(__double2float_rd(c), __double2float_ru(c),
+                              __double2float_rd(s), __double2float_ru(s));
+  }
+  __syncthreads();
+  if (head >= heads) return;
+  const int64_t offset = (static_cast<int64_t>(token) * heads + head) * 128 + 2 * pair;
+  const float a = to_float(input[offset]), b = to_float(input[offset + 1]);
+  const float4 cs = bounds[pair];
+  const auto value = certified_complex_value<T>(a, b, coefficients, coeff, cs);
+  output[offset] = value.real;
+  output[offset + 1] = value.imag;
+}
+
+// Staged RMS over the complete flattened head row, then complex rotation.
+// The baseline covers every complex-table geometry. Warp reduction is chosen
+// with exactly the same structural predicate/tree as NormNumerics::Staged.
+// No input values are inspected for dispatch, and no workspace is allocated.
+template<class T, bool WarpReduction, bool CertifiedRotation>
+__global__ void rms_complex_table(const T* input, const T* weight,
+                                  const double* coefficients, T* output,
+                                  int heads, int head_dim, float eps) {
+  const int dim = CertifiedRotation ? 128 : head_dim;
+  __shared__ float scratch[32];
+  __shared__ float factor;
+  __shared__ float4 bounds[64];
+  const int token = blockIdx.x, thread = threadIdx.x, cols = heads*dim;
+  const int64_t base = static_cast<int64_t>(token)*cols;
+  if constexpr (WarpReduction) {
+    if (thread < 32) {
+      float sums[4] = {0.f,0.f,0.f,0.f};
+      for (int start=thread*4; start<cols; start+=128) {
+        #pragma unroll
+        for (int j=0; j<4; ++j) {
+          const float x=to_float(input[base+start+j]);
+          sums[j]=__fadd_rn(sums[j],__fmul_rn(x,x));
+        }
+      }
+      float sum=__fadd_rn(__fadd_rn(__fadd_rn(sums[0],sums[1]),sums[2]),sums[3]);
+      for (int offset=16; offset; offset/=2)
+        sum=__fadd_rn(sum,__shfl_down_sync(0xffffffff,sum,offset));
+      sum=__shfl_sync(0xffffffff,sum,0);
+      if (thread==0) factor=rsqrtf(__fadd_rn(__fmul_rn(sum,1.f/cols),eps));
+    }
+  } else {
+    float sum=0.f;
+    for (int64_t col=thread; col<cols; col+=blockDim.x) {
+      const float x=to_float(input[base+col]);
+      sum=__fadd_rn(sum,__fmul_rn(x,x));
+    }
+    const float square_sum=apxinf::norm::kernels::block_sum_parallel_unsafe(sum,scratch);
+    if (thread==0) factor=rsqrtf(square_sum/cols+eps);
+  }
+  if constexpr (CertifiedRotation) {
+    if (thread<64) {
+      const int64_t coeff=static_cast<int64_t>(token)*128+2*thread;
+      const double c=coefficients[coeff], sn=coefficients[coeff+1];
+      bounds[thread]=make_float4(__double2float_rd(c),__double2float_ru(c),
+                                __double2float_rd(sn),__double2float_ru(sn));
+    }
+  }
+  // Every input has contributed to the row reduction before any in-place store.
+  __syncthreads();
+  for (int64_t work=thread; work<cols/2; work+=blockDim.x) {
+    const int64_t off=base+2*work;
+    const int pair=work%(dim/2);
+    const int64_t coeff=static_cast<int64_t>(token)*dim+2*pair;
+    const float an=to_float(from_float<T>(__fmul_rn(to_float(input[off]),factor)));
+    const float bn=to_float(from_float<T>(__fmul_rn(to_float(input[off+1]),factor)));
+    const float a=to_float(from_float<T>(__fmul_rn(an,to_float(weight[2*work]))));
+    const float b=to_float(from_float<T>(__fmul_rn(bn,to_float(weight[2*work+1]))));
+    if constexpr (CertifiedRotation) {
+      const auto value=certified_complex_value<T>(a,b,coefficients,coeff,bounds[pair]);
+      output[off]=value.real;
+      output[off+1]=value.imag;
+    } else {
+      const double c=coefficients[coeff], sn=coefficients[coeff+1];
+      output[off]=from_double<T>(__dsub_rn(__dmul_rn(double(a),c),__dmul_rn(double(b),sn)));
+      output[off+1]=from_double<T>(__dadd_rn(__dmul_rn(double(a),sn),__dmul_rn(double(b),c)));
+    }
+  }
 }
 
 }  // namespace apxinf::rope::kernels

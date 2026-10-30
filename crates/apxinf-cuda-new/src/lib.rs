@@ -38,7 +38,7 @@ pub use ops::{
     NormKind, NormNumerics, PointwiseActivation, PointwiseArgs, PointwiseSemantic,
     QkvCacheRopeArgs, QuantOut, QuantizationArgs, QuantizationSemantic, ResidualAddArgs, RopeArgs,
     RopeSemantic, SegmentedAttentionArgs, VisionPositionArgs,
-    complex_rotary, ComplexRotaryTable, rounded_additive_attention, RoundedAttentionBiasArgs, permute, resize_bicubic, unfold3d, unfold3d_blocked, Unfold3dGeometry,
+    complex_rotary, ComplexRotaryTable, rms_complex_rotary, RmsComplexRotaryArgs, rounded_additive_attention, RoundedAttentionBiasArgs, permute, resize_bicubic, unfold3d, unfold3d_blocked, Unfold3dGeometry,
 };
 pub use phase::PreparedPhase;
 pub use stream::CudaStream;

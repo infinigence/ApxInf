@@ -119,10 +119,20 @@ that same plan if the old values must remain stable.
 Rust `prepare_for(real_request, policy)` supports `Eager`, `PreferGraph`, and
 `RequireGraph`. Spec-only preparation is rejected because the real montage,
 prompt and history are required. Implicit inference requires all three graphs:
-Vision (CLIP/temporal VAE), Language (both prompts/context projections), and
+Vision (CLIP/temporal VAE), Language (both prompts, context projections and
+per-layer text/image cross-attention K/V), and
 Action (observed K/V computation plus joint denoising). A compatible prepared
 run rebinds stable inputs and executes without capture or autotuning. The
 implicit cache holds one profile; switching profiles replaces it.
+Language recomputes both CFG branches' cross-attention K/V on every request.
+Each layer retains its own four BF16 tensors; observed and denoising evaluations
+only read them. Raw key-projection scratch is shared across layers within each
+branch. Biased projections and staged RMS normalization include all padded text
+rows. These tensors belong to the prepared workspace and are independent of
+committed video history. Relative to recomputing K/V in each block evaluation,
+this adds 1,228,431,360 bytes of tensor storage for the fixed 40-layer profile;
+provider execution resources are additional.
+
 Streaming observations advance the history length and therefore require a new
 profile until window rollover. Preparation recomputes the three stages, and a
 successful call copies committed K/V into independent device storage. A warm
@@ -132,20 +142,18 @@ single-observation replay measurement does not represent streaming latency.
 are immutable for a loaded runner. Construct a new runner to select another
 store/configuration; legacy tuning JSON is not interpreted as native recipes.
 
-DreamZero selects the backend's `ColdBaseline` GEMM algorithm policy. All
-projections use the first successfully prepared cold-fallback algorithm within
-their declared workspace and precision constraints. Online tuning performs real
-timing and capture validation of that one eligible algorithm; it cannot trade
-reduction order for speed. Other families retain unrestricted selection by
-default. Recipe/session keys distinguish these domains. This contract is scoped
-to the qualified device, library and build; it is not a cross-hardware arithmetic
-guarantee. Attention continues to use its existing candidate domain.
+DreamZero keeps `ColdBaseline` GEMM selection for encoder, context-embedding,
+timestep and output-head projections. Bulk DiT block projections, including
+per-layer cross-attention K/V produced by Language, use `Any` within the same
+BF16 staged-bias, deterministic and 1 MiB workspace constraints. Online tuning
+runs during preparation; replay retains the selected executions. Recipe/session
+keys distinguish these domains. This contract is scoped to the qualified device,
+library and build; it is not a cross-hardware arithmetic guarantee. Attention
+continues to use its existing candidate domain.
 
-Unrestricted GEMM tuning failed full-trajectory action/video gates despite
-zero-error isolated component captures. A controlled replay reproduced the error
-with the original recipes and restored zero-error action/video outputs by replacing
-only GEMM choices with measured cold-baseline choices. Unrestricted tuning is
-therefore not an admitted DreamZero numerical profile. The constrained policy is qualified below for the pinned device and build.
+Unrestricted tuning across all GEMMs failed full-trajectory action/video gates
+despite zero-error isolated component captures. The bulk-block-only relaxation
+was subsequently qualified separately, as recorded in the performance section.
 
 ## Qualified device profile
 
@@ -203,23 +211,30 @@ inference with 16 evaluations per CFG branch. Its full real-checkpoint test
 passes all 14 scenarios and 28 action/video metrics with relative L2, RMSE and
 max-absolute error zero, using the maintained gates directly. History rollover,
 request rebinding, graph ownership, RNG and failed-call rollback checks pass.
-The CUDA backend suite passes 163 tests (2 ignored; the unchanged long
+The CUDA backend suite passes 165 tests (2 ignored; the unchanged long
 convolution-candidate test is filtered); all 9 family contract tests pass.
 These are results for the frozen performance build, rather than a new run of
 the historical 122 component checkpoints above.
 
 The changes use exact indexed/vector transport for unfold and pointwise, plus
 certified FP32 intervals with the original FP64 fallback for complex rotation.
+Staged RMS and complex RoPE are fused for self-attention Q/K, retaining both
+normalization casts and the FP64 fallback. Language computes all layers' text/image
+K/V once per request; observed and denoising blocks reuse those exact tensors.
+A same-profile public/canonical input rebind matches an independent capture with
+zero action error, then restores the original public output exactly. CUDA capture
+counts remain 3 before rebind, after changed input and after restoration.
 Bulk DiT block projections may tune within deterministic `StagedBias` and the
 1 MiB workspace limit. Encoders, context/timestep projections and output heads
 retain `ColdBaseline`. Algorithm selection is qualified for the recorded Thor,
 CUDA and library build; deterministic execution alone does not promise identical
 arithmetic across every future library tactic.
 
-A fresh process restores the optimized public profile without online tuning:
-47 disk-recipe and 1,431 memory-recipe preparation summaries are recorded, and
-public outputs remain exact. Its full-process CUDA/NVTX trace passes the same
-strict process, event-loss, transfer and three-graph audit described below.
+The preceding performance build (`b2179f9`) also has an accepted fresh-process
+CUDA/NVTX trace: 47 disk-recipe and 1,431 memory-recipe preparation summaries,
+exact public outputs, and the strict process, event-loss, transfer and three-graph
+audit described below. Those trace counts describe that build, not the subsequent
+RMS/RoPE and request-context K/V revision.
 
 ## Measured performance and residency
 
@@ -239,6 +254,23 @@ leading-batch noise checks. GPU frequency samples inside the measured calls are
 1,575 MHz for both paths. Default memory DVFS is retained: baseline EMC samples
 range from 3.2 to 4.266 GHz; optimized samples stay at 4.266 GHz. These are stock
 MAXN end-to-end results, rather than an experiment that locks both memory clocks.
+
+A second matched A→B→B→A experiment compares the published performance build
+(`b2179f9`) with the RMS/RoPE fusion and per-request K/V revision. Both use frozen
+extensions and qualified recipes, the same public-input script and no online
+tuning; each variant has two fresh processes and six warm samples.
+
+| Path | Warm median | Warm p95 | Warm samples |
+| --- | ---: | ---: | ---: |
+| Published performance build (`b2179f9`) | 25.085 | 25.181 | 6 |
+| RMS/RoPE fusion + per-request cross-attention K/V | 22.650 | 22.714 | 6 |
+
+This matched improvement is 1.108×, or 9.7% less latency. All normalized and robot
+output errors are zero, with exact repeated replay and leading-batch noise
+checks. During measured windows, all GPU frequency samples are 1,575 MHz and all
+EMC samples are 4.266 GHz for both variants; clocks were not reconfigured. The
+old 47.541→24.975 s comparison and this 25.085→22.650 s comparison are separate
+experiments and should not be combined into a new matched-baseline speedup.
 
 Earlier pre-performance runs measured 47.617 s cold and 47.756 s restored public
 medians (5 samples each). The historical official preprocessed BF16-head median

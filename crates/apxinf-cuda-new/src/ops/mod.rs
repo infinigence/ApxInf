@@ -80,7 +80,7 @@ pub use quantization::{
 };
 pub use rope::apply_vision_2d as rope_apply_vision_2d;
 pub use rope::{
-    complex_rotary, decode_rope, decode_rotation, execute_batched as rope_apply_batched,
+    complex_rotary, rms_complex_rotary, RmsComplexRotaryArgs, decode_rope, decode_rotation, execute_batched as rope_apply_batched,
     execute_mrope as rope_apply_mrope, multimodal_rope, partial_rope, rope, rotary_dim,
     split_grouped_qkv, split_qkv_axial_rope, split_qkv_cache, split_qkv_mrope_cache, AxialRopeArgs,
     AxialRopeNumerics, ComplexRotaryTable, DecodeRopeArgs, DecodeRotationArgs,

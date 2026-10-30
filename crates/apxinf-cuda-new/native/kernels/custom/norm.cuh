@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include "norm_reduction.cuh"
 
 namespace apxinf::norm::kernels {
 
@@ -36,32 +37,7 @@ __device__ inline __nv_bfloat16 from_float(float value) {
 template <> __device__ inline float to_float(float value) { return value; }
 template <> __device__ inline float from_float(float value) { return value; }
 
-__device__ __forceinline__ float warp_sum(float value) {
-  for (int offset = 16; offset > 0; offset >>= 1)
-    value += __shfl_down_sync(0xffffffff, value, offset);
-  return value;
-}
 
-// One block per row; `scratch` must hold blockDim.x / 32 floats. The final
-// barrier publishes scratch[0], but does not protect the reads that follow it.
-// Callers must consume the result and synchronize all block threads before
-// reusing the same scratch storage.
-__device__ __forceinline__ float block_sum_parallel_unsafe(float value,
-                                                            float* scratch) {
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int warps = blockDim.x >> 5;
-  value = warp_sum(value);
-  if (lane == 0) scratch[warp] = value;
-  __syncthreads();
-  if (warp == 0) {
-    value = lane < warps ? scratch[lane] : 0.0f;
-    value = warp_sum(value);
-    if (lane == 0) scratch[0] = value;
-  }
-  __syncthreads();
-  return scratch[0];
-}
 
 // Every kernel below takes (rows, cols) in that order.  The legacy backend
 // carries two same-named overloads that differ only by `int` versus

@@ -170,6 +170,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
     let position = args.position.ptr().cast_const().cast::<u32>();
 
     let spec = abi::Spec {
+        norm_numerics: 0,
+        norm_weight_alignment: 0,
         version: abi::SPEC_VERSION,
         semantic: 2,
         dtype: 2,
@@ -194,6 +196,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
         cache_capacity: cache_capacity as i64,
     };
     let bindings = abi::Bindings {
+        norm_weight: std::ptr::null(),
+        norm_eps: 0.,
         qkv: q.ptr(),
         bias: std::ptr::null(),
         q: q_out.ptr(),

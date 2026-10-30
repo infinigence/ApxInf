@@ -4,10 +4,11 @@ pub(crate) use super::types::CudaStream;
 use super::types::Runtime;
 use crate::ffi::raw::cuda_runtime::{cudaError_t, cudaStream_t};
 
-pub(crate) const SPEC_VERSION: u32 = 7;
+pub(crate) const SPEC_VERSION: u32 = 8;
 
 pub(crate) const SEMANTIC_SPLIT_QKV_MROPE_CACHE: u32 = 6;
 pub(crate) const SEMANTIC_APPLY: u32 = 7;
+pub(crate) const SEMANTIC_RMS_COMPLEX_TABLE: u32 = 9;
 
 pub(crate) const LAYOUT_PACKED_QKV: u32 = 0;
 pub(crate) const LAYOUT_SEPARATE_QKV: u32 = 1;
@@ -56,6 +57,8 @@ pub(crate) struct Spec {
     pub rotation_alignment: u32,
     pub tokens: i64,
     pub cache_capacity: i64,
+    pub norm_numerics: u32,
+    pub norm_weight_alignment: u32,
 }
 
 #[repr(C)]
@@ -74,6 +77,8 @@ pub(crate) struct Bindings {
     pub theta: f32,
     pub position_offset: i32,
     pub kv_output_offset: i32,
+    pub norm_weight: *const c_void,
+    pub norm_eps: f32,
 }
 
 unsafe extern "C" {
