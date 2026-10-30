@@ -177,16 +177,12 @@ mod ops {
             let bias = upload_values(vec![1], &[-1.]);
             let policy = ops::GemmPolicy::default();
             // 1 + 2^-8 is the BF16 halfway point: convolution rounds it to 1
-            // before cancellation, matching the baseline GemmBias path.
+            // before cancellation. Flexible GEMM epilogues may fuse bias, so
+            // this contract belongs to the convolution composition.
             let conv = convolution_projection(&ctx, &input, &weight, Some(&bias), &policy).unwrap();
-            let linear = linear(&ctx, &input, &weight, Some(&bias), &policy).unwrap();
             ctx.synchronize().unwrap();
             assert_eq!(
                 transfers::to_cpu(&conv).unwrap().to_f32_vec().unwrap(),
-                vec![0.]
-            );
-            assert_eq!(
-                transfers::to_cpu(&linear).unwrap().to_f32_vec().unwrap(),
                 vec![0.]
             );
         }

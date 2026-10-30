@@ -125,6 +125,10 @@ pub fn pairwise_rope(ctx: &CudaContext, args: PairwiseRopeArgs<'_>) -> Result<()
             ctx.stream().handle() as _,
         ))?;
     }
-    crate::workspace::retain_resource(&std::rc::Rc::new((input, output, table.storage.clone())));
+    crate::workspace::retain_resource(&std::rc::Rc::new((
+        input.retained_for_execution(),
+        output.retained_for_execution(),
+        table.storage.retained_for_execution(),
+    )));
     Ok(())
 }

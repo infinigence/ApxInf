@@ -279,7 +279,9 @@ cudaError_t launch(const apxinf_pointwise_spec_t& spec,
     case APXINF_POINTWISE_SEMANTIC_MULTIPLY:
     case APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY:
       kernels::binary<T><<<grid, kDirectThreads, 0, stream>>>(
-          input, secondary, output, count, cols, spec.semantic, bindings.dt);
+          input, secondary, output, count, cols,
+          spec.semantic == APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY,
+          spec.semantic == APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY);
       break;
     default:
       return cudaErrorInvalidValue;

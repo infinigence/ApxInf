@@ -109,14 +109,14 @@ __global__ void euler_update(const T* state, const T* velocity, T* output,
   }
 }
 
-// Elementwise and broadcast binary operations; semantics 5 and 6 are reserved.
+// Elementwise and broadcast multiplication; ABI semantics stay in the adapter.
 template <class T>
 __global__ void binary(const T* input, const T* secondary, T* output,
-                               int64_t count, int cols, int semantic, float dt) {
+                               int64_t count, int cols, bool broadcast_columns, bool broadcast_rows) {
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < count; i += static_cast<int64_t>(blockDim.x) * gridDim.x) {
     const float x = to_float(input[i]);
-    const float y = to_float(secondary[(semantic == 4) ? i % cols : semantic == 8 ? i / cols : i]);
+    const float y = to_float(secondary[broadcast_columns ? i % cols : broadcast_rows ? i / cols : i]);
     output[i] = from_float<T>(x * y);
   }
 }

@@ -442,3 +442,54 @@ native VAE/text/action pipeline, not only substituted embeddings. The extension
 SHA-256 is `043fe0d3f1c3126969aba5dea48d3c185fa52de949c4498477d5577223991455`.
 These ten successful episodes do not establish statistical equivalence or replace
 the full multi-suite evaluation.
+
+### Main integration and remaining text drift (2026-10-30)
+
+The integration with main `4de8f5cc` uses unified `NormArgs`, attention input-layout
+contracts and the current workspace lifetime rules. Merge regressions were found
+by GPU tests and repaired: broadcast multiplication used an obsolete semantic
+number; F32 LayerNorm lost its overlap rejection; image/pairwise graph retention
+pinned temporary workspace leases only during capture. These fixes do not change
+baseline operator arithmetic or the workspace allocator. A two-allocation
+prepare/capture regression fails before the retention fix and passes afterwards.
+
+Thor regression passes 144 backend tests, seven public integration tests,
+convolution and VAE checkpoint/capture checks, and all twelve native frozen cases
+with whole-model graph/lifetime checks. The backend count includes the new workspace regression.
+The standalone text gate still fails at relative-L2 0.0314636, cosine 0.999507 and
+maximum absolute error 0.0703125; its 0.01 threshold is unchanged. All eleven text
+fixtures are bit-identical to the pre-merge precision revision. Canonical text
+also matches all 338 captured stages and repeats exactly after ten other prompts.
+The previous full-native LIBERO pilot is historical evidence; it has not been
+rerun with this merge.
+
+An independent reference with only GELU changed to F32 arithmetic isolates the
+first remaining canonical divergence to zero-based layer 9 FFN RMSNorm: 16 of
+524288 values differ. For task 3, the first divergence is layer 1 attention
+RMSNorm: 31 values differ. Same-input task-3 replay checks 339 boundaries; 307 are
+exact, and nonzero differences occur only in RMSNorm and attention. Final task-3
+text relative-L2 is 0.146971 and cosine 0.989151, so canonical accuracy alone is
+not representative of every prompt.
+
+Both first RMS divergences were minimized to one 4096-element row. Independent
+CPU F32 reduction trees reproduce the native sums exactly; changing only the
+inverse RMS to the reference value reproduces the reference row. The actual
+kernel reproduces the captured row over 100 repetitions, with zero memcheck
+errors and racecheck hazards. Canonical native/reference inverse RMS differs by
+one F32 ULP; task 3 also differs by one ULP. Direct nearest-even BF16 rounding of independent FP64 arithmetic agrees with
+the native output on both rows. PyTorch FP64-to-BF16 conversion can round through
+F32, so it is not used as the direct-rounding oracle. These
+observations support reduction-order and BF16-boundary amplification, rather
+than a missing term, indexing error or race in these minimized cases. They do not
+establish that matching the reference's reduction order improves mathematical
+accuracy or downstream quality. No global operator replacement or tolerance
+relaxation is justified by this evidence.
+
+For task 3's largest local attention difference (layer 14, relative-L2 0.000356659
+against direct-rounding FP64), a standalone cuBLAS QK → production softmax →
+cuBLAS PV chain is bit-identical to the model's captured output and passes
+memcheck. Separate boundary comparisons find 16 QK values, six softmax
+probabilities, and seven PV values differing from same-input FP64 with direct
+BF16 rounding. This localizes the observed discrepancy to arithmetic and rounding
+inside the individual operations, rather than model layout, masking or reuse.
+All 266 same-input projection/GELU/embedding/residual/multiply/mask checks are exact.

@@ -123,7 +123,10 @@ pub fn image_rgb_indices(
             &bindings,
         ))?;
     }
-    crate::workspace::retain_resource(&std::rc::Rc::new((images.clone(), ob)));
+    crate::workspace::retain_resource(&std::rc::Rc::new((
+        images.retained_for_execution(),
+        ob.retained_for_execution(),
+    )));
     Ok(())
 }
 fn geometry(input: &Tensor, height: usize, width: usize) -> Result<(usize, abi::Spec)> {
@@ -225,7 +228,13 @@ fn execute(
     unsafe {
         status::check(abi::apxinf_image_launch(ctx.runtime(), &s, &bindings))?;
     }
-    crate::workspace::retain_resource(&std::rc::Rc::new((ib, ob, pb, p2b)));
+    // Keep the allocation alive without extending workspace tensor liveness.
+    crate::workspace::retain_resource(&std::rc::Rc::new((
+        ib.retained_for_execution(),
+        ob.retained_for_execution(),
+        pb.as_ref().map(CudaBuffer::retained_for_execution),
+        p2b.as_ref().map(CudaBuffer::retained_for_execution),
+    )));
     Ok(())
 }
 
@@ -587,6 +596,48 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn image_and_pairwise_capture_preserve_workspace_reuse() {
+        use crate::ops::{pairwise_rope, PairwiseRopeArgs, PairwiseRopeTable};
+        let ctx = CudaContext::new_with_autotune(0, false).unwrap();
+        let x = upload(&ctx, vec![1, 4], &[1., 2., 3., 4.], DType::BF16);
+        let table = PairwiseRopeTable::new(&ctx, 1, 4, &[(1., 0.), (1., 0.)]).unwrap();
+        for use_rope in [false, true] {
+            let mut addresses = Vec::new();
+            let phase = crate::PreparedPhase::prepare_and_capture(
+                &ctx,
+                crate::ExecutionSession::with_capacity(512, ctx.device_id()).unwrap(),
+                || {
+                    for _ in 0..2 {
+                        let mut out = ctx.allocate_output(x.shape().clone(), DType::BF16)?;
+                        addresses.push(CudaBuffer::from_tensor(&out).unwrap().ptr() as usize);
+                        if use_rope {
+                            pairwise_rope(
+                                &ctx,
+                                PairwiseRopeArgs {
+                                    input: &x,
+                                    table: &table,
+                                    output: &mut out,
+                                    heads: 1,
+                                },
+                            )?;
+                        } else {
+                            image_im2col(&ctx, &x, &mut out, 1, 1, 1, 1, 0, 1, 1)?;
+                        }
+                        // The tensor lease ends here in BOTH traversals. Graph
+                        // retention must keep the arena, not pin this slice.
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(addresses.len(), 4);
+            assert!(addresses.iter().all(|&p| p == addresses[0]), "{addresses:?}");
+            phase.replay().unwrap();
+            ctx.synchronize().unwrap();
         }
     }
 

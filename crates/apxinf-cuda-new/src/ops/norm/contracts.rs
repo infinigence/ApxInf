@@ -675,6 +675,31 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         "normalized",
         &mut storage,
     )?;
+    if plain_f32_layer {
+        let output_start = normalized as usize;
+        let output_end = output_start
+            .checked_add(
+                count
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid("LayerNorm size overflow"))?,
+            )
+            .ok_or_else(|| invalid("LayerNorm address overflow"))?;
+        for (pointer, elements) in [(input_pointer, count), (weight, cols), (norm_bias, cols)] {
+            let start = pointer as usize;
+            let end = start
+                .checked_add(
+                    elements
+                        .checked_mul(4)
+                        .ok_or_else(|| invalid("LayerNorm size overflow"))?,
+                )
+                .ok_or_else(|| invalid("LayerNorm address overflow"))?;
+            if start < output_end && output_start < end {
+                return Err(invalid(
+                    "F32 LayerNorm output overlaps an input, weight or bias",
+                ));
+            }
+        }
+    }
     let (quantized, quantized_alignment) = bind_output(
         args.quantized_output,
         args.quantization != Quantization::None,
