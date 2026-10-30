@@ -528,11 +528,13 @@ projections explicitly select `Any` while preserving `StagedBias`, determinism
 and the 1 MiB bound; a workspace limit alone does not specify a reduction order.
 
 Initial vision binds one real RGB montage followed by 32 zero frames. The
-model reuses the identical temporal suffix within the first two high-resolution
-VAE residual blocks: it computes the transient and one complete steady frame,
+model reuses the identical temporal suffix in the first two VAE resolutions and
+the intervening spatial-only downsampling. It computes the transient and one
+complete steady frame,
 then fills repeated output frames with nonoverlapping device copies. Retained
 convolution tiles keep their original GEMM row count, including the final
-partial tile. Normalization and later VAE stages keep their full execution;
+partial tile. Reuse ends before temporal downsampling. Normalization and later
+VAE stages keep their full execution;
 all nine initial latent frames remain available to conditioning. History and
 general 1/9/33-frame encoding use the ordinary full path. No activation is
 reused across requests.

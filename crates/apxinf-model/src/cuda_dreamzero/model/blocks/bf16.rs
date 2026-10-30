@@ -1916,9 +1916,9 @@ mod vae {
         let mut current = s.slot(0, &shape)?;
         convolution(ctx, p, s, &s.input, &w.input, geometry(&w.input), &current)?;
         // The initial request binds a real first frame followed by 32 zeros.
-        // The native causal stem has a three-frame transient. Only the first
-        // two high-resolution residual blocks retain a reusable suffix;
-        // subsequent stages execute every convolution tile.
+        // The native causal stem has a three-frame transient. A spatial-only
+        // downsample preserves the steady temporal suffix. Stop specializing
+        // before temporal downsampling; later stages execute every tile.
         let mut steady = initial_zero_suffix.then_some(3);
         let mut index = 0;
         for layer in &w.down {
@@ -1933,7 +1933,11 @@ mod vae {
                     current = out;
                 }
                 Down::Spatial { conv, temporal } => {
-                    steady = None;
+                    // No temporal mixing occurs at the first spatial downsample.
+                    // Keep its suffix through the following residual blocks.
+                    if temporal.is_some() {
+                        steady = None;
+                    }
                     shape[2] /= 2;
                     shape[3] /= 2;
                     let out = s.slot(next_index, &shape)?;
@@ -1944,7 +1948,7 @@ mod vae {
                         padding_before: [0; 3],
                         padding_after: [0, 1, 1],
                     };
-                    convolution(ctx, p, s, &current, conv, g, &out)?;
+                    convolution_prefix(ctx, p, s, &current, conv, g, &out, steady)?;
                     if let Some(time) = temporal {
                         let target_shape =
                             [1, (shape[1] - 1) / 2 + 1, shape[2], shape[3], shape[4]];
