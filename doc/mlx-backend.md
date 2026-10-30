@@ -130,6 +130,88 @@ Use `--keep-special-tokens` when special-token text carries application meaning;
 chat options containing `tools` enable this behavior automatically. MiniCPM's
 `<function>`/`<param>` tags must survive decoding for valid tool XML.
 
+### Implemented image selection
+
+[`metal_qwen_image`](../crates/apxinf-model/src/metal_qwen_image/README.md)
+runs Qwen-Image-2.1 text-to-image from the mflux 4-bit
+export (affine Q4 DiT, BF16 text encoder, F32 VAE decoder) and follows the
+mflux f0bf9cf0 txt2img path with `--low-ram`. The export has no top-level
+`config.json`; detection reads the transformer index. The family admits 40
+linear steps at guidance 1, batch 1, and positive sides that are multiples of
+16 up to 32768, with at most 174762 image tokens. The family README derives
+this execution bound; it is not a memory-capacity guarantee. The family
+returns RGB8 through `ImageRuntime`; the CLI writes binary PPM, so no image
+codec dependency is added.
+
+- Loading reads the tokenizer, checks every text-encoder tensor header, and
+  loads the DiT and VAE decoder with complete key, shape and dtype checks.
+- A request reads the text encoder one layer at a time and frees each layer.
+  The DiT computes the text-prefix K/V once and then runs one compiled image
+  forward per step. On `applegpu_g16g` (M4), the architecture where it was
+  measured faster, the default `auto` variant uses the MPP GEMM for image
+  projections of at least 1024 aligned tokens after a load-time probe of the
+  three projection shapes at 1024 rows. Matching that probe does not qualify
+  all weights, shapes or image outputs. Other architectures use quantized matmul.
+  `model_variant=reference` skips MPP and uses quantized matmul for all Q4
+  projections, without changing the scheduler or other execution paths. The DiT
+  is released before the tiled VAE decode (512 px tiles, 128 px overlap) and
+  read again by the next request, as `--low-ram` does.
+- The pure image-forward callable prepares the request's exact first-step
+  inputs twice and supplies its second output to the first solver update.
+  Later steps execute once each; all 40 original BF16 updates are unchanged.
+  This is request-local velocity compilation, not a compiled scheduler or
+  rollout. Local activations are prepared separately. VAE overlap accumulation,
+  normalization and final channel rounding use safe device arrays; the final
+  download contains completed integer channels for RGB8 serialization.
+- The checkpoint weights are under the Qwen Research License, which permits
+  non-commercial use only. APXinf ships no weights.
+
+```sh
+cargo run --features mlx -- generate-image --model /path/to/Qwen-Image-2.1-MLX-4bit \
+  --width 1024 --height 576 --seed 42 --prompt 'A lighthouse at dusk' \
+  --output lighthouse.ppm
+```
+
+Add `--model-variant reference` to select the quantized-matmul reference path.
+Omitting it or using `--model-variant auto` preserves the optimization target.
+
+### Implemented speech selection
+
+[`metal_qwen3_tts`](../crates/apxinf-model/src/metal_qwen3_tts/README.md) runs
+Qwen3-TTS-12Hz-1.7B-CustomVoice through `SpeechRuntime`: batch one,
+non-streaming, the checkpoint's voices and languages, an optional style
+instruction and a seed. AutoModel detects it from `model_type` `qwen3_tts`.
+It follows the EngineTailor MLX parity path (mlx-audio 70f4add with reference
+cast seams) operation by operation, so a seed reproduces that path's codes and
+waveform. The CLI `speak` command writes 32-bit float WAV. The default
+`auto` variant runs the code predictor MLPs on the EngineTailor `SwigluMlpGemv`
+kernels only on the measured `applegpu_g16g` architecture. Other architectures
+keep the composed reference until their numerical and timing gates pass.
+`--model-variant reference` keeps the composed parity SwiGLU on every device.
+
+- Sampling depends on the pinned MLX version: MLX 0.32.3 samples one row of
+  logits by inverse CDF, where 0.31.2 used Gumbel-max.
+- The [family-scoped EOS decision](../crates/apxinf-model/src/metal_qwen3_tts/README.md#scoped-eos-control-boundary)
+  permits only a stopping Boolean on host. First-code ids and repetition
+  membership remain device arrays. Top-k/categorical vocabulary profiles and
+  local GELU/RoPE prepare explicitly; request-length RoPE prepares before the
+  Talker. The selected predictor fusion evaluates each retained layer on
+  materialized one/two-row scratch inputs at load. The decoder prepares the
+  exact GELU profiles derived from its actual chunk lengths and loaded widths
+  before waveform execution. This is local compilation, not a prepared full
+  speech loop, and does not establish numerical, resource, native-JIT or
+  performance qualification. Warm calls remain in complete load/request timing.
+- As in mlx-audio, the waveform decoder's transformer uses a full causal mask;
+  the checkpoint's `sliding_window` of 72 frames is not applied.
+- The checkpoint ships no `tokenizer.json`; the family builds the tokenizer
+  from `vocab.json` and `merges.txt` as Transformers 5 does.
+
+```sh
+cargo run --features mlx -- speak --model /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --voice Vivian --language English --seed 46 \
+  --text 'Hello, could you close the window for me? Thank you.' --output hello.wav
+```
+
 ## Native dependency and ABI
 
 The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.
@@ -172,6 +254,27 @@ Repeated execution uses prepared block/step closures, avoiding per-token
 Rust-to-Python or subprocess calls. Custom Metal kernels are registered once
 during preparation and invoked through the same safe operator boundary.
 
+## Device architecture and kernel policy
+
+Apple GPUs differ in generation, core count and memory bandwidth, so the fastest
+launch geometry or implementation can differ between them, as it does between
+CUDA architecture families. `MetalDeviceCaps`, reached through
+`Stream::metal_caps()`, holds the MLX architecture string and its parsed
+generation and device class. It contains no policy.
+
+A policy that reads these facts lives beside its kernel in `apxinf-mlx`, as
+CUDA launch policies live beside their kernels. A model family branches on
+architecture only for a structural choice, such as which device runs a stage,
+and states the reason. Each architecture's values come from measurement on a
+device of that architecture, recorded with the policy. An unrecognized or
+unmeasured architecture keeps the existing default.
+
+A choice that keeps each output's reduction order and rounding, such as output
+tiling, threadgroup shape or independent column splits, needs the paired timing
+gate on that architecture. A choice that changes reduction order or rounding
+also needs the family's numerical qualification on that architecture. Stock MLX
+output already differs between devices, so references are recorded per device.
+
 ## Tensor ownership and model-specific numerical semantics
 
 `Device::Metal(usize)` is the distinct Metal device identity. Physical device identity and backend
@@ -202,6 +305,17 @@ normalization rounding, attention masking, weight packing and fused selection.
 For example, cast-before-affine and cast-after-affine norms cannot share a fused
 candidate just because both are called RMSNorm. The compatibility adapter's
 existing Backend methods do not define the native models' layer arithmetic.
+
+MLX-format affine checkpoints store packed weights as U32, which core `DType`
+does not represent. Load them with `apxinf_mlx::load_safetensors` over
+`apxinf_loader::safetensors::safetensors_files`, not through `Tensor`, and
+keep only the keys the family uses. The family owns the key map, group size,
+bit width and every shape check.
+
+This native loader depends on the pinned MLX 0.32.3 SDK upgrade, including its
+lazy payload-read error propagation. Matching function signatures in 0.31.2
+do not establish that guarantee. Native CPU regression tests cover failure
+after header validation, before payload evaluation completes.
 
 Keep structural checks at preparation where possible, preserve safe operand and
 resource checks at invocation, and compare the actual compiled/fused path with
@@ -333,7 +447,7 @@ and avoid per-layer host synchronization introduced only for measurement.
 | Prepared execution | No hot retrace/tune; input rebinding; eager/compiled parity; shape invalidation and bounded memory |
 | Model | Exact checkpoint load, important intermediate tensors, full real-input gate and state regressions |
 | Public path | Registry/CLI or existing binding invocation, real decoded outputs and supported options |
-| Performance | Raw paired samples and exact source/environment binding; no cross-run speedup arithmetic |
+| Performance | Raw paired samples and exact source/environment binding, including the Metal architecture string; no cross-run speedup arithmetic |
 
 Temporary references, captures and reports stay in ignored `devlocal/` per
 [AGENTS.md](../AGENTS.md). Product code, focused maintained tests, capability

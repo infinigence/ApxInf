@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
-    AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, LlmInput,
-    LoadOptions, SamplingMode,
+    AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, ImageRequest,
+    LlmInput, LoadOptions, SamplingMode, SpeechRequest,
 };
 use apxinf_tokenizer::{ChatMessage, Tokenizer};
 use clap::{Parser, Subcommand};
@@ -159,6 +159,92 @@ enum Commands {
         tuning_dir: Option<PathBuf>,
     },
 
+    /// Generate an image from a text prompt and write it as binary PPM
+    GenerateImage {
+        /// Path to the image model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Explicit registry family
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Family execution variant (Qwen-Image: auto or reference)
+        #[arg(long)]
+        model_variant: Option<String>,
+
+        /// Text prompt
+        #[arg(short, long)]
+        prompt: String,
+
+        /// Image width in pixels
+        #[arg(long, default_value_t = 1024)]
+        width: usize,
+
+        /// Image height in pixels
+        #[arg(long, default_value_t = 1024)]
+        height: usize,
+
+        /// Noise seed
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Denoising steps; families reject counts they do not support
+        #[arg(long, default_value_t = 40)]
+        steps: usize,
+
+        /// Output file (binary PPM, P6)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Device to run inference on (metal[:N])
+        #[arg(short, long, default_value = "metal")]
+        device: String,
+    },
+
+    /// Synthesize speech from text and write it as 32-bit float WAV
+    Speak {
+        /// Path to the speech model directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Explicit registry family
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Family-local implementation variant; unsupported choices are rejected by its loader
+        #[arg(long)]
+        model_variant: Option<String>,
+
+        /// Text to speak
+        #[arg(short, long)]
+        text: String,
+
+        /// Voice name (families list the voices they support)
+        #[arg(long)]
+        voice: String,
+
+        /// Language name, or "auto"
+        #[arg(long, default_value = "auto")]
+        language: String,
+
+        /// Optional speaking-style instruction
+        #[arg(long, default_value = "")]
+        instruction: String,
+
+        /// Sampling seed
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+
+        /// Output WAV file
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Device to run inference on (metal[:N])
+        #[arg(short, long, default_value = "metal")]
+        device: String,
+    },
+
     /// Run a quick test of the engine
     Test,
 }
@@ -263,6 +349,74 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::GenerateImage {
+            model,
+            model_name,
+            model_variant,
+            prompt,
+            width,
+            height,
+            seed,
+            steps,
+            output,
+            device,
+        } => {
+            let request = ImageRequest {
+                prompt: &prompt,
+                width,
+                height,
+                seed,
+                steps,
+            };
+            let result = parse_device(&device).and_then(|device| {
+                run_generate_image(
+                    &model,
+                    model_name.as_deref(),
+                    model_variant.as_deref(),
+                    device,
+                    &request,
+                    &output,
+                )
+            });
+            if let Err(error) = result {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Speak {
+            model,
+            model_name,
+            model_variant,
+            text,
+            voice,
+            language,
+            instruction,
+            seed,
+            output,
+            device,
+        } => {
+            let request = SpeechRequest {
+                text: &text,
+                voice: &voice,
+                language: &language,
+                instruction: &instruction,
+                seed,
+            };
+            let result = parse_device(&device).and_then(|device| {
+                run_speak(
+                    &model,
+                    model_name.as_deref(),
+                    model_variant.as_deref(),
+                    device,
+                    &request,
+                    &output,
+                )
+            });
+            if let Err(error) = result {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Test => {
             run_test();
         }
@@ -346,7 +500,7 @@ mod truncation_tests {
 
 #[cfg(test)]
 mod device_tests {
-    use super::{parse_device, Cli, Commands};
+    use super::{parse_device, run_generate_image, Cli, Commands, ImageRequest};
     use apxinf_core::Device;
     use clap::Parser;
 
@@ -401,6 +555,83 @@ mod device_tests {
         };
         assert_eq!(model_name.as_deref(), Some("minicpm5"));
         assert_eq!(model_variant.as_deref(), Some("bf16-compiled"));
+    }
+
+    #[test]
+    fn image_cli_accepts_reference_variant() {
+        let result = Cli::try_parse_from([
+            "apxinf",
+            "generate-image",
+            "--model",
+            "/checkpoint",
+            "--prompt",
+            "a red bicycle",
+            "--output",
+            "image.ppm",
+            "--model-variant",
+            "reference",
+        ]);
+        let cli = result.unwrap_or_else(|error| panic!("reference variant rejected: {error}"));
+        let Commands::GenerateImage {
+            model_variant,
+            width,
+            height,
+            steps,
+            ..
+        } = cli.command
+        else {
+            panic!("expected generate-image command");
+        };
+        assert_eq!(model_variant.as_deref(), Some("reference"));
+        assert_eq!((width, height, steps), (1024, 1024, 40));
+    }
+
+    #[test]
+    fn image_cli_preserves_default_and_auto_variants() {
+        for variant in [None, Some("auto")] {
+            let mut arguments = vec![
+                "apxinf",
+                "generate-image",
+                "--model",
+                "/checkpoint",
+                "--prompt",
+                "a red bicycle",
+                "--output",
+                "image.ppm",
+            ];
+            if let Some(variant) = variant {
+                arguments.extend(["--model-variant", variant]);
+            }
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Commands::GenerateImage { model_variant, .. } = cli.command else {
+                panic!("expected generate-image command");
+            };
+            assert_eq!(model_variant.as_deref(), variant);
+        }
+    }
+
+    #[test]
+    fn image_command_forwards_variant_to_loader_before_checkpoint_io() {
+        let request = ImageRequest {
+            prompt: "a red bicycle",
+            width: 512,
+            height: 512,
+            seed: 7,
+            steps: 40,
+        };
+        let error = run_generate_image(
+            &"/missing-qwen-image-checkpoint".into(),
+            Some("qwen_image"),
+            Some("reference"),
+            Device::Cpu,
+            &request,
+            &"/unused-image.ppm".into(),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("model qwen_image does not yet support model_variant"),
+            "{error}"
+        );
     }
 }
 
@@ -659,6 +890,140 @@ fn run_generate(
     }
     println!("{}", output.profile.summary());
     Ok(())
+}
+
+fn run_generate_image(
+    model_dir: &PathBuf,
+    model_name_override: Option<&str>,
+    model_variant: Option<&str>,
+    device: Device,
+    request: &ImageRequest<'_>,
+    output: &PathBuf,
+) -> Result<(), String> {
+    let model_name = match model_name_override {
+        Some(name) => name.to_owned(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+    let options = LoadOptions {
+        model_name: Some(model_name.clone()),
+        model_variant: model_variant.map(str::to_owned),
+        ..LoadOptions::default()
+    };
+    eprintln!("Loading {model_name} from {:?}...", model_dir);
+    let started = std::time::Instant::now();
+    let mut model = AutoModel::load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+    eprintln!("Loaded in {:.2}s", started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let image = model
+        .generate_image(request)
+        .map_err(|error| format!("Image generation failed: {error}"))?;
+    eprintln!("Generated in {:.2}s", started.elapsed().as_secs_f64());
+    let mut ppm = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
+    ppm.extend_from_slice(&image.rgb);
+    std::fs::write(output, ppm)
+        .map_err(|error| format!("Failed to write {}: {error}", output.display()))?;
+    println!("{}", output.display());
+    Ok(())
+}
+
+fn run_speak(
+    model_dir: &PathBuf,
+    model_name_override: Option<&str>,
+    model_variant: Option<&str>,
+    device: Device,
+    request: &SpeechRequest<'_>,
+    output: &PathBuf,
+) -> Result<(), String> {
+    let model_name = match model_name_override {
+        Some(name) => name.to_owned(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+    let options = LoadOptions {
+        model_name: Some(model_name.clone()),
+        model_variant: model_variant.map(str::to_owned),
+        ..LoadOptions::default()
+    };
+    eprintln!("Loading {model_name} from {:?}...", model_dir);
+    let started = std::time::Instant::now();
+    let mut model = AutoModel::load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+    eprintln!("Loaded in {:.2}s", started.elapsed().as_secs_f64());
+    let started = std::time::Instant::now();
+    let audio = model
+        .synthesize(request)
+        .map_err(|error| format!("Speech synthesis failed: {error}"))?;
+    let seconds = audio.samples.len() as f64 / audio.channels as f64 / audio.sample_rate as f64;
+    eprintln!(
+        "Synthesized {seconds:.2}s of audio in {:.2}s{}",
+        started.elapsed().as_secs_f64(),
+        if audio.complete {
+            ""
+        } else {
+            " (stopped at the length limit)"
+        }
+    );
+    std::fs::write(output, float_wav(&audio))
+        .map_err(|error| format!("Failed to write {}: {error}", output.display()))?;
+    println!("{}", output.display());
+    Ok(())
+}
+
+/// RIFF WAVE with IEEE float samples (format 3), so samples are stored exactly.
+fn float_wav(audio: &apxinf_model::GeneratedAudio) -> Vec<u8> {
+    let data = (audio.samples.len() * 4) as u32;
+    let channels = audio.channels as u16;
+    let mut out = Vec::with_capacity(44 + data as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&3u16.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&audio.sample_rate.to_le_bytes());
+    out.extend_from_slice(&(audio.sample_rate * 4 * channels as u32).to_le_bytes());
+    out.extend_from_slice(&(4 * channels).to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data.to_le_bytes());
+    for sample in &audio.samples {
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
+    out
+}
+
+#[cfg(test)]
+mod wav_tests {
+    use super::float_wav;
+    use apxinf_model::GeneratedAudio;
+
+    #[test]
+    fn float_wav_header_describes_the_samples() {
+        let audio = GeneratedAudio {
+            sample_rate: 24000,
+            channels: 1,
+            samples: vec![0.5, -0.25, 1.0],
+            complete: true,
+        };
+        let wav = float_wav(&audio);
+        let u32_at = |i: usize| u32::from_le_bytes(wav[i..i + 4].try_into().unwrap());
+        let u16_at = |i: usize| u16::from_le_bytes(wav[i..i + 2].try_into().unwrap());
+        assert_eq!(
+            (&wav[0..4], &wav[8..16], &wav[36..40]),
+            (&b"RIFF"[..], &b"WAVEfmt "[..], &b"data"[..])
+        );
+        assert_eq!(
+            (u32_at(4), u16_at(20), u16_at(22), u32_at(24)),
+            (36 + 12, 3, 1, 24000)
+        );
+        assert_eq!(
+            (u32_at(28), u16_at(32), u16_at(34), u32_at(40)),
+            (96000, 4, 32, 12)
+        );
+        assert_eq!(f32::from_le_bytes(wav[48..52].try_into().unwrap()), -0.25);
+    }
 }
 
 fn run_decide(

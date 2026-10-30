@@ -9,12 +9,17 @@ mod generation_config;
 pub mod gr00t;
 #[cfg(feature = "hip")]
 pub mod hip_pi05;
+pub mod image;
 pub mod llama;
 pub mod llm_trait;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_qwen_image;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_qwen3_tts;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
@@ -25,6 +30,7 @@ pub mod qwen_drive;
 pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
+pub mod speech;
 pub mod vla;
 mod walloss;
 
@@ -36,6 +42,8 @@ pub use d3::{
     D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
 pub use debug::{DebugCapture, DebugConfig};
+pub use image::{GeneratedImage, ImageRequest, ImageRuntime};
+pub use speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};

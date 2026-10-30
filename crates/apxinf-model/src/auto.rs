@@ -11,12 +11,14 @@ use crate::d3::{DecisionInput, DecisionOutput, DecisionRuntime};
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
+use crate::image::{GeneratedImage, ImageRequest, ImageRuntime};
 use crate::llm_trait::{
     GeneratedToken, GenerationOutput, GenerationRequest, LlmCapabilities, LlmInput, LlmTrait,
 };
 use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
+use crate::speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
 use crate::vla::{Action, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime};
 
 /// User-level precision policy. Hardware/tactic dispatch remains in kernels.
@@ -94,6 +96,8 @@ pub enum LoadedModel {
     },
     Vla(Box<dyn VlaRuntime>),
     Decision(Box<dyn DecisionRuntime>),
+    Image(Box<dyn ImageRuntime>),
+    Speech(Box<dyn SpeechRuntime>),
 }
 
 impl LoadedModel {
@@ -109,6 +113,8 @@ impl LoadedModel {
             Self::Text { model, .. } => Ok(&mut **model),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
 
@@ -117,6 +123,8 @@ impl LoadedModel {
             Self::Vla(model) => Ok(&**model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not VLA".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not VLA".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not VLA".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not VLA".into())),
         }
     }
 
@@ -125,6 +133,8 @@ impl LoadedModel {
             Self::Decision(model) => Ok(&mut **model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
 
@@ -137,6 +147,8 @@ impl LoadedModel {
             Self::Decision(model) => Ok(model.code_names()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
 
@@ -145,6 +157,8 @@ impl LoadedModel {
             Self::Decision(model) => Ok(model.token_ids()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
 
@@ -157,6 +171,8 @@ impl LoadedModel {
             Self::Text { model, .. } => Ok(model.capabilities()),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(model) => Ok(model.capabilities()),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
 
@@ -172,6 +188,12 @@ impl LoadedModel {
             )),
             Self::Decision(_) => Err(Error::Other(
                 "decision models do not use autoregressive generation defaults".into(),
+            )),
+            Self::Image(_) => Err(Error::Other(
+                "image models do not use autoregressive generation defaults".into(),
+            )),
+            Self::Speech(_) => Err(Error::Other(
+                "speech models do not use autoregressive generation defaults".into(),
             )),
         }
     }
@@ -215,7 +237,37 @@ impl LoadedModel {
             }
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
+    }
+
+    pub fn image_mut(&mut self) -> Result<&mut dyn ImageRuntime> {
+        match self {
+            Self::Image(model) => Ok(&mut **model),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not image".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not image".into())),
+            Self::Decision(_) => Err(Error::Other("loaded model is decision, not image".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not image".into())),
+        }
+    }
+
+    pub fn generate_image(&mut self, request: &ImageRequest<'_>) -> Result<GeneratedImage> {
+        self.image_mut()?.generate(request)
+    }
+
+    pub fn speech_mut(&mut self) -> Result<&mut dyn SpeechRuntime> {
+        match self {
+            Self::Speech(model) => Ok(&mut **model),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not speech".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not speech".into())),
+            Self::Decision(_) => Err(Error::Other("loaded model is decision, not speech".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not speech".into())),
+        }
+    }
+
+    pub fn synthesize(&mut self, request: &SpeechRequest<'_>) -> Result<GeneratedAudio> {
+        self.speech_mut()?.synthesize(request)
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -334,6 +386,24 @@ impl AutoModel {
             }
         }
         let config_path = model_dir.join("config.json");
+        // mflux image exports have no top-level config.json; the single-stream
+        // text projection in the transformer index identifies Qwen-Image-2.1.
+        let transformer_index = model_dir.join("transformer/model.safetensors.index.json");
+        if !config_path.is_file() && transformer_index.is_file() {
+            let raw = std::fs::read_to_string(&transformer_index).map_err(|error| {
+                Error::Other(format!("read {}: {error}", transformer_index.display()))
+            })?;
+            let index: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+                Error::Other(format!("parse {}: {error}", transformer_index.display()))
+            })?;
+            let weights = index.get("weight_map");
+            if ["txt_in.text_norm.weight", "modulation.layers.1.weight"]
+                .iter()
+                .all(|name| weights.and_then(|map| map.get(name)).is_some())
+            {
+                return Ok("qwen_image".to_owned());
+            }
+        }
         let raw = std::fs::read_to_string(&config_path)
             .map_err(|error| Error::Other(format!("read {}: {error}", config_path.display())))?;
         let config: serde_json::Value = serde_json::from_str(&raw)
@@ -585,6 +655,31 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "mlx"))]
+    #[test]
+    fn image_variants_reach_device_admission_without_mlx() {
+        for family in ["qwen_image", "metal_qwen_image", "qwen_image-mlx"] {
+            for variant in ["auto", "reference"] {
+                let options = LoadOptions {
+                    model_name: Some(family.into()),
+                    model_variant: Some(variant.into()),
+                    ..LoadOptions::default()
+                };
+                let error = AutoModel::load_model(
+                    Device::Metal(0),
+                    Path::new("checkpoint-must-not-be-opened"),
+                    &options,
+                )
+                .err()
+                .expect("MLX is unavailable");
+                assert!(
+                    matches!(error, Error::UnsupportedDevice(Device::Metal(0))),
+                    "{family}/{variant}: {error}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn cuda_recipe_tuning_is_explicit_and_independent_of_directory() {
         let mut options = LoadOptions::default();
@@ -710,6 +805,9 @@ mod tests {
             "minicpm5-mlx",
             "llama",
             "qwen3_vl",
+            "qwen_image",
+            "metal_qwen_image",
+            "qwen_image-mlx",
         ] {
             assert!(supports_model_variant(name, Device::Metal(0)));
             assert!(!supports_model_variant(name, Device::Cpu));
@@ -745,6 +843,25 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn metal_variants_do_not_bypass_family_registration() {
+        for family in ["llama", "qwen3_vl", "test_missing_metal_family"] {
+            let options = LoadOptions {
+                model_name: Some(family.into()),
+                model_variant: Some("auto".into()),
+                ..LoadOptions::default()
+            };
+            assert!(matches!(
+                AutoModel::load_model(
+                    Device::Metal(0),
+                    Path::new("checkpoint-must-not-be-opened"),
+                    &options,
+                ),
+                Err(Error::UnsupportedDevice(Device::Metal(0)))
+            ));
+        }
     }
 
     #[test]
@@ -787,6 +904,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(AutoModel::detect_model_name(&directory).unwrap(), "d3");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mflux_qwen_image_export_is_detected_without_config_json() {
+        let directory = temporary_directory("qwen-image-detection");
+        std::fs::create_dir(directory.join("transformer")).unwrap();
+        std::fs::write(
+            directory.join("transformer/model.safetensors.index.json"),
+            r#"{"weight_map":{"txt_in.text_norm.weight":"0.safetensors",
+                "modulation.layers.1.weight":"1.safetensors"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            AutoModel::detect_model_name(&directory).unwrap(),
+            "qwen_image"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
