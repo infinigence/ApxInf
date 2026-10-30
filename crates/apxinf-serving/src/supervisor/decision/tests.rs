@@ -17,7 +17,13 @@ impl Probe {
             .collect()
     }
     async fn event(&self, name: &str) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        assert!(
+            self.event_within(name, Duration::from_secs(5)).await,
+            "fixture did not record {name}"
+        );
+    }
+    async fn event_within(&self, name: &str, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
             loop {
                 if self.events().iter().any(|event| event["event"] == name) {
                     return;
@@ -26,7 +32,7 @@ impl Probe {
             }
         })
         .await
-        .unwrap();
+        .is_ok()
     }
     fn release(&self) {
         std::fs::write(self.0.join("release"), b"release").unwrap();
@@ -82,7 +88,29 @@ async fn start(
     timeout: Duration,
     replacement_delay: Duration,
 ) -> (Arc<Service>, tokio::task::JoinHandle<StopResult>) {
+    start_with_fixture_timeout(
+        probe,
+        mode,
+        timeout,
+        replacement_delay,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap()
+}
+
+async fn start_with_fixture_timeout(
+    probe: &Probe,
+    mode: &str,
+    timeout: Duration,
+    replacement_delay: Duration,
+    fixture_timeout: Duration,
+) -> Result<(Arc<Service>, tokio::task::JoinHandle<StopResult>), String> {
     let (initial_worker, ready) = worker(probe.0.clone(), mode).await.unwrap();
+    if !probe.event_within("started", fixture_timeout).await {
+        drop(initial_worker);
+        return Err("decision fixture did not start".into());
+    }
     let service = super::super::lifecycle_regressions::cpu_service(ready, timeout, 4);
     start_queue_sweeper(&service);
     let root = probe.0.clone();
@@ -93,7 +121,21 @@ async fn start(
             worker(root, "success").await
         }
     }));
-    (service, task)
+    Ok((service, task))
+}
+
+#[tokio::test]
+async fn decision_fixture_requires_started_observation() {
+    let probe = Probe::new();
+    assert!(start_with_fixture_timeout(
+        &probe,
+        "no_started",
+        Duration::from_millis(300),
+        Duration::ZERO,
+        Duration::from_millis(20),
+    )
+    .await
+    .is_err());
 }
 fn request() -> crate::decision::DecisionRequest {
     parse_decision_request(br#"{"model":"cpu-fixture","state":"warm","questions":{"grade":{"type":"score","instructions":"Rate","criteria":["low","high"]},"choice":{"type":"choice","instructions":"Choose","criteria":{"a":"A","b":"B"}},"warm":{"type":"noul","instructions":"Warm?"}}}"#).unwrap()

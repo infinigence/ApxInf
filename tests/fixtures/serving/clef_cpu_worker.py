@@ -40,7 +40,8 @@ parser.add_argument("--epoch", required=True)
 parser.add_argument("--mode", required=True)
 args = parser.parse_args()
 root = Path(args.root)
-trace("started")
+if args.mode != "no_started":
+    trace("started")
 
 for line in sys.stdin:
     command = json.loads(line)

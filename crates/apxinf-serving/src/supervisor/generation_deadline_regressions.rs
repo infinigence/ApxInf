@@ -2,28 +2,45 @@
 use super::*;
 use futures_util::FutureExt;
 
-struct GenerationProbe(PathBuf);
+struct GenerationProbe {
+    trace: PathBuf,
+    reader_ready: PathBuf,
+}
 
 impl GenerationProbe {
     fn new() -> Self {
-        Self(std::env::temp_dir().join(format!(
+        let trace = std::env::temp_dir().join(format!(
             "apxinf-generation-deadline-{}.jsonl",
             uuid::Uuid::new_v4()
-        )))
+        ));
+        Self {
+            reader_ready: trace.with_extension("reader-ready"),
+            trace,
+        }
     }
 
     fn commands(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.0)
+        std::fs::read_to_string(&self.trace)
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
             .collect()
     }
+    async fn reader_ready_within(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            while !self.reader_ready.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
 }
 
 impl Drop for GenerationProbe {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.trace);
+        let _ = std::fs::remove_file(&self.reader_ready);
     }
 }
 
@@ -31,13 +48,24 @@ async fn service_for(
     probe: &GenerationProbe,
     mode: &str,
 ) -> (Arc<Service>, tokio::task::JoinHandle<()>) {
+    service_for_with_fixture_timeout(probe, mode, Duration::from_secs(5))
+        .await
+        .unwrap()
+}
+
+async fn service_for_with_fixture_timeout(
+    probe: &GenerationProbe,
+    mode: &str,
+    fixture_timeout: Duration,
+) -> Result<(Arc<Service>, tokio::task::JoinHandle<()>), String> {
     // Model execution is absent. Real pipes carry the complete checked protocol.
     let script = r#"
 import hashlib, json, queue, struct, sys, threading, time
-mode, trace_path = sys.argv[1:]
+mode, trace_path, reader_ready_path = sys.argv[1:]
 generation = 0
 commands = queue.Queue()
 def receive():
+    if mode != "no_reader_ready": open(reader_ready_path, "x").close()
     for line in sys.stdin:
         command = json.loads(line)
         with open(trace_path, "a") as trace: trace.write(command["kind"] + "\n")
@@ -95,13 +123,19 @@ while True:
     let epoch = uuid::Uuid::new_v4().to_string();
     let mut child = Command::new("python3")
         .args(["-u", "-c", script, mode])
-        .arg(&probe.0)
+        .arg(&probe.trace)
+        .arg(&probe.reader_ready)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    if !probe.reader_ready_within(fixture_timeout).await {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err("generation fixture reader did not start".into());
+    }
     let input = child.stdin.take();
     let frames = read_worker_frames(child.stdout.take().unwrap());
     let worker = Worker {
@@ -143,7 +177,17 @@ while True:
         || async { Err("The deadline probe must not rotate.".to_owned()) },
         sender,
     ));
-    (service, task)
+    Ok((service, task))
+}
+
+#[tokio::test]
+async fn generation_fixture_requires_reader_ready_observation() {
+    let probe = GenerationProbe::new();
+    assert!(
+        service_for_with_fixture_timeout(&probe, "no_reader_ready", Duration::from_millis(20),)
+            .await
+            .is_err()
+    );
 }
 
 fn request() -> Request {
