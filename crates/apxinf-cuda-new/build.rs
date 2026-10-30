@@ -638,7 +638,7 @@ fn main() {
                 .map(|source| (source, false, false, false, false, false, true)),
         )
         .chain(std::iter::once((
-            adapters.join("convolution.cu"),
+            adapters.join("convolution/launch.cu"),
             false,
             false,
             false,

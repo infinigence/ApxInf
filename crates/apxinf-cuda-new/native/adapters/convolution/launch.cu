@@ -1,5 +1,5 @@
-#include "../include/apxinf_cuda/convolution.h"
-#include "../framework/runtime_internal.h"
+#include "../../include/apxinf_cuda/convolution.h"
+#include "../../framework/runtime_internal.h"
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
