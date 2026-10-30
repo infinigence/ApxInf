@@ -41,7 +41,8 @@ pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingM
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
 pub use llama::{GeneralLlama, KVCache, LlamaModel, LlamaWeights, TransformerLayer};
 pub use llm_trait::{
-    generate_streaming, generate_streaming_with_options, GeneratedToken, GenerationOutput,
+    generate_streaming, generate_streaming_controlled_with_sampler, generate_streaming_with_options,
+    GeneratedToken, GenerationBoundary, GenerationOutput,
     GenerationRequest, ImageInput, LlmCapabilities, LlmInput, LlmTrait, TextCompilationScope,
     TextPreparationState, TextPreparationStatus,
 };

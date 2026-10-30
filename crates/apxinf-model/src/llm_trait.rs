@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 
 use apxinf_core::{
-    Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSamplingInit, TokenSamplingSpec,
+    Backend, Device, Error, NextTokenLogits, Result, Tensor, TokenSampler, TokenSamplingInit,
+    TokenSamplingSpec,
 };
 use apxinf_loader::ModelConfig;
 use serde::Serialize;
@@ -148,6 +149,17 @@ pub struct GeneratedToken {
     pub logprob: Option<f32>,
 }
 
+/// A control boundary where a caller may stop generation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GenerationBoundary {
+    /// No prompt work has started. This does not report consumed positions.
+    PrefillStart,
+    PrefillProgress {
+        consumed_tokens: usize,
+    },
+    Token(GeneratedToken),
+}
+
 /// Generated tokens together with host-side timing metrics.
 pub struct GenerationOutput {
     pub tokens: Vec<GeneratedToken>,
@@ -203,8 +215,43 @@ pub trait LlmTrait {
         self.forward(input.token_ids, 0)
     }
 
+    /// Process a prompt with control before work and after evaluated progress.
+    /// A false callback result stops prefill without logits for the sampler.
+    /// The caller must still release partial request state after a stop or error.
+    fn prefill_controlled(
+        &mut self,
+        input: LlmInput<'_>,
+        boundary: &mut dyn FnMut(GenerationBoundary) -> Result<bool>,
+    ) -> Result<Option<Tensor>> {
+        if !boundary(GenerationBoundary::PrefillStart)? {
+            return Ok(None);
+        }
+        let logits = self.prefill(input)?;
+        if !boundary(GenerationBoundary::PrefillProgress {
+            consumed_tokens: input.token_ids.len(),
+        })? {
+            return Ok(None);
+        }
+        Ok(Some(logits))
+    }
+
     /// Reset state for a new generation.
     fn reset(&mut self);
+
+    /// Release request-owned state after checked device settlement.
+    fn release_request_state(&mut self) -> Result<()> {
+        Err(Error::Contract("request state release is unsupported"))
+    }
+
+    /// Run the shared loop with control before prefill and at completed execution boundaries.
+    fn generate_streaming_controlled_dyn(
+        &mut self,
+        request: GenerationRequest<'_>,
+        boundary: &mut dyn FnMut(GenerationBoundary) -> Result<bool>,
+    ) -> Result<GenerationOutput> {
+        let options = request.options.resolve()?;
+        generate_streaming_with_resolved_options(self, request.input, &options, boundary)
+    }
 
     /// Optional hook called once before prefill, with the prompt length and
     /// the number of tokens that will be generated. Models with a CUDA
@@ -272,28 +319,97 @@ pub trait LlmTrait {
 pub fn generate_streaming_with_options<M, F>(
     model: &mut M,
     request: GenerationRequest<'_>,
-    on_token: F,
-) -> Result<GenerationOutput>
-where
-    M: LlmTrait + ?Sized,
-    F: FnMut(GeneratedToken),
-{
-    let options = request.options.resolve()?;
-    generate_streaming_with_resolved_options(model, request.input, &options, on_token)
-}
-
-fn generate_streaming_with_resolved_options<M, F>(
-    model: &mut M,
-    input: LlmInput<'_>,
-    options: &ResolvedGenerationOptions,
     mut on_token: F,
 ) -> Result<GenerationOutput>
 where
     M: LlmTrait + ?Sized,
     F: FnMut(GeneratedToken),
 {
-    let prompt_tokens = input.token_ids;
-    if prompt_tokens.is_empty() {
+    let options = request.options.resolve()?;
+    generate_streaming_with_resolved_options(model, request.input, &options, |boundary| {
+        if let GenerationBoundary::Token(token) = boundary {
+            on_token(token);
+        }
+        Ok(true)
+    })
+}
+
+fn generate_streaming_with_resolved_options<M, F>(
+    model: &mut M,
+    input: LlmInput<'_>,
+    options: &ResolvedGenerationOptions,
+    boundary: F,
+) -> Result<GenerationOutput>
+where
+    M: LlmTrait + ?Sized,
+    F: FnMut(GenerationBoundary) -> Result<bool>,
+{
+    validate_generation_input(model, input)?;
+    let profile = GenerationProfile::new();
+    if options.max_new_tokens == 0 {
+        return Ok(empty_generation_output(input.token_ids.len(), profile));
+    }
+    let spec = generation_sampling_spec(model, input, options)?;
+    let mut sampler = model.backend().create_token_sampler(spec)?;
+    generate_streaming_with_resolved_sampler(
+        model,
+        input,
+        options,
+        sampler.as_mut(),
+        profile,
+        boundary,
+    )
+}
+
+/// Run controlled generation with a caller-selected sampler.
+/// Check its vocabulary and capacity before model mutation.
+/// The caller must supply a sampler that accepts this model's logits.
+pub fn generate_streaming_controlled_with_sampler<M, F>(
+    model: &mut M,
+    request: GenerationRequest<'_>,
+    sampler: &mut dyn TokenSampler,
+    boundary: F,
+) -> Result<GenerationOutput>
+where
+    M: LlmTrait + ?Sized,
+    F: FnMut(GenerationBoundary) -> Result<bool>,
+{
+    let options = request.options.resolve()?;
+    validate_generation_input(model, request.input)?;
+    let profile = GenerationProfile::new();
+    let required = generation_sampling_spec(model, request.input, &options)?;
+    let spec = sampler.spec();
+    spec.validate()?;
+    if spec.vocab_size != required.vocab_size {
+        return Err(Error::Other(format!(
+            "sampler vocabulary size must equal {}, got {}",
+            required.vocab_size, spec.vocab_size
+        )));
+    }
+    if spec.max_sequence_len < required.max_sequence_len {
+        return Err(Error::Other(format!(
+            "sampler capacity must be at least {}, got {}",
+            required.max_sequence_len, spec.max_sequence_len
+        )));
+    }
+    if options.max_new_tokens == 0 {
+        return Ok(empty_generation_output(
+            request.input.token_ids.len(),
+            profile,
+        ));
+    }
+    generate_streaming_with_resolved_sampler(
+        model,
+        request.input,
+        &options,
+        sampler,
+        profile,
+        boundary,
+    )
+}
+
+fn validate_generation_input<M: LlmTrait + ?Sized>(model: &M, input: LlmInput<'_>) -> Result<()> {
+    if input.token_ids.is_empty() {
         return Err(Error::Other("generate_streaming: empty prompt".into()));
     }
     if input.image.is_some() && !model.capabilities().image {
@@ -301,24 +417,47 @@ where
             "this model does not support image input".into(),
         ));
     }
-    let mut profile = GenerationProfile::new();
-    if options.max_new_tokens == 0 {
-        profile.finalize(prompt_tokens.len(), 0);
-        return Ok(GenerationOutput {
-            tokens: Vec::new(),
-            profile,
-        });
-    }
+    Ok(())
+}
 
-    let capacity = prompt_tokens
+fn generation_sampling_spec<M: LlmTrait + ?Sized>(
+    model: &M,
+    input: LlmInput<'_>,
+    options: &ResolvedGenerationOptions,
+) -> Result<TokenSamplingSpec> {
+    let capacity = input
+        .token_ids
         .len()
         .checked_add(options.max_new_tokens)
         .ok_or_else(|| Error::Other("generation sequence length overflow".into()))?;
-    let spec = TokenSamplingSpec {
+    Ok(TokenSamplingSpec {
         vocab_size: model.vocab_size(),
         max_sequence_len: capacity,
-    };
-    let mut sampler = model.backend().create_token_sampler(spec)?;
+    })
+}
+
+fn empty_generation_output(prompt_len: usize, mut profile: GenerationProfile) -> GenerationOutput {
+    profile.finalize(prompt_len, 0);
+    GenerationOutput {
+        tokens: Vec::new(),
+        profile,
+    }
+}
+
+fn generate_streaming_with_resolved_sampler<M, F>(
+    model: &mut M,
+    input: LlmInput<'_>,
+    options: &ResolvedGenerationOptions,
+    sampler: &mut dyn TokenSampler,
+    mut profile: GenerationProfile,
+    mut boundary: F,
+) -> Result<GenerationOutput>
+where
+    M: LlmTrait + ?Sized,
+    F: FnMut(GenerationBoundary) -> Result<bool>,
+{
+    let prompt_tokens = input.token_ids;
+    let vocab_size = model.vocab_size();
     sampler.begin(TokenSamplingInit {
         prompt_token_ids: prompt_tokens,
         params: &options.sampling,
@@ -329,18 +468,24 @@ where
     model.prewarm_decode(prompt_tokens.len(), options.max_new_tokens);
 
     let mut generated = Vec::with_capacity(options.max_new_tokens);
-    let logits = model.prefill(input)?;
-    let first = sampler.sample(NextTokenLogits::last(&logits, spec.vocab_size)?)?;
+    let Some(logits) = model.prefill_controlled(input, &mut boundary)? else {
+        profile.finalize(prompt_tokens.len(), 0);
+        return Ok(GenerationOutput {
+            tokens: generated,
+            profile,
+        });
+    };
+    let first = sampler.sample(NextTokenLogits::last(&logits, vocab_size)?)?;
     profile.record_first_token();
     let mut current = GeneratedToken {
         token_id: first.token_id,
         logprob: first.logprob,
     };
     generated.push(current);
-    profile.run_unprofiled(|| on_token(current));
+    let mut keep_going = profile.run_unprofiled(|| boundary(GenerationBoundary::Token(current)))?;
 
     for index in 1..options.max_new_tokens {
-        if options.eos_token_ids.contains(&current.token_id) {
+        if !keep_going || options.eos_token_ids.contains(&current.token_id) {
             break;
         }
         let position = prompt_tokens
@@ -349,13 +494,13 @@ where
             .and_then(|position| u32::try_from(position).ok())
             .ok_or_else(|| Error::Other("generation position exceeds u32".into()))?;
         let logits = model.forward(&[current.token_id], position)?;
-        let sample = sampler.sample(NextTokenLogits::last(&logits, spec.vocab_size)?)?;
+        let sample = sampler.sample(NextTokenLogits::last(&logits, vocab_size)?)?;
         current = GeneratedToken {
             token_id: sample.token_id,
             logprob: sample.logprob,
         };
         generated.push(current);
-        profile.run_unprofiled(|| on_token(current));
+        keep_going = profile.run_unprofiled(|| boundary(GenerationBoundary::Token(current)))?;
     }
 
     profile.finalize(prompt_tokens.len(), generated.len());
