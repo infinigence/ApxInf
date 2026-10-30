@@ -6,6 +6,8 @@ points other layers code against:
 
 * :class:`ModelRunnerProtocol` — the model-side contract (L1 bare inference) a policy
   consumes, i.e. the subset of a ``apxinf_py.ModelRunner`` handle it relies on.
+* :class:`StateConditionedModelRunnerProtocol` — the additional continuous-state
+  and explicit-latent-shape capability used by joint-latent policies.
 * :class:`Policy` — the L2 contract (``obs dict -> result dict``) every
   model-specific policy satisfies. Downstream consumers (the websocket server, the
   :class:`~apxinf.policies.auto.AutoPolicy` registry, a lerobot adaptor) code
@@ -37,6 +39,7 @@ import numpy as np
 __all__ = [
     "Policy",
     "ModelRunnerProtocol",
+    "StateConditionedModelRunnerProtocol",
     "ComposablePolicy",
     "VIEW_SLOTS",
     "CANONICAL_IMAGE_KEYS",
@@ -102,6 +105,28 @@ class ModelRunnerProtocol(Protocol):
         layout: str,
         token_ids: np.ndarray,
         noise: np.ndarray | None = None,
+    ) -> np.ndarray: ...
+
+
+@runtime_checkable
+class StateConditionedModelRunnerProtocol(ModelRunnerProtocol, Protocol):
+    """Runner capability for continuous state and an explicitly shaped latent.
+
+    Kept separate from the minimal RGB/token runner contract so policies with
+    action-matrix noise and no continuous state need no additional capability.
+    The latent shape describes supplied noise, independently of action shape.
+    """
+
+    initial_latent_shape: Sequence[int]
+
+    def infer_rgb(
+        self,
+        rgb_u8: np.ndarray,
+        layout: str,
+        token_ids: np.ndarray,
+        noise: np.ndarray | None = None,
+        *,
+        state: np.ndarray | None = None,
     ) -> np.ndarray: ...
 
 

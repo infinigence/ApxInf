@@ -163,3 +163,83 @@ D256 attention and the 624/2200 vision schedule are candidates in the existing
 Attention registries. BF16 SwiGLU is the GEMM semantic above. First-prefill GDN
 is `ops::gdn_first_prefill`; it owns both the fixed SM110 launch and the generic
 decomposition, so candidate misses never escape to model code.
+<!-- l3-operator:Unfold3d -->
+### Unfold3d
+
+`PreparedUnfold3d::new` binds a nonempty BF16 THWC volume, optional preceding
+THWC history, asymmetric zero padding, positive three-axis kernel/stride and a
+contiguous tile of flattened output rows. Columns are ordered kernel T/H/W/C.
+This preserves causal history without a host readback or a full im2col allocation;
+the caller tiles rows and composes ordinary GEMM. Output must not alias either
+source. `enqueue` performs exact BF16 copies with zero padding, allocates no
+memory and can be captured after preparation. Captured graphs retain the prepared execution and its
+input/output storage even after caller handles are dropped. Deterministic dispatch
+uses vectorized bit copies for supported aligned geometries with proven 32-bit
+index bounds, and retains a 64-bit scalar path for all other valid inputs.
+This adds no device workspace or persistent recipe and does not strengthen the
+public BF16 alignment requirement. Supported dtype is BF16 only.
+Target-device numerical/capture acceptance is required before a model claims it.
+
+<!-- l3-operator:ChannelL2Norm -->
+### ChannelL2Norm
+
+`channel_l2_norm` uses the unified `NormArgs` contract with
+`NormKind::ChannelL2` (plain weighted normalization, BF16 only, without
+quantization or fused residuals). It accepts contiguous BF16 `[rows, channels]` and learned BF16
+`[channels]` weights. It computes the L2 norm in FP32, rounds the norm to BF16,
+clamps it by epsilon (normal positive FP32), divides and rounds to BF16, multiplies
+by `sqrt(channels)` and rounds again, then multiplies by the learned weight.
+The output is BF16 with the input shape. Epsilon is a lower bound on the norm,
+not an additive variance epsilon. This distinct numerical semantic preserves
+channel normalization used by causal video autoencoders. The fixed kernel has
+no selection, workspace or allocation; it supports eager and captured launches.
+
+<!-- l3-operator:Multiply -->
+### Multiply
+
+`PointwiseSemantic::Multiply` multiplies same-shaped contiguous `[rows, cols]`
+input and secondary tensors, with a single round to the output dtype. F16, BF16
+and F32 are supported; all three tensors must have the same dtype. No bias,
+activation or quantization scale is accepted. Exact in-place operation is
+supported. The existing EulerUpdate semantic also accepts F32 for a full-precision
+state boundary; F32 also requires identical shapes and rejects partial aliasing.
+Its formula and existing F16/BF16 behavior are unchanged.
+
+<!-- l3-operator:RgbToPatchesStaged -->
+### RgbToPatchesStaged
+
+`GatherSemantic::RgbToPatchesStaged` uses the existing RGB patch geometry and
+layouts, with a distinct normalization recipe: cast the byte to output F16 or
+BF16, divide by 127.5 and round to that dtype, subtract 1 and round again.
+The existing `RgbToPatches` single-round recipe is unchanged. The fixed kernel
+has no workspace or selection; input bytes and output buffers remain device
+resident during capture. Exhaustive byte rounding is checked in
+`tests/mixed_precision_ops.rs`.
+
+<!-- l3-operator:F64Recurrence -->
+### F64Recurrence
+
+`F64RecurrenceState` owns opaque FP64 state and previous-input storage tied to
+one device stream. `prepare_reset` converts matching FP32 input to FP64 state,
+zeros history and publishes FP32 output. `prepare_update` computes
+`a*state + d*(b*input + c*previous_input)` with separate FP64 rounds, stores the
+FP64 state/current input, and publishes rounded FP32 output. Coefficients must
+be finite. Inputs and output have identical nonempty shapes; exact in-place
+output is supported, partial aliasing is rejected. Call reset at every independent
+sequence boundary. Prepared executions and captured graphs retain all storage.
+This single fixed implementation has no recipe/tuning; enqueue allocates nothing.
+`tests/mixed_precision_ops.rs` checks retained FP64 precision and graph ownership.
+
+<!-- l3-operator:IndexedColumnMean -->
+### IndexedColumnMean
+
+`PreparedIndexedMean::new` accepts an FP32 input tensor, FP32 output and a static
+row-major host index matrix `[rows, output.numel()]`. It validates and uploads
+indices once, then computes each output column's indexed arithmetic mean on GPU.
+Every index must be in bounds; output cannot overlap input. Rows are bounded by
+2^24 so the FP32 divisor remains exact. The deterministic baseline accumulates
+in FP32 with a 128-thread tree; its summation order is part of this implementation,
+not a promise of bitwise identity with arbitrary framework reductions. Graphs
+retain the input, index map, output and execution; enqueue has no allocation,
+host transfer or tuning. Noncontiguous selection and graph lifetime are tested
+in `tests/mixed_precision_ops.rs`.

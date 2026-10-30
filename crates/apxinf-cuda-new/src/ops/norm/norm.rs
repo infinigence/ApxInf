@@ -12,6 +12,8 @@ use crate::CudaContext;
 pub enum NormKind {
     Rms,
     Layer,
+    /// Staged BF16 L2 clamp/divide/sqrt(cols)/weight normalization.
+    ChannelL2,
 }
 
 /// Affine transform applied after the normalization statistic.
@@ -161,6 +163,7 @@ fn statistic(kind: NormKind) -> Statistic {
     match kind {
         NormKind::Rms => Statistic::Rms,
         NormKind::Layer => Statistic::Layer,
+        NormKind::ChannelL2 => Statistic::ChannelL2,
     }
 }
 
@@ -254,9 +257,9 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
             offset: false,
         } => {
             match args.kind {
-                NormKind::Rms if bias.is_none() => {}
+                NormKind::Rms | NormKind::ChannelL2 if bias.is_none() => {}
                 NormKind::Layer if bias.is_some() => {}
-                NormKind::Rms => {
+                NormKind::Rms | NormKind::ChannelL2 => {
                     return Err(super::contracts::invalid(
                         "RMSNorm does not take an affine bias",
                     ))
@@ -569,4 +572,17 @@ pub fn residual_add(ctx: &CudaContext, args: ResidualAddArgs<'_>) -> Result<()> 
             output_scale: 1.0,
         },
     )
+}
+
+/// Staged BF16 channel L2 normalization (epsilon clamps the norm).
+pub struct ChannelL2NormArgs<'a> {
+    pub input: &'a Tensor,
+    pub weight: &'a Tensor,
+    pub out: &'a mut Tensor,
+    pub eps: f32,
+}
+pub fn channel_l2_norm(ctx: &CudaContext, args: ChannelL2NormArgs<'_>) -> Result<()> {
+    let mut call = NormArgs::rms(args.input, args.weight, args.out, args.eps);
+    call.kind = NormKind::ChannelL2;
+    norm(ctx, call)
 }

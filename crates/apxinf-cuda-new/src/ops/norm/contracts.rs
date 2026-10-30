@@ -26,6 +26,7 @@ pub(crate) enum Statistic {
     None,
     Rms,
     Layer,
+    ChannelL2,
 }
 
 impl Statistic {
@@ -34,6 +35,7 @@ impl Statistic {
             Self::None => 0,
             Self::Rms => 1,
             Self::Layer => 2,
+            Self::ChannelL2 => 3,
         }
     }
 }
@@ -156,7 +158,7 @@ fn valid_contract(
         (operation, statistic, affine, gate),
         (
             Operation::Norm,
-            Statistic::Rms | Statistic::Layer,
+            Statistic::Rms | Statistic::Layer | Statistic::ChannelL2,
             AffineKind::Weight,
             GateKind::None
         ) | (
@@ -300,6 +302,19 @@ fn tensor_storage(
 pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normalized> {
     let operation = args.operation;
     let statistic = args.statistic;
+    if statistic == Statistic::ChannelL2
+        && !(args.input.dtype() == DType::BF16
+            && operation == Operation::Norm
+            && args.affine == AffineKind::Weight
+            && args.gate == GateKind::None
+            && args.quantization == Quantization::None
+            && args.numerics == NormNumerics::Flexible
+            && !args.weight_offset)
+    {
+        return Err(invalid(
+            "ChannelL2 requires plain unquantized BF16 weighted normalization",
+        ));
+    }
     let affine = args.affine;
     let gate = args.gate;
     if !valid_contract(operation, statistic, affine, gate) {

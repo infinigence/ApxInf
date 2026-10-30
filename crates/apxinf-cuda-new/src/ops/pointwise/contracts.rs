@@ -14,6 +14,8 @@ pub enum PointwiseSemantic {
     Swiglu,
     AddInto,
     SwigluRowwiseE4m3,
+    /// Elementwise multiplication with one output rounding.
+    Multiply,
 }
 
 impl PointwiseSemantic {
@@ -25,11 +27,12 @@ impl PointwiseSemantic {
             Self::Swiglu => 3,
             Self::AddInto => 4,
             Self::SwigluRowwiseE4m3 => 5,
+            Self::Multiply => 6,
         }
     }
 
     fn reads_secondary(self) -> bool {
-        matches!(self, Self::EulerUpdate)
+        matches!(self, Self::EulerUpdate | Self::Multiply)
     }
 
     fn may_have_bias(self) -> bool {
@@ -63,7 +66,7 @@ impl PointwiseActivation {
 pub struct PointwiseArgs<'a> {
     pub semantic: PointwiseSemantic,
     pub input: &'a Tensor,
-    /// Euler-update velocity; unused by the other semantics.
+    /// Euler-update velocity or elementwise multiplier.
     pub secondary: Option<&'a Tensor>,
     pub bias: Option<&'a Tensor>,
     pub out: &'a mut Tensor,
@@ -105,6 +108,7 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
 
 fn input_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
         _ => Err(invalid("Pointwise input currently supports F16 and BF16")),
@@ -113,6 +117,7 @@ fn input_dtype_code(dtype: DType) -> Result<u32> {
 
 fn output_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
         DType::F8E4M3 => Ok(3),
@@ -185,6 +190,23 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     let cols_abi = i32::try_from(cols)
         .map_err(|_| invalid("Pointwise column count exceeds the CUDA kernel range"))?;
     let input_dtype = args.input.dtype();
+    if input_dtype == DType::F32
+        && !matches!(
+            semantic,
+            PointwiseSemantic::EulerUpdate | PointwiseSemantic::Multiply
+        )
+    {
+        return Err(invalid(
+            "F32 pointwise supports only EulerUpdate and Multiply",
+        ));
+    }
+    let strict_elementwise = semantic == PointwiseSemantic::Multiply
+        || (semantic == PointwiseSemantic::EulerUpdate && input_dtype == DType::F32);
+    if strict_elementwise && args.input.shape() != args.out.shape() {
+        return Err(invalid(
+            "Pointwise elementwise input/output shapes must match",
+        ));
+    }
     let output_dtype = args.out.dtype();
     let input_dims = args.input.shape().dims();
     if input_dims.len() != 2 || input_dims[0] != rows {
@@ -217,6 +239,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         }
         PointwiseSemantic::BiasActivation
         | PointwiseSemantic::EulerUpdate
+        | PointwiseSemantic::Multiply
         | PointwiseSemantic::AddInto
             if input_cols != cols =>
         {
@@ -302,6 +325,11 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
 
     let (secondary, secondary_alignment) = match args.secondary {
         Some(tensor) => {
+            if strict_elementwise && tensor.shape() != args.input.shape() {
+                return Err(invalid(
+                    "Pointwise elementwise inputs must have identical shapes",
+                ));
+            }
             let buffer = tensor_storage(ctx, tensor, input_dtype, count)?;
             let pointer = buffer.ptr() as *const std::ffi::c_void;
             let alignment = alignment_of(buffer.ptr() as usize);
@@ -335,6 +363,20 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     let output_buffer = tensor_storage(ctx, args.out, output_dtype, count)?;
     let output = output_buffer.ptr() as *mut std::ffi::c_void;
     let output_alignment = alignment_of(output_buffer.ptr() as usize);
+    if strict_elementwise {
+        let bytes = count
+            .checked_mul(input_dtype.size_in_bytes())
+            .ok_or_else(|| invalid("Pointwise storage size overflow"))?;
+        for source in [input as usize, secondary as usize] {
+            if source != output as usize
+                && storage_ranges_overlap(source, bytes, output as usize, bytes)?
+            {
+                return Err(invalid(
+                    "Pointwise elementwise operation rejects partially overlapping output",
+                ));
+            }
+        }
+    }
     if quantized_geglu {
         if input_alignment < 4 || output_alignment < 2 {
             return Err(invalid(

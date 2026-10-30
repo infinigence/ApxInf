@@ -291,6 +291,17 @@ pub trait VlaRuntime {
         self.contract().action_shape
     }
 
+    /// Shape of supplied standard-normal noise, independent of the action
+    /// readout. Joint video/action diffusion runtimes override this with their
+    /// complete latent geometry. Existing action-only runtimes retain their
+    /// two-dimensional noise contract.
+    ///
+    /// This is fixed for the loaded runtime. Prepared plans must validate this
+    /// geometry along with their family-local precision and sampling profile.
+    fn initial_latent_shape(&self) -> Vec<usize> {
+        self.action_shape().to_vec()
+    }
+
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
 

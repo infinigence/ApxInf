@@ -94,7 +94,7 @@ __global__ void bias_position(const T* projection, const T* bias,
 // Output is [views * patches_per_view, 3 * patch_size * patch_size].
 template <class T, bool kNhwc>
 __global__ void rgb_u8_to_patches(const uint8_t* images, T* patches, int views,
-                                  int image_size, int patch_size) {
+                                  int image_size, int patch_size, bool staged) {
   const int patches_per_side = image_size / patch_size;
   const int patches_per_view = patches_per_side * patches_per_side;
   const int patch_area = patch_size * patch_size;
@@ -122,8 +122,9 @@ __global__ void rgb_u8_to_patches(const uint8_t* images, T* patches, int views,
                  x) * 3 + channel
               : ((static_cast<int64_t>(view) * 3 + channel) * image_size + y) *
                         image_size + x;
-    const float normalized =
-        (static_cast<float>(images[input_index]) / 255.0f) * 2.0f - 1.0f;
+    const float normalized = staged
+        ? __fsub_rn(to_float(from_float<T>(__fdiv_rn(to_float(from_float<T>(static_cast<float>(images[input_index]))), 127.5f))), 1.0f)
+        : (static_cast<float>(images[input_index]) / 255.0f) * 2.0f - 1.0f;
     patches[output_index] = from_float<T>(normalized);
   }
 }

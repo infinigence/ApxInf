@@ -92,3 +92,7 @@ required-features = ["cuda"]
 [[example]]
 name = "d3_decision_index"
 required-features = ["cuda"]
+
+[[example]]
+name = "cosmos_policy_bench"
+required-features = ["cuda"]

@@ -166,6 +166,15 @@ Any default step is replaceable at construction (`image_pipeline=`,
 `tokenizer=`, `unnormalizer=`, `noise=`) for a custom high-performance
 implementation.
 
+### Cosmos Policy direct mode
+
+`AutoPolicy` recognizes prepared `cosmos-policy` assets. The supported BF16
+LIBERO profile consumes wrist/primary RGB, an explicitly named 9-value state
+field and one of 40 cached task texts. It returns a 16×7 action chunk while the
+native model jointly denoises actions, future state, images and value. Supplied
+noise uses `ModelRunner.initial_latent_shape` (`[1,16,9,28,28]`), independently
+of action shape. See [checkpoint preparation, usage and measured validation](../../doc/cosmos-policy.md).
+
 ### GR00T local assets
 
 `AutoPolicy` dispatches GR00T by its checkpoint config and loads its local

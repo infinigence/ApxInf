@@ -15,6 +15,7 @@ pub mod quantization;
 pub mod rope;
 pub mod sampling;
 pub(crate) mod validation;
+mod volume;
 
 // Keep these crate-private aliases while graph/workspace and unit tests still
 // refer to the GEMM implementation through `crate::ops`.
@@ -61,8 +62,8 @@ pub use gemm::{
     GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales, WeightVersion,
 };
 pub use norm::{
-    fused_add_norm, residual_add, Affine, BiasOrder, FusedAddNormArgs, NormArgs, NormKind,
-    NormNumerics, QuantOut, ResidualAddArgs, ResidualGate,
+    channel_l2_norm, fused_add_norm, residual_add, Affine, BiasOrder, ChannelL2NormArgs,
+    FusedAddNormArgs, NormArgs, NormKind, NormNumerics, QuantOut, ResidualAddArgs, ResidualGate,
 };
 pub use pointwise::{
     pointwise, swiglu_into, PointwiseActivation, PointwiseArgs, PointwiseSemantic,
@@ -83,6 +84,7 @@ pub use rope::{
     RopeSemantic,
 };
 pub use sampling::{argmax, ArgmaxArgs};
+pub use volume::{PreparedUnfold3d, Unfold3dArgs, Unfold3dGeometry};
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(
@@ -128,3 +130,9 @@ pub fn scratch_buffer_tail_zeroed(
 }
 #[cfg(test)]
 mod tests;
+
+mod recurrence;
+pub use recurrence::{F64RecurrenceState, PreparedRecurrence, RecurrenceCoefficients};
+
+mod reduction;
+pub use reduction::PreparedIndexedMean;

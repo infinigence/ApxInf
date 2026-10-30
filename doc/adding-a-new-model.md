@@ -20,6 +20,18 @@ Every model implementation starts in its own directory:
 crates/apxinf-model/src/<model>/
 ```
 
+A new implementation that directly composes one backend's native APIs uses
+`<backend>_<family>/`, for example `cuda_cosmos_policy/`. Preserve existing
+public model names as loader aliases when renaming a native module.
+
+For a single BF16 VLA, follow the PI0.5 responsibility boundaries with one
+`model/blocks/bf16.rs` and one `weights/bf16.rs`, plus host checkpoint storage in
+`weights/host.rs`. A concrete `Bf16Blocks` encapsulates operator calls and
+intermediate representations; the model owns connectivity and the sampling
+schedule. Keep runtime validation/cache and preparation/resource ownership in
+`model_runner/{runner,prepare}.rs`. Split a precision file only for a demonstrated
+maintenance need; subnetwork count alone does not require extra files or traits.
+
 Do not add the new architecture to `llama/`, `qwen3vl/`, or `pi05/`, even when
 most code looks similar. Register the new directory from `lib.rs` and
 `builtin.rs`; keep model detection in the existing registry/`AutoModel` path.
@@ -253,6 +265,9 @@ Complete these steps in the new family's own code and the existing registries:
    `infer`, `prepare` and `infer_host_f32`; add preparation/calibration support
    deliberately instead of inheriting unsupported defaults unknowingly.
 3. Declare the VLA input/output shape and RGB capability in `VlaContract`.
+   Override `VlaRuntime::initial_latent_shape()` when supplied noise has a
+   different geometry from the action output; see the
+   [runtime contract](model-layer-architecture.md#runtime-contracts).
    Use `VlaRequest` for observation, provided latent or RNG key, and applicable
    metadata. Keep family config parsing in the loader. Check the
    [current option limits](model-layer-architecture.md#current-coverage-and-port-decisions)

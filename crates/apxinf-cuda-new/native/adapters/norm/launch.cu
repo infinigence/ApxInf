@@ -137,6 +137,9 @@ bool is_contract(const apxinf_norm_spec_t& spec, uint32_t operation,
 bool valid_contract(const apxinf_norm_spec_t& spec) {
   return
       is_contract(spec, APXINF_NORM_OPERATION_NORM,
+                  APXINF_NORM_STATISTIC_CHANNEL_L2, APXINF_NORM_AFFINE_WEIGHT,
+                  APXINF_NORM_GATE_NONE) ||
+      is_contract(spec, APXINF_NORM_OPERATION_NORM,
                   APXINF_NORM_STATISTIC_RMS, APXINF_NORM_AFFINE_WEIGHT,
                   APXINF_NORM_GATE_NONE) ||
       is_contract(spec, APXINF_NORM_OPERATION_NORM,
@@ -169,6 +172,16 @@ bool valid_contract(const apxinf_norm_spec_t& spec) {
 }
 
 void validate_spec(const apxinf_norm_spec_t& spec) {
+  if (spec.statistic == APXINF_NORM_STATISTIC_CHANNEL_L2 &&
+      !(spec.dtype == APXINF_DTYPE_BF16 &&
+        spec.operation == APXINF_NORM_OPERATION_NORM &&
+        spec.affine == APXINF_NORM_AFFINE_WEIGHT &&
+        spec.gate == APXINF_NORM_GATE_NONE &&
+        spec.quantization == APXINF_NORM_QUANTIZATION_NONE &&
+        spec.numerics == APXINF_NORM_NUMERICS_FLEXIBLE &&
+        spec.weight_offset == 0)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "ChannelL2 requires plain unquantized BF16 weighted normalization");
+  }
   const bool stable_decode_plain =
       is_contract(spec, APXINF_NORM_OPERATION_NORM,
                   APXINF_NORM_STATISTIC_RMS, APXINF_NORM_AFFINE_WEIGHT,
@@ -739,7 +752,10 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
   const int64_t count = spec.rows * spec.cols;
   auto stream = static_cast<cudaStream_t>(bindings.stream);
 
-  if (is_contract(spec, APXINF_NORM_OPERATION_NORM,
+  if (spec.statistic == APXINF_NORM_STATISTIC_CHANNEL_L2) {
+    kernels::channel_l2_norm<T><<<rows, kThreads, 0, stream>>>(
+        input, weight, normalized, rows, cols, bindings.eps);
+  } else if (is_contract(spec, APXINF_NORM_OPERATION_NORM,
                   APXINF_NORM_STATISTIC_RMS,
                   APXINF_NORM_AFFINE_WEIGHT, APXINF_NORM_GATE_NONE)) {
     kernels::rms_norm<T><<<rows, kThreads, 0, stream>>>(

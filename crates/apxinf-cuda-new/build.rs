@@ -387,6 +387,9 @@ fn main() {
         "rope/launch.cu",
         "gather/launch.cu",
         "quantization/launch.cu",
+        "volume.cu",
+        "recurrence.cu",
+        "reduction.cu",
     ]
     .map(|source| adapters.join(source))
     .to_vec();

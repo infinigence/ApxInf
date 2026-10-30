@@ -2979,3 +2979,25 @@ fn attention_semantics_use_distinct_native_registries() {
     assert_ne!(dense_summary, segmented_summary);
     assert_ne!(cache_summary, segmented_summary);
 }
+
+#[test]
+fn video_precision_semantics_reject_incompatible_bindings() {
+    use crate::{ChannelL2NormArgs,F64RecurrenceState,PreparedIndexedMean,PreparedUnfold3d,Unfold3dArgs,Unfold3dGeometry};
+    let ctx=CudaContext::new(0).unwrap();
+    let input=tensor(0,vec![2,3],&[1.;6]);let weight=tensor(0,vec![3],&[1.;3]);
+    let mut out=tensor(0,vec![2,3],&[0.;6]);
+    assert!(crate::channel_l2_norm(&ctx,ChannelL2NormArgs{input:&input,weight:&weight,out:&mut out,eps:0.}).is_err());
+    let secondary=tensor(0,vec![3,2],&[1.;6]);
+    let mut multiply=crate::PointwiseArgs::new(crate::PointwiseSemantic::Multiply,&input,&mut out);
+    multiply.secondary=Some(&secondary);assert!(crate::pointwise(&ctx,multiply).is_err());
+    let state=F64RecurrenceState::new(&ctx,6).unwrap();
+    assert!(state.prepare_reset(&ctx,&input,&out).is_err()); // BF16 is not an FP32 boundary.
+    assert!(PreparedIndexedMean::new(&ctx,&input,&out,&[0;6]).is_err());
+    let volume=input.reshape(vec![1,1,2,3]).unwrap();
+    assert!(PreparedUnfold3d::new(&ctx,Unfold3dArgs{input:&volume,history:None,row_start:0,out:&mut out,
+        geometry:Unfold3dGeometry{kernel:[1;3],stride:[0,1,1],padding_before:[0;3],padding_after:[0;3]}}).is_err());
+    let images=crate::CudaBuffer::alloc(3,0).unwrap();
+    let mut args=crate::GatherArgs::rgb_to_patches(&images,&mut out,crate::GatherPatchGeometry{views:1,image_size:1,patch_size:1,nhwc:true});
+    args.semantic=crate::GatherSemantic::RgbToPatchesStaged;
+    assert!(crate::gather(&ctx,args).is_err());
+}

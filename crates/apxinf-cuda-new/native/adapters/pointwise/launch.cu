@@ -26,7 +26,8 @@ bool valid_alignment(uint32_t alignment) {
 }
 
 bool reads_secondary(uint32_t semantic) {
-  return semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE;
+  return semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE ||
+         semantic == APXINF_POINTWISE_SEMANTIC_MULTIPLY;
 }
 
 bool may_have_bias(uint32_t semantic) {
@@ -44,8 +45,11 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
       spec.dtype == APXINF_DTYPE_BF16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
   if (spec.version != APXINF_POINTWISE_SPEC_VERSION ||
-      spec.semantic > APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3 ||
-      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
+      spec.semantic > APXINF_POINTWISE_SEMANTIC_MULTIPLY ||
+      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16 &&
+        !(spec.dtype == APXINF_DTYPE_F32 &&
+          (spec.semantic == APXINF_POINTWISE_SEMANTIC_MULTIPLY ||
+           spec.semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE))) ||
       (!quantized_geglu && !quantized_swiglu &&
        spec.output_dtype != spec.dtype) ||
       spec.activation > APXINF_POINTWISE_ACTIVATION_RELU ||
@@ -272,6 +276,9 @@ cudaError_t launch(const apxinf_pointwise_spec_t& spec,
       kernels::euler_update<T><<<grid, kDirectThreads, 0, stream>>>(
           input, secondary, output, count, bindings.dt);
       break;
+    case APXINF_POINTWISE_SEMANTIC_MULTIPLY:
+      kernels::multiply<T><<<grid, kDirectThreads, 0, stream>>>(input, secondary, output, count);
+      break;
     default:
       return cudaErrorInvalidValue;
   }
@@ -355,6 +362,10 @@ extern "C" apxinf_status_t apxinf_pointwise_launch(
           static_cast<int>(spec->rows), static_cast<int>(spec->cols),
           bindings->output_scale,
           static_cast<cudaStream_t>(bindings->stream)));
+      return;
+    }
+    if (spec->dtype == APXINF_DTYPE_F32) {
+      apxinf::framework::check_cuda(launch<float>(*spec, *bindings));
       return;
     }
     apxinf::framework::check_cuda(
