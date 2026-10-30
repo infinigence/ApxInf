@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! bash crates/apxinf-cuda-new/test-new.sh \
-//!   test -p apxinf-cuda --test qwen38_gdn_batched_ops -- --ignored --nocapture
+//!   test -p apxinf-cuda-new --test qwen38_gdn_batched_ops -- --ignored --nocapture
 //! ```
 
 use apxinf_core::{DType, Shape, Tensor};
@@ -92,9 +92,11 @@ fn fused_conv_prepare_matches_separate_and_continues_decode() {
         let channels = (2 * k_heads + v_heads) * 128;
         for tokens in [1usize, 3, 4, 63, 64, 65, 129, 2048] {
             let values: Vec<f32> = (0..tokens * channels)
-                .map(|index| (index as f32 * 0.023).sin() * 3.5).collect();
+                .map(|index| (index as f32 * 0.023).sin() * 3.5)
+                .collect();
             let weights: Vec<f32> = (0..channels * 4)
-                .map(|index| (index as f32 * 0.043).cos() * 0.31).collect();
+                .map(|index| (index as f32 * 0.043).cos() * 0.31)
+                .collect();
             let input = upload_bf16(&ctx, &values, vec![tokens, channels]);
             let weight = upload_bf16(&ctx, &weights, vec![channels, 4]);
             let convolved = zeros(&ctx, vec![tokens, channels], DType::BF16);
@@ -106,25 +108,75 @@ fn fused_conv_prepare_matches_separate_and_continues_decode() {
                 zeros(&ctx, vec![tokens, v_heads], DType::F32),
                 zeros(&ctx, vec![channels, 4], DType::F32),
             ];
-            let candidate: Vec<Tensor> = reference.iter().enumerate().map(|(index, tensor)| {
-                let output = zeros(&ctx, tensor.shape().dims().to_vec(), tensor.dtype());
-                let buffer = CudaBuffer::from_tensor(&output).unwrap();
-                buffer.copy_from_host(&vec![0xaa + index as u8; buffer.len()]).unwrap();
-                output
-            }).collect();
-            ops::gdn_causal_conv_forward(&ctx, &input, &weight, &convolved,
-                Some(&reference[4]), tokens, channels, 4).unwrap();
-            ops::gdn_prepare_flashinfer(&ctx, &convolved, &reference[0], &reference[1],
-                &reference[2], &decay, &reference[3], tokens, channels, k_heads, v_heads, 128, 1e-6).unwrap();
-            ops::gdn_conv_prepare_flashinfer(&ctx, &input, &weight, &candidate[4],
-                &candidate[0], &candidate[1], &candidate[2], &decay, &candidate[3],
-                tokens, k_heads, v_heads, 1e-6).unwrap();
+            let candidate: Vec<Tensor> = reference
+                .iter()
+                .enumerate()
+                .map(|(index, tensor)| {
+                    let output = zeros(&ctx, tensor.shape().dims().to_vec(), tensor.dtype());
+                    let buffer = CudaBuffer::from_tensor(&output).unwrap();
+                    buffer
+                        .copy_from_host(&vec![0xaa + index as u8; buffer.len()])
+                        .unwrap();
+                    output
+                })
+                .collect();
+            ops::gdn_causal_conv_forward(
+                &ctx,
+                &input,
+                &weight,
+                &convolved,
+                Some(&reference[4]),
+                tokens,
+                channels,
+                4,
+            )
+            .unwrap();
+            ops::gdn_prepare_prefill(
+                &ctx,
+                &convolved,
+                &reference[0],
+                &reference[1],
+                &reference[2],
+                &decay,
+                &reference[3],
+                tokens,
+                channels,
+                k_heads,
+                v_heads,
+                128,
+                1e-6,
+            )
+            .unwrap();
+            ops::gdn_conv_prepare(
+                &ctx,
+                &input,
+                &weight,
+                &candidate[4],
+                &candidate[0],
+                &candidate[1],
+                &candidate[2],
+                &decay,
+                &candidate[3],
+                tokens,
+                k_heads,
+                v_heads,
+                1e-6,
+            )
+            .unwrap();
             ctx.synchronize().unwrap();
             for (index, (expected, actual)) in reference.iter().zip(&candidate).enumerate() {
-                assert_eq!(read(expected), read(actual), "tokens={tokens}, heads={k_heads}/{v_heads}, output={index}");
+                assert_eq!(
+                    read(expected),
+                    read(actual),
+                    "tokens={tokens}, heads={k_heads}/{v_heads}, output={index}"
+                );
                 if index < 3 {
-                    assert!(read(actual).chunks_exact(2).all(|bytes|
-                        half::f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).is_finite()));
+                    assert!(read(actual)
+                        .chunks_exact(2)
+                        .all(|bytes| half::f16::from_bits(u16::from_le_bytes([
+                            bytes[0], bytes[1]
+                        ]))
+                        .is_finite()));
                 } else {
                     assert!(read_f32(actual).iter().all(|value| value.is_finite()));
                 }
@@ -171,7 +223,9 @@ fn fused_fp16_gated_norm_matches_explicit_bf16_conversion() {
             .collect();
         let buffer = CudaBuffer::alloc(bytes.len(), ctx.device_id()).unwrap();
         buffer.copy_from_host(&bytes).unwrap();
-        let input = buffer.as_tensor(Shape::new(dims.clone()), DType::F16).unwrap();
+        let input = buffer
+            .as_tensor(Shape::new(dims.clone()), DType::F16)
+            .unwrap();
         let gate_values: Vec<f32> = (0..count)
             .map(|index| ((index * 7919 % 65536) as f32 - 32768.0) / 4096.0)
             .collect();
@@ -179,18 +233,57 @@ fn fused_fp16_gated_norm_matches_explicit_bf16_conversion() {
         let wide = zeros(&ctx, dims.clone(), DType::BF16);
         let expected = zeros(&ctx, dims.clone(), DType::BF16);
         let actual = zeros(&ctx, dims, DType::BF16);
-        CudaBuffer::from_tensor(&expected).unwrap().copy_from_host(&vec![0xaa; count * 2]).unwrap();
-        CudaBuffer::from_tensor(&actual).unwrap().copy_from_host(&vec![0x55; count * 2]).unwrap();
-        ops::convert_f16_to_bf16(&ctx, &input, &wide, count).unwrap();
-        ops::gdn_gated_norm_seq(&ctx, &wide, &gate, &weight, &expected, tokens, heads, head_dim, 1e-6).unwrap();
-        ops::gdn_gated_norm_seq(&ctx, &input, &gate, &weight, &actual, tokens, heads, head_dim, 1e-6).unwrap();
+        CudaBuffer::from_tensor(&expected)
+            .unwrap()
+            .copy_from_host(&vec![0xaa; count * 2])
+            .unwrap();
+        CudaBuffer::from_tensor(&actual)
+            .unwrap()
+            .copy_from_host(&vec![0x55; count * 2])
+            .unwrap();
+        ops::quantization::cast(&ctx, &input, &wide).unwrap();
+        ops::gdn_gated_norm(
+            &ctx,
+            ops::GdnGatedNormArgs {
+                input: &wide,
+                gate: ops::GdnGate::Dense(&gate),
+                weight: &weight,
+                output: &expected,
+                quantized: None,
+                epsilon: 1e-6,
+            },
+        )
+        .unwrap();
+        ops::gdn_gated_norm(
+            &ctx,
+            ops::GdnGatedNormArgs {
+                input: &input,
+                gate: ops::GdnGate::Dense(&gate),
+                weight: &weight,
+                output: &actual,
+                quantized: None,
+                epsilon: 1e-6,
+            },
+        )
+        .unwrap();
         ctx.synchronize().unwrap();
         let produced = read_bf16(&actual);
         assert_eq!(produced.len(), count);
         assert!(produced.iter().all(|value| value.is_finite()));
         assert_eq!(produced, read_bf16(&expected), "tokens={tokens}");
         let wrong_type = zeros(&ctx, vec![tokens, heads, head_dim], DType::F32);
-        assert!(ops::gdn_gated_norm_seq(&ctx, &wrong_type, &gate, &weight, &actual, tokens, heads, head_dim, 1e-6).is_err());
+        assert!(ops::gdn_gated_norm(
+            &ctx,
+            ops::GdnGatedNormArgs {
+                input: &wrong_type,
+                gate: ops::GdnGate::Dense(&gate),
+                weight: &weight,
+                output: &actual,
+                quantized: None,
+                epsilon: 1e-6,
+            },
+        )
+        .is_err());
     }
 }
 
@@ -208,23 +301,48 @@ fn preserved_warp_prepare_matches_four_warp_reduction() {
             .map(|index| ((index * 7919 + 37) % 65536) as f32 / 4096.0 - 8.0)
             .collect();
         let fused = upload_bf16(&ctx, &values, vec![tokens, row_width]);
-        let decay = upload_f32(&ctx, &vec![-0.5; tokens * value_heads], vec![tokens, value_heads]);
-        let make_outputs = || [
-            zeros(&ctx, vec![tokens, key_heads, dim], DType::F16),
-            zeros(&ctx, vec![tokens, key_heads, dim], DType::F16),
-            zeros(&ctx, vec![tokens, value_heads, dim], DType::F16),
-            zeros(&ctx, vec![tokens, value_heads], DType::F32),
-        ];
+        let decay = upload_f32(
+            &ctx,
+            &vec![-0.5; tokens * value_heads],
+            vec![tokens, value_heads],
+        );
+        let make_outputs = || {
+            [
+                zeros(&ctx, vec![tokens, key_heads, dim], DType::F16),
+                zeros(&ctx, vec![tokens, key_heads, dim], DType::F16),
+                zeros(&ctx, vec![tokens, value_heads, dim], DType::F16),
+                zeros(&ctx, vec![tokens, value_heads], DType::F32),
+            ]
+        };
         let baseline = make_outputs();
         let candidate = make_outputs();
         for (variant, outputs) in [("0", &baseline), ("5", &candidate)] {
             std::env::set_var("APXINF_GDN_PREPARE_PARALLEL", variant);
             for output in outputs {
                 let storage = CudaBuffer::from_tensor(output).unwrap();
-                storage.copy_from_host(&vec![if variant == "0" { 0xaa } else { 0x55 }; storage.len()]).unwrap();
+                storage
+                    .copy_from_host(&vec![
+                        if variant == "0" { 0xaa } else { 0x55 };
+                        storage.len()
+                    ])
+                    .unwrap();
             }
-            ops::gdn_prepare_flashinfer(&ctx, &fused, &outputs[0], &outputs[1], &outputs[2],
-                &decay, &outputs[3], tokens, row_width, key_heads, value_heads, dim, 1e-6).unwrap();
+            ops::gdn_prepare_prefill(
+                &ctx,
+                &fused,
+                &outputs[0],
+                &outputs[1],
+                &outputs[2],
+                &decay,
+                &outputs[3],
+                tokens,
+                row_width,
+                key_heads,
+                value_heads,
+                dim,
+                1e-6,
+            )
+            .unwrap();
         }
         ctx.synchronize().unwrap();
         for (expected, actual) in baseline.iter().zip(candidate.iter()) {
@@ -296,31 +414,19 @@ fn batched_conv_matches_the_single_token_path() {
         let stepped_out = zeros(&ctx, vec![tokens, CHANNELS], DType::BF16);
         let stepped_window = zeros(&ctx, vec![CHANNELS, CONV_WIDTH], DType::F32);
         for token in 0..tokens {
-            let token_in = slice_of(
-                &input_device,
-                token * CHANNELS,
-                vec![CHANNELS],
-                DType::BF16,
-            );
-            let token_out = slice_of(
-                &stepped_out,
-                token * CHANNELS,
-                vec![CHANNELS],
-                DType::BF16,
-            );
-            ops::gdn_causal_conv_step(
-                &ctx,
-                &stepped_window,
-                &token_in,
-                &weight_device,
-                &token_out,
-            )
-            .unwrap();
+            let token_in = slice_of(&input_device, token * CHANNELS, vec![CHANNELS], DType::BF16);
+            let token_out = slice_of(&stepped_out, token * CHANNELS, vec![CHANNELS], DType::BF16);
+            ops::gdn_causal_conv_step(&ctx, &stepped_window, &token_in, &weight_device, &token_out)
+                .unwrap();
         }
         ctx.synchronize().unwrap();
 
         let worst = worst_relative(&read_bf16(&batched_out), &read_bf16(&stepped_out));
-        assert_eq!(read_bf16(&batched_out), read_bf16(&stepped_out), "conv bit equality, tokens={tokens}");
+        assert_eq!(
+            read_bf16(&batched_out),
+            read_bf16(&stepped_out),
+            "conv bit equality, tokens={tokens}"
+        );
         println!("tokens={tokens:3}  conv output worst relative: {worst:.6}");
         // Both paths accumulate in f32 and round once to BF16, so they should
         // agree to the last bit; the tolerance only allows for the two loops
@@ -332,9 +438,12 @@ fn batched_conv_matches_the_single_token_path() {
 
         // The window hand-off. A prefill that produces correct outputs but a
         // wrong window still breaks the very next decode step.
-        let window_worst =
-            worst_relative(&read_f32(&batched_window), &read_f32(&stepped_window));
-        assert_eq!(read_f32(&batched_window), read_f32(&stepped_window), "conv state equality, tokens={tokens}");
+        let window_worst = worst_relative(&read_f32(&batched_window), &read_f32(&stepped_window));
+        assert_eq!(
+            read_f32(&batched_window),
+            read_f32(&stepped_window),
+            "conv state equality, tokens={tokens}"
+        );
         println!("tokens={tokens:3}  conv window  worst relative: {window_worst:.6}");
         assert!(
             window_worst < 1e-3,
@@ -374,10 +483,14 @@ fn decode_continues_correctly_after_a_batched_conv() {
         CONV_WIDTH,
     )
     .unwrap();
-    let last_in = slice_of(&input_device, prompt * CHANNELS, vec![CHANNELS], DType::BF16);
+    let last_in = slice_of(
+        &input_device,
+        prompt * CHANNELS,
+        vec![CHANNELS],
+        DType::BF16,
+    );
     let last_out = slice_of(&prefill_out, prompt * CHANNELS, vec![CHANNELS], DType::BF16);
-    ops::gdn_causal_conv_step(&ctx, &prefill_window, &last_in, &weight_device, &last_out)
-        .unwrap();
+    ops::gdn_causal_conv_step(&ctx, &prefill_window, &last_in, &weight_device, &last_out).unwrap();
 
     // Reference: every token through the single-token path.
     let stepped_out = zeros(&ctx, vec![total, CHANNELS], DType::BF16);
@@ -431,16 +544,16 @@ fn sequence_decay_and_beta_matches_the_per_token_kernel() {
 
     let decay = zeros(&ctx, vec![tokens, HEADS], DType::F32);
     let beta = zeros(&ctx, vec![tokens, HEADS], DType::F32);
-    ops::gdn_decay_and_beta_seq(
+    ops::gdn_decay_and_beta(
         &ctx,
-        &a_device,
-        &b_device,
-        &a_log_device,
-        &dt_bias_device,
-        &decay,
-        &beta,
-        tokens,
-        HEADS,
+        ops::GdnDecayAndBetaArgs {
+            a: &a_device,
+            b: &b_device,
+            a_log: &a_log_device,
+            dt_bias: &dt_bias_device,
+            decay: &decay,
+            beta: &beta,
+        },
     )
     .unwrap();
 
@@ -449,12 +562,14 @@ fn sequence_decay_and_beta_matches_the_per_token_kernel() {
     for token in 0..tokens {
         ops::gdn_decay_and_beta(
             &ctx,
-            &slice_of(&a_device, token * HEADS, vec![HEADS], DType::BF16),
-            &slice_of(&b_device, token * HEADS, vec![HEADS], DType::BF16),
-            &a_log_device,
-            &dt_bias_device,
-            &slice_of(&stepped_decay, token * HEADS, vec![HEADS], DType::F32),
-            &slice_of(&stepped_beta, token * HEADS, vec![HEADS], DType::F32),
+            ops::GdnDecayAndBetaArgs {
+                a: &slice_of(&a_device, token * HEADS, vec![HEADS], DType::BF16),
+                b: &slice_of(&b_device, token * HEADS, vec![HEADS], DType::BF16),
+                a_log: &a_log_device,
+                dt_bias: &dt_bias_device,
+                decay: &slice_of(&stepped_decay, token * HEADS, vec![HEADS], DType::F32),
+                beta: &slice_of(&stepped_beta, token * HEADS, vec![HEADS], DType::F32),
+            },
         )
         .unwrap();
     }
@@ -466,6 +581,27 @@ fn sequence_decay_and_beta_matches_the_per_token_kernel() {
     // Identical arithmetic in both kernels, so this should be exact.
     assert!(decay_worst < 1e-6, "sequence decay diverged: {decay_worst}");
     assert!(beta_worst < 1e-6, "sequence beta diverged: {beta_worst}");
+
+    let graph_decay = zeros(&ctx, vec![tokens, HEADS], DType::F32);
+    let graph_beta = zeros(&ctx, vec![tokens, HEADS], DType::F32);
+    let graph = apxinf_cuda_new::capture(&ctx, || {
+        ops::gdn_decay_and_beta(
+            &ctx,
+            ops::GdnDecayAndBetaArgs {
+                a: &a_device,
+                b: &b_device,
+                a_log: &a_log_device,
+                dt_bias: &dt_bias_device,
+                decay: &graph_decay,
+                beta: &graph_beta,
+            },
+        )
+    })
+    .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(read_f32(&graph_decay), read_f32(&decay));
+    assert_eq!(read_f32(&graph_beta), read_f32(&beta));
 }
 
 /// Sequence-axis gated norm against the per-token kernel.
@@ -491,16 +627,16 @@ fn sequence_gated_norm_matches_the_per_token_kernel() {
     let weight_device = upload_bf16(&ctx, &weight, vec![HEAD_DIM]);
 
     let output = zeros(&ctx, vec![tokens, HEADS, HEAD_DIM], DType::BF16);
-    ops::gdn_gated_norm_seq(
+    ops::gdn_gated_norm(
         &ctx,
-        &input_device,
-        &gate_device,
-        &weight_device,
-        &output,
-        tokens,
-        HEADS,
-        HEAD_DIM,
-        1e-6,
+        ops::GdnGatedNormArgs {
+            input: &input_device,
+            gate: ops::GdnGate::Dense(&gate_device),
+            weight: &weight_device,
+            output: &output,
+            quantized: None,
+            epsilon: 1e-6,
+        },
     )
     .unwrap();
 
@@ -509,11 +645,29 @@ fn sequence_gated_norm_matches_the_per_token_kernel() {
     for token in 0..tokens {
         ops::gdn_gated_norm(
             &ctx,
-            &slice_of(&input_device, token * head_span, vec![HEADS, HEAD_DIM], DType::BF16),
-            &slice_of(&gate_device, token * head_span, vec![HEADS, HEAD_DIM], DType::BF16),
-            &weight_device,
-            &slice_of(&stepped, token * head_span, vec![HEADS, HEAD_DIM], DType::BF16),
-            1e-6,
+            ops::GdnGatedNormArgs {
+                input: &slice_of(
+                    &input_device,
+                    token * head_span,
+                    vec![HEADS, HEAD_DIM],
+                    DType::BF16,
+                ),
+                gate: ops::GdnGate::Dense(&slice_of(
+                    &gate_device,
+                    token * head_span,
+                    vec![HEADS, HEAD_DIM],
+                    DType::BF16,
+                )),
+                weight: &weight_device,
+                output: &slice_of(
+                    &stepped,
+                    token * head_span,
+                    vec![HEADS, HEAD_DIM],
+                    DType::BF16,
+                ),
+                quantized: None,
+                epsilon: 1e-6,
+            },
         )
         .unwrap();
     }

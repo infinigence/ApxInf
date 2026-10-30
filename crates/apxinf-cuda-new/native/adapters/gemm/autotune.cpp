@@ -27,7 +27,9 @@ class GemmTuningProblem {
         eligible_(eligible),
         output_(static_cast<size_t>(
                     spec.m *
-                    (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU
+                    ((spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU ||
+                      spec.semantic ==
+                          APXINF_GEMM_SEMANTIC_GEMM_SWIGLU)
                          ? spec.n / 2
                          : spec.n)) *
                 dtype_bytes(spec.output_dtype)),

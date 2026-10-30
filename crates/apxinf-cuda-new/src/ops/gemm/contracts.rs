@@ -41,6 +41,8 @@ pub enum GemmAlgorithmPolicy {
 pub struct GemmPolicy {
     /// Accumulation precision is part of the GEMM key, not a candidate detail.
     pub accumulation_dtype: DType,
+    /// Provider-neutral numerical behavior required by the caller.
+    pub numerics: GemmNumerics,
     pub workspace_limit: usize,
     pub online_tune: bool,
     pub allow_fallback: bool,
@@ -55,6 +57,7 @@ impl Default for GemmPolicy {
     fn default() -> Self {
         Self {
             accumulation_dtype: DType::F32,
+            numerics: GemmNumerics::Default,
             workspace_limit: 256 * 1024 * 1024,
             online_tune: true,
             allow_fallback: true,
@@ -64,6 +67,15 @@ impl Default for GemmPolicy {
             cache_dir: None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GemmNumerics {
+    #[default]
+    Default,
+    /// Preserve the established shared-cuBLAS BF16 reduction path. This is a
+    /// semantic constraint; native dispatch still owns the provider choice.
+    LegacyCublas,
 }
 
 /// Parameters common to the GEMM semantic operators.
@@ -76,6 +88,7 @@ pub struct GemmArgs<'a> {
     /// Canonical row-major output `[M, N]`. GEMM mutates this tensor.
     pub out: &'a mut Tensor,
     pub quantization: GemmQuantization<'a>,
+    pub weight_layout: GemmWeightLayout,
     pub alpha: f32,
     pub output_scale: f32,
     pub policy: GemmPolicy,
@@ -86,9 +99,19 @@ pub struct GemmArgs<'a> {
     /// identity: both the tensor address and this version identify a prepared
     /// weight.
     pub weight_version: Option<WeightVersion>,
-    /// Store B as contiguous [N,K] for single-round GEMM+bias. Other
-    /// semantics and quantized operands currently require their default layout.
-    pub b_transposed: bool,
+
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GemmWeightLayout {
+    #[default]
+    Kn,
+    /// Physical checkpoint layout `[N, K]`, used by W8A8 and packed NVFP4.
+    OutputMajor,
+    /// Physical `[K, 2N]` projection with each gate tile immediately followed
+    /// by the matching up tile. The tile width is an operand-layout property;
+    /// candidates decide whether they support the requested width.
+    GateUpPairs { pair_width: usize },
 }
 
 /// Quantization contract for the operands supplied to one GEMM call.
@@ -142,61 +165,55 @@ impl<'a> GemmArgs<'a> {
             b,
             out,
             quantization: GemmQuantization::None,
+            weight_layout: GemmWeightLayout::Kn,
             alpha: 1.0,
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
-            b_transposed: false,
         }
     }
 
-    pub fn fp8(
+    /// Construct a GEMM whose quantized operands carry one scale per A row
+    /// and B output channel. The operand dtype selects FP8 versus INT8 while
+    /// the public entry point remains format-neutral.
+    pub fn row_channel_quantized(
         a: &'a Tensor,
         row_scales: &'a Tensor,
         b: &'a Tensor,
         channel_scales: &'a Tensor,
         out: &'a mut Tensor,
     ) -> Self {
-        Self {
-            a,
-            b,
-            out,
-            quantization: GemmQuantization::Fp8 {
-                row_scales,
-                channel_scales,
-            },
-            alpha: 1.0,
-            output_scale: 1.0,
-            policy: GemmPolicy::default(),
-            weight_version: None,
-            b_transposed: false,
-        }
-    }
-
-    pub fn w8a8(
-        a: &'a Tensor,
-        row_scales: &'a Tensor,
-        b: &'a Tensor,
-        channel_scales: &'a Tensor,
-        out: &'a mut Tensor,
-    ) -> Self {
+        let (quantization, accumulation_dtype) = if a.dtype() == DType::I8 {
+            (
+                GemmQuantization::W8A8 {
+                    row_scales,
+                    channel_scales,
+                },
+                DType::I32,
+            )
+        } else {
+            (
+                GemmQuantization::Fp8 {
+                    row_scales,
+                    channel_scales,
+                },
+                DType::F32,
+            )
+        };
         let policy = GemmPolicy {
-            accumulation_dtype: DType::I32,
+            accumulation_dtype,
             ..GemmPolicy::default()
         };
         Self {
             a,
             b,
             out,
-            quantization: GemmQuantization::W8A8 {
-                row_scales,
-                channel_scales,
-            },
+            quantization,
+            weight_layout: GemmWeightLayout::Kn,
             alpha: 1.0,
             output_scale: 1.0,
             policy,
             weight_version: None,
-            b_transposed: false,
         }
     }
 
@@ -207,11 +224,17 @@ impl<'a> GemmArgs<'a> {
         self
     }
 
+    /// Consume a W8A8 checkpoint weight stored physically as `[N, K]`.
+    pub fn with_output_major_weight(mut self) -> Self {
+        self.weight_layout = GemmWeightLayout::OutputMajor;
+        self
+    }
+
     /// NVFP4 GEMM over packed E2M1 operands with per-block E4M3 scales.
     ///
     /// `alpha` carries the product of the per-tensor scales; pass 1.0 when the
     /// operands are already absolutely scaled.
-    pub fn nvfp4(
+    pub fn block_quantized(
         a: &'a Tensor,
         a_block_scales: &'a Tensor,
         b: &'a Tensor,
@@ -229,11 +252,11 @@ impl<'a> GemmArgs<'a> {
                 b_block_scales,
                 block_size,
             },
+            weight_layout: GemmWeightLayout::OutputMajor,
             alpha,
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
-            b_transposed: false,
         }
     }
 }
@@ -245,7 +268,8 @@ pub(crate) enum Semantic {
     GemmGeglu = 2,
     GemmBias = 3,
     GemmBiasResidual = 4,
-    GemmBiasSingleRound = 5,
+    GemmSwiGlu = 5,
+    GemmBiasSingleRound = 6,
 }
 
 #[cfg(test)]
@@ -258,6 +282,7 @@ impl Semantic {
         Self::GemmBiasGelu,
         Self::GemmGeglu,
         Self::GemmBiasResidual,
+        Self::GemmSwiGlu,
         Self::GemmBiasSingleRound,
     ];
 
@@ -271,6 +296,7 @@ impl Semantic {
             Self::GemmBiasGelu => "gemm_bias_gelu",
             Self::GemmGeglu => "gemm_geglu",
             Self::GemmBiasResidual => "gemm_bias_residual",
+            Self::GemmSwiGlu => "gemm_swiglu",
             Self::GemmBiasSingleRound => "gemm_bias_single_round",
         }
     }
@@ -407,18 +433,21 @@ fn normalize_fused<'a>(
     if a_shape.len() != 2 || b_shape.len() != 2 {
         return Err(invalid("GEMM requires rank-2 tensors"));
     }
-    if args.b_transposed
-        && (semantic != Semantic::GemmBiasSingleRound
-            || !matches!(args.quantization, GemmQuantization::None))
-    {
-        return Err(invalid(
-            "transposed B is supported only by unquantized single-round GEMM+bias",
-        ));
-    }
+
     let nvfp4 = matches!(args.quantization, GemmQuantization::Nvfp4 { .. });
-    // Layout is explicit and candidate-independent. Single-round bias admits
-    // original linear weights [N,K]; other floating-point contracts use [K,N].
-    // NVFP4 packs two values per byte along K, with weight storage [N,K/2].
+    let (output_major, gate_up_pair_width) = match args.weight_layout {
+        GemmWeightLayout::Kn => (false, None),
+        GemmWeightLayout::OutputMajor => (true, None),
+        GemmWeightLayout::GateUpPairs { pair_width } => (false, Some(pair_width)),
+    };
+    // Public storage is deliberately canonical and candidate-independent.
+    // Candidates may transpose or pack internally while preparing an execution.
+    //
+    // NVFP4 is the one contract whose canonical storage is not `A=[M,K]`,
+    // `B=[K,N]`: both operands are packed two-values-per-byte along K, and the
+    // weight is stored `[N, K/2]`. That is how the checkpoint already stores it
+    // and what the block-scaled kernel consumes, so demanding the usual [K,N]
+    // orientation would force a transpose that buys nothing.
     let (m, k) = if nvfp4 {
         (a_shape[0], a_shape[1] * 2)
     } else {
@@ -426,7 +455,7 @@ fn normalize_fused<'a>(
     };
     let (weight_k, n) = if nvfp4 {
         (b_shape[1] * 2, b_shape[0])
-    } else if args.b_transposed {
+    } else if output_major {
         (b_shape[1], b_shape[0])
     } else {
         (b_shape[0], b_shape[1])
@@ -441,16 +470,45 @@ fn normalize_fused<'a>(
     {
         return Err(invalid("invalid GEMM dimensions"));
     }
-    if semantic == Semantic::GemmGeglu && n % 2 != 0 {
-        return Err(invalid("GEMM+GeGLU requires an even projection width"));
+    if matches!(semantic, Semantic::GemmGeglu | Semantic::GemmSwiGlu) && n % 2 != 0 {
+        return Err(invalid("gated GEMM requires an even projection width"));
+    }
+    if (semantic == Semantic::GemmSwiGlu) != gate_up_pair_width.is_some() {
+        return Err(invalid(
+            "gate/up-pair weight layout is required only by GEMM+SwiGLU",
+        ));
+    }
+    if semantic == Semantic::GemmSwiGlu
+        && (gate_up_pair_width != Some(256)
+            || args.a.dtype() != DType::BF16
+            || args.b.dtype() != DType::BF16
+            || args.out.dtype() != DType::BF16
+            || n % 512 != 0
+            || args.alpha != 1.0
+            || args.output_scale != 1.0)
+    {
+        return Err(invalid(
+            "pair-interleaved SwiGLU requires BF16, 256-column gate/up pairs, and unit scales",
+        ));
     }
     if !args.alpha.is_finite() || !args.output_scale.is_finite() || args.output_scale <= 0.0 {
         return Err(invalid("invalid GEMM scales"));
     }
-    let needs_bias = matches!(
-        semantic,
-        Semantic::GemmBias | Semantic::GemmBiasGelu | Semantic::GemmBiasSingleRound
-    );
+    if args.policy.numerics == GemmNumerics::LegacyCublas
+        && (semantic != Semantic::Gemm
+            || !matches!(args.quantization, GemmQuantization::None)
+            || args.weight_layout != GemmWeightLayout::Kn
+            || args.a.dtype() != DType::BF16
+            || args.b.dtype() != DType::BF16
+            || args.out.dtype() != DType::BF16
+            || args.alpha != 1.0
+            || args.output_scale != 1.0)
+    {
+        return Err(invalid(
+            "legacy cuBLAS numerics require unit-scale canonical BF16 GEMM",
+        ));
+    }
+    let needs_bias = matches!(semantic, Semantic::GemmBias | Semantic::GemmBiasGelu | Semantic::GemmBiasSingleRound);
     let allows_bias = needs_bias || semantic == Semantic::GemmBiasResidual;
     if (bias.is_some() && !allows_bias) || (bias.is_none() && needs_bias) {
         return Err(invalid("fused operands do not match the semantic operator"));
@@ -492,7 +550,10 @@ fn normalize_fused<'a>(
             if args.a.dtype() != DType::I8
                 || args.b.dtype() != DType::I8
                 || args.out.dtype() != DType::BF16
-                || !matches!(semantic, Semantic::Gemm | Semantic::GemmBias)
+                || !matches!(
+                    semantic,
+                    Semantic::Gemm | Semantic::GemmBias | Semantic::GemmBiasGelu
+                )
                 || k > 131071
             {
                 return Err(invalid("invalid W8A8 GEMM contract"));
@@ -532,8 +593,16 @@ fn normalize_fused<'a>(
         ));
     }
     let has_row_channel_scales = matches!(quantization, 2 | 3);
-    if semantic == Semantic::GemmGeglu && has_row_channel_scales {
-        return Err(invalid("scaled GEMM+GeGLU is unsupported"));
+    let plain_output_major = output_major && quantization == 0;
+    if (output_major && !plain_output_major && !matches!(quantization, 3 | 4))
+        || (nvfp4 && !output_major)
+    {
+        return Err(invalid(
+            "output-major GEMM weights require plain, W8A8, or NVFP4 operands",
+        ));
+    }
+    if matches!(semantic, Semantic::GemmGeglu | Semantic::GemmSwiGlu) && has_row_channel_scales {
+        return Err(invalid("scaled gated GEMM is unsupported"));
     }
     if semantic == Semantic::GemmBiasResidual
         && (quantization != 1 || args.out.dtype() != DType::F16)
@@ -547,7 +616,7 @@ fn normalize_fused<'a>(
         tensor_storage(ctx, args.a, args.a.dtype(), a_shape)?,
         tensor_storage(ctx, args.b, args.b.dtype(), b_shape)?,
     ];
-    let output_width = if semantic == Semantic::GemmGeglu {
+    let output_width = if matches!(semantic, Semantic::GemmGeglu | Semantic::GemmSwiGlu) {
         n / 2
     } else {
         n
@@ -671,16 +740,28 @@ fn normalize_fused<'a>(
     }
     storage.push(output_buffer);
 
+    let mut policy = args.policy.clone();
+    if policy.cache_dir.is_none() {
+        policy.cache_dir = ctx.recipe_cache_dir().map(str::to_owned);
+    }
     Ok(Normalized {
         spec: abi::Spec {
-            version: 9,
+            version: 11,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,
             accumulation_dtype: dtype(args.policy.accumulation_dtype)?,
             output_dtype: dtype(args.out.dtype())?,
             quantization,
-            b_transposed: u32::from(args.b_transposed),
+            b_layout: match args.weight_layout {
+                GemmWeightLayout::Kn => 0,
+                GemmWeightLayout::OutputMajor => 1,
+                GemmWeightLayout::GateUpPairs { .. } => 2,
+            },
+            numerics: match args.policy.numerics {
+                GemmNumerics::Default => 0,
+                GemmNumerics::LegacyCublas => 1,
+            },
             b_is_immutable: bindings.b_is_immutable,
             a_alignment: alignment_class(bindings.a),
             b_alignment: alignment_class(bindings.b),
@@ -700,7 +781,7 @@ fn normalize_fused<'a>(
             alpha_is_unit: u32::from(args.alpha == 1.0),
             output_scale_is_unit: u32::from(args.output_scale == 1.0),
         },
-        policy: args.policy,
+        policy,
         bindings,
         storage,
     })

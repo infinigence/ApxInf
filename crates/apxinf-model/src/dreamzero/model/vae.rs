@@ -294,7 +294,7 @@ fn promoted_normalization(
         ctx,
         ops::QuantizationArgs::new(ops::QuantizationSemantic::CastBf16ToF32, gamma, &mut weight),
     )?;
-    ops::l2_norm_rounded(ctx, &a, &mut b, 1e-12)?;
+    crate::dreamzero::backend::staged_l2(ctx, &a, &mut b, 1e-12)?;
     let mut scale = ops::PointwiseArgs::new(S::Scale, &b, &mut a);
     scale.dt = (shape[1] as f32).sqrt();
     ops::pointwise(ctx, scale)?;
@@ -325,7 +325,7 @@ fn normalized_silu(ctx: &Context, s: &VaeWorkspace, x: &Tensor, gamma: &Tensor) 
     let mut norm = s.slot(2, shape)?;
     let mut scaled = s.slot(3, shape)?;
     let mut weighted = s.slot(4, shape)?;
-    ops::l2_norm_rounded(ctx, &input, &mut norm, 1e-12)?;
+    crate::dreamzero::backend::staged_l2(ctx, &input, &mut norm, 1e-12)?;
     let mut args = ops::PointwiseArgs::new(S::Scale, &norm, &mut scaled);
     args.dt = (shape[1] as f32).sqrt();
     ops::pointwise(ctx, args)?;
@@ -450,7 +450,7 @@ pub(in crate::dreamzero) fn encode(
         let mut norm = s.slot(2, input.shape().dims())?;
         let mut scaled = s.slot(3, input.shape().dims())?;
         let mut normalized = s.slot(4, input.shape().dims())?;
-        ops::l2_norm_rounded(ctx, &input, &mut norm, 1e-12)?;
+        crate::dreamzero::backend::staged_l2(ctx, &input, &mut norm, 1e-12)?;
         let mut scale = ops::PointwiseArgs::new(S::Scale, &norm, &mut scaled);
         scale.dt = 384f32.sqrt();
         ops::pointwise(ctx, scale)?;

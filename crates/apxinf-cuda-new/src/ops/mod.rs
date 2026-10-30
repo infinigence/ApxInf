@@ -2,19 +2,21 @@
 
 mod convolution;
 pub use convolution::{convolution3d, convolution_cudnn_version};
-
-mod attention;
-mod attn_ops;
-mod cache;
-mod gather;
-mod gdn;
-mod gemm;
-pub mod mlp;
-mod model;
-mod norm;
-mod pointwise;
-mod quantization;
-mod rope;
+pub mod attention;
+pub mod cache;
+pub mod elementwise;
+pub mod embedding;
+pub mod gather;
+pub mod gdn;
+pub mod gemm;
+pub mod norm;
+pub mod pillow_bicubic;
+pub mod pointwise;
+pub mod preprocess;
+pub mod quantization;
+pub mod rope;
+pub mod sampling;
+pub(crate) mod validation;
 
 // Keep these crate-private aliases while graph/workspace and unit tests still
 // refer to the GEMM implementation through `crate::ops`.
@@ -30,48 +32,62 @@ pub(crate) use gemm::gemm_execution as execution;
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 pub use attention::{
+    apply_output_gate, split_query_and_gate, OutputGateArgs, OutputGateNumerics, OutputGateSource,
+};
+pub use attention::{
     attention, decode_attention, decode_attention_workspace_bytes, kv_cache_attention,
-    packed_qkv_attention, rounded_additive_attention, segmented_attention, AttentionArgs,
-    AttentionMask, AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta,
-    PackedQkvAttentionArgs, RoundedAttentionBiasArgs, SegmentedAttentionArgs,
+    segmented_attention, AttentionArgs, AttentionInput, AttentionMask, AttentionNumerics,
+    AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta, SegmentedAttentionArgs,
+    rounded_additive_attention, RoundedAttentionBiasArgs,
 };
-pub use attn_ops::{
-    apply_output_gate, head_rms_norm, partial_rope, rotary_dim, split_query_and_gate,
+pub use cache::core::{append as cache_append, concat_rows, copy_tensor, reserve_prefix};
+pub use elementwise::add_into;
+pub use elementwise::core::{
+    activation as elementwise_activation, add as elementwise_add, add_bias as elementwise_add_bias,
+    mul as elementwise_mul, scale as elementwise_scale, ElementwiseActivation,
 };
-pub use cache::{concat_rows, reserve_prefix};
 pub use gather::{
-    gather, permute, resize_bicubic, unfold3d, unfold3d_blocked, GatherArgs, GatherSemantic,
-    PatchGeometry as GatherPatchGeometry, Unfold3dGeometry,
+    embedding_gather, gather, EmbeddingScale, GatherArgs, GatherSemantic,
+    PatchGeometry as GatherPatchGeometry,
 };
 pub use gdn::{
-    gdn_causal_conv_forward, gdn_causal_conv_step, gdn_chunk_scan, gdn_chunk_scan_interleaved,
-    gdn_conv_prepare, gdn_decay_and_beta, gdn_decay_and_beta_seq, gdn_gated_norm,
-    gdn_gated_norm_quantize, gdn_gated_norm_seq, gdn_gated_norm_seq_f16, gdn_l2_normalize_heads,
-    gdn_prefill, gdn_prefill_workspace_bytes, gdn_prepare_prefill, gdn_recurrent_step,
-    gdn_state_elements, gdn_widen_f16_to_bf16,
+    gdn_causal_conv_forward, gdn_causal_conv_step, gdn_chunk_scan, gdn_continue, gdn_conv_prepare,
+    gdn_decay_and_beta, gdn_first_prefill, gdn_gated_norm, gdn_l2_normalize_heads, gdn_prefill,
+    gdn_prefill_workspace_bytes, gdn_prepare_prefill, gdn_recurrent_step, gdn_state_elements,
+    GdnChunkScanArgs, GdnChunkScanInput, GdnContinuationArgs, GdnDecayAndBetaArgs,
+    GdnFirstPrefillArgs, GdnGate, GdnGatedNormArgs, GdnQuantizedOutput,
 };
 pub use gemm::{
-    gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_bias_single_round, gemm_geglu,
-    nvfp4_gemm_swiglu, nvfp4_pack_block_scales, nvfp4_quantize_activation, nvfp4_quantize_rms_norm,
-    nvfp4_quantize_swiglu, nvfp4_scale_buffer_bytes, GemmAlgorithmPolicy, GemmArgs, GemmBiasArgs,
-    GemmBiasGeluArgs, GemmBiasResidualArgs, GemmGegluArgs, GemmPolicy, GemmQuantization,
-    ScaleLayout, WeightVersion,
+    gemm_bias_single_round, GemmAlgorithmPolicy,
+    gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, gemm_swiglu, gemv, gemv_bias,
+    pack_swiglu_weight_host, BlockQuantizedSwiGluArgs, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs,
+    GemmBiasResidualArgs, GemmGegluArgs, GemmNumerics, GemmPolicy, GemmQuantization,
+    GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales, WeightVersion,
 };
-pub use mlp::{add_into, fp8_gemv, nvfp4_gemv, quantize_fp8_per_tensor, swiglu};
-pub use model::{argmax, embedding_gather};
+pub use gather::{permute,resize_bicubic,unfold3d,unfold3d_blocked,Unfold3dGeometry};
 pub use norm::{
-    ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm, bias_residual,
-    bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual, l2_norm_rounded,
-    layer_norm, rms_norm, rms_norm_rounded, AdaGateResidualArgs, AdaGateResidualRmsNormArgs,
-    AdaptiveRmsNormArgs, BiasResidualArgs, BiasResidualLayerNormArgs, BiasResidualRmsNormArgs,
-    BiasThenResidualArgs, LayerNormArgs, RmsNormArgs,
+    norm, fused_add_norm, residual_add, Affine, BiasOrder, FusedAddNormArgs, NormArgs, NormKind,
+    NormNumerics, QuantOut, ResidualAddArgs, ResidualGate,
 };
-pub use pointwise::{pointwise, PointwiseActivation, PointwiseArgs, PointwiseSemantic};
-pub use quantization::{quantization, QuantizationArgs, QuantizationSemantic};
+pub use pointwise::{
+    pointwise, swiglu_into, PointwiseActivation, PointwiseArgs, PointwiseSemantic,
+};
+pub use preprocess::{vision_position, VisionPositionArgs};
+pub use quantization::{
+    block_quantize, block_scale_buffer_bytes, pack_block_scales, quantization, quantize_per_tensor,
+    BlockQuantizationArgs, BlockQuantizationSemantic, PackBlockScalesArgs, QuantizationArgs,
+    QuantizationSemantic, ScaleLayout,
+};
+pub use rope::apply_vision_2d as rope_apply_vision_2d;
 pub use rope::{
-    complex_rotary, decode_rope, multimodal_rope, rope, split_qkv_axial_rope, AxialRopeArgs,
-    ComplexRotaryTable, DecodeRopeArgs, MultimodalRopeArgs, RopeArgs, RopeSemantic,
+    complex_rotary, ComplexRotaryTable, decode_rope, decode_rotation, execute_batched as rope_apply_batched,
+    execute_mrope as rope_apply_mrope, multimodal_rope, partial_rope, rope, rotary_dim,
+    split_grouped_qkv, split_qkv_axial_rope, split_qkv_cache, split_qkv_mrope_cache, AxialRopeArgs,
+    AxialRopeNumerics, DecodeRopeArgs, DecodeRotationArgs, DecodeRotationPosition,
+    GroupedQkvRopeArgs, MropeCacheArgs, MultimodalRopeArgs, QkvCacheRopeArgs, RopeArgs,
+    RopeSemantic,
 };
+pub use sampling::{argmax, ArgmaxArgs};
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(
@@ -88,6 +104,32 @@ pub fn with_session<T>(
     operation: impl FnOnce() -> apxinf_core::Result<T>,
 ) -> apxinf_core::Result<T> {
     crate::workspace::with_session(session, operation)
+}
+
+/// Session-aware scratch storage for direct-launch operators.
+pub fn scratch_buffer(
+    ctx: &crate::CudaContext,
+    bytes: usize,
+) -> apxinf_core::Result<crate::CudaBuffer> {
+    crate::workspace::output_buffer(ctx, bytes)
+}
+
+/// Session-aware scratch storage that is explicitly cleared before use.
+pub fn scratch_buffer_zeroed(
+    ctx: &crate::CudaContext,
+    bytes: usize,
+) -> apxinf_core::Result<crate::CudaBuffer> {
+    crate::workspace::output_buffer_zeroed(ctx, bytes)
+}
+
+/// Session-aware scratch storage with only each group's unused tail cleared.
+pub fn scratch_buffer_tail_zeroed(
+    ctx: &crate::CudaContext,
+    groups: usize,
+    group_bytes: usize,
+    used_bytes: usize,
+) -> apxinf_core::Result<crate::CudaBuffer> {
+    crate::workspace::output_buffer_tail_zeroed(ctx, groups, group_bytes, used_bytes)
 }
 #[cfg(test)]
 mod tests;

@@ -11,6 +11,9 @@ pub enum PointwiseSemantic {
     Geglu,
     BiasActivation,
     EulerUpdate,
+    Swiglu,
+    AddInto,
+    SwigluRowwiseE4m3,
     Add,
     Subtract,
     Multiply,
@@ -40,6 +43,9 @@ impl PointwiseSemantic {
         Self::Geglu,
         Self::BiasActivation,
         Self::EulerUpdate,
+        Self::Swiglu,
+        Self::AddInto,
+        Self::SwigluRowwiseE4m3,
         Self::Add,
         Self::Subtract,
         Self::Multiply,
@@ -60,6 +66,9 @@ impl PointwiseSemantic {
             Self::Geglu => "pointwise_geglu",
             Self::BiasActivation => "pointwise_bias_activation",
             Self::EulerUpdate => "pointwise_euler_update",
+            Self::Swiglu => "pointwise_swiglu",
+            Self::AddInto => "pointwise_add_into",
+            Self::SwigluRowwiseE4m3 => "pointwise_swiglu_rowwise_e4m3",
             Self::Add => "pointwise_add",
             Self::Subtract => "pointwise_subtract",
             Self::Multiply => "pointwise_multiply",
@@ -80,18 +89,21 @@ impl PointwiseSemantic {
             Self::Geglu => 0,
             Self::BiasActivation => 1,
             Self::EulerUpdate => 2,
-            Self::Add => 3,
-            Self::Subtract => 4,
-            Self::Multiply => 5,
-            Self::BroadcastAdd => 6,
-            Self::BroadcastMultiply => 7,
-            Self::RowMultiply => 8,
-            Self::Scale => 9,
-            Self::ScalarAdd => 10,
-            Self::ScalarDivide => 11,
-            Self::Exp => 12,
-            Self::Sin => 13,
-            Self::Cos => 14,
+            Self::Swiglu => 3,
+            Self::AddInto => 4,
+            Self::SwigluRowwiseE4m3 => 5,
+            Self::Add => 6,
+            Self::Subtract => 7,
+            Self::Multiply => 8,
+            Self::BroadcastAdd => 9,
+            Self::BroadcastMultiply => 10,
+            Self::RowMultiply => 11,
+            Self::Scale => 12,
+            Self::ScalarAdd => 13,
+            Self::ScalarDivide => 14,
+            Self::Exp => 15,
+            Self::Sin => 16,
+            Self::Cos => 17,
         }
     }
 
@@ -109,7 +121,7 @@ impl PointwiseSemantic {
     }
 
     fn may_have_bias(self) -> bool {
-        matches!(self, Self::BiasActivation)
+        matches!(self, Self::BiasActivation | Self::SwigluRowwiseE4m3)
     }
 }
 
@@ -119,10 +131,10 @@ pub enum PointwiseActivation {
     Gelu,
     Silu,
     GeluExact,
+    Relu,
     /// Tanh GELU with a dtype rounding boundary after every elementary
     /// operation, including the cubic power. Unlike fused tanh GELU.
     GeluRounded,
-    Relu,
     /// Explicit sigmoid tensor rounded before multiplication by input.
     SwishRounded,
 }
@@ -134,8 +146,8 @@ impl PointwiseActivation {
             Self::Gelu => 1,
             Self::Silu => 2,
             Self::GeluExact => 3,
-            Self::GeluRounded => 4,
-            Self::Relu => 5,
+            Self::Relu => 4,
+            Self::GeluRounded => 5,
             Self::SwishRounded => 6,
         }
     }
@@ -150,6 +162,10 @@ pub struct PointwiseArgs<'a> {
     pub secondary: Option<&'a Tensor>,
     pub bias: Option<&'a Tensor>,
     pub out: &'a mut Tensor,
+    /// One F32 scale per row for dynamic rowwise quantization.
+    pub scales: Option<&'a mut Tensor>,
+    /// Logical, unpadded SwiGLU width. Zero means the physical output width.
+    pub logical_cols: usize,
     pub activation: PointwiseActivation,
     /// Step size for EulerUpdate or scalar for Scale/ScalarAdd.
     pub dt: f32,
@@ -164,6 +180,8 @@ impl<'a> PointwiseArgs<'a> {
             secondary: None,
             bias: None,
             out,
+            scales: None,
+            logical_cols: 0,
             activation: PointwiseActivation::None,
             dt: 0.0,
             output_scale: 1.0,
@@ -234,7 +252,11 @@ fn tensor_storage(
         return Err(invalid("Pointwise tensor device/dtype mismatch"));
     }
     if tensor.shape().numel() != elements {
-        return Err(invalid("Pointwise tensor element count mismatch"));
+        return Err(invalid(format!(
+            "Pointwise tensor element count mismatch: expected {elements}, got {} for shape {:?}",
+            tensor.shape().numel(),
+            tensor.shape().dims()
+        )));
     }
     let expected = elements
         .checked_mul(dtype.size_in_bytes())
@@ -265,13 +287,60 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         .map_err(|_| invalid("Pointwise column count exceeds the CUDA kernel range"))?;
     let input_dtype = args.input.dtype();
     let output_dtype = args.out.dtype();
+    let input_dims = args.input.shape().dims();
+    if input_dims.len() != 2 || input_dims[0] != rows {
+        return Err(invalid(
+            "Pointwise input and output must be rank-2 tensors with matching rows",
+        ));
+    }
+    let input_cols = input_dims[1];
+    let logical_cols = if args.logical_cols == 0 {
+        cols
+    } else {
+        args.logical_cols
+    };
     let quantized_geglu = matches!(semantic, PointwiseSemantic::Geglu)
         && input_dtype == DType::F16
         && output_dtype == DType::F8E4M3;
-    if !quantized_geglu && input_dtype != output_dtype {
+    let quantized_swiglu = matches!(semantic, PointwiseSemantic::SwigluRowwiseE4m3)
+        && input_dtype == DType::BF16
+        && output_dtype == DType::F8E4M3;
+    if !quantized_geglu && !quantized_swiglu && input_dtype != output_dtype {
         return Err(invalid(
-            "Pointwise input/output dtypes must match except for F16-to-E4M3 GeGLU",
+            "Pointwise input/output dtypes must match except for quantized GeGLU/SwiGLU",
         ));
+    }
+    match semantic {
+        PointwiseSemantic::Geglu | PointwiseSemantic::Swiglu if input_cols != 2 * cols => {
+            return Err(invalid(
+                "Pointwise gated activation input width must be twice the output width",
+            ));
+        }
+        PointwiseSemantic::BiasActivation
+        | PointwiseSemantic::EulerUpdate
+        | PointwiseSemantic::AddInto
+            if input_cols != cols =>
+        {
+            return Err(invalid("Pointwise input/output width mismatch"));
+        }
+        PointwiseSemantic::SwigluRowwiseE4m3
+            if logical_cols == 0
+                || input_cols < 2 * logical_cols
+                || cols < logical_cols
+                || !quantized_swiglu =>
+        {
+            return Err(invalid(
+                "Pointwise rowwise SwiGLU quantization shape or dtype mismatch",
+            ));
+        }
+        _ => {}
+    }
+    if matches!(
+        semantic,
+        PointwiseSemantic::Swiglu | PointwiseSemantic::AddInto
+    ) && input_dtype != DType::BF16
+    {
+        return Err(invalid("Pointwise SwiGLU/add-into currently require BF16"));
     }
     let count = rows
         .checked_mul(cols)
@@ -280,14 +349,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         i32::try_from(count)
             .map_err(|_| invalid("F16-to-E4M3 GeGLU element count exceeds kernel range"))?;
     }
-    // GeGLU consumes a gate and an up half per output element.
-    let input_count = if matches!(semantic, PointwiseSemantic::Geglu) {
-        count
-            .checked_mul(2)
-            .ok_or_else(|| invalid("Pointwise size overflow"))?
-    } else {
-        count
-    };
+    let input_count = rows
+        .checked_mul(input_cols)
+        .ok_or_else(|| invalid("Pointwise size overflow"))?;
 
     if !args.dt.is_finite() {
         return Err(invalid("Pointwise dt must be finite"));
@@ -311,6 +375,11 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     if args.secondary.is_some() && !semantic.reads_secondary() {
         return Err(invalid(
             "Pointwise semantic does not take a secondary input",
+        ));
+    }
+    if args.scales.is_some() != matches!(semantic, PointwiseSemantic::SwigluRowwiseE4m3) {
+        return Err(invalid(
+            "Pointwise scales binding is required only for rowwise SwiGLU quantization",
         ));
     }
     if args.activation != PointwiseActivation::None
@@ -360,7 +429,14 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
 
     let (bias, bias_alignment) = match args.bias {
         Some(tensor) => {
-            let buffer = tensor_storage(ctx, tensor, input_dtype, cols)?;
+            let bias_elements = if matches!(semantic, PointwiseSemantic::SwigluRowwiseE4m3) {
+                logical_cols
+                    .checked_mul(2)
+                    .ok_or_else(|| invalid("Pointwise SwiGLU bias size overflow"))?
+            } else {
+                cols
+            };
+            let buffer = tensor_storage(ctx, tensor, input_dtype, bias_elements)?;
             let pointer = buffer.ptr() as *const std::ffi::c_void;
             let alignment = alignment_of(buffer.ptr() as usize);
             storage.push(buffer);
@@ -416,6 +492,16 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     }
     storage.push(output_buffer);
 
+    let scales = match args.scales {
+        Some(tensor) => {
+            let buffer = tensor_storage(ctx, tensor, DType::F32, rows)?;
+            let pointer = buffer.ptr() as *mut std::ffi::c_void;
+            storage.push(buffer);
+            pointer
+        }
+        None => std::ptr::null_mut(),
+    };
+
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
         semantic: semantic.code(),
@@ -429,6 +515,10 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         output_alignment,
         rows: i64::from(rows_abi),
         cols: i64::from(cols_abi),
+        input_cols: i64::try_from(input_cols)
+            .map_err(|_| invalid("Pointwise input width exceeds i64"))?,
+        logical_cols: i64::try_from(logical_cols)
+            .map_err(|_| invalid("Pointwise logical width exceeds i64"))?,
         output_scale_is_unit: u32::from(args.output_scale == 1.0),
     };
 
@@ -437,6 +527,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         secondary,
         bias,
         output,
+        scales,
         stream: ctx.stream().handle() as abi::CudaStream,
         dt: args.dt,
         output_scale: args.output_scale,

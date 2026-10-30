@@ -55,6 +55,7 @@ pub struct CudaBuffer {
     len: usize,
     device: usize,
     owner: Arc<dyn std::any::Any + Send + Sync>,
+    retained_owner: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 // SAFETY: CUDA device pointers can be sent between threads.
@@ -76,7 +77,8 @@ impl CudaBuffer {
             ptr,
             len: num_bytes,
             device,
-            owner,
+            owner: Arc::clone(&owner),
+            retained_owner: owner,
         })
     }
 
@@ -108,6 +110,29 @@ impl CudaBuffer {
         crate::transfers::copy_host_to_device(self.device, src, self.ptr as usize)
     }
 
+    /// Copy host data after earlier work on `stream`, and do not return until
+    /// the pageable host slice is no longer needed by CUDA.
+    pub fn copy_from_host_on(&self, src: &[u8], stream: &crate::CudaStream) -> Result<(), String> {
+        assert!(src.len() <= self.len, "source exceeds buffer size");
+        if stream.device() != self.device {
+            return Err(format!(
+                "CUDA buffer is on device {}, but copy stream targets device {}",
+                self.device,
+                stream.device()
+            ));
+        }
+        stream.with_current_device(|| unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                src.as_ptr() as *const c_void,
+                src.len(),
+                ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream.handle(),
+            ))?;
+            ffi::check_cuda(ffi::cudaStreamSynchronize(stream.handle()))
+        })
+    }
+
     /// Copy data from this device buffer to host.
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<(), String> {
         assert!(dst.len() <= self.len, "destination exceeds buffer size");
@@ -121,9 +146,130 @@ impl CudaBuffer {
         }
     }
 
+    /// Copy device data after earlier work on `stream`, and do not return
+    /// until `dst` contains the completed result.
+    pub fn copy_to_host_on(
+        &self,
+        dst: &mut [u8],
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        assert!(dst.len() <= self.len, "destination exceeds buffer size");
+        if stream.device() != self.device {
+            return Err(format!(
+                "CUDA buffer is on device {}, but copy stream targets device {}",
+                self.device,
+                stream.device()
+            ));
+        }
+        stream.with_current_device(|| unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                dst.as_mut_ptr() as *mut c_void,
+                self.ptr,
+                dst.len(),
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                stream.handle(),
+            ))?;
+            ffi::check_cuda(ffi::cudaStreamSynchronize(stream.handle()))
+        })
+    }
+
     /// Zero-fill the buffer on device, without a host staging allocation.
     pub fn zero(&self) -> Result<(), String> {
         unsafe { ffi::check_cuda(ffi::cudaMemset(self.ptr, 0, self.len)) }
+    }
+
+    /// Device-to-device async copy of `num_bytes` from `source` on `stream`.
+    pub fn copy_from_device_async(
+        &self,
+        source: &CudaBuffer,
+        num_bytes: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if num_bytes > self.len || num_bytes > source.len {
+            return Err(format!(
+                "device copy of {num_bytes} bytes exceeds {} or {}",
+                self.len, source.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                self.ptr,
+                source.ptr,
+                num_bytes,
+                ffi::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Fill the first `num_bytes` with `value` on `stream`.
+    pub fn memset_async(
+        &self,
+        value: i32,
+        num_bytes: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if num_bytes > self.len {
+            return Err(format!(
+                "memset of {num_bytes} bytes exceeds the {} byte buffer",
+                self.len
+            ));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemsetAsync(
+                self.ptr,
+                value,
+                num_bytes,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Fill `height` runs of `width` bytes, the first at `offset` and each
+    /// `pitch` bytes after the last.
+    pub fn memset_2d_async(
+        &self,
+        value: i32,
+        offset: usize,
+        pitch: usize,
+        width: usize,
+        height: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if width > pitch {
+            return Err(format!("memset2d width {width} exceeds pitch {pitch}"));
+        }
+        let span = match height.checked_sub(1).and_then(|last| {
+            last.checked_mul(pitch)
+                .and_then(|skip| skip.checked_add(width))
+                .and_then(|end| end.checked_add(offset))
+        }) {
+            Some(span) => span,
+            None if height == 0 => return Ok(()),
+            None => return Err("memset2d extent overflow".into()),
+        };
+        if span > self.len {
+            return Err(format!(
+                "memset2d of {height}x{width} bytes at {offset} exceeds the {} byte buffer",
+                self.len
+            ));
+        }
+        if width == 0 {
+            return Ok(());
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaMemset2DAsync(
+                (self.ptr as *mut u8).add(offset) as *mut c_void,
+                pitch,
+                value,
+                width,
+                height,
+                stream.handle(),
+            ))?;
+        }
+        Ok(())
     }
 
     /// Enqueue a zero-fill on `stream`.
@@ -186,6 +332,35 @@ impl CudaBuffer {
             len,
             device: self.device,
             owner: Arc::clone(&self.owner),
+            retained_owner: Arc::clone(&self.retained_owner),
+        })
+    }
+
+    /// Create a view with a custom owner. The owner must retain this
+    /// allocation (directly or indirectly) for as long as the view is live.
+    pub(crate) fn view_with_owner(
+        &self,
+        byte_offset: usize,
+        len: usize,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+        retained_owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Self, String> {
+        let end = byte_offset
+            .checked_add(len)
+            .ok_or_else(|| "CUDA buffer view range overflow".to_string())?;
+        if end > self.len {
+            return Err(format!(
+                "CUDA buffer view [{byte_offset}..{end}] exceeds {} bytes",
+                self.len
+            ));
+        }
+        let ptr = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut c_void };
+        Ok(Self {
+            ptr,
+            len,
+            device: self.device,
+            owner,
+            retained_owner,
         })
     }
 
@@ -203,12 +378,32 @@ impl CudaBuffer {
             .owner()
             .cloned()
             .ok_or_else(|| "CUDA tensor storage has no owning allocation".to_string())?;
+        if let Some(parent) = owner.downcast_ref::<CudaBuffer>() {
+            let offset = (handle.ptr() as usize)
+                .checked_sub(parent.ptr as usize)
+                .ok_or_else(|| "CUDA tensor pointer precedes its owning buffer".to_string())?;
+            return parent.view(offset, handle.len());
+        }
         Ok(Self {
             ptr: handle.ptr() as *mut c_void,
             len: handle.len(),
             device,
+            retained_owner: Arc::clone(&owner),
             owner,
         })
+    }
+
+    /// Retain the backing allocation without pinning a workspace suballocation.
+    /// Native executions hold raw pointers for graph replay; the graph-owned
+    /// arena keeps those addresses valid while the tensor lease controls reuse.
+    pub(crate) fn retained_for_execution(&self) -> Self {
+        Self {
+            ptr: self.ptr,
+            len: self.len,
+            device: self.device,
+            owner: Arc::clone(&self.retained_owner),
+            retained_owner: Arc::clone(&self.retained_owner),
+        }
     }
 
     /// Turn an owned CUDA allocation into a Tensor while preserving ownership.
@@ -360,5 +555,23 @@ impl Drop for HostMappedBuffer {
             let _ = ffi::cudaSetDevice(self.device as i32);
             let _ = ffi::cudaFreeHost(self.host_ptr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_ordered_host_copies_observe_prior_work() {
+        let _guard = crate::CUDA_TEST_LOCK.lock().unwrap();
+        let ctx = crate::CudaContext::new(0).unwrap();
+        let buffer = CudaBuffer::alloc(4096, 0).unwrap();
+        let input = vec![0x5a; buffer.len()];
+        buffer.copy_from_host_on(&input, ctx.stream()).unwrap();
+        buffer.zero_async(ctx.stream()).unwrap();
+        let mut output = vec![0xff; buffer.len()];
+        buffer.copy_to_host_on(&mut output, ctx.stream()).unwrap();
+        assert_eq!(output, vec![0; buffer.len()]);
     }
 }

@@ -74,9 +74,9 @@ impl DitContext {
             &mut self.text_activation,
         )?;
         projection(ctx, p, &self.text_activation, &w.text[1], &mut self.text)?;
-        ops::layer_norm(
+        ops::norm(
             ctx,
-            ops::LayerNormArgs::new(
+            ops::NormArgs::layer(
                 clip,
                 &w.image_norm1.weight,
                 &w.image_norm1.bias,
@@ -104,9 +104,9 @@ impl DitContext {
             &w.image[1],
             &mut self.image_projected,
         )?;
-        ops::layer_norm(
+        ops::norm(
             ctx,
-            ops::LayerNormArgs::new(
+            ops::NormArgs::layer(
                 &self.image_projected,
                 &w.image_norm2.weight,
                 &w.image_norm2.bias,
@@ -519,9 +519,9 @@ impl DitWorkspace {
                 &mut self.action_velocity,
             )?;
         }
-        ops::layer_norm(
+        ops::norm(
             ctx,
-            ops::LayerNormArgs::new(
+            ops::NormArgs::layer(
                 &rows(&self.block.hidden, 0, n)?,
                 &self.unit_weight,
                 &self.zero_bias,

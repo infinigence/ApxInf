@@ -323,9 +323,9 @@ fn rounded_norm_matches_independent_reference_and_replays() {
                 let eps = if l2 { 1e-4f32 } else { 1e-6f32 };
                 let invoke = |out: &mut Tensor| {
                     if l2 {
-                        l2_norm_rounded(&ctx, &x, out, eps)
+                        staged_l2(&ctx, &x, out, eps)
                     } else {
-                        rms_norm_rounded(&ctx, RmsNormArgs::new(&x, &w, out, eps))
+                        staged_rms(&ctx, NormArgs::rms(&x, &w, out, eps))
                     }
                 };
                 invoke(&mut out).unwrap();
@@ -383,15 +383,15 @@ fn rounded_norm_matches_independent_reference_and_replays() {
     let w = upload(vec![3], &[0.75, 1.25, 1.5], DType::BF16);
     let mut out = upload(vec![1, 3], &[0.; 3], DType::BF16);
     let graph = capture(&ctx, || {
-        rms_norm_rounded(&ctx, RmsNormArgs::new(&x, &w, &mut out, 1e-6))
+        staged_rms(&ctx, NormArgs::rms(&x, &w, &mut out, 1e-6))
     })
     .unwrap();
     let mut alias = x.clone();
-    assert!(l2_norm_rounded(&ctx, &x, &mut alias, 1e-4)
+    assert!(staged_l2(&ctx, &x, &mut alias, 1e-4)
         .unwrap_err()
         .to_string()
         .contains("overlap"));
-    assert!(l2_norm_rounded(&ctx, &x, &mut out, f32::NAN).is_err());
+    assert!(staged_l2(&ctx, &x, &mut out, f32::NAN).is_err());
     drop(alias);
     drop(x);
     drop(w);
@@ -509,7 +509,7 @@ fn rounded_rms_vector_reduction_matches_torch_materialization() {
     let x = upload(vec![16, 4096], &source, DType::BF16);
     let w = upload(vec![4096], &weights, DType::BF16);
     let mut output = upload(vec![16, 4096], &vec![0.; source.len()], DType::BF16);
-    rms_norm_rounded(&ctx, RmsNormArgs::new(&x, &w, &mut output, 1e-6)).unwrap();
+    staged_rms(&ctx, NormArgs::rms(&x, &w, &mut output, 1e-6)).unwrap();
     ctx.synchronize().unwrap();
     let actual = transfers::to_cpu(&output).unwrap();
     let mut digest = 14695981039346656037u64;
@@ -521,7 +521,7 @@ fn rounded_rms_vector_reduction_matches_torch_materialization() {
     assert_eq!(digest, 16015136281615547435u64);
     let expected = actual.to_f32_vec().unwrap();
     let graph = crate::capture(&ctx, || {
-        rms_norm_rounded(&ctx, RmsNormArgs::new(&x, &w, &mut output, 1e-6))
+        staged_rms(&ctx, NormArgs::rms(&x, &w, &mut output, 1e-6))
     })
     .unwrap();
     drop(x);
@@ -563,13 +563,13 @@ fn l2_f32_preserves_promoted_precision_and_replays() {
             row.iter().map(move |&x| (f64::from(x) / norm) as f32)
         })
         .collect();
-    l2_norm_rounded(&ctx, &input, &mut out, 1e-12).unwrap();
+    staged_l2(&ctx, &input, &mut out, 1e-12).unwrap();
     ctx.synchronize().unwrap();
     let eager = transfers::to_cpu(&out).unwrap().to_f32_vec().unwrap();
     for (&actual, &expected) in eager.iter().zip(&expected) {
         assert!((actual - expected).abs() <= 1e-7);
     }
-    let graph = capture(&ctx, || l2_norm_rounded(&ctx, &input, &mut out, 1e-12)).unwrap();
+    let graph = capture(&ctx, || staged_l2(&ctx, &input, &mut out, 1e-12)).unwrap();
     drop(input);
     for _ in 0..3 {
         graph.replay().unwrap();
@@ -673,7 +673,7 @@ fn l2_channel_rows_match_torch_and_changed_input_capture() {
         let retained_input = input.clone();
         let mut output = upload(vec![128, width], &vec![0.; source.len()], dtype);
         let eps = if dtype == DType::F16 { 1e-4 } else { 1e-12 };
-        l2_norm_rounded(&ctx, &input, &mut output, eps).unwrap();
+        staged_l2(&ctx, &input, &mut output, eps).unwrap();
         ctx.synchronize().unwrap();
         let host = transfers::to_cpu(&output).unwrap();
         let mut hash = 14695981039346656037u64;
@@ -682,7 +682,7 @@ fn l2_channel_rows_match_torch_and_changed_input_capture() {
         }
         assert_eq!(hash, expected_hash, "{dtype:?} width={width}");
         let expected = host.to_f32_vec().unwrap();
-        let graph = capture(&ctx, || l2_norm_rounded(&ctx, &input, &mut output, eps)).unwrap();
+        let graph = capture(&ctx, || staged_l2(&ctx, &input, &mut output, eps)).unwrap();
         drop(input);
         for sign in [-1., 1.] {
             let changed = upload(

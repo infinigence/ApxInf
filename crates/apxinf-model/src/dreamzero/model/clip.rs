@@ -56,14 +56,14 @@ impl ClipWorkspace {
     }
 }
 fn norm(ctx: &Context, x: &Tensor, w: &Norm, y: &mut Tensor) -> Result<()> {
-    ops::layer_norm(ctx, ops::LayerNormArgs::new(x, &w.weight, &w.bias, y, 1e-5))
+    ops::norm(ctx, ops::NormArgs::layer(x, &w.weight, &w.bias, y, 1e-5))
 }
 fn projection(ctx: &Context, p: &Policies, x: &Tensor, w: &Linear, y: &mut Tensor) -> Result<()> {
     let mut gemm = ops::GemmArgs::new(x, &w.weight, y);
     gemm.policy = p.gemm.clone();
     // Preserve the fixed BF16 reference's Lt reduction/workspace profile.
     gemm.policy.workspace_limit = gemm.policy.workspace_limit.min(1 << 20);
-    gemm.b_transposed = true;
+    gemm.weight_layout = ops::GemmWeightLayout::OutputMajor;
     ops::gemm_bias_single_round(
         ctx,
         ops::GemmBiasArgs {

@@ -267,7 +267,7 @@ def test_infer_reports_the_keys_it_consumes():
 def test_from_pretrained_rejects_options_that_cannot_mean_anything_here(tmp_path):
     for kwargs, error, match in (
         ({"norm_stats": tmp_path / "norm_stats.json"}, NotImplementedError, "norm_stats"),
-        ({"calibration": tmp_path / "cal.json"}, NotImplementedError, "calibration"),
+        ({"tactics": tmp_path / "tactics.json"}, NotImplementedError, "GEMM-tactic"),
         ({"num_flow_steps": 10}, NotImplementedError, "flow-matching"),
         ({"discrete_state": False}, ValueError, "always discretizes"),
         ({"something_else": 1}, TypeError, "unsupported options"),

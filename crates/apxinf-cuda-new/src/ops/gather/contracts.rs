@@ -7,7 +7,7 @@ use crate::{CudaBuffer, CudaContext, CudaDeviceAddress};
 /// `gather_types.h`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GatherSemantic {
-    /// Token-embedding gather, scaled by `sqrt(cols)`.
+    /// Token-embedding gather. [`GatherArgs::embedding_scale`] controls scaling.
     EmbeddingLookup,
     /// Projection + learned position embedding, plus an optional bias.
     BiasPosition,
@@ -15,6 +15,22 @@ pub enum GatherSemantic {
     RgbToPatches,
     /// Replace selected matrix rows according to a u32 row map.
     ReplaceRows,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum EmbeddingScale {
+    #[default]
+    None,
+    SqrtWidth,
+}
+
+impl EmbeddingScale {
+    fn code(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::SqrtWidth => 1,
+        }
+    }
 }
 
 impl GatherSemantic {
@@ -64,6 +80,7 @@ pub struct GatherArgs<'a> {
     pub position: Option<&'a Tensor>,
     pub out: &'a mut Tensor,
     pub vocab_size: usize,
+    pub embedding_scale: EmbeddingScale,
     pub tokens_per_view: usize,
     pub patches: Option<PatchGeometry>,
 }
@@ -82,6 +99,7 @@ impl<'a> GatherArgs<'a> {
             position: None,
             out,
             vocab_size: 0,
+            embedding_scale: EmbeddingScale::None,
             tokens_per_view: 0,
             patches: None,
         }
@@ -104,6 +122,7 @@ impl<'a> GatherArgs<'a> {
             position: None,
             out,
             vocab_size: 0,
+            embedding_scale: EmbeddingScale::None,
             tokens_per_view: 0,
             patches: Some(geometry),
         }
@@ -129,10 +148,20 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::Other(message.into())
 }
 
-fn dtype_code(dtype: DType) -> Result<u32> {
+fn dtype_code(dtype: DType, semantic: GatherSemantic) -> Result<u32> {
     match dtype {
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
+        // F32 is used by RGB preprocessing and the portable backend's default
+        // embedding path.
+        DType::F32
+            if matches!(
+                semantic,
+                GatherSemantic::RgbToPatches | GatherSemantic::EmbeddingLookup
+            ) =>
+        {
+            Ok(0)
+        }
         _ => Err(invalid("Gather currently supports F16 and BF16")),
     }
 }
@@ -191,6 +220,11 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
 
     if args.bias.is_some() && !semantic.may_have_bias() {
         return Err(invalid("Gather semantic does not take a bias"));
+    }
+    if semantic != GatherSemantic::EmbeddingLookup && args.embedding_scale != EmbeddingScale::None {
+        return Err(invalid(
+            "embedding scale is valid only for embedding lookup",
+        ));
     }
     match semantic {
         GatherSemantic::EmbeddingLookup => {
@@ -447,8 +481,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
         semantic: semantic.code(),
-        dtype: dtype_code(dtype)?,
+        dtype: dtype_code(dtype, semantic)?,
         has_bias: u32::from(!bias.is_null()),
+        embedding_scale: args.embedding_scale.code(),
         vocab_size: if matches!(semantic, GatherSemantic::EmbeddingLookup) {
             u32::try_from(args.vocab_size)
                 .map_err(|_| invalid("Gather vocabulary size exceeds the ABI range"))?

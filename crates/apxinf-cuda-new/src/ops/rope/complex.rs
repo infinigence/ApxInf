@@ -84,7 +84,11 @@ pub fn complex_rotary(
     let align = |p: usize| (1usize << p.trailing_zeros().min(8)) as u32;
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
-        semantic: 5,
+        semantic: 8,
+        layout: abi::LAYOUT_SINGLE_TENSOR,
+        cache_write: abi::CACHE_WRITE_NONE,
+        rotation_source: abi::ROTATION_PRECOMPUTED_TABLE,
+        rotary_convention: abi::CONVENTION_NONE,
         dtype,
         has_bias: 1,
         q_heads: dims[1] as u32,
@@ -98,7 +102,7 @@ pub fn complex_rotary(
         bias_alignment: align(table.storage.ptr() as usize),
         q_alignment: align(b),
         kv_alignment: 256,
-        position_alignment: 256,
+        rotation_alignment: align(table.storage.ptr() as usize),
         tokens: table.tokens as i64,
         cache_capacity: 0,
     };
@@ -111,6 +115,7 @@ pub fn complex_rotary(
         key_input: std::ptr::null(),
         value_input: std::ptr::null(),
         position: std::ptr::null(),
+        rotation_table: table.storage.ptr(),
         stream: ctx.stream().handle(),
         theta: 0.,
         position_offset: 0,

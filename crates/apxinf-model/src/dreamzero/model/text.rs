@@ -67,9 +67,9 @@ pub(in crate::dreamzero) fn encode(
     for block in &weights.blocks {
         encode_block(ctx, policies, block, work)?;
     }
-    ops::rms_norm_rounded(
+    crate::dreamzero::backend::staged_rms(
         ctx,
-        ops::RmsNormArgs::new(&work.hidden, &weights.norm, &mut work.output, 1e-6),
+        ops::NormArgs::rms(&work.hidden, &weights.norm, &mut work.output, 1e-6),
     )
 }
 
@@ -80,9 +80,9 @@ pub(super) fn encode_block(
     work: &mut TextWorkspace,
 ) -> Result<()> {
     let n = C::TEXT_LEN;
-    ops::rms_norm_rounded(
+    crate::dreamzero::backend::staged_rms(
         ctx,
-        ops::RmsNormArgs::new(&work.hidden, &block.norm1, &mut work.norm, 1e-6),
+        ops::NormArgs::rms(&work.hidden, &block.norm1, &mut work.norm, 1e-6),
     )?;
     linear(ctx, policies, &work.norm, &block.q, &mut work.q)?;
     linear(ctx, policies, &work.norm, &block.k, &mut work.k)?;
@@ -124,9 +124,9 @@ pub(super) fn encode_block(
         &work.projection,
         &mut work.residual,
     )?;
-    ops::rms_norm_rounded(
+    crate::dreamzero::backend::staged_rms(
         ctx,
-        ops::RmsNormArgs::new(&work.residual, &block.norm2, &mut work.norm, 1e-6),
+        ops::NormArgs::rms(&work.residual, &block.norm2, &mut work.norm, 1e-6),
     )?;
     linear(ctx, policies, &work.norm, &block.gate, &mut work.gate)?;
     let mut activation =

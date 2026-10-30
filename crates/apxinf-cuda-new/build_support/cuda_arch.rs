@@ -64,6 +64,7 @@ pub const DEVICE_FEATURE_CUTLASS_SM100: u64 = 1 << 1;
 pub const DEVICE_FEATURE_FA2: u64 = 1 << 2;
 pub const DEVICE_FEATURE_CUTLASS_SM89_BF16_GEGLU: u64 = 1 << 3;
 pub const DEVICE_FEATURE_CUTLASS_SM87_W8A8: u64 = 1 << 4;
+pub const DEVICE_FEATURE_QWEN_DRIVE_SM110: u64 = 1 << 5;
 
 pub fn is_cutlass_sm100_family(arch: &str) -> bool {
     matches!(
@@ -108,6 +109,9 @@ pub fn target_features(target: &ArchTarget) -> u64 {
     }
     if target.cutlass_arch == "sm_87" {
         features |= DEVICE_FEATURE_CUTLASS_SM87_W8A8;
+    }
+    if target.sm() == 110 {
+        features |= DEVICE_FEATURE_QWEN_DRIVE_SM110;
     }
     features
 }
@@ -428,11 +432,7 @@ mod tests {
             89,
             DEVICE_FEATURE_FA2 | DEVICE_FEATURE_CUTLASS_SM89_BF16_GEGLU
         ));
-        assert!(!supports_target(
-            &targets,
-            89,
-            DEVICE_FEATURE_CUTLASS_SM100
-        ));
+        assert!(!supports_target(&targets, 89, DEVICE_FEATURE_CUTLASS_SM100));
         assert!(supports_target(
             &targets,
             110,

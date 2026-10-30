@@ -24,7 +24,8 @@ pub(crate) struct Spec {
     pub accumulation_dtype: u32,
     pub output_dtype: u32,
     pub quantization: u32,
-    pub b_transposed: u32,
+    pub b_layout: u32,
+    pub numerics: u32,
     pub b_is_immutable: u32,
     pub a_alignment: u32,
     pub b_alignment: u32,
@@ -44,7 +45,6 @@ pub(crate) struct Spec {
     pub alpha_is_unit: u32,
     pub output_scale_is_unit: u32,
 }
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Bindings {
@@ -67,6 +67,26 @@ pub(crate) struct Bindings {
 pub(crate) type Execution = *mut c_void;
 
 unsafe extern "C" {
+    pub(crate) fn apxinf_gemm_fp8_gemv(
+        weight: *const c_void,
+        activation: *const c_void,
+        output: *mut c_void,
+        n: i64,
+        k: i64,
+        alpha: f32,
+        stream: CudaStream,
+    ) -> i32;
+    pub(crate) fn apxinf_gemm_nvfp4_gemv(
+        weight: *const c_void,
+        weight_scales: *const c_void,
+        activation: *const c_void,
+        activation_scales: *const c_void,
+        output: *mut c_void,
+        n: i64,
+        k: i64,
+        alpha: f32,
+        stream: CudaStream,
+    ) -> i32;
     pub(crate) fn apxinf_gemm_prepare(
         runtime: Runtime,
         spec: *const Spec,
@@ -76,11 +96,7 @@ unsafe extern "C" {
     ) -> i32;
     pub(crate) fn apxinf_gemm_enqueue(execution: Execution) -> i32;
     pub(crate) fn apxinf_gemm_destroy(execution: Execution);
-    pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(
-        rows: i64,
-        k: i64,
-        sf_vec_size: u32,
-    ) -> u64;
+    pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(rows: i64, k: i64, sf_vec_size: u32) -> u64;
     pub(crate) fn apxinf_gemm_nvfp4_pack_block_scales(
         source_row_major: *const c_void,
         destination: *mut c_void,

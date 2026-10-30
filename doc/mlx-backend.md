@@ -88,7 +88,9 @@ CPU/CUDA models do not silently execute a Metal request on CPU.
 
 Metal admission requires a registered `metal_` factory and is resolved before
 device construction or checkpoint loading. It does not fall back to a legacy
-generic model factory; CPU/CUDA registry fallback remains unchanged. Explicit
+generic model factory; CPU/CUDA registry fallback remains unchanged. Only the
+selected family parses `model_variant`, so adding a Metal family does not edit
+a central variant list. Explicit
 `--model-name metal_qwen3` and `--model-name metal_minicpm5` select these
 implementations. The original `qwen3`/`minicpm5` and `qwen3-mlx`/`minicpm5-mlx`
 selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
@@ -130,7 +132,7 @@ chat options containing `tools` enable this behavior automatically. MiniCPM's
 
 ## Native dependency and ABI
 
-The implemented bridge wraps the **MLX 0.31.2** C++ SDK with a small C ABI.
+The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.
 `MLX_ROOT` identifies the matching `include/mlx/` and `lib/` distribution;
 headers are checked at build time and the linked version at stream construction.
 Do not combine arbitrary system headers with another wheel's library. A wheel

@@ -20,6 +20,8 @@ pub(crate) struct Spec {
     pub output_alignment: u32,
     pub rows: i64,
     pub cols: i64,
+    pub input_cols: i64,
+    pub logical_cols: i64,
     /// Structural predicate only: the scale value lives in [`Bindings`].
     pub output_scale_is_unit: u32,
 }
@@ -31,6 +33,7 @@ pub(crate) struct Bindings {
     pub secondary: *const c_void,
     pub bias: *const c_void,
     pub output: *mut c_void,
+    pub scales: *mut c_void,
     pub stream: CudaStream,
     pub dt: f32,
     pub output_scale: f32,

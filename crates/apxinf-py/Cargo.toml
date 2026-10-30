@@ -30,3 +30,6 @@ extension-module = ["pyo3/extension-module"]
 # which is only registered on CUDA devices. Without it the extension still
 # imports and reports shapes, but `load` errors for pi05.
 cuda = ["apxinf-model/cuda"]
+# Forward HIP support to the model crate, so `device="hip:N"` reaches the HIP
+# pi05 runtime. Builds without ROCm too; loading then reports why it cannot.
+hip = ["apxinf-model/hip"]

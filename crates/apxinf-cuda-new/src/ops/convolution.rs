@@ -212,7 +212,7 @@ pub fn convolution3d(
     let execution = prepare(ctx, input, weight, stride, output, workspace, -1)?;
     enqueue(&execution)?;
     if !crate::workspace::is_capturing()
-        && (!crate::workspace::has_active_session() || crate::workspace::is_preparing_session())
+        && (crate::workspace::may_prepare_native_resources())
     {
         ctx.synchronize().map_err(Error::Cuda)?;
     }

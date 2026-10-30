@@ -37,7 +37,7 @@ pub(super) fn projection(
     // Match the fixed BF16 reference's Lt workspace budget. Its narrow output
     // head uses F32 split-K; a different budget changes reduction grouping.
     gemm.policy.workspace_limit = gemm.policy.workspace_limit.min(1 << 20);
-    gemm.b_transposed = true;
+    gemm.weight_layout = ops::GemmWeightLayout::OutputMajor;
     ops::gemm_bias_single_round(
         ctx,
         ops::GemmBiasArgs {
@@ -48,14 +48,14 @@ pub(super) fn projection(
     Ok(())
 }
 fn norm(ctx: &Context, x: &Tensor, w: &Norm, out: &mut Tensor) -> Result<()> {
-    ops::layer_norm(
+    ops::norm(
         ctx,
-        ops::LayerNormArgs::new(x, &w.weight, &w.bias, out, 1e-6),
+        ops::NormArgs::layer(x, &w.weight, &w.bias, out, 1e-6),
     )?;
     Ok(())
 }
 fn rms(ctx: &Context, x: &Tensor, weight: &Tensor, out: &mut Tensor) -> Result<()> {
-    ops::rms_norm_rounded(ctx, ops::RmsNormArgs::new(x, weight, out, 1e-6))?;
+    crate::dreamzero::backend::staged_rms(ctx, ops::NormArgs::rms(x, weight, out, 1e-6))?;
     Ok(())
 }
 fn attend(

@@ -3,16 +3,11 @@
 use crate::pi05::backend::{
     ops::{
         attention as l3_attention, concat_rows as l3_concat_rows, gather as l3_gather,
-        adaptive_rms_norm as l3_adaptive_rms_norm, bias_residual as l3_bias_residual,
-        bias_residual_layer_norm as l3_bias_residual_layer_norm,
-        bias_residual_rms_norm as l3_bias_residual_rms_norm, gemm as l3_gemm,
-        gemm_geglu as l3_gemm_geglu, layer_norm as l3_layer_norm,
-        pointwise as l3_pointwise, rms_norm as l3_rms_norm,
-        reserve_prefix as l3_reserve_prefix, rope as l3_rope, AttentionArgs, GatherArgs,
-        AdaptiveRmsNormArgs, BiasResidualArgs, BiasResidualLayerNormArgs,
-        BiasResidualRmsNormArgs, GatherPatchGeometry, GatherSemantic, GemmArgs, GemmGegluArgs,
-        LayerNormArgs, PointwiseActivation, PointwiseArgs, PointwiseSemantic, RmsNormArgs,
-        RopeArgs, RopeSemantic, WeightVersion,
+        gemm as l3_gemm, gemm_geglu as l3_gemm_geglu, pointwise as l3_pointwise,
+        reserve_prefix as l3_reserve_prefix, rope as l3_rope, Affine, AttentionArgs, BiasOrder,
+        EmbeddingScale, FusedAddNormArgs, GatherArgs, GatherPatchGeometry, GatherSemantic,
+        GemmArgs, GemmGegluArgs, NormArgs, NormKind, NormNumerics, PointwiseActivation,
+        PointwiseArgs, PointwiseSemantic, ResidualAddArgs, RopeArgs, RopeSemantic, WeightVersion,
     },
     Context, DeviceBuffer as CudaBuffer,
 };
@@ -47,8 +42,8 @@ struct ResidualNormTensors {
 }
 
 fn rms_bf16(ctx: &Context, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    l3_rms_norm(ctx, RmsNormArgs::new(input, weight, &mut output, eps))?;
+    let output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    crate::pi05::backend::ops::norm::norm(ctx, NormArgs::rms(input, weight, &output, eps))?;
     Ok(output)
 }
 
@@ -59,20 +54,12 @@ fn layer_bf16(
     bias: &Tensor,
     eps: f32,
 ) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    l3_layer_norm(
-        ctx,
-        LayerNormArgs::new(input, weight, bias, &mut output, eps),
-    )?;
+    let output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    crate::pi05::backend::ops::norm::norm(ctx, NormArgs::layer(input, weight, bias, &output, eps))?;
     Ok(output)
 }
 
-fn adaptive_rms_bf16(
-    ctx: &Context,
-    input: &Tensor,
-    style: &Tensor,
-    eps: f32,
-) -> Result<Tensor> {
+fn adaptive_rms_bf16(ctx: &Context, input: &Tensor, style: &Tensor, eps: f32) -> Result<Tensor> {
     let cols = input
         .shape()
         .dims()
@@ -80,10 +67,18 @@ fn adaptive_rms_bf16(
         .copied()
         .ok_or_else(|| Error::Other("PI0.5 adaptive RMS input has no columns".into()))?;
     let style = bf16_vector_prefix(style, 2 * cols)?;
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    l3_adaptive_rms_norm(
+    let output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    crate::pi05::backend::ops::norm::norm(
         ctx,
-        AdaptiveRmsNormArgs::new(input, &style, &mut output, eps),
+        NormArgs {
+            input,
+            output: Some(&output),
+            kind: NormKind::Rms,
+            affine: Affine::Adaptive { style: &style },
+            quantized: None,
+            numerics: NormNumerics::Flexible,
+            eps,
+        },
     )?;
     Ok(output)
 }
@@ -102,12 +97,7 @@ fn bias_activation_bf16(
     Ok(output)
 }
 
-fn euler_update_bf16(
-    ctx: &Context,
-    state: &Tensor,
-    velocity: &Tensor,
-    dt: f32,
-) -> Result<Tensor> {
+fn euler_update_bf16(ctx: &Context, state: &Tensor, velocity: &Tensor, dt: f32) -> Result<Tensor> {
     let mut output = ctx.allocate_output(state.shape().clone(), DType::BF16)?;
     let mut args = PointwiseArgs::new(PointwiseSemantic::EulerUpdate, state, &mut output);
     args.secondary = Some(velocity);
@@ -181,10 +171,7 @@ fn gemm_geglu_bf16(
             canonical_weight.dtype()
         )));
     }
-    crate::pi05::model::calibration::observe_bf16_activation(
-        activation,
-        canonical_weight,
-    )?;
+    crate::pi05::model::calibration::observe_bf16_activation(activation, canonical_weight)?;
     let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1] / 2]), DType::BF16)?;
     let mut gemm = GemmArgs::new(activation, canonical_weight, &mut output)
         .with_immutable_weight(WeightVersion::new(1));
@@ -228,19 +215,13 @@ fn mqa_bf16(
     let key = CudaBuffer::from_tensor(key)
         .and_then(|buffer| buffer.view(0, kv_bytes))
         .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
+            buffer.as_tensor(Shape::new(vec![1, key_tokens, kv_heads, q[2]]), DType::BF16)
         })
         .map_err(Error::Cuda)?;
     let value = CudaBuffer::from_tensor(value)
         .and_then(|buffer| buffer.view(0, kv_bytes))
         .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
+            buffer.as_tensor(Shape::new(vec![1, key_tokens, kv_heads, q[2]]), DType::BF16)
         })
         .map_err(Error::Cuda)?;
     let query4 = query.reshape(Shape::new(vec![1, q[0], q[1], q[2]]))?;
@@ -291,10 +272,7 @@ fn split_qkv_bias_bf16(
     head_dim: usize,
 ) -> Result<QkvTensors> {
     let shape = qkv.shape().dims();
-    if qkv.dtype() != DType::BF16
-        || shape.len() != 2
-        || shape[1] != 3 * heads * head_dim
-    {
+    if qkv.dtype() != DType::BF16 || shape.len() != 2 || shape[1] != 3 * heads * head_dim {
         return Err(Error::Other(
             "PI0.5 BF16 vision QKV shape/dtype mismatch".into(),
         ));
@@ -343,10 +321,7 @@ fn split_qkv_rope_bf16(
             "PI0.5 BF16 rotary QKV shape/dtype mismatch".into(),
         ));
     }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
+    let mut q = ctx.allocate_output(Shape::new(vec![shape[0], q_heads, head_dim]), DType::BF16)?;
     let kv_shape = Shape::new(vec![shape[0], kv_heads, head_dim]);
     let mut k = ctx.allocate_output(kv_shape.clone(), DType::BF16)?;
     let mut v = ctx.allocate_output(kv_shape, DType::BF16)?;
@@ -393,10 +368,7 @@ fn split_qkv_rope_into_cache_bf16(
             "PI0.5 BF16 cached rotary QKV shape/dtype mismatch".into(),
         ));
     }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
+    let mut q = ctx.allocate_output(Shape::new(vec![shape[0], q_heads, head_dim]), DType::BF16)?;
     let mut key_cache = key_cache.clone();
     let mut value_cache = value_cache.clone();
     l3_rope(
@@ -435,10 +407,17 @@ fn bias_residual_bf16(
     bias: Option<&Tensor>,
     residual: &Tensor,
 ) -> Result<Tensor> {
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    l3_bias_residual(
+    let hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    crate::pi05::backend::ops::residual_add(
         ctx,
-        BiasResidualArgs::new(projection, bias, residual, &mut hidden),
+        ResidualAddArgs {
+            input: projection,
+            bias,
+            residual,
+            gate: None,
+            hidden: &hidden,
+            bias_order: BiasOrder::SingleRound,
+        },
     )?;
     Ok(hidden)
 }
@@ -451,19 +430,28 @@ fn bias_residual_rms_bf16(
     weight: &Tensor,
     eps: f32,
 ) -> Result<ResidualNormTensors> {
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    l3_bias_residual_rms_norm(
+    let hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    let normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    crate::pi05::backend::ops::fused_add_norm(
         ctx,
-        BiasResidualRmsNormArgs::new(
-            projection,
+        FusedAddNormArgs {
+            input: projection,
             bias,
             residual,
-            weight,
-            &mut hidden,
-            &mut normalized,
+            gate: None,
+            hidden: &hidden,
+            normalized: Some(&normalized),
+            kind: NormKind::Rms,
+            affine: Affine::Weight {
+                weight,
+                bias: None,
+                offset: false,
+            },
+            quantized: None,
+            numerics: NormNumerics::Flexible,
+            bias_order: BiasOrder::SingleRound,
             eps,
-        ),
+        },
     )?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
@@ -478,20 +466,28 @@ fn bias_residual_layer_bf16(
     norm_bias: &Tensor,
     eps: f32,
 ) -> Result<ResidualNormTensors> {
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    l3_bias_residual_layer_norm(
+    let hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    let normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    crate::pi05::backend::ops::fused_add_norm(
         ctx,
-        BiasResidualLayerNormArgs::new(
-            projection,
-            projection_bias,
+        FusedAddNormArgs {
+            input: projection,
+            bias: projection_bias,
             residual,
-            norm_weight,
-            norm_bias,
-            &mut hidden,
-            &mut normalized,
+            gate: None,
+            hidden: &hidden,
+            normalized: Some(&normalized),
+            kind: NormKind::Layer,
+            affine: Affine::Weight {
+                weight: norm_weight,
+                bias: Some(norm_bias),
+                offset: false,
+            },
+            quantized: None,
+            numerics: NormNumerics::Flexible,
+            bias_order: BiasOrder::SingleRound,
             eps,
-        ),
+        },
     )?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
@@ -511,19 +507,26 @@ fn adaptive_gate_residual_rms_bf16(
         .copied()
         .ok_or_else(|| Error::Other("PI0.5 AdaRMS input has no columns".into()))?;
     let norm_style = bf16_vector_prefix(norm_style, 2 * cols)?;
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    crate::pi05::backend::ops::ada_gate_residual_rms_norm(
+    let hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    let normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    crate::pi05::backend::ops::fused_add_norm(
         ctx,
-        crate::pi05::backend::ops::AdaGateResidualRmsNormArgs::new(
-            projection,
+        FusedAddNormArgs {
+            input: projection,
+            bias: None,
             residual,
-            &norm_style,
-            gate_style,
-            &mut hidden,
-            &mut normalized,
+            gate: Some(crate::pi05::backend::ops::ResidualGate::PackedStyle(
+                gate_style,
+            )),
+            hidden: &hidden,
+            normalized: Some(&normalized),
+            kind: NormKind::Rms,
+            affine: Affine::Adaptive { style: &norm_style },
+            quantized: None,
+            numerics: NormNumerics::Flexible,
+            bias_order: BiasOrder::SingleRound,
             eps,
-        ),
+        },
     )?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
@@ -597,8 +600,7 @@ fn language_layer_bf16_with_policies(
     )?;
     let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up.weight)?;
     let projected = gemm_bf16(ctx, policies, &activated, &weights.down.weight)?;
-    let hidden =
-        bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
+    let hidden = bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
     Ok(Bf16LanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
@@ -951,6 +953,7 @@ pub(in crate::pi05::model) mod backbone {
             );
             args.ids = Some(token_ids);
             args.vocab_size = self.weights.token_embedding.shape().dims()[0];
+            args.embedding_scale = EmbeddingScale::SqrtWidth;
             l3_gather(self.ctx(), args)?;
             l3_concat_rows(self.ctx(), vision_tokens, &language)
         }

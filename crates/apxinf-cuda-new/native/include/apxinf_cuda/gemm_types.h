@@ -26,6 +26,11 @@ typedef enum {
 } apxinf_gemm_layout_t;
 
 typedef enum {
+  APXINF_GEMM_NUMERICS_DEFAULT = 0,
+  APXINF_GEMM_NUMERICS_LEGACY_CUBLAS = 1,
+} apxinf_gemm_numerics_t;
+
+typedef enum {
   APXINF_GEMM_QUANT_NONE = 0,
   APXINF_GEMM_QUANT_FP8_UNIT_SCALE = 1,
   APXINF_GEMM_QUANT_FP8_ROW_CHANNEL = 2,
@@ -43,8 +48,10 @@ typedef enum {
   APXINF_GEMM_SEMANTIC_GEMM_GEGLU = 2,
   APXINF_GEMM_SEMANTIC_GEMM_BIAS = 3,
   APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL = 4,
-  /* F32 accumulation plus bias, then a single output cast. */
-  APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND = 5,
+  /* BF16 GEMM followed by rounded SwiGLU. The B layout describes how gate and
+     up columns are encoded. Output is [M,N]. */
+  APXINF_GEMM_SEMANTIC_GEMM_SWIGLU = 5,
+  APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND = 6,
 } apxinf_gemm_semantic_t;
 
 typedef struct {
@@ -55,8 +62,13 @@ typedef struct {
   uint32_t accumulation_dtype;
   uint32_t output_dtype;
   uint32_t quantization;
-  /* Contiguous [N,K] B storage, admitted only for unquantized single-round bias. */
-  uint32_t b_transposed;
+  /* Physical B storage. KN is canonical; NK is accepted by contracts such as
+     W8A8 and packed NVFP4 whose checkpoints are already output-major;
+     GATE_UP_INTERLEAVED_256 is the paired-column SwiGLU encoding. */
+  uint32_t b_layout;
+  /* Provider-neutral numerical constraint. LEGACY_CUBLAS preserves the
+     established BF16 reduction path while dispatch remains inside GEMM. */
+  uint32_t numerics;
   /* Changes whether candidate preparation may hoist weight preprocessing. */
   uint32_t b_is_immutable;
   /* Largest guaranteed power-of-two byte alignment, capped at 256. */

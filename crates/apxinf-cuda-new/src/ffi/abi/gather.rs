@@ -3,7 +3,7 @@ use std::ffi::c_void;
 pub(crate) use super::types::CudaStream;
 use super::types::Runtime;
 
-pub(crate) const SPEC_VERSION: u32 = 5;
+pub(crate) const SPEC_VERSION: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -12,6 +12,7 @@ pub(crate) struct Spec {
     pub semantic: u32,
     pub dtype: u32,
     pub has_bias: u32,
+    pub embedding_scale: u32,
     pub vocab_size: u32,
     pub replacement_rows: u32,
     pub tokens_per_view: u32,

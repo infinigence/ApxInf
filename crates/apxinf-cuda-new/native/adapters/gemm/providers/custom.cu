@@ -5,6 +5,10 @@
 #include <cstdint>
 #include <cuda_fp8.h>
 
+extern "C" cudaError_t apxinf_activation_swiglu_bf16_rounded_pair_interleaved(
+    const void* gate_up, void* output, int rows, int inner, int pair,
+    cudaStream_t stream);
+
 namespace {
 #include "../../../kernels/primitives/math.cuh"
 #include "../../../kernels/primitives/activation.cuh"
@@ -55,10 +59,30 @@ bool fp8_f32_projection_forced() {
   return forced;
 }
 
+// Dtype of caller-owned fused operands. This mirrors the Rust L3 contract's
+// `projection_dtype` calculation; it is deliberately separate from
+// `common_projection_dtype`, which describes an internal provider buffer and
+// may be widened for final-rounding reasons.
+uint32_t binding_projection_dtype(const Spec& spec) {
+  if (has_row_channel_scales(spec)) return spec.output_dtype;
+  if (spec.a_dtype == APXINF_DTYPE_E4M3) {
+    return spec.output_dtype == APXINF_DTYPE_F16 ? APXINF_DTYPE_F16
+                                                 : APXINF_DTYPE_F32;
+  }
+  return spec.a_dtype;
+}
+
 }  // namespace
 
 uint32_t common_projection_dtype(const Spec& spec) {
-  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND) {
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+      spec.a_dtype == APXINF_DTYPE_BF16 &&
+      spec.b_dtype == APXINF_DTYPE_BF16 &&
+      spec.output_dtype == APXINF_DTYPE_BF16 &&
+      spec.quantization == APXINF_GEMM_QUANT_NONE) {
+    // The cuBLAS fallback has no fused bias epilogue. Keep its accumulator in
+    // F32 until finish() adds the BF16 bias, matching the L3 final-rounding
+    // contract instead of rounding the GEMM result before bias.
     return APXINF_DTYPE_F32;
   }
   if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU &&
@@ -70,6 +94,13 @@ uint32_t common_projection_dtype(const Spec& spec) {
     return APXINF_DTYPE_I32;
   }
   if (has_row_channel_scales(spec)) {
+    // cuBLASLt native-FP8 matmul supports half-precision outputs, not an F32
+    // projection. Accumulation remains F32 inside the GEMM; finish() applies
+    // row/channel scales in F32 before writing the requested 16-bit result.
+    if (spec.output_dtype == APXINF_DTYPE_F16 ||
+        spec.output_dtype == APXINF_DTYPE_BF16) {
+      return spec.output_dtype;
+    }
     return APXINF_DTYPE_F32;
   }
   if (spec.a_dtype != APXINF_DTYPE_E4M3 && spec.b_dtype != APXINF_DTYPE_E4M3) {
@@ -104,7 +135,8 @@ void CommonResources::release() noexcept {
 
 void allocate_common_resources(const Spec& spec,
                                CommonResources& resources,
-                               bool native_fp8) {
+                               bool native_fp8,
+                               bool native_bias_epilogue) {
   const bool unpack =
       ((spec.a_dtype == APXINF_DTYPE_E4M3 ||
         spec.b_dtype == APXINF_DTYPE_E4M3) &&
@@ -112,7 +144,9 @@ void allocate_common_resources(const Spec& spec,
       (has_row_channel_scales(spec) && !native_fp8 &&
        spec.a_dtype != APXINF_DTYPE_I8);
 
-  resources.projection_dtype = common_projection_dtype(spec);
+  resources.projection_dtype = native_bias_epilogue
+                                   ? spec.output_dtype
+                                   : common_projection_dtype(spec);
 
   if (unpack) {
     const size_t a_bytes =
@@ -125,11 +159,12 @@ void allocate_common_resources(const Spec& spec,
   }
 
   const bool native_bias =
-      native_fp8 &&
-      (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
-       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL) &&
-      spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
-      spec.output_scale_is_unit != 0;
+      native_bias_epilogue ||
+      (native_fp8 &&
+       (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
+        spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL) &&
+       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
+       spec.output_scale_is_unit != 0);
   const bool needs_postprocess =
       (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM && !native_bias) ||
       has_row_channel_scales(spec) ||
@@ -143,14 +178,17 @@ void allocate_common_resources(const Spec& spec,
   }
 }
 
-size_t common_resource_requirements(const Spec& spec, bool native_fp8) {
+size_t common_resource_requirements(const Spec& spec,
+                                    bool native_fp8,
+                                    bool native_bias_epilogue) {
   const bool unpack =
       ((spec.a_dtype == APXINF_DTYPE_E4M3 ||
         spec.b_dtype == APXINF_DTYPE_E4M3) &&
        !native_fp8) ||
       (has_row_channel_scales(spec) && !native_fp8 &&
        spec.a_dtype != APXINF_DTYPE_I8);
-  const uint32_t projection_dtype = common_projection_dtype(spec);
+  const uint32_t projection_dtype =
+      native_bias_epilogue ? spec.output_dtype : common_projection_dtype(spec);
   size_t bytes = 0;
   if (unpack) {
     bytes += static_cast<size_t>(spec.m * spec.k) *
@@ -159,11 +197,12 @@ size_t common_resource_requirements(const Spec& spec, bool native_fp8) {
              dtype_bytes(projection_dtype);
   }
   const bool native_bias =
-      native_fp8 &&
-      (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
-       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL) &&
-      spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
-      spec.output_scale_is_unit != 0;
+      native_bias_epilogue ||
+      (native_fp8 &&
+       (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ||
+        spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL) &&
+       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
+       spec.output_scale_is_unit != 0);
   const bool needs_postprocess =
       (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM && !native_bias) ||
       has_row_channel_scales(spec) || spec.output_dtype != projection_dtype ||
@@ -208,8 +247,23 @@ cudaError_t launch_postprocess(const Spec& spec,
         static_cast<int>(spec.n / 2),
         static_cast<cudaStream_t>(bindings.stream));
   }
+  if (spec.semantic ==
+          APXINF_GEMM_SEMANTIC_GEMM_SWIGLU &&
+      spec.quantization == APXINF_GEMM_QUANT_NONE &&
+      resources.projection_dtype == APXINF_DTYPE_BF16 &&
+      spec.output_dtype == APXINF_DTYPE_BF16 && spec.alpha_is_unit != 0 &&
+      spec.output_scale_is_unit != 0 && bindings.bias == nullptr) {
+    return apxinf_activation_swiglu_bf16_rounded_pair_interleaved(
+        projection, bindings.output, static_cast<int>(spec.m),
+        static_cast<int>(spec.n / 2), 256,
+        static_cast<cudaStream_t>(bindings.stream));
+  }
   const int64_t output_width =
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU ? spec.n / 2 : spec.n;
+      (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GEGLU ||
+       spec.semantic ==
+           APXINF_GEMM_SEMANTIC_GEMM_SWIGLU)
+          ? spec.n / 2
+          : spec.n;
   const int64_t count = spec.m * output_width;
   const int blocks = static_cast<int>(
       std::min<int64_t>((count + 255) / 256, 4096));
@@ -219,8 +273,7 @@ cudaError_t launch_postprocess(const Spec& spec,
               spec.a_dtype == APXINF_DTYPE_E4M3 &&
               spec.output_dtype == APXINF_DTYPE_E4M3
           ? APXINF_DTYPE_F16
-          : has_row_channel_scales(spec) ? spec.output_dtype
-                                         : resources.projection_dtype;
+          : binding_projection_dtype(spec);
   apxinf::cuda_new::custom::finish<<<blocks, 256, 0,
                                  static_cast<cudaStream_t>(bindings.stream)>>>(
       projection, resources.projection_dtype, bindings.output,

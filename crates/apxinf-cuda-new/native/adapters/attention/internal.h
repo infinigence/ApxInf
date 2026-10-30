@@ -100,6 +100,19 @@ size_t rounded_resource_requirements(const Spec& spec, int configuration);
 void prepare_rounded(Execution& execution);
 cudaError_t launch_rounded(Execution& execution);
 void destroy_rounded(Execution& execution) noexcept;
+cudaError_t launch_output_gate_projection(void* data, const void* projection,
+                                          int rows, int heads, int head_dim,
+                                          int64_t source_row_width,
+                                          cudaStream_t stream);
+cudaError_t launch_output_gate_tensor_rounded(void* data, const void* gate,
+                                              int64_t elements,
+                                              cudaStream_t stream);
+
+size_t cublas_f16_resource_requirements(const Spec& spec,
+                                        int configuration);
+void prepare_cublas_f16(Execution& execution);
+cudaError_t launch_cublas_f16(Execution& execution);
+void destroy_cublas_f16(Execution& execution) noexcept;
 
 #if defined(APXINF_ATTENTION_FA2)
 size_t efficient_resource_requirements(const Spec&, int);
@@ -115,6 +128,11 @@ size_t fa2_splitkv_resource_requirements(const Spec& spec,
 void prepare_fa2_splitkv(Execution& execution);
 cudaError_t launch_fa2_splitkv(Execution& execution);
 void destroy_fa2_splitkv(Execution& execution) noexcept;
+size_t fa2_segmented_resource_requirements(const Spec& spec,
+                                           int configuration);
+void prepare_fa2_segmented(Execution& execution);
+cudaError_t launch_fa2_segmented(Execution& execution);
+void destroy_fa2_segmented(Execution& execution) noexcept;
 #endif
 
 #if defined(APXINF_ATTENTION_CUTLASS)
@@ -122,6 +140,26 @@ size_t cutlass_resource_requirements(const Spec& spec, int configuration);
 void prepare_cutlass(Execution& execution);
 cudaError_t launch_cutlass(Execution& execution);
 void destroy_cutlass(Execution& execution) noexcept;
+#endif
+
+#if defined(APXINF_SEGMENTED_ATTENTION_SM110)
+size_t d256_causal_sm110_resource_requirements(const Spec& spec,
+                                                int configuration);
+void prepare_d256_causal_sm110(Execution& execution);
+cudaError_t launch_d256_causal_sm110(Execution& execution);
+void destroy_d256_causal_sm110(Execution& execution) noexcept;
+
+size_t d256_kv_split_sm110_resource_requirements(const Spec& spec,
+                                                  int configuration);
+void prepare_d256_kv_split_sm110(Execution& execution);
+cudaError_t launch_d256_kv_split_sm110(Execution& execution);
+void destroy_d256_kv_split_sm110(Execution& execution) noexcept;
+
+size_t segmented_vision_sm110_resource_requirements(const Spec& spec,
+                                                     int configuration);
+void prepare_segmented_vision_sm110(Execution& execution);
+cudaError_t launch_segmented_vision_sm110(Execution& execution);
+void destroy_segmented_vision_sm110(Execution& execution) noexcept;
 #endif
 
 }  // namespace apxinf::attention

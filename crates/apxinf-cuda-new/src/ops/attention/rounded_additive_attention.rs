@@ -17,8 +17,11 @@ pub(crate) fn normalize(
     ctx: &CudaContext,
     args: RoundedAttentionBiasArgs<'_>,
 ) -> Result<Normalized> {
+    let super::contracts::AttentionInput::Separate { query, .. } = args.attention.input else {
+        return Err(invalid("Rounded additive attention requires separate Q/K/V"));
+    };
     if args.attention.mask != AttentionMask::None
-        || args.attention.out.dtype() != args.attention.query.dtype()
+        || args.attention.out.dtype() != query.dtype()
     {
         return Err(invalid(
             "Rounded additive attention requires no implicit mask and matching output dtype",

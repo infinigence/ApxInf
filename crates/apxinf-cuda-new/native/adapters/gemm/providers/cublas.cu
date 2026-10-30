@@ -1,5 +1,6 @@
 #include "vendor.h"
 #include "../../../kernels/custom/gemm.cuh"
+#include "../../../kernels/elementwise/broadcast_bf16_f32.cuh"
 
 namespace apxinf::gemm {
 namespace {
@@ -33,7 +34,36 @@ CublasState& provider(Execution& state) {
 }
 
 bool needs_safe_dequantization(const Spec& spec) {
-  return spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL;
+  return spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL &&
+         spec.b_layout == APXINF_GEMM_LAYOUT_KN;
+}
+
+bool uses_checkpoint_bias_numerics(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.b_layout == APXINF_GEMM_LAYOUT_NK &&
+         spec.a_dtype == APXINF_DTYPE_BF16 &&
+         spec.b_dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32;
+}
+
+bool uses_legacy_cublas_numerics(const Spec& spec) {
+  return uses_checkpoint_bias_numerics(spec) ||
+         spec.numerics == APXINF_GEMM_NUMERICS_LEGACY_CUBLAS;
+}
+
+cudaDataType_t input_cuda_dtype(uint32_t dtype) {
+  switch (dtype) {
+    case APXINF_DTYPE_F32: return CUDA_R_32F;
+    case APXINF_DTYPE_F16: return CUDA_R_16F;
+    case APXINF_DTYPE_BF16: return CUDA_R_16BF;
+    case APXINF_DTYPE_E4M3: return CUDA_R_8F_E4M3;
+    case APXINF_DTYPE_I8: return CUDA_R_8I;
+    default:
+      throw Failure(APXINF_STATUS_UNSUPPORTED,
+                    "cuBLAS GEMM input dtype is unsupported");
+  }
 }
 
 Spec cublas_compute_spec(const Spec& spec) {
@@ -77,7 +107,10 @@ void prepare_cublas(Execution& state) {
     check_cuda(cudaMalloc(&resources->dequant_b, b_bytes));
   }
   check_cublas(cublasCreate(&resources->handle));
-  check_cublas(cublasSetMathMode(resources->handle, CUBLAS_PEDANTIC_MATH));
+  check_cublas(cublasSetMathMode(
+      resources->handle, uses_legacy_cublas_numerics(state.spec)
+                             ? CUBLAS_DEFAULT_MATH
+                             : CUBLAS_PEDANTIC_MATH));
   resources->workspace_bytes = 4 * 1024 * 1024;
   check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
   state.resource_bytes =
@@ -124,9 +157,20 @@ cudaError_t launch_cublas(Execution& state) {
   void* projection = resources.common.projection != nullptr
                          ? resources.common.projection
                          : bindings.output;
+  const bool checkpoint_bias = uses_checkpoint_bias_numerics(compute_spec);
+  if (checkpoint_bias) {
+    const int64_t count = compute_spec.m * compute_spec.n;
+    const int blocks = static_cast<int>(
+        std::min<int64_t>((count + 255) / 256, 4096));
+    broadcast_bf16_f32_rows_kernel<<<blocks, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(bindings.bias),
+        static_cast<float*>(projection), count,
+        static_cast<int>(compute_spec.n));
+    check_cuda(cudaGetLastError());
+  }
   const float alpha =
       has_row_channel_scales(compute_spec) ? 1.0F : bindings.alpha;
-  const float beta = 0.0F;
+  const float beta = checkpoint_bias ? 1.0F : 0.0F;
   const int32_t integer_alpha = 1;
   const int32_t integer_beta = 0;
   const void* alpha_pointer = compute_spec.a_dtype == APXINF_DTYPE_I8
@@ -144,26 +188,33 @@ cudaError_t launch_cublas(Execution& state) {
                       ? CUDA_R_16F
                       : CUDA_R_16BF;
   const cudaDataType_t input_type =
-      compute_spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_SINGLE_ROUND
-          ? (compute_spec.a_dtype == APXINF_DTYPE_F16 ? CUDA_R_16F : CUDA_R_16BF)
-          : data_type;
+      resources.common.unpack_a != nullptr
+          ? data_type
+          : input_cuda_dtype(compute_spec.a_dtype);
   check_cublas(cublasSetStream(resources.handle, stream));
   check_cublas(cublasSetWorkspace(resources.handle, resources.workspace,
                                   resources.workspace_bytes));
+  const bool output_major_weight =
+      compute_spec.b_layout == APXINF_GEMM_LAYOUT_NK;
   check_cublas(cublasGemmEx(
-      resources.handle, compute_spec.b_transposed ? CUBLAS_OP_T : CUBLAS_OP_N,
-      CUBLAS_OP_N, compute_spec.n,
-      compute_spec.m, compute_spec.k,
+      resources.handle,
+      output_major_weight ? CUBLAS_OP_T : CUBLAS_OP_N,
+      CUBLAS_OP_N, compute_spec.n, compute_spec.m, compute_spec.k,
       alpha_pointer, weight,
       compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : input_type,
-      compute_spec.b_transposed ? compute_spec.k : compute_spec.n, activation,
+      output_major_weight ? compute_spec.k : compute_spec.n, activation,
       compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_8I : input_type,
       compute_spec.k, beta_pointer, projection, data_type, compute_spec.n,
       compute_spec.a_dtype == APXINF_DTYPE_I8 ? CUBLAS_COMPUTE_32I
                                               : CUBLAS_COMPUTE_32F,
-      CUBLAS_GEMM_DEFAULT));
-  return vendor::launch_postprocess(compute_spec, resources.common, bindings,
-                                    projection);
+      output_major_weight &&
+              compute_spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL
+          ? CUBLAS_GEMM_DEFAULT_TENSOR_OP
+          : CUBLAS_GEMM_DEFAULT));
+  auto postprocess_bindings = bindings;
+  if (checkpoint_bias) postprocess_bindings.bias = nullptr;
+  return vendor::launch_postprocess(compute_spec, resources.common,
+                                    postprocess_bindings, projection);
 }
 
 }  // namespace apxinf::gemm

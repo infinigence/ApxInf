@@ -60,3 +60,14 @@ pub(super) fn binary(
     args.secondary = Some(y);
     ops::pointwise(ctx, args)
 }
+
+pub(super) fn staged_rms(ctx: &Context, mut args: ops::NormArgs<'_>) -> Result<()> {
+    args.numerics = ops::NormNumerics::Staged;
+    ops::norm(ctx, args)
+}
+pub(super) fn staged_l2(ctx: &Context, input: &Tensor, output: &mut Tensor, eps: f32) -> Result<()> {
+    ops::norm(ctx, ops::NormArgs {
+        input, output: Some(output), kind: ops::NormKind::L2,
+        affine: ops::Affine::None, quantized: None, numerics: ops::NormNumerics::Staged, eps,
+    })
+}

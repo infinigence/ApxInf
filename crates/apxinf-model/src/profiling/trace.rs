@@ -8,7 +8,7 @@
 //! `crate::profiling::trace::range("name")` unconditionally.
 
 #[cfg(feature = "cuda")]
-pub use crate::accelerator::cuda::nvtx::{range, Range};
+pub use apxinf_cuda_new::nvtx::{range, Range};
 
 #[cfg(not(feature = "cuda"))]
 pub struct Range;

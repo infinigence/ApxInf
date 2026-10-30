@@ -14,6 +14,11 @@
  *   BIAS_ACTIVATION   input [rows, cols], bias [cols]   -> output [rows, cols]
  *   EULER_UPDATE      input [rows, cols] (state),
  *                     secondary [rows, cols] (velocity) -> output [rows, cols]
+ *   SWIGLU            input [rows, 2 * cols]            -> output [rows, cols]
+ *   ADD_INTO          input [rows, cols]                 -> output [rows, cols]
+ *   SWIGLU_ROWWISE_E4M3
+ *                     input [rows, input_cols], optional bias [input_cols]
+ *                     -> output [rows, cols], scales [rows]
  *
  * `cols` is always the *output* width, so GeGLU's input is twice as wide.
  */
@@ -21,18 +26,21 @@ typedef enum {
   APXINF_POINTWISE_SEMANTIC_GEGLU = 0,
   APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION = 1,
   APXINF_POINTWISE_SEMANTIC_EULER_UPDATE = 2,
-  APXINF_POINTWISE_SEMANTIC_ADD = 3,
-  APXINF_POINTWISE_SEMANTIC_SUBTRACT = 4,
-  APXINF_POINTWISE_SEMANTIC_MULTIPLY = 5,
-  APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD = 6,
-  APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY = 7,
-  APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY = 8,
-  APXINF_POINTWISE_SEMANTIC_SCALE = 9,
-  APXINF_POINTWISE_SEMANTIC_SCALAR_ADD = 10,
-  APXINF_POINTWISE_SEMANTIC_SCALAR_DIVIDE = 11,
-  APXINF_POINTWISE_SEMANTIC_EXP = 12,
-  APXINF_POINTWISE_SEMANTIC_SIN = 13,
-  APXINF_POINTWISE_SEMANTIC_COS = 14,
+  APXINF_POINTWISE_SEMANTIC_SWIGLU = 3,
+  APXINF_POINTWISE_SEMANTIC_ADD_INTO = 4,
+  APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3 = 5,
+  APXINF_POINTWISE_SEMANTIC_ADD = 6,
+  APXINF_POINTWISE_SEMANTIC_SUBTRACT = 7,
+  APXINF_POINTWISE_SEMANTIC_MULTIPLY = 8,
+  APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD = 9,
+  APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY = 10,
+  APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY = 11,
+  APXINF_POINTWISE_SEMANTIC_SCALE = 12,
+  APXINF_POINTWISE_SEMANTIC_SCALAR_ADD = 13,
+  APXINF_POINTWISE_SEMANTIC_SCALAR_DIVIDE = 14,
+  APXINF_POINTWISE_SEMANTIC_EXP = 15,
+  APXINF_POINTWISE_SEMANTIC_SIN = 16,
+  APXINF_POINTWISE_SEMANTIC_COS = 17,
 } apxinf_pointwise_semantic_t;
 
 /* Stable pointwise activation ABI encoding. */
@@ -41,8 +49,8 @@ typedef enum {
   APXINF_POINTWISE_ACTIVATION_GELU = 1,
   APXINF_POINTWISE_ACTIVATION_SILU = 2,
   APXINF_POINTWISE_ACTIVATION_GELU_EXACT = 3,
-  APXINF_POINTWISE_ACTIVATION_GELU_ROUNDED = 4,
-  APXINF_POINTWISE_ACTIVATION_RELU = 5,
+  APXINF_POINTWISE_ACTIVATION_RELU = 4,
+  APXINF_POINTWISE_ACTIVATION_GELU_ROUNDED = 5,
   APXINF_POINTWISE_ACTIVATION_SWISH_ROUNDED = 6,
 } apxinf_pointwise_activation_t;
 
@@ -65,6 +73,9 @@ typedef struct {
   int64_t rows;
   /* Output width.  GEGLU reads a [rows, 2 * cols] input. */
   int64_t cols;
+  /* Physical input width and logical unpadded output width. */
+  int64_t input_cols;
+  int64_t logical_cols;
   /* Structural scale predicate, not the scale value. */
   uint32_t output_scale_is_unit;
 } apxinf_pointwise_spec_t;
@@ -75,6 +86,8 @@ typedef struct {
   const void* secondary;
   const void* bias;
   void* output;
+  /* SWIGLU_ROWWISE_E4M3 writes one F32 scale per row. */
+  void* scales;
   apxinf_cuda_stream_t stream;
   /* EULER_UPDATE step size or SCALE/SCALAR_ADD scalar. */
   float dt;
