@@ -38,6 +38,12 @@ fn checkpoint_joint_history_three_graphs_and_lifecycle() {
 }
 
 #[test]
+#[ignore = "requires pinned complete checkpoint and all official joint inference captures"]
+fn checkpoint_joint_implicit_history_preparation_result() {
+    joint_checkpoint(CheckpointCases::Implicit);
+}
+
+#[test]
 #[ignore = "requires complete checkpoint and fixed official standalone captures"]
 fn checkpoint_joint_standalone_noise_and_public_input() {
     joint_checkpoint(CheckpointCases::Standalone);
@@ -52,6 +58,7 @@ fn checkpoint_joint_nine_frame_history_precision() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CheckpointCases {
     Full,
+    Implicit,
     Standalone,
     NineFrameHistory,
 }
@@ -113,7 +120,7 @@ fn joint_checkpoint(selection: CheckpointCases) {
     // Same episode/task and a multi-frame observation, but another caller.
     // Reuse the official explicit-reset fixture to prove session isolation.
     match selection {
-        CheckpointCases::Full => {
+        CheckpointCases::Full | CheckpointCases::Implicit => {
             cases.push(serde_json::json!({"name":"session", "position_after":3}));
         }
         CheckpointCases::Standalone => cases.retain(|case| {
@@ -173,6 +180,89 @@ fn joint_checkpoint(selection: CheckpointCases) {
                 ..Default::default()
             },
         );
+        if selection == CheckpointCases::Implicit {
+            let action = runner.infer(&request).unwrap();
+            let values = host(&runner, action.tensor());
+            let plan = runner.implicit.borrow().as_ref().unwrap().clone();
+            assert!(
+                plan.graphs.is_some(),
+                "implicit preparation must capture all stages"
+            );
+            let video = host(&runner, &plan.work.borrow().video());
+            for (kind, actual, expected, actions) in [
+                ("action", &values, &data["action"], true),
+                ("video", &video, &data["video"], false),
+            ] {
+                let checkpoint = format!("implicit.{name}.{kind}");
+                if !metric(&checkpoint, actual, expected, actions) {
+                    numerical_failures.push(checkpoint);
+                }
+            }
+            assert_eq!(
+                runner.session.borrow().as_ref().unwrap().key.next_frame,
+                case["position_after"].as_u64().unwrap() as usize,
+                "implicit preparation must publish history exactly once"
+            );
+            if name == "initial" {
+                assert_eq!(
+                    values,
+                    host(&runner, runner.infer(&request).unwrap().tensor())
+                );
+                assert_eq!(video, host(&runner, &plan.work.borrow().video()));
+                drop(plan);
+                runner.clear_prepared().unwrap();
+                let seeded = VlaRequest::generated_with_metadata(
+                    &observation,
+                    apxinf_core::RngKey::new(71, 0, 0),
+                    request.metadata,
+                );
+                let prepared = host(&runner, runner.infer(&seeded).unwrap().tensor());
+                let future = host(
+                    &runner,
+                    &runner
+                        .implicit
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .work
+                        .borrow()
+                        .video(),
+                );
+                assert_eq!(
+                    prepared,
+                    host(&runner, runner.infer(&seeded).unwrap().tensor())
+                );
+                assert_eq!(
+                    future,
+                    host(
+                        &runner,
+                        &runner
+                            .implicit
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .work
+                            .borrow()
+                            .video()
+                    )
+                );
+                let next = VlaRequest::generated_with_metadata(
+                    &observation,
+                    apxinf_core::RngKey::new(71, 0, 1),
+                    request.metadata,
+                );
+                assert_ne!(
+                    prepared,
+                    host(&runner, runner.infer(&next).unwrap().tensor())
+                );
+                assert_eq!(
+                    values,
+                    host(&runner, runner.infer(&request).unwrap().tensor())
+                );
+                eprintln!("implicit prepared result matches cached graph replay and generated-noise binding");
+            }
+            continue;
+        }
         let before = runner.session.borrow().as_ref().map(|e| e.key.next_frame);
         let start = std::time::Instant::now();
         let plan = runner

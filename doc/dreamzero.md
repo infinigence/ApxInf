@@ -124,6 +124,17 @@ per-layer text/image cross-attention K/V), and
 Action (observed K/V computation plus joint denoising). A compatible prepared
 run rebinds stable inputs and executes without capture or autotuning. The
 implicit cache holds one profile; switching profiles replaces it.
+On an implicit profile miss, real preparation already evaluates the exact
+request's complete schedule. After all three graphs capture successfully, that
+same call publishes the computed result and observed history once, without a
+second evaluation. This reuse is confined to the uninterrupted preparation call;
+no request-value cache or validity token is introduced. Subsequent compatible
+calls rebind and replay normally. Explicit `prepare_for` still publishes no
+history, and every explicit prepared `run` rebinds and executes its request.
+The `checkpoint_joint_implicit_history_preparation_result` opt-in test checks
+the complete action/video history sequence and generated-noise/cache replay.
+This preparation revision requires fresh device qualification; the published
+performance measurements below describe the preceding frozen build.
 Self-attention K/V projections write directly into the current-token rows of
 the contiguous attention buffers. Only that K view receives staged RMS/complex
 RoPE; committed history is copied into the separate prefix before projection

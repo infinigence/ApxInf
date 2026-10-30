@@ -291,9 +291,23 @@ impl Plan {
             self.sessions[1].run(|| self.model.language(&mut work, false))?;
             self.sessions[2].run(|| self.model.action(&mut work, false))?;
         }
+        self.publish(request, host, actual, &work, &mut episode)
+    }
+
+    // The caller owns the session borrow until the synchronized result and its
+    // immutable history snapshot are ready. Both a replay and a just-completed
+    // real preparation use this single publication point.
+    fn publish(
+        &self,
+        request: &VlaRequest<'_>,
+        host: HostInputs,
+        actual: Profile,
+        work: &Workspace,
+        episode: &mut Option<Episode>,
+    ) -> Result<Action> {
         self.model.ctx.synchronize().map_err(Error::Cuda)?;
         let next = if let Some(identity) = host.identity {
-            let history = self.model.snapshot(&work)?;
+            let history = self.model.snapshot(work)?;
             self.model.ctx.synchronize().map_err(Error::Cuda)?;
             Some(Episode {
                 key: HistoryIdentity {
@@ -362,18 +376,28 @@ impl VlaRuntime for DreamZeroModelRunner {
             .as_ref()
             .filter(|p| p.profile == expected)
             .cloned();
-        let plan = match cached {
-            Some(plan) => plan,
-            None => {
-                // Bound the implicit plan cache before allocating the next large profile.
-                self.implicit.borrow_mut().take();
-                let plan =
-                    Rc::new(self.make_plan(request, &host, ExecutionPolicy::RequireGraph)?);
-                *self.implicit.borrow_mut() = Some(plan.clone());
-                plan
-            }
+        if let Some(plan) = cached {
+            return plan.execute(request, host);
+        }
+        // Bound the implicit plan cache before allocating the next large profile.
+        self.implicit.borrow_mut().take();
+        let plan = Rc::new(self.make_plan(request, &host, ExecutionPolicy::RequireGraph)?);
+        // make_plan has already evaluated this exact request on real data, then
+        // successfully captured all three graphs without executing them. No
+        // request can intervene here. Publish that result once instead of
+        // rebinding and evaluating the same complete schedule a second time.
+        // Explicit prepared handles and all later compatible calls still run
+        // through execute, which rebinds every request value before replay.
+        let action = {
+            let mut episode = self
+                .session
+                .try_borrow_mut()
+                .map_err(|_| Error::Other("DreamZero session is already executing".into()))?;
+            let work = plan.work.borrow();
+            plan.publish(request, host, expected, &work, &mut episode)?
         };
-        plan.execute(request, host)
+        *self.implicit.borrow_mut() = Some(plan);
+        Ok(action)
     }
     fn prepare(&self, _spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
         Err(Error::Other(
