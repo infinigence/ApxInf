@@ -41,7 +41,7 @@ def test_ar_fit_with_one_decode_length_has_no_split():
     assert result['fit'] is None
 
 
-def test_recorded_frames_remain_optional(tmp_path):
+def test_recorded_frames_load_with_requested_limit(tmp_path):
     bench = load('bench_pi0_fast')
     path = tmp_path / 'frames.npz'
     images = np.zeros((2, 2, 2, 3), dtype=np.uint8)
@@ -154,12 +154,15 @@ def test_fixed_decode_rejects_early_stop_or_changed_tokens(failure):
 
 
 @pytest.mark.parametrize('lengths', [['0','12'], ['12','12']])
-def test_fixed_decode_rejects_invalid_cli_counts(monkeypatch, lengths):
+def test_fixed_decode_rejects_invalid_cli_counts(monkeypatch, capsys, lengths):
     bench = load('bench_pi0_fast')
     monkeypatch.setattr(sys, 'argv', ['bench', '--model-dir', '/unused', '--layer', 'l1',
+                                   '--state-key', 'observation/state',
                                    '--mode', 'fixed', '--decode-lengths', *lengths])
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as error:
         bench.parse_args()
+    assert error.value.code == 2
+    assert '--decode-lengths needs at least two distinct positive counts' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('legacy_json_exists', [False, True])
@@ -227,3 +230,80 @@ def test_provenance_resolves_recipe_sidecar_before_following_json_symlinks(tmp_p
     result = bench.provenance(tmp_path, tmp_path, tactics=requested)['tactics']
     assert result['path'] == str(recipes)
     assert result['file_count'] == 1
+
+
+@pytest.mark.parametrize('lengths', [[], ['--decode-lengths', '1', '8', '32']])
+def test_fixed_cli_accepts_valid_counts_without_frames(monkeypatch, lengths):
+    bench = load('bench_pi0_fast')
+    monkeypatch.setattr(sys, 'argv', ['bench', '--model-dir', '/unused',
+                        '--state-key', 'observation/state', '--layer', 'l1',
+                        '--mode', 'fixed', *lengths])
+    args = bench.parse_args()
+    assert args.frames is None
+    assert args.seed == 0
+    assert args.decode_lengths == ([1, 8, 32] if lengths else [12, 16, 20, 28, 32, 40])
+
+
+def test_fixed_main_uses_seeded_input_and_forwards_token_limits(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from apxinf.processors.transforms import OBSERVATION, RGB
+
+    bench = load('bench_pi0_fast')
+    calls = []
+    closed = []
+
+    class Native:
+        image_size = 4
+
+        def infer_action_tokens_rgb(self, rgb, layout, token_ids, stop_token=None,
+                                    *, max_new_tokens=None):
+            assert layout == 'nhwc'
+            assert stop_token is None
+            assert max_new_tokens in (1, 8, 32)
+            calls.append((rgb.copy(), token_ids.copy(), max_new_tokens))
+            # Include the policy terminator so fixed timing must ignore EOS.
+            return np.arange(max_new_tokens, dtype=np.uint32)
+
+    def pipeline(payload):
+        obs = payload[OBSERVATION]
+        np.testing.assert_array_equal(obs['observation/state'], np.zeros(8))
+        assert obs['prompt'] == bench.DEFAULT_PROMPT
+        return {RGB: np.stack([obs['image'], obs['wrist']])}
+
+    policy = SimpleNamespace(
+        model=Native(), tokenizer=SimpleNamespace(pipe_token_id=2),
+        metadata={'state_dim': 8, 'max_action_tokens': 256, 'num_views': 2, 'image_size': 4},
+        image_keys=('image', 'wrist'), state_key='observation/state', prompt_key='prompt',
+        action_dim=7, action_horizon=10, input_pipeline=pipeline,
+        _prompt_ids=lambda obs, prompt: [1, 5, 1], close=lambda: closed.append(True),
+    )
+    output = tmp_path / 'report.json'
+    monkeypatch.setattr(sys, 'argv', ['bench', '--model-dir', str(tmp_path),
+                        '--state-key', 'observation/state', '--layer', 'l1',
+                        '--mode', 'fixed', '--decode-lengths', '1', '8', '32',
+                        '--samples', '2', '--warmup', '1', '--out', str(output)])
+    monkeypatch.setattr(bench, 'provenance', lambda *args, **kwargs: {})
+    monkeypatch.setattr(bench, '_git_commit', lambda: 'test')
+    def no_frames(*args):
+        pytest.fail('synthetic benchmark must not load a frame fixture')
+    monkeypatch.setattr(bench, '_load_frames', no_frames)
+
+    reports = []
+    for _ in range(2):
+        bench.main(policy_loader=lambda *args, **kwargs: policy)
+        reports.append(json.loads(output.read_text()))
+    assert closed == [True, True]
+    expected_lengths = [32, 1, 8, 32, 1, 8, 32, 32, 8, 1]
+    assert [length for _, _, length in calls] == expected_lengths * 2
+    for rgb, ids, _ in calls:
+        assert rgb.shape == (2, 4, 4, 3)
+        assert rgb.dtype == np.uint8
+        np.testing.assert_array_equal(rgb, calls[0][0])
+        np.testing.assert_array_equal(ids, [1, 5, 1])
+    for report in reports:
+        assert report['input_source'] == 'synthetic'
+        assert report['seed'] == 0
+        assert report['fixed_decode']['decode_lengths'] == [1, 8, 32]
+        assert report['fixed_decode']['prefix_equal'] is True
+    assert reports[0]['fixed_decode']['prepared_input'] == reports[1]['fixed_decode']['prepared_input']

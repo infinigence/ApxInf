@@ -296,10 +296,10 @@ def test_from_pretrained_loads_a_checkpoint_directory(tmp_path, monkeypatch):
     monkeypatch.setenv("HF_HOME", str(tmp_path))
     model_dir = _write_checkpoint(tmp_path)
     coefficients = (np.arange(70) - 30).astype(np.float64)
-    # The runtime always spends the full token budget: the terminator lands at 72
-    # and the rest is decoded-but-unread tail, exactly as the real decoder emits it.
+    # Natural policy inference returns through the first terminator (inclusive).
+    # Tail truncation is covered separately by the detokenizer test.
     stream = [3] + [_action_token(int(value)) for value in coefficients] + [2]
-    model = _StubModel(stream + [1] * (256 - len(stream)))
+    model = _StubModel(stream)
 
     policy = Pi0FastPolicy.from_pretrained(
         model_dir,

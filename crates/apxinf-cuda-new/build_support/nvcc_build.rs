@@ -1,8 +1,7 @@
 //! Shared nvcc compile scheduling for the CUDA build scripts: an on-disk
 //! object cache keyed by command line + dependency list, and a bounded worker
 //! pool so independent translation units compile concurrently instead of one
-//! at a time. Both `apxinf-cuda` and `apxinf-cuda-new` include this file with
-//! `#[path]`.
+//! at a time. The `apxinf-cuda-new` build script includes this file with `#[path]`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
