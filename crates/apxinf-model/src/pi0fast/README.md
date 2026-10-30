@@ -260,6 +260,12 @@ The head read drops from 1.05 GB to 8.6 MB per step in BF16, and from 526 MB to
 
 ## Reproducing
 
+For a benchmark without a frame file, follow the maintained
+[fixed-length preparation and measurement commands](../../../../doc/pi0-fast-benchmark.md#controlled-token-length-benchmark-no-frame-file).
+They fix the seed, prepare a device/precision-specific recipe cache once, and
+measure in a new process with online tuning disabled. The recorded-frame command
+below retains the historical natural-stop measurement.
+
 ```sh
 # LIBERO-10 accuracy
 MUJOCO_GL=egl python scripts/eval_libero.py --backend in-process \
@@ -276,24 +282,34 @@ MUJOCO_GL=egl python scripts/eval_libero.py --backend in-process \
   --action-dim 7 --suite libero_10 --trials-per-task 1 \
   --results-jsonl out/libero_10_fp8.jsonl --summary-json out/libero_10_fp8.summary.json
 
-# latency, and the fixed / per-step split
+# Historical natural-stop latency and fixed / per-step split
 python scripts/bench_pi0_fast.py --model-dir <checkpoint> \
   --state-key observation/state --mode all \
-  --frames devlocal/pi0-fast/results/raw/libero_frames.npz \
+  --frames /path/to/libero_frames.npz --tactics /path/to/compatible-recipes \
   --out devlocal/pi0-fast/results/bench_pi0_fast.json
-
-# what the tactic database is worth on this board: same script, same frames,
-# once against the pre-tuning database and once against the shipped one
-PI0FAST_TACTICS=<db> python devlocal/pi0-fast/scripts/bench_default_db.py  # omit to use the shipped db
 ```
 
-Tactics are device-specific: the algorithm ids in
-`configs/tuning/<vendor>/<family>-sm<version>/tactics.json` are only valid for
-that compatibility domain and are not portable between Orin and, say, RTX 4090.
-A new board stays on the cuBLAS default until it runs its own autotune
-(`Model.load(..., tactics=<db>, autotune=True)`, or
-`devlocal/pi0-fast/scripts/autotune_decode_gemv.py --phase tune`).
+cuda-new tuning uses device/toolkit-specific recipe directories. Prepare one
+with the maintained benchmark (`--tactics /path/to/recipes --autotune`), then
+omit `--autotune` and reuse the same path for measurement. Legacy `name.json`
+arguments map to sibling `name.recipes` directories; they do not import the old
+GEMM tactic database. Omitting both flags uses the native default cache and
+candidate selection.
 
 The FP8-to-BF16 projections use the formal GEMM recipe key with
-`Fp8UnitScale` quantization and likewise ship only a Thor entry: on another
-board FP8 keeps the default candidate until that board runs its own autotune.
+`Fp8UnitScale` quantization. Prepared recipes are device/toolkit-specific;
+prepare a compatible cache on the target board before measuring.
+
+### Per-request token limits
+
+The discrete-token entry point accepts an optional `max_new_tokens` within
+`1..=config.max_action_tokens`. Omission preserves existing behavior. A supplied
+`stop_token` still ends generation early; without one, the runtime generates
+exactly the requested count. BF16 and FP8 use the same limit semantics, retain
+the checkpoint-sized KV/workspace allocation, and terminate the native loop
+before any extra decode step. Python exposes this through
+`infer_action_tokens_rgb(..., stop_token=None, max_new_tokens=N)`.
+
+The [controlled benchmark](../../../../doc/pi0-fast-benchmark.md#controlled-token-length-benchmark-no-frame-file)
+uses this interface to time a grid derived from recorded natural-stop lengths.
+It neither changes deployed policy stopping nor evaluates action quality.

@@ -73,10 +73,23 @@ impl RuntimeVariant {
         token_ids: &CudaBuffer,
         token_count: usize,
         stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
     ) -> Result<Vec<u32>> {
         match self {
-            Self::Bf16(runtime) => runtime.infer(patches, token_ids, token_count, stop_token),
-            Self::Fp8(runtime) => runtime.infer(patches, token_ids, token_count, stop_token),
+            Self::Bf16(runtime) => runtime.infer_with_limit(
+                patches,
+                token_ids,
+                token_count,
+                stop_token,
+                max_new_tokens,
+            ),
+            Self::Fp8(runtime) => runtime.infer_with_limit(
+                patches,
+                token_ids,
+                token_count,
+                stop_token,
+                max_new_tokens,
+            ),
         }
     }
 
@@ -196,8 +209,13 @@ impl Pi0FastVlaRuntime {
 
     fn run(&self, observation: &Observation, stop_token: Option<u32>) -> Result<Vec<u32>> {
         let (patches, tokens) = self.device_inputs(observation)?;
-        self.runtime
-            .infer(&patches, &tokens, observation.token_ids.len(), stop_token)
+        self.runtime.infer(
+            &patches,
+            &tokens,
+            observation.token_ids.len(),
+            stop_token,
+            None,
+        )
     }
 
     /// Collect one Observation's BF16 activation maxima for FP8 calibration.
@@ -222,6 +240,13 @@ impl Pi0FastVlaRuntime {
 }
 
 impl VlaRuntime for Pi0FastVlaRuntime {
+    fn model_variant(&self) -> Option<&'static str> {
+        Some(match &self.runtime {
+            RuntimeVariant::Bf16(_) => "bf16",
+            RuntimeVariant::Fp8(_) => "fp8_static",
+        })
+    }
+
     fn contract(&self) -> VlaContract {
         VlaContract {
             action_shape: [1, self.config.max_action_tokens],
@@ -251,6 +276,25 @@ impl VlaRuntime for Pi0FastVlaRuntime {
         stop_token: Option<u32>,
     ) -> Result<Tensor> {
         let tokens = self.run(request.observation, stop_token)?;
+        self.token_tensor(&tokens)
+    }
+
+    fn infer_action_tokens_with_limit(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        self.config.decode_token_limit(max_new_tokens)?;
+        let observation = request.observation;
+        let (patches, ids) = self.device_inputs(observation)?;
+        let tokens = self.runtime.infer(
+            &patches,
+            &ids,
+            observation.token_ids.len(),
+            stop_token,
+            max_new_tokens,
+        )?;
         self.token_tensor(&tokens)
     }
 
@@ -386,6 +430,7 @@ pub(super) fn load_registered(
             "π0-FAST does not support synthetic weights yet".into(),
         ));
     }
+    let precision = resolve_precision(super::config::load_precision(options)?)?;
     let root = artifact_root(path);
     let config_path = root.join("config.json");
     let config = Arc::new(if config_path.is_file() {
@@ -394,7 +439,7 @@ pub(super) fn load_registered(
         Pi0FastConfig::default()
     });
     let host_weights = Pi0FastWeights::from_safetensors(&config, path)?;
-    let runtime = match resolve_precision(options.precision)? {
+    let runtime = match precision {
         ModelPrecision::Fp8 => {
             let weights = Arc::new(StaticFp8Pi0FastWeights::from_host(
                 &host_weights,

@@ -188,13 +188,13 @@ separately migrated; do not rename or import them as part of an unrelated port.
 `PreparedInference::status` is `RuntimeManaged`. A successful legacy `prepare`
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
-The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
-names, and for every Metal request. Metal admission reaches only a registered
-`metal_` factory, and each MLX family parses its variants locally; the common
-loader does not infer quantization from a shared CUDA precision choice. A new
-Metal family needs no central admission edit. Supporting it for a new non-Metal
-family requires updating that admission check and implementing family-local
-parsing/validation; registration alone is not
+The common loader accepts `model_variant` for all six built-in Python VLA
+families and D3, and for every Metal request. Metal admission reaches only a
+registered `metal_` factory, and each MLX family parses its variants locally;
+the common loader does not infer quantization from a shared CUDA precision
+choice. A new Metal family needs no central admission edit. Supporting it for a
+new non-Metal family requires updating that admission check and implementing
+family-local parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and
@@ -417,3 +417,26 @@ See the [implemented component view](model-lifecycle/architecture.md#implemented
 and [migration tracker](model-lifecycle/migration.md) for qualification and scope.
 WallOSS follows the same model/, model_runner/ and weights/ split ([WallOSS](walloss.md)).
 GR00T retains its previous implementation pending its own stage.
+
+## Public VLA variant selection
+
+All six Python VLA policies accept `model_variant` and pass it unchanged to
+`ModelRunner.load` / `LoadOptions.model_variant`. Python policy `precision`
+is rejected. PI0.5, SmolVLA, Qwen-Drive and WallOSS select their implementations
+in their model-local loaders. WallOSS selects BF16 or dynamic FP8 directly;
+it does not convert through `ModelPrecision`. GR00T and PI0-FAST keep a single
+family-local `config::load_precision` adapter for their legacy executors.
+The generic loader only admits model names; it does not interpret variant names.
+
+| Family | Public variants |
+| --- | --- |
+| PI0.5 | auto, bf16, fp8_static, int8_dynamic |
+| WallOSS | auto, bf16, fp8_dynamic |
+| SmolVLA | bf16, fp16 |
+| Qwen-Drive | auto, bf16 |
+| GR00T | auto, bf16, fp8_static, int8_dynamic (hardware restrictions still apply) |
+| PI0-FAST | auto, bf16, fp8_static |
+
+CPU CI exercises each policy through AutoPolicy up to the actual native load
+signature and tests the Rust selection/adaptation rules. It does not establish
+GPU numerical or performance parity.

@@ -1,0 +1,40 @@
+name: Benchmark API contracts
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'python/apxinf/**'
+      - 'crates/apxinf-py/**'
+      - 'crates/apxinf-model/**'
+      - 'tests/**'
+      - 'README.md'
+      - 'doc/**'
+      - '.github/workflows/benchmark-contracts.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benchmark-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -e "python/apxinf[serving]" pytest sentencepiece
+      - run: >-
+          python -m pytest -q
+          tests/test_walloss_benchmark_contract.py
+          tests/test_bench_walloss.py
+          tests/test_model_benchmarks.py
+          python/apxinf/tests/test_walloss_policy.py
+          python/apxinf/tests/test_policy_layering.py
+          python/apxinf/tests/test_model_variant_contract.py
+          python/apxinf/tests/test_gr00t_policy.py
+          python/apxinf/tests/test_pi0fast_policy.py
+          python/apxinf/tests/test_smolvla_policy.py
+          python/apxinf/tests/test_qwen_drive_policy.py
+          python/apxinf/tests/test_examples.py
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p apxinf-model --lib variant --no-default-features
+      - run: cargo check -p apxinf-model --features cuda --example gr00t_bench

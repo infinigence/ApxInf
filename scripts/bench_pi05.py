@@ -136,7 +136,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="comma list of l0,l1,l2,l3 or `all` (default: all with --model-dir, else l0,l1)",
     )
-    p.add_argument("--model-variant", choices=("bf16", "fp8_static", "int8_dynamic"), default="bf16")
+    p.add_argument("--model-variant", choices=("bf16", "fp8_dynamic", "fp8_static", "int8_dynamic"), default="bf16")
     p.add_argument("--model", default="pi05", help="model name for the random-weights engine")
     p.add_argument(
         "--model-type",
@@ -177,7 +177,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--action-horizon",
         type=int,
-        help="action horizon; overrides the checkpoint's config.json value",
+        help="action horizon; overrides PI0.5 checkpoint config (other policies may reject it)",
     )
     p.add_argument(
         "--action-dim",
@@ -202,12 +202,15 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _run_in_process(handle, policy, layers, observation, rgb, token_ids, noise, patches, warmup, samples):
+def _run_in_process(handle, policy, layers, observation, rgb, token_ids, noise, patches, warmup, samples, rgb_inputs=None):
     """Time the requested subset of the in-process layers L0/L1/L2."""
     runners = {
         "l0": lambda: handle._infer_patches(patches, token_ids, noise),
-        "l1": lambda: handle.infer_rgb(rgb, "nhwc", token_ids, noise),
-        "l2": lambda: policy.infer(observation),
+        "l1": lambda: (
+            handle.infer_rgb(**rgb_inputs) if rgb_inputs is not None
+            else handle.infer_rgb(rgb, "nhwc", token_ids, noise)
+        ),
+        "l2": lambda: policy.infer(observation, noise=noise),
     }
     raw = {}
     for layer in IN_PROCESS:
@@ -434,9 +437,9 @@ def main() -> None:
                 "observation/state": np.zeros(policy.action_dim, dtype=np.float32),
                 "prompt": args.prompt,
             })
-            if model_type != "pi05" and any(layer in layers for layer in ("l0", "l1")):
+            if model_type != "pi05" and "l0" in layers:
                 raise SystemExit(
-                    f"checkpoint model {model_type!r} supports --layer l2 in this "
+                    f"checkpoint model {model_type!r} does not support --layer l0 in this "
                     "PI0.5-layered benchmark; its model-specific lower-level input "
                     "contract is intentionally not guessed"
                 )
@@ -462,11 +465,23 @@ def main() -> None:
             else:
                 token_count = None
 
+    rgb_inputs = None
+    if checkpoint and callable(getattr(policy, "prepare_rgb_inputs", None)):
+        noise = np.random.default_rng(args.seed).standard_normal(
+            (handle.action_horizon, handle.action_dim), dtype=np.float32
+        )
+    if checkpoint and "l1" in layers:
+        prepare_rgb = getattr(policy, "prepare_rgb_inputs", None)
+        if not callable(prepare_rgb):
+            raise SystemExit("this policy does not expose prepare_rgb_inputs; select --layer l2")
+        rgb_inputs = prepare_rgb(observation, noise=noise)
+        token_count = int(rgb_inputs["token_ids"].size)
+
     in_process_raw = {}
     if in_process:
         in_process_raw = _run_in_process(
             handle, policy, layers, observation, rgb, token_ids, noise, patches,
-            args.warmup, args.samples,
+            args.warmup, args.samples, rgb_inputs=rgb_inputs,
         )
 
     l3_metadata = None
@@ -498,6 +513,10 @@ def main() -> None:
             "num_views": handle.num_views,
             "image_size": handle.image_size,
         }
+        if rgb_inputs is not None:
+            result["workload"]["rgb_shape"] = list(rgb_inputs["rgb_u8"].shape)
+            if "image_grid_thw" in rgb_inputs:
+                result["workload"]["image_grid_thw"] = rgb_inputs["image_grid_thw"].tolist()
         if not random:
             result["model_dir"] = str(args.model_dir)
             result["workload"]["prompt"] = args.prompt
