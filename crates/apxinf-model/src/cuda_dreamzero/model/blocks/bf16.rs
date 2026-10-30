@@ -1890,14 +1890,19 @@ mod vae {
     ) -> Result<()> {
         encode_impl(ctx, p, w, s, false)
     }
-    #[cfg(test)]
+    // The caller must bind one RGB frame followed by 32 zero frames. Reuse is
+    // confined to identical temporal suffixes within this invocation.
     pub(super) fn encode_initial_steady_prefix(
         ctx: &Context,
         p: &Policies,
         w: &VaeWeights,
         s: &VaeWorkspace,
     ) -> Result<()> {
-        assert_eq!(s.frames, 33);
+        if s.frames != 33 {
+            return Err(Error::Other(
+                "initial VAE encoding requires one RGB frame followed by 32 zero frames".into(),
+            ));
+        }
         encode_impl(ctx, p, w, s, true)
     }
     fn encode_impl(
@@ -1911,9 +1916,9 @@ mod vae {
         let mut current = s.slot(0, &shape)?;
         convolution(ctx, p, s, &s.input, &w.input, geometry(&w.input), &current)?;
         // The initial request binds a real first frame followed by 32 zeros.
-        // The native causal stem has a three-frame transient. For this first
-        // experiment only specialize the two high-resolution residual blocks;
-        // every later stage keeps its existing complete execution.
+        // The native causal stem has a three-frame transient. Only the first
+        // two high-resolution residual blocks retain a reusable suffix;
+        // subsequent stages execute every convolution tile.
         let mut steady = initial_zero_suffix.then_some(3);
         let mut index = 0;
         for layer in &w.down {
@@ -2329,7 +2334,13 @@ mod vision {
                     )?;
                 }
             }
-            vae::encode(ctx, p, vae, &self.vae)?;
+            if self.initial {
+                // Above, zero() and the first-frame copy establish this
+                // specialization's input contract on every graph replay.
+                vae::encode_initial_steady_prefix(ctx, p, vae, &self.vae)?;
+            } else {
+                vae::encode(ctx, p, vae, &self.vae)?;
+            }
             let frames = if self.initial { 9 } else { 3 };
             ops::permute(
                 ctx,
