@@ -33,6 +33,7 @@ from .base import (
     CANONICAL_STATE_KEY,
     VIEW_SLOTS,
     ModelRunnerProtocol,
+    StateConditionedModelRunnerProtocol,
     ComposablePolicy,
     Policy,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "CosmosPolicy",
     "Policy",
     "ModelRunnerProtocol",
+    "StateConditionedModelRunnerProtocol",
     "ComposablePolicy",
     "VIEW_SLOTS",
     "CANONICAL_IMAGE_KEYS",

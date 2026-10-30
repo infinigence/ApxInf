@@ -56,6 +56,31 @@ result = policy.infer({
 policy.close()
 ```
 
+The policy accepts **decoded HWC uint8 RGB**, state and a prompt, like the
+other observation-to-action policies. It does not accept encoded JPEG bytes.
+The default LIBERO image transform performs a JPEG-quality-95 encode/decode
+round trip, resize, center crop and final resize to reproduce the reference
+training-data recipe. This is a policy/profile transform, not a VAE or DiT
+input-format requirement. Transport decoding, simulator image orientation,
+camera mapping and robot conventions belong to the application/robo adapter.
+
+`image_transform=` injects a Cosmos-local image transform into the policy;
+it is not forwarded to native model loading. The callback receives one decoded
+RGB image and must return HWC uint8 `[224,224,3]`. An adapter which already
+applied the full profile recipe can pass `image_transform=lambda image: image`
+to avoid applying JPEG/crop/resize twice. An image being 224x224 alone does not
+mean that recipe has been applied. Overriding it changes the policy input recipe
+and requires application-level validation; the native RGB boundary is unchanged.
+The default callback preserves the existing reference pixel checks.
+
+The native boundary is resized RGB plus a normalized FP32 `[9]` state, one
+cached-task ID and optional joint noise; it returns normalized FP32 `[16,7]`
+actions. The policy owns prompt mapping, state normalization and physical-unit
+action unnormalization. This matches the layer responsibilities of other
+families without sharing their model implementations. Unlike token-based
+policies, the cached-task ID is not a text-token sequence, and the joint latent
+noise shape is independent of the action shape.
+
 The caller owns simulator image orientation and robot-specific action adapters.
 Unknown task text is rejected; this profile does not run a general T5 encoder.
 Use `autotune=True` to populate device-specific exact recipes on the first real
@@ -109,9 +134,23 @@ quantized variants and altered sampling schedules are outside this profile.
 
 Preparation binds precision, full latent geometry, checkpoint weights, device
 stream and the fixed sampling schedule. `Eager`, `PreferGraph` and
-`RequireGraph` are explicit policies; placeholder preparation disables online
+`RequireGraph` are explicit policies; default inference/preparation uses
+`PreferGraph`, recording a fallback reason if capture fails. Explicit
+`RequireGraph` still rejects a capture failure; placeholder preparation disables online
 tuning. `prepare_for` may tune on a real sample when loading enabled autotune.
-Compatible runs perform no tuning or capture. Every request recomputes causal
+Compatible runs perform no tuning or capture. Prepared device addresses remain
+stable while each run rebinds RGB, state, task ID and noise; changing values at
+fixed geometry does not rebuild the graph. The entire observation encoding and
+five-step sampler are captured, while Python transforms, request upload and host
+result conversion remain outside it.
+
+Cross-attention currently reuses temporary K/V storage but recomputes text
+projections and K normalization per layer and denoising step. It does not cache
+projected text K/V across steps or requests. That invariant text work can later
+be cached by layer, task, weights, device and precision. Self-attention K/V change
+with the noisy latent and timestep, so an autoregressive append-only KV cache is
+not applicable. Fixed prompt and image geometry enable graph reuse; they do not
+make changing visual/latent activations cacheable. Every request recomputes causal
 VAE caches from the singleton initial chunk and resets solver state. Explicit
 plans retain weights after runner destruction; returned actions own storage
 independent of subsequent replay. `clear_prepared` evicts only implicit plans.

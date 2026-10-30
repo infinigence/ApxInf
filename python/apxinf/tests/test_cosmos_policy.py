@@ -1,4 +1,6 @@
 import json
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -135,6 +137,79 @@ def test_wrong_runtime_profile_and_stats_rejected(stats):
     stats["proprio_max"][0] = stats["proprio_min"][0]
     with pytest.raises(ValueError, match="increasing bounds"):
         policy(Runner(), stats)
+
+
+def test_image_transform_accepts_adapter_rgb_without_reference_preprocessing(stats, observation, monkeypatch):
+    import apxinf.policies.impls.cosmos_policy as implementation
+
+    def unexpected_reference_transform(_):
+        raise AssertionError("adapter RGB must not be JPEG encoded or cropped again")
+
+    monkeypatch.setattr(implementation, "_prepare_image", unexpected_reference_transform)
+    rng = np.random.RandomState(4)
+    observation["wrist_image"] = rng.randint(0, 256, (224, 224, 3), dtype=np.uint8)
+    observation["primary_image"] = rng.randint(0, 256, (224, 224, 3), dtype=np.uint8)
+    runner = Runner()
+    model = CosmosPolicy(runner, tasks=["move the cup"], dataset_stats=stats,
+                         state_key="robot/state", image_transform=lambda image: image)
+    model.infer(observation)
+    np.testing.assert_array_equal(runner.calls[0][0][0], observation["wrist_image"])
+    np.testing.assert_array_equal(runner.calls[0][0][1], observation["primary_image"])
+
+
+@pytest.mark.parametrize("value", [np.zeros((212, 212, 3), np.uint8),
+                                    np.zeros((224, 224, 3), np.float32)])
+def test_invalid_image_transform_output_is_rejected_before_runner(stats, observation, value):
+    runner = Runner()
+    model = CosmosPolicy(runner, tasks=["move the cup"], dataset_stats=stats,
+                         state_key="robot/state", image_transform=lambda _: value)
+    with pytest.raises(ValueError, match="image_transform"):
+        model.infer(observation)
+    assert not runner.calls
+
+
+def test_from_pretrained_keeps_image_transform_out_of_native_load_options(tmp_path, stats, monkeypatch):
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "cosmos-policy", "profile": "libero-2b-direct-v1"}))
+    (tmp_path / "tasks.json").write_text(json.dumps({"tasks": ["move the cup"]}))
+    (tmp_path / "libero_dataset_statistics.json").write_text(json.dumps(stats))
+    runner = Runner()
+    calls = []
+
+    def load(*args, **options):
+        calls.append((args, options))
+        return runner
+
+    monkeypatch.setitem(sys.modules, "apxinf_py", SimpleNamespace(ModelRunner=SimpleNamespace(load=load)))
+    transform = lambda image: image
+    model = CosmosPolicy.from_pretrained(tmp_path, state_key="state", image_transform=transform,
+                                         autotune=True)
+    assert model.image_transform is transform
+    assert calls[0][1] == {"device": "cuda:0", "autotune": True}
+    injected = CosmosPolicy.from_pretrained(tmp_path, state_key="state", model_runner=runner,
+                                            image_transform=transform)
+    assert injected.image_transform is transform
+    assert len(calls) == 1
+
+
+def test_close_releases_runner_once(stats):
+    runner = Runner()
+    closed = []
+    runner.close = lambda: closed.append(True)
+    model = policy(runner, stats)
+    model.close()
+    model.close()
+    assert closed == [True]
+
+
+def test_explicit_noise_overrides_observation_noise(stats, observation):
+    runner = Runner()
+    model = policy(runner, stats)
+    observation["noise"] = np.zeros(runner.initial_latent_shape, np.float32)
+    explicit = np.ones(runner.initial_latent_shape, np.float32)
+    model.infer(observation)
+    model.infer(observation, noise=explicit)
+    np.testing.assert_array_equal(runner.calls[0][3], observation["noise"])
+    np.testing.assert_array_equal(runner.calls[1][3], explicit)
 
 
 def test_crop_resize_matches_torch_tensor_reference():

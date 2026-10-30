@@ -112,7 +112,7 @@ impl VlaRuntime for ModelRunner {
         if self.implicit.borrow().is_none() {
             let plan = self.plan(
                 &request.observation.inference_spec(),
-                ExecutionPolicy::RequireGraph,
+                ExecutionPolicy::PreferGraph,
                 Some(request),
             )?;
             *self.implicit.borrow_mut() = Some(plan);
@@ -121,7 +121,7 @@ impl VlaRuntime for ModelRunner {
         plan.run(request)
     }
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>> {
-        self.prepare_with_policy(spec, ExecutionPolicy::RequireGraph)
+        self.prepare_with_policy(spec, ExecutionPolicy::PreferGraph)
     }
     fn prepare_with_policy(
         &self,

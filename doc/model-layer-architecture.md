@@ -117,6 +117,16 @@ selects a policy; that policy calls the binding, which invokes Rust `AutoModel`.
 Reuse these entry points for a new family instead of adding a factory/runner
 wrapper merely to reproduce the names in this table.
 
+Python policies declare the runner capabilities they consume. The minimal
+`ModelRunnerProtocol` covers RGB/token inference;
+`StateConditionedModelRunnerProtocol` adds the optional continuous `state=`
+input and an `initial_latent_shape` independent of action geometry. These are
+language-boundary contracts, not shared model implementations. Model families
+retain independent preprocessing recipes and native topology. An application
+adapter may replace a family's image transform with already canonical resized
+RGB; it must not silently apply or skip checkpoint-profile transforms based
+only on image dimensions.
+
 ### Dependency direction within a family
 
 ```text

@@ -9,12 +9,13 @@ import io
 import json
 import time
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 from PIL import Image
 
 from ...processors.transforms import lookup_key
+from ..base import StateConditionedModelRunnerProtocol
 from ..registry import register_policy
 
 __all__ = ["CosmosPolicy"]
@@ -81,17 +82,23 @@ class CosmosPolicy:
     Camera order is wrist, primary. The caller names the proprioception key
     explicitly. Simulator image flipping and robot-specific gripper commands
     belong to the caller's observation/action adapter.
+
+    ``image_transform`` replaces the complete per-image reference preprocessing
+    recipe and must return HWC ``[224,224,3]`` uint8 RGB. An adapter that already
+    supplies those canonical pixels can pass an identity transform. The default
+    retains the official profile's JPEG/crop/resize behavior for parity.
     """
 
     def __init__(
         self,
-        model_runner,
+        model_runner: StateConditionedModelRunnerProtocol,
         *,
         tasks: Sequence[str],
         dataset_stats: Mapping[str, Any],
         state_key: str,
         image_keys: Sequence[str] = ("wrist_image", "primary_image"),
         prompt_key: str = "prompt",
+        image_transform: Callable[[Any], np.ndarray] | None = None,
     ):
         if not isinstance(state_key, str) or not state_key:
             raise ValueError("Cosmos Policy requires an explicit nonempty state_key")
@@ -103,19 +110,25 @@ class CosmosPolicy:
             raise ValueError("Cosmos Policy runner does not match the LIBERO direct profile")
         if tuple(model_runner.initial_latent_shape) != _LATENT_SHAPE:
             raise ValueError("Cosmos Policy requires the complete joint latent noise shape")
-        self.model_runner = model_runner
+        self.model_runner: StateConditionedModelRunnerProtocol | None = model_runner
         self._tasks = {task: index for index, task in enumerate(tasks)}
         self._proprio_min, self._proprio_max = _range(dataset_stats, "proprio", 9)
         self._action_min, self._action_max = _range(dataset_stats, "actions", 7)
         self.state_key = state_key
         self.image_keys = tuple(image_keys)
         self.prompt_key = prompt_key
+        # The default reproduces the reference policy's image recipe. An outer
+        # adapter may instead supply canonical RGB, without JPEG/cropping twice.
+        if image_transform is not None and not callable(image_transform):
+            raise TypeError("Cosmos Policy image_transform must be callable")
+        self.image_transform = _prepare_image if image_transform is None else image_transform
         self.metadata = {
             "model_type": "cosmos-policy", "profile": _PROFILE,
             "action_horizon": 16, "action_dim": 7,
             "initial_latent_shape": list(_LATENT_SHAPE),
             "image_keys": self.image_keys, "state_key": state_key,
             "prompt_key": prompt_key, "supported_tasks": tuple(tasks),
+            "image_preprocessing": "libero-reference-v1" if image_transform is None else "custom",
         }
 
     @classmethod
@@ -124,9 +137,10 @@ class CosmosPolicy:
         model_dir,
         *,
         state_key: str,
-        model_runner=None,
+        model_runner: StateConditionedModelRunnerProtocol | None = None,
         image_keys: Sequence[str] = ("wrist_image", "primary_image"),
         prompt_key: str = "prompt",
+        image_transform: Callable[[Any], np.ndarray] | None = None,
         device: str = "cuda:0",
         **load_options,
     ) -> "CosmosPolicy":
@@ -142,7 +156,8 @@ class CosmosPolicy:
         elif load_options:
             raise ValueError("load options cannot be applied to an injected model_runner")
         return cls(model_runner, tasks=tasks, dataset_stats=stats, state_key=state_key,
-                   image_keys=image_keys, prompt_key=prompt_key)
+                   image_keys=image_keys, prompt_key=prompt_key,
+                   image_transform=image_transform)
 
     @property
     def action_horizon(self) -> int:
@@ -160,14 +175,20 @@ class CosmosPolicy:
         if not isinstance(task, str) or task not in self._tasks:
             raise ValueError("Cosmos Policy task is absent from this checkpoint's cached text conditions")
         token_ids = np.asarray([self._tasks[task]], dtype=np.uint32)
-        rgb = np.stack([_prepare_image(lookup_key(observation, key)) for key in self.image_keys])
+        images = []
+        for key in self.image_keys:
+            image = np.asarray(self.image_transform(lookup_key(observation, key)))
+            if image.dtype != np.uint8 or image.shape != (224, 224, 3):
+                raise ValueError("Cosmos Policy image_transform must return [224,224,3] uint8 RGB")
+            images.append(image)
+        rgb = np.ascontiguousarray(np.stack(images))
         proprio = np.asarray(lookup_key(observation, self.state_key), dtype=np.float64)
         if proprio.shape != (9,) or not np.isfinite(proprio).all():
             raise ValueError("Cosmos Policy proprioception must be finite with shape [9]")
         state = np.ascontiguousarray(2 * ((proprio - self._proprio_min) / (self._proprio_max - self._proprio_min)) - 1, dtype=np.float32)
-        selected_noise = None
-        if noise is not None:
-            selected_noise = np.ascontiguousarray(noise, dtype=np.float32)
+        selected_noise = noise if noise is not None else observation.get("noise")
+        if selected_noise is not None:
+            selected_noise = np.ascontiguousarray(selected_noise, dtype=np.float32)
             if selected_noise.shape != _LATENT_SHAPE or not np.isfinite(selected_noise).all():
                 raise ValueError(f"Cosmos Policy noise must be finite with shape {_LATENT_SHAPE}")
         model_started = time.perf_counter()
@@ -184,4 +205,8 @@ class CosmosPolicy:
     __call__ = infer
 
     def close(self) -> None:
+        runner = self.model_runner
         self.model_runner = None
+        close = getattr(runner, "close", None)
+        if callable(close):
+            close()
