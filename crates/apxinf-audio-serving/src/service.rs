@@ -572,7 +572,8 @@ async fn run_actor(
                         timeout_ms: job
                             .deadline
                             .saturating_duration_since(now)
-                            .as_millis()
+                            .as_nanos()
+                            .div_ceil(1_000_000)
                             .clamp(1, 120000) as u64,
                         operation: job.operation.clone(),
                     };
