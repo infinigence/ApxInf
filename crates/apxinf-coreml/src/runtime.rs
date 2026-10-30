@@ -257,7 +257,12 @@ impl ProgramCache {
             .compiled(package)?
             .canonicalize()
             .map_err(|error| Error::Other(format!("Core ML compiled path: {error}")))?;
-        let facts = crate::placement::inspect(&compiled, units, timeout_ms)?;
+        let facts = crate::placement::inspect(&compiled, units, timeout_ms).map_err(|error| {
+            Error::Other(format!(
+                "Core ML placement inspection at {}: {error}",
+                compiled.display()
+            ))
+        })?;
         let model = Model::load(&compiled, units)?;
         admit(&facts)?;
         Ok(model)

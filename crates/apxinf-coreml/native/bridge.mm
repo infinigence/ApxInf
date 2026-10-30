@@ -31,7 +31,7 @@ int fail(const std::string& message) {
 }
 
 int fail(NSError* error, const char* what) {
-    return fail(std::string(what) + ": " + (error ? error.localizedDescription.UTF8String : "unknown error"));
+    return fail(std::string(what) + ": " + (error ? error.description.UTF8String : "unknown error"));
 }
 
 template <typename Action> int guarded(Action action) {
