@@ -29,6 +29,14 @@ bool supports_vendor_math(const Spec& spec) {
            spec.accumulation_dtype == APXINF_DTYPE_F32));
 }
 
+bool supports_f32_projection(const Spec& spec) {
+  return spec.numerics == APXINF_GEMM_NUMERICS_F32_REDUCTION && spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         (spec.a_dtype == APXINF_DTYPE_BF16 || spec.a_dtype == APXINF_DTYPE_F16) &&
+         spec.b_dtype == spec.a_dtype && spec.output_dtype == spec.a_dtype &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE;
+}
+
 bool supports_direct_bias(const Spec& spec) {
   return spec.numerics == APXINF_GEMM_NUMERICS_STAGED_BIAS &&
          (spec.a_dtype == APXINF_DTYPE_BF16 || spec.a_dtype == APXINF_DTYPE_F16) &&
@@ -38,7 +46,7 @@ bool supports_direct_bias(const Spec& spec) {
          spec.output_scale_is_unit != 0;
 }
 bool supports_cublas(const Spec& spec) {
-  return supports_vendor_math(spec);
+  return spec.numerics != APXINF_GEMM_NUMERICS_F32_REDUCTION && supports_vendor_math(spec);
 }
 
 bool supports_vendor(const Spec& spec) {
@@ -488,6 +496,11 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        prepare_cublaslt_native_fp8, launch_cublaslt, destroy_cublaslt},
   };
   static const ImplementationRegistry gemm_entries = {
+      {kProviderCublasLt, 6, 1, "cublasLt-f32-reduction", 0, true, true, true,
+       supports_f32_projection, cublaslt_alignment, cublaslt_resource_requirements,
+       cublaslt_configurations, prepare_cublaslt_f32_reduction, launch_cublaslt,
+       destroy_cublaslt},
+
       {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
@@ -623,7 +636,7 @@ const ImplementationRegistry& registry(uint32_t semantic) {
         return implementation.fallback;
       });
   const int expected_fallbacks =
-      semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS ? 2 : 1;
+      (semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS || semantic == APXINF_GEMM_SEMANTIC_GEMM) ? 2 : 1;
   if (fallback_count != expected_fallbacks) {
     throw Failure(APXINF_STATUS_INTERNAL_ERROR,
                   "GEMM semantic fallback registry is inconsistent");

@@ -29,7 +29,7 @@ before persisting a recipe. It is not a search for a faster algorithm.
 Restoration revalidates the same domain; another supported algorithm under its
 key is a miss. Both the persistent recipe and session execution keys include
 the policy. The GEMM-specific policy ABI is version 1 and requires Spec version
-11; Attention's policy ABI is unchanged.
+12; Attention's policy ABI is unchanged.
 
 This preserves the chosen reduction order across cold, tuned and restored runs
 within a compatible device/build/library/policy domain. It does not promise
@@ -102,6 +102,15 @@ native candidates are the direct cuBLASLt bias epilogue with FP32 split-K
 partials and the cuBLAS FP32 projection plus typed bias epilogue. Existing
 single-round golden, cold/tuned/restored, workspace and Graph lifetime tests
 exercise this opt-in parameter.
+
+`GemmNumerics::F32Reduction` is an opt-in plain GEMM choice for canonical,
+unquantized matching F16/BF16 operands. It requires FP32 split-reduction partials
+before output conversion and selects only candidates that implement that
+constraint. The current cuBLASLt candidate can use zero workspace for admitted
+shapes, while unsupported budgets/algorithms fail explicitly. The VAE's tiled
+unfold/GEMM path uses this mode; ordinary GEMM defaults and candidates retain
+their prior selection. Both numerical modes are encoded in GEMM Spec version 12
+and participate in recipe/session identity.
 
 <!-- l3-operator:gemm_bias_residual -->
 ### `gemm_bias_residual`

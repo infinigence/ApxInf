@@ -1542,6 +1542,7 @@ mod vae {
             let mut args = ops::GemmArgs::new(&columns, &w.weight, &mut projected);
             args.policy = p.gemm.clone();
             args.policy.workspace_limit = 0;
+            args.policy.numerics = ops::GemmNumerics::F32Reduction;
             ops::gemm(ctx, args)?;
             // cuDNN convolution rounds its output before adding the BF16 bias.
             binary(ctx, S::BroadcastAdd, &projected, &w.bias, &mut biased)?;

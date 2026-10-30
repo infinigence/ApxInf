@@ -78,6 +78,8 @@ pub enum GemmNumerics {
     LegacyCublas,
     /// Accumulate GEMM+bias before the only output-dtype cast.
     StagedBias,
+    /// Require FP32 split-reduction partials before the output cast.
+    F32Reduction,
 }
 
 /// Parameters common to the GEMM semantic operators.
@@ -492,6 +494,18 @@ fn normalize_fused<'a>(
     if !args.alpha.is_finite() || !args.output_scale.is_finite() || args.output_scale <= 0.0 {
         return Err(invalid("invalid GEMM scales"));
     }
+    if args.policy.numerics == GemmNumerics::F32Reduction
+        && (semantic != Semantic::Gemm
+            || !matches!(args.quantization, GemmQuantization::None)
+            || args.weight_layout != GemmWeightLayout::Kn
+            || !matches!(args.a.dtype(), DType::F16 | DType::BF16)
+            || args.b.dtype() != args.a.dtype()
+            || args.out.dtype() != args.a.dtype())
+    {
+        return Err(invalid(
+            "FP32 reduction numerics require canonical unquantized F16/BF16 GEMM",
+        ));
+    }
     if args.policy.numerics == GemmNumerics::LegacyCublas
         && (semantic != Semantic::Gemm
             || !matches!(args.quantization, GemmQuantization::None)
@@ -746,7 +760,7 @@ fn normalize_fused<'a>(
     }
     Ok(Normalized {
         spec: abi::Spec {
-            version: 11,
+            version: 12,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,
@@ -762,6 +776,7 @@ fn normalize_fused<'a>(
                 GemmNumerics::Default => 0,
                 GemmNumerics::LegacyCublas => 1,
                 GemmNumerics::StagedBias => 2,
+                GemmNumerics::F32Reduction => 3,
             },
             b_is_immutable: bindings.b_is_immutable,
             a_alignment: alignment_class(bindings.a),

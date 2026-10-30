@@ -276,7 +276,9 @@ explicit L3 parameters: `GemmNumerics::StagedBias` on existing GEMM+bias,
 The separate additive-attention contract supplies UMT5's learned bias and
 materialized logits/probabilities; ordinary attention has no additive-bias input.
 The existing default numerical paths remain the choices for other callers.
-The unused FP32-reduction GEMM candidate was removed.
+The VAE tiled unfold/GEMM path explicitly requests `GemmNumerics::F32Reduction`
+for its FP32 partial-reduction and zero-workspace contract; its native candidate
+is retained because that path uses it.
 
 The joint noise shape, native action shape, Python policy/registry names,
 history transaction and separate `reset_history`/`clear_prepared` operations

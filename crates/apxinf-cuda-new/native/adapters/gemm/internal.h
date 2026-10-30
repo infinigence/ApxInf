@@ -164,6 +164,7 @@ void destroy_cublas(Execution& execution) noexcept;
 cudaError_t launch_cublas(Execution& execution);
 void prepare_cublaslt(Execution& execution);
 void prepare_cublaslt_direct_bias(Execution& execution);
+void prepare_cublaslt_f32_reduction(Execution& execution);
 size_t cublaslt_direct_bias_resource_requirements(const Spec& spec);
 void prepare_cublaslt_native_fp8(Execution& execution);
 void prepare_cublaslt_native_fp4(Execution& execution);
