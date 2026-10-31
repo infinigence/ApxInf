@@ -5,6 +5,10 @@
 #define APXINF_INDEXED_FA2_ROWSUM 1
 #define APXINF_INDEXED_UNFUSED_SCALE 1
 #define APXINF_INDEXED_KEY_TILE 64
+#define APXINF_S_PIPE_STAGES 2
+#define APXINF_1Q_NUM_REGS_SOFTMAX 128
+#define APXINF_1Q_NUM_REGS_CORRECTION 80
+#define APXINF_1Q_NUM_REGS_OTHER 24
 #include "indexed_sm110.h"
 #include <memory>
 // Copyright 2025 ApxInf contributors.
@@ -37,6 +41,7 @@
 #define CUTLASS_ARCH_MMA_SM100F_ENABLED 1
 #endif
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
+#include "apxinf_indexed_singleq_kernel.hpp"
 #if defined(APXINF_FMHA_UNDEF_SM100A)
 #undef CUTLASS_ARCH_MMA_SM100A_ENABLED
 #undef APXINF_FMHA_UNDEF_SM100A
@@ -46,6 +51,7 @@
 #undef APXINF_FMHA_UNDEF_SM100F
 #endif
 #include "apxinf_indexed_mainloop.hpp"
+#include "apxinf_indexed_singleq_mainloop.hpp"
 #include "device/fmha.hpp"
 #include "collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
 #include "collective/sm100_fmha_load_tma_warpspecialized.hpp"
@@ -68,63 +74,99 @@ using ProblemShape = cute::tuple<int, int, int, cute::tuple<cute::tuple<int, int
 namespace apxinf::cuda_new::indexed_attention {
 namespace {
 using Element=cutlass::bfloat16_t;
-using Mainloop=cutlass::fmha::indexed_collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
+using BaselineMainloop=cutlass::fmha::indexed_collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
  Element,float,float,TileShape,StrideQ,StrideK,StrideV,cutlass::fmha::collective::ResidualMask>;
-using Epilogue=cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
- Element,float,typename Mainloop::TileShapePV,StrideO,StrideLSE>;
-using Kernel=cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<ProblemShape,Mainloop,Epilogue,cutlass::fmha::kernel::IndividualTileScheduler>;
-using Device=cutlass::fmha::device::FMHA<Kernel>;
+using BaselineEpilogue=cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+ Element,float,typename BaselineMainloop::TileShapePV,StrideO,StrideLSE>;
+using BaselineKernel=cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
+ ProblemShape,BaselineMainloop,BaselineEpilogue,cutlass::fmha::kernel::IndividualTileScheduler>;
+
+// Both CTA ranks of a cluster must execute the same logical query tile,
+// including the final partial tile. The grid is a whole number of clusters.
+struct Cluster2TileScheduler {
+ struct Params {dim3 grid;};
+ bool valid_=true;
+ CUTLASS_DEVICE explicit Cluster2TileScheduler(const Params&) {}
+ template<class Shape,class Cluster,class Tile>
+ static Params to_underlying_arguments(const Shape& shape,cutlass::KernelHardwareInfo,
+                                       const Cluster& cluster,const Tile& tile){
+  const int tiles=int(cute::ceil_div(cute::size<0>(shape),cute::size<0>(tile)));
+  return {dim3(unsigned(tiles*int(cute::size<0>(cluster))),
+               unsigned(cute::size<3,0>(shape)),unsigned(cute::size<3,1>(shape)))};
+ }
+ static dim3 get_grid_shape(const Params& p){return p.grid;}
+ CUTLASS_DEVICE bool is_valid(){return valid_;}
+ CUTLASS_DEVICE auto get_block_coord(){return cute::make_coord(blockIdx.x/2,cute::_0{},cute::make_coord(blockIdx.y,blockIdx.z));}
+ CUTLASS_DEVICE Cluster2TileScheduler& operator++(){valid_=false;return *this;}
+};
+using SingleQMainloop=cutlass::fmha::indexed_singleq_collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
+ Element,float,float,TileShape,StrideQ,StrideK,StrideV,cutlass::fmha::collective::ResidualMask,
+ cute::Shape<cute::_1,cute::_1,cute::_1>,cute::Shape<cute::_2,cute::_1,cute::_1>>;
+using SingleQEpilogue=cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+ Element,float,typename SingleQMainloop::TileShapePV,StrideO,StrideLSE,cute::false_type,1>;
+using SingleQKernel=cutlass::fmha::indexed_singleq_kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
+ ProblemShape,SingleQMainloop,SingleQEpilogue,Cluster2TileScheduler,
+ cutlass::fmha::indexed_singleq_kernel::Sm100FmhaCtxKernelWarpspecialized1QSchedule>;
+
 struct Plan {
+ virtual ~Plan()=default;
+ virtual cudaError_t enqueue(cudaStream_t)=0;
+};
+template<class Kernel>struct Prepared final:Plan {
+ using Device=cutlass::fmha::device::FMHA<Kernel>;
  Device operation;
  cudaLaunchConfig_t launch{};
  cudaLaunchAttribute cluster_attribute{};
+ cudaError_t enqueue(cudaStream_t stream)override{
+  auto config=launch;config.stream=stream;
+  void* arguments[]={const_cast<typename Device::Params*>(&operation.params())};
+  return cudaLaunchKernelExC(&config,(const void*)cutlass::device_kernel<Kernel>,arguments);
+ }
 };
+template<class Kernel>int prepare_plan(const Bindings& b,void** result){
+ using Device=typename Prepared<Kernel>::Device;
+ const int dim=128,token_stride=b.heads*dim,rounded=(b.queries+127)/128*128;
+ auto problem=make_tuple(b.queries,b.keys,dim,make_tuple(make_tuple(1,b.heads),1));
+ StrideQ qs=make_stride(token_stride,_1{},make_stride(make_stride(dim,dim),token_stride*b.queries));
+ StrideK ks=make_stride(token_stride,_1{},make_stride(make_stride(_0{},dim),token_stride*b.keys));
+ StrideLSE ls=make_stride(_1{},make_stride(make_stride(rounded,rounded),rounded*b.heads));
+ int device=0,sm=0,limit=0;
+ if(cudaGetDevice(&device)!=cudaSuccess || cudaDeviceGetAttribute(&sm,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess || cudaDeviceGetAttribute(&limit,cudaDevAttrMaxSharedMemoryPerBlockOptin,device)!=cudaSuccess)return -2;
+ if(Kernel::SharedStorageSize>limit)return -1;
+ typename Device::Arguments args{problem,
+   {{static_cast<const Element*>(b.query),qs,static_cast<const Element*>(b.key),ks,static_cast<const Element*>(b.value),ks},b.scale,1.f,1.f,1.f,1.f},
+   {static_cast<Element*>(b.output),qs,b.native_lse,ls},{device,sm}};
+ args.mainloop.row_flags=b.flags;args.mainloop.flag_queries=b.queries;args.mainloop.flag_heads=b.heads;args.mainloop.flag_margin=16;
+ if(Device::can_implement(args)!=cutlass::Status::kSuccess || Device::get_workspace_size(args)!=0)return -1;
+ if(cudaFuncSetAttribute(cutlass::device_kernel<Kernel>,cudaFuncAttributeMaxDynamicSharedMemorySize,Kernel::SharedStorageSize)!=cudaSuccess)return -2;
+ if(cudaFuncSetAttribute(cutlass::device_kernel<Kernel>,cudaFuncAttributeNonPortableClusterSizeAllowed,1)!=cudaSuccess)return -2;
+ auto plan=std::make_unique<Prepared<Kernel>>();
+ if(Kernel::initialize_workspace(args,nullptr,nullptr)!=cutlass::Status::kSuccess || plan->operation.update(args,nullptr)!=cutlass::Status::kSuccess)return -2;
+ const dim3 cluster(cute::size<0>(typename Kernel::ClusterShape{}),
+                    cute::size<1>(typename Kernel::ClusterShape{}),
+                    cute::size<2>(typename Kernel::ClusterShape{}));
+ plan->launch.gridDim=Device::get_grid_shape(plan->operation.params());
+ plan->launch.blockDim=Kernel::get_block_shape();
+ plan->launch.dynamicSmemBytes=Kernel::SharedStorageSize;
+ if(cutlass::ClusterLauncher::check_cluster_dims(plan->launch.gridDim,cluster)!=cutlass::Status::kSuccess)return -1;
+ plan->cluster_attribute.id=cudaLaunchAttributeClusterDimension;
+ plan->cluster_attribute.val.clusterDim={cluster.x,cluster.y,cluster.z};
+ plan->launch.numAttrs=1;plan->launch.attrs=&plan->cluster_attribute;
+ *result=static_cast<Plan*>(plan.release());return 0;
 }
-int prepare_native(const Bindings& b,void** result){
+} // namespace
+int prepare_native(const Bindings& b,void** result,int configuration){
  if(result==nullptr)return -1;*result=nullptr;
  try {
-  const int dim=128,token_stride=b.heads*dim,rounded=(b.queries+127)/128*128;
-  auto problem=make_tuple(b.queries,b.keys,dim,make_tuple(make_tuple(1,b.heads),1));
-  StrideQ qs=make_stride(token_stride,_1{},make_stride(make_stride(dim,dim),token_stride*b.queries));
-  StrideK ks=make_stride(token_stride,_1{},make_stride(make_stride(_0{},dim),token_stride*b.keys));
-  StrideLSE ls=make_stride(_1{},make_stride(make_stride(rounded,rounded),rounded*b.heads));
-  int device=0,sm=0,limit=0;
-  if(cudaGetDevice(&device)!=cudaSuccess || cudaDeviceGetAttribute(&sm,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess || cudaDeviceGetAttribute(&limit,cudaDevAttrMaxSharedMemoryPerBlockOptin,device)!=cudaSuccess)return -2;
-  if(Kernel::SharedStorageSize>limit)return -1;
-  typename Device::Arguments args{problem,
-    {{static_cast<const Element*>(b.query),qs,static_cast<const Element*>(b.key),ks,static_cast<const Element*>(b.value),ks},b.scale,1.f,1.f,1.f,1.f},
-    {static_cast<Element*>(b.output),qs,b.native_lse,ls},{device,sm}};
-  args.mainloop.row_flags=b.flags;args.mainloop.flag_queries=b.queries;args.mainloop.flag_heads=b.heads;args.mainloop.flag_margin=16;
-  if(Device::can_implement(args)!=cutlass::Status::kSuccess || Device::get_workspace_size(args)!=0)return -1;
-  // Prepare attributes for this device explicitly. Avoid the upstream wrapper's
-  // process-global initialized bit; enqueue never mutates function attributes.
-  if(cudaFuncSetAttribute(cutlass::device_kernel<Kernel>,cudaFuncAttributeMaxDynamicSharedMemorySize,Kernel::SharedStorageSize)!=cudaSuccess)return -2;
-  if(cudaFuncSetAttribute(cutlass::device_kernel<Kernel>,cudaFuncAttributeNonPortableClusterSizeAllowed,1)!=cudaSuccess)return -2;
-  auto plan=std::make_unique<Plan>();
-  if(Kernel::initialize_workspace(args,nullptr,nullptr)!=cutlass::Status::kSuccess || plan->operation.update(args,nullptr)!=cutlass::Status::kSuccess)return -2;
-  const dim3 cluster(cute::size<0>(typename Kernel::ClusterShape{}),
-                     cute::size<1>(typename Kernel::ClusterShape{}),
-                     cute::size<2>(typename Kernel::ClusterShape{}));
-  plan->launch.gridDim=Device::get_grid_shape(plan->operation.params());
-  plan->launch.blockDim=Kernel::get_block_shape();
-  plan->launch.dynamicSmemBytes=Kernel::SharedStorageSize;
-  if(cutlass::ClusterLauncher::check_cluster_dims(plan->launch.gridDim,cluster)!=cutlass::Status::kSuccess)return -1;
-  plan->cluster_attribute.id=cudaLaunchAttributeClusterDimension;
-  plan->cluster_attribute.val.clusterDim={cluster.x,cluster.y,cluster.z};
-  plan->launch.numAttrs=1;
-  plan->launch.attrs=&plan->cluster_attribute;
-  *result=plan.release();return 0;
- } catch (...) { return -2; }
+  switch(configuration){
+   case 0:return prepare_plan<BaselineKernel>(b,result);
+   case 1:return prepare_plan<SingleQKernel>(b,result);
+   default:return -1;
+  }
+ }catch(...){return -2;}
 }
-cudaError_t enqueue_native(void* p,cudaStream_t stream){
- auto& plan=*static_cast<Plan*>(p);
- auto launch=plan.launch;launch.stream=stream;
- void* arguments[]={const_cast<typename Device::Params*>(&plan.operation.params())};
- // CUTLASS Device::run calls ClusterLauncher::init and mutates function
- // attributes on every launch. Submit the equivalent prepared launch directly.
- return cudaLaunchKernelExC(&launch,(const void*)cutlass::device_kernel<Kernel>,arguments);
-}
-void destroy_native(void* p) noexcept {delete static_cast<Plan*>(p);}
+cudaError_t enqueue_native(void* p,cudaStream_t stream){return static_cast<Plan*>(p)->enqueue(stream);}
+void destroy_native(void* p)noexcept{delete static_cast<Plan*>(p);}
 // Stable per-head compaction: indices are in increasing original query order.
 // Integer ballots/prefixes avoid data-dependent atomic append order entirely.
 __global__ void compact_rows(const uint32_t* flags,int* counts,int* indices,int queries){

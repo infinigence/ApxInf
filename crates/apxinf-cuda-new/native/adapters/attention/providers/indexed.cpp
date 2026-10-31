@@ -31,18 +31,18 @@ void plan_status(int status){
 }
 }
 size_t indexed_resource_requirements(const Spec& s,int configuration){
- if(configuration!=0)throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"indexed Attention configuration");
+ if(configuration<0 || configuration>1)throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"indexed Attention configuration");
  return sizes(s).total();
 }
 void prepare_indexed(Execution& e){
  const auto bytes=sizes(e.spec);
- if(e.configuration!=0 || bytes.total()>e.resource_limit)
+ if(e.configuration<0 || e.configuration>1 || bytes.total()>e.resource_limit)
   throw Failure(APXINF_STATUS_UNSUPPORTED,"indexed Attention workspace exceeds policy");
  auto state=std::make_unique<State>();state->device=e.device;auto& b=state->bindings;
  b.query=e.bindings.query;b.key=e.bindings.key;b.value=e.bindings.value;b.output=e.bindings.output;
  b.queries=int(e.spec.query_tokens);b.keys=int(e.spec.key_tokens);b.heads=int(e.spec.query_heads);b.scale=e.bindings.scale;
  allocate(b.flags,bytes.flags);allocate(b.indices,bytes.indices);allocate(b.counts,bytes.counts);allocate(b.cumulative,bytes.cumulative);allocate(b.native_lse,bytes.native_lse);allocate(b.fa2_lse,bytes.fa2_lse);
- plan_status(kernel::prepare_native(b,&state->native));plan_status(kernel::prepare_mapped(b,&state->mapped));
+ plan_status(kernel::prepare_native(b,&state->native,e.configuration));plan_status(kernel::prepare_mapped(b,&state->mapped));
  e.resource_bytes=bytes.total();e.provider_state=state.release();
 }
 cudaError_t launch_indexed(Execution& e){

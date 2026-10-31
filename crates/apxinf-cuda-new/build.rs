@@ -156,7 +156,7 @@ fn stage_patched_fa2(native: &Path, fa2_root: &Path, out: &Path) -> PathBuf {
     staged
 }
 
-// Only three existing headers are staged. The reviewed patch gives the native
+// Existing headers are staged into isolated copies. The patch gives the native
 // collectives and FA2 entry a private namespace; canonical vendors stay intact.
 fn stage_indexed_attention(native: &Path, out: &Path) -> PathBuf {
     let staged = out.join("attention-indexed-sm110");
@@ -173,6 +173,14 @@ fn stage_indexed_attention(native: &Path, out: &Path) -> PathBuf {
         (
             "kernels/fa2/flash_attn/flash_fwd_kernel.h",
             "apxinf_indexed_fa2.hpp",
+        ),
+        (
+            "kernels/cutlass/fmha/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp",
+            "apxinf_indexed_singleq_mainloop.hpp",
+        ),
+        (
+            "kernels/cutlass/fmha/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp",
+            "apxinf_indexed_singleq_kernel.hpp",
         ),
     ];
     let mut fingerprint = 0x6c62272e07bb014262b821756295c58du128;

@@ -335,3 +335,782 @@
  }
  
  ////////////////////////////////////////////////////////////////////////////////////////////////////
+--- apxinf_indexed_singleq_mainloop.hpp
++++ apxinf_indexed_singleq_mainloop.hpp
+@@ -40,7 +40,9 @@
+ 
+ #include "collective/fmha_common.hpp"
+ #include "collective/fmha_fusion.hpp"
+-#include "collective/sm100_fmha_load_tma_warpspecialized.hpp"
++#include "apxinf_indexed_load.hpp"
++
++namespace apxinf_indexed_singleq_math {
+ 
+ // ===========================================================================
+ // apxinf: macro vocabulary for the SM100 FMHA forward mainloop.
+@@ -639,7 +641,21 @@
+ #endif
+ 
+ 
+-namespace cutlass::fmha::collective {
++} // namespace apxinf_indexed_singleq_math
++
++namespace cutlass::fmha::indexed_singleq_collective {
++using ::apxinf_indexed_singleq_math::apxinf_ex2_approx;
++using ::apxinf_indexed_singleq_math::apxinf_rcp_approx;
++using ::apxinf_indexed_singleq_math::apxinf_fmax3;
++using ::apxinf_indexed_singleq_math::apxinf_ex2_emulation_2;
++using ::apxinf_indexed_singleq_math::apxinf_ex2_c3_reg;
++using ::apxinf_indexed_singleq_math::apxinf_ex2_emulation_2_c3;
++using ::apxinf_indexed_singleq_math::apxinf_use_hw_ex2;
++using ::apxinf_indexed_singleq_math::apxinf_normalize_scale;
++using ::apxinf_indexed_singleq_math::apxinf_lg2_approx;
++using ::apxinf_indexed_singleq_math::apxinf_lse;
++
++using namespace cutlass::fmha::collective;
+ 
+ using namespace cute;
+ 
+@@ -695,7 +711,7 @@
+   // therefore stages the two K128 halves of Q independently.  NumQStages is
+   // still one from the softmax/tmem point of view; this is only the smem/TMA
+   // pipeline depth.
+-  static constexpr int StageCountQ = kIs2Sm ? 2 : NumQStages;
++  static constexpr int StageCountQ = kIs2Sm ? (get<2>(TileShape{}) > 128 ? 2 : NumQStages) : NumQStages;
+ 
+   // apxinf: depth of the mma -> softmax S pipeline. The stock collective has
+   // one S slot per Q stage, which with a single Q stage means the MMA warp
+@@ -839,6 +855,9 @@
+   };
+ 
+   static constexpr uint32_t kTmemColumns = uint32_t(TmemAllocation::kEnd);
++  uint32_t tmem_base = 0;
++  CUTLASS_DEVICE uint32_t tmem_address(uint32_t offset) const { return tmem_base+offset; }
++
+   static_assert(kTmemColumns <= 512,
+       "FMHA tmem footprint exceeds the 512-column SM100 budget; "
+       "use ThreadShape<_1,_1,_1> (one Q stage) for large head_dim");
+@@ -901,7 +920,7 @@
+ 
+   static_assert(TransactionBytesLoadK == TransactionBytesLoadV, "K and V smem layouts must be of equal size");
+ 
+-  using Load = Sm100FmhaLoadTmaWarpspecialized<
++  using Load = cutlass::fmha::indexed_collective::Sm100FmhaLoadTmaWarpspecialized<
+     Element, StrideQ, StrideK, StrideV,
+     CollectiveMmaQK, CollectiveMmaPVCompute,
+     SmemLayoutQ, SmemLayoutK, SmemLayoutV,
+@@ -921,6 +940,10 @@
+ 
+     // scaling factor to quantize O
+     float inv_scale_o = 1.0f;
++    uint32_t* row_flags = nullptr;
++    int flag_queries = 0;
++    int flag_heads = 0;
++    unsigned flag_margin = 0;
+   };
+ 
+   struct Params {
+@@ -930,6 +953,10 @@
+     float scale_softmax_log2;
+ 
+     float scale_output;
++    uint32_t* row_flags;
++    int flag_queries;
++    int flag_heads;
++    unsigned flag_margin;
+   };
+ 
+   template<class ProblemShape>
+@@ -953,7 +980,8 @@
+         Load::to_underlying_arguments(problem_shape, args.load, workspace),
+         args.scale_q * args.scale_k * scale_softmax,
+         args.scale_q * args.scale_k * log2_e * scale_softmax,
+-        args.scale_v * args.inv_scale_o
++        args.scale_v * args.inv_scale_o,
++        args.row_flags, args.flag_queries, args.flag_heads, args.flag_margin
+     };
+   }
+ 
+@@ -1021,15 +1049,15 @@
+         thr_mma_pv.partition_C(cO_mma));
+ 
+     Tensor tStS0 = tStS;
+-    tStS0.data() = tStS.data().get() + uint32_t(TmemAllocation::S0);
++    tStS0.data() = tStS.data().get() + tmem_address(uint32_t(TmemAllocation::S0));
+     Tensor tOtO0 = tOtO;
+-    tOtO0.data() = tOtO.data().get() + uint32_t(TmemAllocation::O0);
++    tOtO0.data() = tOtO.data().get() + tmem_address(uint32_t(TmemAllocation::O0));
+ 
+     Tensor sP = make_tensor(make_smem_ptr((Element*)nullptr),
+                             typename CollectiveMmaPVCompute::SmemLayoutA{});
+     Tensor tOrP = thr_mma_pv.make_fragment_A(sP)(_, _, _, _0{});
+     Tensor tOrP0 = tOrP;
+-    tOrP0.data() = tOrP0.data().get() + uint32_t(TmemAllocation::P0);
++    tOrP0.data() = tOrP0.data().get() + tmem_address(uint32_t(TmemAllocation::P0));
+ 
+     Tensor tOtO0_hi = tOtO0;
+     tOtO0_hi.data() = tOtO0.data().get() + 128;
+@@ -1061,13 +1089,13 @@
+     // apxinf: slot-indexed views for the multi-stage S pipeline.
+     auto tStS_at = [&](uint32_t slot) {
+       Tensor t = tStS;
+-      t.data() = tStS.data().get() + uint32_t(TmemAllocation::S0)
++      t.data() = tStS.data().get() + tmem_address(uint32_t(TmemAllocation::S0))
+                + slot * uint32_t(TmemAllocation::kSizeS);
+       return t;
+     };
+     auto tOrP_at = [&](uint32_t slot) {
+       Tensor t = tOrP;
+-      t.data() = tOrP.data().get() + uint32_t(TmemAllocation::P0)
++      t.data() = tOrP.data().get() + tmem_address(uint32_t(TmemAllocation::P0))
+                + slot * uint32_t(TmemAllocation::kSizeS);
+       return t;
+     };
+@@ -1079,10 +1107,13 @@
+     Tensor tSrQ0 = tSrQ(_,_,_,q_index);
+ 
+     if constexpr (kIs2Sm) {
+-      int q_index_hi = pipeline_q_consumer_state.index();
+-      pipeline_q.consumer_wait(pipeline_q_consumer_state);
+-      ++pipeline_q_consumer_state;
+-      Tensor tSrQ1 = tSrQ(_,_,_,q_index_hi);
++      Tensor tSrQ1 = tSrQ0;
++      if constexpr (StageCountQ > 1) {
++        int q_index_hi = pipeline_q_consumer_state.index();
++        pipeline_q.consumer_wait(pipeline_q_consumer_state);
++        ++pipeline_q_consumer_state;
++        tSrQ1 = tSrQ(_,_,_,q_index_hi);
++      }
+ 
+       int n_tiles = mask_tile_count;
+       auto issue_qk = [&]() {
+@@ -1097,16 +1128,16 @@
+         pipeline_kv.consumer_release(pipeline_kv_release_state);
+         ++pipeline_kv_release_state;
+ 
+-        k_index = pipeline_kv_consumer_state.index();
+-        pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
+-        ++pipeline_kv_consumer_state;
+-        gemm_reset_zero_acc(mma_qk, tSrQ1,
+-                            tSrK(_, _, _, k_index), tStS_i);
++        if constexpr (get<2>(TileShape{}) > 128) {
++          k_index = pipeline_kv_consumer_state.index();
++          pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
++          ++pipeline_kv_consumer_state;
++          gemm_reset_zero_acc(mma_qk, tSrQ1,tSrK(_, _, _, k_index),tStS_i);
++          pipeline_kv.consumer_release(pipeline_kv_release_state);
++          ++pipeline_kv_release_state;
++        }
+         pipeline_s0.producer_commit(pipeline_s0_producer_state);
+         ++pipeline_s0_producer_state;
+-
+-        pipeline_kv.consumer_release(pipeline_kv_release_state);
+-        ++pipeline_kv_release_state;
+       };
+ 
+       auto issue_pv = [&](int tile, auto final_tile) {
+@@ -1139,6 +1170,7 @@
+         pipeline_kv.consumer_release(pipeline_kv_release_state);
+         ++pipeline_kv_release_state;
+ 
++        if constexpr (get<2>(TileShape{}) > 128) {
+         v_index = pipeline_kv_consumer_state.index();
+         pipeline_kv.consumer_wait(pipeline_kv_consumer_state);
+         ++pipeline_kv_consumer_state;
+@@ -1151,6 +1183,8 @@
+         pipeline_kv.consumer_release(pipeline_kv_release_state);
+         ++pipeline_kv_release_state;
+ 
++        }
++
+         pipeline_corr.producer_commit(pipeline_corr_producer_state);
+         ++pipeline_corr_producer_state;
+       };
+@@ -1168,8 +1202,10 @@
+ 
+       pipeline_q.consumer_release(pipeline_q_release_state);
+       ++pipeline_q_release_state;
+-      pipeline_q.consumer_release(pipeline_q_release_state);
+-      ++pipeline_q_release_state;
++      if constexpr (StageCountQ > 1) {
++        pipeline_q.consumer_release(pipeline_q_release_state);
++        ++pipeline_q_release_state;
++      }
+ 
+       // Match the softmax warp's trailing consumer release.
+       pipeline_s0.producer_commit(pipeline_s0_producer_state);
+@@ -1501,22 +1537,22 @@
+     Tensor tOtO = partition_fragment_C(mma_pv_ts, select<0,1>(TileShapePV{}));
+ 
+     Tensor tStS0 = tStS;
+-    tStS0.data() = tStS.data().get() + uint32_t(TmemAllocation::S0);
++    tStS0.data() = tStS.data().get() + tmem_address(uint32_t(TmemAllocation::S0));
+     Tensor tStS1 = tStS;
+-    tStS1.data() = tStS.data().get() + uint32_t(TmemAllocation::S1);
++    tStS1.data() = tStS.data().get() + tmem_address(uint32_t(TmemAllocation::S1));
+ 
+     Tensor tOtO0 = tOtO;
+-    tOtO0.data() = tOtO.data().get() + uint32_t(TmemAllocation::O0);
++    tOtO0.data() = tOtO.data().get() + tmem_address(uint32_t(TmemAllocation::O0));
+     Tensor tOtO1 = tOtO;
+-    tOtO1.data() = tOtO.data().get() + uint32_t(TmemAllocation::O1);
++    tOtO1.data() = tOtO.data().get() + tmem_address(uint32_t(TmemAllocation::O1));
+ 
+     Tensor sP = make_tensor(make_smem_ptr((Element*)nullptr), typename CollectiveMmaPV::SmemLayoutA{});
+     Tensor tOrP = thr_mma_pv.make_fragment_A(sP)(_, _, _, _0{});  // slice out staging
+ 
+     Tensor tOrP0 = tOrP;
+-    tOrP0.data() = tOrP0.data().get() + uint32_t(TmemAllocation::P0);
++    tOrP0.data() = tOrP0.data().get() + tmem_address(uint32_t(TmemAllocation::P0));
+     Tensor tOrP1 = tOrP;
+-    tOrP1.data() = tOrP1.data().get() + uint32_t(TmemAllocation::P1);
++    tOrP1.data() = tOrP1.data().get() + tmem_address(uint32_t(TmemAllocation::P1));
+ 
+     int k_index = 0;
+     int v_index = 0;
+@@ -1757,10 +1793,10 @@
+ 
+     // Same derivation as `softmax_step`'s `s_base`.  V0 == S0 and V1 == S1, so
+     // the statistics live in columns 0-1 of the S slot.
+-    uint32_t s_base = kMultiSStage
++    uint32_t s_base = tmem_base + (kMultiSStage
+         ? warp_uniform(uint32_t(pipeline_s_consumer_state.index())
+                        * uint32_t(TmemAllocation::kSizeS))
+-        : uint32_t(stage == _0{} ? TmemAllocation::S0 : TmemAllocation::S1);
++        : uint32_t(stage == _0{} ? TmemAllocation::S0 : TmemAllocation::S1));
+ 
+     Tensor tStS_v = tStS.compose(make_layout(make_shape(_128{}, _2{})));
+     tStS_v.data() = s_base + kStatsOffset;
+@@ -1805,7 +1841,7 @@
+ 
+       Tensor tTMEM_STOREVtS_final = tTMEM_STOREVtS;
+       if constexpr (kMultiSStage) {
+-        uint32_t final_base = warp_uniform(
++        uint32_t final_base = warp_uniform(tmem_base +
+             uint32_t(pipeline_s_consumer_state.index()) * uint32_t(TmemAllocation::kSizeS));
+         tTMEM_STOREVtS_final.data() =
+             tTMEM_STOREVtS_final.data().get() + final_base - s_base;
+@@ -1823,6 +1859,9 @@
+   CUTLASS_DEVICE auto
+   softmax_step(
+       float& row_max, float& row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++      float4& row_sum_parts,
++#endif
+       Stage stage, bool final_call,
+       BlkCoord const& blk_coord, CoordTensor const& cS,
+       Params const& params, ProblemShape const& problem_shape,
+@@ -1838,10 +1877,10 @@
+     // On the stock path this is a compile-time constant exactly as upstream
+     // (S0 / S1); only the multi-S-slot path needs a runtime, warp-uniform
+     // pipeline index.
+-    uint32_t s_base = kMultiSStage
++    uint32_t s_base = tmem_base + (kMultiSStage
+         ? warp_uniform(uint32_t(pipeline_s_consumer_state.index())
+                        * uint32_t(TmemAllocation::kSizeS))
+-        : uint32_t(stage == _0{} ? TmemAllocation::S0 : TmemAllocation::S1);
++        : uint32_t(stage == _0{} ? TmemAllocation::S0 : TmemAllocation::S1));
+ 
+     Tensor tStS = partition_fragment_C(typename CollectiveMmaQK::TiledMma{}, select<0,1>(TileShapeQK{}));
+     tStS.data() = s_base;
+@@ -2037,7 +2076,12 @@
+         tTMEM_LOADrS(i + 1)
+       );
+       float2 out;
++#if defined(APXINF_INDEXED_UNFUSED_SCALE) && APXINF_INDEXED_UNFUSED_SCALE
++      out.x = __fadd_rn(__fmul_rn(in.x, scale_fp32x2.x), minus_row_max_scale_fp32x2.x);
++      out.y = __fadd_rn(__fmul_rn(in.y, scale_fp32x2.y), minus_row_max_scale_fp32x2.y);
++#else
+       cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
++#endif
+       tTMEM_LOADrS(i + 0) = out.x;
+       tTMEM_LOADrS(i + 1) = out.y;
+ 
+@@ -2143,6 +2187,37 @@
+     pipeline_c.producer_acquire(pipeline_c_producer_state);
+ #endif
+ 
++#if APXINF_INDEXED_FA2_ROWSUM
++    static_assert(!APXINF_FUSE_ROWSUM, "FA2 partial sum probe uses original exponent buffer");
++    // FA2 carries one sequential sum per MMA quad lane across KV tiles.
++    // Match lane column visitation: [2*l,2*l+1,8+2*l,9+2*l,...].
++    float factor = apxinf_ex2_approx((old_row_max - row_max_safe) * scale);
++    row_sum_parts.x = __fmul_rn(row_sum_parts.x, factor);
++    row_sum_parts.y = __fmul_rn(row_sum_parts.y, factor);
++    row_sum_parts.z = __fmul_rn(row_sum_parts.z, factor);
++    row_sum_parts.w = __fmul_rn(row_sum_parts.w, factor);
++    CUTLASS_PRAGMA_UNROLL
++    for (int i = 0; i < size(tTMEM_LOADrS); i += 8) {
++      // Refuse a different TMEM column layout instead of silently summing a
++      // different sequence. The identity-coordinate offsets cancel at compile time.
++      CUTLASS_PRAGMA_UNROLL
++      for (int j = 0; j < 8; ++j) {
++        if (get<1>(tTMEM_LOADcS(i+j)) - get<1>(tTMEM_LOADcS(0)) != i+j)
++          asm volatile("trap;");
++      }
++      row_sum_parts.x = __fadd_rn(row_sum_parts.x, tTMEM_LOADrS(i));
++      row_sum_parts.x = __fadd_rn(row_sum_parts.x, tTMEM_LOADrS(i+1));
++      row_sum_parts.y = __fadd_rn(row_sum_parts.y, tTMEM_LOADrS(i+2));
++      row_sum_parts.y = __fadd_rn(row_sum_parts.y, tTMEM_LOADrS(i+3));
++      row_sum_parts.z = __fadd_rn(row_sum_parts.z, tTMEM_LOADrS(i+4));
++      row_sum_parts.z = __fadd_rn(row_sum_parts.z, tTMEM_LOADrS(i+5));
++      row_sum_parts.w = __fadd_rn(row_sum_parts.w, tTMEM_LOADrS(i+6));
++      row_sum_parts.w = __fadd_rn(row_sum_parts.w, tTMEM_LOADrS(i+7));
++    }
++    // FA2 Allreduce<4> visits XOR2 then XOR1, only at final normalization.
++    row_sum = __fadd_rn(__fadd_rn(row_sum_parts.x, row_sum_parts.z),
++                        __fadd_rn(row_sum_parts.y, row_sum_parts.w));
++#else
+ #if !APXINF_FUSE_ROWSUM
+     // UPSTREAM: a second pass over tTMEM_LOADrS after the P store.
+     APXINF_ACC_SCALE_SEED();
+@@ -2170,6 +2245,8 @@
+     float local_row_sum = local_row_sum_f32x2.x + local_row_sum_f32x2.y;
+ 
+     row_sum = local_row_sum;
++
++#endif
+ 
+     if (final_call) {
+       // re-acquire the S part in the final step
+@@ -2185,7 +2262,7 @@
+       // reads at its matching (last) PipelineC state.
+       Tensor tTMEM_STOREVtS_final = tTMEM_STOREVtS;
+       if constexpr (kMultiSStage) {
+-        uint32_t final_base = warp_uniform(
++        uint32_t final_base = warp_uniform(tmem_base +
+             uint32_t(pipeline_s_consumer_state.index()) * uint32_t(TmemAllocation::kSizeS));
+         tTMEM_STOREVtS_final.data() =
+             tTMEM_STOREVtS_final.data().get() + final_base - s_base;
+@@ -2212,6 +2289,9 @@
+ 
+     ElementQK row_max = -INFINITY;
+     ElementQK row_sum = 0;
++#if APXINF_INDEXED_FA2_ROWSUM
++    float4 row_sum_parts = make_float4(0, 0, 0, 0);
++#endif
+ 
+     Tensor cS_base = make_identity_tensor(select<0,1>(TileShapeQK{}));
+     auto logical_offset = make_coord(
+@@ -2262,7 +2342,11 @@
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; masked_tile_count > 0; masked_tile_count -= 1) {
+       softmax_step<true /* need_apply_mask */>(
+-          row_max, row_sum, stage,
++          row_max, row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++          row_sum_parts,
++#endif
++          stage,
+           (masked_tile_count == 1) && (mask_tile_count == 0),
+           blk_coord, cS, params, problem_shape,
+           pipeline_s, pipeline_s_consumer_state,
+@@ -2276,7 +2360,11 @@
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; mask_tile_count > 0; mask_tile_count -= 1) {
+       softmax_step<false /* need_apply_mask */>(
+-          row_max, row_sum, stage, mask_tile_count == 1,
++          row_max, row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++          row_sum_parts,
++#endif
++          stage, mask_tile_count == 1,
+           blk_coord, cS, params, problem_shape,
+           pipeline_s, pipeline_s_consumer_state,
+           pipeline_c, pipeline_c_producer_state,
+@@ -2295,7 +2383,11 @@
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; mask_tile_count > 0; mask_tile_count -= 1) {
+       softmax_step<false /* need_apply_mask */>(
+-          row_max, row_sum, stage,
++          row_max, row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++          row_sum_parts,
++#endif
++          stage,
+           (mask_tile_count == 1) &&
+               (Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape) == 0),
+           blk_coord, cS, params, problem_shape,
+@@ -2313,7 +2405,11 @@
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; mask_tile_count > 0; mask_tile_count -= 1) {
+       softmax_step<true /* need_apply_mask */>(
+-          row_max, row_sum, stage, mask_tile_count == 1,
++          row_max, row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++          row_sum_parts,
++#endif
++          stage, mask_tile_count == 1,
+           blk_coord, cS, params, problem_shape,
+           pipeline_s, pipeline_s_consumer_state,
+           pipeline_c, pipeline_c_producer_state,
+@@ -2351,12 +2447,12 @@
+     // SHARED-FINDINGS 21.2.
+   }
+ 
+-  template<class Stage, class TensorO>
++  template<class Stage, class TensorO, class BlkCoord>
+   CUTLASS_DEVICE auto
+   correction_epilogue(
+       float scale,
+       Stage stage,
+-      TensorO const& sO_01) {
++      TensorO const& sO_01, Params const& params, BlkCoord const& blk_coord) {
+ 
+     using ElementOut = typename TensorO::value_type;
+ 
+@@ -2367,7 +2463,9 @@
+     // As opposed to the softmax, we do not have enough registers here
+     // to load all of the values (for tile kv = 128), so we loop
+     // good values would be either 32 or 64
+-    const int kCorrectionTileSize = 32 / sizeof(ElementOut);
++    // Diagnostic F32 output retains the BF16 control's 16-column FP32 load/scaling partition.
++    // The stock selector cannot express its 8-column float-output slice with a16x load.
++    const int kCorrectionTileSize = 16;
+ 
+     using TMEM_LOAD = std::conditional_t<kCorrectionTileSize == 32, SM100_TMEM_LOAD_32dp32b32x, SM100_TMEM_LOAD_32dp32b16x>;  // 4x32 threads with 64 cols of 32b elem
+ 
+@@ -2382,11 +2480,11 @@
+     Tensor tOsO_i = logical_divide(tOsO, make_layout(make_shape(_128{}, Int<kCorrectionTileSize>{})));
+ 
+     if constexpr (decltype(stage == _0{})::value) {
+-      tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAllocation::O0);
++      tOtO_i.data() = tOtO_i.data().get() + tmem_address(uint32_t(TmemAllocation::O0));
+     }
+     else {
+       static_assert(decltype(stage == _1{})::value, "stage is either 0 or 1");
+-      tOtO_i.data() = tOtO_i.data().get() + uint32_t(TmemAllocation::O1);
++      tOtO_i.data() = tOtO_i.data().get() + tmem_address(uint32_t(TmemAllocation::O1));
+     }
+ 
+     auto tiled_tmem_load = make_tmem_copy(TMEM_LOAD{}, tOtO_i(make_coord(_, _), _0{}));
+@@ -2420,6 +2518,26 @@
+       }
+ #endif
+ 
++      // Private diagnostic: preserve original float multiply and BF16 conversion.
++      // IndividualTileScheduler gives ((flat head), batch); this path requires
++      // batch=1 and q_heads=kv_heads, so flat head is the original head index.
++      if (params.row_flags != nullptr) {
++        int head = int(get<2,0>(blk_coord));
++        int first_query = int(get<0>(blk_coord)) * int(get<0>(TileShape{}))
++                        + int(stage) * int(get<0>(TileShapePV{}));
++        auto coordinates = tTMEM_LOADcO(_, _0{}, _0{}, i);
++        CUTLASS_PRAGMA_UNROLL
++        for (int j = 0; j < size(tTMrO); ++j) {
++          int query = first_query + int(get<0>(coordinates(j)));
++          unsigned low = __float_as_uint(tTMrO(j)) & 65535u;
++          unsigned distance = low > 32768u ? low - 32768u : 32768u - low;
++          if (head < params.flag_heads && query < params.flag_queries &&
++              distance <= params.flag_margin) {
++            atomicOr(params.row_flags + head * params.flag_queries + query, 1u);
++          }
++        }
++      }
++
+       constexpr int N = 4 / sizeof(ElementOut);
+       NumericArrayConverter<ElementOut, ElementPV, N> convert;
+ 
+@@ -2449,7 +2567,7 @@
+   CUTLASS_DEVICE auto
+   correction_epilogue_direct(
+       float scale, Stage stage, BlkCoord const& blk_coord,
+-      ProblemShape const& problem_shape, CollectiveEpilogue& epilogue) {
++      ProblemShape const& problem_shape, CollectiveEpilogue& epilogue, Params const& params) {
+     static_assert(kIs2Sm, "direct FMHA epilogue is only used by the 2-CTA path");
+     using ElementOut = typename CollectiveEpilogue::ElementOut;
+ 
+@@ -2480,6 +2598,10 @@
+     Tensor gO_qdl = local_tile(
+         mO, make_shape(_128{}, get<1>(TileShapePVMma{}), _1{}),
+         make_coord(_, _, _), Step<_1, _1, X>{});
++    // Each CTA stores 128 original query rows per Q stage.
++    const int row_base = int(get<0>(blk_coord)) * int(get<0>(TileShape{}))
++        + int(stage) * int(get<0>(TileShapeQK{}))
++        + int(cta_mma_rank()) * 128;
+     float2 scale_f32x2 = make_float2(scale, scale);
+     CUTLASS_PRAGMA_UNROLL
+     for (int iter = 0; iter < get<2>(TileShape{}) / get<1>(TileShapePVMma{}); ++iter) {
+@@ -2493,14 +2615,13 @@
+           tOtO_slice, make_shape(_128{}, get<1>(TileShapePVMma{})));
+       Tensor tOcO_i = zipped_divide(
+           cO, make_shape(_128{}, get<1>(TileShapePVMma{})));
+-      int row_tile = get<0>(blk_coord) * int(cute::size<0>(ClusterShape{}))
+-                   + int(cta_mma_rank());
++      int row_tile = row_base / 128;
+       Tensor gO = gO_qdl(_, _, row_tile, iter, get<2>(blk_coord));
+       Tensor gO_i = zipped_divide(
+           gO, make_shape(_128{}, get<1>(TileShapePVMma{})));
+ 
+       uint32_t o_base = decltype(stage == _0{})::value
+-          ? uint32_t(TmemAllocation::O0) : uint32_t(TmemAllocation::O1);
++          ? tmem_address(uint32_t(TmemAllocation::O0)) : tmem_address(uint32_t(TmemAllocation::O1));
+       tOtO_i.data() = tOtO_i.data().get() + o_base
+                     + uint32_t(iter * get<1>(TileShapePVMma{}));
+ 
+@@ -2525,6 +2646,21 @@
+         cute::mul(out, scale_f32x2, in);
+         tTMrO(j) = out.x;
+         tTMrO(j + 1) = out.y;
++      }
++
++      // Same pre-BF16 midpoint criterion as the admitted indexed epilogue.
++      if (params.row_flags != nullptr) {
++        const int head = int(get<2,0>(blk_coord));
++        CUTLASS_PRAGMA_UNROLL
++        for (int j = 0; j < size(tTMrO); ++j) {
++          const int query = row_base + int(get<0>(tTMEM_LOADcO_i(j)));
++          const unsigned low = __float_as_uint(tTMrO(j)) & 65535u;
++          const unsigned distance = low > 32768u ? low - 32768u : 32768u - low;
++          if (head < params.flag_heads && query < params.flag_queries &&
++              distance <= params.flag_margin) {
++            atomicOr(params.row_flags + head * params.flag_queries + query, 1u);
++          }
++        }
+       }
+ 
+       constexpr int N = 4 / sizeof(ElementOut);
+@@ -2538,8 +2674,7 @@
+       }
+ 
+       Tensor src = recast<Array<ElementOut, N>>(coalesce(tRrO));
+-      int row_base = get<0>(blk_coord) * get<0>(TileShape{})
+-                   + int(cta_mma_rank()) * 128;
++
+       auto first_coord = tTMEM_LOADcO_i(0);
+       if (row_base + int(get<0>(first_coord)) <
+           int(cute::size<0>(problem_shape))) {
+@@ -2756,7 +2891,7 @@
+     // from, so with a multi-stage S pipeline the slot is the pipeline index.
+     auto vtS_slot = [&](uint32_t slot) {
+       Tensor t = tTMEM_LOADVtS;
+-      t.data() = t.data().get() + uint32_t(TmemAllocation::V0)
++      t.data() = t.data().get() + tmem_address(uint32_t(TmemAllocation::V0))
+                + slot * uint32_t(TmemAllocation::kSizeS);
+       return t;
+     };
+@@ -2783,11 +2918,11 @@
+       pipeline_o.consumer_wait(pipeline_o_consumer_state);
+ 
+ #if APXINF_CORR_UNCOND
+-      correction_rescale(scale, uint32_t(TmemAllocation::O0));
++      correction_rescale(scale, tmem_address(uint32_t(TmemAllocation::O0)));
+ #else
+       bool warp_do_correction = __any_sync(0xFFFFFFFF, scale != 1.0f);
+       if (warp_do_correction) {
+-        correction_rescale(scale, uint32_t(TmemAllocation::O0));
++        correction_rescale(scale, tmem_address(uint32_t(TmemAllocation::O0)));
+       }
+ #endif
+ 
+@@ -2821,12 +2956,12 @@
+       correction_epilogue_direct(
+           apxinf_normalize_scale(params.scale_output,
+                                  tTMEM_LOADVrS(kIdxFinalRowSum)),
+-          _0{}, blk_coord, problem_shape, epilogue);
++          _0{}, blk_coord, problem_shape, epilogue, params);
+     } else {
+       correction_epilogue(
+           apxinf_normalize_scale(params.scale_output,
+                                  tTMEM_LOADVrS(kIdxFinalRowSum)),
+-          _0{}, sO);
++          _0{}, sO, params, blk_coord);
+     }
+ 
+     if (epilogue.params.ptr_LSE != nullptr) {
+@@ -2903,9 +3038,9 @@
+     Tensor tTMEM_LOADVcS = thr_tmem_loadv.partition_D(tScS_v);
+ 
+     Tensor tTMEM_LOADVtS0 = tTMEM_LOADVtS;
+-    tTMEM_LOADVtS0.data() = tTMEM_LOADVtS0.data().get() + uint32_t(TmemAllocation::V0);
++    tTMEM_LOADVtS0.data() = tTMEM_LOADVtS0.data().get() + tmem_address(uint32_t(TmemAllocation::V0));
+     Tensor tTMEM_LOADVtS1 = tTMEM_LOADVtS;
+-    tTMEM_LOADVtS1.data() = tTMEM_LOADVtS1.data().get() + uint32_t(TmemAllocation::V1);
++    tTMEM_LOADVtS1.data() = tTMEM_LOADVtS1.data().get() + tmem_address(uint32_t(TmemAllocation::V1));
+ 
+     // ignore first signal from softmax as no correction is required
+     pipeline_s0_c.consumer_wait(pipeline_s0_c_consumer_state);
+@@ -2934,7 +3069,7 @@
+ 
+       bool warp_do_correction = __any_sync(0xFFFFFFFF, scale != 1.0f);
+       if (warp_do_correction) {
+-        correction_rescale(scale, uint32_t(TmemAllocation::O0));
++        correction_rescale(scale, tmem_address(uint32_t(TmemAllocation::O0)));
+       }
+ 
+       pipeline_s1_c.consumer_release(pipeline_s1_c_consumer_state);
+@@ -2955,7 +3090,7 @@
+ 
+       warp_do_correction = __any_sync(0xFFFFFFFF, scale != 1.0f);
+       if (warp_do_correction) {
+-        correction_rescale(scale, uint32_t(TmemAllocation::O1));
++        correction_rescale(scale, tmem_address(uint32_t(TmemAllocation::O1)));
+       }
+ 
+       pipeline_s0_c.consumer_release(pipeline_s0_c_consumer_state);
+@@ -2997,7 +3132,13 @@
+     Tensor sO = make_epilogue_smem_tensor(shared_storage_epi);
+     Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), cute::make_shape(cute::size<0>(problem_shape), cute::get<3>(problem_shape)), epilogue.params.dLSE);
+ 
+-    correction_epilogue(apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _0{}, sO);
++    if constexpr (kIs2Sm) {
++      correction_epilogue_direct(
++          apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)),
++          _0{}, blk_coord, problem_shape, epilogue, params);
++    } else {
++    correction_epilogue(apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _0{}, sO, params, blk_coord);
++    }
+ 
+     if (epilogue.params.ptr_LSE != nullptr) {
+       int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord);
+@@ -3036,7 +3177,13 @@
+     pipeline_o.consumer_wait(pipeline_o_consumer_state);
+     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+ 
+-    correction_epilogue(apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _1{}, sO);
++    if constexpr (kIs2Sm) {
++      correction_epilogue_direct(
++          apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)),
++          _1{}, blk_coord, problem_shape, epilogue, params);
++    } else {
++    correction_epilogue(apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _1{}, sO, params, blk_coord);
++    }
+ 
+     if (epilogue.params.ptr_LSE != nullptr) {
+       int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord) + get<0>(TileShapeQK{});
+@@ -3158,4 +3305,4 @@
+ 
+ };
+ 
+-}  // namespace cutlass::fmha::collective
++}  // namespace cutlass::fmha::indexed_singleq_collective
+--- apxinf_indexed_singleq_kernel.hpp
++++ apxinf_indexed_singleq_kernel.hpp
+@@ -43,7 +43,9 @@
+ #include "collective/fmha_fusion.hpp"
+ #include "collective/fmha_common.hpp"
+ 
+-namespace cutlass::fmha::kernel {
++namespace cutlass::fmha::indexed_singleq_kernel {
++using cutlass::fmha::kernel::PersistentTileScheduler;
++using cutlass::fmha::kernel::CausalPersistentTileScheduler;
+ 
+ using namespace cute;
+ using namespace cutlass::fmha::collective;
+@@ -331,6 +333,21 @@
+   using TmemAllocator = cute::conditional_t<
+       kIs2Sm, cute::TMEM::Allocator2Sm, cute::TMEM::Allocator1Sm>;
+ 
++  // Allocate/free the actual power-of-two TMEM footprint
++  // for single-Q 2CTA. Keep the full upstream allocation on other paths.
++  static constexpr uint32_t kRequestedTmemColumns = []() constexpr {
++    if constexpr (kSingleQStage && kIs2Sm) {
++      uint32_t columns=32;
++      while(columns<CollectiveMainloop::kTmemColumns)columns*=2;
++      return columns;
++    } else {
++      return uint32_t(TmemAllocator::Sm100TmemCapacityColumns);
++    }
++  }();
++  static constexpr bool kRebasedTmem = kSingleQStage && kIs2Sm &&
++      kRequestedTmemColumns<TmemAllocator::Sm100TmemCapacityColumns;
++  static_assert(kRequestedTmemColumns<=TmemAllocator::Sm100TmemCapacityColumns);
++
+   struct SharedStorage {
+     using UnionType = union {
+       typename CollectiveMainloop::TensorStorage mainloop;
+@@ -382,7 +399,7 @@
+     typename TileScheduler::Params tile_scheduler;
+   };
+ 
+-  static const int MinBlocksPerMultiprocessor = 1;
++  static const int MinBlocksPerMultiprocessor = (kSingleQStage && kIs2Sm) ? 2 : 1;
+   static const int MaxThreadsPerBlock = NumWarps * cutlass::NumThreadsPerWarp;
+   using ArchTag = cutlass::arch::Sm100;
+ 
+@@ -606,7 +623,19 @@
+     typename CollectiveMainloop::PipelineO::PipelineState pipeline_mma_corr_consumer_state;
+     typename CollectiveMainloop::PipelineO::PipelineState pipeline_mma_corr_producer_state = cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineO>();
+ 
++    // All roles see the allocator result before constructing TMEM views.
++    // Both MMA warps participate in the group2 allocation; the cluster
++    // barrier publishes each CTA's shared base to its softmax/correction.
++    if constexpr (kRebasedTmem) {
++      if (role == WarpRole::MMA) {
++        tmem_allocator.allocate(kRequestedTmemColumns, &shared_storage.tmem_base_ptr);
++      }
++      cute::cluster_sync();
++    }
+     CollectiveMainloop mainloop;
++    if constexpr (kRebasedTmem) {
++      mainloop.tmem_base = shared_storage.tmem_base_ptr;
++    }
+     CollectiveEpilogue epilogue{params.epilogue};
+ 
+     // apxinf: this is upstream's text with one compile-time guard added, and
+@@ -714,7 +743,7 @@
+ 
+         if (has_valid) {
+           uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
+-          tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
++          tmem_allocator.free(free_stage_ptr, kRequestedTmemColumns);
+         }
+       }
+ 
+@@ -722,7 +751,7 @@
+     else if (role == WarpRole::MMA) {
+       warpgroup_reg_set<NumRegsOther>();
+ 
+-      bool allocated = false;
++      bool allocated = kRebasedTmem;
+ 
+       CUTLASS_PRAGMA_NO_UNROLL
+       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+@@ -736,7 +765,7 @@
+         }
+ 
+         if (!allocated) {
+-          tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
++          tmem_allocator.allocate(kRequestedTmemColumns, &shared_storage.tmem_base_ptr);
+           __syncwarp();
+           allocated = true;
+         }
+@@ -820,8 +849,12 @@
+           // while each CTA stores one 128-row local epilogue tile.
+           get<0>(blk_coord) = get<0>(blk_coord) * cute::size<0>(ClusterShape{})
+                             + int(cta_rank_in_cluster % cute::size<0>(ClusterShape{}));
+-          CollectiveEpilogue::consume_only(
+-              pipeline_corr_epi, pipeline_corr_epi_consumer_state);
++          // Experimental: match the number of direct-store producer commits.
++          CUTLASS_PRAGMA_UNROLL
++          for (int q_stage = 0; q_stage < CollectiveMainloop::NumQStages; ++q_stage) {
++            CollectiveEpilogue::consume_only(
++                pipeline_corr_epi, pipeline_corr_epi_consumer_state);
++          }
+         } else {
+           epilogue.store(
+             blk_coord, logical_problem_shape,
+@@ -837,7 +870,7 @@
+       if constexpr (NumWarpsEpilogue == 1 && !kIs2Sm) {
+         if(has_valid) {
+           uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
+-          tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
++          tmem_allocator.free(free_stage_ptr, kRequestedTmemColumns);
+         }
+       }
+ 
+@@ -863,7 +896,7 @@
+       cute::cluster_sync();
+       if (role == WarpRole::MMA) {
+         uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
+-        tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
++        tmem_allocator.free(free_stage_ptr, kRequestedTmemColumns);
+       }
+     }
+ #endif
+@@ -871,4 +904,4 @@
+ 
+ };
+ 
+-}  // namespace cutlass::fmha::kernel
++}  // namespace cutlass::fmha::indexed_singleq_kernel

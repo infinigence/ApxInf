@@ -74,6 +74,7 @@ bool supports_indexed(const Spec& s){
   s.scale_is_default!=0;
 }
 AlignmentRequirements indexed_alignment(const Spec&){return {16,16,16,16};}
+void indexed_configurations(const Spec&,std::vector<int>& out){out.push_back(0);out.push_back(1);}
 #endif
 
 AlignmentRequirements natural_alignment(const Spec&) { return {}; }
@@ -350,7 +351,8 @@ extern "C" int apxinf_attention_test_indexed_support_domain() {
   base.query_tokens=1785; base.scale_is_default=1;
   for (int keys : {257,512,2665}) {
     base.key_tokens=keys;
-    if (!supports_indexed(base) || indexed_resource_requirements(base,0)!=1143844)
+    if (!supports_indexed(base) || indexed_resource_requirements(base,0)!=1143844 ||
+        indexed_resource_requirements(base,1)!=1143844)
       return 0;
     const auto alignment=indexed_alignment(base);
     if (alignment.query!=16 || alignment.key!=16 || alignment.value!=16 || alignment.output!=16)
@@ -370,22 +372,25 @@ extern "C" int apxinf_attention_test_indexed_support_domain() {
       !rejected([](Spec& s){s.query_tokens=1784;}) ||
       !rejected([](Spec& s){s.key_tokens=2664;}) ||
       !rejected([](Spec& s){s.scale_is_default=0;})) return 0;
-  std::vector<int> configs;one_configuration(base,configs);
-  if (configs!=std::vector<int>{0}) return 0;
+  std::vector<int> configs;indexed_configurations(base,configs);
+  if (configs!=std::vector<int>{0,1}) return 0;
   try {
-    indexed_resource_requirements(base,1);
+    indexed_resource_requirements(base,2);
     return 0;
   } catch (const Failure& failure) {
     if (failure.status!=APXINF_STATUS_INVALID_ARGUMENT) return 0;
   }
   // A one-byte-short policy must reject before allocating any device state.
-  Execution execution{};execution.spec=base;execution.resource_limit=1143843;
-  try {
-    prepare_indexed(execution);
-    return 0;
-  } catch (const Failure& failure) {
-    if (failure.status!=APXINF_STATUS_UNSUPPORTED || execution.provider_state!=nullptr)
+  for(int configuration:{0,1}){
+    Execution execution{};execution.spec=base;execution.configuration=configuration;
+    execution.resource_limit=1143843;
+    try {
+      prepare_indexed(execution);
       return 0;
+    } catch (const Failure& failure) {
+      if (failure.status!=APXINF_STATUS_UNSUPPORTED || execution.provider_state!=nullptr)
+        return 0;
+    }
   }
   return 2; // Compiled and checked; 1 means absent on this build target.
 #else
@@ -422,7 +427,7 @@ const ImplementationRegistry& registry(uint32_t semantic) {
 #if defined(APXINF_ATTENTION_INDEXED_SM110)
       {3,3,1,"cutlass-indexed-fa2-sm110",apxinf::gemm::kDeviceFeatureFixedSm110,
        true,true,false,supports_indexed,indexed_alignment,indexed_resource_requirements,
-       one_configuration,prepare_indexed,launch_indexed,destroy_indexed},
+       indexed_configurations,prepare_indexed,launch_indexed,destroy_indexed},
 #endif
 #if defined(APXINF_SEGMENTED_ATTENTION_SM110)
       {kProviderSpecializedSm110, 1, 1, "specialized-d256-causal-sm110",

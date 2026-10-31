@@ -500,6 +500,51 @@ Full public rebinding, RNG, joint-noise shape, cleanup and robot decoding pass;
 all 12 paired public metric rows are zero. The row predicate is an empirical
 numerical safeguard; this candidate remains Flexible and is not a fallback.
 
+A subsequent balanced 16-process public comparison adds configuration 1 to
+that indexed provider. It uses one Q stage across two CTAs with M256/N64/D128,
+384 threads, 65,824 bytes of shared storage and a base-aware 256-column TMEM
+allocation. Configuration 0 remains available through the same ordinary tuner.
+The supported profile, fixed 16-ULP rule, six-buffer scratch budget, BF16
+arithmetic and public API are unchanged. A smaller TMEM request does not prove
+doubled residency; the measured active-cluster query remains 10.
+
+The comparison uses eight fresh processes and 24 warm samples per path. Its
+fixed order is A1 B1 B2 A2 B3 A3 A4 B4 A5 B5 B6 A6 B7 A7 A8 B8, with A the
+published configuration-0 build (`f3aa6e8`) and B the single-Q candidate.
+Extensions and each path's recipe bank are frozen, all 72 GEMM recipes are
+byte-identical, and no online tuning or sample trimming occurs. The ordinary
+tuner selects configuration 1 for long K. This cohort is separate from the
+four-process comparison above.
+
+| Path | First request | First cached | First two requests | Warm median | Warm p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Published indexed Attention | 30.304 | 19.775 | 49.897 | 19.444 | 19.612 |
+| Single-Q clustered Attention | 36.064 | 20.025 | 56.088 | 19.279 | 19.431 |
+
+Values are median seconds. Warm latency falls by 0.8483% (1.0086×). All four
+balanced four-process blocks improve (0.9688%, 0.7756%, 0.9557%, 0.7229%).
+A predeclared 20,000-resample bootstrap, retaining whole three-sample process
+groups and stratifying by path, gives a one-sided 95% lower reduction bound of
+0.4565% (seed 0). All warm windows satisfy the fixed observation-gap and
+coverage checks at sampled GPU 1,575 MHz / EMC 4.266 GHz, without observer
+timeouts or sampled foreign GPU processes. Backups/offloads precede public
+measurements; result transfer starts after the complete cohort. The default-DVFS
+first and cached observations are higher for B, so this result supports only a
+warm-path improvement and does not establish a cold-start benefit.
+
+Fresh maintained-code qualification passes 450 native output/flags/F32-LSE/guard
+checks across 75 cases, the full 170-test backend suite (0 failed, 2 ignored),
+9 model contracts, 5 VAE bitwise checks, 6 independent VAE reference checks,
+6 standalone joint metrics and the original 56 complete-model action/video
+metrics. All recorded joint metrics and all 48 paired public normalized,
+deployed and robot-action metric rows are zero. Full unmodified public
+rebind/restored-output, noise/RNG and cleanup checks pass. Initial script
+failures occurred before any public measurement; corrected namespace parsing
+reused the same built extension and qualified recipe bank. They did not remove
+or restart any measured sample. The candidate remains Flexible; these results
+qualify the recorded workload and do not establish a hardware minimum, arbitrary
+input bitwise equivalence, streaming improvement or an SLA.
+
 A separate canonical-native streaming A→B→B→A comparison exercises the same six
 history scenarios in order, with one warmup sequence followed by two measured
 sequences per fresh process. Each variant has two processes and four measured

@@ -198,7 +198,11 @@ all admitted candidates and changed-input graph replay after owner release.
 The optional SM110 `cutlass-indexed-fa2-sm110` candidate implements the same
 Flexible dense BF16 contract for batch 1, Q=1785, Hq=Hkv=40, D=128,
 K in {2665,512,257}, separate Q/K/V, no mask and default scale. It owns
-1,143,844 bytes of scratch and requires 16-byte binding alignment. A native
+1,143,844 bytes of scratch and requires 16-byte binding alignment. Configuration
+0 retains the two-Q-stage one-CTA kernel; configuration 1 is a single-Q-stage
+two-CTA implementation with base-aware TMEM views. The ordinary tuner measures
+both configurations. The public semantic, supported profile, scratch budget,
+16-ULP midpoint rule and selected-row recomputation stay the same. A native
 pass flags near-midpoint rows; a stable GPU index list drives FA2 recomputation.
 The candidate is graph safe and deterministic, and is not a fallback or a
 Stable numerical implementation. Ordinary tuning may select other candidates,
