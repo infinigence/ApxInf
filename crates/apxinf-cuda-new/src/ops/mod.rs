@@ -1,5 +1,7 @@
 //! Semantic CUDA APIs with selection and native state behind L1.
 
+mod convolution;
+pub use convolution::{convolution3d, convolution_cudnn_version};
 pub mod attention;
 pub mod cache;
 pub mod elementwise;
@@ -34,8 +36,9 @@ pub use attention::{
 };
 pub use attention::{
     attention, decode_attention, decode_attention_workspace_bytes, kv_cache_attention,
-    segmented_attention, AttentionArgs, AttentionInput, AttentionMask, AttentionNumerics,
-    AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta, SegmentedAttentionArgs,
+    rounded_additive_attention, segmented_attention, AttentionArgs, AttentionInput, AttentionMask,
+    AttentionNumerics, AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta,
+    RoundedAttentionBiasArgs, SegmentedAttentionArgs,
 };
 pub use cache::core::{append as cache_append, concat_rows, copy_tensor, reserve_prefix};
 pub use elementwise::add_into;
@@ -47,6 +50,7 @@ pub use gather::{
     embedding_gather, gather, EmbeddingScale, GatherArgs, GatherSemantic,
     PatchGeometry as GatherPatchGeometry,
 };
+pub use gather::{permute, resize_bicubic, unfold3d, unfold3d_blocked, Unfold3dGeometry};
 pub use gdn::{
     gdn_causal_conv_forward, gdn_causal_conv_step, gdn_chunk_scan, gdn_continue, gdn_conv_prepare,
     gdn_decay_and_beta, gdn_first_prefill, gdn_gated_norm, gdn_l2_normalize_heads, gdn_prefill,
@@ -56,12 +60,13 @@ pub use gdn::{
 };
 pub use gemm::{
     gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, gemm_swiglu, gemv, gemv_bias,
-    pack_swiglu_weight_host, BlockQuantizedSwiGluArgs, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs,
-    GemmBiasResidualArgs, GemmGegluArgs, GemmNumerics, GemmPolicy, GemmQuantization,
-    GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales, WeightVersion,
+    pack_swiglu_weight_host, BlockQuantizedSwiGluArgs, GemmAlgorithmPolicy, GemmArgs, GemmBiasArgs,
+    GemmBiasGeluArgs, GemmBiasResidualArgs, GemmGegluArgs, GemmNumerics, GemmPolicy,
+    GemmQuantization, GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales,
+    WeightVersion,
 };
 pub use norm::{
-    fused_add_norm, residual_add, Affine, BiasOrder, FusedAddNormArgs, NormArgs, NormKind,
+    fused_add_norm, norm, residual_add, Affine, BiasOrder, FusedAddNormArgs, NormArgs, NormKind,
     NormNumerics, QuantOut, ResidualAddArgs, ResidualGate,
 };
 pub use pointwise::{
@@ -75,12 +80,12 @@ pub use quantization::{
 };
 pub use rope::apply_vision_2d as rope_apply_vision_2d;
 pub use rope::{
-    decode_rope, decode_rotation, execute_batched as rope_apply_batched,
+    complex_rotary, rms_complex_rotary, RmsComplexRotaryArgs, decode_rope, decode_rotation, execute_batched as rope_apply_batched,
     execute_mrope as rope_apply_mrope, multimodal_rope, partial_rope, rope, rotary_dim,
     split_grouped_qkv, split_qkv_axial_rope, split_qkv_cache, split_qkv_mrope_cache, AxialRopeArgs,
-    AxialRopeNumerics, DecodeRopeArgs, DecodeRotationArgs, DecodeRotationPosition,
-    GroupedQkvRopeArgs, MropeCacheArgs, MultimodalRopeArgs, QkvCacheRopeArgs, RopeArgs,
-    RopeSemantic,
+    AxialRopeNumerics, ComplexRotaryTable, DecodeRopeArgs, DecodeRotationArgs,
+    DecodeRotationPosition, GroupedQkvRopeArgs, MropeCacheArgs, MultimodalRopeArgs,
+    QkvCacheRopeArgs, RopeArgs, RopeSemantic,
 };
 pub use sampling::{argmax, ArgmaxArgs};
 

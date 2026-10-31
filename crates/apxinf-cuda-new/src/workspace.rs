@@ -236,7 +236,7 @@ impl ExecutionSessionInner {
 }
 
 /// Owns reusable prepared resources for one eager/capture/replay session.
-/// Only operators with real prepare state (currently GEMM and Attention) use
+/// Only operators with real prepare state (currently GEMM, Attention and Convolution) use
 /// the typed cache and prepared sequence. Stateless operators launch directly.
 #[derive(Clone)]
 pub struct ExecutionSession {

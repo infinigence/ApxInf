@@ -14,9 +14,88 @@ pub enum PointwiseSemantic {
     Swiglu,
     AddInto,
     SwigluRowwiseE4m3,
+    Add,
+    Subtract,
+    Multiply,
+    /// Add a `[1, cols]` secondary tensor to every input row.
+    BroadcastAdd,
+    /// Multiply by a `[1, cols]` secondary tensor.
+    BroadcastMultiply,
+    /// Multiply by a `[rows, 1]` secondary tensor.
+    RowMultiply,
+    /// Multiply by the scalar `dt`, rounding once to the output dtype.
+    Scale,
+    /// Add the scalar `dt`, rounding once to the output dtype.
+    ScalarAdd,
+    /// Divide by the finite nonzero scalar `dt` with FP32 division rounding.
+    ScalarDivide,
+    /// FP32 exponential, cast once to the output dtype.
+    Exp,
+    /// FP32 sine in radians, cast once to the output dtype.
+    Sin,
+    /// FP32 cosine in radians, cast once to the output dtype.
+    Cos,
+    /// Dtype-rounded `input * (1 + scale) + shift`. `secondary` is [1,cols]
+    /// scale and the required `bias` binding is [cols] shift. Every elementary
+    /// operation rounds to the input dtype; exact input/output alias is allowed.
+    StagedModulation,
+    /// Dtype-rounded `residual + input * gate`. `secondary` is [rows,cols]
+    /// residual and the required `bias` binding is [cols] gate. The product
+    /// rounds before addition; exact output alias with either matrix is allowed.
+    StagedGatedResidual,
 }
 
 impl PointwiseSemantic {
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] = &[
+        Self::Geglu,
+        Self::BiasActivation,
+        Self::EulerUpdate,
+        Self::Swiglu,
+        Self::AddInto,
+        Self::SwigluRowwiseE4m3,
+        Self::Add,
+        Self::Subtract,
+        Self::Multiply,
+        Self::BroadcastAdd,
+        Self::BroadcastMultiply,
+        Self::RowMultiply,
+        Self::Scale,
+        Self::ScalarAdd,
+        Self::ScalarDivide,
+        Self::Exp,
+        Self::Sin,
+        Self::Cos,
+        Self::StagedModulation,
+        Self::StagedGatedResidual,
+    ];
+
+    #[cfg(test)]
+    pub(crate) const fn doc_id(self) -> &'static str {
+        match self {
+            Self::Geglu => "pointwise_geglu",
+            Self::BiasActivation => "pointwise_bias_activation",
+            Self::EulerUpdate => "pointwise_euler_update",
+            Self::Swiglu => "pointwise_swiglu",
+            Self::AddInto => "pointwise_add_into",
+            Self::SwigluRowwiseE4m3 => "pointwise_swiglu_rowwise_e4m3",
+            Self::Add => "pointwise_add",
+            Self::Subtract => "pointwise_subtract",
+            Self::Multiply => "pointwise_multiply",
+            Self::BroadcastAdd => "pointwise_broadcast_add",
+            Self::BroadcastMultiply => "pointwise_broadcast_multiply",
+            Self::RowMultiply => "pointwise_row_multiply",
+            Self::Scale => "pointwise_scale",
+            Self::ScalarAdd => "pointwise_scalar_add",
+            Self::ScalarDivide => "pointwise_scalar_divide",
+            Self::Exp => "pointwise_exp",
+            Self::Sin => "pointwise_sin",
+            Self::Cos => "pointwise_cos",
+            Self::StagedModulation => "pointwise_staged_modulation",
+            Self::StagedGatedResidual => "pointwise_staged_gated_residual",
+        }
+    }
+
     fn code(self) -> u32 {
         match self {
             Self::Geglu => 0,
@@ -25,15 +104,46 @@ impl PointwiseSemantic {
             Self::Swiglu => 3,
             Self::AddInto => 4,
             Self::SwigluRowwiseE4m3 => 5,
+            Self::Add => 6,
+            Self::Subtract => 7,
+            Self::Multiply => 8,
+            Self::BroadcastAdd => 9,
+            Self::BroadcastMultiply => 10,
+            Self::RowMultiply => 11,
+            Self::Scale => 12,
+            Self::ScalarAdd => 13,
+            Self::ScalarDivide => 14,
+            Self::Exp => 15,
+            Self::Sin => 16,
+            Self::Cos => 17,
+            Self::StagedModulation => 18,
+            Self::StagedGatedResidual => 19,
         }
     }
 
     fn reads_secondary(self) -> bool {
-        matches!(self, Self::EulerUpdate)
+        matches!(
+            self,
+            Self::EulerUpdate
+                | Self::Add
+                | Self::Subtract
+                | Self::Multiply
+                | Self::BroadcastAdd
+                | Self::BroadcastMultiply
+                | Self::RowMultiply
+                | Self::StagedModulation
+                | Self::StagedGatedResidual
+        )
     }
 
     fn may_have_bias(self) -> bool {
-        matches!(self, Self::BiasActivation | Self::SwigluRowwiseE4m3)
+        matches!(
+            self,
+            Self::BiasActivation
+                | Self::SwigluRowwiseE4m3
+                | Self::StagedModulation
+                | Self::StagedGatedResidual
+        )
     }
 }
 
@@ -44,6 +154,11 @@ pub enum PointwiseActivation {
     Silu,
     GeluExact,
     Relu,
+    /// Tanh GELU with a dtype rounding boundary after every elementary
+    /// operation, including the cubic power. Unlike fused tanh GELU.
+    GeluRounded,
+    /// Explicit sigmoid tensor rounded before multiplication by input.
+    SwishRounded,
 }
 
 impl PointwiseActivation {
@@ -54,6 +169,8 @@ impl PointwiseActivation {
             Self::Silu => 2,
             Self::GeluExact => 3,
             Self::Relu => 4,
+            Self::GeluRounded => 5,
+            Self::SwishRounded => 6,
         }
     }
 }
@@ -63,8 +180,9 @@ impl PointwiseActivation {
 pub struct PointwiseArgs<'a> {
     pub semantic: PointwiseSemantic,
     pub input: &'a Tensor,
-    /// Euler-update velocity; unused by the other semantics.
+    /// Binary operand; broadcasting follows the selected semantic.
     pub secondary: Option<&'a Tensor>,
+    /// Per-column bias, or shift/gate for the two staged affine semantics.
     pub bias: Option<&'a Tensor>,
     pub out: &'a mut Tensor,
     /// One F32 scale per row for dynamic rowwise quantization.
@@ -72,6 +190,7 @@ pub struct PointwiseArgs<'a> {
     /// Logical, unpadded SwiGLU width. Zero means the physical output width.
     pub logical_cols: usize,
     pub activation: PointwiseActivation,
+    /// Step size for EulerUpdate or scalar for Scale/ScalarAdd.
     pub dt: f32,
     pub output_scale: f32,
 }
@@ -105,19 +224,21 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
 
 fn input_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
-        _ => Err(invalid("Pointwise input currently supports F16 and BF16")),
+        _ => Err(invalid("Pointwise input supports F32, F16 and BF16")),
     }
 }
 
 fn output_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
         DType::F8E4M3 => Ok(3),
         _ => Err(invalid(
-            "Pointwise output currently supports F16, BF16, and E4M3",
+            "Pointwise output supports F32, F16, BF16, and E4M3",
         )),
     }
 }
@@ -172,6 +293,9 @@ fn tensor_storage(
 
 pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<Normalized> {
     let semantic = args.semantic;
+    if semantic == PointwiseSemantic::ScalarDivide && args.dt == 0. {
+        return Err(invalid("Pointwise scalar divisor must be nonzero"));
+    }
     let dims = args.out.shape().dims();
     if dims.len() != 2 {
         return Err(invalid("Pointwise output must be rank 2 [rows, cols]"));
@@ -268,6 +392,15 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     if quantized_geglu && cols % 2 != 0 {
         return Err(invalid("F16-to-E4M3 GeGLU requires an even output width"));
     }
+    let staged_affine = matches!(
+        semantic,
+        PointwiseSemantic::StagedModulation | PointwiseSemantic::StagedGatedResidual
+    );
+    if staged_affine && args.bias.is_none() {
+        return Err(invalid(
+            "Staged affine requires a per-column shift/gate binding",
+        ));
+    }
     if args.bias.is_some() && !semantic.may_have_bias() {
         return Err(invalid("Pointwise semantic does not take a bias"));
     }
@@ -300,9 +433,23 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     let input_alignment = alignment_of(input_buffer.ptr() as usize);
     storage.push(input_buffer);
 
+    let (secondary_count, secondary_shape) = match semantic {
+        PointwiseSemantic::BroadcastAdd
+        | PointwiseSemantic::BroadcastMultiply
+        | PointwiseSemantic::StagedModulation => (cols, [1, cols]),
+        PointwiseSemantic::RowMultiply => (rows, [rows, 1]),
+        _ => (count, [rows, cols]),
+    };
     let (secondary, secondary_alignment) = match args.secondary {
         Some(tensor) => {
-            let buffer = tensor_storage(ctx, tensor, input_dtype, count)?;
+            if semantic != PointwiseSemantic::EulerUpdate
+                && tensor.shape().dims() != secondary_shape
+            {
+                return Err(invalid(
+                    "Pointwise secondary shape disagrees with its broadcast contract",
+                ));
+            }
+            let buffer = tensor_storage(ctx, tensor, input_dtype, secondary_count)?;
             let pointer = buffer.ptr() as *const std::ffi::c_void;
             let alignment = alignment_of(buffer.ptr() as usize);
             storage.push(buffer);
@@ -316,6 +463,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
 
     let (bias, bias_alignment) = match args.bias {
         Some(tensor) => {
+            if staged_affine && tensor.shape().dims() != [cols] {
+                return Err(invalid("Staged affine shift/gate must have shape [cols]"));
+            }
             let bias_elements = if matches!(semantic, PointwiseSemantic::SwigluRowwiseE4m3) {
                 logical_cols
                     .checked_mul(2)
@@ -335,6 +485,45 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     let output_buffer = tensor_storage(ctx, args.out, output_dtype, count)?;
     let output = output_buffer.ptr() as *mut std::ffi::c_void;
     let output_alignment = alignment_of(output_buffer.ptr() as usize);
+    // Broadcast operands may be reused by many threads. Reject overlap rather
+    // than allowing an order-dependent in-place update. Only the two staged
+    // affine semantics permit exact aliases with their full-size matrices.
+    if semantic.code() >= PointwiseSemantic::Add.code() {
+        if args.input.shape().dims() != [rows, cols] {
+            return Err(invalid("Pointwise input must match output [rows, cols]"));
+        }
+        let bytes = count
+            .checked_mul(output_dtype.size_in_bytes())
+            .ok_or_else(|| invalid("Pointwise output size overflow"))?;
+        for (index, buffer) in storage.iter().enumerate() {
+            let read_bytes = if staged_affine {
+                (match index {
+                    0 => count,
+                    1 => secondary_count,
+                    _ => cols,
+                }) * input_dtype.size_in_bytes()
+            } else {
+                buffer.len()
+            };
+            let exact_matrix_alias = staged_affine
+                && (index == 0
+                    || (index == 1 && semantic == PointwiseSemantic::StagedGatedResidual))
+                && buffer.ptr() as usize == output as usize
+                && read_bytes == bytes;
+            if !exact_matrix_alias
+                && storage_ranges_overlap(
+                    buffer.ptr() as usize,
+                    read_bytes,
+                    output as usize,
+                    bytes,
+                )?
+            {
+                return Err(invalid(
+                    "Pointwise binary/scalar input and output storage must not overlap",
+                ));
+            }
+        }
+    }
     if quantized_geglu {
         if input_alignment < 4 || output_alignment < 2 {
             return Err(invalid(

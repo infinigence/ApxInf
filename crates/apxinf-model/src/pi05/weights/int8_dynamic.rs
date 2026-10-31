@@ -217,6 +217,7 @@ mod linear {
                 allow_fallback: false,
                 graph_safe: true,
                 deterministic: true,
+                algorithm: ops::GemmAlgorithmPolicy::Any,
                 cache_dir: Some("test-cache".into()),
             };
             let policy = w8a8_gemm_policy(&input);
@@ -228,6 +229,7 @@ mod linear {
             assert_eq!(policy.allow_fallback, input.allow_fallback);
             assert_eq!(policy.graph_safe, input.graph_safe);
             assert_eq!(policy.deterministic, input.deterministic);
+            assert_eq!(policy.algorithm, input.algorithm);
             assert_eq!(policy.cache_dir, input.cache_dir);
         }
     }

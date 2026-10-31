@@ -19,6 +19,7 @@ struct CublasLtState {
   cublasLtMatmulAlgo_t algorithm{};
   bool has_algorithm = false;
   bool native_fp4 = false;
+  bool direct_bias = false;
   bool direct_fp8_gelu = false;
   bool split_geglu = false;
   void* c_buffer = nullptr;
@@ -88,23 +89,24 @@ size_t common_requirement(const Spec& spec, bool native_fp8) {
 
 void prepare_cublaslt_impl(Execution& state, bool native_fp8,
                            bool direct_fp8_gelu, bool split_geglu = false,
-                           bool native_fp4 = false) {
+                           bool native_fp4 = false, bool direct_bias = false, bool f32_reduction = false) {
   auto resources = std::make_unique<CublasLtState>();
   const auto& spec = state.spec;
   resources->native_fp4 = native_fp4;
+  resources->direct_bias = direct_bias;
   const int64_t projection_columns = split_geglu ? spec.n / 2 : spec.n;
   const int64_t projection_stride = spec.n;
   const int heuristic_rank =
       split_geglu ? state.configuration / 3 : state.configuration;
   resources->common.projection_dtype =
-      (native_fp4 || supports_native_bf16_bias(spec))
+      (native_fp4 || (direct_bias || supports_native_bf16_bias(spec)))
           ? spec.output_dtype
           : vendor::common_projection_dtype(spec);
   const size_t c_buffer_bytes =
       (direct_fp8_gelu || split_geglu)
           ? static_cast<size_t>(spec.m * projection_stride) * sizeof(half)
           : 0;
-  const size_t fixed_bytes = native_fp4 ? 0 : direct_fp8_gelu
+  const size_t fixed_bytes = (native_fp4 || direct_bias) ? 0 : direct_fp8_gelu
                                  ? c_buffer_bytes + sizeof(float)
                                  : split_geglu ? c_buffer_bytes
                                                : common_requirement(spec, native_fp8);
@@ -119,12 +121,15 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
       spec.a_dtype == APXINF_DTYPE_I8
           ? CUDA_R_8I
           : native_fp8 ? CUDA_R_8F_E4M3 : projection_type;
+  if (spec.numerics == APXINF_GEMM_NUMERICS_STAGED_BIAS) {
+    input_type = spec.a_dtype == APXINF_DTYPE_F16 ? CUDA_R_16F : CUDA_R_16BF;
+  }
   const cublasComputeType_t compute_type =
       spec.a_dtype == APXINF_DTYPE_I8 ? CUBLAS_COMPUTE_32I
                                       : CUBLAS_COMPUTE_32F;
   const cudaDataType_t scale_type =
       spec.a_dtype == APXINF_DTYPE_I8 ? CUDA_R_32I : CUDA_R_32F;
-  const cublasOperation_t transpose = native_fp4 ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const cublasOperation_t transpose = (native_fp4 || (spec.b_layout == APXINF_GEMM_LAYOUT_NK)) ? CUBLAS_OP_T : CUBLAS_OP_N;
 #if CUDART_VERSION >= 12080
   if (native_fp4) input_type = CUDA_R_4F_E2M1;
 #else
@@ -188,7 +193,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     check_cublas(cublasLtMatmulDescSetAttribute(
         resources->operation, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
         &state.bindings.bias, sizeof(state.bindings.bias)));
-  } else if (native_bias || native_bias_residual) {
+  } else if (native_bias || native_bias_residual || direct_bias) {
     const cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
     check_cublas(cublasLtMatmulDescSetAttribute(
         resources->operation, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
@@ -228,6 +233,19 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     cublasLtMatmulPreferenceDestroy(preference);
     check_cublas(status);
   }
+  if (direct_bias || f32_reduction) {
+    // A split-K partial may remain in F32 before the bias epilogue and sole
+    // output conversion. Exclude reductions through the F16/BF16 output type.
+    const uint32_t mask = CUBLASLT_REDUCTION_SCHEME_NONE |
+                          CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+    status = cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+        &mask, sizeof(mask));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      cublasLtMatmulPreferenceDestroy(preference);
+      check_cublas(status);
+    }
+  }
   cublasLtMatmulHeuristicResult_t candidates[8]{};
   int candidate_count = 0;
   status = cublasLtMatmulAlgoGetHeuristic(
@@ -240,6 +258,41 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
       candidates[heuristic_rank].state != CUBLAS_STATUS_SUCCESS) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "cuBLASLt heuristic is unavailable");
+  }
+  if (direct_bias || f32_reduction) {
+    // Validate the returned reduction as well as the preference: intermediate
+    // F16/BF16 partials would violate the single output-rounding contract.
+    uint32_t split_k = 0, reduction = 0;
+    size_t written = 0;
+    check_cublas(cublasLtMatmulAlgoConfigGetAttribute(
+        &candidates[heuristic_rank].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+        &split_k, sizeof(split_k), &written));
+    check_cublas(cublasLtMatmulAlgoConfigGetAttribute(
+        &candidates[heuristic_rank].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+        &reduction, sizeof(reduction), &written));
+    if ((split_k > 1 && reduction != CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE) ||
+        (reduction != CUBLASLT_REDUCTION_SCHEME_NONE &&
+         reduction != CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE)) {
+      throw Failure(APXINF_STATUS_UNSUPPORTED,
+                    "projection requires F32 partial reduction");
+    }
+  }
+  {
+    int algorithm_id = 0;
+    uint32_t split_k = 0, reduction = 0;
+    size_t written = 0;
+    check_cublas(cublasLtMatmulAlgoConfigGetAttribute(
+        &candidates[heuristic_rank].algo, CUBLASLT_ALGO_CONFIG_ID,
+        &algorithm_id, sizeof(algorithm_id), &written));
+    check_cublas(cublasLtMatmulAlgoConfigGetAttribute(
+        &candidates[heuristic_rank].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+        &split_k, sizeof(split_k), &written));
+    check_cublas(cublasLtMatmulAlgoConfigGetAttribute(
+        &candidates[heuristic_rank].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+        &reduction, sizeof(reduction), &written));
+    state.provider_detail = " lt-algo=" + std::to_string(algorithm_id) +
+                            " split-k=" + std::to_string(split_k) +
+                            " reduction=" + std::to_string(reduction);
   }
   resources->algorithm = candidates[heuristic_rank].algo;
   resources->has_algorithm = true;
@@ -270,7 +323,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     resources->common.resource_bytes = fixed_bytes;
   } else if (!native_fp4) {
     vendor::allocate_common_resources(spec, resources->common, native_fp8,
-                                      supports_native_bf16_bias(spec));
+                                      (direct_bias || supports_native_bf16_bias(spec)));
   }
   if (resources->workspace_bytes != 0) {
     check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
@@ -295,6 +348,18 @@ size_t cublaslt_native_fp8_resource_requirements(const Spec& spec) {
 
 size_t cublaslt_native_fp8_gelu_resource_requirements(const Spec& spec) {
   return static_cast<size_t>(spec.m * spec.n) * sizeof(half) + sizeof(float);
+}
+
+size_t cublaslt_direct_bias_resource_requirements(const Spec&) { return 0; }
+
+void prepare_cublaslt_direct_bias(Execution& state) {
+  prepare_cublaslt_impl(state, false, false, false, false, true);
+}
+
+
+
+void prepare_cublaslt_f32_reduction(Execution& state) {
+  prepare_cublaslt_impl(state, false, false, false, false, false, true);
 }
 
 void prepare_cublaslt(Execution& state) {
@@ -390,7 +455,8 @@ cudaError_t launch_cublaslt(Execution& state) {
       resources.c_layout, output,
       resources.d_layout, &resources.algorithm, resources.workspace,
       resources.workspace_bytes, stream));
-  if (resources.direct_fp8_gelu || resources.split_geglu) return cudaSuccess;
+  if (resources.direct_fp8_gelu || resources.split_geglu || resources.direct_bias)
+    return cudaSuccess;
   return vendor::launch_postprocess(spec, resources.common, bindings,
                                     projection);
 }

@@ -42,6 +42,8 @@ pub fn register_builtin_models() {
     crate::gr00t::register_builtin();
     #[cfg(feature = "cuda")]
     crate::smolvla::register_builtin();
+    #[cfg(feature = "cuda")]
+    crate::cuda_dreamzero::register_builtin();
 }
 fn load_llama(
     path: &Path,

@@ -12,7 +12,8 @@ pub(crate) mod nvfp4_scales;
 mod observer;
 
 pub use contracts::{
-    GemmArgs, GemmNumerics, GemmPolicy, GemmQuantization, GemmWeightLayout, WeightVersion,
+    GemmAlgorithmPolicy, GemmArgs, GemmNumerics, GemmPolicy, GemmQuantization, GemmWeightLayout,
+    WeightVersion,
 };
 pub use fixed::*;
 pub use gemm::gemm;

@@ -32,6 +32,7 @@ struct ExecutionKey {
     workspace_limit: u64,
     graph_safe: bool,
     deterministic: bool,
+    algorithm: super::contracts::GemmAlgorithmPolicy,
 }
 
 impl ExecutionKey {
@@ -61,6 +62,7 @@ impl ExecutionKey {
             workspace_limit: policy.workspace_limit as u64,
             graph_safe: policy.graph_safe,
             deterministic: policy.deterministic,
+            algorithm: policy.algorithm,
         }
     }
 }
@@ -131,6 +133,8 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
         .transpose()
         .map_err(|_| invalid("cache path contains NUL"))?;
     let policy = abi::Policy {
+        version: 1,
+        algorithm: options.algorithm as u32,
         workspace_limit: options.workspace_limit as u64,
         online_tune: options.online_tune as u32,
         allow_fallback: options.allow_fallback as u32,
@@ -238,6 +242,8 @@ pub(crate) fn seed_recipe(
         .ok_or_else(|| invalid("test recipe seeding requires a cache directory"))?;
     let cache = CString::new(cache.as_str()).map_err(|_| invalid("cache path contains NUL"))?;
     let policy = abi::Policy {
+        version: 1,
+        algorithm: normalized.policy.algorithm as u32,
         workspace_limit: normalized.policy.workspace_limit as u64,
         online_tune: normalized.policy.online_tune as u32,
         allow_fallback: normalized.policy.allow_fallback as u32,
@@ -291,6 +297,8 @@ pub(crate) fn validate_candidates(
         .transpose()
         .map_err(|_| invalid("cache path contains NUL"))?;
     let policy = abi::Policy {
+        version: 1,
+        algorithm: normalized.policy.algorithm as u32,
         workspace_limit: normalized.policy.workspace_limit as u64,
         online_tune: normalized.policy.online_tune as u32,
         allow_fallback: normalized.policy.allow_fallback as u32,

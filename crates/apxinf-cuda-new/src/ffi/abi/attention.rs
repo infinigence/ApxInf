@@ -4,7 +4,7 @@ pub(crate) use super::types::Policy;
 use super::types::{CudaStream, Runtime};
 use crate::ffi::raw::cuda_runtime::{cudaError_t, cudaStream_t};
 
-pub(crate) const SPEC_VERSION: u32 = 6;
+pub(crate) const SPEC_VERSION: u32 = 7;
 pub(crate) const SEMANTIC_DENSE: u32 = 0;
 pub(crate) const SEMANTIC_KV_CACHE: u32 = 1;
 pub(crate) const SEMANTIC_SEGMENTED: u32 = 2;
@@ -19,6 +19,7 @@ pub(crate) const GATE_SOURCE_TENSOR: u32 = 0;
 pub(crate) const GATE_SOURCE_PROJECTION: u32 = 1;
 pub(crate) const GATE_NUMERICS_FLEXIBLE: u32 = 0;
 pub(crate) const GATE_NUMERICS_ROUNDED_SIGMOID: u32 = 1;
+pub(crate) const SEMANTIC_ROUNDED_ADDITIVE: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -34,6 +35,7 @@ pub(crate) struct Spec {
     pub v_alignment: u32,
     pub output_alignment: u32,
     pub offsets_alignment: u32,
+    pub bias_alignment: u32,
     pub batch: i64,
     pub query_tokens: i64,
     pub key_tokens: i64,
@@ -58,6 +60,7 @@ pub(crate) struct Bindings {
     pub value: *const c_void,
     pub offsets: *const c_void,
     pub decode_meta: *const u32,
+    pub bias: *const c_void,
     pub output: *mut c_void,
     pub stream: CudaStream,
     pub scale: f32,

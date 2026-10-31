@@ -107,6 +107,15 @@ pub struct VlaMetadata<'a> {
     pub image_grid_thw: Option<&'a [[u32; 3]]>,
     pub embodiment_id: Option<usize>,
     pub planning: Option<&'a PlanningOptions>,
+    /// Identity for an observation history. Stateful families must isolate
+    /// episodes even when language and image shapes are identical.
+    pub history: Option<HistoryContext<'a>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryContext<'a> {
+    pub session: &'a str,
+    pub episode: &'a str,
 }
 
 /// Complete VLA request: an environment observation plus the model-generation
@@ -128,6 +137,7 @@ impl<'a> VlaRequest<'a> {
                 image_grid_thw: None,
                 embodiment_id: None,
                 planning: None,
+                history: None,
             },
         }
     }
@@ -141,6 +151,7 @@ impl<'a> VlaRequest<'a> {
                 image_grid_thw: None,
                 embodiment_id: None,
                 planning: None,
+                history: None,
             },
         }
     }
@@ -291,6 +302,14 @@ pub trait VlaRuntime {
         self.contract().action_shape
     }
 
+    /// Shape of the complete diffusion latent, which may contain multiple
+    /// modalities. Existing action-only families inherit their action shape.
+    /// This describes Provided input as well as generated-noise preparation;
+    /// it must not be inferred from the shape of the returned actions.
+    fn initial_latent_shape(&self) -> Vec<usize> {
+        self.action_shape().to_vec()
+    }
+
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
 
@@ -322,6 +341,14 @@ pub trait VlaRuntime {
     /// This is not a request/RNG reset.
     fn clear_prepared(&self) -> Result<()> {
         Err(Error::Other("VLA plan eviction is not supported".into()))
+    }
+
+    /// Discard semantic observation history without changing preparation or
+    /// the caller's RNG stream. Unsupported stateless runtimes fail explicitly.
+    fn reset_history(&self) -> Result<()> {
+        Err(Error::Other(
+            "VLA observation history is not supported".into(),
+        ))
     }
 
     /// Current execution path for diagnostics and benchmarks. Implementations

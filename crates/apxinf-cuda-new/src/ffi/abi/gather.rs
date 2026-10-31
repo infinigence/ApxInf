@@ -3,10 +3,10 @@ use std::ffi::c_void;
 pub(crate) use super::types::CudaStream;
 use super::types::Runtime;
 
-pub(crate) const SPEC_VERSION: u32 = 3;
+pub(crate) const SPEC_VERSION: u32 = 6;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) struct Spec {
     pub version: u32,
     pub semantic: u32,
@@ -25,6 +25,16 @@ pub(crate) struct Spec {
     pub output_alignment: u32,
     pub rows: i64,
     pub cols: i64,
+    pub rank: u32,
+    pub layout_shape: [i64; 8],
+    pub layout_strides: [i64; 8],
+    pub row_start: i64,
+    pub output_spatial: [i64; 3],
+    pub kernel: [i64; 3],
+    pub stride: [i64; 3],
+    pub dilation: [i64; 3],
+    pub padding: [i64; 3],
+    pub channel_block: i64,
 }
 
 #[repr(C)]

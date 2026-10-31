@@ -1,3 +1,4 @@
+mod complex;
 pub(crate) mod contracts;
 mod decode;
 mod fixed;
@@ -6,6 +7,7 @@ mod multimodal;
 mod partial;
 mod qkv;
 mod rope;
+pub use complex::{complex_rotary, rms_complex_rotary, ComplexRotaryTable, RmsComplexRotaryArgs};
 
 pub use contracts::{RopeArgs, RopeSemantic};
 pub use decode::{

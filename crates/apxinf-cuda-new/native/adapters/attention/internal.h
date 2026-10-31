@@ -76,6 +76,13 @@ struct Execution {
   ~Execution();
 };
 
+#if defined(APXINF_ATTENTION_INDEXED_SM110)
+size_t indexed_resource_requirements(const Spec&,int configuration);
+void prepare_indexed(Execution&);
+cudaError_t launch_indexed(Execution&);
+void destroy_indexed(Execution&) noexcept;
+#endif
+
 const ImplementationRegistry& registry(uint32_t semantic);
 bool supports_device(const Implementation& implementation, int device,
                      std::string* reason = nullptr);
@@ -96,6 +103,10 @@ void prepare_custom(Execution& execution);
 cudaError_t launch_custom(Execution& execution);
 void destroy_custom(Execution& execution) noexcept;
 
+size_t rounded_resource_requirements(const Spec& spec, int configuration);
+void prepare_rounded(Execution& execution);
+cudaError_t launch_rounded(Execution& execution);
+void destroy_rounded(Execution& execution) noexcept;
 cudaError_t launch_output_gate_projection(void* data, const void* projection,
                                           int rows, int heads, int head_dim,
                                           int64_t source_row_width,
@@ -111,6 +122,10 @@ cudaError_t launch_cublas_f16(Execution& execution);
 void destroy_cublas_f16(Execution& execution) noexcept;
 
 #if defined(APXINF_ATTENTION_FA2)
+size_t efficient_resource_requirements(const Spec&, int);
+void prepare_efficient(Execution&);
+cudaError_t launch_efficient(Execution&);
+void destroy_efficient(Execution&) noexcept;
 size_t fa2_resource_requirements(const Spec& spec, int configuration);
 void prepare_fa2(Execution& execution);
 cudaError_t launch_fa2(Execution& execution);

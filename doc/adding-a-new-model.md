@@ -220,6 +220,14 @@ replace it through an existing safe device path or `adding-new-kernels.md`
 before completion; a repeated host escape is unfinished implementation rather
 than ordinary best-effort optimization debt.
 
+Joint generative models may have a stochastic input larger than their action
+output. Override `VlaRuntime::initial_latent_shape()` instead of overloading
+`VlaContract::action_shape`; the binding's `noise_shape` and validation delegate
+to that method. If a family retains cross-request history, use
+`VlaMetadata::history` for explicit session/episode identity and implement
+`reset_history()` separately from `clear_prepared()`. Verify failed requests and
+preparation cannot publish history. See [DreamZero](dreamzero.md).
+
 For VLA models, include state shape, image/grid structure, masks, action horizon,
 action width, embodiment/category selection, and stochastic input shape where
 they affect execution.

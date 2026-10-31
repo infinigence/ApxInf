@@ -3,6 +3,7 @@
 mod accelerator;
 pub mod auto;
 pub mod builtin;
+pub mod cuda_dreamzero;
 pub mod d3;
 pub mod debug;
 mod generation_config;

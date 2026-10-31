@@ -3,7 +3,9 @@ pub(crate) mod contracts;
 pub(crate) mod execution;
 mod gates;
 mod kv_cache_attention;
+pub(crate) mod rounded_additive_attention;
 mod segmented_attention;
+pub use rounded_additive_attention::{rounded_additive_attention, RoundedAttentionBiasArgs};
 
 pub use attention::attention;
 pub use contracts::{
