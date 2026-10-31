@@ -58,7 +58,10 @@ D256 specialization. A whole-cluster scheduler keeps both CTA ranks valid at
 the tail. The MMA warp allocates TMEM before a cluster barrier publishes its
 base to every role. Score, probability, statistics and output views all include
 that base, and final deallocation uses the original allocator pointer and the
-same column count. The layout consumes two S64 slots plus one O128 slot;
+same column count. After allocation, the MMA warp in each CTA releases the
+allocation permit before the cluster barrier. This relinquishes the allocation
+lock while retaining the allocated TMEM and its original lifetime; it does not
+free the storage. The layout consumes two S64 slots plus one O128 slot;
 requesting 256 columns does not establish doubled residency or a performance
 claim.
 
@@ -104,3 +107,16 @@ build; no cold-start benefit is established. The exact cohort, limits and
 historical configuration-0 baseline are recorded in `doc/dreamzero.md`.
 Neither these measurements nor the private microbenchmarks establish hardware
 minimum latency or a Stable numerical contract.
+
+A later qualification releases the single-Q MMA warp's allocation permit directly
+after allocation in both CTAs, retaining the same storage and final deallocation.
+The unchanged 450 native checks, full 170-test backend suite, model/VAE checks
+and original 56 joint metrics pass; all recorded joint and 48 paired public metric
+rows are zero. A separate frozen 16-process comparison against the published
+single-Q build reduces warm median latency from 19.3299 to 18.9328 seconds
+(2.0543%), with all four blocks improving and a one-sided 95% whole-process
+bootstrap lower reduction bound of 1.8919%. First/cached default-DVFS results are
+mixed. The status observer's partial timing exposure, retained complete cohort,
+exact artifacts and audit scope are recorded in `doc/dreamzero.md`; no measured
+process was restarted and the predeclared analysis was unchanged. This result
+does not establish a cold-start benefit or hardware minimum.

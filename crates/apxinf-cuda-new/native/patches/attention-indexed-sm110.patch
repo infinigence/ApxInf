@@ -1028,7 +1028,7 @@
    static const int MaxThreadsPerBlock = NumWarps * cutlass::NumThreadsPerWarp;
    using ArchTag = cutlass::arch::Sm100;
  
-@@ -606,7 +623,19 @@
+@@ -606,7 +623,20 @@
      typename CollectiveMainloop::PipelineO::PipelineState pipeline_mma_corr_consumer_state;
      typename CollectiveMainloop::PipelineO::PipelineState pipeline_mma_corr_producer_state = cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineO>();
  
@@ -1038,6 +1038,7 @@
 +    if constexpr (kRebasedTmem) {
 +      if (role == WarpRole::MMA) {
 +        tmem_allocator.allocate(kRequestedTmemColumns, &shared_storage.tmem_base_ptr);
++        tmem_allocator.release_allocation_lock();
 +      }
 +      cute::cluster_sync();
 +    }
@@ -1048,7 +1049,7 @@
      CollectiveEpilogue epilogue{params.epilogue};
  
      // apxinf: this is upstream's text with one compile-time guard added, and
-@@ -714,7 +743,7 @@
+@@ -714,7 +744,7 @@
  
          if (has_valid) {
            uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
@@ -1057,7 +1058,7 @@
          }
        }
  
-@@ -722,7 +751,7 @@
+@@ -722,7 +752,7 @@
      else if (role == WarpRole::MMA) {
        warpgroup_reg_set<NumRegsOther>();
  
@@ -1066,7 +1067,7 @@
  
        CUTLASS_PRAGMA_NO_UNROLL
        for (; tile_scheduler.is_valid(); ++tile_scheduler) {
-@@ -736,7 +765,7 @@
+@@ -736,7 +766,7 @@
          }
  
          if (!allocated) {
@@ -1075,7 +1076,7 @@
            __syncwarp();
            allocated = true;
          }
-@@ -820,8 +849,12 @@
+@@ -820,8 +850,12 @@
            // while each CTA stores one 128-row local epilogue tile.
            get<0>(blk_coord) = get<0>(blk_coord) * cute::size<0>(ClusterShape{})
                              + int(cta_rank_in_cluster % cute::size<0>(ClusterShape{}));
@@ -1090,7 +1091,7 @@
          } else {
            epilogue.store(
              blk_coord, logical_problem_shape,
-@@ -837,7 +870,7 @@
+@@ -837,7 +871,7 @@
        if constexpr (NumWarpsEpilogue == 1 && !kIs2Sm) {
          if(has_valid) {
            uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
@@ -1099,7 +1100,7 @@
          }
        }
  
-@@ -863,7 +896,7 @@
+@@ -863,7 +897,7 @@
        cute::cluster_sync();
        if (role == WarpRole::MMA) {
          uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
@@ -1108,7 +1109,7 @@
        }
      }
  #endif
-@@ -871,4 +904,4 @@
+@@ -871,4 +905,4 @@
  
  };
  

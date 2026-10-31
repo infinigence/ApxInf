@@ -545,6 +545,55 @@ or restart any measured sample. The candidate remains Flexible; these results
 qualify the recorded workload and do not establish a hardware minimum, arbitrary
 input bitwise equivalence, streaming improvement or an SLA.
 
+A further balanced 16-process comparison changes only the single-Q kernel's
+TMEM allocation-permit lifetime. After allocating 256 columns, the MMA warp in
+each CTA relinquishes its allocation permit before the existing cluster barrier.
+The allocation remains live, every view retains its base, and final deallocation
+uses the original pointer and column count. There is no later allocation on this
+path. Arithmetic, supported shapes, configuration 0, scratch and provider policy
+remain unchanged; the measured active-cluster count remains 10.
+
+The baseline is the published single-Q build (`377d642`), rather than the earlier
+configuration-0 build. The order is again A1 B1 B2 A2 B3 A3 A4 B4 A5 B5 B6 A6 B7
+A7 A8 B8, with eight fresh processes and 24 warm samples per path. All 72 GEMM
+recipes remain identical, and each path's complete 90-recipe bank is frozen.
+There is no online tuning, profiler run or sample removal in this cohort.
+
+| Path | First request | First cached | First two requests | Warm median | Warm p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Published single-Q Attention | 31.156 | 19.581 | 50.617 | 19.330 | 19.485 |
+| Single-Q with early permit release | 29.392 | 19.924 | 49.108 | 18.933 | 19.118 |
+
+Values are median seconds. Warm latency falls by 2.0543% (1.0210×), or 0.3971 s.
+The four balanced block reductions are 1.8057%, 2.3659%, 2.4792% and 2.0184%.
+The predeclared 20,000-resample whole-process bootstrap gives a one-sided 95%
+lower reduction bound of 1.8919% (seed 0). All 48 warm windows pass the fixed
+observation coverage and gap checks at sampled GPU 1,575 MHz / EMC 4.266 GHz,
+without warm observer timeouts or sampled foreign compute PIDs. Substantial
+transfers finish before public measurements or start after the complete cohort.
+Default-DVFS first-request and cached observations move in different directions;
+this cohort establishes no general cold-start benefit.
+
+An observer status query accidentally printed partial timing results after the
+first 11 processes. The original order, code, acceptance thresholds and analysis
+remained fixed, and all 16 processes and 48 warm samples were retained. This
+deviation is recorded with the evidence; no measured process was restarted.
+An isolated rerun of the pinned audit and bootstrap reproduces every result
+field apart from audit timestamps.
+
+Fresh qualification again passes 450 native checks across 75 cases, 170 backend
+tests (0 failed, 2 ignored), 480 convolution oracle checks, 9 model contracts,
+5 VAE bitwise checks, 6 VAE reference checks, 6 standalone joint metrics and all
+56 original complete-model metrics. The recorded joint metrics and all 48 paired
+public metric rows are zero. Full unmodified public rebinding, RNG, joint-noise,
+cleanup and robot decoding checks pass. The candidate extension SHA-256 is
+`552955ac8df34cf97495ffaa907737dd0c8104de9a83e482252559ea951ef633`;
+the baseline is
+`19088b59421921396f256b4719eb791464b493020af584a8906973c7671b14db`.
+This remains a Flexible implementation and a measured warm-workload improvement;
+it does not establish a hardware minimum, streaming gain or arbitrary-input
+bitwise equivalence.
+
 A separate canonical-native streaming A→B→B→A comparison exercises the same six
 history scenarios in order, with one warmup sequence followed by two measured
 sequences per fresh process. Each variant has two processes and four measured
