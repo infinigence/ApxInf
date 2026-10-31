@@ -134,15 +134,20 @@ enum Commands {
         #[arg(long)]
         model_name: Option<String>,
 
-        /// Input prompt
-        #[arg(short, long)]
-        prompt: String,
+        /// Input prompt, scored over the package code table
+        #[arg(short, long, required_unless_present = "request")]
+        prompt: Option<String>,
+
+        /// JSON file with a schema request {"state", "questions"}, for models
+        /// that encode their own prompt
+        #[arg(long, conflicts_with_all = ["prompt", "system", "candidates"])]
+        request: Option<PathBuf>,
 
         /// System prompt for chat mode
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to run inference on (cuda[:N])
+        /// Device to run inference on (cuda[:N] or metal[:N])
         #[arg(short, long, default_value = "cuda:0")]
         device: String,
 
@@ -236,6 +241,7 @@ fn main() {
             model,
             model_name,
             prompt,
+            request,
             system,
             device,
             candidates,
@@ -249,16 +255,32 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            if let Err(error) = run_decide(
-                &model,
-                model_name.as_deref(),
-                &prompt,
-                system.as_deref(),
-                device,
-                candidates,
+            let options = LoadOptions {
+                model_name,
                 autotune,
-                tuning_dir.as_ref(),
-            ) {
+                tuning_path: tuning_dir,
+                ..LoadOptions::default()
+            };
+            let result = match (request, prompt) {
+                (Some(request), _) => run_decide_schema(
+                    &model,
+                    &request,
+                    device,
+                    options,
+                    |device, path, options| AutoModel::load_model(device, path, options),
+                    &mut std::io::stdout().lock(),
+                ),
+                (None, Some(prompt)) => run_decide(
+                    &model,
+                    &prompt,
+                    system.as_deref(),
+                    device,
+                    candidates,
+                    options,
+                ),
+                (None, None) => Err("decide needs --prompt or --request".into()),
+            };
+            if let Err(error) = result {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -402,6 +424,277 @@ mod device_tests {
         assert_eq!(model_name.as_deref(), Some("minicpm5"));
         assert_eq!(model_variant.as_deref(), Some("bf16-compiled"));
     }
+
+    #[test]
+    fn decide_takes_a_prompt_or_a_schema_request() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["apxinf", "decide", "--model", "/m"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        let cli = parse(&["--request", "/r.json", "--device", "metal"]).unwrap();
+        let Commands::Decide {
+            prompt, request, ..
+        } = cli.command
+        else {
+            panic!("expected decide command");
+        };
+        assert_eq!(
+            (prompt, request),
+            (None, Some(std::path::PathBuf::from("/r.json")))
+        );
+        assert!(parse(&["--prompt", "p"]).is_ok());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--prompt", "p", "--request", "/r.json"]).is_err());
+        assert!(parse(&["--request", "/r.json", "--candidates", "2"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod schema_decision_tests {
+    use super::*;
+    use apxinf_core::{Error, Result};
+    use apxinf_model::{
+        DecisionModel, DecisionSchema, LlmCapabilities, LoadedModel, SchemaDecisionAnswer,
+        SchemaDecisionOutput, SchemaDecisionRuntime, SchemaDecisionScore,
+    };
+
+    const REQUEST: &str = include_str!("../tests/fixtures/decision/schema.json");
+
+    struct StubDecisionRuntime {
+        output: Option<Result<SchemaDecisionOutput>>,
+    }
+
+    impl SchemaDecisionRuntime for StubDecisionRuntime {
+        fn capabilities(&self) -> LlmCapabilities {
+            LlmCapabilities::TEXT_ONLY
+        }
+
+        fn decide_schema(&mut self, schema: &DecisionSchema) -> Result<SchemaDecisionOutput> {
+            assert_eq!(*schema, DecisionSchema::from_json(REQUEST).unwrap());
+            assert_eq!(
+                schema
+                    .questions
+                    .iter()
+                    .map(|question| question.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["zeta", "alpha"]
+            );
+            self.output.take().expect("unexpected inference call")
+        }
+    }
+
+    fn run_schema(
+        extra: &[&str],
+        load_model: impl FnOnce(Device, &std::path::Path, &LoadOptions) -> Result<LoadedModel>,
+    ) -> (std::result::Result<(), String>, String) {
+        let mut args = vec![
+            "apxinf",
+            "decide",
+            "--model",
+            "/unused-checkpoint",
+            "--model-name",
+            "clef",
+            "--device",
+            "metal:1",
+            "--request",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/decision/schema.json"
+            ),
+        ];
+        args.extend_from_slice(extra);
+        let Commands::Decide {
+            model,
+            model_name,
+            request,
+            device,
+            autotune,
+            tuning_dir,
+            ..
+        } = Cli::try_parse_from(args).unwrap().command
+        else {
+            panic!("expected decide command");
+        };
+        let mut stdout = Vec::new();
+        let result = run_decide_schema(
+            &model,
+            &request.unwrap(),
+            parse_device(&device).unwrap(),
+            LoadOptions {
+                model_name,
+                autotune,
+                tuning_path: tuning_dir,
+                ..LoadOptions::default()
+            },
+            load_model,
+            &mut stdout,
+        );
+        (result, String::from_utf8(stdout).unwrap())
+    }
+
+    #[test]
+    fn schema_forwards_tuning_options_and_loader_errors() {
+        for (flags, autotune, tuning_path) in [
+            (vec!["--autotune"], true, None),
+            (vec!["--tuning-dir", "/recipes"], false, Some("/recipes")),
+            (
+                vec!["--autotune", "--tuning-dir", "/recipes"],
+                true,
+                Some("/recipes"),
+            ),
+        ] {
+            let (result, stdout) = run_schema(&flags, |device, path, options| {
+                assert_eq!(device, Device::Metal(1));
+                assert_eq!(path, std::path::Path::new("/unused-checkpoint"));
+                assert_eq!(options.model_name.as_deref(), Some("clef"));
+                assert_eq!(options.autotune, autotune);
+                assert_eq!(
+                    options.tuning_path.as_deref(),
+                    tuning_path.map(std::path::Path::new)
+                );
+                Err(Error::Other("family rejects tuning options".into()))
+            });
+            assert_eq!(
+                result.unwrap_err(),
+                "Failed to load model: family rejects tuning options"
+            );
+            assert!(!stdout.contains("Model ready"));
+        }
+    }
+
+    #[test]
+    fn schema_dispatch_prints_grouped_answers_in_order() {
+        let (result, stdout) = run_schema(&[], |_, _, options| {
+            assert!(!options.autotune);
+            assert!(options.tuning_path.is_none());
+            let answers = [
+                ("zeta", vec![("go", 0.25), ("stay", 0.75)]),
+                (
+                    "alpha",
+                    vec![("low", 0.125), ("medium", 0.5), ("high", 0.375)],
+                ),
+            ]
+            .into_iter()
+            .map(|(question_id, scores)| SchemaDecisionAnswer {
+                question_id: question_id.into(),
+                selected_index: 1,
+                scores: scores
+                    .into_iter()
+                    .map(|(code, probability)| SchemaDecisionScore {
+                        code: code.into(),
+                        probability,
+                    })
+                    .collect(),
+            })
+            .collect();
+            Ok(LoadedModel::Decision(DecisionModel::Schema(Box::new(
+                StubDecisionRuntime {
+                    output: Some(Ok(SchemaDecisionOutput { answers })),
+                },
+            ))))
+        });
+        result.unwrap();
+        let lines: Vec<Vec<_>> = stdout
+            .lines()
+            .skip(3)
+            .map(|line| line.split_whitespace().collect())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                vec!["zeta:", "selected", "stay", "probability", "0.75000000"],
+                vec!["go", "probability=0.25000000"],
+                vec!["stay", "probability=0.75000000"],
+                vec!["alpha:", "selected", "medium", "probability", "0.50000000"],
+                vec!["low", "probability=0.12500000"],
+                vec!["medium", "probability=0.50000000"],
+                vec!["high", "probability=0.37500000"],
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_dispatch_propagates_runtime_and_output_errors() {
+        for (output, expected) in [
+            (
+                Err(Error::Other("schema unsupported by runtime".into())),
+                "Decision failed: schema unsupported by runtime",
+            ),
+            (
+                Ok(SchemaDecisionOutput {
+                    answers: vec![SchemaDecisionAnswer {
+                        question_id: "zeta".into(),
+                        selected_index: 0,
+                        scores: vec![],
+                    }],
+                }),
+                "Invalid decision output: decision output: selected index 0 outside 0 scores",
+            ),
+        ] {
+            let (result, stdout) = run_schema(&[], |_, _, _| {
+                Ok(LoadedModel::Decision(DecisionModel::Schema(Box::new(
+                    StubDecisionRuntime {
+                        output: Some(output),
+                    },
+                ))))
+            });
+            assert_eq!(result.unwrap_err(), expected);
+            assert!(!stdout.contains("selected"));
+        }
+    }
+}
+
+fn run_decide_schema(
+    model_dir: &PathBuf,
+    request: &PathBuf,
+    device: Device,
+    mut options: LoadOptions,
+    load_model: impl FnOnce(
+        Device,
+        &std::path::Path,
+        &LoadOptions,
+    ) -> apxinf_core::Result<apxinf_model::LoadedModel>,
+    writer: &mut impl Write,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(request)
+        .map_err(|error| format!("Failed to read {request:?}: {error}"))?;
+    let schema =
+        apxinf_model::DecisionSchema::from_json(&text).map_err(|error| error.to_string())?;
+    let model_name = match options.model_name.as_ref() {
+        Some(name) => name.clone(),
+        None => AutoModel::detect_model_name(model_dir)
+            .map_err(|error| format!("Failed to detect model type: {error}"))?,
+    };
+    options.model_name = Some(model_name.clone());
+    writeln!(writer, "Loading {model_name} from {:?}...", model_dir)
+        .map_err(|error| error.to_string())?;
+    let mut model = load_model(device, model_dir, &options)
+        .map_err(|error| format!("Failed to load model: {error}"))?;
+    writeln!(writer, "Model ready.\n").map_err(|error| error.to_string())?;
+    let output = model
+        .decide_schema(&schema)
+        .map_err(|error| format!("Decision failed: {error}"))?;
+    for answer in &output.answers {
+        let selected = answer
+            .selected()
+            .map_err(|error| format!("Invalid decision output: {error}"))?;
+        writeln!(
+            writer,
+            "{}: selected {}  probability {:.8}",
+            answer.question_id, selected.code, selected.probability
+        )
+        .map_err(|error| error.to_string())?;
+        for score in &answer.scores {
+            writeln!(
+                writer,
+                "  {:<20}  probability={:.8}",
+                score.code, score.probability
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn run_generate(
@@ -663,19 +956,17 @@ fn run_generate(
 
 fn run_decide(
     model_dir: &PathBuf,
-    model_name_override: Option<&str>,
     prompt: &str,
     system_prompt: Option<&str>,
     device: Device,
     candidates: Option<usize>,
-    autotune: bool,
-    tuning_dir: Option<&PathBuf>,
+    mut options: LoadOptions,
 ) -> Result<(), String> {
     println!("apxinf — decision inference engine");
     println!();
 
-    let model_name = match model_name_override {
-        Some(name) => name.to_owned(),
+    let model_name = match options.model_name.as_ref() {
+        Some(name) => name.clone(),
         None => AutoModel::detect_model_name(model_dir)
             .map_err(|error| format!("Failed to detect model type: {error}"))?,
     };
@@ -697,12 +988,7 @@ fn run_decide(
         .map_err(|error| format!("Failed to encode prompt: {error}"))?;
     println!("Prompt tokens: {}", tokens.len());
 
-    let options = LoadOptions {
-        model_name: Some(model_name.clone()),
-        autotune,
-        tuning_path: tuning_dir.cloned(),
-        ..LoadOptions::default()
-    };
+    options.model_name = Some(model_name.clone());
 
     println!("Loading {model_name} from {:?}...", model_dir);
     let mut model = AutoModel::load_model(device, model_dir, &options)
