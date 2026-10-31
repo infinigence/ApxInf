@@ -311,7 +311,7 @@ impl DecisionRunner {
         };
         let model = AutoModel::load_model(device, &model_path, &options).map_err(runtime_err)?;
         // Verify this is actually a decision model.
-        model.decision_code_names().map_err(|_| {
+        model.decision_capabilities().map_err(|_| {
             PyValueError::new_err(format!(
                 "apxinf_py.DecisionRunner.load: {:?} is not a decision model",
                 model_path
@@ -1924,45 +1924,27 @@ mod tests {
     mod decision {
         use super::*;
         use apxinf_model::{
-            DecisionOutput, DecisionRuntime, DecisionSchema, DecisionScore, LlmCapabilities,
-            SchemaDecisionAnswer, SchemaDecisionOutput, SchemaDecisionScore,
+            CodeDecisionRuntime, DecisionModel, DecisionOutput, DecisionSchema, DecisionScore,
+            LlmCapabilities, SchemaDecisionAnswer, SchemaDecisionOutput, SchemaDecisionRuntime,
+            SchemaDecisionScore,
         };
 
         const REQUEST: &str = include_str!("../../../tests/fixtures/decision/schema.json");
 
-        struct StubDecisionRuntime {
-            schema: Option<DecisionSchema>,
+        struct StubCodeRuntime {
             output: Option<apxinf_core::Result<DecisionOutput>>,
-            schema_output: Option<apxinf_core::Result<SchemaDecisionOutput>>,
         }
 
-        impl DecisionRuntime for StubDecisionRuntime {
+        impl CodeDecisionRuntime for StubCodeRuntime {
             fn capabilities(&self) -> LlmCapabilities {
                 LlmCapabilities::TEXT_ONLY
             }
 
             fn decide(&mut self, input: DecisionInput<'_>) -> apxinf_core::Result<DecisionOutput> {
-                assert!(self.schema.is_none());
                 assert_eq!(input.token_ids, [17, 42]);
                 assert!(input.image.is_none());
                 assert_eq!(input.candidate_count, 2);
                 self.output.take().expect("unexpected inference call")
-            }
-
-            fn decide_schema(
-                &mut self,
-                schema: &DecisionSchema,
-            ) -> apxinf_core::Result<SchemaDecisionOutput> {
-                assert_eq!(Some(schema), self.schema.as_ref());
-                assert_eq!(
-                    schema
-                        .questions
-                        .iter()
-                        .map(|question| question.id.as_str())
-                        .collect::<Vec<_>>(),
-                    ["zeta", "alpha"]
-                );
-                self.schema_output.take().expect("unexpected schema call")
             }
 
             fn code_names(&self) -> &[String] {
@@ -1974,13 +1956,39 @@ mod tests {
             }
         }
 
+        struct StubSchemaRuntime {
+            schema: DecisionSchema,
+            output: Option<apxinf_core::Result<SchemaDecisionOutput>>,
+        }
+
+        impl SchemaDecisionRuntime for StubSchemaRuntime {
+            fn capabilities(&self) -> LlmCapabilities {
+                LlmCapabilities::TEXT_ONLY
+            }
+
+            fn decide_schema(
+                &mut self,
+                schema: &DecisionSchema,
+            ) -> apxinf_core::Result<SchemaDecisionOutput> {
+                assert_eq!(*schema, self.schema);
+                assert_eq!(
+                    schema
+                        .questions
+                        .iter()
+                        .map(|question| question.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["zeta", "alpha"]
+                );
+                self.output.take().expect("unexpected schema call")
+            }
+        }
+
         fn schema_runner(output: apxinf_core::Result<SchemaDecisionOutput>) -> DecisionRunner {
             DecisionRunner {
-                model: LoadedModel::Decision(Box::new(StubDecisionRuntime {
-                    schema: Some(DecisionSchema::from_json(REQUEST).unwrap()),
-                    output: None,
-                    schema_output: Some(output),
-                })),
+                model: LoadedModel::Decision(DecisionModel::Schema(Box::new(StubSchemaRuntime {
+                    schema: DecisionSchema::from_json(REQUEST).unwrap(),
+                    output: Some(output),
+                }))),
                 device: Device::Cpu,
                 model_path: PathBuf::from("/unused-checkpoint"),
             }
@@ -2076,11 +2084,11 @@ mod tests {
                 let runner = Py::new(
                     py,
                     DecisionRunner {
-                        model: LoadedModel::Decision(Box::new(StubDecisionRuntime {
-                            schema: None,
-                            output: Some(Ok(output)),
-                            schema_output: None,
-                        })),
+                        model: LoadedModel::Decision(DecisionModel::Code(Box::new(
+                            StubCodeRuntime {
+                                output: Some(Ok(output)),
+                            },
+                        ))),
                         device: Device::Cpu,
                         model_path: PathBuf::from("/unused-checkpoint"),
                     },

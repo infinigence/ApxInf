@@ -8,7 +8,8 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 use crate::accelerator::create_backend_with_recipe_options;
 use crate::builtin::register_builtin_models;
 use crate::decision::{
-    DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema, SchemaDecisionOutput,
+    CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionSchema,
+    SchemaDecisionOutput,
 };
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
@@ -95,7 +96,7 @@ pub enum LoadedModel {
         generation_defaults: GenerationOptions,
     },
     Vla(Box<dyn VlaRuntime>),
-    Decision(Box<dyn DecisionRuntime>),
+    Decision(DecisionModel),
 }
 
 impl LoadedModel {
@@ -122,26 +123,41 @@ impl LoadedModel {
         }
     }
 
-    pub fn decision_mut(&mut self) -> Result<&mut dyn DecisionRuntime> {
+    pub fn decision_model_mut(&mut self) -> Result<&mut DecisionModel> {
         match self {
-            Self::Decision(model) => Ok(&mut **model),
+            Self::Decision(model) => Ok(model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
+    }
+
+    /// The encoded-prompt runtime of a code decision model.
+    pub fn decision_mut(&mut self) -> Result<&mut dyn CodeDecisionRuntime> {
+        self.decision_model_mut()?.code_mut()
     }
 
     pub fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
         self.decision_mut()?.decide(input)
     }
 
-    /// Score named schema questions without changing encoded decision requests.
+    /// Score named schema questions on a schema decision model.
     pub fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
-        self.decision_mut()?.decide_schema(request)
+        self.decision_model_mut()?
+            .schema_mut()?
+            .decide_schema(request)
     }
 
     pub fn decision_code_names(&self) -> Result<&[String]> {
         match self {
-            Self::Decision(model) => Ok(model.code_names()),
+            Self::Decision(model) => Ok(model.code()?.code_names()),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+        }
+    }
+
+    pub fn decision_capabilities(&self) -> Result<LlmCapabilities> {
+        match self {
+            Self::Decision(model) => Ok(model.capabilities()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
@@ -149,7 +165,7 @@ impl LoadedModel {
 
     pub fn decision_token_ids(&self) -> Result<&[u32]> {
         match self {
-            Self::Decision(model) => Ok(model.token_ids()),
+            Self::Decision(model) => Ok(model.code()?.token_ids()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }

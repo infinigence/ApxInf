@@ -220,7 +220,8 @@ class DecisionRunner:
         token_ids: npt.NDArray[np.uint32],
         candidate_count: int,
     ) -> dict:
-        """Run a text decision and return scored codes.
+        """Run a text decision and return scored codes. Encoded-prompt models
+        (D3) only; a schema model (Clef) raises RuntimeError.
 
         Returns:
             dict with ``selected_index`` (int) and ``scores``
@@ -239,14 +240,15 @@ class DecisionRunner:
         ``question_id``, ``selected_index`` and ``scores`` in option order.
         Each score has ``code``, ``token_id`` (int or None), and ``probability``.
         Probabilities remain grouped by question without renormalization.
-        Invalid JSON or schema raises ValueError; runtime errors, including
-        unsupported input forms, raise RuntimeError.
+        Invalid JSON or schema raises ValueError. A model that takes encoded
+        prompts (D3) and other runtime errors raise RuntimeError.
         """
         ...
 
     @property
     def codes(self) -> list[str]:
-        """Available code names in the package code table."""
+        """Available code names in the package code table. Encoded-prompt
+        models only; a schema model raises RuntimeError."""
         ...
     @property
     def num_codes(self) -> int:

@@ -455,8 +455,8 @@ mod schema_decision_tests {
     use super::*;
     use apxinf_core::{Error, Result};
     use apxinf_model::{
-        DecisionOutput, DecisionRuntime, DecisionSchema, LlmCapabilities, LoadedModel,
-        SchemaDecisionAnswer, SchemaDecisionOutput, SchemaDecisionScore,
+        DecisionModel, DecisionSchema, LlmCapabilities, LoadedModel, SchemaDecisionAnswer,
+        SchemaDecisionOutput, SchemaDecisionRuntime, SchemaDecisionScore,
     };
 
     const REQUEST: &str = include_str!("../tests/fixtures/decision/schema.json");
@@ -465,13 +465,9 @@ mod schema_decision_tests {
         output: Option<Result<SchemaDecisionOutput>>,
     }
 
-    impl DecisionRuntime for StubDecisionRuntime {
+    impl SchemaDecisionRuntime for StubDecisionRuntime {
         fn capabilities(&self) -> LlmCapabilities {
             LlmCapabilities::TEXT_ONLY
-        }
-
-        fn decide(&mut self, _input: DecisionInput<'_>) -> Result<DecisionOutput> {
-            panic!("expected schema dispatch");
         }
 
         fn decide_schema(&mut self, schema: &DecisionSchema) -> Result<SchemaDecisionOutput> {
@@ -485,14 +481,6 @@ mod schema_decision_tests {
                 ["zeta", "alpha"]
             );
             self.output.take().expect("unexpected inference call")
-        }
-
-        fn code_names(&self) -> &[String] {
-            &[]
-        }
-
-        fn token_ids(&self) -> &[u32] {
-            &[]
         }
     }
 
@@ -600,9 +588,11 @@ mod schema_decision_tests {
                     .collect(),
             })
             .collect();
-            Ok(LoadedModel::Decision(Box::new(StubDecisionRuntime {
-                output: Some(Ok(SchemaDecisionOutput { answers })),
-            })))
+            Ok(LoadedModel::Decision(DecisionModel::Schema(Box::new(
+                StubDecisionRuntime {
+                    output: Some(Ok(SchemaDecisionOutput { answers })),
+                },
+            ))))
         });
         result.unwrap();
         let lines: Vec<Vec<_>> = stdout
@@ -643,9 +633,11 @@ mod schema_decision_tests {
             ),
         ] {
             let (result, stdout) = run_schema(&[], |_, _, _| {
-                Ok(LoadedModel::Decision(Box::new(StubDecisionRuntime {
-                    output: Some(output),
-                })))
+                Ok(LoadedModel::Decision(DecisionModel::Schema(Box::new(
+                    StubDecisionRuntime {
+                        output: Some(output),
+                    },
+                ))))
             });
             assert_eq!(result.unwrap_err(), expected);
             assert!(!stdout.contains("selected"));

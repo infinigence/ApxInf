@@ -1,14 +1,15 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use apxinf_core::{Error, Result};
+use apxinf_core::Result;
 use apxinf_model::d3::{
     DecisionInput as D3Input, DecisionOutput as D3Output, DecisionRuntime as D3Runtime,
     DecisionScore as D3Score,
 };
 use apxinf_model::{
-    DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema, DecisionScore, LlmCapabilities,
-    LoadedModel, SchemaDecisionAnswer, SchemaDecisionOutput, SchemaDecisionScore,
+    DecisionInput, DecisionModel, DecisionOutput, DecisionSchema, DecisionScore, LlmCapabilities,
+    LoadedModel, SchemaDecisionAnswer, SchemaDecisionOutput, SchemaDecisionRuntime,
+    SchemaDecisionScore,
 };
 
 struct LegacyRuntime {
@@ -71,11 +72,11 @@ fn request() -> DecisionSchema {
 #[test]
 fn old_imports_literals_methods_and_custom_implementors_remain_compatible() {
     let calls = Rc::new(Cell::new(0));
-    let mut model = LoadedModel::Decision(Box::new(LegacyRuntime {
+    let mut model = LoadedModel::Decision(DecisionModel::Code(Box::new(LegacyRuntime {
         calls: calls.clone(),
         codes: vec!["A".into(), "B".into()],
         ids: [101, 102],
-    }));
+    })));
     assert_eq!(kind(&model), "decision");
     let input: D3Input<'_> = DecisionInput {
         token_ids: &[17, 42],
@@ -104,7 +105,7 @@ fn old_imports_literals_methods_and_custom_implementors_remain_compatible() {
     let error = model.decide_schema(&request()).unwrap_err();
     assert_eq!(
         error.to_string(),
-        "schema decisions are unsupported by this runtime"
+        "decision model takes encoded prompts, not schema requests"
     );
     assert_eq!(calls.get(), 2);
     let invalid = DecisionOutput {
@@ -119,21 +120,9 @@ fn old_imports_literals_methods_and_custom_implementors_remain_compatible() {
 
 struct SchemaRuntime;
 
-impl DecisionRuntime for SchemaRuntime {
+impl SchemaDecisionRuntime for SchemaRuntime {
     fn capabilities(&self) -> LlmCapabilities {
         LlmCapabilities::TEXT_ONLY
-    }
-
-    fn decide(&mut self, _input: DecisionInput<'_>) -> Result<DecisionOutput> {
-        Err(Error::Other("encoded requests are unsupported".into()))
-    }
-
-    fn code_names(&self) -> &[String] {
-        &[]
-    }
-
-    fn token_ids(&self) -> &[u32] {
-        &[]
     }
 
     fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
@@ -161,8 +150,8 @@ impl DecisionRuntime for SchemaRuntime {
 }
 
 #[test]
-fn schema_dispatch_is_additive_and_preserves_ordered_scores() {
-    let mut model = LoadedModel::Decision(Box::new(SchemaRuntime));
+fn schema_models_take_only_schema_requests_and_keep_ordered_scores() {
+    let mut model = LoadedModel::Decision(DecisionModel::Schema(Box::new(SchemaRuntime)));
     let output = model.decide_schema(&request()).unwrap();
     assert_eq!(
         output
@@ -189,6 +178,14 @@ fn schema_dispatch_is_additive_and_preserves_ordered_scores() {
             .decide(DecisionInput::text(&[17, 42], 2))
             .unwrap_err()
             .to_string(),
-        "encoded requests are unsupported"
+        "decision model takes schema requests, not encoded prompts"
+    );
+    assert_eq!(
+        model.decision_code_names().unwrap_err().to_string(),
+        "decision model takes schema requests and has no package code table"
+    );
+    assert_eq!(
+        model.decision_capabilities().unwrap(),
+        LlmCapabilities::TEXT_ONLY
     );
 }

@@ -15,7 +15,7 @@ use crate::d3::{
     D3DecisionConfig, D3PackageConfig, D3_DEFAULT_TEXT_PROFILE_LIMIT,
     D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
-use crate::decision::{DecisionInput, DecisionOutput, DecisionRuntime, DecisionScore};
+use crate::decision::{CodeDecisionRuntime, DecisionInput, DecisionOutput, DecisionScore};
 use crate::llm_trait::{ImageInput, LlmCapabilities};
 
 struct TextProfile {
@@ -302,7 +302,7 @@ impl D3Runner {
     }
 }
 
-impl DecisionRuntime for D3Runner {
+impl CodeDecisionRuntime for D3Runner {
     fn capabilities(&self) -> LlmCapabilities {
         LlmCapabilities::TEXT_ONLY
     }

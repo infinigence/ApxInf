@@ -143,7 +143,7 @@ This is local callable preparation, not a whole-backbone or schema-head
 compiled graph. Other admitted lengths remain valid; the three warm profiles
 do not certify native shader/JIT behavior for every length. Qualification must
 separately check changed operands, unseen lengths, Metal parity, retained
-outputs and warm resources. The non-generative `DecisionRuntime` does not
+outputs and warm resources. The non-generative `SchemaDecisionRuntime` does not
 borrow the text runtime's readiness status or advertise a fabricated `Ready`.
 
 ## Native dependency and ABI

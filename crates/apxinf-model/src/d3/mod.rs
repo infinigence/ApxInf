@@ -19,7 +19,9 @@ mod runner;
 #[cfg(feature = "cuda")]
 mod vision;
 
-pub use crate::decision::{DecisionInput, DecisionOutput, DecisionRuntime, DecisionScore};
+pub use crate::decision::{
+    CodeDecisionRuntime, DecisionInput, DecisionOutput, DecisionRuntime, DecisionScore,
+};
 pub use config::{D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig};
 pub use weights::{D3CheckpointWeights, D3ReadoutWeights};
 

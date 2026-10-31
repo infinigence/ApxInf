@@ -38,8 +38,9 @@ pub use d3::{
     D3_DEFAULT_TEXT_PROFILE_LIMIT, D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
 pub use decision::{
-    DecisionInput, DecisionOutput, DecisionQuestion, DecisionRuntime, DecisionSchema,
-    DecisionScore, SchemaDecisionAnswer, SchemaDecisionOutput, SchemaDecisionScore,
+    CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionQuestion,
+    DecisionRuntime, DecisionSchema, DecisionScore, SchemaDecisionAnswer, SchemaDecisionOutput,
+    SchemaDecisionRuntime, SchemaDecisionScore,
 };
 pub use debug::{DebugCapture, DebugConfig};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};

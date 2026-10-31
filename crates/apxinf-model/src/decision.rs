@@ -186,21 +186,67 @@ pub struct SchemaDecisionOutput {
     pub answers: Vec<SchemaDecisionAnswer>,
 }
 
-/// Non-generative decision runtime. Implementations own their preparation
-/// and return host-visible probabilities only at the end.
-pub trait DecisionRuntime {
+/// Encoded-prompt decisions: the caller tokenizes a complete prompt and the
+/// runtime scores the leading entries of its package code table (d3).
+pub trait CodeDecisionRuntime {
     fn capabilities(&self) -> LlmCapabilities;
     fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput>;
-    /// Package code names in index order; empty without a package code table.
+    /// Package code names in index order.
     fn code_names(&self) -> &[String];
-    /// Token IDs for each package code; empty without a package code table.
+    /// Token IDs for each package code.
     fn token_ids(&self) -> &[u32];
+}
 
-    /// Score a named schema when the runtime supports this request form.
-    fn decide_schema(&mut self, _request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
-        Err(Error::Other(
-            "schema decisions are unsupported by this runtime".into(),
-        ))
+/// Named-schema decisions: the runtime encodes the state and typed questions
+/// itself and scores each question's own options (Clef).
+pub trait SchemaDecisionRuntime {
+    fn capabilities(&self) -> LlmCapabilities;
+    fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput>;
+}
+
+/// The d3 name for [`CodeDecisionRuntime`], kept for existing callers.
+pub use self::CodeDecisionRuntime as DecisionRuntime;
+
+/// A loaded non-generative decision model. The variant is the request
+/// protocol the family supports, fixed at load time.
+pub enum DecisionModel {
+    Code(Box<dyn CodeDecisionRuntime>),
+    Schema(Box<dyn SchemaDecisionRuntime>),
+}
+
+impl DecisionModel {
+    pub fn capabilities(&self) -> LlmCapabilities {
+        match self {
+            Self::Code(model) => model.capabilities(),
+            Self::Schema(model) => model.capabilities(),
+        }
+    }
+
+    pub fn code_mut(&mut self) -> Result<&mut dyn CodeDecisionRuntime> {
+        match self {
+            Self::Code(model) => Ok(&mut **model),
+            Self::Schema(_) => Err(Error::Other(
+                "decision model takes schema requests, not encoded prompts".into(),
+            )),
+        }
+    }
+
+    pub fn code(&self) -> Result<&dyn CodeDecisionRuntime> {
+        match self {
+            Self::Code(model) => Ok(&**model),
+            Self::Schema(_) => Err(Error::Other(
+                "decision model takes schema requests and has no package code table".into(),
+            )),
+        }
+    }
+
+    pub fn schema_mut(&mut self) -> Result<&mut dyn SchemaDecisionRuntime> {
+        match self {
+            Self::Schema(model) => Ok(&mut **model),
+            Self::Code(_) => Err(Error::Other(
+                "decision model takes encoded prompts, not schema requests".into(),
+            )),
+        }
     }
 }
 

@@ -59,13 +59,23 @@ return its final `[1, vocab_size]` row. The common sampler selects the last row
 through `NextTokenLogits::last`; specialized schedules such as DSpark override
 the request-level generation hook without weakening `forward`.
 
-`DecisionRuntime` (`decision.rs`) is the shared non-generative decision
-contract. Its existing `decide(DecisionInput)` scores an encoded prompt over a
-package code table and returns `DecisionOutput`. The `d3` and root type exports,
-fields and required trait methods retain their existing shape.
-The additive `decide_schema` method accepts named questions for `metal_clef`
-and returns `SchemaDecisionOutput`; other runtimes default to unsupported.
-Schema answers have question IDs and option scores without package token IDs.
+`decision.rs` defines the non-generative Decision category and two request
+protocols. A family implements the one it supports, and loading wraps it in
+`DecisionModel`, so `LoadedModel::Decision` states the protocol at load time.
+
+- `CodeDecisionRuntime` (`d3`): `decide(DecisionInput)` scores a caller-encoded
+  prompt over the package code table and returns `DecisionOutput`;
+  `code_names()` and `token_ids()` describe that table. `DecisionRuntime`
+  remains its name in the `d3` and root exports, with the existing input and
+  output types.
+- `SchemaDecisionRuntime` (`metal_clef`): `decide_schema(DecisionSchema)`
+  encodes the state and typed questions inside the family and returns
+  `SchemaDecisionOutput`: question IDs and option scores, without package
+  token IDs.
+
+`LoadedModel::decide` and `decision_code_names` reject a schema model, and
+`decide_schema` rejects a code model, with an error naming the protocol the
+model does take.
 
 `LlmTrait::preparation_status` exposes `TextPreparationStatus` as data only:
 state, selected implementation/variant, prepared compilation scopes and shape
@@ -188,7 +198,7 @@ renamed as part of unrelated work.
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
 | Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
 | MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
-| Clef Flash / `DecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 4096 tokens; `reference` (the stock MLX-VLM composition, also `auto`). Its local shapeless decay/beta callable is prepared at load for lengths 1, 2 and 4096; this is not whole-backbone/head preparation. |
+| Clef Flash / `SchemaDecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 4096 tokens; `reference` (the stock MLX-VLM composition, also `auto`). Its local shapeless decay/beta callable is prepared at load for lengths 1, 2 and 4096; this is not whole-backbone/head preparation. |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until

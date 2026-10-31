@@ -9,8 +9,8 @@ mod weights;
 pub use config::{Config, MAX_INPUT_TOKENS};
 
 use crate::decision::{
-    DecisionInput, DecisionOutput, DecisionRuntime, DecisionSchema, SchemaDecisionAnswer,
-    SchemaDecisionOutput, SchemaDecisionScore,
+    DecisionModel, DecisionSchema, SchemaDecisionAnswer, SchemaDecisionOutput,
+    SchemaDecisionRuntime, SchemaDecisionScore,
 };
 use crate::llm_trait::LlmCapabilities;
 use crate::{LoadOptions, LoadedModel, ModelPrecision};
@@ -90,10 +90,12 @@ pub fn load(
     let stream = native.stream().clone();
     let backbone = weights::Backbone::load(&config, &stream, path)?;
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
-    Ok(LoadedModel::Decision(Box::new(ClefRunner {
-        tokenizer,
-        network: Network::new(config, stream, backbone, head)?,
-    })))
+    Ok(LoadedModel::Decision(DecisionModel::Schema(Box::new(
+        ClefRunner {
+            tokenizer,
+            network: Network::new(config, stream, backbone, head)?,
+        },
+    ))))
 }
 
 impl ClefRunner {
@@ -139,27 +141,13 @@ impl ClefRunner {
     }
 }
 
-impl DecisionRuntime for ClefRunner {
+impl SchemaDecisionRuntime for ClefRunner {
     fn capabilities(&self) -> LlmCapabilities {
         LlmCapabilities::TEXT_ONLY
     }
 
-    fn decide(&mut self, _input: DecisionInput<'_>) -> Result<DecisionOutput> {
-        Err(Error::Other(
-            "Clef encodes its own prompt; pass a schema request".into(),
-        ))
-    }
-
     fn decide_schema(&mut self, schema: &DecisionSchema) -> Result<SchemaDecisionOutput> {
         self.score_schema(schema)
-    }
-
-    fn code_names(&self) -> &[String] {
-        &[]
-    }
-
-    fn token_ids(&self) -> &[u32] {
-        &[]
     }
 }
 

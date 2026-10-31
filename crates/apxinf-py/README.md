@@ -109,8 +109,9 @@ options.
 
 ### CPU binding checks
 
-The Rust unit tests exercise both Python decision methods with a stub
-`DecisionRuntime`, without loading a model or using a GPU. They check schema
+The Rust unit tests exercise both Python decision methods with stub
+`CodeDecisionRuntime` and `SchemaDecisionRuntime` models, without loading a
+model or using a GPU. They check schema
 dispatch, question order, grouped probabilities, errors, and the D3 output shape.
 Use a Python interpreter supported by PyO3 0.22 with NumPy installed. Keep
 `extension-module` disabled so the test executable links libpython:
