@@ -21,3 +21,19 @@ and architecture dispatch belongs in an operator wrapper.
   vendor tree remains pristine.
 - Validation: Thor SM110 all-candidate precision tests, raw E4M3 byte checks,
   and the PI0.5 Attention shape profile.
+
+## `attention-indexed-sm110.patch`
+
+- Source: existing CUTLASS FMHA snapshot and Flash-Attention `v2.7.4.post1`.
+  Exact canonical revisions/hashes, licenses, and affected files are recorded in
+  `../kernels/attention/INDEXED_VENDOR.md`.
+- Purpose: isolate native midpoint row flags and indexed FA2 Q/O addressing
+  without changing canonical vendor files or the public Attention ABI.
+- Application: `build.rs` copies three headers to a private `OUT_DIR` directory
+  and applies the patch only for the dedicated indexed translation units.
+- Validation: staging byte identity, canonical-source preservation and repeated
+  staging passed. Thor compilation and 12 production-kernel closed-form
+  eager/Graph cases passed, including prepared-launch attribute instrumentation
+  with a negative control. Corrected backend regression tests, the original
+  56 complete-model action/video checks, and full public acceptance passed.
+  The frozen public ABBA result and its limits are recorded in `doc/dreamzero.md`.

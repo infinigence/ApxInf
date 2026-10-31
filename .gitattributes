@@ -5,3 +5,6 @@ crates/apxinf-cuda/kernels/cutlass/tools/** whitespace=-trailing-space,-space-be
 crates/apxinf-cuda-new/native/kernels/cutlass/fmha/** whitespace=-trailing-space,-space-before-tab
 crates/apxinf-cuda-new/native/kernels/cutlass/include/** whitespace=-trailing-space,-space-before-tab
 crates/apxinf-cuda-new/native/kernels/cutlass/tools/** whitespace=-trailing-space,-space-before-tab
+
+# Unified patches require single-space context markers for empty upstream lines.
+crates/apxinf-cuda-new/native/patches/attention-indexed-sm110.patch whitespace=-blank-at-eol

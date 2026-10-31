@@ -455,6 +455,51 @@ six independent 1/9/33-frame reference rows and full public rebind/RNG/robot-dec
 acceptance. All 12 paired public metric rows are zero. Native operators and the
 history/general VAE paths are unchanged.
 
+An eighth public A→B→B→A experiment adds the SM110 indexed Attention
+candidate to the published normalization-suffix build (`6136492`). Both paths
+use the unmodified public script, raw input and full joint noise. Each has two
+fresh processes and six warm samples, with online tuning disabled. All 72 GEMM
+recipes are byte-identical across paths. Attention recipes use separate build
+namespaces, and each path's complete qualifying recipe set remains frozen.
+
+| Path | First request | First cached | First two requests | Warm median | Warm p95 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Published normalization suffix | 28.641 | 20.867 | 49.507 | 19.685 | 19.774 |
+| Indexed SM110 Attention | 28.911 | 21.185 | 50.096 | 19.348 | 19.453 |
+
+Values are median seconds. Paired warm latency falls by 1.72% (1.0175×).
+Every candidate sample (19.285–19.466 s) is below every baseline sample
+(19.642–19.774 s). All 229 warm-window observations are 1,575 MHz GPU /
+4.266 GHz EMC, with no warm observer timeout, sampled foreign compute PID or
+sample trimming. Artifact backups and offloads finish before public timing;
+result transfers begin after the entire cohort. The first/cached figures are
+two default-DVFS observations per path and do not establish a cold-latency gain.
+This experiment does not establish streaming performance, an SLA, or a hardware
+minimum, and is separate from the preceding normalization comparison.
+
+The candidate implements ordinary Flexible dense BF16 Attention through the
+existing registry, with provider/implementation/version `3/3/1`, configuration
+0. It supports batch 1, Q=1785, Hq=Hkv=40, D=128, K in {2665,512,257}, no mask
+and default scale. A native pass flags rows within 16 FP32 ULP of a BF16 rounding
+midpoint; stable GPU compaction indexes FA2 recomputation of those rows. Its
+six buffers total 1,143,844 bytes under the existing 2 MiB model policy.
+Preparation owns allocation, TMA parameters and launch attributes; enqueue only
+submits asynchronous work. Ordinary tuning chooses this candidate for long K
+and retains FA2 for the shorter keys. There is no model-side provider branch,
+no new L3 semantic and no host readback for row selection. Vendor sources stay
+unchanged; private build-time patches and provenance are documented in
+`native/kernels/attention/INDEXED_VENDOR.md` under `apxinf-cuda-new`.
+
+The corrected backend passes 169 tests, with the unchanged exhaustive convolution
+check covered by the preceding 170-test suite. Prepared-launch instrumentation,
+12 closed-form eager/Graph capacity/reset cases, fresh model contracts, all five
+VAE bitwise checks and six independent VAE reference metrics pass. All original
+14 explicit and 14 implicit joint scenarios pass with all 56 action/video metric
+rows zero, retaining all latent frames and all 16 evaluations per CFG branch.
+Full public rebinding, RNG, joint-noise shape, cleanup and robot decoding pass;
+all 12 paired public metric rows are zero. The row predicate is an empirical
+numerical safeguard; this candidate remains Flexible and is not a fallback.
+
 A separate canonical-native streaming A→B→B→A comparison exercises the same six
 history scenarios in order, with one warmup sequence followed by two measured
 sequences per fresh process. Each variant has two processes and four measured

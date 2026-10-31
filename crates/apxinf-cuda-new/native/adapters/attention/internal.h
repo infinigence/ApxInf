@@ -76,6 +76,13 @@ struct Execution {
   ~Execution();
 };
 
+#if defined(APXINF_ATTENTION_INDEXED_SM110)
+size_t indexed_resource_requirements(const Spec&,int configuration);
+void prepare_indexed(Execution&);
+cudaError_t launch_indexed(Execution&);
+void destroy_indexed(Execution&) noexcept;
+#endif
+
 const ImplementationRegistry& registry(uint32_t semantic);
 bool supports_device(const Implementation& implementation, int device,
                      std::string* reason = nullptr);

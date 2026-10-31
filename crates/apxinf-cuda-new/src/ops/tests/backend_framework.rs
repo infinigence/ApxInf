@@ -2294,3 +2294,19 @@ fn cold_baseline_gemm_partitions_keys_and_rejects_alternate_recipes() {
 fn cold_baseline_skips_unsupported_but_propagates_operational_failure() {
     assert_eq!(unsafe { apxinf_gemm_test_baseline_failure_contract(0) }, 1);
 }
+
+unsafe extern "C" {
+    fn apxinf_attention_test_indexed_support_domain() -> std::ffi::c_int;
+}
+
+#[test]
+fn indexed_attention_capability_domain() {
+    let status = unsafe { apxinf_attention_test_indexed_support_domain() };
+    assert!(
+        status == 1 || status == 2,
+        "invalid indexed capability domain"
+    );
+    if std::env::var_os("APXINF_TEST_REQUIRE_INDEXED_ATTENTION").is_some() {
+        assert_eq!(status, 2, "indexed candidate must be compiled for this run");
+    }
+}

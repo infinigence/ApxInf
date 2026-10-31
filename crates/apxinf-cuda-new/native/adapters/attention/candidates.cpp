@@ -63,6 +63,19 @@ bool supports_cublas_f16(const Spec& spec) {
          spec.numerics == APXINF_ATTENTION_NUMERICS_STABLE;
 }
 
+#if defined(APXINF_ATTENTION_INDEXED_SM110)
+bool supports_indexed(const Spec& s){
+ return s.semantic==APXINF_ATTENTION_SEMANTIC_DENSE &&
+  s.qkv_layout==APXINF_ATTENTION_QKV_LAYOUT_SEPARATE &&
+  s.mask==APXINF_ATTENTION_MASK_NONE && s.dtype==APXINF_DTYPE_BF16 &&
+  s.output_dtype==s.dtype && s.numerics==APXINF_ATTENTION_NUMERICS_FLEXIBLE &&
+  s.batch==1 && s.head_dim==128 && s.query_heads==40 && s.kv_heads==40 &&
+  s.query_tokens==1785 && (s.key_tokens==2665 || s.key_tokens==512 || s.key_tokens==257) &&
+  s.scale_is_default!=0;
+}
+AlignmentRequirements indexed_alignment(const Spec&){return {16,16,16,16};}
+#endif
+
 AlignmentRequirements natural_alignment(const Spec&) { return {}; }
 
 void one_configuration(const Spec&, std::vector<int>& configurations) {
@@ -324,6 +337,62 @@ AlignmentRequirements specialized_sm110_alignment(const Spec&) {
 
 }  // namespace
 
+// Test-only metadata checks; no GPU allocation or provider forcing.
+extern "C" int apxinf_attention_test_indexed_support_domain() {
+#if defined(APXINF_ATTENTION_INDEXED_SM110)
+  Spec base{};
+  base.semantic=APXINF_ATTENTION_SEMANTIC_DENSE;
+  base.qkv_layout=APXINF_ATTENTION_QKV_LAYOUT_SEPARATE;
+  base.mask=APXINF_ATTENTION_MASK_NONE;
+  base.dtype=base.output_dtype=APXINF_DTYPE_BF16;
+  base.numerics=APXINF_ATTENTION_NUMERICS_FLEXIBLE;
+  base.batch=1; base.head_dim=128; base.query_heads=base.kv_heads=40;
+  base.query_tokens=1785; base.scale_is_default=1;
+  for (int keys : {257,512,2665}) {
+    base.key_tokens=keys;
+    if (!supports_indexed(base) || indexed_resource_requirements(base,0)!=1143844)
+      return 0;
+    const auto alignment=indexed_alignment(base);
+    if (alignment.query!=16 || alignment.key!=16 || alignment.value!=16 || alignment.output!=16)
+      return 0;
+  }
+  auto rejected=[&](auto mutate){auto s=base;mutate(s);return !supports_indexed(s);};
+  if (!rejected([](Spec& s){s.semantic=APXINF_ATTENTION_SEMANTIC_KV_CACHE;}) ||
+      !rejected([](Spec& s){s.qkv_layout=APXINF_ATTENTION_QKV_LAYOUT_PACKED_TOKEN;}) ||
+      !rejected([](Spec& s){s.mask=APXINF_ATTENTION_MASK_CAUSAL;}) ||
+      !rejected([](Spec& s){s.dtype=APXINF_DTYPE_F16;}) ||
+      !rejected([](Spec& s){s.output_dtype=APXINF_DTYPE_F16;}) ||
+      !rejected([](Spec& s){s.numerics=APXINF_ATTENTION_NUMERICS_STABLE;}) ||
+      !rejected([](Spec& s){s.batch=2;}) ||
+      !rejected([](Spec& s){s.head_dim=64;}) ||
+      !rejected([](Spec& s){s.query_heads=39;}) ||
+      !rejected([](Spec& s){s.kv_heads=39;}) ||
+      !rejected([](Spec& s){s.query_tokens=1784;}) ||
+      !rejected([](Spec& s){s.key_tokens=2664;}) ||
+      !rejected([](Spec& s){s.scale_is_default=0;})) return 0;
+  std::vector<int> configs;one_configuration(base,configs);
+  if (configs!=std::vector<int>{0}) return 0;
+  try {
+    indexed_resource_requirements(base,1);
+    return 0;
+  } catch (const Failure& failure) {
+    if (failure.status!=APXINF_STATUS_INVALID_ARGUMENT) return 0;
+  }
+  // A one-byte-short policy must reject before allocating any device state.
+  Execution execution{};execution.spec=base;execution.resource_limit=1143843;
+  try {
+    prepare_indexed(execution);
+    return 0;
+  } catch (const Failure& failure) {
+    if (failure.status!=APXINF_STATUS_UNSUPPORTED || execution.provider_state!=nullptr)
+      return 0;
+  }
+  return 2; // Compiled and checked; 1 means absent on this build target.
+#else
+  return 1;
+#endif
+}
+
 extern "C" int apxinf_attention_test_efficient_support_domain() {
 #if defined(APXINF_ATTENTION_FA2)
   Spec s{};
@@ -350,6 +419,11 @@ extern "C" int apxinf_attention_test_efficient_support_domain() {
 
 const ImplementationRegistry& registry(uint32_t semantic) {
   static const ImplementationRegistry dense_entries = {
+#if defined(APXINF_ATTENTION_INDEXED_SM110)
+      {3,3,1,"cutlass-indexed-fa2-sm110",apxinf::gemm::kDeviceFeatureFixedSm110,
+       true,true,false,supports_indexed,indexed_alignment,indexed_resource_requirements,
+       one_configuration,prepare_indexed,launch_indexed,destroy_indexed},
+#endif
 #if defined(APXINF_SEGMENTED_ATTENTION_SM110)
       {kProviderSpecializedSm110, 1, 1, "specialized-d256-causal-sm110",
        apxinf::gemm::kDeviceFeatureFixedSm110, true, true, false,

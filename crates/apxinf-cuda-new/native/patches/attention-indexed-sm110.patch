@@ -1,0 +1,337 @@
+--- apxinf_indexed_mainloop.hpp
++++ apxinf_indexed_mainloop.hpp
+@@ -40,7 +40,7 @@
+ 
+ #include "collective/fmha_common.hpp"
+ #include "collective/fmha_fusion.hpp"
+-#include "collective/sm100_fmha_load_tma_warpspecialized.hpp"
++#include "apxinf_indexed_load.hpp"
+ 
+ // ===========================================================================
+ // apxinf: macro vocabulary for the SM100 FMHA forward mainloop.
+@@ -639,7 +639,8 @@
+ #endif
+ 
+ 
+-namespace cutlass::fmha::collective {
++namespace cutlass::fmha::indexed_collective {
++using namespace cutlass::fmha::collective;
+ 
+ using namespace cute;
+ 
+@@ -921,6 +922,10 @@
+ 
+     // scaling factor to quantize O
+     float inv_scale_o = 1.0f;
++    uint32_t* row_flags = nullptr;
++    int flag_queries = 0;
++    int flag_heads = 0;
++    unsigned flag_margin = 0;
+   };
+ 
+   struct Params {
+@@ -930,6 +935,10 @@
+     float scale_softmax_log2;
+ 
+     float scale_output;
++    uint32_t* row_flags;
++    int flag_queries;
++    int flag_heads;
++    unsigned flag_margin;
+   };
+ 
+   template<class ProblemShape>
+@@ -953,7 +962,8 @@
+         Load::to_underlying_arguments(problem_shape, args.load, workspace),
+         args.scale_q * args.scale_k * scale_softmax,
+         args.scale_q * args.scale_k * log2_e * scale_softmax,
+-        args.scale_v * args.inv_scale_o
++        args.scale_v * args.inv_scale_o,
++        args.row_flags, args.flag_queries, args.flag_heads, args.flag_margin
+     };
+   }
+ 
+@@ -1823,6 +1833,9 @@
+   CUTLASS_DEVICE auto
+   softmax_step(
+       float& row_max, float& row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++      float4& row_sum_parts,
++#endif
+       Stage stage, bool final_call,
+       BlkCoord const& blk_coord, CoordTensor const& cS,
+       Params const& params, ProblemShape const& problem_shape,
+@@ -2037,7 +2050,12 @@
+         tTMEM_LOADrS(i + 1)
+       );
+       float2 out;
++#if defined(APXINF_INDEXED_UNFUSED_SCALE) && APXINF_INDEXED_UNFUSED_SCALE
++      out.x = __fadd_rn(__fmul_rn(in.x, scale_fp32x2.x), minus_row_max_scale_fp32x2.x);
++      out.y = __fadd_rn(__fmul_rn(in.y, scale_fp32x2.y), minus_row_max_scale_fp32x2.y);
++#else
+       cute::fma(out, scale_fp32x2, in, minus_row_max_scale_fp32x2);
++#endif
+       tTMEM_LOADrS(i + 0) = out.x;
+       tTMEM_LOADrS(i + 1) = out.y;
+ 
+@@ -2143,6 +2161,37 @@
+     pipeline_c.producer_acquire(pipeline_c_producer_state);
+ #endif
+ 
++#if APXINF_INDEXED_FA2_ROWSUM
++    static_assert(!APXINF_FUSE_ROWSUM, "FA2 partial sum probe uses original exponent buffer");
++    // FA2 carries one sequential sum per MMA quad lane across KV tiles.
++    // Match lane column visitation: [2*l,2*l+1,8+2*l,9+2*l,...].
++    float factor = apxinf_ex2_approx((old_row_max - row_max_safe) * scale);
++    row_sum_parts.x = __fmul_rn(row_sum_parts.x, factor);
++    row_sum_parts.y = __fmul_rn(row_sum_parts.y, factor);
++    row_sum_parts.z = __fmul_rn(row_sum_parts.z, factor);
++    row_sum_parts.w = __fmul_rn(row_sum_parts.w, factor);
++    CUTLASS_PRAGMA_UNROLL
++    for (int i = 0; i < size(tTMEM_LOADrS); i += 8) {
++      // Refuse a different TMEM column layout instead of silently summing a
++      // different sequence. The identity-coordinate offsets cancel at compile time.
++      CUTLASS_PRAGMA_UNROLL
++      for (int j = 0; j < 8; ++j) {
++        if (get<1>(tTMEM_LOADcS(i+j)) - get<1>(tTMEM_LOADcS(0)) != i+j)
++          asm volatile("trap;");
++      }
++      row_sum_parts.x = __fadd_rn(row_sum_parts.x, tTMEM_LOADrS(i));
++      row_sum_parts.x = __fadd_rn(row_sum_parts.x, tTMEM_LOADrS(i+1));
++      row_sum_parts.y = __fadd_rn(row_sum_parts.y, tTMEM_LOADrS(i+2));
++      row_sum_parts.y = __fadd_rn(row_sum_parts.y, tTMEM_LOADrS(i+3));
++      row_sum_parts.z = __fadd_rn(row_sum_parts.z, tTMEM_LOADrS(i+4));
++      row_sum_parts.z = __fadd_rn(row_sum_parts.z, tTMEM_LOADrS(i+5));
++      row_sum_parts.w = __fadd_rn(row_sum_parts.w, tTMEM_LOADrS(i+6));
++      row_sum_parts.w = __fadd_rn(row_sum_parts.w, tTMEM_LOADrS(i+7));
++    }
++    // FA2 Allreduce<4> visits XOR2 then XOR1, only at final normalization.
++    row_sum = __fadd_rn(__fadd_rn(row_sum_parts.x, row_sum_parts.z),
++                        __fadd_rn(row_sum_parts.y, row_sum_parts.w));
++#else
+ #if !APXINF_FUSE_ROWSUM
+     // UPSTREAM: a second pass over tTMEM_LOADrS after the P store.
+     APXINF_ACC_SCALE_SEED();
+@@ -2170,6 +2219,8 @@
+     float local_row_sum = local_row_sum_f32x2.x + local_row_sum_f32x2.y;
+ 
+     row_sum = local_row_sum;
++
++#endif
+ 
+     if (final_call) {
+       // re-acquire the S part in the final step
+@@ -2212,6 +2263,9 @@
+ 
+     ElementQK row_max = -INFINITY;
+     ElementQK row_sum = 0;
++#if APXINF_INDEXED_FA2_ROWSUM
++    float4 row_sum_parts = make_float4(0, 0, 0, 0);
++#endif
+ 
+     Tensor cS_base = make_identity_tensor(select<0,1>(TileShapeQK{}));
+     auto logical_offset = make_coord(
+@@ -2262,7 +2316,11 @@
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; masked_tile_count > 0; masked_tile_count -= 1) {
+       softmax_step<true /* need_apply_mask */>(
+-          row_max, row_sum, stage,
++          row_max, row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++          row_sum_parts,
++#endif
++          stage,
+           (masked_tile_count == 1) && (mask_tile_count == 0),
+           blk_coord, cS, params, problem_shape,
+           pipeline_s, pipeline_s_consumer_state,
+@@ -2276,7 +2334,11 @@
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; mask_tile_count > 0; mask_tile_count -= 1) {
+       softmax_step<false /* need_apply_mask */>(
+-          row_max, row_sum, stage, mask_tile_count == 1,
++          row_max, row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++          row_sum_parts,
++#endif
++          stage, mask_tile_count == 1,
+           blk_coord, cS, params, problem_shape,
+           pipeline_s, pipeline_s_consumer_state,
+           pipeline_c, pipeline_c_producer_state,
+@@ -2295,7 +2357,11 @@
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; mask_tile_count > 0; mask_tile_count -= 1) {
+       softmax_step<false /* need_apply_mask */>(
+-          row_max, row_sum, stage,
++          row_max, row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++          row_sum_parts,
++#endif
++          stage,
+           (mask_tile_count == 1) &&
+               (Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape) == 0),
+           blk_coord, cS, params, problem_shape,
+@@ -2313,7 +2379,11 @@
+     CUTLASS_PRAGMA_NO_UNROLL
+     for (; mask_tile_count > 0; mask_tile_count -= 1) {
+       softmax_step<true /* need_apply_mask */>(
+-          row_max, row_sum, stage, mask_tile_count == 1,
++          row_max, row_sum,
++#if APXINF_INDEXED_FA2_ROWSUM
++          row_sum_parts,
++#endif
++          stage, mask_tile_count == 1,
+           blk_coord, cS, params, problem_shape,
+           pipeline_s, pipeline_s_consumer_state,
+           pipeline_c, pipeline_c_producer_state,
+@@ -2351,12 +2421,12 @@
+     // SHARED-FINDINGS 21.2.
+   }
+ 
+-  template<class Stage, class TensorO>
++  template<class Stage, class TensorO, class BlkCoord>
+   CUTLASS_DEVICE auto
+   correction_epilogue(
+       float scale,
+       Stage stage,
+-      TensorO const& sO_01) {
++      TensorO const& sO_01, Params const& params, BlkCoord const& blk_coord) {
+ 
+     using ElementOut = typename TensorO::value_type;
+ 
+@@ -2367,7 +2437,9 @@
+     // As opposed to the softmax, we do not have enough registers here
+     // to load all of the values (for tile kv = 128), so we loop
+     // good values would be either 32 or 64
+-    const int kCorrectionTileSize = 32 / sizeof(ElementOut);
++    // Diagnostic F32 output retains the BF16 control's 16-column FP32 load/scaling partition.
++    // The stock selector cannot express its 8-column float-output slice with a16x load.
++    const int kCorrectionTileSize = 16;
+ 
+     using TMEM_LOAD = std::conditional_t<kCorrectionTileSize == 32, SM100_TMEM_LOAD_32dp32b32x, SM100_TMEM_LOAD_32dp32b16x>;  // 4x32 threads with 64 cols of 32b elem
+ 
+@@ -2419,6 +2491,26 @@
+         tTMrO(j+1) = out.y;
+       }
+ #endif
++
++      // Private diagnostic: preserve original float multiply and BF16 conversion.
++      // IndividualTileScheduler gives ((flat head), batch); this path requires
++      // batch=1 and q_heads=kv_heads, so flat head is the original head index.
++      if (params.row_flags != nullptr) {
++        int head = int(get<2,0>(blk_coord));
++        int first_query = int(get<0>(blk_coord)) * int(get<0>(TileShape{}))
++                        + int(stage) * int(get<0>(TileShapePV{}));
++        auto coordinates = tTMEM_LOADcO(_, _0{}, _0{}, i);
++        CUTLASS_PRAGMA_UNROLL
++        for (int j = 0; j < size(tTMrO); ++j) {
++          int query = first_query + int(get<0>(coordinates(j)));
++          unsigned low = __float_as_uint(tTMrO(j)) & 65535u;
++          unsigned distance = low > 32768u ? low - 32768u : 32768u - low;
++          if (head < params.flag_heads && query < params.flag_queries &&
++              distance <= params.flag_margin) {
++            atomicOr(params.row_flags + head * params.flag_queries + query, 1u);
++          }
++        }
++      }
+ 
+       constexpr int N = 4 / sizeof(ElementOut);
+       NumericArrayConverter<ElementOut, ElementPV, N> convert;
+@@ -2826,7 +2918,7 @@
+       correction_epilogue(
+           apxinf_normalize_scale(params.scale_output,
+                                  tTMEM_LOADVrS(kIdxFinalRowSum)),
+-          _0{}, sO);
++          _0{}, sO, params, blk_coord);
+     }
+ 
+     if (epilogue.params.ptr_LSE != nullptr) {
+@@ -2997,7 +3089,7 @@
+     Tensor sO = make_epilogue_smem_tensor(shared_storage_epi);
+     Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), cute::make_shape(cute::size<0>(problem_shape), cute::get<3>(problem_shape)), epilogue.params.dLSE);
+ 
+-    correction_epilogue(apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _0{}, sO);
++    correction_epilogue(apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _0{}, sO, params, blk_coord);
+ 
+     if (epilogue.params.ptr_LSE != nullptr) {
+       int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord);
+@@ -3036,7 +3128,7 @@
+     pipeline_o.consumer_wait(pipeline_o_consumer_state);
+     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
+ 
+-    correction_epilogue(apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _1{}, sO);
++    correction_epilogue(apxinf_normalize_scale(params.scale_output, tTMEM_LOADVrS(kIdxFinalRowSum)), _1{}, sO, params, blk_coord);
+ 
+     if (epilogue.params.ptr_LSE != nullptr) {
+       int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * get<0>(blk_coord) + get<0>(TileShapeQK{});
+@@ -3158,4 +3250,4 @@
+ 
+ };
+ 
+-}  // namespace cutlass::fmha::collective
++}  // namespace cutlass::fmha::indexed_collective
+--- apxinf_indexed_load.hpp
++++ apxinf_indexed_load.hpp
+@@ -39,7 +39,8 @@
+ #include "collective/fmha_common.hpp"
+ #include "collective/fmha_fusion.hpp"
+ 
+-namespace cutlass::fmha::collective {
++namespace cutlass::fmha::indexed_collective {
++using namespace cutlass::fmha::collective;
+ 
+ using namespace cute;
+ 
+@@ -429,4 +430,4 @@
+   }
+ };
+ 
+-}  // namespace cutlass::fmha::collective
++}  // namespace cutlass::fmha::indexed_collective
+--- apxinf_indexed_fa2.hpp
++++ apxinf_indexed_fa2.hpp
+@@ -247,8 +247,21 @@
+     // Prologue
+ 
+     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
+-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+-                                       binfo.actual_seqlen_q - m_block * kBlockM);
++    // Private indexed-query load. Math below is unchanged. Fixed traits keep
++    // Q in its own shared tile; every selected row supports the original index.
++    static_assert(!Kernel_traits::Share_Q_K_smem && !Kernel_traits::Is_Q_in_regs);
++    for (int index = tidx; index < kBlockM * kHeadDim; index += Kernel_traits::kNThreads) {
++        int row = index / kHeadDim, column = index % kHeadDim;
++        int ordinal = m_block * kBlockM + row;
++        Element value = Element(0.0f);
++        if (ordinal < binfo.actual_seqlen_q && column < params.d) {
++            int query = params.row_map[bidb * params.original_queries + ordinal];
++            value = reinterpret_cast<Element const*>(params.q_ptr)[
++                (int64_t(query) * params.original_heads + bidb) * params.d + column];
++        }
++        sQ(row, column) = value;
++    }
++    __syncthreads();
+     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
+ 
+     // // if (cute::thread(1, 0)) { print(tQsQ); }
+@@ -488,9 +501,18 @@
+         for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+     }
+     // Clear_OOB_K must be false since we don't want to write zeros to gmem
+-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+-        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+-    );
++    // tOrO already contains the original final BF16 conversion. Only the
++    // destination row changes; selected outputs overwrite native BF16 in place.
++    CUTLASS_PRAGMA_UNROLL
++    for (int index = 0; index < size(tOrO); ++index) {
++        int row = int(get<0>(tOcO(index))), column = int(get<1>(tOcO(index)));
++        int ordinal = m_block * kBlockM + row;
++        if (ordinal < binfo.actual_seqlen_q && column < params.d) {
++            int query = params.row_map[bidb * params.original_queries + ordinal];
++            reinterpret_cast<Element*>(params.o_ptr)[
++                (int64_t(query) * params.original_heads + bidb) * params.d + column] = tOrO(index);
++        }
++    }
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////

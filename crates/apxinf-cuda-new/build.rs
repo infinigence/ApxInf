@@ -156,6 +156,67 @@ fn stage_patched_fa2(native: &Path, fa2_root: &Path, out: &Path) -> PathBuf {
     staged
 }
 
+// Only three existing headers are staged. The reviewed patch gives the native
+// collectives and FA2 entry a private namespace; canonical vendors stay intact.
+fn stage_indexed_attention(native: &Path, out: &Path) -> PathBuf {
+    let staged = out.join("attention-indexed-sm110");
+    let patch = native.join("patches/attention-indexed-sm110.patch");
+    let inputs = [
+        (
+            "kernels/cutlass/fmha/collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp",
+            "apxinf_indexed_mainloop.hpp",
+        ),
+        (
+            "kernels/cutlass/fmha/collective/sm100_fmha_load_tma_warpspecialized.hpp",
+            "apxinf_indexed_load.hpp",
+        ),
+        (
+            "kernels/fa2/flash_attn/flash_fwd_kernel.h",
+            "apxinf_indexed_fa2.hpp",
+        ),
+    ];
+    let mut fingerprint = 0x6c62272e07bb014262b821756295c58du128;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            fingerprint ^= u128::from(*byte);
+            fingerprint = fingerprint.wrapping_mul(0x0000000001000000000000000000013b);
+        }
+    };
+    for (source, name) in inputs {
+        let source = native.join(source);
+        println!("cargo:rerun-if-changed={}", source.display());
+        feed(name.as_bytes());
+        feed(&std::fs::read(&source).unwrap_or_else(|e| panic!("read {}: {e}", source.display())));
+    }
+    println!("cargo:rerun-if-changed={}", patch.display());
+    feed(&std::fs::read(&patch).unwrap_or_else(|e| panic!("read {}: {e}", patch.display())));
+    let key = format!("{fingerprint:032x}");
+    let stamp = out.join("attention-indexed-sm110.stamp");
+    if inputs.iter().all(|(_, name)| staged.join(name).is_file())
+        && std::fs::read_to_string(&stamp).ok().as_deref() == Some(key.as_str())
+    {
+        return staged;
+    }
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged)
+            .unwrap_or_else(|e| panic!("remove {}: {e}", staged.display()));
+    }
+    std::fs::create_dir_all(&staged).unwrap_or_else(|e| panic!("create {}: {e}", staged.display()));
+    for (source, name) in inputs {
+        std::fs::copy(native.join(source), staged.join(name))
+            .unwrap_or_else(|e| panic!("stage indexed {name}: {e}"));
+    }
+    run(
+        Command::new("patch")
+            .current_dir(&staged)
+            .args(["--batch", "--forward", "-p0", "-i"])
+            .arg(&patch),
+        "apply indexed Attention compatibility patch",
+    );
+    std::fs::write(&stamp, key).unwrap_or_else(|e| panic!("write {}: {e}", stamp.display()));
+    staged
+}
+
 fn cuda_library_directories(cuda: &str, cpu_arch: &str) -> Vec<PathBuf> {
     [
         format!("{cuda}/lib64"),
@@ -528,6 +589,17 @@ fn main() {
     }
     let patched_fa2_root =
         (!fa2_e4m3_sources.is_empty()).then(|| stage_patched_fa2(&native, &fa2_root, &out));
+    let has_indexed_attention = native_sm110 && has_fa2 && !cutlass_sources.is_empty();
+    let indexed_headers = has_indexed_attention.then(|| stage_indexed_attention(&native, &out));
+    let indexed_sources: Vec<PathBuf> = if has_indexed_attention {
+        vec![
+            adapters.join("attention/providers/indexed.cpp"),
+            attention_kernel_root.join("indexed_native_sm110.cu"),
+            attention_kernel_root.join("indexed_fa2_sm110.cu"),
+        ]
+    } else {
+        Vec::new()
+    };
     let missing_sources = generic_sources
         .iter()
         .chain(&cutlass_sources)
@@ -536,6 +608,7 @@ fn main() {
         .chain(&cutlass_sm89_sources)
         .chain(&fa2_sources)
         .chain(&fa2_e4m3_sources)
+        .chain(&indexed_sources)
         .filter(|path| !path.is_file())
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
@@ -657,6 +730,13 @@ fn main() {
                 false,
             )
         }))
+        // Append new jobs so old object indices/cache paths remain stable.
+        .chain(indexed_sources.into_iter().map(|source| {
+            let name = source.file_name().and_then(|v| v.to_str());
+            let native = name == Some("indexed_native_sm110.cu");
+            let fa2 = name == Some("indexed_fa2_sm110.cu");
+            (source, native, false, false, false, fa2, false)
+        }))
         .enumerate()
     {
         let (source, is_cutlass, is_sm110, is_cutlass_sm87, is_cutlass_sm89, is_fa2, is_fa2_e4m3) =
@@ -674,6 +754,27 @@ fn main() {
             .args(["--compiler-options", "-fPIC", "-O3", "-std=c++17"])
             .arg(format!("-I{}", native.join("include").display()))
             .arg(format!("-I{}", out.display()));
+        let is_indexed_native = source
+            .file_name()
+            .is_some_and(|v| v == "indexed_native_sm110.cu");
+        let is_indexed_fa2 = source
+            .file_name()
+            .is_some_and(|v| v == "indexed_fa2_sm110.cu");
+        if has_indexed_attention
+            && (source == adapters.join("attention/candidates.cpp")
+                || source == adapters.join("attention/providers/indexed.cpp"))
+        {
+            command.arg("-DAPXINF_ATTENTION_INDEXED_SM110=1");
+        }
+        if is_indexed_native || is_indexed_fa2 {
+            command.arg(format!(
+                "-I{}",
+                indexed_headers
+                    .as_ref()
+                    .expect("indexed headers staged")
+                    .display()
+            ));
+        }
         if source == adapters.join("gather/launch.cu")
             || source == adapters.join("pointwise/launch.cu")
         {
@@ -860,11 +961,13 @@ fn main() {
             // unused combinatorial kernel set. The shared constant makes the
             // exact compile policy part of the Attention build fingerprint.
             command.args(attention_fingerprint::FA2_FIXED_FEATURE_DEFINES);
-            command.arg(if is_fa2_e4m3 {
-                "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2_direct_e4m3"
-            } else {
-                "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2"
-            });
+            if !is_indexed_fa2 {
+                command.arg(if is_fa2_e4m3 {
+                    "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2_direct_e4m3"
+                } else {
+                    "-DFLASH_NAMESPACE=apxinf_cuda_new_fa2"
+                });
+            }
             if is_fa2_e4m3 {
                 command.arg("-DAPXINF_FA2_DIRECT_E4M3=1");
             }
@@ -879,6 +982,11 @@ fn main() {
                 ));
             }
             command.arg(format!("-I{}", fa2_root.display()));
+            if is_indexed_fa2 {
+                // This ApxInf-owned CU lives outside the vendor directory;
+                // its direct flash.h include needs the vendor header root.
+                command.arg(format!("-I{}", fa2_root.join("flash_attn").display()));
+            }
             command.arg(format!("-I{}", cutlass_root.join("include").display()));
         }
         // Skip the compile when a previous run produced a current object: the

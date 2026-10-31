@@ -195,6 +195,22 @@ forward source and inference-only compatibility surface are documented in
 covers both dtypes, multiple batches/heads, tile tails, nondefault scale,
 all admitted candidates and changed-input graph replay after owner release.
 
+The optional SM110 `cutlass-indexed-fa2-sm110` candidate implements the same
+Flexible dense BF16 contract for batch 1, Q=1785, Hq=Hkv=40, D=128,
+K in {2665,512,257}, separate Q/K/V, no mask and default scale. It owns
+1,143,844 bytes of scratch and requires 16-byte binding alignment. A native
+pass flags near-midpoint rows; a stable GPU index list drives FA2 recomputation.
+The candidate is graph safe and deterministic, and is not a fallback or a
+Stable numerical implementation. Ordinary tuning may select other candidates,
+including FA2 for shorter sequences. Implementation/provenance are recorded in
+[`INDEXED_VENDOR.md`](native/kernels/attention/INDEXED_VENDOR.md).
+`indexed_attention_all_candidates_two_class_oracle` covers the domain against
+an independent softmax oracle. Thor qualification also covers prepared-launch
+attribute checks, eager/Graph capacity and reset, the original 56 complete-model
+action/video checks, and full public rebinding/RNG/robot decoding. Measured
+public performance and its limits are recorded in
+[`doc/dreamzero.md`](../../doc/dreamzero.md).
+
 <!-- l3-operator:kv_cache_attention -->
 ### `kv_cache_attention`
 

@@ -61,3 +61,6 @@ fn gemm_bias_single_round(
     args.gemm.policy.numerics = GemmNumerics::StagedBias;
     gemm_bias(ctx, args)
 }
+
+#[path = "precision/indexed_attention_precision.rs"]
+mod indexed_attention_precision;
