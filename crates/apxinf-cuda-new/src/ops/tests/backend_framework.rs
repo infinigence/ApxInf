@@ -245,6 +245,16 @@ fn prepare_test_gemm(
     )
 }
 
+fn prepare_test_geglu(
+    ctx: &CudaContext,
+    args: GemmGegluArgs<'_>,
+) -> apxinf_core::Result<std::rc::Rc<super::execution::Execution>> {
+    super::execution::prepare(
+        ctx,
+        super::contracts::normalize(ctx, args.gemm, super::contracts::Semantic::GemmGeglu, None)?,
+    )
+}
+
 #[test]
 fn gemm_rejects_partially_overlapping_output_storage() {
     let ctx = CudaContext::new(0).unwrap();
@@ -1562,7 +1572,6 @@ fn gpu_e2e_three_view_split_geglu_recipe_resources_and_replay() {
 }
 
 #[test]
-#[test]
 fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
     let ctx = CudaContext::new(0).unwrap();
     if ctx.caps().sm != 110 {
@@ -1884,7 +1893,7 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
                     continue;
                 }
                 let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
-                let mut args = GemmArgs::w8a8(&a, &rows, &b, &channels, &mut out)
+                let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut out)
                     .with_repacked_weight(&layout);
                 args.policy.online_tune = false;
                 args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
@@ -1897,7 +1906,9 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
                 }
                 let execution = super::execution::prepare(&ctx, normalized).unwrap();
                 if native {
-                    assert!(execution.summary().starts_with("cutlass-w8a8-sm87 config=0 "));
+                    assert!(execution
+                        .summary()
+                        .starts_with("cutlass-w8a8-sm87 config=0 "));
                 }
                 execution.enqueue().unwrap();
                 ctx.synchronize().unwrap();
@@ -1945,8 +1956,8 @@ fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
         let a = bytes_tensor(0, vec![m, k], DType::I8, &input);
         let rows = scales(0, &vec![1.0; m]);
         let mut output = zeros_tensor(0, vec![m, n], DType::BF16);
-        let mut args =
-            GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut output).with_repacked_weight(&layout);
+        let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut output)
+            .with_repacked_weight(&layout);
         args.policy.online_tune = false;
         args.policy.allow_fallback = false;
         args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
@@ -1989,7 +2000,8 @@ fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
                 }
             }
             let mut canonical_output = zeros_tensor(0, vec![m, n], DType::BF16);
-            let args = GemmArgs::w8a8(&a, &rows, &b, &channels, &mut canonical_output);
+            let args =
+                GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut canonical_output);
             let normalized =
                 super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
                     .unwrap();
@@ -2014,8 +2026,8 @@ fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
     let a = bytes_tensor(0, vec![1, k], DType::I8, &vec![1; k]);
     let rows = scales(0, &[1.0]);
     let mut output = zeros_tensor(0, vec![1, n], DType::BF16);
-    let mut args =
-        GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut output).with_repacked_weight(&layout);
+    let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut output)
+        .with_repacked_weight(&layout);
     args.policy.online_tune = false;
     args.policy.cache_dir = Some(String::new());
     crate::ops::gemm(&ctx, args).unwrap();
@@ -2216,12 +2228,17 @@ fn gpu_shared_weight_layouts_are_deduplicated_and_graph_safe() {
             } else {
                 super::contracts::Semantic::Gemm
             };
+            let (id, version) = if fused { (2, 2) } else { (1, 1) };
             let mut expected = zeros_tensor(0, shape.clone(), dtype);
             let mut args = GemmArgs::new(&a, &canonical, &mut expected)
                 .with_immutable_weight(WeightVersion::new(0));
             args.quantization = GemmQuantization::Fp8UnitScale;
             args.policy.online_tune = false;
+            args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
             let normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
+            // Byte-compare against the same provider so the assertion measures
+            // layout conversion, not cross-provider numerics.
+            super::execution::seed_recipe(&ctx, &normalized, 3, id, version, 0).unwrap();
             super::execution::prepare(&ctx, normalized)
                 .unwrap()
                 .enqueue()
@@ -2234,7 +2251,6 @@ fn gpu_shared_weight_layouts_are_deduplicated_and_graph_safe() {
             args.policy.allow_fallback = false;
             args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
             let normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
-            let (id, version) = if fused { (2, 2) } else { (1, 1) };
             super::execution::seed_recipe(&ctx, &normalized, 3, id, version, 0).unwrap();
             let execution = super::execution::prepare(&ctx, normalized).unwrap();
             execution.enqueue().unwrap();

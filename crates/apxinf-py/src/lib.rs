@@ -67,7 +67,11 @@ impl HfTokenizer {
     }
 
     #[pyo3(name = "encode_with_special_tokens", signature = (text, add_special_tokens))]
-    fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> PyResult<Vec<u32>> {
+    fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> PyResult<Vec<u32>> {
         self.inner
             .encode_with_special_tokens(text, add_special_tokens)
             .map_err(runtime_err)
@@ -966,8 +970,7 @@ impl ModelRunner {
         rng: RngKey,
         grids: Option<&[[u32; 3]]>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let request =
-            VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
+        let request = VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
     }
@@ -996,8 +999,7 @@ impl ModelRunner {
         rng: RngKey,
         grids: Option<&[[u32; 3]]>,
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
-        let request =
-            VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
+        let request = VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
         let (flat, profile) = self
             .model
             .infer_host_f32_profiled(&request)

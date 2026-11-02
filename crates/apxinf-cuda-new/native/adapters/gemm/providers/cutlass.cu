@@ -55,6 +55,19 @@ CutlassNvfp4State& provider(Execution& state) {
   return *static_cast<CutlassNvfp4State*>(state.provider_state);
 }
 
+void pack_geglu_weight(Execution& state,
+                       const apxinf_gemm_bindings_t& bindings) {
+  auto& resources = provider(state);
+  const auto stream = static_cast<cudaStream_t>(bindings.stream);
+  const auto& spec = state.spec;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>((spec.k * spec.n + 255) / 256, 4096));
+  apxinf::cuda_new::custom::pack_gate_up<<<blocks, 256, 0, stream>>>(
+      bindings.b, resources.packed_weight, spec.b_dtype, spec.k, spec.n);
+  check_cuda(cudaGetLastError());
+  ++resources.prepack_count;
+}
+
 #ifdef APXINF_GEMM_CUTLASS_SM89
 void pack_geglu_weight_sm89(Execution& state,
                              const apxinf_gemm_bindings_t& bindings) {
@@ -408,14 +421,37 @@ cudaError_t launch_cutlass_w8a8_bias_gelu_m41_n6144_k1536(
 #endif
 }
 
+// A committed layout (1..3) is bound directly. A canonical (layout 0) weight is
+// packed into the provider-owned buffer by prepare when immutable, or here on
+// each launch when the caller did not promise immutability.
+const void* cutlass_geglu_weight(
+    Execution& state,
+    void (*pack)(Execution&, const apxinf_gemm_bindings_t&)) {
+  const auto& bindings = state.bindings;
+  if (state.spec.b_layout != 0) return bindings.b;
+  auto& resources = provider(state);
+  if (bindings.b_is_immutable != 0) {
+    if (!resources.packed_weight_ready ||
+        resources.packed_weight_source != bindings.b ||
+        resources.packed_weight_version != bindings.b_version) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "CUTLASS immutable weight was not prepared for these bindings");
+    }
+  } else {
+    pack(state, bindings);
+  }
+  return resources.packed_weight;
+}
+
 cudaError_t launch_cutlass_fp8_geglu(Execution& state) {
   const auto& bindings = state.bindings;
 #ifdef APXINF_GEMM_CUTLASS
   const auto& spec = state.spec;
   const auto stream = static_cast<cudaStream_t>(bindings.stream);
+  const void* weight = cutlass_geglu_weight(state, pack_geglu_weight);
   check_cutlass_status(
       apxinf::cuda_new::cutlass_ops::fp8_dual_geglu_detail::production_dual_geglu(
-          bindings.a, bindings.b, bindings.output, spec.m, spec.n / 2, spec.k,
+          bindings.a, weight, bindings.output, spec.m, spec.n / 2, spec.k,
           spec.n, bindings.alpha, bindings.output_scale, stream));
   return cudaSuccess;
 #else
@@ -430,9 +466,10 @@ cudaError_t launch_cutlass_bf16_geglu(Execution& state) {
 #ifdef APXINF_GEMM_CUTLASS
   const auto& spec = state.spec;
   const auto stream = static_cast<cudaStream_t>(bindings.stream);
+  const void* weight = cutlass_geglu_weight(state, pack_geglu_weight);
   check_cutlass_status(apxinf::cuda_new::cutlass_ops::bf16_dual_geglu_detail::
                            production_dual_geglu_bf16(
-                               bindings.a, bindings.b, bindings.output, spec.m,
+                               bindings.a, weight, bindings.output, spec.m,
                                spec.n / 2, spec.k, spec.n, stream));
   return cudaSuccess;
 #else
@@ -469,9 +506,10 @@ cudaError_t launch_cutlass_bf16_geglu_sm89(Execution& state) {
 #ifdef APXINF_GEMM_CUTLASS_SM89
   const auto& spec = state.spec;
   const auto stream = static_cast<cudaStream_t>(bindings.stream);
+  const void* weight = cutlass_geglu_weight(state, pack_geglu_weight_sm89);
   check_cutlass_status(
       apxinf::cuda_new::cutlass_ops::bf16_sm89_detail::interleaved_geglu(
-          bindings.a, bindings.b, bindings.output, spec.m,
+          bindings.a, weight, bindings.output, spec.m,
           spec.n / 2, spec.k, spec.n, 0, stream));
   return cudaSuccess;
 #else

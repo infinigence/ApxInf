@@ -42,12 +42,10 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
       spec.n <= 0 || spec.k <= 0 || spec.m > INT32_MAX ||
       spec.n > INT32_MAX || spec.k > INT32_MAX ||
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
-      spec.b_is_immutable > 1 || spec.b_layout > 4 ||
-      (spec.b_layout > 0 && spec.b_layout < 4 && spec.b_is_immutable == 0)) {
+      spec.b_is_immutable > 1 || spec.b_layout > 4) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec");
   }
-  if ((spec.b_layout == 1 && spec.b_dtype != APXINF_DTYPE_I8) ||
-      (spec.b_layout == 2 &&
+  if ((spec.b_layout == 2 &&
        (spec.n % 512 != 0 ||
         (spec.b_dtype != APXINF_DTYPE_BF16 && spec.b_dtype != APXINF_DTYPE_E4M3))) ||
       (spec.b_layout == 3 &&
@@ -95,8 +93,11 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
   const bool gate_up_pairs =
       spec.b_layout == APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256;
   // Layout 0 is an unprepared canonical weight; preparation selects and
-  // commits the required encoding before the execution is bound.
-  if (spec.b_layout != 0 && swiglu != gate_up_pairs) {
+  // commits the required encoding before the execution is bound. A committed
+  // gate/up encoding may also feed a plain GEMM: the layout-aware cuBLAS
+  // baseline decodes it, which is how one model weight crosses semantic
+  // profiles.
+  if (spec.b_layout != 0 && swiglu && !gate_up_pairs) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "GEMM+SwiGLU requires the gate/up-pair B layout");
   }
@@ -108,7 +109,8 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
   if (spec.numerics == APXINF_GEMM_NUMERICS_LEGACY_CUBLAS &&
       (spec.semantic != APXINF_GEMM_SEMANTIC_GEMM ||
        spec.quantization != APXINF_GEMM_QUANT_NONE ||
-       (spec.b_layout != 0 && spec.b_layout != APXINF_GEMM_LAYOUT_KN) ||
+       (spec.b_layout != 0 && spec.b_layout != APXINF_GEMM_LAYOUT_KN &&
+        spec.b_layout != APXINF_GEMM_LAYOUT_CANONICAL) ||
        spec.a_dtype != APXINF_DTYPE_BF16 ||
        spec.b_dtype != APXINF_DTYPE_BF16 ||
        spec.output_dtype != APXINF_DTYPE_BF16 ||

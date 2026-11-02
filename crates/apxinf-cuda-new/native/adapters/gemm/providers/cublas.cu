@@ -34,8 +34,11 @@ CublasState& provider(Execution& state) {
 }
 
 bool needs_safe_dequantization(const Spec& spec) {
+  // Layout 4 (CANONICAL) means the same physical bytes as KN: the caller owns
+  // a canonical weight and forbids in-place packing.
   return spec.quantization == APXINF_GEMM_QUANT_W8A8_ROW_CHANNEL &&
-         spec.b_layout == APXINF_GEMM_LAYOUT_KN;
+         (spec.b_layout == APXINF_GEMM_LAYOUT_KN ||
+          spec.b_layout == APXINF_GEMM_LAYOUT_CANONICAL);
 }
 
 bool uses_checkpoint_bias_numerics(const Spec& spec) {

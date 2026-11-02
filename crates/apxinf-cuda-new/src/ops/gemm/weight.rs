@@ -176,15 +176,16 @@ impl RepackedWeight {
         // depends on dtype/K/N and device features, never M. Future providers
         // with shape-dependent layouts must not be added to this fixed policy.
         let spec = abi::Spec {
-            version: 8,
+            version: 9,
             semantic: super::contracts::Semantic::Gemm as u32,
             a_dtype: 4,
             b_dtype: 4,
             accumulation_dtype: 5,
             output_dtype: 2,
             quantization: 3,
-            b_is_immutable: 1,
             b_layout: 0,
+            numerics: 0,
+            b_is_immutable: 1,
             a_alignment: 16,
             b_alignment: 16,
             output_alignment: 16,

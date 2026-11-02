@@ -152,7 +152,6 @@ mod linear {
             let zero = linear(&[0.0, 0.0], [1, 2], None);
             assert_eq!(pack_host_parts(&[&zero]).unwrap().1, 1.0);
         }
-
     }
 }
 pub use linear::*;

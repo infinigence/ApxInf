@@ -39,8 +39,11 @@ bool supports_vendor(const Spec& spec) {
 }
 
 bool supports_cublaslt(const Spec& spec) {
+  // CANONICAL carries the same bytes as KN; it only tells preparation not to
+  // repack B in place.
   const bool vendor_layout =
       spec.b_layout == APXINF_GEMM_LAYOUT_KN ||
+      spec.b_layout == APXINF_GEMM_LAYOUT_CANONICAL ||
       (spec.b_layout == APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256 &&
        spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_SWIGLU);
   return vendor_layout && supports_vendor(spec);
@@ -414,10 +417,10 @@ const ImplementationRegistry& registry(uint32_t semantic) {
   // Every L3 semantic has exactly one baseline fallback. cuBLAS owns that role;
   // faster or more specialized providers remain autotuning candidates only.
   static const ImplementationRegistry gemm_bias_gelu_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical 0, true, false, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
@@ -429,8 +432,7 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        launch_cublaslt, destroy_cublaslt},
 #ifdef APXINF_GEMM_CUTLASS_SM87_W8A8
       {kProviderCutlass, 10, 1,
-       "cutlass-w8a8-bias-gelu-m41-n6144-k1536-sm87", WeightLayout::NK
-       kDeviceFeatureCutlassSm87W8A8, true, true, false,
+       "cutlass-w8a8-bias-gelu-m41-n6144-k1536-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8_bias_gelu_m41_n6144_k1536,
        cutlass_w8a8_alignment, cutlass_w8a8_resource_requirements,
        one_configuration, prepare_cutlass_w8a8,
@@ -440,10 +442,10 @@ const ImplementationRegistry& registry(uint32_t semantic) {
   // Keep GEMM+bias as a separate L3 tuning domain even though its current L1
   // candidates happen to be the same vendor implementations.
   static const ImplementationRegistry gemm_bias_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical 0, true, false, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
@@ -453,8 +455,7 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        cublaslt_configurations, prepare_cublaslt_native_fp8, launch_cublaslt,
        destroy_cublaslt},
 #ifdef APXINF_GEMM_CUTLASS_SM87_W8A8
-      {kProviderCutlass, 9, 1, "cutlass-w8a8-bias-m41-n4608-k1536-sm87", WeightLayout::NK
-       kDeviceFeatureCutlassSm87W8A8, true, true, false,
+      {kProviderCutlass, 9, 1, "cutlass-w8a8-bias-m41-n4608-k1536-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8_bias_m41_n4608_k1536,
        cutlass_w8a8_alignment, cutlass_w8a8_resource_requirements,
        one_configuration, prepare_cutlass_w8a8,
@@ -462,10 +463,10 @@ const ImplementationRegistry& registry(uint32_t semantic) {
 #endif
   };
   static const ImplementationRegistry gemm_bias_residual_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical 0, true, false, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
@@ -476,10 +477,10 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        prepare_cublaslt_native_fp8, launch_cublaslt, destroy_cublaslt},
   };
   static const ImplementationRegistry gemm_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical 0, true, false, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
@@ -488,7 +489,7 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        cublaslt_alignment, cublaslt_native_fp8_resource_requirements,
        cublaslt_configurations, prepare_cublaslt_native_fp8, launch_cublaslt,
        destroy_cublaslt},
-      {kProviderCublasLt, 3, 1, "cublasLt-native-nvfp4", WeightLayout::Canonical,
+      {kProviderCublasLt, 3, 1, "cublasLt-native-nvfp4", WeightLayout::NK,
        kDeviceFeatureCutlassSm100, true, false, false, supports_native_fp4,
        cublaslt_nvfp4_alignment, cublaslt_native_fp4_resource_requirements,
        cublaslt_configurations, prepare_cublaslt_native_fp4, launch_cublaslt,
@@ -499,37 +500,33 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        supports_cutlass_fp8, cutlass_fp8_alignment,
        cutlass_fp8_resource_requirements, cutlass_configurations,
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_gemm, destroy_cutlass},
-      {kProviderCutlass, 7, 1, "cutlass-fp8-row-channel", WeightLayout::Canonical
-       kDeviceFeatureCutlassSm100, true, true, false,
+      {kProviderCutlass, 7, 1, "cutlass-fp8-row-channel", WeightLayout::Canonical, kDeviceFeatureCutlassSm100, true, true, false,
        supports_cutlass_fp8_rowwise, cutlass_fp8_rowwise_alignment,
        cutlass_fp8_resource_requirements, cutlass_fp8_rowwise_configurations,
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_rowwise_gemm,
        destroy_cutlass},
-      {kProviderCutlass, 4, 1, "cutlass-nvfp4-blockscaled", WeightLayout::Canonical
-       kDeviceFeatureCutlassSm100, true, true, false,
+      {kProviderCutlass, 4, 1, "cutlass-nvfp4-blockscaled", WeightLayout::NK, kDeviceFeatureCutlassSm100, true, true, false,
        supports_cutlass_nvfp4, cutlass_nvfp4_alignment,
        cutlass_nvfp4_resource_requirements, cutlass_nvfp4_configurations,
        prepare_cutlass_nvfp4, launch_cutlass_nvfp4, destroy_cutlass},
 #endif
 #ifdef APXINF_GEMM_CUTLASS_SM87_W8A8
-      {kProviderCutlass, 8, 1, "cutlass-w8a8-m41-n6144-k1536-sm87", WeightLayout::NK
-       kDeviceFeatureCutlassSm87W8A8, true, true, false,
+      {kProviderCutlass, 8, 1, "cutlass-w8a8-m41-n6144-k1536-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8_m41_n6144_k1536, cutlass_w8a8_alignment,
        cutlass_w8a8_resource_requirements, one_configuration,
        prepare_cutlass_w8a8, launch_cutlass_w8a8_m41_n6144_k1536,
        destroy_cutlass},
-      {kProviderCutlass, 6, 1, "cutlass-w8a8-sm87", WeightLayout::NK
-       kDeviceFeatureCutlassSm87W8A8, true, true, false,
+      {kProviderCutlass, 6, 1, "cutlass-w8a8-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8, cutlass_w8a8_alignment,
        cutlass_w8a8_resource_requirements, one_configuration,
        prepare_cutlass_w8a8, launch_cutlass_w8a8, destroy_cutlass},
 #endif
   };
   static const ImplementationRegistry gemm_geglu_entries = {
-      {kProviderCublas, 1, 2, "cublas+custom-epilogue", WeightLayout::Canonical 0, true, true, true,
+      {kProviderCublas, 1, 2, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 2, "cublasLt+custom-epilogue", WeightLayout::Canonical 0, true, false, false,
+      {kProviderCublasLt, 1, 2, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
@@ -565,16 +562,15 @@ const ImplementationRegistry& registry(uint32_t semantic) {
 #endif
   };
   static const ImplementationRegistry gemm_swiglu_entries = {
-      {kProviderCublas, 1, 1, "cublas+rounded-swiglu", WeightLayout::Canonical 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+rounded-swiglu", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+rounded-swiglu", WeightLayout::Canonical 0, true, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+rounded-swiglu", WeightLayout::Canonical, 0, true, false,
        false, supports_cublaslt, cublaslt_alignment,
        cublaslt_resource_requirements, cublaslt_configurations,
        prepare_cublaslt, launch_cublaslt, destroy_cublaslt},
 #if defined(APXINF_GEMM_CUTLASS) && defined(APXINF_SEGMENTED_ATTENTION_SM110)
-      {kProviderCutlass, 7, 1, "cutlass-bf16-swiglu-sm110", WeightLayout::GateUpInterleaved256
-       kDeviceFeatureFixedSm110, true, true, false,
+      {kProviderCutlass, 7, 1, "cutlass-bf16-swiglu-sm110", WeightLayout::GateUpInterleaved256, kDeviceFeatureFixedSm110, true, true, false,
        supports_cutlass_bf16_swiglu_sm110, cutlass_geglu_alignment,
        cutlass_bf16_swiglu_resource_requirements, one_configuration,
        prepare_cutlass_bf16_swiglu, launch_cutlass_bf16_swiglu,

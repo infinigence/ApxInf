@@ -7,7 +7,7 @@ use crate::pi05::backend::{
         reserve_prefix as l3_reserve_prefix, rope as l3_rope, Affine, AttentionArgs, BiasOrder,
         EmbeddingScale, FusedAddNormArgs, GatherArgs, GatherPatchGeometry, GatherSemantic,
         GemmArgs, GemmGegluArgs, NormArgs, NormKind, NormNumerics, PointwiseActivation,
-        PointwiseArgs, PointwiseSemantic, ResidualAddArgs, RopeArgs, RopeSemantic, WeightVersion,
+        PointwiseArgs, PointwiseSemantic, ResidualAddArgs, RopeArgs, RopeSemantic,
     },
     Context, DeviceBuffer as CudaBuffer,
 };
@@ -145,8 +145,8 @@ fn gemm_bf16(
     }
     crate::pi05::model::calibration::observe_bf16_activation(activation, weight)?;
     let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
-    let mut args = GemmArgs::new(activation, weight, &mut output)
-        .with_repacked_weight(&weights.layout);
+    let mut args =
+        GemmArgs::new(activation, weight, &mut output).with_repacked_weight(&weights.layout);
     args.policy = policies.gemm.clone();
     l3_gemm(ctx, args)?;
     Ok(output)
@@ -176,8 +176,8 @@ fn gemm_geglu_bf16(
     }
     crate::pi05::model::calibration::observe_bf16_activation(activation, weight)?;
     let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1] / 2]), DType::BF16)?;
-    let mut gemm = GemmArgs::new(activation, weight, &mut output)
-        .with_repacked_weight(&weights.layout);
+    let mut gemm =
+        GemmArgs::new(activation, weight, &mut output).with_repacked_weight(&weights.layout);
     gemm.policy = policies.gemm.clone();
     l3_gemm_geglu(ctx, GemmGegluArgs { gemm })?;
     Ok(output)
@@ -603,8 +603,7 @@ fn language_layer_bf16_with_policies(
     )?;
     let activated = gemm_geglu_bf16(ctx, policies, &fused.normalized, &weights.gate_up)?;
     let projected = gemm_bf16(ctx, policies, &activated, &weights.down)?;
-    let hidden =
-        bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
+    let hidden = bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
     Ok(Bf16LanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
@@ -1078,12 +1077,7 @@ pub(in crate::pi05::model) mod backbone {
                     "π0.5 BF16 prefix/modulation depth mismatch".into(),
                 ));
             }
-            let hidden = gemm_bf16(
-                self.ctx(),
-                &self.policies,
-                state,
-                &self.weights.action_in,
-            )?;
+            let hidden = gemm_bf16(self.ctx(), &self.policies, state, &self.weights.action_in)?;
             let mut hidden = bias_activation_bf16(
                 self.ctx(),
                 &hidden,
