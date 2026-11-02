@@ -21,6 +21,12 @@ and overflowing element counts before adding the input. Weight and operation
 shape checks also precede builder mutation. Scalar shapes (`[]`) remain valid;
 `split` sizes and axes must additionally fit their INT32 parameters.
 
+`Var` values belong to the builder that created them, and every input,
+constant and operation output has a unique nonempty name. Operations reject a
+value from another builder, and `finish` rejects foreign, undefined or
+duplicate outputs. `tanh`, `abs` and `identity` also return `Result<Var>` so
+those checks run before an invalid operation enters the program.
+
 `Package::write` writes the `.mlpackage` directory: a fixed `Manifest.json`,
 `model.mlmodel` and a MILBlob version 2 `weight.bin`. The protobuf subset in
 `proto.rs` uses `prost` derive macros; no code generator runs at build time.

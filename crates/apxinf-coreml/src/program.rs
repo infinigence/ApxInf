@@ -6,15 +6,27 @@ use crate::blob::{BlobDataType, BlobWriter};
 use crate::proto::{self, binding, data_type, tensor_value, value};
 use apxinf_core::{Error, Result};
 use half::f16;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const OPSET: &str = "CoreML8";
 const WEIGHTS: &str = "@model_path/weights/weight.bin";
+static NEXT_BUILDER_ID: AtomicUsize = AtomicUsize::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BuilderId(usize);
+
+impl BuilderId {
+    fn new() -> Self {
+        Self(NEXT_BUILDER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 /// A named program value: its MIL data type and static shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Var {
+    builder: BuilderId,
     name: String,
     dtype: i32,
     shape: Vec<usize>,
@@ -36,12 +48,14 @@ pub enum Operand<'a> {
     Scalar(f16),
 }
 
-#[derive(Default)]
+/// Builds one MIL function from builder-owned values with unique names.
 pub struct ProgramBuilder {
+    id: BuilderId,
     inputs: Vec<Var>,
     operations: Vec<proto::Operation>,
     blobs: BlobWriter,
     counts: BTreeMap<&'static str, usize>,
+    symbols: BTreeSet<String>,
 }
 
 fn tensor_type(dtype: i32, shape: &[usize]) -> proto::ValueType {
@@ -134,15 +148,21 @@ fn broadcast(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
 impl ProgramBuilder {
     pub fn new() -> Self {
         Self {
+            id: BuilderId::new(),
+            inputs: Vec::new(),
+            operations: Vec::new(),
             blobs: BlobWriter::new(),
-            ..Self::default()
+            counts: BTreeMap::new(),
+            symbols: BTreeSet::new(),
         }
     }
 
     /// An FP16 function input.
     pub fn input(&mut self, name: &str, shape: &[usize]) -> Result<Var> {
         shape_elements(shape)?;
+        self.reserve_symbols(&[name.to_owned()])?;
         let var = Var {
+            builder: self.id,
             name: name.to_owned(),
             dtype: data_type::FLOAT16,
             shape: shape.to_vec(),
@@ -151,15 +171,41 @@ impl ProgramBuilder {
         Ok(var)
     }
 
-    fn op_name(&mut self, kind: &'static str, name: Option<&str>) -> String {
+    fn op_name(&self, kind: &'static str, name: Option<&str>) -> String {
         match name {
             Some(name) => name.to_owned(),
-            None => {
-                let count = self.counts.entry(kind).or_default();
-                *count += 1;
-                format!("{kind}_{}", *count - 1)
+            None => format!("{kind}_{}", self.counts.get(kind).copied().unwrap_or(0)),
+        }
+    }
+
+    fn commit_op_name(&mut self, kind: &'static str, name: Option<&str>) {
+        if name.is_none() {
+            *self.counts.entry(kind).or_default() += 1;
+        }
+    }
+
+    fn reserve_symbols(&mut self, names: &[String]) -> Result<()> {
+        let mut pending = BTreeSet::new();
+        for name in names {
+            if name.is_empty() {
+                return Err(contract("ML Program value names must be nonempty"));
+            }
+            if self.symbols.contains(name) || !pending.insert(name.clone()) {
+                return Err(contract("ML Program value names must be unique"));
             }
         }
+        self.symbols.extend(names.iter().cloned());
+        Ok(())
+    }
+
+    fn require_value(&self, var: &Var) -> Result<()> {
+        if var.builder != self.id {
+            return Err(contract("ML Program value belongs to a different builder"));
+        }
+        if !self.symbols.contains(&var.name) {
+            return Err(contract("ML Program value is not defined by this builder"));
+        }
+        Ok(())
     }
 
     fn push(
@@ -194,6 +240,7 @@ impl ProgramBuilder {
     ) -> Var {
         let name = format!("{op}_{param}_0");
         let var = Var {
+            builder: self.id,
             name: name.clone(),
             dtype,
             shape: shape.to_vec(),
@@ -262,6 +309,8 @@ impl ProgramBuilder {
             ));
         }
         let name = self.op_name("constexpr_blockwise_shift_scale", None);
+        self.reserve_symbols(std::slice::from_ref(&name))?;
+        self.commit_op_name("constexpr_blockwise_shift_scale", None);
         let bytes: Vec<u8> = data.iter().map(|&v| v as u8).collect();
         let data = self.blob_value(data_type::INT8, shape, BlobDataType::Int8, &bytes);
         let bytes: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -277,6 +326,7 @@ impl ProgramBuilder {
             }],
         };
         let out = Var {
+            builder: self.id,
             name: name.clone(),
             dtype: data_type::FLOAT16,
             shape: shape.to_vec(),
@@ -297,6 +347,8 @@ impl ProgramBuilder {
 
     /// 2-D convolution, stride 1, `valid` padding, dilation 1, one group.
     pub fn conv(&mut self, x: &Var, weight: &Var) -> Result<Var> {
+        self.require_value(x)?;
+        self.require_value(weight)?;
         let (&[n, cin, h, w], &[cout, wcin, kh, kw]) = (&x.shape[..], &weight.shape[..]) else {
             return Err(contract("conv needs rank-4 input and weight"));
         };
@@ -306,6 +358,14 @@ impl ProgramBuilder {
         let shape = vec![n, cout, h - kh + 1, w - kw + 1];
         shape_elements(&shape)?;
         let name = self.op_name("conv", None);
+        let names = ["strides", "pad_type", "pad", "dilations", "groups"]
+            .map(|param| format!("{name}_{param}_0"));
+        self.reserve_symbols(
+            &std::iter::once(name.clone())
+                .chain(names)
+                .collect::<Vec<_>>(),
+        )?;
+        self.commit_op_name("conv", None);
         let strides = self.ints(&name, "strides", &[1, 1], false);
         let pad_type = immediate(
             data_type::STRING,
@@ -319,6 +379,7 @@ impl ProgramBuilder {
         let dilations = self.ints(&name, "dilations", &[1, 1], false);
         let groups = self.ints(&name, "groups", &[1], true);
         let out = Var {
+            builder: self.id,
             name: name.clone(),
             dtype: data_type::FLOAT16,
             shape,
@@ -346,6 +407,10 @@ impl ProgramBuilder {
         y: Operand<'_>,
         name: Option<&str>,
     ) -> Result<Var> {
+        self.require_value(x)?;
+        if let Operand::Var(var) = &y {
+            self.require_value(var)?;
+        }
         let shape = broadcast(
             &x.shape,
             match &y {
@@ -354,7 +419,14 @@ impl ProgramBuilder {
             },
         )?;
         shape_elements(&shape)?;
-        let name = self.op_name(kind, name);
+        let requested_name = name;
+        let name = self.op_name(kind, requested_name);
+        let names = match &y {
+            Operand::Var(_) => vec![name.clone()],
+            Operand::Scalar(_) => vec![name.clone(), format!("{name}_y_0")],
+        };
+        self.reserve_symbols(&names)?;
+        self.commit_op_name(kind, requested_name);
         let y = match y {
             Operand::Var(v) => v.clone(),
             Operand::Scalar(s) => {
@@ -369,6 +441,7 @@ impl ProgramBuilder {
             }
         };
         let out = Var {
+            builder: self.id,
             name: name.clone(),
             dtype: data_type::FLOAT16,
             shape,
@@ -391,9 +464,14 @@ impl ProgramBuilder {
         self.binary("maximum", x, y, name)
     }
 
-    fn unary(&mut self, kind: &'static str, x: &Var, name: Option<&str>) -> Var {
-        let name = self.op_name(kind, name);
+    fn unary(&mut self, kind: &'static str, x: &Var, name: Option<&str>) -> Result<Var> {
+        self.require_value(x)?;
+        let requested_name = name;
+        let name = self.op_name(kind, requested_name);
+        self.reserve_symbols(std::slice::from_ref(&name))?;
+        self.commit_op_name(kind, requested_name);
         let out = Var {
+            builder: self.id,
             name: name.clone(),
             ..x.clone()
         };
@@ -403,21 +481,22 @@ impl ProgramBuilder {
             [("x".to_owned(), by_name(x))].into(),
             std::slice::from_ref(&out),
         );
-        out
+        Ok(out)
     }
 
-    pub fn tanh(&mut self, x: &Var) -> Var {
+    pub fn tanh(&mut self, x: &Var) -> Result<Var> {
         self.unary("tanh", x, None)
     }
-    pub fn abs(&mut self, x: &Var) -> Var {
+    pub fn abs(&mut self, x: &Var) -> Result<Var> {
         self.unary("abs", x, None)
     }
-    pub fn identity(&mut self, x: &Var, name: Option<&str>) -> Var {
+    pub fn identity(&mut self, x: &Var, name: Option<&str>) -> Result<Var> {
         self.unary("identity", x, name)
     }
 
     /// `reduce_max` over `axes` (non-negative).
     pub fn reduce_max(&mut self, x: &Var, axes: &[i32], keep_dims: bool) -> Result<Var> {
+        self.require_value(x)?;
         if axes
             .iter()
             .any(|&a| usize::try_from(a).map_or(true, |a| a >= x.shape.len()))
@@ -425,6 +504,12 @@ impl ProgramBuilder {
             return Err(contract("reduce_max axes must index the input"));
         }
         let name = self.op_name("reduce_max", None);
+        self.reserve_symbols(&[
+            name.clone(),
+            format!("{name}_axes_0"),
+            format!("{name}_keep_dims_0"),
+        ])?;
+        self.commit_op_name("reduce_max", None);
         let axes_var = self.ints(&name, "axes", axes, false);
         let keep = immediate(
             data_type::BOOL,
@@ -447,6 +532,7 @@ impl ProgramBuilder {
             )
             .collect();
         let out = Var {
+            builder: self.id,
             name: name.clone(),
             dtype: x.dtype,
             shape,
@@ -461,6 +547,7 @@ impl ProgramBuilder {
 
     /// `split` along a non-negative `axis` into parts of `sizes`.
     pub fn split(&mut self, x: &Var, sizes: &[usize], axis: usize) -> Result<Vec<Var>> {
+        self.require_value(x)?;
         let total = sizes.iter().try_fold(0usize, |sum, &size| {
             sum.checked_add(size)
                 .ok_or_else(|| contract("ML Program split size sum overflows usize"))
@@ -476,6 +563,12 @@ impl ProgramBuilder {
         let axis_i32 =
             i32::try_from(axis).map_err(|_| contract("ML Program split axis exceeds int32"))?;
         let name = self.op_name("split", None);
+        let names = std::iter::once(name.clone())
+            .chain([format!("{name}_split_sizes_0"), format!("{name}_axis_0")])
+            .chain((0..sizes.len()).map(|index| format!("{name}_{index}")))
+            .collect::<Vec<_>>();
+        self.reserve_symbols(&names)?;
+        self.commit_op_name("split", None);
         let sizes_var = self.ints(&name, "split_sizes", &sizes_i32, false);
         let axis_var = self.ints(&name, "axis", &[axis_i32], true);
         let outs: Vec<Var> = sizes
@@ -485,6 +578,7 @@ impl ProgramBuilder {
                 let mut shape = x.shape.clone();
                 shape[axis] = s;
                 Var {
+                    builder: self.id,
                     name: format!("{name}_{i}"),
                     dtype: x.dtype,
                     shape,
@@ -501,8 +595,18 @@ impl ProgramBuilder {
 
     /// The package: one `main` function returning `outputs`, all FP16.
     pub fn finish(self, outputs: &[&Var]) -> Result<Package> {
-        if outputs.is_empty() || outputs.iter().any(|v| v.dtype != data_type::FLOAT16) {
-            return Err(contract("ML Program outputs must be FP16 values"));
+        if outputs.is_empty() {
+            return Err(contract("ML Program needs at least one output"));
+        }
+        let mut names = BTreeSet::new();
+        for output in outputs {
+            self.require_value(output)?;
+            if output.dtype != data_type::FLOAT16 {
+                return Err(contract("ML Program outputs must be FP16 values"));
+            }
+            if !names.insert(output.name.as_str()) {
+                return Err(contract("ML Program output names must be unique"));
+            }
         }
         let feature = |v: &Var| proto::FeatureDescription {
             name: v.name.clone(),
@@ -564,6 +668,12 @@ impl ProgramBuilder {
             model,
             weights: self.blobs.finish(),
         })
+    }
+}
+
+impl Default for ProgramBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -632,7 +742,7 @@ mod tests {
         let m2 = b.mul(&m, Operand::Var(&s), None).unwrap();
         let r = b.reduce_max(&m2, &[1], true).unwrap();
         let parts = b.split(&m2, &[1, 1], 1).unwrap();
-        let y = b.identity(&parts[0], Some("y"));
+        let y = b.identity(&parts[0], Some("y")).unwrap();
         assert_eq!(
             [
                 m.name(),
@@ -690,6 +800,122 @@ mod tests {
         assert!(b.reduce_max(&x, &[4], true).is_err());
         let wide = b.input("z", &[1, 3, 1, 8]).unwrap();
         assert!(b.mul(&x, Operand::Var(&wide), None).is_err());
+    }
+
+    #[test]
+    fn values_cannot_cross_builder_boundaries() {
+        let mut first = ProgramBuilder::new();
+        let foreign = first.input("x", &[1]).unwrap();
+
+        let mut second = ProgramBuilder::new();
+        let before = (
+            second.inputs.clone(),
+            second.operations.clone(),
+            second.counts.clone(),
+            second.symbols.clone(),
+        );
+        assert!(second
+            .identity(&foreign, None)
+            .unwrap_err()
+            .to_string()
+            .contains("ML Program value belongs to a different builder"));
+        assert_eq!(second.inputs, before.0);
+        assert_eq!(second.operations, before.1);
+        assert_eq!(second.counts, before.2);
+        assert_eq!(second.symbols, before.3);
+
+        let local = second.input("local", &[1]).unwrap();
+        let before = (
+            second.inputs.clone(),
+            second.operations.clone(),
+            second.counts.clone(),
+            second.symbols.clone(),
+        );
+        assert!(second
+            .add(&local, Operand::Var(&foreign), None)
+            .unwrap_err()
+            .to_string()
+            .contains("ML Program value belongs to a different builder"));
+        assert!(second
+            .conv(&local, &foreign)
+            .unwrap_err()
+            .to_string()
+            .contains("ML Program value belongs to a different builder"));
+        assert_eq!(second.inputs, before.0);
+        assert_eq!(second.operations, before.1);
+        assert_eq!(second.counts, before.2);
+        assert_eq!(second.symbols, before.3);
+
+        assert!(second
+            .finish(&[&foreign])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("ML Program value belongs to a different builder"));
+
+        let mut third = ProgramBuilder::new();
+        let local = third.input("x", &[1]).unwrap();
+        assert!(third
+            .finish(&[&local, &local])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("ML Program output names must be unique"));
+
+        let empty = ProgramBuilder::new();
+        assert!(empty
+            .finish(&[])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("ML Program needs at least one output"));
+    }
+
+    #[test]
+    fn duplicate_and_empty_symbols_are_rejected_without_mutation() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1]).unwrap();
+        let before = (
+            b.inputs.clone(),
+            b.operations.clone(),
+            b.counts.clone(),
+            b.symbols.clone(),
+        );
+        assert!(b
+            .input("x", &[1])
+            .unwrap_err()
+            .to_string()
+            .contains("ML Program value names must be unique"));
+        assert!(b
+            .identity(&x, Some("x"))
+            .unwrap_err()
+            .to_string()
+            .contains("ML Program value names must be unique"));
+        assert!(b
+            .input("", &[1])
+            .unwrap_err()
+            .to_string()
+            .contains("ML Program value names must be nonempty"));
+        assert!(b
+            .identity(&x, Some(""))
+            .unwrap_err()
+            .to_string()
+            .contains("ML Program value names must be nonempty"));
+        assert_eq!(b.inputs, before.0);
+        assert_eq!(b.operations, before.1);
+        assert_eq!(b.counts, before.2);
+        assert_eq!(b.symbols, before.3);
+
+        b.input("mul_0", &[1]).unwrap();
+        let before = (b.operations.clone(), b.counts.clone(), b.symbols.clone());
+        assert!(b
+            .mul(&x, Operand::Scalar(f16::ONE), None)
+            .unwrap_err()
+            .to_string()
+            .contains("ML Program value names must be unique"));
+        assert_eq!(b.operations, before.0);
+        assert_eq!(b.counts, before.1);
+        assert_eq!(b.symbols, before.2);
     }
 
     #[test]

@@ -100,12 +100,12 @@ fn int8_mlp_program(model: &proto::Model, weights: &[u8]) -> Result<apxinf_corem
     let wu = w(&mut b, 1)?;
     let u = b.conv(&x, &wu)?;
     let half = b.mul(&g, Operand::Scalar(scalar(model, "mul_0_y_0")), None)?;
-    let t = b.tanh(&half);
+    let t = b.tanh(&half)?;
     let t1 = b.add(&t, Operand::Scalar(scalar(model, "add_0_y_0")), None)?;
     let s = b.mul(&half, Operand::Var(&t1), None)?;
-    let sa = b.abs(&s);
+    let sa = b.abs(&s)?;
     let s_max = b.reduce_max(&sa, &[1], true)?;
-    let ua = b.abs(&u);
+    let ua = b.abs(&u)?;
     let u_max = b.reduce_max(&ua, &[1], true)?;
     let sm = b.mul(&s_max, Operand::Scalar(scalar(model, "mul_2_y_0")), None)?;
     let s_scale = b.maximum(
@@ -129,7 +129,7 @@ fn int8_mlp_program(model: &proto::Model, weights: &[u8]) -> Result<apxinf_corem
     let wd1 = w(&mut b, 3)?;
     let y1 = b.conv(&xs[1], &wd1)?;
     let sum = b.add(&y0, Operand::Var(&y1), None)?;
-    let y = b.identity(&sum, Some("y"));
+    let y = b.identity(&sum, Some("y"))?;
     b.finish(&[&y, &s_scale, &u_scale])
 }
 
@@ -166,7 +166,7 @@ fn written_and_recorded_programs_predict_identical_bits() -> Result<()> {
     cache.seal();
     let mut other = ProgramBuilder::new();
     let x = other.input("x", &[1, 4, 1, 1])?;
-    let id = other.identity(&x, Some("y"));
+    let id = other.identity(&x, Some("y"))?;
     assert!(
         cache
             .load(&other.finish(&[&id])?, ComputeUnits::CpuOnly)
