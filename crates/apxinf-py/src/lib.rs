@@ -42,8 +42,9 @@ use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::{
-    AutoModel, DecisionInput, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation,
-    Pi05Config, SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    AutoModel, DecisionInput, ExecutionPolicy, ImageLayout, LoadOptions, LoadedModel,
+    ModelPrecision, Observation, Pi05Config, SyntheticWeights, VisionObservation, VlaContract,
+    VlaMetadata, VlaRequest,
 };
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
@@ -122,7 +123,7 @@ fn parse_device(spec: &str) -> PyResult<Device> {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
                 PyValueError::new_err(format!(
-                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0` or `metal:0`)"
+                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0`, `musa:0` or `metal:0`)"
                 ))
             })?;
             (kind, index)
@@ -132,10 +133,11 @@ fn parse_device(spec: &str) -> PyResult<Device> {
     match kind {
         "cuda" => Ok(Device::Cuda(index)),
         "hip" => Ok(Device::Hip(index)),
+        "musa" => Ok(Device::Musa(index)),
         "metal" | "mlx" => Ok(Device::Metal(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|metal|mlx|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|musa|metal|mlx|cpu)"
         ))),
     }
 }
@@ -148,6 +150,17 @@ fn parse_precision(spec: &str) -> PyResult<ModelPrecision> {
         "int8" | "w8a8" => Ok(ModelPrecision::W8A8),
         other => Err(PyValueError::new_err(format!(
             "apxinf_py.load: unknown precision `{other}` (expected auto|fp8|bf16|int8)"
+        ))),
+    }
+}
+
+fn parse_execution_policy(spec: &str) -> PyResult<ExecutionPolicy> {
+    match spec {
+        "eager" => Ok(ExecutionPolicy::Eager),
+        "prefer-graph" => Ok(ExecutionPolicy::PreferGraph),
+        "require-graph" => Ok(ExecutionPolicy::RequireGraph),
+        other => Err(PyValueError::new_err(format!(
+            "apxinf_py.load: unknown execution `{other}` (expected eager|prefer-graph|require-graph)"
         ))),
     }
 }
@@ -1030,6 +1043,12 @@ impl ModelRunner {
     ///   the same weights load and run at the requested chunk length.
     /// * `num_views` - serve fewer cameras than the checkpoint declares.
     ///
+    /// `execution` selects how the MUSA PI0.5 runtime builds the plans it
+    /// caches for repeated inference: `"eager"` never captures, `"prefer-graph"`
+    /// (the default when omitted) captures and falls back to eager, and
+    /// `"require-graph"` turns a capture failure into an error. The mode a run
+    /// actually took is reported by [`Self::execution_mode`].
+    ///
     /// `num_views` exists because a deployment often has fewer cameras than the
     /// checkpoint was trained with. Dropping the trailing views is numerically
     /// equivalent to openpi zero-padding and masking them - a masked view is
@@ -1038,7 +1057,7 @@ impl ModelRunner {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None, execution=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -1055,6 +1074,7 @@ impl ModelRunner {
         sampling_seed: u64,
         assets: Option<BTreeMap<String, PathBuf>>,
         model_variant: Option<String>,
+        execution: Option<&str>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -1103,6 +1123,7 @@ impl ModelRunner {
             autotune,
             num_views,
             config,
+            execution_policy: execution.map(parse_execution_policy).transpose()?,
             ..LoadOptions::default()
         };
         let loaded = AutoModel::load_model(device, &path, &options).map_err(runtime_err)?;
@@ -1812,6 +1833,18 @@ impl ModelRunner {
         Ok(self.model.vla().map_err(runtime_err)?.model_variant())
     }
 
+    /// Execution path the runtime is actually on: `"unprepared"`, `"eager"`,
+    /// `"graph"`, `"invalidated"` or `"runtime-managed"`.
+    ///
+    /// Ask after a run, not after loading: the plan is built on first use. A
+    /// `"eager"` here after asking for `"require-graph"` cannot happen - that
+    /// combination fails the run - while after `"prefer-graph"` it means the
+    /// capture fell back.
+    #[getter]
+    fn execution_mode(&self) -> PyResult<&'static str> {
+        Ok(self.model.vla().map_err(runtime_err)?.execution_mode())
+    }
+
     #[getter]
     fn action_dim(&self) -> usize {
         self.action_shape()[1]
@@ -1890,6 +1923,8 @@ mod tests {
         assert!(matches!(parse_device("cuda").unwrap(), Device::Cuda(0)));
         assert!(matches!(parse_device("hip").unwrap(), Device::Hip(0)));
         assert!(matches!(parse_device("hip:2").unwrap(), Device::Hip(2)));
+        assert!(matches!(parse_device("musa").unwrap(), Device::Musa(0)));
+        assert!(matches!(parse_device("musa:1").unwrap(), Device::Musa(1)));
         assert!(matches!(parse_device("cuda:1").unwrap(), Device::Cuda(1)));
         assert!(matches!(parse_device("cpu").unwrap(), Device::Cpu));
         assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));

@@ -21,6 +21,16 @@ pub(crate) fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
         Device::Hip(id) => hip::create(id),
         #[cfg(not(feature = "hip"))]
         Device::Hip(_) => Err(Error::Other("HIP support not compiled in".into())),
+        // No `dyn Backend` family is ported to MUSA: PI0.5 reaches it through
+        // its own concrete seam in `musa_pi05/`. Both arms spell `Error` out in
+        // full because the import above is gone exactly when every other
+        // backend feature is on, and one of these two arms always compiles.
+        #[cfg(feature = "musa")]
+        Device::Musa(_) => Err(apxinf_core::Error::UnsupportedDevice(device)),
+        #[cfg(not(feature = "musa"))]
+        Device::Musa(_) => Err(apxinf_core::Error::Other(
+            "MUSA support not compiled in".into(),
+        )),
     }
 }
 
@@ -40,6 +50,19 @@ pub(crate) mod hip {
     pub(crate) fn create(device_id: usize) -> Result<Arc<dyn Backend>> {
         Ok(Arc::new(apxinf_hip::HipBackend::new(device_id)?))
     }
+}
+
+/// Moore Threads seam.
+///
+/// No `dyn Backend` family is ported to MUSA — PI0.5 reaches the device through
+/// its own concrete port in `musa_pi05/`, which owns every device import. What
+/// the model layer needs from this backend is the profiling marker, so it is
+/// re-exported here and `profiling::trace` reaches it the same way it reaches
+/// `cuda::nvtx`. That module picks one backend for the whole process, so this
+/// is compiled exactly when MUSA is the one it picks.
+#[cfg(all(feature = "musa", not(feature = "cuda")))]
+pub(crate) mod musa {
+    pub(crate) use apxinf_musa::mttx;
 }
 
 #[cfg(feature = "cuda")]

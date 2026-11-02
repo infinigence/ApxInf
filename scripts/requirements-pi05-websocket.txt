@@ -2,8 +2,10 @@
 # The compiled CUDA binding `apxinf_py` must be installed separately (maturin);
 # it also carries the tokenizer, so SentencePiece is not a runtime dependency.
 # The pure-Python `apxinf` package is imported from ../python/apxinf.
+# websockets 15 is the floor for `scripts/pi05_remote_client.py`, which names
+# `proxy=` when it connects; 14 passes it through to create_connection and raises.
 msgpack>=1.0.5
 numpy>=1.22.4
 Pillow>=9.0.0
 typing_extensions>=4.12
-websockets>=14.0
+websockets>=15.0

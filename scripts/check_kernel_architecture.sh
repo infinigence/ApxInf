@@ -100,7 +100,8 @@ fail_if_present 'std::env::|env::var(_os)?' \
     crates/apxinf-cuda/src/kernels -g '*.rs'
 fail_if_present 'crate::launch|launch::|mod launch' \
     'removed launch layer is still referenced' \
-    crates/apxinf-cuda/src crates/apxinf-model/src/pi05 -g '*.rs'
+    crates/apxinf-cuda/src crates/apxinf-model/src/pi05 \
+    crates/apxinf-model/src/hip_pi05 crates/apxinf-model/src/musa_pi05 -g '*.rs'
 fail_if_present 'kernels::(bf16|fp8|w8a8|decode)(::|\b)' \
     'callers must use physical operator modules, not precision/stage modules' \
     crates/apxinf-cuda/src crates/apxinf-model/src -g '*.rs'
