@@ -16,6 +16,10 @@ see the [design](../../doc/coreml-ane.md). No Python or coremltools is used.
 
 Other operations are rejected until added with a test. Operations and their
 constants are named as coremltools 9.0 `mb.program` names them.
+`input` returns `Result<Var>` and rejects zero or unrepresentable dimensions
+and overflowing element counts before adding the input. Weight and operation
+shape checks also precede builder mutation. Scalar shapes (`[]`) remain valid;
+`split` sizes and axes must additionally fit their INT32 parameters.
 
 `Package::write` writes the `.mlpackage` directory: a fixed `Manifest.json`,
 `model.mlmodel` and a MILBlob version 2 `weight.bin`. The protobuf subset in

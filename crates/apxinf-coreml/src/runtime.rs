@@ -286,7 +286,7 @@ mod tests {
 
     fn package() -> Package {
         let mut builder = ProgramBuilder::new();
-        let input = builder.input("x", &[1]);
+        let input = builder.input("x", &[1]).unwrap();
         builder.finish(&[&input]).unwrap()
     }
 

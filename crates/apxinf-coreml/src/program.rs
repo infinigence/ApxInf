@@ -48,11 +48,13 @@ fn tensor_type(dtype: i32, shape: &[usize]) -> proto::ValueType {
     proto::ValueType {
         tensor_type: Some(proto::TensorType {
             data_type: dtype,
-            rank: shape.len() as i64,
+            rank: i64::try_from(shape.len()).expect("validated shape rank"),
             dimensions: shape
                 .iter()
                 .map(|&size| proto::Dimension {
-                    constant: Some(proto::ConstantDimension { size: size as u64 }),
+                    constant: Some(proto::ConstantDimension {
+                        size: u64::try_from(size).expect("validated shape dimension"),
+                    }),
                 })
                 .collect(),
         }),
@@ -93,6 +95,19 @@ fn contract(message: &'static str) -> Error {
     Error::Contract(message)
 }
 
+fn shape_elements(shape: &[usize]) -> Result<usize> {
+    i64::try_from(shape.len()).map_err(|_| contract("ML Program rank exceeds int64"))?;
+    shape.iter().try_fold(1usize, |count, &dimension| {
+        if dimension == 0 {
+            return Err(contract("ML Program dimensions must be positive"));
+        }
+        i64::try_from(dimension).map_err(|_| contract("ML Program dimension exceeds int64"))?;
+        count
+            .checked_mul(dimension)
+            .ok_or_else(|| contract("ML Program element count overflows usize"))
+    })
+}
+
 /// Numpy-style broadcast of two static shapes of equal rank.
 fn broadcast(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
     if b.is_empty() {
@@ -125,14 +140,15 @@ impl ProgramBuilder {
     }
 
     /// An FP16 function input.
-    pub fn input(&mut self, name: &str, shape: &[usize]) -> Var {
+    pub fn input(&mut self, name: &str, shape: &[usize]) -> Result<Var> {
+        shape_elements(shape)?;
         let var = Var {
             name: name.to_owned(),
             dtype: data_type::FLOAT16,
             shape: shape.to_vec(),
         };
         self.inputs.push(var.clone());
-        var
+        Ok(var)
     }
 
     fn op_name(&mut self, kind: &'static str, name: Option<&str>) -> String {
@@ -237,8 +253,8 @@ impl ProgramBuilder {
         scale: &[f16],
         scale_shape: &[usize],
     ) -> Result<Var> {
-        if data.len() != shape.iter().product::<usize>()
-            || scale.len() != scale_shape.iter().product::<usize>()
+        if data.len() != shape_elements(shape)?
+            || scale.len() != shape_elements(scale_shape)?
             || broadcast(shape, scale_shape)? != shape
         {
             return Err(contract(
@@ -287,6 +303,8 @@ impl ProgramBuilder {
         if cin != wcin || kh > h || kw > w {
             return Err(contract("conv weight does not fit the input"));
         }
+        let shape = vec![n, cout, h - kh + 1, w - kw + 1];
+        shape_elements(&shape)?;
         let name = self.op_name("conv", None);
         let strides = self.ints(&name, "strides", &[1, 1], false);
         let pad_type = immediate(
@@ -303,7 +321,7 @@ impl ProgramBuilder {
         let out = Var {
             name: name.clone(),
             dtype: data_type::FLOAT16,
-            shape: vec![n, cout, h - kh + 1, w - kw + 1],
+            shape,
         };
         let inputs = [
             ("x", x),
@@ -328,6 +346,14 @@ impl ProgramBuilder {
         y: Operand<'_>,
         name: Option<&str>,
     ) -> Result<Var> {
+        let shape = broadcast(
+            &x.shape,
+            match &y {
+                Operand::Var(v) => &v.shape,
+                Operand::Scalar(_) => &[],
+            },
+        )?;
+        shape_elements(&shape)?;
         let name = self.op_name(kind, name);
         let y = match y {
             Operand::Var(v) => v.clone(),
@@ -345,7 +371,7 @@ impl ProgramBuilder {
         let out = Var {
             name: name.clone(),
             dtype: data_type::FLOAT16,
-            shape: broadcast(&x.shape, &y.shape)?,
+            shape,
         };
         let inputs = [("x".to_owned(), by_name(x)), ("y".to_owned(), by_name(&y))].into();
         self.push(kind, &name, inputs, std::slice::from_ref(&out));
@@ -412,11 +438,13 @@ impl ProgramBuilder {
             .shape
             .iter()
             .enumerate()
-            .filter_map(|(i, &d)| match axes.contains(&(i as i32)) {
-                true if keep_dims => Some(1),
-                true => None,
-                false => Some(d),
-            })
+            .filter_map(
+                |(i, &d)| match axes.iter().any(|&a| usize::try_from(a) == Ok(i)) {
+                    true if keep_dims => Some(1),
+                    true => None,
+                    false => Some(d),
+                },
+            )
             .collect();
         let out = Var {
             name: name.clone(),
@@ -433,14 +461,23 @@ impl ProgramBuilder {
 
     /// `split` along a non-negative `axis` into parts of `sizes`.
     pub fn split(&mut self, x: &Var, sizes: &[usize], axis: usize) -> Result<Vec<Var>> {
-        if axis >= x.shape.len() || sizes.iter().sum::<usize>() != x.shape[axis] || sizes.is_empty()
+        let total = sizes.iter().try_fold(0usize, |sum, &size| {
+            sum.checked_add(size)
+                .ok_or_else(|| contract("ML Program split size sum overflows usize"))
+        })?;
+        if axis >= x.shape.len() || total != x.shape[axis] || sizes.is_empty() || sizes.contains(&0)
         {
             return Err(contract("split sizes must add up to the axis"));
         }
+        let sizes_i32: Vec<i32> = sizes
+            .iter()
+            .map(|&s| i32::try_from(s).map_err(|_| contract("ML Program split size exceeds int32")))
+            .collect::<Result<_>>()?;
+        let axis_i32 =
+            i32::try_from(axis).map_err(|_| contract("ML Program split axis exceeds int32"))?;
         let name = self.op_name("split", None);
-        let sizes_i32: Vec<i32> = sizes.iter().map(|&s| s as i32).collect();
         let sizes_var = self.ints(&name, "split_sizes", &sizes_i32, false);
-        let axis_var = self.ints(&name, "axis", &[axis as i32], true);
+        let axis_var = self.ints(&name, "axis", &[axis_i32], true);
         let outs: Vec<Var> = sizes
             .iter()
             .enumerate()
@@ -472,7 +509,11 @@ impl ProgramBuilder {
             short_description: String::new(),
             r#type: Some(proto::FeatureType {
                 multi_array_type: Some(proto::ArrayFeatureType {
-                    shape: v.shape.iter().map(|&d| d as i64).collect(),
+                    shape: v
+                        .shape
+                        .iter()
+                        .map(|&d| i64::try_from(d).expect("validated shape dimension"))
+                        .collect(),
                     data_type: proto::ARRAY_FLOAT16,
                 }),
                 is_optional: false,
@@ -576,7 +617,7 @@ mod tests {
     #[test]
     fn names_follow_coremltools_counters_and_named_ops() {
         let mut b = ProgramBuilder::new();
-        let x = b.input("x", &[1, 4, 1, 8]);
+        let x = b.input("x", &[1, 4, 1, 8]).unwrap();
         let w = b
             .constexpr_blockwise_shift_scale(&[1; 8], &[2, 4, 1, 1], &[f16::ONE; 2], &[2, 1, 1, 1])
             .unwrap();
@@ -637,7 +678,7 @@ mod tests {
     #[test]
     fn invalid_programs_are_rejected() {
         let mut b = ProgramBuilder::new();
-        let x = b.input("x", &[1, 4, 1, 8]);
+        let x = b.input("x", &[1, 4, 1, 8]).unwrap();
         assert!(b
             .constexpr_blockwise_shift_scale(&[1; 7], &[2, 4, 1, 1], &[f16::ONE; 2], &[2, 1, 1, 1])
             .is_err());
@@ -647,7 +688,113 @@ mod tests {
         assert!(b.conv(&x, &w).is_err());
         assert!(b.split(&x, &[3], 1).is_err());
         assert!(b.reduce_max(&x, &[4], true).is_err());
-        let wide = b.input("z", &[1, 3, 1, 8]);
+        let wide = b.input("z", &[1, 3, 1, 8]).unwrap();
         assert!(b.mul(&x, Operand::Var(&wide), None).is_err());
+    }
+
+    #[test]
+    fn invalid_input_shapes_leave_the_builder_unchanged() {
+        let mut b = ProgramBuilder::new();
+        for shape in [&[0][..], &[2, 0], &[usize::MAX, 2], &[i64::MAX as usize, 3]] {
+            assert!(b.input("invalid", shape).is_err());
+            assert!(b.inputs.is_empty());
+            assert!(b.operations.is_empty());
+            assert!(b.counts.is_empty());
+        }
+        let scalar = b.input("scalar", &[]).unwrap();
+        let package = b.finish(&[&scalar]).unwrap();
+        assert!(package.model.description.unwrap().input[0]
+            .r#type
+            .as_ref()
+            .unwrap()
+            .multi_array_type
+            .as_ref()
+            .unwrap()
+            .shape
+            .is_empty());
+    }
+
+    #[test]
+    fn invalid_weight_shapes_do_not_append_blobs_or_operations() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1]).unwrap();
+        for shape in [&[0][..], &[usize::MAX, 2], &[i64::MAX as usize, 3]] {
+            assert!(b
+                .constexpr_blockwise_shift_scale(&[], shape, &[f16::ONE], &[])
+                .is_err());
+        }
+        assert!(b
+            .constexpr_blockwise_shift_scale(&[1], &[1], &[], &[usize::MAX, 2])
+            .is_err());
+        assert!(b.operations.is_empty());
+        assert!(b.counts.is_empty());
+        let actual = b.finish(&[&x]).unwrap();
+        let mut clean = ProgramBuilder::new();
+        let x = clean.input("x", &[1]).unwrap();
+        let expected = clean.finish(&[&x]).unwrap();
+        assert_eq!(actual.model_bytes(), expected.model_bytes());
+        assert_eq!(actual.weights, expected.weights);
+    }
+
+    #[test]
+    fn split_rejects_overflow_truncation_and_zero_without_mutation() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[2]).unwrap();
+        let large = b.input("large", &[i32::MAX as usize + 1]).unwrap();
+        for sizes in [&[usize::MAX, 3][..], &[0, 2], &[]] {
+            assert!(b.split(&x, sizes, 0).is_err());
+        }
+        assert!(b.split(&large, &[i32::MAX as usize + 1], 0).is_err());
+        assert!(b.operations.is_empty());
+        assert!(b.counts.is_empty());
+        let parts = b.split(&x, &[1, 1], 0).unwrap();
+        assert_eq!(parts[0].name(), "split_0_0");
+        let package = b.finish(&[&parts[0]]).unwrap();
+        assert_eq!(&package.weights[0..4], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn derived_shapes_are_checked_before_emitting_constants() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[i64::MAX as usize, 1]).unwrap();
+        let y = b.input("y", &[1, 3]).unwrap();
+        assert!(b.mul(&x, Operand::Var(&y), None).is_err());
+        assert!(b.counts.is_empty());
+        assert!(b.operations.is_empty());
+        let x = b.input("image", &[i64::MAX as usize, 1, 1, 1]).unwrap();
+        let w = b
+            .constexpr_blockwise_shift_scale(&[1; 3], &[3, 1, 1, 1], &[f16::ONE], &[])
+            .unwrap();
+        let before = b.operations.clone();
+        let counts = b.counts.clone();
+        assert!(b.conv(&x, &w).is_err());
+        assert_eq!(b.operations, before);
+        assert_eq!(b.counts, counts);
+    }
+
+    #[test]
+    fn scalar_and_int32_boundary_shapes_remain_supported() {
+        let mut b = ProgramBuilder::new();
+        let scalar = b
+            .constexpr_blockwise_shift_scale(&[2], &[], &[f16::ONE], &[])
+            .unwrap();
+        let scalar = b.mul(&scalar, Operand::Scalar(f16::ONE), None).unwrap();
+        assert!(scalar.shape().is_empty());
+        let large = b.input("large", &[i32::MAX as usize]).unwrap();
+        let parts = b.split(&large, &[i32::MAX as usize], 0).unwrap();
+        assert_eq!(parts[0].shape(), &[i32::MAX as usize]);
+        let package = b.finish(&[&scalar, &parts[0]]).unwrap();
+        let description = package.model.description.unwrap();
+        assert_eq!(
+            description.output[1]
+                .r#type
+                .as_ref()
+                .unwrap()
+                .multi_array_type
+                .as_ref()
+                .unwrap()
+                .shape,
+            &[i64::from(i32::MAX)]
+        );
     }
 }

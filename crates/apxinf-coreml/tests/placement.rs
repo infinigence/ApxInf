@@ -52,8 +52,8 @@ fn native_plan_binds_cpu_configuration_and_rejects_before_publication() -> Resul
     let root =
         std::env::temp_dir().join(format!("apxinf-placement-{}-{nonce}", std::process::id()));
     let mut builder = ProgramBuilder::new();
-    let input = builder.input("x", &[1, 8, 1, 16]);
-    let other = builder.input("other", &[1, 8, 1, 16]);
+    let input = builder.input("x", &[1, 8, 1, 16])?;
+    let other = builder.input("other", &[1, 8, 1, 16])?;
     let sum = builder.add(&input, apxinf_coreml::Operand::Var(&other), None)?;
     let output = builder.tanh(&sum);
     let package = builder.finish(&[&output])?;

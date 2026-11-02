@@ -91,7 +91,7 @@ fn scalar(model: &proto::Model, name: &str) -> f16 {
 fn int8_mlp_program(model: &proto::Model, weights: &[u8]) -> Result<apxinf_coreml::Package> {
     let q = quantized(model, weights);
     let mut b = ProgramBuilder::new();
-    let x = b.input("x", &[1, 4096, 1, 512]);
+    let x = b.input("x", &[1, 4096, 1, 512])?;
     let w = |b: &mut ProgramBuilder, i: usize| {
         b.constexpr_blockwise_shift_scale(&q[i].0, &q[i].1, &q[i].2, &q[i].3)
     };
@@ -165,7 +165,7 @@ fn written_and_recorded_programs_predict_identical_bits() -> Result<()> {
     )?;
     cache.seal();
     let mut other = ProgramBuilder::new();
-    let x = other.input("x", &[1, 4, 1, 1]);
+    let x = other.input("x", &[1, 4, 1, 1])?;
     let id = other.identity(&x, Some("y"));
     assert!(
         cache
