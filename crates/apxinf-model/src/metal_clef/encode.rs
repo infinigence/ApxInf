@@ -210,13 +210,11 @@ pub fn render(value: &Value) -> Result<String> {
 }
 
 pub fn encode(tokenizer: &Tokenizer, schema: &DecisionSchema) -> Result<Encoded> {
+    schema.validate()?;
     let tokens = |text: &str| tokenizer.encode_with_special_tokens(text, false);
     let mut schema_ids = tokens("\n\nSCHEMA FIELDS:\n")?;
     let mut questions = Vec::with_capacity(schema.questions.len());
     for (qi, question) in schema.questions.iter().enumerate() {
-        if question.id.is_empty() {
-            return Err(invalid("question IDs must be nonempty strings".into()));
-        }
         let (kind, options) = options(question)?;
         schema_ids.extend(tokens(&format!(
             "\nFIELD {}\nID: {}\nTYPE: {}\nINSTRUCTION: ",
@@ -326,6 +324,84 @@ mod tests {
             instructions: None,
             criteria,
         }
+    }
+
+    fn test_tokenizer(usable: bool) -> Tokenizer {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../devlocal/clef-schema-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("tokenizer-{}-{next}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            json!({
+                "version": "1.0", "truncation": null, "padding": null,
+                "added_tokens": [], "normalizer": null, "pre_tokenizer": null,
+                "post_processor": null, "decoder": null,
+                "model": {"type": "WordLevel", "vocab": {"[UNK]": 0},
+                    "unk_token": if usable { "[UNK]" } else { "missing" }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let tokenizer = Tokenizer::from_file(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        tokenizer
+    }
+
+    #[test]
+    fn direct_schema_invariants_are_checked_before_tokenization() {
+        let tokenizer = test_tokenizer(true);
+        let unusable = test_tokenizer(false);
+        assert!(unusable.encode("unrecognized").is_err());
+        let q = question("noul", None);
+        let mut empty_id = q.clone();
+        empty_id.id.clear();
+        for (questions, message) in [
+            (vec![], "at least one question is required"),
+            (vec![empty_id], "question IDs must be nonempty strings"),
+            (vec![q.clone(), q], "duplicate question `q`"),
+        ] {
+            let schema = DecisionSchema {
+                state: Value::Null,
+                questions,
+            };
+            assert!(encode(&tokenizer, &schema).is_err());
+            assert!(encode(&unusable, &schema)
+                .unwrap_err()
+                .to_string()
+                .contains(message));
+        }
+    }
+
+    #[test]
+    fn direct_and_json_schemas_encode_identically_in_request_order() {
+        let tokenizer = test_tokenizer(true);
+        let direct = DecisionSchema {
+            state: json!("state"),
+            questions: ["zeta", "alpha"]
+                .into_iter()
+                .map(|id| DecisionQuestion {
+                    id: id.into(),
+                    ..question("noul", None)
+                })
+                .collect(),
+        };
+        let parsed = DecisionSchema::from_json(
+            r#"{"state":"state","questions":{"zeta":{"type":"noul"},"alpha":{"type":"noul"}}}"#,
+        )
+        .unwrap();
+        let encoded = encode(&tokenizer, &direct).unwrap();
+        assert_eq!(encoded, encode(&tokenizer, &parsed).unwrap());
+        assert_eq!(
+            encoded
+                .questions
+                .iter()
+                .map(|q| q.id.as_str())
+                .collect::<Vec<_>>(),
+            ["zeta", "alpha"]
+        );
     }
 
     #[test]

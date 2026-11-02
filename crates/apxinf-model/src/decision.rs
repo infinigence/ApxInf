@@ -1,6 +1,6 @@
 //! Model-neutral decision API, shared by decision families (d3, metal_clef).
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use apxinf_core::{Error, Result};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
@@ -58,6 +58,24 @@ pub struct DecisionQuestion {
 }
 
 impl DecisionSchema {
+    /// Checks the question-list invariants for parsed and directly constructed requests.
+    pub fn validate(&self) -> Result<()> {
+        let invalid = |message: String| Error::Other(format!("decision request: {message}"));
+        if self.questions.is_empty() {
+            return Err(invalid("at least one question is required".into()));
+        }
+        let mut ids = HashSet::with_capacity(self.questions.len());
+        for question in &self.questions {
+            if question.id.is_empty() {
+                return Err(invalid("question IDs must be nonempty strings".into()));
+            }
+            if !ids.insert(question.id.as_str()) {
+                return Err(invalid(format!("duplicate question `{}`", question.id)));
+            }
+        }
+        Ok(())
+    }
+
     /// Parses `{"state": ..., "questions": {"<id>": {"type", "instructions"?,
     /// "criteria"?}, ...}}`. Questions keep their document order; duplicate
     /// question IDs and unknown fields are rejected.
@@ -97,20 +115,12 @@ impl<'de> Deserialize<'de> for DecisionSchema {
                     ) -> std::result::Result<Questions, A::Error> {
                         let mut out: Vec<DecisionQuestion> = Vec::new();
                         while let Some((id, q)) = map.next_entry::<String, Question>()? {
-                            if out.iter().any(|existing| existing.id == id) {
-                                return Err(de::Error::custom(format!(
-                                    "duplicate question `{id}`"
-                                )));
-                            }
                             out.push(DecisionQuestion {
                                 id,
                                 kind: q.kind,
                                 instructions: q.instructions,
                                 criteria: q.criteria,
                             });
-                        }
-                        if out.is_empty() {
-                            return Err(de::Error::custom("at least one question is required"));
                         }
                         Ok(Questions(out))
                     }
@@ -119,10 +129,12 @@ impl<'de> Deserialize<'de> for DecisionSchema {
             }
         }
         let body = Body::deserialize(deserializer)?;
-        Ok(Self {
+        let schema = Self {
             state: body.state,
             questions: body.questions.0,
-        })
+        };
+        schema.validate().map_err(de::Error::custom)?;
+        Ok(schema)
     }
 }
 
@@ -271,6 +283,57 @@ mod tests {
             ..output
         };
         assert!(invalid.selected().is_err());
+    }
+
+    #[test]
+    fn direct_and_json_schemas_share_question_invariants() {
+        let question = |id: &str| DecisionQuestion {
+            id: id.into(),
+            kind: "noul".into(),
+            instructions: None,
+            criteria: None,
+        };
+        for (questions, json, message) in [
+            (
+                vec![],
+                r#"{"state":null,"questions":{}}"#,
+                "at least one question is required",
+            ),
+            (
+                vec![question("")],
+                r#"{"state":null,"questions":{"":{"type":"noul"}}}"#,
+                "question IDs must be nonempty strings",
+            ),
+            (
+                vec![question("q"), question("q")],
+                r#"{"state":null,"questions":{"q":{"type":"noul"},"q":{"type":"noul"}}}"#,
+                "duplicate question `q`",
+            ),
+        ] {
+            let direct = DecisionSchema {
+                state: serde_json::Value::Null,
+                questions,
+            };
+            assert!(direct.validate().unwrap_err().to_string().contains(message));
+            assert!(DecisionSchema::from_json(json)
+                .unwrap_err()
+                .to_string()
+                .contains(message));
+            assert!(serde_json::from_str::<DecisionSchema>(json).is_err());
+        }
+
+        let direct = DecisionSchema {
+            state: serde_json::Value::Null,
+            questions: vec![question("zeta"), question("alpha")],
+        };
+        direct.validate().unwrap();
+        assert_eq!(
+            direct,
+            DecisionSchema::from_json(
+                r#"{"state":null,"questions":{"zeta":{"type":"noul"},"alpha":{"type":"noul"}}}"#
+            )
+            .unwrap()
+        );
     }
 
     #[test]
