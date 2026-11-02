@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "snapshot",
+    "review_status",
+    "verdict",
+    "summary",
+    "overall_impact",
+    "coverage_notes",
+    "findings"
+  ],
+  "properties": {
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "pr_number",
+        "base_sha",
+        "head_sha",
+        "merge_base_sha",
+        "changed_files",
+        "additions",
+        "deletions"
+      ],
+      "properties": {
+        "repository": { "type": "string" },
+        "pr_number": { "type": "integer", "minimum": 1 },
+        "base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "merge_base_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "changed_files": { "type": "integer", "minimum": 0 },
+        "additions": { "type": "integer", "minimum": 0 },
+        "deletions": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "review_status": {
+      "type": "string",
+      "enum": ["COMPLETE", "INCOMPLETE"]
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["BLOCK", "NEEDS_WORK", "LGTM"]
+    },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "overall_impact": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "coverage_notes": {
+      "type": "array",
+      "maxItems": 30,
+      "items": { "type": "string", "minLength": 1, "maxLength": 1000 }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "priority",
+          "title",
+          "body",
+          "path",
+          "line",
+          "side",
+          "trigger",
+          "impact",
+          "suggestion"
+        ],
+        "properties": {
+          "priority": { "type": "string", "enum": ["P0", "P1", "P2"] },
+          "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+          "body": { "type": "string", "minLength": 1, "maxLength": 3000 },
+          "path": { "type": "string", "minLength": 1, "maxLength": 1000 },
+          "line": { "type": "integer", "minimum": 1 },
+          "side": { "type": "string", "enum": ["LEFT", "RIGHT"] },
+          "trigger": { "type": "string", "minLength": 1, "maxLength": 1500 },
+          "impact": { "type": "string", "minLength": 1, "maxLength": 1500 },
+          "suggestion": { "type": "string", "minLength": 1, "maxLength": 1500 }
+        }
+      }
+    }
+  }
+}

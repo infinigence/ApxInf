@@ -1,0 +1,180 @@
+name: ApxInf AI review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+
+concurrency:
+  group: apxinf-ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze PR
+    if: >-
+      !github.event.pull_request.draft &&
+      github.actor != 'dependabot[bot]' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ai-review') &&
+      (
+        github.event.pull_request.head.repo.full_name == github.repository ||
+        contains(github.event.pull_request.labels.*.name, 'ai-review')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - name: Check out the trusted base revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          # The collector needs one authenticated fetch of refs/pull/<n>/head.
+          # Credentials are removed and verified absent before Codex starts.
+          persist-credentials: true
+
+      - name: Install the trusted review skill
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          set -euo pipefail
+          mkdir -p "$CODEX_HOME/skills"
+          cp -R .github/skills/apxinf-code-review "$CODEX_HOME/skills/"
+
+      - name: Collect the immutable review snapshot
+        id: context
+        env:
+          REVIEW_CONTEXT: devlocal/apxinf-auto-review/review-context.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$REVIEW_CONTEXT")"
+          python3 .github/codex/scripts/collect_pr_context.py \
+            --event "$GITHUB_EVENT_PATH" \
+            --output "$REVIEW_CONTEXT"
+
+      - name: Remove checkout credentials before Codex
+        run: |
+          set -euo pipefail
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          if git config --local --get-regexp 'extraheader|authorization'; then
+            echo 'Git credentials remain in the checkout configuration.' >&2
+            exit 1
+          fi
+
+      - name: Run one read-only Codex review
+        id: codex
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1
+        with:
+          openai-api-key: ${{ secrets.CODEX_REVIEW_API_KEY }}
+          responses-api-endpoint: ${{ vars.CODEX_RESPONSES_API_ENDPOINT }}
+          model: ${{ vars.CODEX_REVIEW_MODEL || 'gpt-5.6-sol' }}
+          codex-home: ${{ runner.temp }}/codex-home
+          prompt-file: .github/codex/review-prompt.md
+          output-file: devlocal/apxinf-auto-review/review.json
+          output-schema-file: .github/codex/review-schema.json
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+          allow-users: "*"
+          effort: high
+          codex-args: '["--ephemeral"]'
+
+      - name: Validate and render the review
+        env:
+          REVIEW_CONTEXT: devlocal/apxinf-auto-review/review-context.json
+          REVIEW_JSON: devlocal/apxinf-auto-review/review.json
+          REVIEW_MARKDOWN: devlocal/apxinf-auto-review/review.md
+        run: |
+          set -euo pipefail
+          python3 .github/codex/scripts/validate_review.py \
+            --context "$REVIEW_CONTEXT" \
+            --review "$REVIEW_JSON" \
+            --markdown-output "$REVIEW_MARKDOWN"
+
+      - name: Preserve the validated report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: apxinf-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: |
+            devlocal/apxinf-auto-review/review-context.json
+            devlocal/apxinf-auto-review/review.json
+            devlocal/apxinf-auto-review/review.md
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish validated review
+    needs: analyze
+    if: needs.analyze.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Download the validated report
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: apxinf-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: review-artifact
+
+      - name: Verify the head and update the review comment
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          REVIEW_FILE: review-artifact/review.md
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- apxinf-ai-review -->';
+            const prNumber = context.payload.pull_request.number;
+            const { owner, repo } = context.repo;
+
+            const { data: current } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+            if (current.head.sha !== process.env.EXPECTED_HEAD) {
+              core.setFailed(
+                `PR head changed from ${process.env.EXPECTED_HEAD} to ${current.head.sha}; refusing to publish a stale review.`,
+              );
+              return;
+            }
+
+            const body = fs.readFileSync(process.env.REVIEW_FILE, 'utf8');
+            if (!body.includes(marker)) {
+              core.setFailed('Validated review is missing its publication marker.');
+              return;
+            }
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: prNumber, per_page: 100 },
+            );
+            const previous = comments.find(
+              (comment) => comment.user?.type === 'Bot' && comment.body?.includes(marker),
+            );
+
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: previous.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body,
+              });
+            }

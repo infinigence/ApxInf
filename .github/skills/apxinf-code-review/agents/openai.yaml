@@ -1,0 +1,4 @@
+interface:
+  display_name: "ApxInf Code Review"
+  short_description: "Evidence-based, version-pinned review for ApxInf pull requests"
+  default_prompt: "Use $apxinf-code-review to review this ApxInf pull request with version-pinned evidence and actionable findings."
