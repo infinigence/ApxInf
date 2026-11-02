@@ -1,11 +1,17 @@
 name: ApxInf AI review
 
 on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [labeled]
 
 concurrency:
-  group: apxinf-ai-review-${{ github.event.pull_request.number }}
+  group: apxinf-ai-review-${{ inputs.pr_number || github.event.pull_request.number }}
   cancel-in-progress: true
 
 permissions:
@@ -14,14 +20,13 @@ permissions:
 jobs:
   analyze:
     name: Analyze PR
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      base_sha: ${{ steps.pr.outputs.base_sha }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
     if: >-
-      !github.event.pull_request.draft &&
-      github.actor != 'dependabot[bot]' &&
-      (github.event.action != 'labeled' || github.event.label.name == 'ai-review') &&
-      (
-        github.event.pull_request.head.repo.full_name == github.repository ||
-        contains(github.event.pull_request.labels.*.name, 'ai-review')
-      )
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'ai-review'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -29,10 +34,56 @@ jobs:
       pull-requests: read
 
     steps:
+      - name: Resolve the requested pull request
+        id: pr
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          DISPATCH_PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEW_EVENT: ${{ runner.temp }}/review-event.json
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const requested = context.eventName === 'workflow_dispatch'
+              ? process.env.DISPATCH_PR_NUMBER
+              : context.payload.pull_request?.number;
+            const prNumber = Number(requested);
+            if (!Number.isSafeInteger(prNumber) || prNumber < 1) {
+              core.setFailed(`Invalid pull request number: ${requested}`);
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+            if (pr.state !== 'open') {
+              core.setFailed(`Pull request #${prNumber} is ${pr.state}, not open.`);
+              return;
+            }
+            if (pr.draft) {
+              core.setFailed(`Pull request #${prNumber} is still a draft.`);
+              return;
+            }
+
+            fs.writeFileSync(
+              process.env.REVIEW_EVENT,
+              JSON.stringify({
+                repository: { full_name: `${owner}/${repo}` },
+                pull_request: pr,
+              }),
+              { encoding: 'utf8', mode: 0o600 },
+            );
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('base_sha', pr.base.sha);
+            core.setOutput('head_sha', pr.head.sha);
+
       - name: Check out the trusted base revision
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          ref: ${{ steps.pr.outputs.base_sha }}
           fetch-depth: 0
           # The collector needs one authenticated fetch of refs/pull/<n>/head.
           # Credentials are removed and verified absent before Codex starts.
@@ -50,11 +101,12 @@ jobs:
         id: context
         env:
           REVIEW_CONTEXT: devlocal/apxinf-auto-review/review-context.json
+          REVIEW_EVENT: ${{ runner.temp }}/review-event.json
         run: |
           set -euo pipefail
           mkdir -p "$(dirname "$REVIEW_CONTEXT")"
           python3 .github/codex/scripts/collect_pr_context.py \
-            --event "$GITHUB_EVENT_PATH" \
+            --event "$REVIEW_EVENT" \
             --output "$REVIEW_CONTEXT"
 
       - name: Remove checkout credentials before Codex
@@ -98,7 +150,7 @@ jobs:
       - name: Preserve the validated report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: apxinf-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          name: apxinf-review-${{ steps.pr.outputs.pr_number }}-${{ steps.pr.outputs.head_sha }}
           path: |
             devlocal/apxinf-auto-review/review-context.json
             devlocal/apxinf-auto-review/review.json
@@ -121,20 +173,21 @@ jobs:
       - name: Download the validated report
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: apxinf-review-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          name: apxinf-review-${{ needs.analyze.outputs.pr_number }}-${{ needs.analyze.outputs.head_sha }}
           path: review-artifact
 
       - name: Verify the head and update the review comment
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ needs.analyze.outputs.pr_number }}
+          EXPECTED_HEAD: ${{ needs.analyze.outputs.head_sha }}
           REVIEW_FILE: review-artifact/review.md
         with:
           github-token: ${{ github.token }}
           script: |
             const fs = require('fs');
             const marker = '<!-- apxinf-ai-review -->';
-            const prNumber = context.payload.pull_request.number;
+            const prNumber = Number(process.env.PR_NUMBER);
             const { owner, repo } = context.repo;
 
             const { data: current } = await github.rest.pulls.get({

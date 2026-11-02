@@ -16,8 +16,8 @@ used by `.github/workflows/apxinf-ai-review.yml`.
 - The separate `publish` job receives only validated artifacts and is the only
   job with permission to update a PR comment. It refuses to publish if the PR
   head changed after analysis.
-- Same-repository PRs run automatically. Fork PRs require a maintainer to add
-  the `ai-review` label.
+- Ordinary PR pushes never invoke the model. Maintainers trigger a review from
+  the Actions page with a PR number or by adding the `ai-review` label.
 
 ## Repository setup
 
@@ -29,8 +29,10 @@ used by `.github/workflows/apxinf-ai-review.yml`.
    `https://cloud.infini-ai.com/maas/v1/responses` and `gpt-5.6-sol`.
 3. Merge the workflow into the default branch. GitHub does not run a newly
    introduced `pull_request_target` workflow from the PR that introduces it.
-4. Create the `ai-review` label for explicitly authorized fork reviews.
-5. Open a small same-repository test PR. Confirm that the `analyze` job uploads
+4. Create the `ai-review` label for the PR-page manual trigger.
+5. Open a small test PR, then either run **ApxInf AI review** from the Actions
+   page with its PR number or add the `ai-review` label. Confirm that the
+   `analyze` job uploads
    one JSON/Markdown artifact and the `publish` job creates or updates one
    comment containing `<!-- apxinf-ai-review -->`.
 6. Keep the workflow advisory while evaluating false positives. Do not make it
@@ -43,8 +45,10 @@ PR is therefore a compatibility qualification, not just a credential check.
 
 ## Cost controls
 
-- One Codex invocation per PR head.
-- Concurrency cancellation discards superseded runs after a new push.
+- No invocation occurs on `opened`, `synchronize`, `reopened`, or
+  `ready_for_review`; each review requires an explicit maintainer action.
+- Concurrency cancellation prevents two manually requested reviews of the same
+  PR from consuming tokens simultaneously.
 - The complete pinned comparison is reviewed with `gpt-5.6-sol` at high
   reasoning effort. This favors review depth over per-run token cost.
 - The prompt contains only task constraints. Review rules live in the installed
