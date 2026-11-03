@@ -7,7 +7,10 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 
 use crate::accelerator::create_backend_with_recipe_options;
 use crate::builtin::register_builtin_models;
-use crate::d3::{DecisionInput, DecisionOutput, DecisionRuntime};
+use crate::decision::{
+    CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionSchema,
+    SchemaDecisionOutput,
+};
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
@@ -93,7 +96,7 @@ pub enum LoadedModel {
         generation_defaults: GenerationOptions,
     },
     Vla(Box<dyn VlaRuntime>),
-    Decision(Box<dyn DecisionRuntime>),
+    Decision(DecisionModel),
 }
 
 impl LoadedModel {
@@ -120,21 +123,41 @@ impl LoadedModel {
         }
     }
 
-    pub fn decision_mut(&mut self) -> Result<&mut dyn DecisionRuntime> {
+    pub fn decision_model_mut(&mut self) -> Result<&mut DecisionModel> {
         match self {
-            Self::Decision(model) => Ok(&mut **model),
+            Self::Decision(model) => Ok(model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
+    }
+
+    /// The encoded-prompt runtime of a code decision model.
+    pub fn decision_mut(&mut self) -> Result<&mut dyn CodeDecisionRuntime> {
+        self.decision_model_mut()?.code_mut()
     }
 
     pub fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
         self.decision_mut()?.decide(input)
     }
 
+    /// Score named schema questions on a schema decision model.
+    pub fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
+        self.decision_model_mut()?
+            .schema_mut()?
+            .decide_schema(request)
+    }
+
     pub fn decision_code_names(&self) -> Result<&[String]> {
         match self {
-            Self::Decision(model) => Ok(model.code_names()),
+            Self::Decision(model) => Ok(model.code()?.code_names()),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+        }
+    }
+
+    pub fn decision_capabilities(&self) -> Result<LlmCapabilities> {
+        match self {
+            Self::Decision(model) => Ok(model.capabilities()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
@@ -142,7 +165,7 @@ impl LoadedModel {
 
     pub fn decision_token_ids(&self) -> Result<&[u32]> {
         match self {
-            Self::Decision(model) => Ok(model.token_ids()),
+            Self::Decision(model) => Ok(model.code()?.token_ids()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
@@ -317,6 +340,10 @@ impl AutoModel {
         // Decision 3.0 deliberately preserves the base Qwen3.5 model_type in
         // config.json. Its package-level format is the discriminator; without
         // this check it is incorrectly routed to the Qwen3.8 NVFP4 loader.
+        // Clef keeps the Qwen3.5 model_type; its joint schema head identifies it.
+        if model_dir.join("joint_head_config.json").is_file() {
+            return Ok("clef".to_owned());
+        }
         let decision_path = model_dir.join("decision_config.json");
         if decision_path.is_file() {
             let raw = std::fs::read_to_string(&decision_path).map_err(|error| {

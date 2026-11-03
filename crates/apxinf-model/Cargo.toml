@@ -10,6 +10,7 @@ apxinf-mlx = { path = "../apxinf-mlx", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
 apxinf-hip = { path = "../apxinf-hip", optional = true }
 apxinf-loader = { path = "../apxinf-loader" }
+apxinf-tokenizer = { path = "../apxinf-tokenizer", optional = true }
 thiserror = "1"
 once_cell = "1"
 half = "2"
@@ -21,7 +22,7 @@ sha2 = { version = "0.10", optional = true }
 default = []
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
 cuda = ["dep:apxinf-cuda-new"]
-mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2"]
+mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # It no longer gates anything: `cuda` already pulls in `apxinf-cuda-new`, and
 # the model code that used to hide behind this flag now follows `cuda`.
@@ -92,3 +93,7 @@ required-features = ["cuda"]
 [[example]]
 name = "d3_decision_index"
 required-features = ["cuda"]
+
+[[example]]
+name = "clef_decision_index"
+required-features = ["mlx"]
