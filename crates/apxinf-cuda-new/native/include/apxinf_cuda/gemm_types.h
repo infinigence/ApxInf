@@ -28,6 +28,8 @@ typedef enum {
 typedef enum {
   APXINF_GEMM_NUMERICS_DEFAULT = 0,
   APXINF_GEMM_NUMERICS_LEGACY_CUBLAS = 1,
+  APXINF_GEMM_NUMERICS_STAGED_BIAS = 2,
+  APXINF_GEMM_NUMERICS_F32_REDUCTION = 3,
 } apxinf_gemm_numerics_t;
 
 typedef enum {
@@ -97,7 +99,23 @@ typedef struct {
   uint32_t output_scale_is_unit;
 } apxinf_gemm_spec_t;
 
-typedef apxinf_tuning_policy_t apxinf_gemm_policy_t;
+typedef enum {
+  APXINF_GEMM_ALGORITHM_ANY = 0,
+  APXINF_GEMM_ALGORITHM_COLD_BASELINE = 1,
+} apxinf_gemm_algorithm_policy_t;
+
+/* Policy ABI v1 is admitted only with GEMM Spec v9. Keep this extension local
+   to GEMM; Attention retains the shared tuning-policy layout. */
+typedef struct {
+  uint32_t version;
+  uint32_t algorithm;
+  uint64_t workspace_limit;
+  uint32_t online_tune;
+  uint32_t allow_fallback;
+  uint32_t graph_safe;
+  uint32_t deterministic;
+  const char* cache_dir;
+} apxinf_gemm_policy_t;
 
 typedef struct {
   const void* a;

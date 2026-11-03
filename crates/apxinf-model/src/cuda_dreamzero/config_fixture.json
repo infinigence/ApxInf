@@ -1,0 +1,59 @@
+{
+  "action_dim": 32,
+  "action_head_cfg": {
+    "_convert_": "object",
+    "_target_": "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead",
+    "config": {
+      "action_dim": 32,
+      "action_horizon": 24,
+      "decouple_inference_noise": false,
+      "decouple_video_action_noise": false,
+      "diffusion_model_cfg": {
+        "_convert_": "object",
+        "_target_": "groot.vla.model.dreamzero.modules.wan_video_dit_action_casual_chunk.CausalWanModel",
+        "diffusion_model_pretrained_path": null,
+        "dim": 5120,
+        "eps": 1e-06,
+        "ffn_dim": 13824,
+        "frame_seqlen": 880,
+        "freq_dim": 256,
+        "in_dim": 36,
+        "max_chunk_size": 4,
+        "model_type": "i2v",
+        "num_action_per_block": 24,
+        "num_frame_per_block": 2,
+        "num_heads": 40,
+        "num_layers": 40,
+        "num_state_per_block": 1,
+        "out_dim": 16
+      },
+      "image_encoder_cfg": {
+        "_convert_": "object",
+        "_target_": "groot.vla.model.dreamzero.modules.wan_video_image_encoder.WanImageEncoder",
+        "image_encoder_pretrained_path": null
+      },
+      "max_action_dim": 32,
+      "max_state_dim": 64,
+      "num_frame_per_block": 2,
+      "num_frames": 33,
+      "num_timestep_buckets": 1000,
+      "text_encoder_cfg": {
+        "_convert_": "object",
+        "_target_": "groot.vla.model.dreamzero.modules.wan_video_text_encoder.WanTextEncoder",
+        "text_encoder_pretrained_path": null
+      },
+      "tiled": false,
+      "train_architecture": "full",
+      "vae_cfg": {
+        "_convert_": "object",
+        "_target_": "groot.vla.model.dreamzero.modules.wan_video_vae.WanVideoVAE",
+        "vae_pretrained_path": null
+      }
+    }
+  },
+  "action_horizon": 24,
+  "backbone_cfg": {
+    "_target_": "groot.vla.model.dreamzero.backbone.identity.IdentityBackbone"
+  },
+  "model_type": "vla"
+}

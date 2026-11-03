@@ -370,6 +370,8 @@ pub fn split_qkv_vision(ctx: &CudaContext, args: VisionQkvRopeArgs<'_>) -> Resul
     };
     let normalized = Normalized {
         spec: abi::Spec {
+            norm_numerics: 0,
+            norm_weight_alignment: 0,
             version: abi::SPEC_VERSION,
             semantic: 5,
             dtype: 2,
@@ -395,6 +397,8 @@ pub fn split_qkv_vision(ctx: &CudaContext, args: VisionQkvRopeArgs<'_>) -> Resul
             cache_capacity: 0,
         },
         bindings: abi::Bindings {
+            norm_weight: std::ptr::null(),
+            norm_eps: 0.,
             qkv: qkv_buffer.ptr(),
             bias: bias_buffer.ptr(),
             q: q_buffer.ptr(),

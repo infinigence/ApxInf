@@ -112,6 +112,8 @@ fn normalize_axial(ctx: &CudaContext, args: AxialRopeArgs<'_>) -> Result<Normali
         AxialRopeNumerics::RoundedInput => (5, abi::CONVENTION_HALF_SPLIT_AXIAL_ROUNDED_INPUT),
     };
     let spec = abi::Spec {
+        norm_numerics: 0,
+        norm_weight_alignment: 0,
         version: abi::SPEC_VERSION,
         semantic,
         dtype: 2,
@@ -136,6 +138,8 @@ fn normalize_axial(ctx: &CudaContext, args: AxialRopeArgs<'_>) -> Result<Normali
         cache_capacity: 0,
     };
     let bindings = abi::Bindings {
+        norm_weight: std::ptr::null(),
+        norm_eps: 0.,
         qkv: qkv.ptr(),
         bias: bias_ptr,
         q: query.ptr(),
@@ -228,6 +232,8 @@ fn normalize_mrope_cache(ctx: &CudaContext, args: MropeCacheArgs<'_>) -> Result<
         .map(|buffer| buffer.ptr().cast_const())
         .unwrap_or(std::ptr::null());
     let spec = abi::Spec {
+        norm_numerics: 0,
+        norm_weight_alignment: 0,
         version: abi::SPEC_VERSION,
         semantic: abi::SEMANTIC_SPLIT_QKV_MROPE_CACHE,
         dtype: 2,
@@ -252,6 +258,8 @@ fn normalize_mrope_cache(ctx: &CudaContext, args: MropeCacheArgs<'_>) -> Result<
         cache_capacity: capacity as i64,
     };
     let bindings = abi::Bindings {
+        norm_weight: std::ptr::null(),
+        norm_eps: 0.,
         qkv: qkv.ptr(),
         bias: bias_ptr,
         q: query.ptr(),
@@ -306,6 +314,8 @@ fn normalize_multimodal(ctx: &CudaContext, args: MultimodalRopeArgs<'_>) -> Resu
     let data = tensor_storage(ctx, args.data, DType::BF16, tokens * heads * head_dim)?;
     let positions = tensor_storage(ctx, args.positions, DType::I32, tokens * 3)?;
     let spec = abi::Spec {
+        norm_numerics: 0,
+        norm_weight_alignment: 0,
         version: abi::SPEC_VERSION,
         semantic: 4,
         dtype: 2,
@@ -330,6 +340,8 @@ fn normalize_multimodal(ctx: &CudaContext, args: MultimodalRopeArgs<'_>) -> Resu
         cache_capacity: 0,
     };
     let bindings = abi::Bindings {
+        norm_weight: std::ptr::null(),
+        norm_eps: 0.,
         qkv: std::ptr::null(),
         bias: std::ptr::null(),
         q: data.ptr(),

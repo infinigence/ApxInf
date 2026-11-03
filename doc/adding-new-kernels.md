@@ -156,6 +156,15 @@ src/lib.rs
 
 Normalize MUST: Spec stores only structural information required for the semantic, legality, and selection equivalence class; Bindings stores addresses, the stream, and dynamic values that do not affect selection; Policy stores the resource and selection constraints supported by the operator; when addresses affect candidate selection, normalize them to alignment classes; keep storage alive; equivalent calls produce the same Spec. A new operator does not need to copy every GEMM/Attention field.
 
+GEMM's opt-in `ColdBaseline` algorithm policy is an adapter-owned eligibility
+constraint in this existing path, not another dispatcher. It resolves the first
+successfully prepared cold-fallback tuple and restricts both tuning and recipe
+restoration to that tuple. The ordinary tuner still measures and capture-checks
+the singleton domain. Include such constraints in persistent and session keys,
+version the affected ABI, preserve unrestricted defaults, and test genuine
+cold/tuned/fresh-process execution. Do not equate deterministic execution with
+identical arithmetic across algorithms or libraries.
+
 ### Step 2: Stable L2/L1 C ABI
 
 Required files:

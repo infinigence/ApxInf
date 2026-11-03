@@ -264,6 +264,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Re
     };
     let bindings = abi::Bindings {
         query: q.ptr(),
+        bias: std::ptr::null(),
         key: k.ptr(),
         value: v.ptr(),
         offsets: std::ptr::null(),
@@ -281,6 +282,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Re
         spec: abi::Spec {
             version: abi::SPEC_VERSION,
             semantic: Semantic::KvCache.abi_value(),
+            bias_alignment: 0,
             dtype: dtype_code(dtype)?,
             output_dtype: dtype_code(dtype)?,
             mask: args.mask as u32,

@@ -50,6 +50,7 @@ typedef enum {
   APXINF_NORM_STATISTIC_NONE = 0,
   APXINF_NORM_STATISTIC_RMS = 1,
   APXINF_NORM_STATISTIC_LAYER = 2,
+  APXINF_NORM_STATISTIC_L2 = 3,
 } apxinf_norm_statistic_t;
 
 typedef enum {
@@ -74,6 +75,8 @@ typedef enum {
   APXINF_NORM_NUMERICS_FLEXIBLE = 0,
   APXINF_NORM_NUMERICS_STABLE_DECODE = 1,
   APXINF_NORM_NUMERICS_STABLE_PLANNING = 2,
+  APXINF_NORM_NUMERICS_STAGED = 3,
+  APXINF_NORM_NUMERICS_WELFORD = 4,
 } apxinf_norm_numerics_t;
 
 typedef enum {
@@ -81,7 +84,7 @@ typedef enum {
   APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL = 1,
 } apxinf_norm_bias_order_t;
 
-#define APXINF_NORM_SPEC_VERSION 7u
+#define APXINF_NORM_SPEC_VERSION 8u
 
 typedef struct {
   uint32_t version;

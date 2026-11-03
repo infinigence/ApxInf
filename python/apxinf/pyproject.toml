@@ -20,6 +20,8 @@ dependencies = [
 [project.optional-dependencies]
 # A live Pi05Policy binds the PyO3 model handle (Phase 1).
 policy = ["apxinf-py>=0.1.0"]
+# DreamZero uses these only for public CPU camera/text preprocessing.
+dreamzero = ["ftfy>=6", "torch>=2.8", "torchvision>=0.23"]
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
 serving = ["msgpack>=1.0.5", "websockets>=14.0"]
 # SentencePiece remains a test-only reference for native differential checks.

@@ -20,6 +20,208 @@ mod torch_fixture;
 #[path = "torch_split_geglu_fixtures.rs"]
 mod split_fixture;
 
+#[path = "torch_rounded_attention_fixtures.rs"]
+mod rounded_fixture;
+
+#[test]
+fn rounded_additive_attention_all_candidates_match_torch() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (b, q, k, h, d) = (2, 3, 5, 2, 16);
+    for (dtype, golden) in [
+        (DType::F16, rounded_fixture::F16),
+        (DType::BF16, rounded_fixture::BF16),
+    ] {
+        let make = |shape: Vec<usize>, mult: usize, modulus: usize| {
+            let data: Vec<_> = (0..shape.iter().product())
+                .map(|i| ((i * mult % modulus) as f32 - (modulus / 2) as f32) / 16.)
+                .collect();
+            if dtype == DType::F16 {
+                f16_tensor(0, shape, &data)
+            } else {
+                tensor(0, shape, &data)
+            }
+        };
+        let query = make(vec![b, q, h, d], 3, 17);
+        let key = make(vec![b, k, h, d], 5, 19);
+        let value = make(vec![b, k, h, d], 7, 23);
+        let mut bias_values: Vec<_> = (0..b * h * q * k)
+            .map(|i| ((i * 11 % 13) as f32 - 6.) / 16.)
+            .collect();
+        for i in (k - 1..bias_values.len()).step_by(k) {
+            bias_values[i] = if dtype == DType::F16 {
+                half::f16::MIN.to_f32()
+            } else {
+                half::bf16::MIN.to_f32()
+            };
+        }
+        let bias = if dtype == DType::F16 {
+            f16_tensor(0, vec![b, h, q, k], &bias_values)
+        } else {
+            tensor(0, vec![b, h, q, k], &bias_values)
+        };
+        let expected: Vec<_> = golden
+            .iter()
+            .map(|&bits| {
+                if dtype == DType::F16 {
+                    half::f16::from_bits(bits).to_f32()
+                } else {
+                    half::bf16::from_bits(bits).to_f32()
+                }
+            })
+            .collect();
+        let mut out = zeros_tensor(0, vec![b, q, h, d], dtype);
+        let mut attention = AttentionArgs::new(&query, &key, &value, &mut out);
+        attention.scale = 1.;
+        attention.policy.cache_dir = Some(String::new());
+        let normalized = crate::ops::attention::rounded_additive_attention::normalize(
+            &ctx,
+            RoundedAttentionBiasArgs {
+                attention,
+                bias: &bias,
+            },
+        )
+        .unwrap();
+        super::attention_execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
+        let actual = crate::transfers::to_cpu(&out)
+            .unwrap()
+            .to_f32_vec()
+            .unwrap();
+        let error: f64 = actual
+            .iter()
+            .zip(&expected)
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum();
+        let norm: f64 = expected.iter().map(|&v| f64::from(v).powi(2)).sum();
+        assert!(
+            (error / norm).sqrt() <= 0.005,
+            "{dtype:?} relative L2 {}",
+            (error / norm).sqrt()
+        );
+    }
+}
+
+#[path = "torch_single_round_fixtures.rs"]
+mod single_round_fixture;
+
+#[test]
+fn gemm_bias_single_round_all_candidates_match_torch() {
+    use single_round_fixture as f;
+    let ctx = CudaContext::new_with_autotune(0, false).unwrap();
+    for (dtype, av, bv, biasv, expected) in [
+        (DType::F16, f::F16_A, f::F16_B, f::F16_BIAS, f::F16_OUTPUT),
+        (
+            DType::BF16,
+            f::BF16_A,
+            f::BF16_B,
+            f::BF16_BIAS,
+            f::BF16_OUTPUT,
+        ),
+    ] {
+        for b_transposed in [false, true] {
+            let decode = |values: &[u16]| -> Vec<f32> {
+                values
+                    .iter()
+                    .map(|&v| {
+                        if dtype == DType::F16 {
+                            half::f16::from_bits(v).to_f32()
+                        } else {
+                            half::bf16::from_bits(v).to_f32()
+                        }
+                    })
+                    .collect()
+            };
+            let upload = |shape, bits: &[u16]| {
+                if dtype == DType::F16 {
+                    f16_tensor(0, shape, &decode(bits))
+                } else {
+                    tensor(0, shape, &decode(bits))
+                }
+            };
+            let a = upload(vec![3, 16], av);
+            let transposed: Vec<_> = (0..32)
+                .flat_map(|n| (0..16).map(move |k| bv[k * 32 + n]))
+                .collect();
+            let b = if b_transposed {
+                upload(vec![32, 16], &transposed)
+            } else {
+                upload(vec![16, 32], bv)
+            };
+            let bias = upload(vec![32], biasv);
+            let mut out = zeros_tensor(0, vec![3, 32], dtype);
+            let expected = decode(expected);
+            let mut args = GemmArgs::new(&a, &b, &mut out);
+            args.weight_layout = if b_transposed {
+                GemmWeightLayout::OutputMajor
+            } else {
+                GemmWeightLayout::Kn
+            };
+            args.policy.numerics = GemmNumerics::StagedBias;
+            args.policy.cache_dir = Some(String::new());
+            validate_all_candidates(
+                &ctx,
+                args,
+                super::contracts::Semantic::GemmBias,
+                Some(&bias),
+                &expected,
+            )
+            .unwrap();
+            let session = crate::ExecutionSession::with_capacity(256, 0).unwrap();
+            let run = |out: &mut Tensor| {
+                let mut gemm = GemmArgs::new(&a, &b, out);
+                gemm.weight_layout = if b_transposed {
+                    GemmWeightLayout::OutputMajor
+                } else {
+                    GemmWeightLayout::Kn
+                };
+                gemm.policy.cache_dir = Some(String::new());
+                gemm_bias_single_round(&ctx, GemmBiasArgs { gemm, bias: &bias })
+            };
+            session.prepare(|| run(&mut out)).unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                crate::transfers::to_cpu(&out)
+                    .unwrap()
+                    .to_f32_vec()
+                    .unwrap(),
+                expected
+            );
+            let graph = session
+                .run(|| crate::capture(&ctx, || run(&mut out)))
+                .unwrap();
+            for _ in 0..3 {
+                graph.replay().unwrap();
+                ctx.synchronize().unwrap();
+                assert_eq!(
+                    crate::transfers::to_cpu(&out)
+                        .unwrap()
+                        .to_f32_vec()
+                        .unwrap(),
+                    expected
+                );
+            }
+            let zeros = if dtype == DType::F16 {
+                Tensor::from_f16(vec![3, 16], &[half::f16::ZERO; 48]).unwrap()
+            } else {
+                Tensor::from_bf16(vec![3, 16], &[half::bf16::ZERO; 48]).unwrap()
+            };
+            crate::transfers::copy_cpu_to_cuda(&zeros, &a).unwrap();
+            drop(a);
+            drop(b);
+            drop(bias);
+            drop(session);
+            graph.replay().unwrap();
+            ctx.synchronize().unwrap();
+            assert_eq!(
+                crate::transfers::to_cpu(&out)
+                    .unwrap()
+                    .to_f32_vec()
+                    .unwrap(),
+                decode(biasv).repeat(3)
+            );
+        }
+    }
+}
+
 fn u32_buffer(device: usize, values: &[u32]) -> crate::CudaBuffer {
     let bytes: Vec<_> = values
         .iter()

@@ -107,14 +107,7 @@ impl CudaBuffer {
     /// Copy data from host to this device buffer.
     pub fn copy_from_host(&self, src: &[u8]) -> Result<(), String> {
         assert!(src.len() <= self.len, "source exceeds buffer size");
-        unsafe {
-            ffi::check_cuda(ffi::cudaMemcpy(
-                self.ptr,
-                src.as_ptr() as *const c_void,
-                src.len(),
-                ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
-            ))
-        }
+        crate::transfers::copy_host_to_device(self.device, src, self.ptr as usize)
     }
 
     /// Copy host data after earlier work on `stream`, and do not return until

@@ -67,7 +67,11 @@ impl HfTokenizer {
     }
 
     #[pyo3(name = "encode_with_special_tokens", signature = (text, add_special_tokens))]
-    fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> PyResult<Vec<u32>> {
+    fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> PyResult<Vec<u32>> {
         self.inner
             .encode_with_special_tokens(text, add_special_tokens)
             .map_err(runtime_err)
@@ -370,18 +374,50 @@ impl DecisionRunner {
     }
 }
 
+fn validate_latent_shape(
+    expected: &[usize],
+    actual: &[usize],
+    allow_batch: bool,
+) -> Result<Shape, String> {
+    if actual == expected
+        || (allow_batch && actual.first() == Some(&1) && actual.get(1..) == Some(expected))
+    {
+        // Optional Python batch 1 is a transport convenience. Native runtimes
+        // receive their declared latent shape, including rank-one joint noise.
+        Ok(Shape::new(expected.to_vec()))
+    } else {
+        Err(format!(
+            "noise expected shape {expected:?}{}; got {actual:?}",
+            if allow_batch {
+                " (optionally with leading batch 1)"
+            } else {
+                ""
+            }
+        ))
+    }
+}
+
+fn validate_finite_latent(data: &[f32]) -> Result<(), String> {
+    if data.iter().any(|x| !x.is_finite()) {
+        Err("noise must contain finite float32 values".into())
+    } else {
+        Ok(())
+    }
+}
+
 fn grid_metadata(grids: Option<&[[u32; 3]]>) -> VlaMetadata<'_> {
     VlaMetadata {
         attention_mask: None,
         image_grid_thw: grids,
         embodiment_id: None,
         planning: None,
+        history: None,
     }
 }
 
 struct PreprocessedVlaInput {
     observation: Observation,
-    latent: Tensor,
+    latent: Option<Tensor>,
     attention_mask: Vec<u8>,
     image_grid_thw: Vec<[u32; 3]>,
     embodiment_id: Option<usize>,
@@ -511,19 +547,20 @@ impl ModelRunner {
 
     /// Validate `noise` shape and build a CPU f32 tensor. The runtime normalizes
     /// f32 CPU tensors to its input dtype, so numpy f32 is accepted directly.
-    fn noise_tensor(&self, noise: PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
-        let expected = self.action_shape();
+    fn noise_tensor(&self, noise: PyReadonlyArrayDyn<'_, f32>) -> PyResult<Tensor> {
+        let expected = self
+            .model
+            .vla()
+            .map_err(runtime_err)?
+            .initial_latent_shape();
         let shape = noise.shape();
-        if shape.len() != 2 || shape[0] != expected[0] || shape[1] != expected[1] {
-            return Err(PyValueError::new_err(format!(
-                "apxinf_py.infer: noise expected shape [{}, {}], got {:?}",
-                expected[0], expected[1], shape
-            )));
-        }
+        let shape =
+            validate_latent_shape(&expected, shape, false).map_err(PyValueError::new_err)?;
         let data = noise.as_slice().map_err(|_| {
             PyValueError::new_err("apxinf_py.infer: noise must be C-contiguous float32")
         })?;
-        Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), data).map_err(runtime_err)
+        validate_finite_latent(data).map_err(PyValueError::new_err)?;
+        Tensor::from_f32(shape, data).map_err(runtime_err)
     }
 
     fn action_mask_tensor(&self, mask: PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
@@ -594,7 +631,7 @@ impl ModelRunner {
         attention_mask: PyReadonlyArray1<'py, u8>,
         state: PyReadonlyArrayDyn<'py, f32>,
         embodiment_id: Option<usize>,
-        noise: PyReadonlyArrayDyn<'py, f32>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
     ) -> PyResult<PreprocessedVlaInput> {
         let pixels_shape = pixel_values.shape();
         if pixels_shape.len() != 2 || pixels_shape[0] == 0 || pixels_shape[1] == 0 {
@@ -666,22 +703,24 @@ impl ModelRunner {
             })?,
         )
         .map_err(runtime_err)?;
-        let [horizon, action_dim] = self.action_shape();
-        let noise_shape = noise.shape();
-        if noise_shape != [horizon, action_dim] && noise_shape != [1, horizon, action_dim] {
-            return Err(PyValueError::new_err(format!(
-                "apxinf_py.{method}: noise expected [{horizon}, {action_dim}] or [1, {horizon}, {action_dim}], got {noise_shape:?}"
-            )));
-        }
-        let latent = Tensor::from_f32(
-            Shape::new(noise_shape.to_vec()),
-            noise.as_slice().map_err(|_| {
-                PyValueError::new_err(format!(
-                    "apxinf_py.{method}: noise must be C-contiguous float32"
-                ))
-            })?,
-        )
-        .map_err(runtime_err)?;
+        let latent = noise
+            .map(|noise| -> PyResult<Tensor> {
+                let expected = self
+                    .model
+                    .vla()
+                    .map_err(runtime_err)?
+                    .initial_latent_shape();
+                let shape = validate_latent_shape(&expected, noise.shape(), true)
+                    .map_err(PyValueError::new_err)?;
+                let values = noise.as_slice().map_err(|_| {
+                    PyValueError::new_err(format!(
+                        "apxinf_py.{method}: noise must be C-contiguous float32"
+                    ))
+                })?;
+                validate_finite_latent(values).map_err(PyValueError::new_err)?;
+                Tensor::from_f32(shape, values).map_err(runtime_err)
+            })
+            .transpose()?;
         Ok(PreprocessedVlaInput {
             observation: Observation {
                 vision: VisionObservation::Patches(pixels),
@@ -778,19 +817,22 @@ impl ModelRunner {
             })?,
         )
         .map_err(runtime_err)?;
-        let [horizon, dim] = self.action_shape();
-        if noise.shape() != [horizon, dim] && noise.shape() != [1, horizon, dim] {
-            return Err(PyValueError::new_err(
-                "_infer_resized_rgb: noise shape mismatch",
-            ));
-        }
+        let expected = self
+            .model
+            .vla()
+            .map_err(runtime_err)?
+            .initial_latent_shape();
+        let shape =
+            validate_latent_shape(&expected, noise.shape(), true).map_err(PyValueError::new_err)?;
         let latent = Tensor::from_f32(
-            Shape::new(noise.shape().to_vec()),
+            shape,
             noise.as_slice().map_err(|_| {
                 PyValueError::new_err("_infer_resized_rgb: noise must be contiguous float32")
             })?,
         )
         .map_err(runtime_err)?;
+        validate_finite_latent(&latent.to_f32_vec().map_err(runtime_err)?)
+            .map_err(PyValueError::new_err)?;
         Ok(PreprocessedVlaInput {
             observation: Observation {
                 vision: VisionObservation::RgbU8 {
@@ -801,7 +843,7 @@ impl ModelRunner {
                 state: Some(state),
                 action_mask: None,
             },
-            latent,
+            latent: Some(latent),
             attention_mask: mask,
             image_grid_thw: grids,
             embodiment_id,
@@ -935,9 +977,18 @@ impl ModelRunner {
                 || options.reasoning.is_some()
                 || options.raw_rgb_resize.is_some())
             .then_some(&options),
+            history: None,
         };
-        let request =
-            VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
+        let request = match &input.latent {
+            Some(latent) => {
+                VlaRequest::provided_with_metadata(&input.observation, latent, metadata)
+            }
+            None => VlaRequest::generated_with_metadata(
+                &input.observation,
+                self.next_sampling_rng()?,
+                metadata,
+            ),
+        };
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
     }
@@ -966,8 +1017,7 @@ impl ModelRunner {
         rng: RngKey,
         grids: Option<&[[u32; 3]]>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let request =
-            VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
+        let request = VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
     }
@@ -996,8 +1046,7 @@ impl ModelRunner {
         rng: RngKey,
         grids: Option<&[[u32; 3]]>,
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
-        let request =
-            VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
+        let request = VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
         let (flat, profile) = self
             .model
             .infer_host_f32_profiled(&request)
@@ -1240,7 +1289,7 @@ impl ModelRunner {
         py: Python<'py>,
         patches: PyReadonlyArray2<'py, f32>,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: Option<PyReadonlyArray2<'py, f32>>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let expected = [self.patch_rows(), self.patch_width()];
@@ -1294,9 +1343,9 @@ impl ModelRunner {
         attention_mask,
         state,
         embodiment_id,
-        noise,
+        noise=None,
         *, num_steps=None, max_new_tokens=None, min_new_tokens=0,
-        terminator_ids=None, closing_ids=None,
+        terminator_ids=None, closing_ids=None, history_session=None, history_episode=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn infer_preprocessed<'py>(
@@ -1308,13 +1357,26 @@ impl ModelRunner {
         attention_mask: PyReadonlyArray1<'py, u8>,
         state: PyReadonlyArrayDyn<'py, f32>,
         embodiment_id: Option<usize>,
-        noise: PyReadonlyArrayDyn<'py, f32>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         num_steps: Option<usize>,
         max_new_tokens: Option<usize>,
         min_new_tokens: usize,
         terminator_ids: Option<Vec<u32>>,
         closing_ids: Option<Vec<u32>>,
+        history_session: Option<String>,
+        history_episode: Option<String>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let history = match (history_session.as_deref(), history_episode.as_deref()) {
+            (None, None) => None,
+            (Some(session), Some(episode)) if !session.is_empty() && !episode.is_empty() => {
+                Some(apxinf_model::vla::HistoryContext { session, episode })
+            }
+            _ => {
+                return Err(PyValueError::new_err(
+                    "history_session and history_episode must both be nonempty strings",
+                ))
+            }
+        };
         let input = self.preprocessed_vla_input(
             "_infer_preprocessed",
             pixel_values,
@@ -1355,9 +1417,18 @@ impl ModelRunner {
             embodiment_id: input.embodiment_id,
             planning: (options.num_steps.is_some() || options.reasoning.is_some())
                 .then_some(&options),
+            history,
         };
-        let request =
-            VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
+        let request = match &input.latent {
+            Some(latent) => {
+                VlaRequest::provided_with_metadata(&input.observation, latent, metadata)
+            }
+            None => VlaRequest::generated_with_metadata(
+                &input.observation,
+                self.next_sampling_rng()?,
+                metadata,
+            ),
+        };
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
     }
@@ -1513,18 +1584,22 @@ impl ModelRunner {
             attention_mask,
             state,
             Some(embodiment_id),
-            noise,
+            Some(noise),
         )?;
         let metadata = VlaMetadata {
             attention_mask: Some(&input.attention_mask),
             image_grid_thw: Some(&input.image_grid_thw),
             embodiment_id: input.embodiment_id,
             planning: None,
+            history: None,
         };
         self.model
             .calibration_amax(&VlaRequest::provided_with_metadata(
                 &input.observation,
-                &input.latent,
+                input
+                    .latent
+                    .as_ref()
+                    .ok_or_else(|| PyValueError::new_err("calibration requires explicit noise"))?,
                 metadata,
             ))
             .map_err(runtime_err)
@@ -1597,7 +1672,7 @@ impl ModelRunner {
         rgb_u8: PyReadonlyArrayDyn<'py, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: Option<PyReadonlyArray2<'py, f32>>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
         state: Option<PyReadonlyArray1<'py, f32>>,
         image_grid_thw: Option<PyReadonlyArray2<'py, u32>>,
@@ -1632,7 +1707,7 @@ impl ModelRunner {
         rgb_u8: PyReadonlyArrayDyn<'py, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: Option<PyReadonlyArray2<'py, f32>>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
         state: Option<PyReadonlyArray1<'py, f32>>,
         image_grid_thw: Option<PyReadonlyArray2<'py, u32>>,
@@ -1726,7 +1801,7 @@ impl ModelRunner {
         rgb_u8: PyReadonlyArrayDyn<'_, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'_, u32>,
-        noise: PyReadonlyArray2<'_, f32>,
+        noise: PyReadonlyArrayDyn<'_, f32>,
     ) -> PyResult<BTreeMap<String, f32>> {
         let (observation, _) =
             self.rgb_observation("_calibrate_rgb", rgb_u8, layout, token_ids, None)?;
@@ -1800,10 +1875,38 @@ impl ModelRunner {
         self.sampling_draw.set(0);
     }
 
+    /// Reset observation history independently of RNG and prepared resources.
+    fn reset_history(&self) -> PyResult<()> {
+        self.model
+            .vla()
+            .map_err(runtime_err)?
+            .reset_history()
+            .map_err(runtime_err)
+    }
+
+    /// Evict implicit execution plans without resetting observation history.
+    fn clear_prepared(&self) -> PyResult<()> {
+        self.model
+            .vla()
+            .map_err(runtime_err)?
+            .clear_prepared()
+            .map_err(runtime_err)
+    }
+
     /// Device string, e.g. `"cuda:0"`.
     #[getter]
     fn device(&self) -> String {
         self.device.to_string()
+    }
+
+    /// Complete diffusion noise shape, independent of the action output shape.
+    #[getter]
+    fn noise_shape(&self) -> PyResult<Vec<usize>> {
+        Ok(self
+            .model
+            .vla()
+            .map_err(runtime_err)?
+            .initial_latent_shape())
     }
 
     /// Actual loaded implementation; `auto` is resolved during loading.
@@ -1940,5 +2043,37 @@ mod tests {
         assert!(PackedRgbU8::from_slices(&[&[]]).is_err());
         let part = &[1u8][..];
         assert!(PackedRgbU8::from_slices(&vec![part; 65_536]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod latent_contract_tests {
+    use super::{validate_finite_latent, validate_latent_shape};
+    #[test]
+    fn joint_latent_shape_is_independent_of_actions() {
+        assert!(validate_latent_shape(&[113408], &[113408], false).is_ok());
+        assert!(validate_latent_shape(&[113408], &[24, 32], false).is_err());
+        assert_eq!(
+            validate_latent_shape(&[113408], &[1, 113408], true)
+                .unwrap()
+                .dims(),
+            &[113408]
+        );
+        assert!(validate_latent_shape(&[113408], &[1, 113408], false).is_err());
+        assert!(validate_latent_shape(&[24, 32], &[24, 32], false).is_ok());
+        assert_eq!(
+            validate_latent_shape(&[24, 32], &[1, 24, 32], true)
+                .unwrap()
+                .dims(),
+            &[24, 32]
+        );
+        assert!(validate_latent_shape(&[24, 32], &[2, 24, 32], true).is_err());
+    }
+    #[test]
+    fn provided_noise_rejects_nonfinite_values() {
+        assert!(validate_finite_latent(&[0., -1., 1.]).is_ok());
+        for x in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(validate_finite_latent(&[0., x]).is_err());
+        }
     }
 }

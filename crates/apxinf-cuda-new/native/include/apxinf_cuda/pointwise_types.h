@@ -29,6 +29,24 @@ typedef enum {
   APXINF_POINTWISE_SEMANTIC_SWIGLU = 3,
   APXINF_POINTWISE_SEMANTIC_ADD_INTO = 4,
   APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3 = 5,
+  APXINF_POINTWISE_SEMANTIC_ADD = 6,
+  APXINF_POINTWISE_SEMANTIC_SUBTRACT = 7,
+  APXINF_POINTWISE_SEMANTIC_MULTIPLY = 8,
+  APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD = 9,
+  APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY = 10,
+  APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY = 11,
+  APXINF_POINTWISE_SEMANTIC_SCALE = 12,
+  APXINF_POINTWISE_SEMANTIC_SCALAR_ADD = 13,
+  APXINF_POINTWISE_SEMANTIC_SCALAR_DIVIDE = 14,
+  APXINF_POINTWISE_SEMANTIC_EXP = 15,
+  APXINF_POINTWISE_SEMANTIC_SIN = 16,
+  APXINF_POINTWISE_SEMANTIC_COS = 17,
+  /* secondary [1,cols] = scale; bias [cols] = shift. Round 1+scale,
+   * multiplication, then addition separately to dtype. */
+  APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION = 18,
+  /* secondary [rows,cols] = residual; bias [cols] = gate. Round the
+   * multiplication before adding residual and rounding again. */
+  APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL = 19,
 } apxinf_pointwise_semantic_t;
 
 /* Stable pointwise activation ABI encoding. */
@@ -38,9 +56,11 @@ typedef enum {
   APXINF_POINTWISE_ACTIVATION_SILU = 2,
   APXINF_POINTWISE_ACTIVATION_GELU_EXACT = 3,
   APXINF_POINTWISE_ACTIVATION_RELU = 4,
+  APXINF_POINTWISE_ACTIVATION_GELU_ROUNDED = 5,
+  APXINF_POINTWISE_ACTIVATION_SWISH_ROUNDED = 6,
 } apxinf_pointwise_activation_t;
 
-#define APXINF_POINTWISE_SPEC_VERSION 2u
+#define APXINF_POINTWISE_SPEC_VERSION 3u
 
 typedef struct {
   uint32_t version;
@@ -68,14 +88,15 @@ typedef struct {
 
 typedef struct {
   const void* input;
-  /* EULER_UPDATE reads the velocity here; unused elsewhere. */
+  /* Binary operand: full shape, [1,cols] for BROADCAST_*, [rows,1] for ROW_*. */
   const void* secondary;
+  /* Per-column bias, or required shift/gate for staged affine semantics. */
   const void* bias;
   void* output;
   /* SWIGLU_ROWWISE_E4M3 writes one F32 scale per row. */
   void* scales;
   apxinf_cuda_stream_t stream;
-  /* EULER_UPDATE step size; unused elsewhere. */
+  /* EULER_UPDATE step size or SCALE/SCALAR_ADD scalar. */
   float dt;
   float output_scale;
 } apxinf_pointwise_bindings_t;

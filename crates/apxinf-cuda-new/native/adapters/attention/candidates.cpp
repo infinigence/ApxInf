@@ -1,6 +1,7 @@
 #include "internal.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
@@ -34,6 +35,14 @@ bool supports_dense_custom(const Spec& spec) {
          supports_custom(spec);
 }
 
+bool supports_rounded(const Spec& spec) {
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE &&
+         supports_custom(spec) && spec.mask == APXINF_ATTENTION_MASK_NONE &&
+         spec.query_heads == spec.kv_heads &&
+         spec.query_heads <= INT32_MAX / spec.head_dim &&
+         spec.batch <= INT32_MAX / spec.query_heads / spec.query_tokens;
+}
+
 bool supports_kv_cache_custom(const Spec& spec) {
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
          supports_custom(spec);
@@ -54,6 +63,20 @@ bool supports_cublas_f16(const Spec& spec) {
          spec.numerics == APXINF_ATTENTION_NUMERICS_STABLE;
 }
 
+#if defined(APXINF_ATTENTION_INDEXED_SM110)
+bool supports_indexed(const Spec& s){
+ return s.semantic==APXINF_ATTENTION_SEMANTIC_DENSE &&
+  s.qkv_layout==APXINF_ATTENTION_QKV_LAYOUT_SEPARATE &&
+  s.mask==APXINF_ATTENTION_MASK_NONE && s.dtype==APXINF_DTYPE_BF16 &&
+  s.output_dtype==s.dtype && s.numerics==APXINF_ATTENTION_NUMERICS_FLEXIBLE &&
+  s.batch==1 && s.head_dim==128 && s.query_heads==40 && s.kv_heads==40 &&
+  s.query_tokens==1785 && (s.key_tokens==2665 || s.key_tokens==512 || s.key_tokens==257) &&
+  s.scale_is_default!=0;
+}
+AlignmentRequirements indexed_alignment(const Spec&){return {16,16,16,16};}
+void indexed_configurations(const Spec&,std::vector<int>& out){out.push_back(0);out.push_back(1);}
+#endif
+
 AlignmentRequirements natural_alignment(const Spec&) { return {}; }
 
 void one_configuration(const Spec&, std::vector<int>& configurations) {
@@ -61,6 +84,16 @@ void one_configuration(const Spec&, std::vector<int>& configurations) {
 }
 
 #if defined(APXINF_ATTENTION_FA2)
+bool supports_efficient(const Spec& s) {
+  return s.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+      s.mask == APXINF_ATTENTION_MASK_NONE && supports_custom(s) &&
+      s.head_dim == 384 && s.query_heads == s.kv_heads &&
+      s.query_heads <= INT32_MAX / s.head_dim && s.query_heads <= 65535 &&
+      s.batch <= 65535 && s.query_tokens <= INT32_MAX - 32 &&
+      s.batch <= INT32_MAX / s.query_tokens &&
+      s.query_tokens <= INT32_MAX / (s.query_heads * s.head_dim) &&
+      s.key_tokens <= INT32_MAX / (s.query_heads * s.head_dim);
+}
 bool fa2_head_dim_supported(const Spec& spec) {
   return spec.head_dim > 0 && spec.head_dim <= 256 &&
          spec.head_dim % 8 == 0;
@@ -305,8 +338,97 @@ AlignmentRequirements specialized_sm110_alignment(const Spec&) {
 
 }  // namespace
 
+// Test-only metadata checks; no GPU allocation or provider forcing.
+extern "C" int apxinf_attention_test_indexed_support_domain() {
+#if defined(APXINF_ATTENTION_INDEXED_SM110)
+  Spec base{};
+  base.semantic=APXINF_ATTENTION_SEMANTIC_DENSE;
+  base.qkv_layout=APXINF_ATTENTION_QKV_LAYOUT_SEPARATE;
+  base.mask=APXINF_ATTENTION_MASK_NONE;
+  base.dtype=base.output_dtype=APXINF_DTYPE_BF16;
+  base.numerics=APXINF_ATTENTION_NUMERICS_FLEXIBLE;
+  base.batch=1; base.head_dim=128; base.query_heads=base.kv_heads=40;
+  base.query_tokens=1785; base.scale_is_default=1;
+  for (int keys : {257,512,2665}) {
+    base.key_tokens=keys;
+    if (!supports_indexed(base) || indexed_resource_requirements(base,0)!=1143844 ||
+        indexed_resource_requirements(base,1)!=1143844)
+      return 0;
+    const auto alignment=indexed_alignment(base);
+    if (alignment.query!=16 || alignment.key!=16 || alignment.value!=16 || alignment.output!=16)
+      return 0;
+  }
+  auto rejected=[&](auto mutate){auto s=base;mutate(s);return !supports_indexed(s);};
+  if (!rejected([](Spec& s){s.semantic=APXINF_ATTENTION_SEMANTIC_KV_CACHE;}) ||
+      !rejected([](Spec& s){s.qkv_layout=APXINF_ATTENTION_QKV_LAYOUT_PACKED_TOKEN;}) ||
+      !rejected([](Spec& s){s.mask=APXINF_ATTENTION_MASK_CAUSAL;}) ||
+      !rejected([](Spec& s){s.dtype=APXINF_DTYPE_F16;}) ||
+      !rejected([](Spec& s){s.output_dtype=APXINF_DTYPE_F16;}) ||
+      !rejected([](Spec& s){s.numerics=APXINF_ATTENTION_NUMERICS_STABLE;}) ||
+      !rejected([](Spec& s){s.batch=2;}) ||
+      !rejected([](Spec& s){s.head_dim=64;}) ||
+      !rejected([](Spec& s){s.query_heads=39;}) ||
+      !rejected([](Spec& s){s.kv_heads=39;}) ||
+      !rejected([](Spec& s){s.query_tokens=1784;}) ||
+      !rejected([](Spec& s){s.key_tokens=2664;}) ||
+      !rejected([](Spec& s){s.scale_is_default=0;})) return 0;
+  std::vector<int> configs;indexed_configurations(base,configs);
+  if (configs!=std::vector<int>{0,1}) return 0;
+  try {
+    indexed_resource_requirements(base,2);
+    return 0;
+  } catch (const Failure& failure) {
+    if (failure.status!=APXINF_STATUS_INVALID_ARGUMENT) return 0;
+  }
+  // A one-byte-short policy must reject before allocating any device state.
+  for(int configuration:{0,1}){
+    Execution execution{};execution.spec=base;execution.configuration=configuration;
+    execution.resource_limit=1143843;
+    try {
+      prepare_indexed(execution);
+      return 0;
+    } catch (const Failure& failure) {
+      if (failure.status!=APXINF_STATUS_UNSUPPORTED || execution.provider_state!=nullptr)
+        return 0;
+    }
+  }
+  return 2; // Compiled and checked; 1 means absent on this build target.
+#else
+  return 1;
+#endif
+}
+
+extern "C" int apxinf_attention_test_efficient_support_domain() {
+#if defined(APXINF_ATTENTION_FA2)
+  Spec s{};
+  s.semantic=APXINF_ATTENTION_SEMANTIC_DENSE;
+  s.dtype=s.output_dtype=APXINF_DTYPE_BF16;
+  s.mask=APXINF_ATTENTION_MASK_NONE;
+  s.batch=1; s.head_dim=384; s.query_heads=s.kv_heads=2;
+  s.query_tokens=35; s.key_tokens=137;
+  if (!supports_efficient(s)) return 0;
+  const int64_t limit=INT32_MAX/(s.query_heads*s.head_dim);
+  s.key_tokens=limit;
+  if (!supports_efficient(s)) return 0;
+  s.key_tokens=limit+1;
+  if (supports_efficient(s)) return 0;
+  s.key_tokens=137; s.query_tokens=limit;
+  if (!supports_efficient(s)) return 0;
+  s.query_tokens=limit+1;
+  if (supports_efficient(s)) return 0;
+  s.query_tokens=35; s.query_heads=3;
+  if (supports_efficient(s)) return 0;
+#endif
+  return 1;
+}
+
 const ImplementationRegistry& registry(uint32_t semantic) {
   static const ImplementationRegistry dense_entries = {
+#if defined(APXINF_ATTENTION_INDEXED_SM110)
+      {3,3,1,"cutlass-indexed-fa2-sm110",apxinf::gemm::kDeviceFeatureFixedSm110,
+       true,true,false,supports_indexed,indexed_alignment,indexed_resource_requirements,
+       indexed_configurations,prepare_indexed,launch_indexed,destroy_indexed},
+#endif
 #if defined(APXINF_SEGMENTED_ATTENTION_SM110)
       {kProviderSpecializedSm110, 1, 1, "specialized-d256-causal-sm110",
        apxinf::gemm::kDeviceFeatureFixedSm110, true, true, false,
@@ -338,10 +460,12 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        supports_fa2_splitkv, fa2_alignment,
        fa2_splitkv_resource_requirements, splitkv_configurations,
        prepare_fa2_splitkv, launch_fa2_splitkv, destroy_fa2_splitkv},
-      {kProviderFa2, 1, 1, "flash-attention-2",
-       apxinf::gemm::kDeviceFeatureFa2, true, true, false, supports_fa2,
-       fa2_alignment, fa2_resource_requirements, one_configuration,
-       prepare_fa2, launch_fa2, destroy_fa2},
+#endif
+#if defined(APXINF_ATTENTION_FA2)
+      {5, 1, 1, "cutlass-memory-efficient-attention", apxinf::gemm::kDeviceFeatureFa2,
+       true, true, true, supports_efficient, fa2_alignment,
+       efficient_resource_requirements, one_configuration,
+       prepare_efficient, launch_efficient, destroy_efficient},
 #endif
       {kProviderCublas, 1, 1, "cublas-f16-gqa-stable", 0, true, true, true,
        supports_cublas_f16, natural_alignment,
@@ -351,6 +475,15 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        true, supports_dense_custom, natural_alignment,
        custom_resource_requirements, one_configuration, prepare_custom,
        launch_custom, destroy_custom},
+#if defined(APXINF_ATTENTION_FA2)
+      // Keep the existing custom cold-cache baseline when it fits. Large
+      // sequences can exceed its quadratic workspace budget; FA2 is then a
+      // deterministic, graph-safe fallback without requiring online tuning.
+      {kProviderFa2, 1, 1, "flash-attention-2",
+       apxinf::gemm::kDeviceFeatureFa2, true, true, true, supports_fa2,
+       fa2_alignment, fa2_resource_requirements, one_configuration,
+       prepare_fa2, launch_fa2, destroy_fa2},
+#endif
   };
   static const ImplementationRegistry kv_cache_entries = {
 #if defined(APXINF_SEGMENTED_ATTENTION_SM110)
@@ -400,6 +533,14 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        launch_custom, destroy_custom},
   };
   switch (semantic) {
+    case APXINF_ATTENTION_SEMANTIC_ROUNDED_ADDITIVE: {
+      static const ImplementationRegistry rounded_entries = {
+          {4, 1, 1, "cublas-rounded-additive-attention", 0, true, true, true,
+           supports_rounded, natural_alignment, rounded_resource_requirements,
+           one_configuration, prepare_rounded, launch_rounded, destroy_rounded},
+      };
+      return rounded_entries;
+    }
     case APXINF_ATTENTION_SEMANTIC_DENSE:
       return dense_entries;
     case APXINF_ATTENTION_SEMANTIC_KV_CACHE:

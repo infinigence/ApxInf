@@ -26,6 +26,7 @@ pub(crate) enum Statistic {
     None,
     Rms,
     Layer,
+    L2,
 }
 
 impl Statistic {
@@ -34,6 +35,7 @@ impl Statistic {
             Self::None => 0,
             Self::Rms => 1,
             Self::Layer => 2,
+            Self::L2 => 3,
         }
     }
 }
@@ -91,14 +93,20 @@ pub enum NormNumerics {
     /// the planning kernels. This is a numerical contract, not a provider
     /// request.
     StablePlanning,
+    /// Round the normalized RMS value before multiplying the learned weight.
+    Staged,
+    /// Four-lane vector Welford LayerNorm reduction.
+    Welford,
 }
 
 impl NormNumerics {
-    fn code(self) -> u32 {
+    pub(in crate::ops) fn code(self) -> u32 {
         match self {
             Self::Flexible => 0,
             Self::StableDecode => 1,
             Self::StablePlanning => 2,
+            Self::Staged => 3,
+            Self::Welford => 4,
         }
     }
 }
@@ -153,6 +161,14 @@ fn valid_contract(
     gate: GateKind,
 ) -> bool {
     matches!(
+        (operation, statistic, affine, gate),
+        (
+            Operation::Norm,
+            Statistic::L2,
+            AffineKind::None,
+            GateKind::None
+        )
+    ) || matches!(
         (operation, statistic, affine, gate),
         (
             Operation::Norm,
@@ -343,7 +359,32 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
             "StablePlanning numerics currently requires weight-offset affine",
         ));
     }
+    if args.numerics == NormNumerics::Welford
+        && !(operation == Operation::Norm
+            && statistic == Statistic::Layer
+            && affine == AffineKind::Weight
+            && gate == GateKind::None
+            && !args.weight_offset
+            && args.quantization == Quantization::None)
+    {
+        return Err(invalid("Welford requires plain learned LayerNorm"));
+    }
+    if args.numerics == NormNumerics::Staged
+        && !(operation == Operation::Norm
+            && matches!(
+                (statistic, affine),
+                (Statistic::Rms, AffineKind::Weight) | (Statistic::L2, AffineKind::None)
+            )
+            && gate == GateKind::None
+            && !args.weight_offset
+            && args.quantization == Quantization::None)
+    {
+        return Err(invalid(
+            "Staged normalization supports plain RMS or L2 without quantization",
+        ));
+    }
     if dtype == DType::F32
+        && statistic != Statistic::L2
         && !(operation == Operation::Norm
             && statistic == Statistic::Rms
             && affine == AffineKind::Weight
@@ -682,6 +723,32 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         "quantized scales",
         &mut storage,
     )?;
+    if args.numerics == NormNumerics::Staged {
+        let bytes = count
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| invalid("Norm size overflow"))?;
+        let out = normalized as usize;
+        let end = out
+            .checked_add(bytes)
+            .ok_or_else(|| invalid("Norm output range overflow"))?;
+        for (pointer, elements) in [(input_pointer, count), (weight, cols)] {
+            if pointer.is_null() {
+                continue;
+            }
+            let start = pointer as usize;
+            let input_end = start
+                .checked_add(
+                    elements
+                        .checked_mul(dtype.size_in_bytes())
+                        .ok_or_else(|| invalid("Norm input size overflow"))?,
+                )
+                .ok_or_else(|| invalid("Norm input range overflow"))?;
+            if out < input_end && start < end {
+                return Err(invalid("Staged Norm output overlaps an input"));
+            }
+        }
+    }
+
     if args.numerics == NormNumerics::StableDecode
         && operation == Operation::FusedAddNorm
         && hidden as usize != residual as usize

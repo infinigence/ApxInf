@@ -23,6 +23,20 @@ impl WeightVersion {
     }
 }
 
+/// Legal algorithm domain within the existing GEMM preparation/tuning path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum GemmAlgorithmPolicy {
+    #[default]
+    Any = 0,
+    /// Use the first successfully prepared cold-fallback algorithm for this
+    /// exact contract. Online tuning still measures and captures that singleton
+    /// domain, but cannot change its reduction order to improve latency.
+    /// This is scoped to one compatible build, library, device and policy;
+    /// it does not promise identical arithmetic across hardware/toolkit versions.
+    ColdBaseline = 1,
+}
+
 #[derive(Clone, Debug)]
 pub struct GemmPolicy {
     /// Accumulation precision is part of the GEMM key, not a candidate detail.
@@ -34,6 +48,7 @@ pub struct GemmPolicy {
     pub allow_fallback: bool,
     pub graph_safe: bool,
     pub deterministic: bool,
+    pub algorithm: GemmAlgorithmPolicy,
     /// None uses the context's hardware/toolkit directory; Some("") disables disk caching.
     pub cache_dir: Option<String>,
 }
@@ -48,6 +63,7 @@ impl Default for GemmPolicy {
             allow_fallback: true,
             graph_safe: true,
             deterministic: false,
+            algorithm: GemmAlgorithmPolicy::Any,
             cache_dir: None,
         }
     }
@@ -60,6 +76,10 @@ pub enum GemmNumerics {
     /// Preserve the established shared-cuBLAS BF16 reduction path. This is a
     /// semantic constraint; native dispatch still owns the provider choice.
     LegacyCublas,
+    /// Accumulate GEMM+bias before the only output-dtype cast.
+    StagedBias,
+    /// Require FP32 split-reduction partials before the output cast.
+    F32Reduction,
 }
 
 /// Parameters common to the GEMM semantic operators.
@@ -413,6 +433,7 @@ fn normalize_fused<'a>(
     if a_shape.len() != 2 || b_shape.len() != 2 {
         return Err(invalid("GEMM requires rank-2 tensors"));
     }
+
     let nvfp4 = matches!(args.quantization, GemmQuantization::Nvfp4 { .. });
     let (output_major, gate_up_pair_width) = match args.weight_layout {
         GemmWeightLayout::Kn => (false, None),
@@ -472,6 +493,18 @@ fn normalize_fused<'a>(
     }
     if !args.alpha.is_finite() || !args.output_scale.is_finite() || args.output_scale <= 0.0 {
         return Err(invalid("invalid GEMM scales"));
+    }
+    if args.policy.numerics == GemmNumerics::F32Reduction
+        && (semantic != Semantic::Gemm
+            || !matches!(args.quantization, GemmQuantization::None)
+            || args.weight_layout != GemmWeightLayout::Kn
+            || !matches!(args.a.dtype(), DType::F16 | DType::BF16)
+            || args.b.dtype() != args.a.dtype()
+            || args.out.dtype() != args.a.dtype())
+    {
+        return Err(invalid(
+            "FP32 reduction numerics require canonical unquantized F16/BF16 GEMM",
+        ));
     }
     if args.policy.numerics == GemmNumerics::LegacyCublas
         && (semantic != Semantic::Gemm
@@ -562,6 +595,17 @@ fn normalize_fused<'a>(
             (4, None, None)
         }
     };
+    if args.policy.numerics == GemmNumerics::StagedBias
+        && (semantic != Semantic::GemmBias
+            || args.output_scale != 1.0
+            || quantization != 0
+            || !matches!(args.a.dtype(), DType::F16 | DType::BF16)
+            || args.out.dtype() != args.a.dtype())
+    {
+        return Err(invalid(
+            "single-round GEMM+bias requires matching F16/BF16 inputs and output",
+        ));
+    }
     let has_row_channel_scales = matches!(quantization, 2 | 3);
     let plain_output_major = output_major && quantization == 0;
     if (output_major && !plain_output_major && !matches!(quantization, 3 | 4))
@@ -716,7 +760,7 @@ fn normalize_fused<'a>(
     }
     Ok(Normalized {
         spec: abi::Spec {
-            version: 9,
+            version: 12,
             semantic: semantic as u32,
             a_dtype: dtype(args.a.dtype())?,
             b_dtype: dtype(args.b.dtype())?,
@@ -731,6 +775,8 @@ fn normalize_fused<'a>(
             numerics: match args.policy.numerics {
                 GemmNumerics::Default => 0,
                 GemmNumerics::LegacyCublas => 1,
+                GemmNumerics::StagedBias => 2,
+                GemmNumerics::F32Reduction => 3,
             },
             b_is_immutable: bindings.b_is_immutable,
             a_alignment: alignment_class(bindings.a),

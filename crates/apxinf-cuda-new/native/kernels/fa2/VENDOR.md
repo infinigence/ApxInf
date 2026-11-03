@@ -34,6 +34,21 @@ The compatibility layer is inference-only: dropout is disabled, and it is not
 intended to emulate PyTorch beyond the types and checks required to instantiate
 the forward kernels.
 
+## Softmax arithmetic
+
+ApxInf enables the upstream `UNFUSE_FMA` switch, also enabled by
+[PyTorch v2.11.0](https://github.com/pytorch/pytorch/blob/v2.11.0/aten/src/ATen/CMakeLists.txt).
+It rounds score scaling before subtracting the scaled maximum. Fusing those
+operations can leave a positive residual at the maximum and overflow the
+exponential even for finite logits. The shared attention build fingerprint
+includes this switch, invalidating recipes produced with the previous math.
+`attention_large_equal_logits_remain_finite` covers the failure with F16/BF16
+inputs and retained graph replay. FA2 translation units also use NVCC's precise
+math defaults (no `--use_fast_math`); approximate reciprocal changes BF16
+rounding near ties even with unfused maximum subtraction. This compilation
+choice is versioned in the attention fingerprint. The vendored sources remain
+unchanged.
+
 ## Direct E4M3 extension
 
 The checked-in vendor sources remain identical to v2.7.4.post1. The direct

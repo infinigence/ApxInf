@@ -5,6 +5,8 @@
 
 #include <climits>
 #include <cstdint>
+#include <algorithm>
+#include <array>
 
 namespace {
 
@@ -29,10 +31,10 @@ void validate_spec(const apxinf_gather_spec_t& spec) {
   const bool dtype_ok =
       spec.dtype == APXINF_DTYPE_F16 || spec.dtype == APXINF_DTYPE_BF16 ||
       (spec.dtype == APXINF_DTYPE_F32 &&
-       (spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES ||
+       (spec.semantic >= APXINF_GATHER_SEMANTIC_PERMUTE || spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES ||
         spec.semantic == APXINF_GATHER_SEMANTIC_EMBEDDING_LOOKUP));
   if (spec.version != APXINF_GATHER_SPEC_VERSION ||
-      spec.semantic > APXINF_GATHER_SEMANTIC_REPLACE_ROWS ||
+      spec.semantic > APXINF_GATHER_SEMANTIC_RESIZE_BICUBIC ||
       !dtype_ok ||
       spec.has_bias > 1 ||
       spec.embedding_scale > APXINF_GATHER_EMBEDDING_SCALE_SQRT_WIDTH ||
@@ -45,6 +47,57 @@ void validate_spec(const apxinf_gather_spec_t& spec) {
       !valid_alignment(spec.bias_alignment) ||
       !valid_alignment(spec.output_alignment)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Gather Spec");
+  }
+  if (spec.semantic == APXINF_GATHER_SEMANTIC_PERMUTE) {
+    if (spec.rank == 0 || spec.rank > 8 || spec.cols != 1)
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid permutation rank");
+    int64_t count=1;
+    for (unsigned i=0;i<spec.rank;++i) {
+      if(spec.layout_shape[i]<=0 || spec.layout_strides[i]<=0 || count>INT64_MAX/spec.layout_shape[i])
+        throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid permutation geometry");
+      count*=spec.layout_shape[i];
+    }
+    if(count!=spec.rows) throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"permutation size mismatch");
+    std::array<unsigned,8> axes{};
+    for(unsigned i=0;i<spec.rank;++i) axes[i]=i;
+    std::sort(axes.begin(),axes.begin()+spec.rank,[&](unsigned a,unsigned b){return spec.layout_strides[a]<spec.layout_strides[b];});
+    int64_t expected_stride=1;
+    for(unsigned i=0;i<spec.rank;++i) {
+      const auto axis=axes[i];
+      if(spec.layout_shape[axis]==1) continue;
+      if(spec.layout_strides[axis]!=expected_stride)
+        throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"noncontiguous permutation strides");
+      expected_stride*=spec.layout_shape[axis];
+    }
+  }
+  if(spec.semantic==APXINF_GATHER_SEMANTIC_RESIZE_BICUBIC) {
+    int64_t count=1;
+    if(spec.rank!=4 || spec.output_spatial[0]<=0 || spec.output_spatial[1]<=0 ||
+       spec.output_spatial[0]>INT32_MAX || spec.output_spatial[1]>INT32_MAX)
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid bicubic output dimensions");
+    for(int i=0;i<4;++i) {
+      if(spec.layout_shape[i]<=0 || spec.layout_shape[i]>INT32_MAX || count>INT64_MAX/spec.layout_shape[i])
+        throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid bicubic input dimensions");
+      count*=spec.layout_shape[i];
+    }
+    if(spec.layout_shape[0]>INT64_MAX/spec.output_spatial[0] ||
+       spec.layout_shape[0]*spec.output_spatial[0]>INT64_MAX/spec.output_spatial[1] ||
+       spec.rows!=spec.layout_shape[0]*spec.output_spatial[0]*spec.output_spatial[1] || spec.cols!=spec.layout_shape[3])
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"bicubic output size mismatch");
+  }
+  if (spec.semantic == APXINF_GATHER_SEMANTIC_UNFOLD3D) {
+    int64_t rows=spec.layout_shape[0],cols=spec.layout_shape[4];
+    if(rows<=0 || cols<=0 || spec.row_start<0)
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid unfold geometry");
+    for(int i=0;i<3;++i) {
+      if(spec.layout_shape[i+1]<=0 || spec.output_spatial[i]<=0 || spec.kernel[i]<=0 || spec.stride[i]<=0 || spec.dilation[i]<=0 || spec.padding[i]<0 || rows>INT64_MAX/spec.output_spatial[i] || cols>INT64_MAX/spec.kernel[i])
+        throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"invalid unfold geometry");
+      rows*=spec.output_spatial[i];cols*=spec.kernel[i];
+    }
+    const int64_t taps=cols/spec.layout_shape[4];
+    if(spec.cols<cols || spec.cols%taps!=0 || spec.channel_block<0 ||
+       (spec.channel_block>0 && (spec.cols/taps)%spec.channel_block!=0) || spec.rows>rows || spec.row_start>rows-spec.rows)
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"unfold output range mismatch");
   }
   if (spec.has_bias != 0 && !may_have_bias(spec.semantic)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -139,6 +192,22 @@ int blocks_for(int64_t count) {
   return static_cast<int>(blocks < kMaxBlocks ? blocks : kMaxBlocks);
 }
 
+// All divmod dividends and coordinate arithmetic must fit signed 32-bit.
+// Tensor addresses remain 64-bit. Large/unaligned geometries retain coverage.
+bool unfold_index32_supported(const apxinf_gather_spec_t& s, int unit) {
+  if (s.rows > INT_MAX || s.row_start > INT_MAX-s.rows ||
+      s.cols/unit > INT_MAX || s.rows > INT_MAX/(s.cols/unit)) return false;
+  for (int a=0;a<5;++a) if (s.layout_shape[a]>INT_MAX) return false;
+  for (int a=0;a<3;++a) {
+    if (s.kernel[a]>INT_MAX || s.output_spatial[a]>INT_MAX ||
+        s.stride[a]>INT_MAX || s.padding[a]>INT_MAX || s.dilation[a]>INT_MAX)
+      return false;
+    if ((s.output_spatial[a]-1)*s.stride[a]+(s.kernel[a]-1)*s.dilation[a]>INT_MAX)
+      return false;
+  }
+  return true;
+}
+
 template <class T>
 cudaError_t launch(const apxinf_gather_spec_t& spec,
                    const apxinf_gather_bindings_t& bindings) {
@@ -195,6 +264,40 @@ cudaError_t launch(const apxinf_gather_spec_t& spec,
       kernels::replace_rows<T><<<grid, kThreads, 0, stream>>>(
           input, static_cast<const T*>(bindings.replacement), bindings.row_map,
           output, count, cols, spec.replacement_rows);
+      break;
+    case APXINF_GATHER_SEMANTIC_PERMUTE:
+      kernels::permute<T><<<grid,kThreads,0,stream>>>(input,output,spec);
+      break;
+    case APXINF_GATHER_SEMANTIC_UNFOLD3D:
+      {
+        constexpr int vector_elements = 16/sizeof(T);
+        const int64_t taps=spec.kernel[0]*spec.kernel[1]*spec.kernel[2];
+        const int64_t block=spec.channel_block?spec.channel_block:spec.cols/taps;
+        const bool vectorized=spec.layout_shape[4]%vector_elements==0 &&
+            block%vector_elements==0 &&
+            reinterpret_cast<uintptr_t>(input)%16==0 &&
+            reinterpret_cast<uintptr_t>(output)%16==0;
+        const int unit=vectorized?vector_elements:1;
+        if (unfold_index32_supported(spec,unit)) {
+          kernels::UnfoldIndex32 index(spec,unit);
+          const int fast_grid=blocks_for(index.count);
+          if (vectorized) {
+            kernels::unfold3d_index32<uint4><<<fast_grid,kThreads,0,stream>>>(
+                reinterpret_cast<const uint4*>(input),reinterpret_cast<uint4*>(output),index);
+          } else if constexpr (sizeof(T)==4) {
+            kernels::unfold3d_index32<uint32_t><<<fast_grid,kThreads,0,stream>>>(
+                reinterpret_cast<const uint32_t*>(input),reinterpret_cast<uint32_t*>(output),index);
+          } else {
+            kernels::unfold3d_index32<uint16_t><<<fast_grid,kThreads,0,stream>>>(
+                reinterpret_cast<const uint16_t*>(input),reinterpret_cast<uint16_t*>(output),index);
+          }
+        } else {
+          kernels::unfold3d<T><<<grid,kThreads,0,stream>>>(input,output,spec);
+        }
+      }
+      break;
+    case APXINF_GATHER_SEMANTIC_RESIZE_BICUBIC:
+      kernels::resize_bicubic<T><<<grid,kThreads,0,stream>>>(input,output,spec);
       break;
     default:
       return cudaErrorInvalidValue;

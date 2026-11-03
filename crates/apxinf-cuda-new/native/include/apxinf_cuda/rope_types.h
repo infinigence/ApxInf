@@ -33,6 +33,8 @@ typedef enum {
   APXINF_ROPE_SEMANTIC_SPLIT_QKV_AXIAL = 3,
   /* In-place partial interleaved temporal/height/width rotary embedding. */
   APXINF_ROPE_SEMANTIC_PARTIAL_MROPE = 4,
+  APXINF_ROPE_SEMANTIC_COMPLEX_TABLE = 8,
+  APXINF_ROPE_SEMANTIC_RMS_COMPLEX_TABLE = 9,
   /* Packed BF16 vision QKV split with either H/W position ids or a
      precomputed float2 rotation table. */
   APXINF_ROPE_SEMANTIC_SPLIT_QKV_VISION = 5,
@@ -75,7 +77,7 @@ typedef enum {
   APXINF_ROPE_CONVENTION_HALF_SPLIT_AXIAL_ROUNDED_INPUT = 4,
 } apxinf_rope_convention_t;
 
-#define APXINF_ROPE_SPEC_VERSION 6u
+#define APXINF_ROPE_SPEC_VERSION 8u
 
 typedef struct {
   uint32_t version;
@@ -103,6 +105,8 @@ typedef struct {
   uint32_t rotation_alignment;
   int64_t tokens;
   int64_t cache_capacity;
+  uint32_t norm_numerics;
+  uint32_t norm_weight_alignment;
 } apxinf_rope_spec_t;
 
 typedef struct {
@@ -126,4 +130,6 @@ typedef struct {
   int32_t position_offset;
   /* Row offset into the K/V destination; 0 for fresh buffers. */
   int32_t kv_output_offset;
+  const void* norm_weight;
+  float norm_eps;
 } apxinf_rope_bindings_t;

@@ -4,6 +4,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <cutlass/fast_math.h>
+#include "../../include/apxinf_cuda/gather_types.h"
 
 namespace apxinf::gather::kernels {
 
@@ -141,6 +143,142 @@ __global__ void replace_rows(const T* input, const T* replacement,
     output[index] = source_row < replacement_rows
         ? replacement[static_cast<int64_t>(source_row) * cols + index % cols]
         : input[index];
+  }
+}
+
+// The normalized geometry contains no pointers or runtime host state.
+template<class T>
+__global__ void permute(const T* input,T* output,apxinf_gather_spec_t spec) {
+  for(int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+      i<spec.rows;i+=static_cast<int64_t>(gridDim.x)*blockDim.x) {
+    int64_t residual=i,source=0;
+    for(int axis=static_cast<int>(spec.rank)-1;axis>=0;--axis) {
+      source+=(residual%spec.layout_shape[axis])*spec.layout_strides[axis];
+      residual/=spec.layout_shape[axis];
+    }
+    output[i]=input[source];
+  }
+}
+
+// Copy in scalar or aligned 16-byte units. Host-precomputed exact integer
+// dividers avoid per-element runtime 64-bit division; no floating arithmetic
+// or convolution accumulation order changes. The launcher proves the index
+// domain first and retains the general 64-bit kernel for larger geometry.
+struct UnfoldIndex32 {
+  int count, start, channels, shape[5], stride[3], padding[3], dilation[3], block;
+  cutlass::FastDivmod cols, block_div, taps, taps_block, kernel[3], spatial[3];
+
+  explicit UnfoldIndex32(const apxinf_gather_spec_t& s, int unit)
+      : count(s.rows*s.cols/unit), start(s.row_start),
+        channels(s.layout_shape[4]/unit),
+        block((s.channel_block ? s.channel_block
+               : s.cols/(s.kernel[0]*s.kernel[1]*s.kernel[2]))/unit),
+        cols(s.cols/unit), block_div(block),
+        taps(s.kernel[0]*s.kernel[1]*s.kernel[2]), taps_block(taps.divisor*block) {
+    for (int a=0; a<5; ++a) shape[a]=s.layout_shape[a];
+    for (int a=0; a<3; ++a) {
+      stride[a]=s.stride[a];
+      padding[a]=s.padding[a];
+      dilation[a]=s.dilation[a];
+      kernel[a]=cutlass::FastDivmod(s.kernel[a]);
+      spatial[a]=cutlass::FastDivmod(s.output_spatial[a]);
+    }
+  }
+};
+
+template<class V>
+__global__ void unfold3d_index32(const V* input, V* output, UnfoldIndex32 g) {
+  // Unsigned iteration also keeps the last grid-stride increment defined when
+  // the proven count is close to INT_MAX.
+  for (uint32_t i=blockIdx.x*blockDim.x+threadIdx.x;
+       i<static_cast<uint32_t>(g.count); i+=gridDim.x*blockDim.x) {
+    int row, col;
+    g.cols(row,col,i);
+    row+=g.start;
+    int group, ignored, lane;
+    g.taps_block(group,ignored,col);
+    g.block_div(ignored,lane,col);
+    const int channel=group*g.block+lane;
+    int tap;
+    g.taps(ignored,tap,g.block_div.div(col));
+    int coord[3];
+    #pragma unroll
+    for (int a=2; a>=0; --a) {
+      int kernel_offset, center;
+      g.kernel[a](tap,kernel_offset,tap);
+      g.spatial[a](row,center,row);
+      coord[a]=center*g.stride[a]-g.padding[a]+kernel_offset*g.dilation[a];
+    }
+    bool inside=channel<g.channels;
+    #pragma unroll
+    for (int a=0; a<3; ++a)
+      inside &= coord[a]>=0 && coord[a]<g.shape[a+1];
+    if (inside) {
+      const int64_t offset=(((int64_t(row)*g.shape[1]+coord[0])*g.shape[2]
+          +coord[1])*g.shape[3]+coord[2])*g.channels+channel;
+      output[i]=input[offset];
+    } else {
+      output[i]=V{};
+    }
+  }
+}
+
+template<class T>
+__global__ void unfold3d(const T* input,T* output,apxinf_gather_spec_t s) {
+  const int64_t count=s.rows*s.cols;
+  const int64_t channels=s.cols/(s.kernel[0]*s.kernel[1]*s.kernel[2]);
+  for(int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+      i<count;i+=static_cast<int64_t>(gridDim.x)*blockDim.x) {
+    int64_t row=s.row_start+i/s.cols, col=i%s.cols;
+    const int64_t block=s.channel_block>0?s.channel_block:channels;
+    const int64_t taps=s.kernel[0]*s.kernel[1]*s.kernel[2];
+    const int64_t c=(col/(taps*block))*block+col%block;
+    col=(col/block)%taps;
+    int64_t coord[3];
+    for(int axis=2;axis>=0;--axis) {
+      const int64_t tap=col%s.kernel[axis];col/=s.kernel[axis];
+      const int64_t center=row%s.output_spatial[axis];row/=s.output_spatial[axis];
+      coord[axis]=center*s.stride[axis]-s.padding[axis]+tap*s.dilation[axis];
+    }
+    bool inside=c<s.layout_shape[4];
+    for(int axis=0;axis<3;++axis) inside &= coord[axis]>=0 && coord[axis]<s.layout_shape[axis+1];
+    if(inside) {
+      const int64_t offset=(((row*s.layout_shape[1]+coord[0])*s.layout_shape[2]+coord[1])*s.layout_shape[3]+coord[2])*s.layout_shape[4]+c;
+      output[i]=input[offset];
+    } else output[i]=from_float<T>(0.0f);
+  }
+}
+
+__device__ inline float cubic_inner(float x) {return (1.25f*x-2.25f)*x*x+1.f;}
+__device__ inline float cubic_outer(float x) {return ((-0.75f*x+3.75f)*x-6.f)*x+3.f;}
+__device__ inline void cubic_coefficients(float t,float* c) {
+  c[0]=cubic_outer(t+1.f);c[1]=cubic_inner(t);
+  const float opposite=1.f-t;
+  c[2]=cubic_inner(opposite);c[3]=cubic_outer(opposite+1.f);
+}
+template<class T>
+__global__ void resize_bicubic(const T* input,T* output,apxinf_gather_spec_t spec) {
+  const int ih=spec.layout_shape[1],iw=spec.layout_shape[2],channels=spec.layout_shape[3];
+  const int oh=spec.output_spatial[0],ow=spec.output_spatial[1];
+  const int64_t count=spec.rows*spec.cols;
+  const float sy=static_cast<float>(ih)/oh,sx=static_cast<float>(iw)/ow;
+  for(int64_t i=static_cast<int64_t>(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=static_cast<int64_t>(gridDim.x)*blockDim.x) {
+    const int c=i%channels,x=(i/channels)%ow,y=(i/channels/ow)%oh;
+    const int64_t batch=i/channels/ow/oh;
+    if(ih==oh && iw==ow) {output[i]=input[i];continue;}
+    const float fy=sy*(y+0.5f)-0.5f,fx=sx*(x+0.5f)-0.5f;
+    const int iy=static_cast<int>(floorf(fy)),ix=static_cast<int>(floorf(fx));
+    float cy[4],cx[4],v[4];cubic_coefficients(fy-iy,cy);cubic_coefficients(fx-ix,cx);
+    for(int j=0;j<4;++j) {
+      const int yy=min(max(iy+j-1,0),ih-1);
+      float pixel[4];
+      for(int k=0;k<4;++k) {
+        const int xx=min(max(ix+k-1,0),iw-1);
+        pixel[k]=to_float(input[((batch*ih+yy)*iw+xx)*channels+c]);
+      }
+      v[j]=pixel[0]*cx[0]+pixel[1]*cx[1]+pixel[2]*cx[2]+pixel[3]*cx[3];
+    }
+    output[i]=from_float<T>(v[0]*cy[0]+v[1]*cy[1]+v[2]*cy[2]+v[3]*cy[3]);
   }
 }
 

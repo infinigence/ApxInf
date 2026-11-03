@@ -79,7 +79,7 @@ std::string common_key(const Spec& spec,
   key << '|' << (spec.alpha_is_unit != 0 ? 1 : 0) << '|'
       << (spec.output_scale_is_unit != 0 ? 1 : 0) << '|'
       << policy.workspace_limit << '|' << policy.graph_safe << '|'
-      << policy.deterministic;
+      << policy.deterministic << '|' << policy.algorithm;
   return key.str();
 }
 

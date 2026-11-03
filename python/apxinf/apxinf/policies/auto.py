@@ -92,6 +92,11 @@ def _read_model_type(model_dir: Path) -> str:
         and "noise_scheduler" in document
     ):
         return "walloss"
+    action_head = document.get("action_head_cfg")
+    if isinstance(action_head, dict) and action_head.get("_target_") == (
+        "groot.vla.model.dreamzero.action_head.wan_flow_matching_action_tf.WANPolicyHead"
+    ):
+        return "dreamzero"
     for key in _MODEL_TYPE_KEYS:
         value = document.get(key)
         if isinstance(value, str) and value:

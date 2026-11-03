@@ -26,12 +26,17 @@ bool valid_alignment(uint32_t alignment) {
 }
 
 bool reads_secondary(uint32_t semantic) {
-  return semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE;
+  return semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE ||
+         (semantic >= APXINF_POINTWISE_SEMANTIC_ADD && semantic <= APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY) ||
+         semantic == APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION ||
+         semantic == APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL;
 }
 
 bool may_have_bias(uint32_t semantic) {
   return semantic == APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION ||
-         semantic == APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3;
+         semantic == APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3 ||
+         semantic == APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION ||
+         semantic == APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL;
 }
 
 void validate_spec(const apxinf_pointwise_spec_t& spec) {
@@ -44,11 +49,11 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
       spec.dtype == APXINF_DTYPE_BF16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
   if (spec.version != APXINF_POINTWISE_SPEC_VERSION ||
-      spec.semantic > APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3 ||
-      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
+      spec.semantic > APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL ||
+      (spec.dtype != APXINF_DTYPE_F32 && spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!quantized_geglu && !quantized_swiglu &&
        spec.output_dtype != spec.dtype) ||
-      spec.activation > APXINF_POINTWISE_ACTIVATION_RELU ||
+      spec.activation > APXINF_POINTWISE_ACTIVATION_SWISH_ROUNDED ||
       spec.has_bias > 1 || spec.rows <= 0 || spec.cols <= 0 ||
       spec.input_cols <= 0 || spec.logical_cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
@@ -83,6 +88,11 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid Pointwise rowwise SwiGLU contract");
   }
+  if ((spec.semantic == APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION ||
+       spec.semantic == APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL) &&
+      (spec.has_bias != 1 || spec.input_cols != spec.cols || spec.logical_cols != spec.cols)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid staged affine contract");
+  }
   if (spec.has_bias != 0 && !may_have_bias(spec.semantic)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "Pointwise semantic does not take a bias");
@@ -102,6 +112,9 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
 
 void validate_bindings(const apxinf_pointwise_spec_t& spec,
                        const apxinf_pointwise_bindings_t& bindings) {
+  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_SCALAR_DIVIDE && bindings.dt == 0.0f) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "zero Pointwise scalar divisor");
+  }
   if (bindings.input == nullptr || bindings.output == nullptr ||
       (reads_secondary(spec.semantic) && bindings.secondary == nullptr) ||
       ((spec.semantic == APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3) !=
@@ -272,6 +285,72 @@ cudaError_t launch(const apxinf_pointwise_spec_t& spec,
       kernels::euler_update<T><<<grid, kDirectThreads, 0, stream>>>(
           input, secondary, output, count, bindings.dt);
       break;
+    case APXINF_POINTWISE_SEMANTIC_STAGED_MODULATION:
+    case APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL: {
+      constexpr int unit = 16 / sizeof(T);
+      const bool vectorized = count >= 8192 && cols % unit == 0 && count / unit <= INT_MAX &&
+          reinterpret_cast<uintptr_t>(input) % 16 == 0 && reinterpret_cast<uintptr_t>(secondary) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(bias) % 16 == 0 && reinterpret_cast<uintptr_t>(output) % 16 == 0;
+#define APXINF_STAGED_AFFINE(GATE) \
+      if (vectorized) kernels::staged_affine_vector<T,GATE><<<blocks_for(count/unit),kDirectThreads,0,stream>>>( \
+          input,secondary,bias,output,static_cast<int>(count/unit),cutlass::FastDivmod(cols/unit)); \
+      else kernels::staged_affine_scalar<T,GATE><<<grid,kDirectThreads,0,stream>>>(input,secondary,bias,output,count,cols)
+      if (spec.semantic == APXINF_POINTWISE_SEMANTIC_STAGED_GATED_RESIDUAL) { APXINF_STAGED_AFFINE(true); }
+      else { APXINF_STAGED_AFFINE(false); }
+#undef APXINF_STAGED_AFFINE
+      break;
+    }
+    case APXINF_POINTWISE_SEMANTIC_ADD:
+    case APXINF_POINTWISE_SEMANTIC_SUBTRACT:
+    case APXINF_POINTWISE_SEMANTIC_MULTIPLY:
+    case APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD:
+    case APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY:
+    case APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY:
+    case APXINF_POINTWISE_SEMANTIC_SCALE:
+    case APXINF_POINTWISE_SEMANTIC_SCALAR_ADD:
+    case APXINF_POINTWISE_SEMANTIC_SCALAR_DIVIDE:
+    case APXINF_POINTWISE_SEMANTIC_EXP:
+    case APXINF_POINTWISE_SEMANTIC_SIN:
+    case APXINF_POINTWISE_SEMANTIC_COS:
+      {
+        constexpr int unit=16/sizeof(T);
+        const bool broadcast=spec.semantic==APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD ||
+            spec.semantic==APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY ||
+            spec.semantic==APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY;
+        const bool vector_secondary=spec.semantic<=APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY;
+        const bool aligned=reinterpret_cast<uintptr_t>(input)%16==0 &&
+            reinterpret_cast<uintptr_t>(output)%16==0 &&
+            (!vector_secondary || reinterpret_cast<uintptr_t>(secondary)%16==0);
+        const bool vectorized=count>=8192 && count%unit==0 && count/unit<=INT_MAX &&
+            (!broadcast || cols%unit==0) && aligned;
+        if (vectorized) {
+          const int groups=static_cast<int>(count/unit);
+          const int blocks=blocks_for(groups);
+          const cutlass::FastDivmod divisor(broadcast?cols/unit:1);
+#define APXINF_BINARY_VECTOR_CASE(S) case S: \
+          kernels::binary_vector<T,S><<<blocks,kDirectThreads,0,stream>>>( \
+              input,secondary,output,groups,divisor,bindings.dt); break
+          switch(spec.semantic) {
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_ADD);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SUBTRACT);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_MULTIPLY);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_BROADCAST_ADD);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_BROADCAST_MULTIPLY);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_ROW_MULTIPLY);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SCALE);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SCALAR_ADD);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SCALAR_DIVIDE);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_EXP);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_SIN);
+            APXINF_BINARY_VECTOR_CASE(APXINF_POINTWISE_SEMANTIC_COS);
+          }
+#undef APXINF_BINARY_VECTOR_CASE
+        } else {
+          kernels::binary_scalar<T><<<grid,kDirectThreads,0,stream>>>(
+              input,secondary,output,count,cols,static_cast<int>(spec.semantic),bindings.dt);
+        }
+      }
+      break;
     default:
       return cudaErrorInvalidValue;
   }
@@ -280,6 +359,8 @@ cudaError_t launch(const apxinf_pointwise_spec_t& spec,
 
 cudaError_t launch_bf16(const apxinf_pointwise_spec_t& spec,
                         const apxinf_pointwise_bindings_t& bindings) {
+  if (spec.semantic >= APXINF_POINTWISE_SEMANTIC_ADD) return launch<__nv_bfloat16>(spec,bindings);
+
   const auto* input = static_cast<const __nv_bfloat16*>(bindings.input);
   const auto* bias = static_cast<const __nv_bfloat16*>(bindings.bias);
   auto* output = static_cast<__nv_bfloat16*>(bindings.output);
@@ -289,7 +370,8 @@ cudaError_t launch_bf16(const apxinf_pointwise_spec_t& spec,
   if (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU) {
     return launch_bf16_geglu(input, output, rows, cols, stream);
   }
-  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION) {
+  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION &&
+      spec.activation <= APXINF_POINTWISE_ACTIVATION_GELU_EXACT) {
     return launch_bf16_bias_activation(
         input, bias, output, rows, cols, static_cast<int>(spec.activation),
         stream);
@@ -360,6 +442,8 @@ extern "C" apxinf_status_t apxinf_pointwise_launch(
     apxinf::framework::check_cuda(
         spec->dtype == APXINF_DTYPE_BF16
             ? launch_bf16(*spec, *bindings)
-            : launch<__half>(*spec, *bindings));
+            : spec->dtype == APXINF_DTYPE_F32
+                ? launch<float>(*spec, *bindings)
+                : launch<__half>(*spec, *bindings));
   });
 }

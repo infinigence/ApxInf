@@ -1,5 +1,6 @@
 pub(crate) mod activation;
 pub(crate) mod attention;
+pub(crate) mod convolution;
 pub(crate) mod cache;
 pub(crate) mod elementwise;
 pub(crate) mod embedding;

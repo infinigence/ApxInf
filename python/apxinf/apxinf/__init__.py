@@ -69,6 +69,7 @@ from .policies import (
     Pi0FastPolicy,
     Policy,
     WallossPolicy,
+    DreamZeroPolicy,
 )
 from .processors import (
     GaussianNoise,
@@ -91,6 +92,7 @@ __all__ = [
     "Pi0FastPolicy",
     "Gr00tPolicy",
     "WallossPolicy",
+    "DreamZeroPolicy",
     "AutoPolicy",
     # offline calibration framework
     "CalibrationContext",
