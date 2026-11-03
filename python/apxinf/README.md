@@ -1,6 +1,6 @@
 # apxinf (Python frontend)
 
-Python-first (NumPy/Pillow plus native Rust tokenizers) processor library + the **L2** policy
+Python-first (NumPy/Pillow, optional CPU acceleration, and native Rust tokenizers) processor library + the **L2** policy
 layer for the ApxInf VLA runtime. The bare-model L1 inference binding lives in
 the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
 `apxinf.ModelRunner` so you never import `apxinf_py` directly.
@@ -9,7 +9,7 @@ the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
 
 ```
 apxinf/
-├── processors/   pure-numpy pre/post steps + Pipeline (offline, no GPU/Rust)
+├── processors/   NumPy pre/post steps + optional CPU kernels (offline, no GPU)
 ├── policies/     the L2 layer — stable machinery + volatile per-model impls
 │   ├── base.py       Policy + ModelRunnerProtocol contracts (structural Protocols)
 │   ├── registry.py   model_type -> policy-class registry
@@ -296,3 +296,11 @@ a SentencePiece model (`APXINF_TOKENIZER` or `APXINF_PI05_MODEL_DIR`). Everythin
 else is checked against the definition or against itself — the π0-FAST inverse DCT
 is compared with the textbook term-by-term sum, not with scipy. The real-model
 layering test needs a CUDA `apxinf_py` build plus `APXINF_PI05_MODEL_DIR`.
+
+The package optionally builds a C++17 CPU resize primitive with setuptools.
+Cosmos Policy uses it for the reference 212→224 crop resize while preserving
+separate FP32 passes and final nearest-even uint8 rounding. JPEG encoding,
+cropping, camera order, and custom image transforms remain policy-owned. If
+the accelerator is unavailable, the existing NumPy implementation remains
+available without a compiler, GPU, or model runtime. No platform-specific
+CPU instruction set is required by the distributed extension.

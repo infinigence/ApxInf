@@ -33,6 +33,13 @@
  * interchangeable:
  *
  *   norm_style  [2 * cols]  scale in [0, cols), shift in [cols, 2 * cols)
+ * When style_group_rows > 0, staged BF16 adaptive LayerNorm reads
+ * norm_style [rows/style_group_rows, style_parts, cols]; shift_first controls
+ * the first two parts. Staged grouped residual reads gate_style with three
+ * parts per group and rounds the gate product before adding residual.
+ * FUSED_ADD_NORM may combine these grouped styles: gate always has three
+ * parts; norm_style has style_parts parts and shares the same group rows.
+ *
  *   gate_style  [3 * cols]  the gate is the third segment,
  *                           [2 * cols, 3 * cols)
  *
@@ -44,6 +51,9 @@ typedef enum {
   APXINF_NORM_OPERATION_NORM = 0,
   APXINF_NORM_OPERATION_FUSED_ADD_NORM = 1,
   APXINF_NORM_OPERATION_RESIDUAL_ADD = 2,
+  APXINF_NORM_OPERATION_NORM_SILU = 3,
+  APXINF_NORM_OPERATION_BIAS_NORM_SILU = 4,
+  APXINF_NORM_OPERATION_FUSED_ADD_NORM_SILU = 5,
 } apxinf_norm_operation_t;
 
 typedef enum {
@@ -75,6 +85,7 @@ typedef enum {
   APXINF_NORM_NUMERICS_FLEXIBLE = 0,
   APXINF_NORM_NUMERICS_STABLE_DECODE = 1,
   APXINF_NORM_NUMERICS_STABLE_PLANNING = 2,
+  APXINF_NORM_NUMERICS_STAGED_BF16 = 3,
 } apxinf_norm_numerics_t;
 
 typedef enum {
@@ -82,10 +93,14 @@ typedef enum {
   APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL = 1,
 } apxinf_norm_bias_order_t;
 
-#define APXINF_NORM_SPEC_VERSION 8u
+#define APXINF_NORM_SPEC_VERSION 10u
 
 typedef struct {
   uint32_t version;
+  /* Zero for legacy vector styles; otherwise rows per group. */
+  int64_t style_group_rows;
+  uint32_t style_parts;
+  uint32_t shift_first;
   uint32_t operation;
   uint32_t statistic;
   uint32_t affine;

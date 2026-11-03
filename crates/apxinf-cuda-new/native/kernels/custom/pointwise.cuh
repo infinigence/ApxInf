@@ -45,6 +45,28 @@ __global__ void multiply(const T* a, const T* b, T* out, int64_t count) {
     out[i] = from_float<T>(__fmul_rn(to_float(a[i]), to_float(b[i])));
 }
 
+// Aligned BF16 binary operations: one 16-byte transaction per eight elements.
+// Both inputs are loaded before writing, preserving exact in-place operation.
+template <bool Euler>
+__global__ void binary_bf16_vec8(const uint4* a, const uint4* b, uint4* out,
+                                int64_t vectors, float dt) {
+  union Pack { uint4 words; unsigned short lanes[8]; };
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < vectors; i += int64_t(gridDim.x) * blockDim.x) {
+    Pack x, y, z;
+    x.words = a[i];
+    y.words = b[i];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float av = __bfloat162float(__ushort_as_bfloat16(x.lanes[j]));
+      float bv = __bfloat162float(__ushort_as_bfloat16(y.lanes[j]));
+      float value = Euler ? av + dt * bv : __fmul_rn(av, bv);
+      z.lanes[j] = __bfloat16_as_ushort(__float2bfloat16(value));
+    }
+    out[i] = z.words;
+  }
+}
+
 __device__ __forceinline__ float gelu_tanh(float value) {
   constexpr float kAlpha = 0.7978845608028654f;
   return 0.5f * value *

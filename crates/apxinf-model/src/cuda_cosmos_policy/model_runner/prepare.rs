@@ -137,19 +137,29 @@ impl ModelRunner {
                 return Err(invalid("sample/spec mismatch"));
             }
         }
-        let inputs = Inputs::allocate(&self.ctx)?;
-        let model = CosmosPolicyModel::new(self.ctx.clone(), self.weights.clone(), &inputs)?;
-        let workspace_bytes = model.workspace_bytes();
-        let generator = crate::cuda_cosmos_policy::backend::sampling::create_normal_generator(
-            &self.ctx,
-            inputs.noise.clone(),
-        )?;
         let mut gemm = self.gemm.clone();
         let mut attention = self.attention.clone();
         if sample.is_none() {
             gemm.online_tune = false;
             attention.online_tune = false;
         }
+        let convolution = crate::cuda_cosmos_policy::backend::Conv3dPolicy {
+            online_tune: gemm.online_tune,
+            allow_fallback: gemm.allow_fallback,
+            cache_dir: gemm.cache_dir.clone(),
+        };
+        let inputs = Inputs::allocate(&self.ctx)?;
+        let model = CosmosPolicyModel::new(
+            self.ctx.clone(),
+            self.weights.clone(),
+            &inputs,
+            &convolution,
+        )?;
+        let workspace_bytes = model.workspace_bytes();
+        let generator = crate::cuda_cosmos_policy::backend::sampling::create_normal_generator(
+            &self.ctx,
+            inputs.noise.clone(),
+        )?;
         let mut state = PlanState {
             graph: None,
             model,
@@ -183,6 +193,10 @@ impl ModelRunner {
                 attention,
                 ..
             } = &mut state;
+            // Constant computation has a different prepared-operator sequence
+            // from requests. Record it separately, then record only the request
+            // traversal that eager execution and Graph capture will replay.
+            session.prepare(|| model.prepare_constants(gemm, attention))?;
             session.prepare(|| model.forward(gemm, attention))?;
         }
         self.ctx.synchronize().map_err(Error::Cuda)?;
@@ -370,6 +384,15 @@ mod tests {
         for i in 0..16 {
             assert_eq!(eager_action[i * 7 + 6] > 0., expected[i * 7 + 6] > 0.);
         }
+        let mut changed_task = o.clone();
+        changed_task.token_ids[0] = (changed_task.token_ids[0] + 1) % 40;
+        let changed_task_eager = host(
+            eager
+                .run(&VlaRequest::provided(&changed_task, &fixture["noise"]))?
+                .tensor(),
+        )?;
+        assert_ne!(changed_task_eager, eager_action);
+        assert_eq!(host(eager.run(&request)?.tensor())?, eager_action);
         drop(eager);
         eprintln!("Preparing full model graph");
         let graph = runner.plan(
@@ -412,15 +435,15 @@ mod tests {
             )?,
             eager_action
         );
-        let mut changed_task = o.clone();
-        changed_task.token_ids[0] = (changed_task.token_ids[0] + 1) % 40;
-        assert_ne!(
+        // Per-request text projections must refresh in captured execution and
+        // agree with an independently executed eager task transition.
+        assert_eq!(
             host(
                 graph
                     .run(&VlaRequest::provided(&changed_task, &fixture["noise"]))?
                     .tensor()
             )?,
-            eager_action
+            changed_task_eager
         );
         let wrong_noise = Tensor::zeros(vec![16, 7], DType::F32);
         assert!(graph.run(&VlaRequest::provided(&o, &wrong_noise)).is_err());

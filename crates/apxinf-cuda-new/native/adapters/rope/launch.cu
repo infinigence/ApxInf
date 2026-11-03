@@ -1,8 +1,11 @@
 #include "../../include/apxinf_cuda/rope.h"
+#include "../../include/apxinf_cuda/norm.h"
+#include "../../include/apxinf_cuda/runtime.h"
 #include "../../framework/runtime_internal.h"
 #include "../../kernels/custom/rope.cuh"
 #include "../../kernels/rope/multimodal.cuh"
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -140,7 +143,8 @@ bool valid_contract_fields(const apxinf_rope_spec_t& spec) {
     case APXINF_ROPE_SEMANTIC_APPLY:
       return spec.layout == APXINF_ROPE_LAYOUT_SINGLE_TENSOR &&
              spec.cache_write == APXINF_ROPE_CACHE_WRITE_NONE &&
-             ((spec.rotation_source == APXINF_ROPE_ROTATION_POSITION_OFFSET &&
+             (((spec.rotation_source == APXINF_ROPE_ROTATION_POSITION_OFFSET ||
+                spec.rotation_source == APXINF_ROPE_ROTATION_PRECOMPUTED_TABLE) &&
                spec.rotary_convention == APXINF_ROPE_CONVENTION_HALF_SPLIT) ||
               (spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_IDS &&
                spec.rotary_convention ==
@@ -250,6 +254,11 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
         spec.rotation_source == APXINF_ROPE_ROTATION_POSITION_OFFSET &&
         spec.rotary_dim == spec.head_dim && spec.section_t == 0 &&
         spec.section_h == 0 && spec.section_w == 0;
+    const bool precomputed =
+        spec.dtype == APXINF_DTYPE_BF16 &&
+        spec.rotation_source == APXINF_ROPE_ROTATION_PRECOMPUTED_TABLE &&
+        spec.rotary_dim == spec.head_dim && spec.section_t == 0 &&
+        spec.section_h == 0 && spec.section_w == 0;
     const bool multimodal =
         spec.dtype == APXINF_DTYPE_BF16 &&
         spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_IDS &&
@@ -264,7 +273,7 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
             spec.head_dim / 2;
     if (spec.has_bias != 0 || spec.q_heads != spec.kv_heads ||
         spec.cache_capacity != 0 ||
-        (!one_dimensional && !multimodal && !axial)) {
+        (!one_dimensional && !multimodal && !axial && !precomputed)) {
       throw Failure(APXINF_STATUS_UNSUPPORTED,
                     "unsupported standalone RoPE Spec");
     }
@@ -294,7 +303,7 @@ void validate_bindings(const apxinf_rope_spec_t& spec,
   if (single_tensor &&
       (bindings.bias != nullptr || bindings.k != nullptr ||
        bindings.v != nullptr || bindings.key_input != nullptr ||
-       bindings.value_input != nullptr || bindings.rotation_table != nullptr ||
+       bindings.value_input != nullptr ||
        bindings.kv_output_offset != 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "standalone RoPE received unrelated bindings");
@@ -360,7 +369,7 @@ void validate_bindings(const apxinf_rope_spec_t& spec,
         spec.rotation_source == APXINF_ROPE_ROTATION_POSITION_OFFSET;
     if ((uses_position_offset && bindings.position != nullptr) ||
         (!uses_position_offset &&
-         (bindings.position == nullptr || bindings.position_offset != 0))) {
+         ((!precomputed && bindings.position == nullptr) || bindings.position_offset != 0))) {
       throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                     "standalone RoPE offset/position binding mismatch");
     }
@@ -513,6 +522,24 @@ cudaError_t launch_apply(const apxinf_rope_spec_t& spec,
   const dim3 grid((spec.head_dim / 2 + kDecodeThreads - 1) / kDecodeThreads,
                   spec.q_heads, static_cast<uint32_t>(spec.tokens));
   auto stream = static_cast<cudaStream_t>(bindings.stream);
+  if (spec.rotation_source == APXINF_ROPE_ROTATION_PRECOMPUTED_TABLE) {
+    const int64_t pairs = spec.tokens * spec.q_heads * (spec.head_dim / 2);
+    const int blocks = static_cast<int>(std::min<int64_t>((pairs + 255) / 256, 65535));
+    // Compile the common geometry into shifts/masks rather than runtime
+    // 64-bit divisions. Arithmetic and the generic contract are unchanged.
+    if (spec.q_heads == 16 && spec.head_dim == 128) {
+      kernels::apply_precomputed_bf16<16, 128><<<blocks, 256, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(bindings.qkv),
+          static_cast<const float*>(bindings.rotation_table),
+          static_cast<__nv_bfloat16*>(bindings.q), spec.tokens, spec.q_heads, spec.head_dim);
+    } else {
+      kernels::apply_precomputed_bf16<><<<blocks, 256, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(bindings.qkv),
+          static_cast<const float*>(bindings.rotation_table),
+          static_cast<__nv_bfloat16*>(bindings.q), spec.tokens, spec.q_heads, spec.head_dim);
+    }
+    return cudaGetLastError();
+  }
   if (spec.rotation_source == APXINF_ROPE_ROTATION_POSITION_OFFSET) {
     if (spec.dtype == APXINF_DTYPE_F16) {
       return apxinf_rope_half_split_f16(
@@ -581,5 +608,80 @@ extern "C" apxinf_status_t apxinf_rope_launch(
                    ? launch_split<__nv_bfloat16>(*spec, *bindings)
                    : launch_split<__half>(*spec, *bindings));
     apxinf::framework::check_cuda(status);
+  });
+}
+
+// This fixed compound operation has no tuning state: dim128 uses one kernel;
+// the explicit baseline composes the existing Norm and RoPE adapters in place.
+extern "C" apxinf_status_t apxinf_rope_rms_precomputed_launch(
+    apxinf_runtime_t runtime, const apxinf_rms_precomputed_rope_spec_t* spec,
+    const apxinf_rms_precomputed_rope_bindings_t* bindings) {
+  return apxinf::framework::abi_boundary([&] {
+    auto require=[](bool ok,const char* message) {
+      if(!ok)throw apxinf::framework::Failure(APXINF_STATUS_INVALID_ARGUMENT,message);
+    };
+    require(runtime && spec && bindings,"null RMSNorm RoPE argument");
+    const auto& s=*spec;const auto& b=*bindings;
+    require(s.version==APXINF_RMS_PRECOMPUTED_ROPE_VERSION && !s.reserved &&
+        s.tokens>0 && s.tokens<=INT_MAX && s.heads>0 &&
+        s.heads<=uint64_t(INT_MAX)/s.tokens && s.dim>0 && s.dim<=2048 && s.dim%2==0 &&
+        std::isfinite(b.epsilon) && b.epsilon>0 && b.input && b.weight && b.table && b.output,
+        "invalid RMSNorm precomputed RoPE contract");
+    require(reinterpret_cast<uintptr_t>(b.input)%2==0 && reinterpret_cast<uintptr_t>(b.weight)%2==0 &&
+        reinterpret_cast<uintptr_t>(b.output)%2==0 && reinterpret_cast<uintptr_t>(b.table)%4==0,
+        "RMSNorm RoPE binding alignment mismatch");
+    const int rows=int(s.tokens*s.heads);
+    auto overlap=[](const void* a,uint64_t an,const void* b,uint64_t bn) {
+      auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);
+      return x<=y ? y-x<an : x-y<bn;
+    };
+    const uint64_t bytes=uint64_t(rows)*s.dim*2;
+    require((b.input==b.output || !overlap(b.input,bytes,b.output,bytes)) &&
+        !overlap(b.weight,uint64_t(s.dim)*2,b.output,bytes) &&
+        !overlap(b.table,uint64_t(s.tokens)*s.dim*4,b.output,bytes),"RMSNorm RoPE output overlaps source");
+    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
+    auto stream=static_cast<cudaStream_t>(b.stream);
+    if(s.dim==128 && rows>=1024 &&
+        ((reinterpret_cast<uintptr_t>(b.input) | reinterpret_cast<uintptr_t>(b.weight) |
+          reinterpret_cast<uintptr_t>(b.output)) & 15)==0) {
+      apxinf::rope::kernels::rms_precomputed_packed_bf16_128<8><<<(uint64_t(rows)+63)/64,256,0,stream>>>(
+          static_cast<const __nv_bfloat16*>(b.input),static_cast<const __nv_bfloat16*>(b.weight),
+          static_cast<const float*>(b.table),static_cast<__nv_bfloat16*>(b.output),rows,s.heads,b.epsilon);
+      apxinf::framework::check_cuda(cudaGetLastError());
+      return;
+    }
+    if(s.dim==128) {
+      apxinf::rope::kernels::rms_precomputed_bf16_128<<<(uint64_t(rows)+7)/8,256,0,stream>>>(
+          static_cast<const __nv_bfloat16*>(b.input),static_cast<const __nv_bfloat16*>(b.weight),
+          static_cast<const float*>(b.table),static_cast<__nv_bfloat16*>(b.output),rows,s.heads,b.epsilon);
+      apxinf::framework::check_cuda(cudaGetLastError());
+      return;
+    }
+    auto checked=[](apxinf_status_t status) {
+      if(status!=APXINF_STATUS_OK)throw apxinf::framework::Failure(status,apxinf_last_error());
+    };
+    apxinf_norm_spec_t ns{};
+    ns.version=APXINF_NORM_SPEC_VERSION;ns.operation=APXINF_NORM_OPERATION_NORM;
+    ns.statistic=APXINF_NORM_STATISTIC_RMS;ns.affine=APXINF_NORM_AFFINE_WEIGHT;
+    ns.dtype=ns.output_dtype=APXINF_DTYPE_BF16;ns.has_native_output=1;
+    ns.input_alignment=ns.weight_alignment=ns.normalized_alignment=2;
+    ns.bias_alignment=ns.residual_alignment=ns.style_alignment=ns.hidden_alignment=256;
+    ns.quantized_alignment=ns.quantized_scales_alignment=256;
+    ns.rows=rows;ns.cols=s.dim;ns.output_scale_is_unit=1;
+    apxinf_norm_bindings_t nb{};
+    nb.input=b.input;nb.weight=b.weight;nb.normalized=b.output;nb.stream=b.stream;
+    nb.eps=b.epsilon;nb.output_scale=1;
+    checked(apxinf_norm_launch(runtime,&ns,&nb));
+    apxinf_rope_spec_t rs{};
+    rs.version=APXINF_ROPE_SPEC_VERSION;rs.semantic=APXINF_ROPE_SEMANTIC_APPLY;
+    rs.dtype=APXINF_DTYPE_BF16;rs.layout=APXINF_ROPE_LAYOUT_SINGLE_TENSOR;
+    rs.rotation_source=APXINF_ROPE_ROTATION_PRECOMPUTED_TABLE;
+    rs.rotary_convention=APXINF_ROPE_CONVENTION_HALF_SPLIT;
+    rs.q_heads=rs.kv_heads=s.heads;rs.head_dim=rs.rotary_dim=s.dim;
+    rs.qkv_alignment=rs.q_alignment=2;rs.bias_alignment=rs.kv_alignment=256;
+    rs.rotation_alignment=4;rs.tokens=s.tokens;
+    apxinf_rope_bindings_t rb{};
+    rb.qkv=b.output;rb.q=b.output;rb.rotation_table=b.table;rb.stream=b.stream;rb.theta=1;
+    checked(apxinf_rope_launch(runtime,&rs,&rb));
   });
 }

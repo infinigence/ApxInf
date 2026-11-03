@@ -57,6 +57,23 @@ mod tensor_ops {
         }
         Ok(())
     }
+    pub fn linear_gelu_exact(
+        ctx: &CudaContext,
+        input: &Tensor,
+        w: &Linear,
+        output: &Tensor,
+        policy: &GemmPolicy,
+    ) -> Result<()> {
+        if w.bias.is_some() {
+            linear(ctx, input, w, output, policy)?;
+            return activate(ctx, output, None, PointwiseActivation::GeluExact, output);
+        }
+        let mut out = output.clone();
+        let mut args = GemmArgs::new(input, &w.weight, &mut out);
+        args.policy = policy.clone();
+        args.weight_version = Some(WeightVersion::new(1));
+        crate::cuda_cosmos_policy::backend::ops::gemm_gelu_exact(ctx, args)
+    }
     pub fn activate(
         ctx: &CudaContext,
         input: &Tensor,
@@ -105,31 +122,22 @@ mod tensor_ops {
     }
 }
 mod convolution {
-    use crate::cuda_cosmos_policy::backend::ops::{gemm, GemmArgs, GemmPolicy, WeightVersion};
-    use crate::cuda_cosmos_policy::backend::{pointwise, PointwiseArgs, PointwiseSemantic};
+    use crate::cuda_cosmos_policy::backend::ops::GemmPolicy;
     use crate::cuda_cosmos_policy::backend::{
-        CudaBuffer, CudaContext, PreparedUnfold3d, Unfold3dArgs, Unfold3dGeometry,
+        fused_add_channel_l2_norm_silu, pointwise, residual_add, BiasOrder, Conv3dArgs,
+        Conv3dPolicy, CudaBuffer, CudaContext, FusedAddChannelL2NormArgs, PointwiseArgs,
+        PointwiseSemantic, PreparedConv3d, ResidualAddArgs, Unfold3dGeometry,
     };
+    use crate::cuda_cosmos_policy::weights::Conv;
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
-    use crate::cuda_cosmos_policy::weights::Conv;
-
-    /// Stable per-invocation lowering resources. The shared column buffer is
-    /// reused between tiles, with all launches ordered on the model stream.
     pub(in crate::cuda_cosmos_policy::model::blocks::bf16) struct ConvWorkspace {
-        tiles: Vec<Tile>,
+        convolution: PreparedConv3d,
         pub output: Tensor,
     }
-
-    struct Tile {
-        unfold: PreparedUnfold3d,
-        columns: Tensor,
-        destination: Tensor,
-        output: Tensor,
-    }
-
     impl ConvWorkspace {
         pub fn prepare(
+            policy: &Conv3dPolicy,
             ctx: &CudaContext,
             weights: &Conv,
             input: &Tensor,
@@ -147,13 +155,16 @@ mod convolution {
             let mut output_shape = vec![0; 4];
             for axis in 0..3 {
                 let padded = dims[axis]
-                    + padding_before[axis]
-                    + padding_after[axis]
-                    + if axis == 0 {
-                        history.map_or(0, |h| h.shape().dims()[0])
-                    } else {
-                        0
-                    };
+                    .checked_add(padding_before[axis])
+                    .and_then(|v| v.checked_add(padding_after[axis]))
+                    .and_then(|v| {
+                        v.checked_add(if axis == 0 {
+                            history.map_or(0, |h| h.shape().dims()[0])
+                        } else {
+                            0
+                        })
+                    })
+                    .ok_or_else(|| Error::Other("Cosmos VAE convolution extent overflow".into()))?;
                 if stride[axis] == 0 || padded < weights.kernel[axis] {
                     return Err(Error::Other(
                         "Cosmos VAE convolution padding/stride mismatch".into(),
@@ -162,118 +173,155 @@ mod convolution {
                 output_shape[axis] = (padded - weights.kernel[axis]) / stride[axis] + 1;
             }
             output_shape[3] = weights.output_channels;
-            let rows: usize = output_shape[..3].iter().product();
-            let tile_rows = rows.min(4096);
-            let k = weights.input_channels * weights.kernel.iter().product::<usize>();
-            let columns_buffer =
-                CudaBuffer::alloc(tile_rows * k * 2, ctx.device_id()).map_err(Error::Cuda)?;
-            let output_buffer =
-                CudaBuffer::alloc(rows * weights.output_channels * 2, ctx.device_id())
-                    .map_err(Error::Cuda)?;
-            // Bind every full tile to one GEMM output address. Distinct final
-            // destinations would otherwise create one vendor handle/workspace per
-            // tile, even though execution is sequential and the weights are shared.
-            let tile_buffer =
-                CudaBuffer::alloc(tile_rows * weights.output_channels * 2, ctx.device_id())
-                    .map_err(Error::Cuda)?;
-            let output = output_buffer
+            let bytes = output_shape
+                .iter()
+                .try_fold(2usize, |a, &b| a.checked_mul(b))
+                .ok_or_else(|| Error::Other("Cosmos VAE convolution output overflow".into()))?;
+            let mut output = CudaBuffer::alloc(bytes, ctx.device_id())
+                .map_err(Error::Cuda)?
                 .as_tensor(Shape::new(output_shape), DType::BF16)
                 .map_err(Error::Cuda)?;
-            let mut tiles = Vec::new();
-            for start in (0..rows).step_by(tile_rows) {
-                let count = tile_rows.min(rows - start);
-                let mut columns = columns_buffer
-                    .view(0, count * k * 2)
-                    .map_err(Error::Cuda)?
-                    .as_tensor(Shape::new(vec![count, k]), DType::BF16)
-                    .map_err(Error::Cuda)?;
-                let destination = output_buffer
-                    .view(
-                        start * weights.output_channels * 2,
-                        count * weights.output_channels * 2,
-                    )
-                    .map_err(Error::Cuda)?
-                    .as_tensor(
-                        Shape::new(vec![count, weights.output_channels]),
-                        DType::BF16,
-                    )
-                    .map_err(Error::Cuda)?;
-                let tile_output = tile_buffer
-                    .view(0, count * weights.output_channels * 2)
-                    .map_err(Error::Cuda)?
-                    .as_tensor(
-                        Shape::new(vec![count, weights.output_channels]),
-                        DType::BF16,
-                    )
-                    .map_err(Error::Cuda)?;
-                let unfold = PreparedUnfold3d::new(
-                    ctx,
-                    Unfold3dArgs {
-                        input,
-                        history,
-                        row_start: start,
-                        out: &mut columns,
-                        geometry: Unfold3dGeometry {
-                            kernel: weights.kernel,
-                            stride,
-                            padding_before,
-                            padding_after,
-                        },
+            let convolution = PreparedConv3d::with_policy(
+                ctx,
+                Conv3dArgs {
+                    input,
+                    history,
+                    weight: &weights.linear.weight,
+                    geometry: Unfold3dGeometry {
+                        kernel: weights.kernel,
+                        stride,
+                        padding_before,
+                        padding_after,
                     },
-                )?;
-                tiles.push(Tile {
-                    unfold,
-                    columns,
-                    destination,
-                    output: tile_output,
-                });
-            }
-            Ok(Self { tiles, output })
+                    out: &mut output,
+                    workspace_limit: 512 * 1024 * 1024,
+                },
+                policy,
+            )?;
+            Ok(Self {
+                convolution,
+                output,
+            })
         }
-
         pub fn forward(
             &mut self,
             ctx: &CudaContext,
             weights: &Conv,
-            policy: &GemmPolicy,
+            _policy: &GemmPolicy,
         ) -> Result<()> {
-            for tile in &mut self.tiles {
-                tile.unfold.enqueue()?;
+            self.convolution.enqueue()?;
+            if let Some(bias) = &weights.linear.bias {
+                // Preserve the convolution-output BF16 rounding before bias.
+                let input = self.output.reshape(vec![
+                    self.output.numel() / weights.output_channels,
+                    weights.output_channels,
+                ])?;
+                let mut output = input.clone();
                 let mut args =
-                    GemmArgs::new(&tile.columns, &weights.linear.weight, &mut tile.output);
-                args.policy = policy.clone();
-                args.weight_version = Some(WeightVersion::new(1));
-                gemm(ctx, args)?;
-                if let Some(bias) = &weights.linear.bias {
-                    // Preserve the convolution-output BF16 rounding before bias.
-                    let input = tile.output.clone();
-                    let mut args = PointwiseArgs::new(
-                        PointwiseSemantic::BiasActivation,
-                        &input,
-                        &mut tile.output,
-                    );
-                    args.bias = Some(bias);
-                    pointwise(ctx, args)?;
-                }
-                crate::cuda_cosmos_policy::backend::transfers::copy_cuda_to_cuda(
-                    ctx,
-                    &tile.output,
-                    &tile.destination,
-                )?;
+                    PointwiseArgs::new(PointwiseSemantic::BiasActivation, &input, &mut output);
+                args.bias = Some(bias);
+                pointwise(ctx, args)?;
             }
             Ok(())
         }
+        /// Materialize the biased result and the next channel normalization together.
+        pub fn forward_normalized(
+            &mut self,
+            ctx: &CudaContext,
+            weights: &Conv,
+            norm_weight: &Tensor,
+            normalized: &Tensor,
+        ) -> Result<()> {
+            self.convolution.enqueue()?;
+            let shape = vec![
+                self.output.numel() / weights.output_channels,
+                weights.output_channels,
+            ];
+            let input = self.output.reshape(shape.clone())?;
+            let mut normalized = normalized.reshape(shape)?;
+            fused_add_channel_l2_norm_silu(
+                ctx,
+                FusedAddChannelL2NormArgs {
+                    input: &input,
+                    bias: weights.linear.bias.as_ref(),
+                    residual: None,
+                    hidden: &input,
+                    weight: norm_weight,
+                    normalized: &mut normalized,
+                    eps: 1e-12,
+                },
+            )
+        }
+
+        /// Preserve the staged residual output while producing its next normalization.
+        pub fn forward_residual_normalized(
+            &mut self,
+            ctx: &CudaContext,
+            weights: &Conv,
+            residual: &Tensor,
+            output: &Tensor,
+            norm_weight: &Tensor,
+            normalized: &Tensor,
+        ) -> Result<()> {
+            self.convolution.enqueue()?;
+            let shape = vec![
+                self.output.numel() / weights.output_channels,
+                weights.output_channels,
+            ];
+            let mut normalized = normalized.reshape(shape.clone())?;
+            fused_add_channel_l2_norm_silu(
+                ctx,
+                FusedAddChannelL2NormArgs {
+                    input: &self.output.reshape(shape.clone())?,
+                    bias: weights.linear.bias.as_ref(),
+                    residual: Some(&residual.reshape(shape.clone())?),
+                    hidden: &output.reshape(shape)?,
+                    weight: norm_weight,
+                    normalized: &mut normalized,
+                    eps: 1e-12,
+                },
+            )
+        }
+
+        /// Publish a residual result without materializing a biased convolution intermediate.
+        /// `self.output` remains convolution scratch; temporal history uses normalized inputs.
+        pub fn forward_residual(
+            &mut self,
+            ctx: &CudaContext,
+            weights: &Conv,
+            residual: &Tensor,
+            output: &Tensor,
+        ) -> Result<()> {
+            self.convolution.enqueue()?;
+            let shape = vec![
+                self.output.numel() / weights.output_channels,
+                weights.output_channels,
+            ];
+            residual_add(
+                ctx,
+                ResidualAddArgs {
+                    input: &self.output.reshape(shape.clone())?,
+                    bias: weights.linear.bias.as_ref(),
+                    residual: &residual.reshape(shape.clone())?,
+                    hidden: &output.reshape(shape)?,
+                    gate: None,
+                    // Conv output rounds first, bias addition rounds before residual addition.
+                    bias_order: BiasOrder::BiasThenResidual,
+                },
+            )
+        }
     }
 }
+
 mod vae {
     //! Causal Wan2.1 encoder. Cache edges point at preceding chunk activations;
     //! every inference recomputes the singleton chunk before consuming those edges.
     //! No activation state crosses observation boundaries.
     use crate::cuda_cosmos_policy::backend::ops::{embedding_gather, GemmPolicy};
     use crate::cuda_cosmos_policy::backend::{
-        attention, channel_l2_norm, pointwise, residual_add, AttentionArgs, AttentionPolicy,
-        BiasOrder, ChannelL2NormArgs, CudaBuffer, CudaContext, PointwiseActivation, PointwiseArgs,
-        PointwiseSemantic, ResidualAddArgs,
+        attention, channel_l2_norm, channel_l2_norm_silu, pointwise, AttentionArgs,
+        AttentionPolicy, ChannelL2NormArgs, Conv3dPolicy, CudaBuffer, CudaContext, PointwiseArgs,
+        PointwiseSemantic,
     };
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
@@ -286,6 +334,96 @@ mod vae {
             .map_err(Error::Cuda)?
             .as_tensor(Shape::new(shape), DType::BF16)
             .map_err(Error::Cuda)
+    }
+
+    /// A chronological activation allocation shared by the two causal chunks.
+    /// The two leading frames stay zero; producers write only their current view.
+    struct CausalActivation {
+        storage: CudaBuffer,
+        current: Tensor,
+        causal: Tensor,
+        end: usize,
+        capacity: usize,
+    }
+
+    impl CausalActivation {
+        fn prepare(
+            ctx: &CudaContext,
+            shape: &[usize],
+            total_frames: usize,
+            previous: Option<&Self>,
+        ) -> Result<Self> {
+            if shape.len() != 4 || shape.contains(&0) || total_frames < shape[0] {
+                return Err(Error::Other("invalid causal activation extent".into()));
+            }
+            let capacity = total_frames
+                .checked_add(2)
+                .ok_or_else(|| Error::Other("causal activation capacity overflow".into()))?;
+            let frame_bytes = shape[1..]
+                .iter()
+                .try_fold(2usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| Error::Other("causal activation frame overflow".into()))?;
+            let (storage, start) = if let Some(previous) = previous {
+                if previous.capacity != capacity
+                    || previous.current.shape().dims()[1..] != shape[1..]
+                {
+                    return Err(Error::Other(
+                        "causal activation history geometry mismatch".into(),
+                    ));
+                }
+                (previous.storage.clone(), previous.end)
+            } else {
+                let bytes = capacity
+                    .checked_mul(frame_bytes)
+                    .ok_or_else(|| Error::Other("causal activation allocation overflow".into()))?;
+                (
+                    CudaBuffer::alloc_zeros(bytes, ctx.device_id()).map_err(Error::Cuda)?,
+                    2,
+                )
+            };
+            let end = start
+                .checked_add(shape[0])
+                .filter(|&end| end <= capacity)
+                .ok_or_else(|| {
+                    Error::Other("causal activation exceeds prepared timeline".into())
+                })?;
+            let view = |start: usize, frames: usize| -> Result<Tensor> {
+                let mut dims = shape.to_vec();
+                dims[0] = frames;
+                storage
+                    .view(start * frame_bytes, frames * frame_bytes)
+                    .map_err(Error::Cuda)?
+                    .as_tensor(Shape::new(dims), DType::BF16)
+                    .map_err(Error::Cuda)
+            };
+            let current = view(start, shape[0])?;
+            let causal = view(start - 2, shape[0] + 2)?;
+            Ok(Self {
+                storage,
+                current,
+                causal,
+                end,
+                capacity,
+            })
+        }
+    }
+
+    fn causal_activation(
+        policy: &Conv3dPolicy,
+        ctx: &CudaContext,
+        weights: &Conv,
+        input: &CausalActivation,
+    ) -> Result<ConvWorkspace> {
+        ConvWorkspace::prepare(
+            policy,
+            ctx,
+            weights,
+            &input.causal,
+            None,
+            [1; 3],
+            [0, 1, 1],
+            [0, 1, 1],
+        )
     }
 
     fn matrix(t: &Tensor) -> Result<Tensor> {
@@ -308,6 +446,7 @@ mod vae {
     }
 
     fn causal(
+        policy: &Conv3dPolicy,
         ctx: &CudaContext,
         weights: &Conv,
         input: &Tensor,
@@ -316,6 +455,7 @@ mod vae {
         let history = previous.map(|p| tail(p, 2)).transpose()?;
         let past = history.as_ref().map_or(0, |h| h.shape().dims()[0]);
         ConvWorkspace::prepare(
+            policy,
             ctx,
             weights,
             input,
@@ -334,7 +474,7 @@ mod vae {
     ) -> Result<()> {
         let input = matrix(input)?;
         let mut output = matrix(output)?;
-        channel_l2_norm(
+        channel_l2_norm_silu(
             ctx,
             ChannelL2NormArgs {
                 input: &input,
@@ -342,32 +482,14 @@ mod vae {
                 out: &mut output,
                 eps: 1e-12,
             },
-        )?;
-        let input = output.clone();
-        let mut args = PointwiseArgs::new(PointwiseSemantic::BiasActivation, &input, &mut output);
-        args.activation = PointwiseActivation::Silu;
-        pointwise(ctx, args)
-    }
-
-    fn add(ctx: &CudaContext, a: &Tensor, b: &Tensor, out: &Tensor) -> Result<()> {
-        residual_add(
-            ctx,
-            ResidualAddArgs {
-                input: &matrix(a)?,
-                bias: None,
-                residual: &matrix(b)?,
-                hidden: &matrix(out)?,
-                gate: None,
-                bias_order: BiasOrder::SingleRound,
-            },
         )
     }
 
     struct Residual {
         input: Tensor,
-        norm1: Tensor,
+        norm1: CausalActivation,
         conv1: ConvWorkspace,
-        norm2: Tensor,
+        norm2: CausalActivation,
         conv2: ConvWorkspace,
         shortcut: Option<ConvWorkspace>,
         output: Tensor,
@@ -375,20 +497,32 @@ mod vae {
 
     impl Residual {
         fn prepare(
+            policy: &Conv3dPolicy,
             ctx: &CudaContext,
             w: &VaeResidual,
             input: &Tensor,
+            total_frames: usize,
             previous: Option<&Self>,
         ) -> Result<Self> {
-            let norm1 = alloc(ctx, input.shape().dims().to_vec())?;
-            let conv1 = causal(ctx, &w.conv1, &norm1, previous.map(|p| &p.norm1))?;
-            let norm2 = alloc(ctx, conv1.output.shape().dims().to_vec())?;
-            let conv2 = causal(ctx, &w.conv2, &norm2, previous.map(|p| &p.norm2))?;
+            let norm1 = CausalActivation::prepare(
+                ctx,
+                input.shape().dims(),
+                total_frames,
+                previous.map(|p| &p.norm1),
+            )?;
+            let conv1 = causal_activation(policy, ctx, &w.conv1, &norm1)?;
+            let norm2 = CausalActivation::prepare(
+                ctx,
+                conv1.output.shape().dims(),
+                total_frames,
+                previous.map(|p| &p.norm2),
+            )?;
+            let conv2 = causal_activation(policy, ctx, &w.conv2, &norm2)?;
             let shortcut = w
                 .shortcut
                 .as_ref()
                 .map(|weight| {
-                    ConvWorkspace::prepare(ctx, weight, input, None, [1; 3], [0; 3], [0; 3])
+                    ConvWorkspace::prepare(policy, ctx, weight, input, None, [1; 3], [0; 3], [0; 3])
                 })
                 .transpose()?;
             let output = alloc(ctx, conv2.output.shape().dims().to_vec())?;
@@ -409,10 +543,21 @@ mod vae {
             w: &VaeResidual,
             policy: &GemmPolicy,
         ) -> Result<()> {
-            normalize_activate(ctx, &self.input, &w.norm1, &self.norm1)?;
-            self.conv1.forward(ctx, &w.conv1, policy)?;
-            normalize_activate(ctx, &self.conv1.output, &w.norm2, &self.norm2)?;
-            self.conv2.forward(ctx, &w.conv2, policy)?;
+            normalize_activate(ctx, &self.input, &w.norm1, &self.norm1.current)?;
+            self.forward_normalized(ctx, w, policy, None)
+        }
+
+        // The producer has already populated norm1. The optional destination
+        // composes this residual update with the following block's normalization.
+        fn forward_normalized(
+            &mut self,
+            ctx: &CudaContext,
+            w: &VaeResidual,
+            policy: &GemmPolicy,
+            next_normalization: Option<(&Tensor, &Tensor)>,
+        ) -> Result<()> {
+            self.conv1
+                .forward_normalized(ctx, &w.conv1, &w.norm2, &self.norm2.current)?;
             let residual = match (&mut self.shortcut, &w.shortcut) {
                 (Some(shortcut), Some(weights)) => {
                     shortcut.forward(ctx, weights, policy)?;
@@ -420,7 +565,19 @@ mod vae {
                 }
                 _ => &self.input,
             };
-            add(ctx, &self.conv2.output, residual, &self.output)
+            if let Some((weight, normalized)) = next_normalization {
+                self.conv2.forward_residual_normalized(
+                    ctx,
+                    &w.conv2,
+                    residual,
+                    &self.output,
+                    weight,
+                    normalized,
+                )
+            } else {
+                self.conv2
+                    .forward_residual(ctx, &w.conv2, residual, &self.output)
+            }
         }
     }
 
@@ -443,11 +600,17 @@ mod vae {
     }
 
     impl SpatialAttention {
-        fn prepare(ctx: &CudaContext, w: &VaeWeights, input: &Tensor) -> Result<Self> {
+        fn prepare(
+            policy: &Conv3dPolicy,
+            ctx: &CudaContext,
+            w: &VaeWeights,
+            input: &Tensor,
+        ) -> Result<Self> {
             let dims = input.shape().dims();
             let (t, pixels, c) = (dims[0], dims[1] * dims[2], dims[3]);
             let normalized = alloc(ctx, dims.to_vec())?;
             let qkv = ConvWorkspace::prepare(
+                policy,
                 ctx,
                 &w.attention_qkv,
                 &normalized,
@@ -470,6 +633,7 @@ mod vae {
             let v = alloc(ctx, vec![t, pixels, 1, c])?;
             let attended = alloc(ctx, dims.to_vec())?;
             let projection = ConvWorkspace::prepare(
+                policy,
                 ctx,
                 &w.attention_output,
                 &attended,
@@ -518,8 +682,8 @@ mod vae {
             let mut args = AttentionArgs::new(&self.q, &self.k, &self.v, &mut output);
             args.policy = attention_policy.clone();
             attention(ctx, args)?;
-            self.projection.forward(ctx, &w.attention_output, gemm)?;
-            add(ctx, &self.projection.output, &self.input, &self.output)
+            self.projection
+                .forward_residual(ctx, &w.attention_output, &self.input, &self.output)
         }
     }
 
@@ -531,7 +695,7 @@ mod vae {
         middle_before: Residual,
         attention: SpatialAttention,
         middle_after: Residual,
-        head_norm: Tensor,
+        head_norm: CausalActivation,
         head_conv: ConvWorkspace,
         mean_projection: ConvWorkspace,
         mean_indices: Tensor,
@@ -542,32 +706,40 @@ mod vae {
 
     impl VaeChunk {
         pub fn prepare(
+            policy: &Conv3dPolicy,
             ctx: &CudaContext,
             w: &VaeWeights,
             input: &Tensor,
+            total_frames: usize,
             previous: Option<&Self>,
         ) -> Result<Self> {
-            let input_conv = causal(ctx, &w.input, input, previous.map(|p| &p.input))?;
+            let input_conv = causal(policy, ctx, &w.input, input, previous.map(|p| &p.input))?;
             let mut current = input_conv.output.clone();
+            let mut total_frames = total_frames;
             let mut blocks = Vec::new();
             let mut downsample = Vec::new();
             for (level, weights) in w.down_blocks.iter().enumerate() {
                 let first = Residual::prepare(
+                    policy,
                     ctx,
                     &weights[0],
                     &current,
+                    total_frames,
                     previous.map(|p| &p.blocks[level][0]),
                 )?;
                 let second = Residual::prepare(
+                    policy,
                     ctx,
                     &weights[1],
                     &first.output,
+                    total_frames,
                     previous.map(|p| &p.blocks[level][1]),
                 )?;
                 current = second.output.clone();
                 blocks.push([first, second]);
                 if level < 3 {
                     let spatial = ConvWorkspace::prepare(
+                        policy,
                         ctx,
                         &w.downsample[level].spatial,
                         &current,
@@ -580,6 +752,7 @@ mod vae {
                         (Some(weight), Some(p)) => {
                             let history = tail(&p.downsample[level].spatial.output, 1)?;
                             Some(ConvWorkspace::prepare(
+                                policy,
                                 ctx,
                                 weight,
                                 &spatial.output,
@@ -596,24 +769,37 @@ mod vae {
                         .map_or(&spatial.output, |t| &t.output)
                         .clone();
                     downsample.push(Downsample { spatial, temporal });
+                    if w.downsample[level].temporal.is_some() {
+                        total_frames = (total_frames - 1) / 2 + 1;
+                    }
                 }
             }
             let middle_before = Residual::prepare(
+                policy,
                 ctx,
                 &w.middle_before,
                 &current,
+                total_frames,
                 previous.map(|p| &p.middle_before),
             )?;
-            let attention = SpatialAttention::prepare(ctx, w, &middle_before.output)?;
+            let attention = SpatialAttention::prepare(policy, ctx, w, &middle_before.output)?;
             let middle_after = Residual::prepare(
+                policy,
                 ctx,
                 &w.middle_after,
                 &attention.output,
+                total_frames,
                 previous.map(|p| &p.middle_after),
             )?;
-            let head_norm = alloc(ctx, middle_after.output.shape().dims().to_vec())?;
-            let head_conv = causal(ctx, &w.output, &head_norm, previous.map(|p| &p.head_norm))?;
+            let head_norm = CausalActivation::prepare(
+                ctx,
+                middle_after.output.shape().dims(),
+                total_frames,
+                previous.map(|p| &p.head_norm),
+            )?;
+            let head_conv = causal_activation(policy, ctx, &w.output, &head_norm)?;
             let mean_projection = ConvWorkspace::prepare(
+                policy,
                 ctx,
                 &w.mean_projection,
                 &head_conv.output,
@@ -676,19 +862,38 @@ mod vae {
             gemm: &GemmPolicy,
             attention: &AttentionPolicy,
         ) -> Result<()> {
-            self.input_conv.forward(ctx, &w.input, gemm)?;
+            self.input_conv.forward_normalized(
+                ctx,
+                &w.input,
+                &w.down_blocks[0][0].norm1,
+                &self.blocks[0][0].norm1.current,
+            )?;
             for level in 0..4 {
-                for block in 0..2 {
-                    self.blocks[level][block].forward(ctx, &w.down_blocks[level][block], gemm)?;
-                }
+                let (first, second) = self.blocks[level].split_at_mut(1);
+                first[0].forward_normalized(
+                    ctx,
+                    &w.down_blocks[level][0],
+                    gemm,
+                    Some((&w.down_blocks[level][1].norm1, &second[0].norm1.current)),
+                )?;
+                second[0].forward_normalized(ctx, &w.down_blocks[level][1], gemm, None)?;
                 if level < 3 {
                     let down = &mut self.downsample[level];
-                    down.spatial
-                        .forward(ctx, &w.downsample[level].spatial, gemm)?;
+                    let norm_weight = &w.down_blocks[level + 1][0].norm1;
+                    let normalized = &self.blocks[level + 1][0].norm1.current;
                     if let (Some(temporal), Some(weights)) =
                         (&mut down.temporal, &w.downsample[level].temporal)
                     {
-                        temporal.forward(ctx, weights, gemm)?;
+                        down.spatial
+                            .forward(ctx, &w.downsample[level].spatial, gemm)?;
+                        temporal.forward_normalized(ctx, weights, norm_weight, normalized)?;
+                    } else {
+                        down.spatial.forward_normalized(
+                            ctx,
+                            &w.downsample[level].spatial,
+                            norm_weight,
+                            normalized,
+                        )?;
                     }
                 }
             }
@@ -699,7 +904,7 @@ mod vae {
                 ctx,
                 &self.middle_after.output,
                 &w.output_norm,
-                &self.head_norm,
+                &self.head_norm.current,
             )?;
             self.head_conv.forward(ctx, &w.output, gemm)?;
             self.mean_projection
@@ -756,8 +961,28 @@ mod vae {
                 .map_err(Error::Cuda)?
                 .as_tensor(Shape::new(vec![16, 224, 224, 3]), DType::BF16)
                 .map_err(Error::Cuda)?;
-            let mut first = VaeChunk::prepare(&ctx, &weights, &first, None)?;
-            let mut rest = VaeChunk::prepare(&ctx, &weights, &rest, Some(&first))?;
+            let mut first = VaeChunk::prepare(
+                &Conv3dPolicy {
+                    online_tune: true,
+                    ..Default::default()
+                },
+                &ctx,
+                &weights,
+                &first,
+                17,
+                None,
+            )?;
+            let mut rest = VaeChunk::prepare(
+                &Conv3dPolicy {
+                    online_tune: true,
+                    ..Default::default()
+                },
+                &ctx,
+                &weights,
+                &rest,
+                17,
+                Some(&first),
+            )?;
             let session = ExecutionSession::with_capacity(256 * 1024 * 1024, 0)?;
             let gemm = GemmPolicy {
                 online_tune: false,
@@ -841,74 +1066,91 @@ mod dit {
     use super::tensor_ops::*;
     use crate::cuda_cosmos_policy::backend::ops::GemmPolicy;
     use crate::cuda_cosmos_policy::backend::{
-        attention, norm, AttentionArgs, AttentionPolicy, CudaContext, NormArgs, PointwiseActivation,
+        attention, norm,
+        ops::{
+            fused_add_norm, Affine, BiasOrder, FusedAddNormArgs, NormKind, NormNumerics,
+            ResidualGate,
+        },
+        AttentionArgs, AttentionPolicy, CudaContext, NormArgs, PointwiseActivation,
     };
     use crate::cuda_cosmos_policy::weights::{upload, Attention, DitWeights, Modulation};
-    use apxinf_core::{DType, Result, Tensor};
+    use apxinf_core::{Result, Tensor};
 
     const TOKENS: usize = 9 * 14 * 14;
     const WIDTH: usize = 2048;
 
+    /// Schedule-fixed BF16 styles, prepared with the same shared GEMM scratch
+    /// as the original forward path. Request values never enter this cache.
+    pub(super) struct StepModulation {
+        time_global: Tensor,
+        blocks: Vec<[Tensor; 3]>,
+        final_style: Tensor,
+    }
+    impl StepModulation {
+        pub(super) fn allocate(ctx: &CudaContext, w: &DitWeights) -> Result<Self> {
+            Ok(Self {
+                time_global: bf(ctx, 9, 6144)?,
+                blocks: w
+                    .blocks
+                    .iter()
+                    .map(|_| Ok([bf(ctx, 9, 6144)?, bf(ctx, 9, 6144)?, bf(ctx, 9, 6144)?]))
+                    .collect::<Result<_>>()?,
+                final_style: bf(ctx, 9, 4096)?,
+            })
+        }
+    }
+
     struct Rotary {
-        swap: Tensor,
-        cos: Tensor,
-        signed_sin: Tensor,
-        swapped: Tensor,
-        a: Tensor,
-        b: Tensor,
+        table: Tensor,
     }
     impl Rotary {
         fn new(ctx: &CudaContext, w: &DitWeights, ntk: [f32; 3]) -> Result<Self> {
-            // Source buffers have already been rounded to BF16 by checkpoint load.
+            // Checkpoint ranges were rounded to BF16 at load. Preserve the
+            // original FP32 angle/trigonometry; coefficients broadcast over heads.
             let temporal = w.temporal_range.as_bf16()?;
             let spatial = w.spatial_range.as_bf16()?;
             let seq = w.position_seq.as_bf16()?;
-            let mut cos = Vec::with_capacity(TOKENS * WIDTH);
-            let mut sin = Vec::with_capacity(TOKENS * WIDTH);
-            let mut swap = Vec::with_capacity(TOKENS * WIDTH);
+            let mut table = Vec::with_capacity(TOKENS * 128);
             for token in 0..TOKENS {
                 let coordinates = [token / 196, token / 14 % 14, token % 14];
-                for head in 0..16 {
-                    for c in 0..128 {
-                        let half = c % 64;
-                        let (axis, exponent) = if half < 22 {
-                            (0, temporal[half])
-                        } else if half < 43 {
-                            (1, spatial[half - 22])
-                        } else {
-                            (2, spatial[half - 43])
-                        };
-                        let angle = seq[coordinates[axis]].to_f32()
-                            * (1. / (10000. * ntk[axis]).powf(exponent.to_f32()));
-                        cos.push(angle.cos());
-                        sin.push(angle.sin() * if c < 64 { -1. } else { 1. });
-                        swap.push((token * WIDTH + head * 128 + (c + 64) % 128) as i32);
-                    }
+                let mut sin = Vec::with_capacity(64);
+                for c in 0..64 {
+                    let (axis, exponent) = if c < 22 {
+                        (0, temporal[c])
+                    } else if c < 43 {
+                        (1, spatial[c - 22])
+                    } else {
+                        (2, spatial[c - 43])
+                    };
+                    let angle = seq[coordinates[axis]].to_f32()
+                        * (1. / (10000. * ntk[axis]).powf(exponent.to_f32()));
+                    table.push(angle.cos());
+                    sin.push(angle.sin());
                 }
+                table.extend(sin);
             }
             Ok(Self {
-                swap: indices(ctx, &swap)?,
-                cos: upload(
-                    &Tensor::from_f32(vec![TOKENS, WIDTH], &cos)?,
+                table: upload(
+                    &Tensor::from_f32(vec![TOKENS, 2, 64], &table)?,
                     ctx.device_id(),
                 )?,
-                signed_sin: upload(
-                    &Tensor::from_f32(vec![TOKENS, WIDTH], &sin)?,
-                    ctx.device_id(),
-                )?,
-                swapped: bf(ctx, TOKENS, WIDTH)?,
-                a: alloc(ctx, vec![TOKENS, WIDTH], DType::F32)?,
-                b: alloc(ctx, vec![TOKENS, WIDTH], DType::F32)?,
             })
         }
-        fn apply(&self, ctx: &CudaContext, input: &Tensor) -> Result<()> {
-            gather(ctx, input, &self.swap, 1, &self.swapped)?;
-            cast(ctx, input, &self.a)?;
-            cast(ctx, &self.swapped, &self.b)?;
-            multiply(ctx, &self.a, &self.cos, &self.a)?;
-            multiply(ctx, &self.b, &self.signed_sin, &self.b)?;
-            add(ctx, &self.a, &self.b, &self.a)?;
-            cast(ctx, &self.a, input)
+        fn apply_normalized(
+            &self,
+            ctx: &CudaContext,
+            input: &Tensor,
+            weight: &Tensor,
+        ) -> Result<()> {
+            let heads = input.reshape(vec![TOKENS, 16, 128])?;
+            crate::cuda_cosmos_policy::backend::ops::rope::rms_norm_apply_precomputed(
+                ctx,
+                &heads,
+                weight,
+                &self.table,
+                1e-6,
+                &heads,
+            )
         }
     }
 
@@ -917,13 +1159,11 @@ mod dit {
         pub output: Tensor,
         pub hidden: Tensor,
         normalized: Tensor,
-        ones: Tensor,
-        zeros: Tensor,
+
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        text_k: Tensor,
-        text_v: Tensor,
+        text_kv: Vec<[Tensor; 2]>,
         attended: Tensor,
         projected: Tensor,
         mlp: Tensor,
@@ -936,33 +1176,10 @@ mod dit {
         final_modulation: Tensor,
         final_global: Tensor,
         final_global_ids: Tensor,
-        broadcast_ids: [Tensor; 3],
-        final_ids: [Tensor; 2],
-        scale: Tensor,
-        shift: Tensor,
-        gate: Tensor,
         rotary: Rotary,
     }
     impl Dit {
         pub fn prepare(ctx: &CudaContext, w: &DitWeights, ntk: [f32; 3]) -> Result<Self> {
-            let maps = [0, 1, 2].map(|part| {
-                indices(
-                    ctx,
-                    &(0..TOKENS)
-                        .map(|r| (r / 196 * 3 + part) as i32)
-                        .collect::<Vec<_>>(),
-                )
-            });
-            let [shift, scale, gate] = maps;
-            let maps = [0, 1].map(|part| {
-                indices(
-                    ctx,
-                    &(0..TOKENS)
-                        .map(|r| (r / 196 * 2 + part) as i32)
-                        .collect::<Vec<_>>(),
-                )
-            });
-            let [final_shift, final_scale] = maps;
             let final_global_ids = indices(
                 ctx,
                 &(0..9)
@@ -974,13 +1191,15 @@ mod dit {
                 output: bf(ctx, TOKENS, 64)?,
                 hidden: bf(ctx, TOKENS, WIDTH)?,
                 normalized: bf(ctx, TOKENS, WIDTH)?,
-                ones: constant(ctx, WIDTH, 1.)?,
-                zeros: constant(ctx, WIDTH, 0.)?,
+
                 q: bf(ctx, TOKENS, WIDTH)?,
                 k: bf(ctx, TOKENS, WIDTH)?,
                 v: bf(ctx, TOKENS, WIDTH)?,
-                text_k: bf(ctx, 512, WIDTH)?,
-                text_v: bf(ctx, 512, WIDTH)?,
+                text_kv: w
+                    .blocks
+                    .iter()
+                    .map(|_| Ok([bf(ctx, 512, WIDTH)?, bf(ctx, 512, WIDTH)?]))
+                    .collect::<Result<_>>()?,
                 attended: bf(ctx, TOKENS, WIDTH)?,
                 projected: bf(ctx, TOKENS, WIDTH)?,
                 mlp: bf(ctx, TOKENS, 8192)?,
@@ -993,15 +1212,10 @@ mod dit {
                 final_modulation: bf(ctx, 9, 4096)?,
                 final_global: bf(ctx, 9, 4096)?,
                 final_global_ids,
-                broadcast_ids: [shift?, scale?, gate?],
-                final_ids: [final_shift?, final_scale?],
-                scale: bf(ctx, TOKENS, WIDTH)?,
-                shift: bf(ctx, TOKENS, WIDTH)?,
-                gate: bf(ctx, TOKENS, WIDTH)?,
                 rotary: Rotary::new(ctx, w, ntk)?,
             })
         }
-        fn modulate(
+        fn compute_modulation(
             &self,
             ctx: &CudaContext,
             w: &Modulation,
@@ -1015,74 +1229,87 @@ mod dit {
                 &self.modulation_hidden,
                 policy,
             )?;
-            let (modulation, global, ids) = if final_layer {
-                (
-                    &self.final_modulation,
-                    &self.final_global,
-                    &self.final_ids[..],
-                )
+            let (modulation, global) = if final_layer {
+                (&self.final_modulation, &self.final_global)
             } else {
-                (&self.modulation, &self.time_global, &self.broadcast_ids[..])
+                (&self.modulation, &self.time_global)
             };
             linear(ctx, &self.modulation_hidden, &w.up, modulation, policy)?;
             add(ctx, modulation, global, modulation)?;
-            gather(ctx, modulation, &ids[0], WIDTH, &self.shift)?;
-            gather(ctx, modulation, &ids[1], WIDTH, &self.scale)?;
-            if !final_layer {
-                gather(ctx, modulation, &ids[2], WIDTH, &self.gate)?;
-            }
-            // These three BF16 rounding boundaries are present in the reference.
-            activate(
-                ctx,
-                &self.scale,
-                Some(&self.ones),
-                PointwiseActivation::None,
-                &self.scale,
-            )?;
+            Ok(())
+        }
+        fn modulate(&self, ctx: &CudaContext, modulation: &Tensor) -> Result<()> {
+            let parts = modulation.numel() / (9 * WIDTH);
+            let style = modulation.reshape(vec![9, parts, WIDTH])?;
             norm(
                 ctx,
-                NormArgs::layer(
-                    &self.hidden,
-                    &self.ones,
-                    &self.zeros,
-                    &mut self.normalized.clone(),
-                    1e-6,
-                ),
-            )?;
-            multiply(ctx, &self.normalized, &self.scale, &self.normalized)?;
-            add(ctx, &self.normalized, &self.shift, &self.normalized)
+                NormArgs {
+                    input: &self.hidden,
+                    output: Some(&self.normalized),
+                    kind: NormKind::Layer,
+                    affine: Affine::GroupedAdaptive {
+                        style: &style,
+                        shift_first: true,
+                    },
+                    quantized: None,
+                    numerics: NormNumerics::StagedBf16,
+                    eps: 1e-6,
+                },
+            )
+        }
+
+        /// Refresh all text projections once per request, before the five
+        /// denoising steps. This remains in the request graph so task updates
+        /// cannot reuse projections from an earlier observation.
+        pub(super) fn project_text(
+            &self,
+            ctx: &CudaContext,
+            w: &DitWeights,
+            text: &Tensor,
+            gemm: &GemmPolicy,
+        ) -> Result<()> {
+            for (block, [k, v]) in w.blocks.iter().zip(&self.text_kv) {
+                let w = &block.cross_attention;
+                linear(ctx, text, &w.k, k, gemm)?;
+                linear(ctx, text, &w.v, v, gemm)?;
+                norm(
+                    ctx,
+                    NormArgs::rms(&matrix(k, 128)?, &w.k_norm, &mut matrix(k, 128)?, 1e-6),
+                )?;
+            }
+            Ok(())
         }
         fn attend(
             &self,
             ctx: &CudaContext,
             w: &Attention,
-            text: Option<&Tensor>,
+            text: Option<&[Tensor; 2]>,
             gemm: &GemmPolicy,
             policy: &AttentionPolicy,
         ) -> Result<()> {
-            let (context, k, v) = match text {
-                Some(t) => (t, &self.text_k, &self.text_v),
-                None => (&self.normalized, &self.k, &self.v),
+            let (k, v) = match text {
+                Some([k, v]) => (k, v),
+                None => (&self.k, &self.v),
             };
-            linear(ctx, &self.normalized, &w.q, &self.q, gemm)?;
-            linear(ctx, context, &w.k, k, gemm)?;
-            linear(ctx, context, &w.v, v, gemm)?;
-            norm(
-                ctx,
-                NormArgs::rms(
-                    &matrix(&self.q, 128)?,
-                    &w.q_norm,
-                    &mut matrix(&self.q, 128)?,
-                    1e-6,
-                ),
-            )?;
-            norm(
-                ctx,
-                NormArgs::rms(&matrix(k, 128)?, &w.k_norm, &mut matrix(k, 128)?, 1e-6),
-            )?;
             if text.is_none() {
-                self.rotary.apply(ctx, &self.q)?;
-                self.rotary.apply(ctx, k)?;
+                // Independent projections share the normalized input. Prepare V
+                // first, then consume each Q/K projection immediately.
+                linear(ctx, &self.normalized, &w.v, v, gemm)?;
+                linear(ctx, &self.normalized, &w.q, &self.q, gemm)?;
+                self.rotary.apply_normalized(ctx, &self.q, &w.q_norm)?;
+                linear(ctx, &self.normalized, &w.k, k, gemm)?;
+                self.rotary.apply_normalized(ctx, k, &w.k_norm)?;
+            } else {
+                linear(ctx, &self.normalized, &w.q, &self.q, gemm)?;
+                norm(
+                    ctx,
+                    NormArgs::rms(
+                        &matrix(&self.q, 128)?,
+                        &w.q_norm,
+                        &mut matrix(&self.q, 128)?,
+                        1e-6,
+                    ),
+                )?;
             }
             let q = self.q.reshape(vec![1, TOKENS, 16, 128])?;
             let k = k.reshape(vec![1, k.numel() / WIDTH, 16, 128])?;
@@ -1093,33 +1320,46 @@ mod dit {
             attention(ctx, args)?;
             linear(ctx, &self.attended, &w.output, &self.projected, gemm)
         }
-        fn residual(&self, ctx: &CudaContext) -> Result<()> {
-            multiply(ctx, &self.projected, &self.gate, &self.projected)?;
-            add(ctx, &self.hidden, &self.projected, &self.hidden)
+        fn residual_modulate(
+            &self,
+            ctx: &CudaContext,
+            modulation: &Tensor,
+            next: &Tensor,
+        ) -> Result<()> {
+            let gate = modulation.reshape(vec![9, 3, WIDTH])?;
+            let style = next.reshape(vec![9, next.numel() / (9 * WIDTH), WIDTH])?;
+            fused_add_norm(
+                ctx,
+                FusedAddNormArgs {
+                    input: &self.projected,
+                    bias: None,
+                    residual: &self.hidden,
+                    gate: Some(ResidualGate::GroupedStyle {
+                        style: &gate,
+                        numerics: NormNumerics::StagedBf16,
+                    }),
+                    hidden: &self.hidden,
+                    normalized: Some(&self.normalized),
+                    kind: NormKind::Layer,
+                    affine: Affine::GroupedAdaptive {
+                        style: &style,
+                        shift_first: true,
+                    },
+                    quantized: None,
+                    numerics: NormNumerics::StagedBf16,
+                    bias_order: BiasOrder::SingleRound,
+                    eps: 1e-6,
+                },
+            )
         }
-        pub fn forward(
+        pub(super) fn prepare_modulation(
             &self,
             ctx: &CudaContext,
             w: &DitWeights,
             time: &Tensor,
-            text: &Tensor,
+            prepared: &StepModulation,
             gemm: &GemmPolicy,
-            attention: &AttentionPolicy,
         ) -> Result<()> {
-            self.forward_observed(ctx, w, time, text, gemm, attention, |_, _| Ok(()))
-        }
-        pub fn forward_observed(
-            &self,
-            ctx: &CudaContext,
-            w: &DitWeights,
-            time: &Tensor,
-            text: &Tensor,
-            gemm: &GemmPolicy,
-            attention: &AttentionPolicy,
-            mut observe: impl FnMut(&str, &Tensor) -> Result<()>,
-        ) -> Result<()> {
-            linear(ctx, &self.patches, &w.patch, &self.hidden, gemm)?;
-            observe("patch", &self.hidden)?;
             linear(ctx, time, &w.time_in, &self.time_hidden, gemm)?;
             activate(
                 ctx,
@@ -1147,25 +1387,73 @@ mod dit {
                 WIDTH,
                 &self.final_global,
             )?;
-            observe("time_lora", &self.time_global)?;
+            super::copy(ctx, &self.time_global, &prepared.time_global)?;
+            for (block, styles) in w.blocks.iter().zip(&prepared.blocks) {
+                for (weights, style) in [
+                    &block.self_modulation,
+                    &block.cross_modulation,
+                    &block.mlp_modulation,
+                ]
+                .into_iter()
+                .zip(styles)
+                {
+                    self.compute_modulation(ctx, weights, false, gemm)?;
+                    super::copy(ctx, &self.modulation, style)?;
+                }
+            }
+            self.compute_modulation(ctx, &w.final_modulation, true, gemm)?;
+            super::copy(ctx, &self.final_modulation, &prepared.final_style)
+        }
+        pub fn forward(
+            &self,
+            ctx: &CudaContext,
+            w: &DitWeights,
+            prepared: &StepModulation,
+            gemm: &GemmPolicy,
+            attention: &AttentionPolicy,
+        ) -> Result<()> {
+            self.forward_observed(ctx, w, prepared, gemm, attention, |_, _| Ok(()))
+        }
+        pub fn forward_observed(
+            &self,
+            ctx: &CudaContext,
+            w: &DitWeights,
+            prepared: &StepModulation,
+            gemm: &GemmPolicy,
+            attention: &AttentionPolicy,
+            mut observe: impl FnMut(&str, &Tensor) -> Result<()>,
+        ) -> Result<()> {
+            linear(ctx, &self.patches, &w.patch, &self.hidden, gemm)?;
+            observe("patch", &self.hidden)?;
+            observe("time_lora", &prepared.time_global)?;
+            self.modulate(ctx, &prepared.blocks[0][0])?;
             for (index, block) in w.blocks.iter().enumerate() {
-                self.modulate(ctx, &block.self_modulation, false, gemm)?;
                 self.attend(ctx, &block.self_attention, None, gemm, attention)?;
-                self.residual(ctx)?;
-                self.modulate(ctx, &block.cross_modulation, false, gemm)?;
-                self.attend(ctx, &block.cross_attention, Some(text), gemm, attention)?;
-                self.residual(ctx)?;
-                self.modulate(ctx, &block.mlp_modulation, false, gemm)?;
-                linear(ctx, &self.normalized, &block.mlp_up, &self.mlp, gemm)?;
-                activate(
+                self.residual_modulate(
                     ctx,
-                    &self.mlp,
-                    None,
-                    PointwiseActivation::GeluExact,
-                    &self.mlp,
+                    &prepared.blocks[index][0],
+                    &prepared.blocks[index][1],
                 )?;
+                self.attend(
+                    ctx,
+                    &block.cross_attention,
+                    Some(&self.text_kv[index]),
+                    gemm,
+                    attention,
+                )?;
+                self.residual_modulate(
+                    ctx,
+                    &prepared.blocks[index][1],
+                    &prepared.blocks[index][2],
+                )?;
+                linear_gelu_exact(ctx, &self.normalized, &block.mlp_up, &self.mlp, gemm)?;
                 linear(ctx, &self.mlp, &block.mlp_down, &self.projected, gemm)?;
-                self.residual(ctx)?;
+                let next = prepared
+                    .blocks
+                    .get(index + 1)
+                    .map(|styles| &styles[0])
+                    .unwrap_or(&prepared.final_style);
+                self.residual_modulate(ctx, &prepared.blocks[index][2], next)?;
                 match index {
                     0 => observe("block0", &self.hidden)?,
                     13 => observe("block13", &self.hidden)?,
@@ -1173,7 +1461,6 @@ mod dit {
                     _ => {}
                 }
             }
-            self.modulate(ctx, &w.final_modulation, true, gemm)?;
             linear(
                 ctx,
                 &self.normalized,
@@ -1221,13 +1508,15 @@ mod dit {
                 ..Default::default()
             };
             let session = ExecutionSession::with_capacity(256 * 1024 * 1024, 0)?;
+            let prepared = StepModulation::allocate(&ctx, &weights)?;
+            session.prepare(|| dit.prepare_modulation(&ctx, &weights, &time, &prepared, &gemm))?;
             let mut failures = Vec::new();
             session.prepare(|| {
+            dit.project_text(&ctx, &weights, &text, &gemm)?;
             dit.forward_observed(
                 &ctx,
                 &weights,
-                &time,
-                &text,
+                &prepared,
                 &gemm,
                 &attention,
                 |name, tensor| {
@@ -1281,7 +1570,10 @@ mod dit {
             assert!(failures.is_empty(), "reference differences: {failures:?}");
             let eager = std::fs::read(root.join("dit-native-final.bf16"))?;
             let graph = crate::cuda_cosmos_policy::backend::capture(&ctx, || {
-                session.run(|| dit.forward(&ctx, &weights, &time, &text, &gemm, &attention))
+                session.run(|| {
+                    dit.project_text(&ctx, &weights, &text, &gemm)?;
+                    dit.forward(&ctx, &weights, &prepared, &gemm, &attention)
+                })
             })?;
             graph.replay()?;
             ctx.synchronize().map_err(Error::Cuda)?;
@@ -1295,7 +1587,11 @@ mod dit {
         }
     }
 }
-use self::{dit::Dit, tensor_ops::*, vae::VaeChunk};
+use self::{
+    dit::{Dit, StepModulation},
+    tensor_ops::*,
+    vae::VaeChunk,
+};
 use crate::cuda_cosmos_policy::backend::ops::GemmPolicy;
 use crate::cuda_cosmos_policy::backend::{
     AttentionPolicy, CudaBuffer, CudaContext, F64RecurrenceState, GatherArgs, GatherPatchGeometry,
@@ -1338,6 +1634,7 @@ struct Step {
     input_scale: Tensor,
     output_scale: Tensor,
     time: Tensor,
+    modulation: StepModulation,
     update: Option<PreparedRecurrence>,
 }
 
@@ -1355,6 +1652,7 @@ pub(in crate::cuda_cosmos_policy::model) struct Bf16Blocks {
     images: Tensor,
     video: Tensor,
     first: VaeChunk,
+    prefix: VaeChunk,
     rest: VaeChunk,
     condition_source: Tensor,
     condition_map: Tensor,
@@ -1381,20 +1679,40 @@ impl Bf16Blocks {
         weights: Rc<Bf16Weights>,
         inputs: &Inputs,
         schedule: &[SolverStep],
+        convolution: &crate::cuda_cosmos_policy::backend::Conv3dPolicy,
     ) -> Result<Self> {
         let rgb = inputs.rgb.clone();
         let images = bf(&ctx, 2 * PIXELS, 3)?;
         let video = upload(
             &Tensor::from_bf16(
-                vec![17, 224, 224, 3],
-                &vec![half::bf16::NEG_ONE; 17 * PIXELS * 3],
+                vec![13, 224, 224, 3],
+                &vec![half::bf16::NEG_ONE; 13 * PIXELS * 3],
             )?,
             ctx.device_id(),
         )?;
+        // Frames 0..4 are the constant -1 padding the model never overwrites, so
+        // their causal activations are computed once in prepare_constants. Only
+        // frames 5..12 (the two camera views) are encoded per request.
         let first_input = slice(&video, 0, PIXELS * 3, vec![1, 224, 224, 3])?;
-        let rest_input = slice(&video, PIXELS * 3, 16 * PIXELS * 3, vec![16, 224, 224, 3])?;
-        let first = VaeChunk::prepare(&ctx, &weights.vae, &first_input, None)?;
-        let rest = VaeChunk::prepare(&ctx, &weights.vae, &rest_input, Some(&first))?;
+        let prefix_input = slice(&video, PIXELS * 3, 4 * PIXELS * 3, vec![4, 224, 224, 3])?;
+        let rest_input = slice(&video, 5 * PIXELS * 3, 8 * PIXELS * 3, vec![8, 224, 224, 3])?;
+        let first = VaeChunk::prepare(convolution, &ctx, &weights.vae, &first_input, 13, None)?;
+        let prefix = VaeChunk::prepare(
+            convolution,
+            &ctx,
+            &weights.vae,
+            &prefix_input,
+            13,
+            Some(&first),
+        )?;
+        let rest = VaeChunk::prepare(
+            convolution,
+            &ctx,
+            &weights.vae,
+            &rest_input,
+            13,
+            Some(&prefix),
+        )?;
         let proprio = inputs.proprio.clone();
         let task = inputs.task.clone();
         let noise = inputs.noise.clone();
@@ -1517,6 +1835,7 @@ impl Bf16Blocks {
                 input_scale: constant_f32(&ctx, &input_scale)?,
                 output_scale: constant_f32(&ctx, &output_scale)?,
                 time: upload(&Tensor::from_bf16(vec![9, 2048], &time)?, ctx.device_id())?,
+                modulation: StepModulation::allocate(&ctx, &weights.dit)?,
                 update,
             });
         }
@@ -1537,6 +1856,7 @@ impl Bf16Blocks {
             images,
             video,
             first,
+            prefix,
             rest,
             condition_source,
             condition_map,
@@ -1557,6 +1877,31 @@ impl Bf16Blocks {
             steps,
             readout,
         })
+    }
+    /// Frame zero is always -1 RGB, independent of every request. Keep its
+    /// intermediate activations alive: the following VAE chunk reads these
+    /// tensors as its causal history. Fixed schedule modulation is prepared here
+    /// too, with shared scratch and identical BF16 operations for all five steps.
+    /// These computations run outside the request graph.
+    pub fn prepare_constants(
+        &mut self,
+        gemm: &GemmPolicy,
+        attention: &AttentionPolicy,
+    ) -> Result<()> {
+        self.first
+            .forward(&self.ctx, &self.weights.vae, gemm, attention)?;
+        self.prefix
+            .forward(&self.ctx, &self.weights.vae, gemm, attention)?;
+        for step in &self.steps {
+            self.dit.prepare_modulation(
+                &self.ctx,
+                &self.weights.dit,
+                &step.time,
+                &step.modulation,
+                gemm,
+            )?;
+        }
+        Ok(())
     }
     pub fn encode_observation(
         &mut self,
@@ -1587,18 +1932,33 @@ impl Bf16Blocks {
                 )?;
             }
         }
-        self.first
-            .forward(ctx, &self.weights.vae, gemm, attention)?;
         self.rest.forward(ctx, &self.weights.vae, gemm, attention)?;
         copy(
             ctx,
             &self.first.output,
             &slice(&self.condition_source, 0, FRAME, vec![FRAME, 1])?,
         )?;
+        // Latent 4 (frames 13..16) is never read by condition_map, so the encoder
+        // stops after frame 12. Size the copy from the produced latents instead of
+        // assuming how many latent frames causal downsampling yields.
+        // Latent slots [FRAME, 2*FRAME) hold latent 1 from the constant prefix;
+        // condition_map reads only latents 0, 2 and 3, so the per-request body
+        // writes straight into slots 2 and 3.
+        let prefix_latents = self.prefix.output.numel();
+        let rest_latents = self.rest.output.numel();
+        assert!(
+            prefix_latents == FRAME && rest_latents == 2 * FRAME,
+            "unexpected latent geometry"
+        );
+        copy(
+            ctx,
+            &self.prefix.output,
+            &slice(&self.condition_source, FRAME, prefix_latents, vec![prefix_latents, 1])?,
+        )?;
         copy(
             ctx,
             &self.rest.output,
-            &slice(&self.condition_source, FRAME, 4 * FRAME, vec![4 * FRAME, 1])?,
+            &slice(&self.condition_source, 2 * FRAME, rest_latents, vec![rest_latents, 1])?,
         )?;
         cast(
             ctx,
@@ -1614,7 +1974,8 @@ impl Bf16Blocks {
         )?;
         cast(ctx, &self.condition_bf16, &self.condition)?;
         gather(ctx, &self.weights.text, &self.task, 512 * 1024, &self.text)?;
-        Ok(())
+        self.dit
+            .project_text(ctx, &self.weights.dit, &self.text, gemm)
     }
     pub fn initial_state(&self) -> Result<()> {
         let ctx = &self.ctx;
@@ -1640,14 +2001,8 @@ impl Bf16Blocks {
             1,
             &self.dit.patches,
         )?;
-        self.dit.forward(
-            ctx,
-            &self.weights.dit,
-            &step.time,
-            &self.text,
-            gemm,
-            attention,
-        )?;
+        self.dit
+            .forward(ctx, &self.weights.dit, &step.modulation, gemm, attention)?;
         gather(
             ctx,
             &self.dit.output,

@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "ApxInf Python frontend: processors, VLA policies, and serving."
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
-# The processor library stays importable without the native extension. Built-in
+# The processor library stays importable without its optional CPU accelerator
+# or the model extension. Built-in
 # policy tokenizers are provided by `apxinf-py`; custom Python processors remain
 # ordinary callables and need only the dependencies they choose.
 dependencies = [

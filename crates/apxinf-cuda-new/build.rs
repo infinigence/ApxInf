@@ -1,3 +1,5 @@
+#[path = "build_support/conv3d_fingerprint.rs"]
+mod conv3d_fingerprint;
 use std::env;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -230,6 +232,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
     println!("cargo:rerun-if-changed=build_support/attention_fingerprint.rs");
+    println!("cargo:rerun-if-changed=build_support/conv3d_fingerprint.rs");
     println!("cargo:rerun-if-changed=build_support/gemm_fingerprint.rs");
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -308,6 +311,8 @@ fn main() {
                 .map(|arch| (arch.nvcc_arch.as_str(), arch.cutlass_arch.as_str())),
         )
     });
+    let conv3d_id = conv3d_fingerprint::build_id(&native, &target,
+        selection.targets.iter().map(|arch| (arch.nvcc_arch.as_str(), arch.cutlass_arch.as_str())));
     let attention_id = attention_fingerprint::build_id(
         &native,
         &target,
@@ -343,6 +348,7 @@ fn main() {
         "attention/execution.cpp",
         "attention/gates.cpp",
         "attention/providers/custom.cu",
+        "attention/providers/wide_bf16.cu",
         "elementwise/ops.cpp",
         "cache/ops.cpp",
         "pointwise/fixed_bf16.cu",
@@ -388,6 +394,7 @@ fn main() {
         "gather/launch.cu",
         "quantization/launch.cu",
         "volume.cu",
+        "conv3d.cu",
         "recurrence.cu",
         "reduction.cu",
     ]
@@ -449,6 +456,7 @@ fn main() {
                 "gemm_bf16_geglu_sm100.cu",
                 "gemm_bf16_geglu_interleaved_sm100.cu",
                 "gemm_nvfp4_sm100.cu",
+                "gemm_bf16_gelu_exact_sm100.cu",
             ]
             .map(|source| operators.join(source)),
         );
@@ -471,6 +479,7 @@ fn main() {
             ]);
         }
         cutlass_sources.push(adapters.join("attention/providers/cutlass.cu"));
+        cutlass_sources.push(adapters.join("attention/providers/cutlass_persistent.cu"));
         // Vendored FlashInfer Cake GDN prefill: plain CUDA C++, but it needs
         // the same compute_110a codegen as the CUTLASS group because it emits
         // tcgen05 and TMA. See native/kernels/flashinfer_gdn/README.md.
@@ -670,6 +679,9 @@ fn main() {
                 command.arg(format!("-DAPXINF_ATTENTION_BUILD_ID=\"{attention_id}\""));
             }
         }
+        if source.file_name().is_some_and(|name| name == "conv3d.cu") {
+            command.arg(format!("-DAPXINF_CONV3D_BUILD_ID=\"{conv3d_id}-{id}\""));
+        }
         command.args(if is_sm110 {
             &sm110_codegen
         } else if is_cutlass || is_fa2_e4m3 {
@@ -867,6 +879,7 @@ fn main() {
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");
+    println!("cargo:rustc-link-lib=dl");
     // The vendored FlashInfer GDN prefill builds its TMA descriptors with
     // cuTensorMapEncodeTiled, which lives in the driver library rather than
     // the runtime.

@@ -12,6 +12,9 @@ pub fn rope(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<()> {
 
 pub(super) enum ApplyRotation<'a> {
     PositionOffset(usize),
+    Precomputed {
+        table: &'a Tensor,
+    },
     Multimodal {
         positions: &'a CudaBuffer,
         sections: [usize; 3],
@@ -55,8 +58,42 @@ pub(super) fn apply_tensor(
     let input_buffer = tensor_storage(ctx, input, input.dtype(), elements)?;
     let output_buffer = tensor_storage(ctx, output, output.dtype(), elements)?;
 
+    let table_buffer = match &rotation {
+        ApplyRotation::Precomputed { table } => {
+            if input.dtype() != DType::BF16 || table.shape().dims() != [tokens, 2, head_dim / 2] {
+                return Err(Error::Other(
+                    "precomputed RoPE requires BF16 and an FP32 [tokens,2,head_dim/2] table".into(),
+                ));
+            }
+            let table = tensor_storage(ctx, table, DType::F32, tokens * head_dim)?;
+            let start = output_buffer.ptr() as usize;
+            let end = start + elements * input.dtype().size_in_bytes();
+            let input_start = input_buffer.ptr() as usize;
+            let table_start = table.ptr() as usize;
+            if (start != input_start
+                && start < input_start + elements * input.dtype().size_in_bytes()
+                && input_start < end)
+                || (start < table_start + tokens * head_dim * 4 && table_start < end)
+            {
+                return Err(Error::Other(
+                    "precomputed RoPE rejects partial input/output or table/output overlap".into(),
+                ));
+            }
+            Some(table)
+        }
+        _ => None,
+    };
+
     let (rotation_source, convention, rotary_dim, sections, position, position_offset) =
         match rotation {
+            ApplyRotation::Precomputed { .. } => (
+                abi::ROTATION_PRECOMPUTED_TABLE,
+                abi::CONVENTION_HALF_SPLIT,
+                head_dim,
+                [0, 0, 0],
+                None,
+                0,
+            ),
             ApplyRotation::PositionOffset(offset) => (
                 abi::ROTATION_POSITION_OFFSET,
                 abi::CONVENTION_HALF_SPLIT,
@@ -151,7 +188,10 @@ pub(super) fn apply_tensor(
         bias_alignment: 256,
         q_alignment: alignment_of(output_buffer.ptr() as usize),
         kv_alignment: 256,
-        rotation_alignment: position.map_or(256, |buffer| alignment_of(buffer.ptr() as usize)),
+        rotation_alignment: table_buffer.as_ref().map_or_else(
+            || position.map_or(256, |buffer| alignment_of(buffer.ptr() as usize)),
+            |buffer| alignment_of(buffer.ptr() as usize),
+        ),
         tokens: i64::try_from(tokens)
             .map_err(|_| Error::Other("RoPE token count exceeds i64".into()))?,
         cache_capacity: 0,
@@ -165,7 +205,9 @@ pub(super) fn apply_tensor(
         key_input: std::ptr::null(),
         value_input: std::ptr::null(),
         position: position_ptr,
-        rotation_table: std::ptr::null(),
+        rotation_table: table_buffer
+            .as_ref()
+            .map_or(std::ptr::null(), |buffer| buffer.ptr()),
         stream: ctx.stream().handle(),
         theta,
         position_offset: i32::try_from(position_offset)
@@ -173,6 +215,9 @@ pub(super) fn apply_tensor(
         kv_output_offset: 0,
     };
     let mut storage = vec![input_buffer, output_buffer];
+    if let Some(table) = table_buffer {
+        storage.push(table);
+    }
     if let Some(position) = position {
         storage.push(position.clone());
     }
@@ -310,4 +355,31 @@ pub fn apply_vision_2d(
         ApplyRotation::Axial { positions: &ids },
     )?;
     Ok(output)
+}
+
+/// Apply half-split rotation to BF16 [tokens, heads, head_dim] tensors using
+/// FP32 [tokens, 2, head_dim/2] cosine/sine coefficients, broadcast over heads.
+/// Each product and then the sum round separately to FP32, followed by BF16.
+/// Exact input/output aliasing is supported; partial overlap is rejected.
+pub fn apply_precomputed(
+    ctx: &CudaContext,
+    input: &Tensor,
+    table: &Tensor,
+    output: &Tensor,
+) -> Result<()> {
+    let dims = input.shape().dims();
+    if dims.len() != 3 || input.shape() != output.shape() {
+        return Err(Error::Other(
+            "precomputed RoPE requires matching rank-three input/output shapes".into(),
+        ));
+    }
+    apply_tensor(
+        ctx,
+        input,
+        output,
+        dims[1],
+        dims[2],
+        1.0,
+        ApplyRotation::Precomputed { table },
+    )
 }

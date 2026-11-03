@@ -5,7 +5,9 @@ pub(crate) mod launch;
 mod multimodal;
 mod partial;
 mod qkv;
+mod rms_precomputed;
 mod rope;
+pub use rms_precomputed::rms_norm_apply_precomputed;
 
 pub use contracts::{RopeArgs, RopeSemantic};
 pub use decode::{
@@ -19,5 +21,9 @@ pub use multimodal::{
 pub use partial::{partial_rope, rotary_dim};
 pub use qkv::{split_grouped_qkv, split_qkv_cache, GroupedQkvRopeArgs, QkvCacheRopeArgs};
 pub use rope::{
-    apply_batched as execute_batched, apply_mrope as execute_mrope, apply_vision_2d, rope,
+    apply_batched as execute_batched, apply_mrope as execute_mrope, apply_precomputed,
+    apply_vision_2d, rope,
 };
+
+#[cfg(test)]
+pub(crate) const DOC_IDS: &[&str] = &["RmsNormPrecomputedRoPE"];

@@ -32,7 +32,7 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 
 void validate_spec(const apxinf::gemm::Spec& spec) {
   if (spec.version != 9 ||
-      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_SWIGLU ||
+      spec.semantic > APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT ||
       spec.a_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.b_dtype > APXINF_DTYPE_E2M1_PAIR ||
       spec.accumulation_dtype > APXINF_DTYPE_I32 ||
@@ -45,6 +45,13 @@ void validate_spec(const apxinf::gemm::Spec& spec) {
       spec.alpha_is_unit > 1 || spec.output_scale_is_unit > 1 ||
       spec.b_is_immutable > 1) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid GEMM Spec");
+  }
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT &&
+      (spec.a_dtype != APXINF_DTYPE_BF16 || spec.b_dtype != APXINF_DTYPE_BF16 ||
+       spec.output_dtype != APXINF_DTYPE_BF16 || spec.accumulation_dtype != APXINF_DTYPE_F32 ||
+       spec.quantization != APXINF_GEMM_QUANT_NONE || spec.b_layout != APXINF_GEMM_LAYOUT_KN ||
+       !spec.alpha_is_unit || !spec.output_scale_is_unit || spec.bias_alignment || spec.residual_alignment)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid staged exact GELU GEMM contract");
   }
   for (uint32_t alignment : {
            spec.a_alignment, spec.b_alignment, spec.bias_alignment,

@@ -34,3 +34,35 @@ unsafe extern "C" {
     pub(crate) fn apxinf_unfold3d_enqueue(execution: *mut c_void) -> i32;
     pub(crate) fn apxinf_unfold3d_destroy(execution: *mut c_void);
 }
+
+#[repr(C)]
+pub(crate) struct ConvSpec {
+    pub geometry: Spec,
+    pub output_channels: i64,
+}
+#[repr(C)]
+pub(crate) struct ConvBindings {
+    pub volume: Bindings,
+    pub weight: *const c_void,
+}
+#[repr(C)]
+pub(crate) struct ConvPolicy {
+    pub workspace_limit: u64,
+    pub version: u32,
+    pub online_tune: u32,
+    pub allow_fallback: u32,
+    pub reserved: u32,
+    pub cache_dir: *const std::ffi::c_char,
+}
+unsafe extern "C" {
+    pub(crate) fn apxinf_conv3d_prepare(
+        runtime: Runtime,
+        spec: *const ConvSpec,
+        policy: *const ConvPolicy,
+        bindings: *const ConvBindings,
+        execution: *mut *mut c_void,
+    ) -> i32;
+    pub(crate) fn apxinf_conv3d_enqueue(execution: *mut c_void) -> i32;
+    pub(crate) fn apxinf_conv3d_destroy(execution: *mut c_void);
+    pub(crate) fn apxinf_conv3d_summary(execution: *mut c_void) -> *const std::ffi::c_char;
+}

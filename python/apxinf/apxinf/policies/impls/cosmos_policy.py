@@ -18,6 +18,11 @@ from ...processors.transforms import lookup_key
 from ..base import StateConditionedModelRunnerProtocol
 from ..registry import register_policy
 
+try:
+    from ...processors._resize_native import bilinear_upsample_rgb as _native_resize
+except ImportError:
+    _native_resize = None
+
 __all__ = ["CosmosPolicy"]
 
 _PROFILE = "libero-2b-direct-v1"
@@ -25,6 +30,13 @@ _LATENT_SHAPE = (1, 16, 9, 28, 28)
 
 
 def _resize_crop(image: np.ndarray) -> np.ndarray:
+    if _native_resize is not None and image.dtype == np.uint8 and image.shape == (212, 212, 3):
+        data = _native_resize(np.ascontiguousarray(image), 224, 224)
+        return np.frombuffer(data, dtype=np.uint8).reshape(224, 224, 3)
+    return _resize_crop_numpy(image)
+
+
+def _resize_crop_numpy(image: np.ndarray) -> np.ndarray:
     """212 -> 224 bilinear AA in FP32, followed by Torch's uint8 rounding.
 
     Pillow rounds each separable pass to uint8. The upstream tensor transform

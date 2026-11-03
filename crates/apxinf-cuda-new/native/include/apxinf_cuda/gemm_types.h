@@ -51,6 +51,7 @@ typedef enum {
   /* BF16 GEMM followed by rounded SwiGLU. The B layout describes how gate and
      up columns are encoded. Output is [M,N]. */
   APXINF_GEMM_SEMANTIC_GEMM_SWIGLU = 5,
+  APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT = 6,
 } apxinf_gemm_semantic_t;
 
 typedef struct {

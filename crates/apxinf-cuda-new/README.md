@@ -11,14 +11,30 @@ The norm family exposes exactly three caller-owned L3 entries:
 `ops::norm::norm(ctx, NormArgs)`, `ops::fused_add_norm(ctx, FusedAddNormArgs)`,
 and `ops::residual_add(ctx, ResidualAddArgs)`. RMS/Layer statistics, affine
 form, gating, rounding order, numerical compatibility and optional quantization
-are fields rather than additional function names. Norm Spec version 6 carries
+are fields rather than additional function names. Norm Spec version 9 carries
 the common operation/statistic/affine/gate/quantization axes directly; the
-previous nine-value combination semantic is rejected. The planning-compatible
+previous nine-value combination semantic is rejected. Grouped adaptive affine and gated residual layouts use explicit group geometry and staged BF16 numerical policy; legacy vector styles retain their existing dispatch. `fused_add_norm` also composes grouped gates with independent grouped adaptive LayerNorm, retaining both BF16 outputs and the staged reduction/rounding order. For 16-byte-aligned 2048-column inputs, four independent warp rows share a CTA; other alignment uses the existing packed or staged fallback. Tail rows and group boundaries retain the same contract. The warp path uses separate rounded BF16 pair multiply/add instructions for gates and affine transforms, preserving every staged BF16 boundary. The planning-compatible
 weighted-adaptive and unit-offset-gate implementations are selected behind the
 same three L3 entries while their remaining private launch ABIs are retired.
 GEMM Spec version 9 includes the provider-neutral `GemmNumerics` constraint in
 the execution and recipe key. Older specs are rejected rather than reused
 across incompatible contracts.
+
+The fixed-sm110 staged exact GELU registry includes an independent CUTLASS
+lookup candidate (implementation 12, six configurations). Preparation builds a
+128 KiB device table from the original erf formula for every BF16 input bit
+pattern. The epilogue indexes it after the same BF16 accumulator rounding and
+returns the same rounded BF16 result. Each prepared execution owns its table;
+its resource requirement includes the table and any kernel workspace. Capture
+retains that execution, and enqueue performs no table allocation or generation.
+The original implementation 11 remains available with zero workspace. Selection
+uses the normal recipe fingerprint and autotuning path.
+
+Plain BF16 cuBLASLt includes an independent 128x224 / 2x1x1 tile family
+with stable configurations 72–79 on CUDA 13. The provider validates algorithm
+capability, descriptor legality, alignment and workspace during preparation.
+All custom options are enumerated for normal tuning; existing heuristic
+configurations retain their identities.
 
 ## Operator Layers: L3 to L0
 
@@ -243,3 +259,116 @@ outputs with unit and non-unit scales. The framework regression covers recipe
 restoration, all three split schedules, resource rejection, and unsupported
 M789/configuration rejection. Changing these adapter sources invalidates old
 recipes through the normal operator build fingerprint.
+
+### Prepared volume convolution
+
+`Conv3d` extends the volume family beyond `Unfold3d`: it owns the full BF16
+cross-correlation, not just neighborhood extraction. Its ABI v1 embeds the
+Unfold3d v1 geometry and adds output channels, immutable weight binding and a
+total workspace limit. `PreparedConv3d::new` defaults to no online tuning and
+allows the deterministic baseline. `with_policy` accepts a provider-neutral
+`Conv3dPolicy` with tuning, fallback and cache-directory controls. The baseline
+uses optional legacy cuDNN, then tiled lowering/GEMM when direct convolution is
+unsupported. Opt-in tuning compares that baseline with explicit cuDNN backend
+engine/knob configurations through the common framework autotuner. Backend
+configurations currently require sm110 and actual cuDNN 9.20; unsupported
+plans are rejected at prepare. FP32 accumulation, deterministic operation and
+Graph-safe enqueue remain mandatory.
+
+Exact recipes include the Conv3d build fingerprint, geometry, alignment classes,
+resource limit and GPU/toolkit/library identity. A hit reconstructs and validates
+the selected configuration. A miss tunes only when both policy and context allow
+it; otherwise it uses the explicit baseline if fallback is allowed. Untuned
+fallbacks are not written as winners. Recipes live in the requested directory;
+with an empty directory, each preparation tunes or follows its fallback policy.
+A Conv3d-owned mutex serializes preparation and persistent writes. Selection
+state therefore leaves the shared runtime and unrelated operator fingerprints
+unchanged. Tuning uses isolated output, while each
+execution owns its packed weights, transformed input, workspace, descriptors
+and variant pack. All resources are prepared before capture and bound to one
+stream; enqueue errors propagate without switching implementations.
+
+cuDNN is an optional system dependency, not vendored: Linux builds with
+`cudnn.h` discover `libcudnn.so.9` via `dlopen`; builds without the header or
+runtime library retain the lowering baseline. This adapter uses unmodified
+NVIDIA cuDNN 9 C API declarations (validated against 9.20 on Thor); installing
+cuDNN is subject to NVIDIA's cuDNN license. No third-party implementation source
+is copied into the repository. Packed weights and asymmetric padding are owned
+by this operator. The CUDA build tracks its native adapter/kernel/header inputs;
+there are no persisted convolution recipes requiring a separate fingerprint.
+
+
+`rms_norm_apply_precomputed` combines per-head BF16 RMSNorm with a precomputed
+FP32 rotary table. Its dedicated fixed ABI v1 leaves the general RoPE v6 ABI
+unchanged. The native adapter selects the 128-dimensional fused implementation
+or the explicit existing Norm-then-RoPE baseline. Both retain the intermediate
+BF16 rounding; neither allocates or tunes during enqueue. Graph capture retains
+input, weight, table and output storage. This fixed selection does not use
+recipes or change the common tuning framework.
+
+The additive GEMM semantic `gemm_gelu_exact` retains the Spec v9 layout and
+existing semantic IDs. ID 6 explicitly rounds the FP32 accumulator to BF16
+before exact erf GELU and rounds the activation to BF16. Its independent
+registry provides a cuBLAS baseline and prepared SM110 CUTLASS epilogues.
+The CUTLASS epilogue declares no source matrix (`ElementSource = void`),
+matching its accumulator-only computation and allowing the builder to select
+the corresponding shared-memory and store pipeline. Existing tanh GELU
+semantics are unchanged.
+
+The SM110 BF16 d384 single-head dense attention candidate preserves full FP32
+probabilities and FP32 V accumulation, with separately tunable serial/parallel
+softmax. Its owned cuBLAS resources are prepared before capture; the exact
+recipe key includes the runtime cuBLAS version. See the operator catalog for
+geometry, workspace and numerical constraints. Thor Cosmos BF16 five-step
+model and graph/lifetime qualification passes; public latency is 449.90 ms
+pooled median, still above the 200 ms target.
+
+`channel_l2_norm_silu` composes staged BF16 channel-L2 normalization and
+SiLU through the Norm family (additive operation 3, unchanged Spec layout).
+The normalized result rounds to BF16 before SiLU, retaining the separate
+operator rounding boundary. It accepts the same `ChannelL2NormArgs`, including
+exact input/output aliasing, and supports only unquantized weighted BF16
+channel-L2. For at least 1024 rows, the 96/192-channel fused BF16 paths uses eight-element
+loads/stores and four lanes per row when input, weight and output are 16-byte
+aligned. Other alignments retain the warp kernel, as do large 384-channel
+rows; other shapes use the generic fused kernel. All preserve the existing
+reduction tree, BF16 boundaries and exact input/output aliasing.
+No preparation allocation, tuning, or graph replay allocation is introduced.
+Thor Cosmos full-model qualification passes with bitwise unchanged VAE and
+full-joint outputs. Real AutoPolicy pooled median is 445.39 ms; the full
+backend suite reports 202 passed, 0 failed, 20 ignored.
+
+### BF16 plain GEMM cuBLASLt custom options
+
+The existing plain-GEMM cuBLASLt candidate retains configurations 0–7 as
+heuristic ranks. Unquantized BF16 input/output with FP32 accumulation additionally
+exposes configurations `8 + 8 * rank + option` for ranks/options 0–7. These are
+model-independent selection candidates, not an override of a known shape.
+Preparation checks the algorithm's custom-option capability, sets the option,
+runs `cublasLtMatmulAlgoCheck`, and verifies total resource usage before device
+allocation. Unsupported configurations are rejected; enqueue uses only the
+prepared algorithm. Other semantics, quantized paths and output types retain
+their existing configuration set. The GEMM build fingerprint invalidates old
+recipes normally, and baseline fallback behavior is unchanged.
+
+Independent periodic CPU references cover every executable configuration at
+small and real square/downprojection sizes, in eager and Graph execution.
+A Thor regression checks configuration51 restoration, zero workspace,
+unsupported-output/configuration rejection and graph resource retention.
+
+### Bias/residual channel normalization
+
+`fused_add_channel_l2_norm_silu(FusedAddChannelL2NormArgs)` materializes both
+`hidden = bf16(bf16(input + bias) + residual)` and its staged channel-L2
+normalization followed by SiLU. An absent bias or residual omits that addition;
+all existing BF16 normalization boundaries are retained. Matrices are contiguous
+BF16 `[rows, cols]`; weight and optional bias are `[cols]`, and epsilon is finite
+and positive. The two outputs must be disjoint. Either may exactly alias input
+or residual; partial activation overlap and output overlap with weight/bias are
+rejected by both the safe API and native adapter.
+
+The stateless Norm backend fuses aligned 96/192-channel rows when `rows >= 1024`.
+Other legal sizes and alignments use the staged pointwise update followed by the
+existing channel normalization kernel. No scratch allocation or persistent
+state is required. CUDA Graph callers retain all bound storage through replay.
+The Norm Spec version is 10; its layout and the GEMM recipe contract are unchanged.

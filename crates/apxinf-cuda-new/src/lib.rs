@@ -27,14 +27,15 @@ pub use graph::{capture, CapturedGraph};
 pub use kv_cache::CudaKvCache;
 pub use ops::norm::norm;
 pub use ops::{
-    attention, channel_l2_norm, concat_rows, decode_rope, decode_rotation, fused_add_norm, gather,
-    kv_cache_attention, multimodal_rope, pointwise, quantization, reserve_prefix, residual_add,
-    rope, segmented_attention, split_grouped_qkv, split_qkv_axial_rope, split_qkv_cache,
-    split_qkv_mrope_cache, vision_position, Affine, ArgmaxArgs, AttentionArgs, AttentionInput,
-    AttentionMask, AttentionPolicy, AxialRopeArgs, AxialRopeNumerics, BiasOrder, ChannelL2NormArgs,
+    attention, channel_l2_norm, channel_l2_norm_silu, concat_rows, decode_rope, decode_rotation,
+    fused_add_channel_l2_norm_silu, fused_add_norm, gather, kv_cache_attention, multimodal_rope,
+    pointwise, quantization, reserve_prefix, residual_add, rope, segmented_attention,
+    split_grouped_qkv, split_qkv_axial_rope, split_qkv_cache, split_qkv_mrope_cache,
+    vision_position, Affine, ArgmaxArgs, AttentionArgs, AttentionInput, AttentionMask,
+    AttentionPolicy, AxialRopeArgs, AxialRopeNumerics, BiasOrder, ChannelL2NormArgs,
     DecodeRopeArgs, DecodeRotationArgs, DecodeRotationPosition, EmbeddingScale, ExecutionSession,
-    FusedAddNormArgs, GatherArgs, GatherPatchGeometry, GatherSemantic, GraphWorkspace,
-    GroupedQkvRopeArgs, KvCacheAttentionArgs, KvCacheDecodeMeta, MropeCacheArgs,
+    FusedAddChannelL2NormArgs, FusedAddNormArgs, GatherArgs, GatherPatchGeometry, GatherSemantic,
+    GraphWorkspace, GroupedQkvRopeArgs, KvCacheAttentionArgs, KvCacheDecodeMeta, MropeCacheArgs,
     MultimodalRopeArgs, NormArgs, NormKind, NormNumerics, PointwiseActivation, PointwiseArgs,
     PointwiseSemantic, QkvCacheRopeArgs, QuantOut, QuantizationArgs, QuantizationSemantic,
     ResidualAddArgs, RopeArgs, RopeSemantic, SegmentedAttentionArgs, VisionPositionArgs,
@@ -43,7 +44,9 @@ pub use phase::PreparedPhase;
 pub use stream::CudaStream;
 
 pub mod ops;
-pub use ops::{PreparedUnfold3d, Unfold3dArgs, Unfold3dGeometry};
+pub use ops::{
+    Conv3dArgs, Conv3dPolicy, PreparedConv3d, PreparedUnfold3d, Unfold3dArgs, Unfold3dGeometry,
+};
 
 /// Whether the SM110 native NVFP4 GEMM+SwiGLU implementation is available.
 ///
@@ -62,3 +65,8 @@ pub const FA2_DECODE: bool = cfg!(apxinf_fa2_decode);
 pub use ops::{F64RecurrenceState, PreparedRecurrence, RecurrenceCoefficients};
 
 pub use ops::PreparedIndexedMean;
+
+pub use ops::rms_norm_apply_precomputed;
+
+/// BF16 staged exact-erf GELU GEMM.
+pub use ops::gemm_gelu_exact;

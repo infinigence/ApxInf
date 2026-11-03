@@ -119,6 +119,61 @@ def generate_video_precision() -> None:
         f"// PyTorch {torch.__version__}; exact low-precision operands, CPU reference.\n\n" + "\n".join(arrays))
 
 
+def generate_channel_update() -> list[str]:
+    """Public staged BF16 expression; no kernel packing or reduction layout."""
+    generator = torch.Generator(device="cpu").manual_seed(0xC4A1_2026)
+    arrays = []
+    for cols in [3, 96, 192, 384]:
+        prefix = f"CHANNEL_UPDATE_{cols}"
+        x = (torch.randn((3, cols), generator=generator) * 0.75).bfloat16()
+        residual = (torch.randn((3, cols), generator=generator) * 0.25).bfloat16()
+        bias = (torch.randn(cols, generator=generator) * 0.125).bfloat16()
+        weight = (torch.randn(cols, generator=generator) * 0.5 + 0.75).bfloat16()
+        x[0] = 0
+        residual[0] = 0
+        x[1] *= 2**-20
+        residual[1] *= 2**-20
+        for name, value in [("INPUT", x), ("RESIDUAL", residual), ("BIAS", bias), ("WEIGHT", weight)]:
+            arrays.append(rust_array(f"{prefix}_{name}", "u16", words(value), 8))
+        for mode in range(4):
+            hidden = x
+            if mode & 1:
+                hidden = (hidden.float() + bias.float()).bfloat16()
+            if mode & 2:
+                hidden = (hidden.float() + residual.float()).bfloat16()
+            arrays.append(rust_array(f"{prefix}_HIDDEN_{mode}", "f32", f32_bits(hidden.float()), 4))
+            for index, eps in enumerate([1e-12, 0.5]):
+                norm = torch.linalg.vector_norm(hidden.float(), dim=1, keepdim=True).bfloat16()
+                denominator = norm.float().clamp_min(eps).bfloat16()
+                normalized = (hidden.float() / denominator.float()).bfloat16()
+                normalized = (normalized.float() * cols**0.5).bfloat16()
+                normalized = (normalized.float() * weight.float()).bfloat16()
+                expected = torch.nn.functional.silu(normalized.float()).bfloat16().float()
+                arrays.append(rust_array(f"{prefix}_OUTPUT_{mode}_{index}", "f32", f32_bits(expected), 4))
+    return arrays
+
+
+def generate_plain_rms():
+    generator = torch.Generator().manual_seed(0x5eed_c0de)
+    original = torch.randn((5, 128), generator=generator)
+    original[0].zero_()
+    original[1] *= 1e-3
+    original[2] *= 8
+    weight = torch.randn((128,), generator=generator) * 0.75
+    arrays = []
+    for name, dtype in [("F16", torch.float16), ("BF16", torch.bfloat16)]:
+        x, w = original.to(dtype), weight.to(dtype)
+        prefix = f"PLAIN_RMS_{name}"
+        arrays.append(rust_array(prefix + "_INPUT", "u16", words(x), 8))
+        arrays.append(rust_array(prefix + "_WEIGHT", "u16", words(w), 8))
+        for index, eps in enumerate([1e-6, 0.125]):
+            # Public RMS meaning, starting from exact stored typed inputs.
+            xf, wf = x.float(), w.float()
+            expected = xf * torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + eps) * wf
+            arrays.append(rust_array(prefix + f"_OUTPUT_{index}", "f32", f32_bits(expected), 4))
+    return arrays
+
+
 def main() -> None:
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True)
@@ -156,6 +211,11 @@ def main() -> None:
     ) * row_scales[:, None] * channel_scales[None, :]
 
     arrays: list[str] = []
+    exact = torch.nn.functional.gelu(bf16_projection.to(torch.bfloat16).float(), approximate="none").to(torch.bfloat16).float()
+    arrays.append(rust_array("BF16_GELU_EXACT", "f32", f32_bits(exact), 4))
+    grid = 1.5 * torch.arange(-2, 3).float()[:, None] * (torch.arange(-2, 3).float()[None, :] / 4)
+    grid = torch.nn.functional.gelu(grid.to(torch.bfloat16).float(), approximate="none").to(torch.bfloat16).float()
+    arrays.append(rust_array("BF16_GELU_EXACT_GRID", "f32", f32_bits(grid), 5))
     arrays.append(rust_array("BF16_A", "u16", words(bf16_a), K))
     arrays.append(rust_array("BF16_B", "u16", words(bf16_b), N))
     arrays.append(rust_array("BF16_GEGLU_B", "u16", words(bf16_geglu_b), 2 * N))
@@ -195,6 +255,9 @@ def main() -> None:
             W8A8_ALPHA, W8A8_OUTPUT_SCALE,
         )
         arrays.append(rust_array(f"W8A8_{semantic.upper()}", "f32", f32_bits(expected), 4))
+
+    arrays.extend(generate_channel_update())
+    arrays.extend(generate_plain_rms())
 
     destination = Path(__file__).with_name("torch_l3_fixtures.rs")
     destination.write_text(

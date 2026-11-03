@@ -301,6 +301,28 @@ cudaError_t launch_bf16(const apxinf_pointwise_spec_t& spec,
         input, bias, output, rows, cols, static_cast<int>(spec.activation),
         stream);
   }
+  const int64_t count = spec.rows * spec.cols;
+  const bool packed = count >= 1024 && count % 8 == 0 &&
+      ((reinterpret_cast<uintptr_t>(input) |
+        reinterpret_cast<uintptr_t>(bindings.secondary) |
+        reinterpret_cast<uintptr_t>(output)) & 15) == 0;
+  if (packed && (spec.semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE ||
+                 spec.semantic == APXINF_POINTWISE_SEMANTIC_MULTIPLY)) {
+    const int64_t vectors = count / 8;
+    const int grid = blocks_for(vectors);
+    if (spec.semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE) {
+      kernels::binary_bf16_vec8<true><<<grid, kDirectThreads, 0, stream>>>(
+          reinterpret_cast<const uint4*>(input),
+          static_cast<const uint4*>(bindings.secondary),
+          reinterpret_cast<uint4*>(output), vectors, bindings.dt);
+    } else {
+      kernels::binary_bf16_vec8<false><<<grid, kDirectThreads, 0, stream>>>(
+          reinterpret_cast<const uint4*>(input),
+          static_cast<const uint4*>(bindings.secondary),
+          reinterpret_cast<uint4*>(output), vectors, bindings.dt);
+    }
+    return cudaGetLastError();
+  }
   return launch<__nv_bfloat16>(spec, bindings);
 }
 
