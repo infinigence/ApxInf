@@ -107,6 +107,16 @@ pub struct VlaMetadata<'a> {
     pub image_grid_thw: Option<&'a [[u32; 3]]>,
     pub embodiment_id: Option<usize>,
     pub planning: Option<&'a PlanningOptions>,
+    /// Override the RoPE position offset for the action expert.
+    ///
+    /// When `Some(n)`, the action expert's RoPE positions start at `n` instead
+    /// of the prefix's total row count. This aligns with LeRobot's
+    /// `sum(prefix_pad_masks)` semantics, where masked tokens (empty cameras,
+    /// language padding) do not occupy RoPE positions.
+    ///
+    /// `None` (default) preserves the original behavior: position offset =
+    /// prefix total rows.
+    pub valid_prefix_tokens: Option<usize>,
 }
 
 /// Complete VLA request: an environment observation plus the model-generation
@@ -128,6 +138,7 @@ impl<'a> VlaRequest<'a> {
                 image_grid_thw: None,
                 embodiment_id: None,
                 planning: None,
+                valid_prefix_tokens: None,
             },
         }
     }
@@ -141,6 +152,7 @@ impl<'a> VlaRequest<'a> {
                 image_grid_thw: None,
                 embodiment_id: None,
                 planning: None,
+                valid_prefix_tokens: None,
             },
         }
     }
@@ -339,6 +351,18 @@ pub trait VlaRuntime {
     /// This convenience performs the device→host copy inside the runtime, which
     /// already owns the backend.
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>>;
+
+    /// Run inference and dump per-layer activations to host as `f32`.
+    ///
+    /// Diagnostic-only; unsupported families return an explicit error.
+    fn infer_host_f32_with_dump(
+        &self,
+        _request: &VlaRequest<'_>,
+    ) -> Result<(Vec<f32>, BTreeMap<String, (Vec<f32>, Vec<usize>)>)> {
+        Err(Error::Other(
+            "infer_host_f32_with_dump not implemented for this VLA runtime".into(),
+        ))
+    }
 
     /// Run inference, return host actions, and report model-local phase timings.
     ///

@@ -39,6 +39,12 @@ pub(crate) fn create_backend_with_recipe_options(
         Device::Hip(id) => hip::create(id),
         #[cfg(not(feature = "hip"))]
         Device::Hip(_) => Err(Error::Other("HIP support not compiled in".into())),
+        #[cfg(feature = "ascend")]
+        Device::Npu(_) => Err(Error::Other(
+            "Ascend NPU uses ascend-pi05 direct path, not dyn Backend".into(),
+        )),
+        #[cfg(not(feature = "ascend"))]
+        Device::Npu(_) => Err(Error::Other("Ascend support not compiled in".into())),
     }
 }
 

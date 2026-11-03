@@ -31,7 +31,7 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use numpy::ndarray::{Array1, Array2};
+use numpy::ndarray::{Array1, Array2, ArrayD};
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
     PyUntypedArrayMethods,
@@ -133,6 +133,7 @@ fn parse_device(spec: &str) -> PyResult<Device> {
         "cuda" => Ok(Device::Cuda(index)),
         "hip" => Ok(Device::Hip(index)),
         "metal" | "mlx" => Ok(Device::Metal(index)),
+        "npu" => Ok(Device::Npu(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
             "apxinf_py.load: unknown device `{other}` (expected cuda|hip|metal|mlx|cpu)"
@@ -376,6 +377,7 @@ fn grid_metadata(grids: Option<&[[u32; 3]]>) -> VlaMetadata<'_> {
         image_grid_thw: grids,
         embodiment_id: None,
         planning: None,
+        valid_prefix_tokens: None,
     }
 }
 
@@ -935,6 +937,7 @@ impl ModelRunner {
                 || options.reasoning.is_some()
                 || options.raw_rgb_resize.is_some())
             .then_some(&options),
+            valid_prefix_tokens: None,
         };
         let request =
             VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
@@ -950,9 +953,13 @@ impl ModelRunner {
         observation: Observation,
         latent: Tensor,
         grids: Option<&[[u32; 3]]>,
+        valid_prefix_tokens: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let request =
-            VlaRequest::provided_with_metadata(&observation, &latent, grid_metadata(grids));
+        let metadata = VlaMetadata {
+            valid_prefix_tokens,
+            ..grid_metadata(grids)
+        };
+        let request = VlaRequest::provided_with_metadata(&observation, &latent, metadata);
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
     }
@@ -965,9 +972,13 @@ impl ModelRunner {
         observation: Observation,
         rng: RngKey,
         grids: Option<&[[u32; 3]]>,
+        valid_prefix_tokens: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let request =
-            VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
+        let metadata = VlaMetadata {
+            valid_prefix_tokens,
+            ..grid_metadata(grids)
+        };
+        let request = VlaRequest::generated_with_metadata(&observation, rng, metadata);
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
     }
@@ -1278,9 +1289,9 @@ impl ModelRunner {
         match noise {
             Some(noise) => {
                 let noise_tensor = self.noise_tensor(noise)?;
-                self.run_provided(py, observation, noise_tensor, None)
+                self.run_provided(py, observation, noise_tensor, None, None)
             }
-            None => self.run_generated(py, observation, self.next_sampling_rng()?, None),
+            None => self.run_generated(py, observation, self.next_sampling_rng()?, None, None),
         }
     }
 
@@ -1355,6 +1366,7 @@ impl ModelRunner {
             embodiment_id: input.embodiment_id,
             planning: (options.num_steps.is_some() || options.reasoning.is_some())
                 .then_some(&options),
+            valid_prefix_tokens: None,
         };
         let request =
             VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
@@ -1520,6 +1532,7 @@ impl ModelRunner {
             image_grid_thw: Some(&input.image_grid_thw),
             embodiment_id: input.embodiment_id,
             planning: None,
+            valid_prefix_tokens: None,
         };
         self.model
             .calibration_amax(&VlaRequest::provided_with_metadata(
@@ -1572,7 +1585,7 @@ impl ModelRunner {
             state: None,
             action_mask: None,
         };
-        self.run_generated(py, observation, RngKey::new(seed, sequence, draw), None)
+        self.run_generated(py, observation, RngKey::new(seed, sequence, draw), None, None)
     }
 
     /// **L1** - infer from resized RGB `uint8` images; vision->patches runs in the
@@ -1589,7 +1602,7 @@ impl ModelRunner {
     ///   `grid_h * patch_size x grid_w * patch_size`.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
-    #[pyo3(signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None, state=None, image_grid_thw=None))]
+    #[pyo3(signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None, state=None, image_grid_thw=None, valid_prefix_tokens=None))]
     #[allow(clippy::too_many_arguments)]
     fn infer_rgb<'py>(
         &self,
@@ -1601,6 +1614,7 @@ impl ModelRunner {
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
         state: Option<PyReadonlyArray1<'py, f32>>,
         image_grid_thw: Option<PyReadonlyArray2<'py, u32>>,
+        valid_prefix_tokens: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let (mut observation, grids) =
             self.rgb_observation("infer_rgb", rgb_u8, layout, token_ids, image_grid_thw)?;
@@ -1613,15 +1627,73 @@ impl ModelRunner {
         match noise {
             Some(noise) => {
                 let noise_tensor = self.noise_tensor(noise)?;
-                self.run_provided(py, observation, noise_tensor, grids.as_deref())
+                self.run_provided(py, observation, noise_tensor, grids.as_deref(), valid_prefix_tokens)
             }
             None => {
                 let rng = self.next_sampling_rng()?;
-                self.run_generated(py, observation, rng, grids.as_deref())
+                self.run_generated(py, observation, rng, grids.as_deref(), valid_prefix_tokens)
             }
         }
     }
 
+/// Run inference with an exact caller-provided latent and dump all per-layer
+    /// intermediate activations. Returns `(action, captures)` where `action` is
+    /// `float32 [action_horizon, action_dim]` and `captures` is a `dict` mapping
+    /// activation names (e.g. `vision.layer.0.output`, `language.layer.4.output`,
+    /// `denoise.step.2.action_layer.3.output`) to numpy `float32` arrays.
+    /// Diagnostics-only. Runs in eager mode (no graph capture).
+    #[pyo3(name = "infer_rgb_dump", signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None, state=None, valid_prefix_tokens=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_rgb_dump<'py>(
+        &self,
+        py: Python<'py>,
+        rgb_u8: PyReadonlyArrayDyn<'py, u8>,
+        layout: &str,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        noise: Option<PyReadonlyArray2<'py, f32>>,
+        action_mask: Option<PyReadonlyArray2<'py, f32>>,
+        state: Option<PyReadonlyArray1<'py, f32>>,
+        valid_prefix_tokens: Option<usize>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyDict>)> {
+        let (mut observation, _grids) =
+            self.rgb_observation("infer_rgb_dump", rgb_u8, layout, token_ids, None)?;
+        observation.action_mask = action_mask
+            .map(|value| self.action_mask_tensor(value))
+            .transpose()?;
+        if let Some(state) = state {
+            observation.state = Some(self.state_tensor(state)?);
+        }
+        let noise_tensor = match noise {
+            Some(noise) => self.noise_tensor(noise)?,
+            None => {
+                return Err(PyValueError::new_err(
+                    "apxinf_py.infer_rgb_dump: an explicit noise latent is required so the dump is reproducible",
+                ));
+            }
+        };
+
+        let request = VlaRequest::provided_with_metadata(
+            &observation,
+            &noise_tensor,
+            VlaMetadata {
+                valid_prefix_tokens,
+                ..Default::default()
+            },
+        );
+        let (flat, captures) = self
+            .model
+            .infer_host_f32_with_dump(&request)
+            .map_err(runtime_err)?;
+        let actions = self.action_array(py, flat)?;
+        let dict = PyDict::new_bound(py);
+        for (name, (data, shape)) in captures {
+            let array = ArrayD::from_shape_vec(shape, data)
+                .map_err(runtime_err)?
+                .into_pyarray_bound(py);
+            dict.set_item(name, array).map_err(runtime_err)?;
+        }
+        Ok((actions, dict))
+    }
     /// Diagnostic variant of [`ModelRunner::infer_rgb`] with model-local phase
     /// timings. Currently only SmolVLA implements the profile.
     #[pyo3(name = "infer_rgb_profiled", signature = (rgb_u8, layout, token_ids, noise=None, action_mask=None, state=None, image_grid_thw=None))]
@@ -1787,7 +1859,7 @@ impl ModelRunner {
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let (observation, _) =
             self.rgb_observation("infer_rgb_seeded", rgb_u8, layout, token_ids, None)?;
-        self.run_generated(py, observation, RngKey::new(seed, sequence, draw), None)
+        self.run_generated(py, observation, RngKey::new(seed, sequence, draw), None, None)
     }
 
     /// Reset the implicit device-side sampling stream used when `noise=None`.

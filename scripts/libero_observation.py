@@ -34,10 +34,13 @@ def quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
 
 
 def libero_images(base: np.ndarray, wrist: np.ndarray) -> np.ndarray:
-    """Orient raw LIBERO frames; the selected policy owns model-specific resize."""
-    return np.stack(
-        [np.ascontiguousarray(base[::-1, ::-1]), np.ascontiguousarray(wrist[::-1, ::-1])]
-    )
+    """Orient raw LIBERO frames; the selected policy owns model-specific resize.
+
+    LeRobot's ``LiberoEnv._format_raw_obs`` does NOT flip images — the 180°
+    rotation in ``render()`` is for visualization only. The checkpoint was
+    trained on unflipped frames, so we pass them through as-is.
+    """
+    return np.stack([np.ascontiguousarray(base), np.ascontiguousarray(wrist)])
 
 
 def libero_state(observation, *, finger_joints: int = 1) -> np.ndarray:
@@ -149,11 +152,7 @@ def load_libero_init_states(suite, task_id: int):
     from libero.libero import get_libero_path
 
     task = suite.get_task(task_id)
-    init_states_path = (
-        pathlib.Path(get_libero_path("init_states"))
-        / task.problem_folder
-        / task.init_states_file
-    )
+    init_states_path = pathlib.Path(get_libero_path("init_states")) / task.problem_folder / task.init_states_file
     return torch.load(init_states_path, weights_only=False)
 
 

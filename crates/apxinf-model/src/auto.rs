@@ -233,6 +233,14 @@ impl LoadedModel {
         self.vla()?.infer_host_f32(request)
     }
 
+    /// Run VLA inference and dump per-layer activations to host as `f32`.
+    pub fn infer_host_f32_with_dump(
+        &self,
+        request: &VlaRequest<'_>,
+    ) -> Result<(Vec<f32>, BTreeMap<String, (Vec<f32>, Vec<usize>)>)> {
+        self.vla()?.infer_host_f32_with_dump(request)
+    }
+
     /// Run a VLA inference with optional model-local phase timings.
     pub fn infer_host_f32_profiled(
         &self,
@@ -386,8 +394,11 @@ impl AutoModel {
             #[cfg(feature = "cuda")]
             return crate::pi05::load_with_cuda_new(path, device, options);
 
-            #[cfg(not(feature = "cuda"))]
-            return Err(Error::Other("PI0.5 requires CUDA or HIP support".into()));
+            #[cfg(all(not(feature = "cuda"), not(feature = "hip"), feature = "ascend"))]
+            return crate::ascend_pi05::load_with_ascend(path, device, options);
+
+            #[cfg(not(any(feature = "cuda", feature = "hip", feature = "ascend")))]
+            return Err(Error::Other("PI0.5 requires CUDA, HIP or Ascend support".into()));
         }
 
         if matches!(model_name, "d3" | "d3-cuda") {
@@ -403,6 +414,7 @@ impl AutoModel {
             Device::Cuda(_) => Some("cuda"),
             Device::Hip(_) => Some("hip"),
             Device::Metal(_) | Device::Cpu => None,
+            Device::Npu(_) => Some("npu"),
         };
 
         let specific_name = device_name.map(|suffix| format!("{model_name}-{suffix}"));

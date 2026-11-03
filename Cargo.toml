@@ -4,6 +4,7 @@ members = [
     "crates/apxinf-cuda-new",
     "crates/apxinf-hip",
     "crates/apxinf-mlx",
+    "crates/apxinf-ascend",
     "crates/apxinf-loader",
     "crates/apxinf-model",
     "crates/apxinf-tokenizer",
@@ -37,6 +38,9 @@ cuda-new = ["cuda", "apxinf-model/cuda-new"]
 # AMD ROCm/HIP inference. Independent of `cuda`: both may be enabled, and
 # a process can then hold a CUDA and a HIP backend at once.
 hip = ["dep:apxinf-hip", "apxinf-model/hip"]
+# Huawei Ascend NPU inference. Independent of `cuda`/`hip`: all three may
+# be enabled, and a process can then hold backends for multiple runtimes.
+ascend = ["dep:apxinf-ascend", "apxinf-model/ascend"]
 # CPU-only BLAS backend for the non-GPU matmul fallback. Combine with `cuda`
 # if you want the CPU path to use OpenBLAS. Drive OS aarch64 doesn't ship
 # libopenblas — leave this off on Thor.
@@ -47,6 +51,7 @@ apxinf-core = { path = "crates/apxinf-core" }
 apxinf-cuda-new = { path = "crates/apxinf-cuda-new", optional = true }
 apxinf-mlx = { path = "crates/apxinf-mlx", optional = true }
 apxinf-hip = { path = "crates/apxinf-hip", optional = true }
+apxinf-ascend = { path = "crates/apxinf-ascend", optional = true }
 apxinf-loader = { path = "crates/apxinf-loader" }
 apxinf-model = { path = "crates/apxinf-model" }
 apxinf-tokenizer = { path = "crates/apxinf-tokenizer" }

@@ -300,7 +300,7 @@ pub(crate) fn adjusted_logit(mut value: f32, occurrences: u32, penalties: TokenP
     value
 }
 
-pub(crate) struct CpuTokenSampler {
+pub struct CpuTokenSampler {
     spec: TokenSamplingSpec,
     counts: Vec<u32>,
     sequence_len: usize,
@@ -309,7 +309,7 @@ pub(crate) struct CpuTokenSampler {
 }
 
 impl CpuTokenSampler {
-    pub(crate) fn new(spec: TokenSamplingSpec) -> Result<Self> {
+    pub fn new(spec: TokenSamplingSpec) -> Result<Self> {
         spec.validate()?;
         Ok(Self {
             spec,
@@ -499,12 +499,12 @@ impl TokenSampler for CpuTokenSampler {
     }
 }
 
-pub(crate) struct CpuNormalGenerator {
+pub struct CpuNormalGenerator {
     output: Tensor,
 }
 
 impl CpuNormalGenerator {
-    pub(crate) fn new(output: Tensor) -> Result<Self> {
+    pub fn new(output: Tensor) -> Result<Self> {
         if output.device() != Device::Cpu {
             return Err(Error::DeviceMismatch {
                 expected: Device::Cpu,

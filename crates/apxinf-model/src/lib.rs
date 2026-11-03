@@ -17,6 +17,8 @@ pub mod metal_minicpm5;
 pub mod metal_qwen3;
 pub mod pi05;
 pub mod pi0fast;
+#[cfg(feature = "ascend")]
+pub mod ascend_pi05;
 pub mod profiling;
 #[cfg(feature = "cuda")]
 pub mod qwen38;

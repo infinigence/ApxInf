@@ -15,13 +15,13 @@ pub use error::{Error, Result};
 pub use kv_cache::{CpuKVCache, KvCache};
 pub use op_impls::cpu::CpuBackend;
 pub use sampling::{
-    philox4x32_10, standard_normal_f32, uniform_f32, NextTokenLogits,
-    NormalGenerator, RngKey, SamplingBackend, TokenPenalties, TokenSample,
+    CpuNormalGenerator, CpuTokenSampler, philox4x32_10, standard_normal_f32, uniform_f32,
+    NextTokenLogits, NormalGenerator, RngKey, SamplingBackend, TokenPenalties, TokenSample,
     TokenSampler, TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec,
     TokenSelection,
 };
 pub use shape::Shape;
-pub use storage::Storage;
+pub use storage::{GpuStorageHandle, Storage};
 pub use tensor::Tensor;
 
 /// Represents where a tensor lives.
@@ -37,11 +37,17 @@ pub enum Device {
     /// non-CUDA devices.
     Hip(usize),
     Metal(usize),
+    /// A Huawei Ascend NPU addressed through CANN/ACL.
+    ///
+    /// Same rationale as `Hip`: the tensor records which runtime owns its
+    /// allocation, and the CUDA/HIP crates reject it through their
+    /// non-matching-device fallback arms.
+    Npu(usize),
 }
 
 impl Device {
     pub fn is_gpu(&self) -> bool {
-        matches!(self, Device::Cuda(_) | Device::Hip(_) | Device::Metal(_))
+        matches!(self, Device::Cuda(_) | Device::Hip(_) | Device::Metal(_) | Device::Npu(_))
     }
 }
 
@@ -52,6 +58,7 @@ impl std::fmt::Display for Device {
             Device::Cuda(id) => write!(f, "cuda:{id}"),
             Device::Hip(id) => write!(f, "hip:{id}"),
             Device::Metal(id) => write!(f, "metal:{id}"),
+            Device::Npu(id) => write!(f, "npu:{id}"),
         }
     }
 }

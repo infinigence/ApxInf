@@ -71,6 +71,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 name = "apxinf"
 version = "0.1.0"
 dependencies = [
+ "apxinf-ascend",
  "apxinf-core",
  "apxinf-cuda-new",
  "apxinf-hip",
@@ -81,6 +82,15 @@ dependencies = [
  "clap",
  "half",
  "serde_json",
+]
+
+[[package]]
+name = "apxinf-ascend"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "bytemuck",
+ "half",
 ]
 
 [[package]]
@@ -142,6 +152,7 @@ dependencies = [
 name = "apxinf-model"
 version = "0.1.0"
 dependencies = [
+ "apxinf-ascend",
  "apxinf-core",
  "apxinf-cuda-new",
  "apxinf-hip",

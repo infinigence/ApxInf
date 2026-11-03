@@ -50,8 +50,8 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ...calibration import CalibrationContext, CalibrationPlan
 from ..._tactics import resolve_pi05_tactics
+from ...calibration import CalibrationContext, CalibrationPlan
 from ...checkpoints import (
     CheckpointError,
     OpenPINormalizationError,
@@ -68,7 +68,6 @@ from ...checkpoints.descriptor import (
     NormalizationPlan,
     TransformSpec,
 )
-from ..base import CANONICAL_STATE_KEY, VIEW_SLOTS, ModelRunnerProtocol
 from ...processors import (
     GaussianNoise,
     ImageStack,
@@ -96,6 +95,7 @@ from ...processors.transforms import (
     has_key,
     lookup_key,
 )
+from ..base import CANONICAL_STATE_KEY, VIEW_SLOTS, ModelRunnerProtocol
 from ..registry import register_policy
 
 __all__ = ["Pi05Policy"]
@@ -132,15 +132,11 @@ def _normalizer_from_transform(spec: TransformSpec, *, dtype=None) -> Optional[N
     raise ValueError(f"unsupported state transform mode {spec.mode!r}")
 
 
-def _unnormalizer_from_transform(
-    spec: TransformSpec, *, dims: Optional[int] = None, dtype=None
-) -> Unnormalizer:
+def _unnormalizer_from_transform(spec: TransformSpec, *, dims: Optional[int] = None, dtype=None) -> Unnormalizer:
     """Materialize action transform, preserving an explicit identity width."""
     width = spec.width if dims is None else int(dims)
     if width <= 0 or width > spec.width:
-        raise ValueError(
-            f"action_dim={width} is incompatible with checkpoint normalization width {spec.width}"
-        )
+        raise ValueError(f"action_dim={width} is incompatible with checkpoint normalization width {spec.width}")
     if spec.mode == IDENTITY:
         return Unnormalizer(
             q01=[-1.0] * width,
@@ -186,18 +182,16 @@ class Pi05Policy:
         state_key: Optional[str] = None,
         action_dim: Optional[int] = None,
         metadata: Optional[Mapping[str, Any]] = None,
+        valid_prefix_tokens: Optional[int] = None,
     ):
         self.model_runner = model_runner
         self.input_pipeline = input_pipeline
         self.output_pipeline = output_pipeline
-        self.image_keys = tuple(
-            image_keys if image_keys is not None else _default_image_keys(model_runner.num_views)
-        )
+        self.valid_prefix_tokens = valid_prefix_tokens
+        self.image_keys = tuple(image_keys if image_keys is not None else _default_image_keys(model_runner.num_views))
         self.prompt_key = prompt_key
         self.state_key = state_key
-        self.action_dim_out = (
-            int(action_dim) if action_dim is not None else self._derive_action_dim(output_pipeline)
-        )
+        self.action_dim_out = int(action_dim) if action_dim is not None else self._derive_action_dim(output_pipeline)
 
         # Introspect the optional tokenize step so ``_require_keys`` and metadata
         # know whether state is actually injected (a custom pipeline may omit it).
@@ -293,13 +287,10 @@ class Pi05Policy:
         by loading with ``num_views=``, which drops the trailing view slots at
         load time rather than zero-filling them per request.
         """
-        image_keys = tuple(
-            image_keys if image_keys is not None else _default_image_keys(model_runner.num_views)
-        )
+        image_keys = tuple(image_keys if image_keys is not None else _default_image_keys(model_runner.num_views))
         if len(image_keys) != model_runner.num_views:
             fix = (
-                f"load with num_views={len(image_keys)} to serve fewer cameras "
-                "than the checkpoint declares"
+                f"load with num_views={len(image_keys)} to serve fewer cameras " "than the checkpoint declares"
                 if len(image_keys) < model_runner.num_views
                 else "a checkpoint cannot serve more cameras than it was trained on"
             )
@@ -361,6 +352,7 @@ class Pi05Policy:
         asset_id: Optional[str] = None,
         norm_stats=None,
         metadata: Optional[Mapping[str, Any]] = None,
+        valid_prefix_tokens: Optional[int] = None,
     ) -> "Pi05Policy":
         """Build the **default** policy from a checkpoint directory.
 
@@ -538,11 +530,7 @@ class Pi05Policy:
         plan = layout.normalization if layout is not None else None
         injected_unnormalizer = unnormalizer is not None
         if plan is None:
-            stats_path = (
-                Path(norm_stats)
-                if norm_stats is not None
-                else model_dir / "norm_stats.json"
-            )
+            stats_path = Path(norm_stats) if norm_stats is not None else model_dir / "norm_stats.json"
             if stats_path.is_file():
                 try:
                     plan = load_normalization_plan(
@@ -576,22 +564,15 @@ class Pi05Policy:
             unnormalizer = (
                 unnormalizer
                 if unnormalizer is not None
-                else _unnormalizer_from_transform(
-                    plan.action, dims=action_dim, dtype=norm_dtype
-                )
+                else _unnormalizer_from_transform(plan.action, dims=action_dim, dtype=norm_dtype)
             )
             state_normalizer = (
                 _normalizer_from_transform(plan.state, dtype=norm_dtype)
                 if discrete_state and plan.state is not None
                 else None
             )
-            missing_state_stats = discrete_state and (
-                plan.state is None or plan.state.status == IDENTITY_MISSING_STATS
-            )
-            missing_action_stats = (
-                not injected_unnormalizer
-                and plan.action.status == IDENTITY_MISSING_STATS
-            )
+            missing_state_stats = discrete_state and (plan.state is None or plan.state.status == IDENTITY_MISSING_STATS)
+            missing_action_stats = not injected_unnormalizer and plan.action.status == IDENTITY_MISSING_STATS
             if missing_state_stats or missing_action_stats:
                 _LOGGER.warning(
                     "checkpoint %s lacks statistics for one or more transforms; "
@@ -699,6 +680,7 @@ class Pi05Policy:
             state_key=state_key,
             action_dim=width,
             metadata={"weights": "synthetic", **(dict(metadata) if metadata else {})},
+            valid_prefix_tokens=valid_prefix_tokens,
         )
 
     # --- composition -------------------------------------------------------
@@ -741,6 +723,7 @@ class Pi05Policy:
             state_key=self.state_key,
             action_dim=self.action_dim_out if action_dim is None else int(action_dim),
             metadata={**self._extra_metadata, **(dict(metadata) if metadata else {})},
+            valid_prefix_tokens=self.valid_prefix_tokens,
         )
 
     # --- inference ---------------------------------------------------------
@@ -767,16 +750,12 @@ class Pi05Policy:
             selected_noise = np.ascontiguousarray(selected_noise, dtype=np.float32)
             expected_noise = (self.model_runner.action_horizon, self.model_runner.action_dim)
             if selected_noise.shape != expected_noise:
-                raise ValueError(
-                    f"noise shape {selected_noise.shape}, expected {expected_noise}"
-                )
+                raise ValueError(f"noise shape {selected_noise.shape}, expected {expected_noise}")
             if not np.isfinite(selected_noise).all():
                 raise ValueError("noise must contain only finite values")
         return data[RGB], data[TOKEN_IDS], selected_noise, data
 
-    def calibrate_observation(
-        self, observation: Mapping[str, Any], *, noise: np.ndarray
-    ) -> Mapping[str, float]:
+    def calibrate_observation(self, observation: Mapping[str, Any], *, noise: np.ndarray) -> Mapping[str, float]:
         """Collect FP8 statistics from one normal business Observation.
 
         Calibration deliberately requires an explicit latent so a dataset and
@@ -803,13 +782,9 @@ class Pi05Policy:
             seed_algorithm="numpy-pcg64-seed-sequence-v1",
         )
 
-    def collect_calibration(
-        self, observation: Mapping[str, Any], context: CalibrationContext
-    ) -> Mapping[str, float]:
+    def collect_calibration(self, observation: Mapping[str, Any], context: CalibrationContext) -> Mapping[str, float]:
         """Implement the common runner seam using normal PI0.5 preprocessing."""
-        rng = np.random.default_rng(
-            np.random.SeedSequence([context.seed, context.sample_index])
-        )
+        rng = np.random.default_rng(np.random.SeedSequence([context.seed, context.sample_index]))
         noise = np.ascontiguousarray(
             rng.standard_normal((self.model_runner.action_horizon, self.model_runner.action_dim)),
             dtype=np.float32,
@@ -834,7 +809,10 @@ class Pi05Policy:
         # model: the policy's own middle step (not a pipeline stage)
         model_started = time.perf_counter()
         normalized = np.asarray(
-            self.model_runner.infer_rgb(rgb, "nhwc", token_ids, selected_noise), dtype=np.float32
+            self.model_runner.infer_rgb(
+                rgb, "nhwc", token_ids, selected_noise, valid_prefix_tokens=self.valid_prefix_tokens
+            ),
+            dtype=np.float32,
         )
         model_ms = (time.perf_counter() - model_started) * 1000.0
 

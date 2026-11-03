@@ -400,7 +400,10 @@ fn main() {
     generic_sources.push(native.join("kernels/rope/multimodal.cu"));
     generic_sources.push(native.join("kernels/custom/preprocess_ops.cu"));
     generic_sources.push(native.join("kernels/custom/gdn_ops.cu"));
-    generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_tma.cpp"));
+    let skip_flashinfer_gdn = selection.targets.iter().any(|t| t.sm() == 120);
+    if !skip_flashinfer_gdn {
+        generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_tma.cpp"));
+    }
     generic_sources.push(native.join("kernels/custom/rope_partial.cu"));
     generic_sources.push(native.join("kernels/custom/norm_head.cu"));
     generic_sources.push(native.join("kernels/custom/attention_gates.cu"));
@@ -471,7 +474,9 @@ fn main() {
         // Vendored FlashInfer Cake GDN prefill: plain CUDA C++, but it needs
         // the same compute_110a codegen as the CUTLASS group because it emits
         // tcgen05 and TMA. See native/kernels/flashinfer_gdn/README.md.
-        cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+        if !skip_flashinfer_gdn {
+            cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+        }
     } else {
         // No sm100 target: the kernel translation unit is absent, so link the
         // unsupported-status stub in its place (a weak symbol is not enough —
