@@ -68,7 +68,11 @@ impl HfTokenizer {
     }
 
     #[pyo3(name = "encode_with_special_tokens", signature = (text, add_special_tokens))]
-    fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> PyResult<Vec<u32>> {
+    fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> PyResult<Vec<u32>> {
         self.inner
             .encode_with_special_tokens(text, add_special_tokens)
             .map_err(runtime_err)
@@ -1002,8 +1006,7 @@ impl ModelRunner {
         rng: RngKey,
         grids: Option<&[[u32; 3]]>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let request =
-            VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
+        let request = VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
     }
@@ -1032,8 +1035,7 @@ impl ModelRunner {
         rng: RngKey,
         grids: Option<&[[u32; 3]]>,
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
-        let request =
-            VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
+        let request = VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
         let (flat, profile) = self
             .model
             .infer_host_f32_profiled(&request)
@@ -1074,7 +1076,7 @@ impl ModelRunner {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None, weight_layout_budget_bytes=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -1091,6 +1093,7 @@ impl ModelRunner {
         sampling_seed: u64,
         assets: Option<BTreeMap<String, PathBuf>>,
         model_variant: Option<String>,
+        weight_layout_budget_bytes: Option<usize>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -1133,6 +1136,7 @@ impl ModelRunner {
             model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
             model_variant,
+            weight_layout_budget_bytes,
             calibration_path: calibration,
             tuning_path: tactics,
             assets: assets.unwrap_or_default(),

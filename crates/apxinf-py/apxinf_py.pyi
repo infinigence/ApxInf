@@ -49,6 +49,8 @@ class ModelRunner:
         flow_start_time: float | None = ...,
         sampling_seed: int = ...,
         assets: dict[str, str] | None = ...,
+        model_variant: str | None = ...,
+        weight_layout_budget_bytes: int | None = ...,
     ) -> "ModelRunner":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
@@ -63,6 +65,12 @@ class ModelRunner:
         the absent views but skips their patch tokens.
         ``num_flow_steps`` and ``flow_start_time`` are PI0.5 deployment overrides.
         ``sampling_seed`` seeds the implicit device-side noise stream.
+        ``weight_layout_budget_bytes`` limits live extra PI0.5 BF16/FP8
+        language gate/up weight layouts. ``None`` permits one extra per weight
+        for concurrent consumers, released with its last execution/graph;
+        retired bases may change layout in place. ``0`` uses canonical layouts.
+        Temporary buffers and execution
+        workspaces are excluded.
         """
         ...
 

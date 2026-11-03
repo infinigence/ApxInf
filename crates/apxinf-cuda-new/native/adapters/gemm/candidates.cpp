@@ -39,8 +39,11 @@ bool supports_vendor(const Spec& spec) {
 }
 
 bool supports_cublaslt(const Spec& spec) {
+  // CANONICAL carries the same bytes as KN; it only tells preparation not to
+  // repack B in place.
   const bool vendor_layout =
       spec.b_layout == APXINF_GEMM_LAYOUT_KN ||
+      spec.b_layout == APXINF_GEMM_LAYOUT_CANONICAL ||
       (spec.b_layout == APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256 &&
        spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_SWIGLU);
   return vendor_layout && supports_vendor(spec);
@@ -371,6 +374,13 @@ bool supports_cutlass_bf16_geglu_sm89(const Spec& spec) {
 
 }  // namespace
 
+bool supports_weight_layout(const Implementation& implementation, const Spec& spec) {
+  if (spec.b_layout == 0) return true;
+  // cuBLAS is the layout-aware baseline for shape/semantic changes.
+  if (implementation.provider_id == kProviderCublas) return true;
+  return static_cast<uint32_t>(implementation.weight_layout) == spec.b_layout;
+}
+
 bool supports_device(const Implementation& implementation,
                      int device,
                      std::string* reason) {
@@ -407,14 +417,14 @@ const ImplementationRegistry& registry(uint32_t semantic) {
   // Every L3 semantic has exactly one baseline fallback. cuBLAS owns that role;
   // faster or more specialized providers remain autotuning candidates only.
   static const ImplementationRegistry gemm_bias_gelu_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
-      {kProviderCublasLt, 3, 1, "cublasLt-native-fp8-gelu-bias",
+      {kProviderCublasLt, 3, 1, "cublasLt-native-fp8-gelu-bias", WeightLayout::Canonical,
        kDeviceFeatureNativeFp8, true, false, false,
        supports_native_fp8_bias_gelu, cublaslt_alignment,
        cublaslt_native_fp8_gelu_resource_requirements,
@@ -422,8 +432,7 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        launch_cublaslt, destroy_cublaslt},
 #ifdef APXINF_GEMM_CUTLASS_SM87_W8A8
       {kProviderCutlass, 10, 1,
-       "cutlass-w8a8-bias-gelu-m41-n6144-k1536-sm87",
-       kDeviceFeatureCutlassSm87W8A8, true, true, false,
+       "cutlass-w8a8-bias-gelu-m41-n6144-k1536-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8_bias_gelu_m41_n6144_k1536,
        cutlass_w8a8_alignment, cutlass_w8a8_resource_requirements,
        one_configuration, prepare_cutlass_w8a8,
@@ -433,21 +442,20 @@ const ImplementationRegistry& registry(uint32_t semantic) {
   // Keep GEMM+bias as a separate L3 tuning domain even though its current L1
   // candidates happen to be the same vendor implementations.
   static const ImplementationRegistry gemm_bias_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
-      {kProviderCublasLt, 2, 1, "cublasLt-native-fp8-bias",
+      {kProviderCublasLt, 2, 1, "cublasLt-native-fp8-bias", WeightLayout::Canonical,
        kDeviceFeatureNativeFp8, true, false, false, supports_native_fp8_bias,
        cublaslt_alignment, cublaslt_native_fp8_resource_requirements,
        cublaslt_configurations, prepare_cublaslt_native_fp8, launch_cublaslt,
        destroy_cublaslt},
 #ifdef APXINF_GEMM_CUTLASS_SM87_W8A8
-      {kProviderCutlass, 9, 1, "cutlass-w8a8-bias-m41-n4608-k1536-sm87",
-       kDeviceFeatureCutlassSm87W8A8, true, true, false,
+      {kProviderCutlass, 9, 1, "cutlass-w8a8-bias-m41-n4608-k1536-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8_bias_m41_n4608_k1536,
        cutlass_w8a8_alignment, cutlass_w8a8_resource_requirements,
        one_configuration, prepare_cutlass_w8a8,
@@ -455,101 +463,97 @@ const ImplementationRegistry& registry(uint32_t semantic) {
 #endif
   };
   static const ImplementationRegistry gemm_bias_residual_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
-      {kProviderCublasLt, 3, 1, "cublasLt-native-fp8-bias-residual",
+      {kProviderCublasLt, 3, 1, "cublasLt-native-fp8-bias-residual", WeightLayout::Canonical,
        kDeviceFeatureNativeFp8, true, false, false,
        supports_native_fp8_bias_residual, cublaslt_alignment,
        cublaslt_native_fp8_resource_requirements, cublaslt_configurations,
        prepare_cublaslt_native_fp8, launch_cublaslt, destroy_cublaslt},
   };
   static const ImplementationRegistry gemm_entries = {
-      {kProviderCublas, 1, 1, "cublas+custom-epilogue", 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", 0, true, false, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
-      {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+custom-epilogue",
+      {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+custom-epilogue", WeightLayout::Canonical,
        kDeviceFeatureNativeFp8, true, false, false, supports_native_fp8,
        cublaslt_alignment, cublaslt_native_fp8_resource_requirements,
        cublaslt_configurations, prepare_cublaslt_native_fp8, launch_cublaslt,
        destroy_cublaslt},
-      {kProviderCublasLt, 3, 1, "cublasLt-native-nvfp4",
+      {kProviderCublasLt, 3, 1, "cublasLt-native-nvfp4", WeightLayout::NK,
        kDeviceFeatureCutlassSm100, true, false, false, supports_native_fp4,
        cublaslt_nvfp4_alignment, cublaslt_native_fp4_resource_requirements,
        cublaslt_configurations, prepare_cublaslt_native_fp4, launch_cublaslt,
        destroy_cublaslt},
 #ifdef APXINF_GEMM_CUTLASS
-      {kProviderCutlass, 1, 1, "cutlass-fp8", kDeviceFeatureCutlassSm100,
+      {kProviderCutlass, 1, 1, "cutlass-fp8", WeightLayout::Canonical, kDeviceFeatureCutlassSm100,
        true, true, false,
        supports_cutlass_fp8, cutlass_fp8_alignment,
        cutlass_fp8_resource_requirements, cutlass_configurations,
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_gemm, destroy_cutlass},
-      {kProviderCutlass, 7, 1, "cutlass-fp8-row-channel",
-       kDeviceFeatureCutlassSm100, true, true, false,
+      {kProviderCutlass, 7, 1, "cutlass-fp8-row-channel", WeightLayout::Canonical, kDeviceFeatureCutlassSm100, true, true, false,
        supports_cutlass_fp8_rowwise, cutlass_fp8_rowwise_alignment,
        cutlass_fp8_resource_requirements, cutlass_fp8_rowwise_configurations,
        prepare_cutlass_fp8_gemm, launch_cutlass_fp8_rowwise_gemm,
        destroy_cutlass},
-      {kProviderCutlass, 4, 1, "cutlass-nvfp4-blockscaled",
-       kDeviceFeatureCutlassSm100, true, true, false,
+      {kProviderCutlass, 4, 1, "cutlass-nvfp4-blockscaled", WeightLayout::NK, kDeviceFeatureCutlassSm100, true, true, false,
        supports_cutlass_nvfp4, cutlass_nvfp4_alignment,
        cutlass_nvfp4_resource_requirements, cutlass_nvfp4_configurations,
        prepare_cutlass_nvfp4, launch_cutlass_nvfp4, destroy_cutlass},
 #endif
 #ifdef APXINF_GEMM_CUTLASS_SM87_W8A8
-      {kProviderCutlass, 8, 1, "cutlass-w8a8-m41-n6144-k1536-sm87",
-       kDeviceFeatureCutlassSm87W8A8, true, true, false,
+      {kProviderCutlass, 8, 1, "cutlass-w8a8-m41-n6144-k1536-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8_m41_n6144_k1536, cutlass_w8a8_alignment,
        cutlass_w8a8_resource_requirements, one_configuration,
        prepare_cutlass_w8a8, launch_cutlass_w8a8_m41_n6144_k1536,
        destroy_cutlass},
-      {kProviderCutlass, 6, 1, "cutlass-w8a8-sm87",
-       kDeviceFeatureCutlassSm87W8A8, true, true, false,
+      {kProviderCutlass, 6, 1, "cutlass-w8a8-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8, cutlass_w8a8_alignment,
        cutlass_w8a8_resource_requirements, one_configuration,
        prepare_cutlass_w8a8, launch_cutlass_w8a8, destroy_cutlass},
 #endif
   };
   static const ImplementationRegistry gemm_geglu_entries = {
-      {kProviderCublas, 1, 2, "cublas+custom-epilogue", 0, true, true, true,
+      {kProviderCublas, 1, 2, "cublas+custom-epilogue", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 2, "cublasLt+custom-epilogue", 0, true, false, false,
+      {kProviderCublasLt, 1, 2, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
        cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
-      {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+geglu",
+      {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+geglu", WeightLayout::Canonical,
        kDeviceFeatureNativeFp8, true, false, false,
        supports_native_fp8, cublaslt_alignment,
        cublaslt_native_fp8_resource_requirements, cublaslt_configurations,
        prepare_cublaslt_native_fp8, launch_cublaslt, destroy_cublaslt},
 #ifdef APXINF_GEMM_CUTLASS
-      {kProviderCutlass, 2, 2, "cutlass-dual-geglu",
+      {kProviderCutlass, 2, 2, "cutlass-dual-geglu", WeightLayout::GateUpInterleaved256,
        kDeviceFeatureCutlassSm100, true, true, false,
        supports_cutlass_fp8_geglu, cutlass_geglu_alignment,
        cutlass_geglu_resource_requirements, one_configuration,
        prepare_cutlass_geglu, launch_cutlass_fp8_geglu, destroy_cutlass},
-      {kProviderCutlass, 5, 1, "cublasLt+cutlass-split-geglu",
+      {kProviderCutlass, 5, 1, "cublasLt+cutlass-split-geglu", WeightLayout::Canonical,
        kDeviceFeatureCutlassSm100, true, false, false,
        supports_cutlass_fp8_split_geglu, cublaslt_alignment,
        cublaslt_split_geglu_resource_requirements, split_geglu_configurations,
        prepare_cublaslt_split_geglu, launch_cublaslt_split_geglu, destroy_cublaslt},
-      {kProviderCutlass, 3, 2, "cutlass-bf16-dual-geglu",
+      {kProviderCutlass, 3, 2, "cutlass-bf16-dual-geglu", WeightLayout::GateUpInterleaved256,
        kDeviceFeatureCutlassSm100, true, true, false, supports_cutlass_bf16_geglu,
        cutlass_geglu_alignment, cutlass_geglu_resource_requirements,
        one_configuration, prepare_cutlass_geglu,
        launch_cutlass_bf16_geglu, destroy_cutlass},
 #endif
 #ifdef APXINF_GEMM_CUTLASS_SM89
-      {kProviderCutlass, 4, 1, "cutlass-bf16-sm89-geglu",
+      {kProviderCutlass, 4, 1, "cutlass-bf16-sm89-geglu", WeightLayout::GateUpAdjacent,
        kDeviceFeatureCutlassSm89Bf16Geglu, true, true, false,
        supports_cutlass_bf16_geglu_sm89, cutlass_geglu_alignment,
        cutlass_geglu_resource_requirements, one_configuration,
@@ -558,16 +562,15 @@ const ImplementationRegistry& registry(uint32_t semantic) {
 #endif
   };
   static const ImplementationRegistry gemm_swiglu_entries = {
-      {kProviderCublas, 1, 1, "cublas+rounded-swiglu", 0, true, true, true,
+      {kProviderCublas, 1, 1, "cublas+rounded-swiglu", WeightLayout::Canonical, 0, true, true, true,
        supports_cublas, vendor_alignment, cublas_resource_requirements,
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
-      {kProviderCublasLt, 1, 1, "cublasLt+rounded-swiglu", 0, true, false,
+      {kProviderCublasLt, 1, 1, "cublasLt+rounded-swiglu", WeightLayout::Canonical, 0, true, false,
        false, supports_cublaslt, cublaslt_alignment,
        cublaslt_resource_requirements, cublaslt_configurations,
        prepare_cublaslt, launch_cublaslt, destroy_cublaslt},
 #if defined(APXINF_GEMM_CUTLASS) && defined(APXINF_SEGMENTED_ATTENTION_SM110)
-      {kProviderCutlass, 7, 1, "cutlass-bf16-swiglu-sm110",
-       kDeviceFeatureFixedSm110, true, true, false,
+      {kProviderCutlass, 7, 1, "cutlass-bf16-swiglu-sm110", WeightLayout::GateUpInterleaved256, kDeviceFeatureFixedSm110, true, true, false,
        supports_cutlass_bf16_swiglu_sm110, cutlass_geglu_alignment,
        cutlass_bf16_swiglu_resource_requirements, one_configuration,
        prepare_cutlass_bf16_swiglu, launch_cutlass_bf16_swiglu,
@@ -627,7 +630,7 @@ std::unique_ptr<Execution> prepare(
                   "candidate is incompatible with this device: " +
                       device_reason);
   }
-  if (!implementation.supports(spec)) {
+  if (!implementation.supports(spec) || !supports_weight_layout(implementation, spec)) {
     throw Failure(APXINF_STATUS_UNSUPPORTED, "candidate contract mismatch");
   }
   if (!supports_alignment(implementation, spec)) {
@@ -643,6 +646,9 @@ std::unique_ptr<Execution> prepare(
                   "candidate is not deterministic");
   }
 
+  // Layout 0 is canonical: the provider may pack a private copy while
+  // preparing, or the caller may have committed the layout in place (in which
+  // case prepare is called with that layout and the provider binds B directly).
   const size_t required = implementation.resource_requirements(spec);
   if (required > policy.workspace_limit) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
@@ -663,6 +669,36 @@ std::unique_ptr<Execution> prepare(
     throw Failure(APXINF_STATUS_UNSUPPORTED, "workspace policy exceeded");
   }
   return execution;
+}
+
+std::unique_ptr<CandidateTrial> prepare_trial(
+    const Implementation& implementation, int configuration, const Spec& spec,
+    const apxinf_gemm_policy_t& policy,
+    const apxinf_gemm_bindings_t& bindings, int device) {
+  check_cuda(cudaSetDevice(device));
+  const auto layout = static_cast<uint32_t>(implementation.weight_layout);
+  const bool pack = spec.b_layout == 0 && layout != 4;
+  const size_t bytes = pack
+      ? static_cast<size_t>(spec.k * spec.n) * dtype_bytes(spec.b_dtype) : 0;
+  if (bytes > policy.workspace_limit) {
+    throw Failure(APXINF_STATUS_UNSUPPORTED, "trial packing exceeds workspace limit");
+  }
+  auto trial = std::make_unique<CandidateTrial>(bytes);
+  auto trial_spec = spec;
+  auto trial_bindings = bindings;
+  if (pack) {
+    pack_weight(spec, bindings, trial->weight.pointer, layout);
+    check_cuda(cudaStreamSynchronize(static_cast<cudaStream_t>(bindings.stream)));
+    trial_spec.b_layout = layout;
+    trial_bindings.b = trial->weight.pointer;
+  }
+  auto execution_policy = policy;
+  execution_policy.workspace_limit -= bytes;
+  trial->execution = prepare(implementation, configuration, trial_spec,
+                             execution_policy, trial_bindings, device);
+  trial->implementation = &implementation;
+  trial->configuration = configuration;
+  return trial;
 }
 
 }  // namespace apxinf::gemm
@@ -698,6 +734,7 @@ extern "C" int apxinf_gemm_test_resource_prefilter(int device) {
       1,
       1,
       "resource-prefilter-test",
+      WeightLayout::Canonical,
       0,
       true,
       true,
