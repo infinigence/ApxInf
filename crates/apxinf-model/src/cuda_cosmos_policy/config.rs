@@ -1,3 +1,7 @@
+use super::model::{
+    ACTION_SHAPE, DENOISER_CALLS, IMAGE_SIZE, INITIAL_LATENT_SHAPE, NUM_TASKS, NUM_VIEWS,
+    STATE_DIM, TEXT_TOKENS, TEXT_WIDTH,
+};
 use apxinf_core::{Error, Result};
 use serde::Deserialize;
 use std::path::Path;
@@ -46,14 +50,14 @@ impl CosmosPolicyConfig {
             || self.source_revision != SOURCE_REVISION
             || self.checkpoint_revision != CHECKPOINT_REVISION
             || self.precision != "bf16"
-            || self.num_tasks != 40
-            || self.text_shape != [512, 1024]
-            || self.initial_latent_shape != [1, 16, 9, 28, 28]
-            || self.action_shape != [16, 7]
-            || self.num_views != 2
-            || self.image_size != 224
-            || self.state_dim != 9
-            || self.denoiser_calls != 5
+            || self.num_tasks != NUM_TASKS
+            || self.text_shape != [TEXT_TOKENS, TEXT_WIDTH]
+            || self.initial_latent_shape != INITIAL_LATENT_SHAPE
+            || self.action_shape != ACTION_SHAPE
+            || self.num_views != NUM_VIEWS
+            || self.image_size != IMAGE_SIZE
+            || self.state_dim != STATE_DIM
+            || self.denoiser_calls != DENOISER_CALLS
             || self.scaling != "rectified_flow"
             || self.solver != "2ab"
         {

@@ -212,14 +212,25 @@ void cublaslt_configurations(const Spec&,
   }
 }
 
+// The extended tile/custom-option sweep is a Cosmos Policy joint-latent
+// optimization. It is gated on the plain-BF16 M=1764 token geometry that only
+// that family produces: enumerating 72 more configurations for every family's
+// BF16 GEMM would multiply first-run autotuning time, and re-tuning can land on
+// algorithms whose FP32 accumulation order was never validated for those
+// models. Heuristic ranks 0..7 therefore stay the only candidates elsewhere.
+bool supports_extended_tiles(const Spec& spec) {
+  return spec.a_dtype == APXINF_DTYPE_BF16 &&
+         spec.b_dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         spec.m == 1764;
+}
+
 void cublaslt_plain_configurations(const Spec& spec, std::vector<int>& configs) {
   cublaslt_configurations(spec, configs);
-  if (spec.a_dtype == APXINF_DTYPE_BF16 &&
-      spec.b_dtype == APXINF_DTYPE_BF16 &&
-      spec.output_dtype == APXINF_DTYPE_BF16 &&
-      spec.accumulation_dtype == APXINF_DTYPE_F32 &&
-      spec.quantization == APXINF_GEMM_QUANT_NONE &&
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM) {
+  if (supports_extended_tiles(spec)) {
     // 0..7 retain their original heuristic-rank meaning. New configurations
     // encode 8 + 8 * heuristic_rank + custom_option (options 0..7).
     for (int configuration = 8; configuration < 72; ++configuration) {

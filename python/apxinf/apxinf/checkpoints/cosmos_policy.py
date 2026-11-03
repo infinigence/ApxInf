@@ -93,6 +93,9 @@ def convert(assets: Path, output: Path) -> dict:
         "source_revision": SOURCE_REVISION, "checkpoint_revision": CHECKPOINT_REVISION,
         "source_sha256": ASSETS, "removed_non_inference_entries": sorted(removed),
         "vae_scope": "encoder and mean projection; FP32 to BF16 as in the official loader",
+        # Every artifact produced so far. The policy verifies these before it
+        # builds a policy, so a reordered tasks.json or a swapped tensor file is
+        # rejected instead of silently selecting the wrong cached text.
         "output_sha256": {path.name: sha256(path) for path in sorted(output.iterdir())},
     }
     (output / "conversion.json").write_text(json.dumps(manifest, indent=2) + "\n")

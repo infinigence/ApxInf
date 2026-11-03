@@ -11,7 +11,7 @@ The norm family exposes exactly three caller-owned L3 entries:
 `ops::norm::norm(ctx, NormArgs)`, `ops::fused_add_norm(ctx, FusedAddNormArgs)`,
 and `ops::residual_add(ctx, ResidualAddArgs)`. RMS/Layer statistics, affine
 form, gating, rounding order, numerical compatibility and optional quantization
-are fields rather than additional function names. Norm Spec version 9 carries
+are fields rather than additional function names. Norm Spec version 10 carries
 the common operation/statistic/affine/gate/quantization axes directly; the
 previous nine-value combination semantic is rejected. Grouped adaptive affine and gated residual layouts use explicit group geometry and staged BF16 numerical policy; legacy vector styles retain their existing dispatch. `fused_add_norm` also composes grouped gates with independent grouped adaptive LayerNorm, retaining both BF16 outputs and the staged reduction/rounding order. For 16-byte-aligned 2048-column inputs, four independent warp rows share a CTA; other alignment uses the existing packed or staged fallback. Tail rows and group boundaries retain the same contract. The warp path uses separate rounded BF16 pair multiply/add instructions for gates and affine transforms, preserving every staged BF16 boundary. The planning-compatible
 weighted-adaptive and unit-offset-gate implementations are selected behind the
@@ -27,14 +27,20 @@ pattern. The epilogue indexes it after the same BF16 accumulator rounding and
 returns the same rounded BF16 result. Each prepared execution owns its table;
 its resource requirement includes the table and any kernel workspace. Capture
 retains that execution, and enqueue performs no table allocation or generation.
-The original implementation 11 remains available with zero workspace. Selection
-uses the normal recipe fingerprint and autotuning path.
+The original implementation 11 remains available with zero workspace.
+Selection uses the normal recipe fingerprint and autotuning path; on a recipe
+miss the fallback tries the CUTLASS candidates newest-first so the lookup-table
+epilogue is the untuned default for this semantic.
 
 Plain BF16 cuBLASLt includes an independent 128x224 / 2x1x1 tile family
 with stable configurations 72–79 on CUDA 13. The provider validates algorithm
 capability, descriptor legality, alignment and workspace during preparation.
-All custom options are enumerated for normal tuning; existing heuristic
-configurations retain their identities.
+The extended sweep (configurations 8–79: per-heuristic custom options plus the
+explicit tile) is gated on the M=1764 plain-BF16 geometry that only the Cosmos
+Policy joint-latent family produces. Every other family keeps the eight
+heuristic ranks, so first-run autotuning cost and its previously validated
+accumulation orders are unchanged. Existing heuristic configurations retain
+their identities.
 
 ## Operator Layers: L3 to L0
 
@@ -318,10 +324,19 @@ semantics are unchanged.
 The SM110 BF16 d384 single-head dense attention candidate preserves full FP32
 probabilities and FP32 V accumulation, with separately tunable serial/parallel
 softmax. Its owned cuBLAS resources are prepared before capture; the exact
-recipe key includes the runtime cuBLAS version. See the operator catalog for
+recipe key includes the runtime cuBLAS version. That added key component
+intentionally invalidates every previously written Attention recipe, so the
+first run after upgrading re-selects instead of restoring a choice that was made
+under a different cuBLAS. See the operator catalog for
 geometry, workspace and numerical constraints. Thor Cosmos BF16 five-step
-model and graph/lifetime qualification passes; public latency is 449.90 ms
-pooled median, still above the 200 ms target.
+model and graph/lifetime qualification passes.
+
+The persistent-scheduler FMHA candidate (`cutlass-fmha-persistent-sm100`,
+provider 3 / implementation 2) is pinned to the same 1764-token joint-latent
+geometry. It is a distinct identity from the per-tile CUTLASS candidate, so a
+recipe never crosses between them, and a recipe miss prefers it explicitly
+before falling back to FA2. Without that preference the untuned path would
+select FA2 and silently lose the persistent 2-CTA cluster.
 
 `channel_l2_norm_silu` composes staged BF16 channel-L2 normalization and
 SiLU through the Norm family (additive operation 3, unchanged Spec layout).

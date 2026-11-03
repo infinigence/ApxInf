@@ -1,7 +1,11 @@
+#[cfg(test)]
 use apxinf_core::{DType, Result, Tensor};
 
+#[cfg(test)]
 use crate::ffi::abi::volume as abi;
+#[cfg(test)]
 use crate::ops::gemm::contracts::{invalid, tensor_storage};
+#[cfg(test)]
 use crate::{CudaBuffer, CudaContext};
 
 /// A contiguous THWC input is logically preceded by `history` frames. Padding
@@ -15,6 +19,7 @@ pub struct Unfold3dGeometry {
     pub padding_after: [usize; 3],
 }
 
+#[cfg(test)]
 pub struct Unfold3dArgs<'a> {
     pub input: &'a Tensor,
     pub history: Option<&'a Tensor>,
@@ -25,12 +30,14 @@ pub struct Unfold3dArgs<'a> {
     pub out: &'a mut Tensor,
 }
 
+#[cfg(test)]
 pub(super) struct Normalized {
     pub spec: abi::Spec,
     pub bindings: abi::Bindings,
     pub storage: Vec<CudaBuffer>,
 }
 
+#[cfg(test)]
 fn product(values: &[usize]) -> Result<usize> {
     values
         .iter()
@@ -38,6 +45,7 @@ fn product(values: &[usize]) -> Result<usize> {
         .ok_or_else(|| invalid("Unfold3d element count overflow"))
 }
 
+#[cfg(test)]
 pub(super) fn normalize(ctx: &CudaContext, args: Unfold3dArgs<'_>) -> Result<Normalized> {
     let dims = args.input.shape().dims();
     if dims.len() != 4 || dims.contains(&0) || args.input.dtype() != DType::BF16 {

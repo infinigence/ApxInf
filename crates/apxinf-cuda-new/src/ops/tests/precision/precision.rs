@@ -980,9 +980,9 @@ fn unfold3d_all_candidates_match_torch() {
     let input = bf16_bits_tensor(0, vec![2, 2, 3, 2], video_fixture::UNFOLD_INPUT);
     let history = bf16_bits_tensor(0, vec![1, 2, 3, 2], video_fixture::UNFOLD_HISTORY);
     let mut out = zeros_tensor(0, vec![6, 24], DType::BF16);
-    crate::PreparedUnfold3d::new(
+    crate::ops::volume::PreparedUnfold3d::new(
         &ctx,
-        crate::Unfold3dArgs {
+        crate::ops::volume::Unfold3dArgs {
             input: &input,
             history: Some(&history),
             row_start: 0,

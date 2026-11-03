@@ -44,9 +44,7 @@ pub use phase::PreparedPhase;
 pub use stream::CudaStream;
 
 pub mod ops;
-pub use ops::{
-    Conv3dArgs, Conv3dPolicy, PreparedConv3d, PreparedUnfold3d, Unfold3dArgs, Unfold3dGeometry,
-};
+pub use ops::{Conv3dArgs, Conv3dPolicy, PreparedConv3d, Unfold3dGeometry};
 
 /// Whether the SM110 native NVFP4 GEMM+SwiGLU implementation is available.
 ///

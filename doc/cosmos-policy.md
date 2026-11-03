@@ -12,10 +12,17 @@ Cosmos **Policy**, not Cosmos Reason or a generic video-generation endpoint.
 | Policy checkpoint, statistics, cached T5 | [nvidia/Cosmos-Policy-LIBERO-Predict2-2B](https://huggingface.co/nvidia/Cosmos-Policy-LIBERO-Predict2-2B/tree/cb689ec0e3347c13667d70a78a3447388f5c3bb8), revision `cb689ec0e3347c13667d70a78a3447388f5c3bb8` |
 | Wan2.1 VAE | `tokenizer/tokenizer.pth` from NVIDIA Cosmos-Predict2-2B-Video2World, revision `f50c09f5d8ab133a90cac3f4886a6471e9ba3f18`; the byte-identical official [Wan-AI original](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B/tree/37ec512624d61f7aa208f7ea8140a131f93afc9a) is also usable |
 | Prepared profile | `libero-2b-direct-v1`, batch 1, BF16 model/VAE |
-| Observation | Wrist then primary RGB; deterministic 224×224 preprocessing; 9 proprioceptive values; one of the official 40 cached task texts |
+| Observation | Wrist then primary RGB; deterministic 224×224 preprocessing; 9 proprioceptive values in the order `gripper_qpos[0..1], eef_pos[0..2], eef_quat[0..3]`; one of the official 40 cached task texts |
 | Sampling | Five denoiser calls, rectified-flow preconditioning, FP64 2ab solver state with FP32 denoiser boundaries |
 | Supplied noise | Standard-normal FP32 `[1,16,9,28,28]`; the family applies sigma-max 80 |
 | Public output | FP32 `[16,7]` actions, unnormalized by the Python policy |
+
+The proprioception order is positional, not named: the checkpoint normalizes
+and the denoiser consumes the nine values in this order, so a permuted vector
+still has a valid shape and silently changes the action. The Python policy
+exports it as `PROPRIO_LAYOUT`; an adapter that reads LIBERO's
+`robot0_gripper_qpos`, `robot0_eef_pos` and `robot0_eef_quat` must concatenate
+them in exactly that order.
 
 The converter verifies SHA256 before reading any source asset. Its accepted
 identities are maintained in
@@ -84,8 +91,19 @@ noise shape is independent of the action shape.
 The caller owns simulator image orientation and robot-specific action adapters.
 Unknown task text is rejected; this profile does not run a general T5 encoder.
 Use `autotune=True` to populate device-specific exact recipes on the first real
-request. Fresh processes can use `autotune=False` with the same `tactics`
-directory; untuned fallback attention is substantially slower.
+request, then ship or reuse that `tactics` directory: it is the only thing that
+carries per-shape tuner decisions. Fresh processes can use `autotune=False` with
+the same directory.
+
+Without a recipe the untuned path no longer falls through to the generic
+baseline for the shapes this family owns. The backend prefers, in order, the
+persistent-scheduler FMHA candidate for 1764-token attention, the cuBLASLt
+128x224 2-CTA tile for the `M=1764,N=2048,K=8192` MLP-down projection, the
+vendor heuristic rank 0 for the `1764/2048/2048` square projections, and the
+CUTLASS lookup-table exact-GELU epilogue for the `1764x8192x2048` MLP up. These
+are compile-time-verifiable shortcuts, not measured picks, so a real recipe can
+still win over them; they exist so that a fresh process is close to the accepted
+latency rather than silently several times slower.
 `model_runner=` injection uses the same policy interface. The policy validates
 joint-noise geometry independently of the action shape.
 
@@ -421,6 +439,20 @@ outputs are not bitwise identical to the previous lowering implementation.
 The target below 200ms has not been reached. These are fixed-fixture numerical
 and latency results, not an episode success-rate claim.
 
+Each `ConvWorkspace` keeps its lowered tile buffers alive for the plan's
+lifetime, so the per-convolution workspace limit is effectively multiplied by
+the ~24 VAE convolutions. The family now passes 32 MiB instead of 512 MiB:
+lowering derives the tile height from that budget, and 512 MiB let every stage
+run at its 4096-row cap and retained 543 MiB of scratch, while 32 MiB retains
+about 280 MiB and costs roughly 210 additional tile launches across the whole
+request. Smaller values trade launches faster than they release bytes. The prefix chunk's
+head tail is deliberately *not* skipped even though `condition_map` substitutes
+proprioception at t == 1 and never reads latent 1: removing it changes the
+operator sequence the shared session observes, which shifts the buffer offsets
+the following chunk sees and selects different vectorized kernels. That is
+numerically visible (joint frame 2 relative L2 0.46 versus 0.005), so the
+redundant copy stays as a stability constraint, not dead work.
+
 
 Vectorized Conv3d input/history materialization reduces a subsequent matched
 native median from543.77ms to523.53ms. Actual AutoPolicy median is541.62ms
@@ -570,12 +602,14 @@ fallbacks. This does not change the five-step schedule, precision or observation
 contract. End-to-end performance acceptance remains separate from operator
 selection and compilation.
 
-The Python processor package may accelerate the reference crop resize with
-its optional CPU bilinear upsampling extension. Policy ownership and the
-resized-RGB model input seam remain unchanged. The accelerator preserves
-FP32 horizontal intermediates, separately rounded first taps, fused second
-taps, and final nearest-even uint8 rounding; NumPy remains the fallback.
-JPEG quality, crop geometry, and custom-transform behavior are unchanged.
+The reference crop resize is implemented once, in NumPy
+(`_resize_crop` in the Python policy). It preserves FP32 horizontal
+intermediates, separately rounded first taps, fused second taps, and final
+nearest-even uint8 rounding. A C++ CPU extension with the same algorithm was
+evaluated and removed: it saved about 2.6 ms per request (~0.8% of the
+measured 335.81 ms), only applied when the optional build succeeded, and
+duplicated the NumPy path line for line. JPEG quality, crop geometry, and
+custom-transform behavior are unchanged.
 
 
 The VAE convolution producer can now request

@@ -296,7 +296,8 @@ std::unique_ptr<Execution> fallback(
   constexpr uint32_t kProviderCutlass = 3;
   const auto& implementations = apxinf::gemm::registry(spec.semantic);
   auto prepare_first_supported = [&](bool designated_only,
-                                     uint32_t provider_id)
+                                     uint32_t provider_id,
+                                     int configuration = -1)
       -> std::unique_ptr<Execution> {
     for (const auto& implementation : implementations) {
       if ((designated_only && !implementation.fallback) ||
@@ -309,11 +310,15 @@ std::unique_ptr<Execution> fallback(
         continue;
       }
       std::vector<int> configurations;
-      implementation.enumerate_configs(spec, configurations);
-      for (int configuration : configurations) {
+      if (configuration >= 0) {
+        configurations.push_back(configuration);
+      } else {
+        implementation.enumerate_configs(spec, configurations);
+      }
+      for (int selected : configurations) {
         try {
           return apxinf::gemm::prepare(
-              implementation, configuration, spec, policy, bindings, device);
+              implementation, selected, spec, policy, bindings, device);
         } catch (const Failure&) {
           cudaGetLastError();
         }
@@ -321,6 +326,34 @@ std::unique_ptr<Execution> fallback(
     }
     return nullptr;
   };
+
+  // Untuned rank-0 shortcuts for the Cosmos Policy shapes. A recipe still wins
+  // over these, but without one the plan must land on the same operators the
+  // accepted 335.81 ms measurement used instead of a slower generic baseline.
+  // Each shortcut names one exact candidate/configuration and is skipped when
+  // the provider rejects it for this device or shape.
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+      spec.a_dtype == APXINF_DTYPE_BF16 && spec.b_dtype == APXINF_DTYPE_BF16 &&
+      spec.output_dtype == APXINF_DTYPE_BF16 && spec.quantization == APXINF_GEMM_QUANT_NONE &&
+      spec.b_layout == APXINF_GEMM_LAYOUT_KN &&
+      spec.alpha_is_unit != 0 && spec.output_scale_is_unit != 0) {
+    // MLP down is M=1764,N=2048,K=8192: the measured `nvjet 128x192 2cta`
+    // winner, which the extended sweep enumerates as 72 + custom option 0.
+    if (spec.m == 1764 && spec.n == 2048 && spec.k == 8192) {
+      if (auto execution = prepare_first_supported(false, kProviderCublasLt, 72)) {
+        return execution;
+      }
+    }
+    // The square projections (Q/K/V/output, M=K=N=2048 at M=1764) measured the
+    // `nvjet 256x256` tile family. Heuristic rank 0 is the vendor's own first
+    // choice for this shape, so it needs no explicit tile identifier and stays
+    // valid across CUDA versions.
+    if (spec.m == 1764 && spec.n == 2048 && spec.k == 2048) {
+      if (auto execution = prepare_first_supported(false, kProviderCublasLt, 0)) {
+        return execution;
+      }
+    }
+  }
 
   // Dynamic row/channel quantization needs the provider that consumes its
   // scale tensors in the mainloop/epilogue.  The generic cuBLAS baseline is
@@ -344,6 +377,45 @@ std::unique_ptr<Execution> fallback(
     if (auto execution =
             prepare_first_supported(false, kProviderCutlass)) {
       return execution;
+    }
+  }
+
+  // The staged exact-GELU semantic exists for one consumer (the Cosmos Policy
+  // MLP up projection) and its validated contract fixes M/N/K, BF16 operands,
+  // unit scales and KN layout. Without a recipe, the designated cuBLAS
+  // baseline would drop the fused epilogue and fall back to GEMM + pointwise,
+  // which is correct but not the configuration this semantic was added for.
+  // Prefer the CUTLASS candidates, newest implementation first, so the
+  // lookup-table epilogue (12) wins over the table-free one (11), matching the
+  // accepted 46.4 ms / 179 TFLOPS measurement. Registry order alone would
+  // return 11.
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT) {
+    std::vector<const apxinf::gemm::Implementation*> cutlass;
+    for (const auto& implementation : implementations) {
+      if (!implementation.fallback &&
+          implementation.provider_id == kProviderCutlass) {
+        cutlass.push_back(&implementation);
+      }
+    }
+    while (!cutlass.empty()) {
+      const auto& implementation = *cutlass.back();
+      cutlass.pop_back();
+      if (!apxinf::gemm::supports_device(implementation, device) ||
+          !implementation.supports(spec) ||
+          (policy.graph_safe && !implementation.graph_safe) ||
+          (policy.deterministic && !implementation.deterministic)) {
+        continue;
+      }
+      std::vector<int> configurations;
+      implementation.enumerate_configs(spec, configurations);
+      for (int configuration : configurations) {
+        try {
+          return apxinf::gemm::prepare(implementation, configuration, spec,
+                                       policy, bindings, device);
+        } catch (const Failure&) {
+          cudaGetLastError();
+        }
+      }
     }
   }
 

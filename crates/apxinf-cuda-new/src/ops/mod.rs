@@ -86,9 +86,7 @@ pub use rope::{
     QkvCacheRopeArgs, RopeArgs, RopeSemantic,
 };
 pub use sampling::{argmax, ArgmaxArgs};
-pub use volume::{
-    Conv3dArgs, Conv3dPolicy, PreparedConv3d, PreparedUnfold3d, Unfold3dArgs, Unfold3dGeometry,
-};
+pub use volume::{Conv3dArgs, Conv3dPolicy, PreparedConv3d, Unfold3dGeometry};
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(

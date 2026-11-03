@@ -34,12 +34,6 @@ mod tensor_ops {
             ctx.device_id(),
         )
     }
-    pub fn constant(ctx: &CudaContext, cols: usize, value: f32) -> Result<Tensor> {
-        upload(
-            &Tensor::from_bf16(vec![cols], &vec![half::bf16::from_f32(value); cols])?,
-            ctx.device_id(),
-        )
-    }
     pub fn linear(
         ctx: &CudaContext,
         input: &Tensor,
@@ -57,6 +51,10 @@ mod tensor_ops {
         }
         Ok(())
     }
+    /// DiT MLP up projection. The checkpoint's `mlp.layer1` has no bias, which
+    /// is also the only form the staged exact-GELU GEMM accepts. The biased
+    /// branch is kept as an explicit unfused composition rather than silently
+    /// reading a different rounding order if a future checkpoint adds one.
     pub fn linear_gelu_exact(
         ctx: &CudaContext,
         input: &Tensor,
@@ -122,7 +120,6 @@ mod tensor_ops {
     }
 }
 mod convolution {
-    use crate::cuda_cosmos_policy::backend::ops::GemmPolicy;
     use crate::cuda_cosmos_policy::backend::{
         fused_add_channel_l2_norm_silu, pointwise, residual_add, BiasOrder, Conv3dArgs,
         Conv3dPolicy, CudaBuffer, CudaContext, FusedAddChannelL2NormArgs, PointwiseArgs,
@@ -130,6 +127,16 @@ mod convolution {
     };
     use crate::cuda_cosmos_policy::weights::Conv;
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
+
+    /// Per-convolution scratch budget. Every `ConvWorkspace` keeps its own
+    /// lowered tile buffers alive for the plan's lifetime, so this value is
+    /// effectively multiplied by the ~24 VAE convolutions rather than shared.
+    /// Lowering derives `tile_rows = limit / (2 * (k + n) * 2)`, so the bound
+    /// is what actually decides the tile: 512 MiB kept every level at its
+    /// 4096-row cap and retained 543 MiB of scratch; 32 MiB retains ~280 MiB
+    /// and costs ~210 extra tile launches for the whole request. Smaller
+    /// values trade launches faster than they release bytes.
+    const CONV3D_WORKSPACE_LIMIT: usize = 512 * 1024 * 1024;
 
     pub(in crate::cuda_cosmos_policy::model::blocks::bf16) struct ConvWorkspace {
         convolution: PreparedConv3d,
@@ -194,7 +201,7 @@ mod convolution {
                         padding_after,
                     },
                     out: &mut output,
-                    workspace_limit: 512 * 1024 * 1024,
+                    workspace_limit: CONV3D_WORKSPACE_LIMIT,
                 },
                 policy,
             )?;
@@ -203,12 +210,7 @@ mod convolution {
                 output,
             })
         }
-        pub fn forward(
-            &mut self,
-            ctx: &CudaContext,
-            weights: &Conv,
-            _policy: &GemmPolicy,
-        ) -> Result<()> {
+        pub fn forward(&mut self, ctx: &CudaContext, weights: &Conv) -> Result<()> {
             self.convolution.enqueue()?;
             if let Some(bias) = &weights.linear.bias {
                 // Preserve the convolution-output BF16 rounding before bias.
@@ -317,7 +319,7 @@ mod vae {
     //! Causal Wan2.1 encoder. Cache edges point at preceding chunk activations;
     //! every inference recomputes the singleton chunk before consuming those edges.
     //! No activation state crosses observation boundaries.
-    use crate::cuda_cosmos_policy::backend::ops::{embedding_gather, GemmPolicy};
+    use crate::cuda_cosmos_policy::backend::ops::embedding_gather;
     use crate::cuda_cosmos_policy::backend::{
         attention, channel_l2_norm, channel_l2_norm_silu, pointwise, AttentionArgs,
         AttentionPolicy, ChannelL2NormArgs, Conv3dPolicy, CudaBuffer, CudaContext, PointwiseArgs,
@@ -537,14 +539,9 @@ mod vae {
             })
         }
 
-        fn forward(
-            &mut self,
-            ctx: &CudaContext,
-            w: &VaeResidual,
-            policy: &GemmPolicy,
-        ) -> Result<()> {
+        fn forward(&mut self, ctx: &CudaContext, w: &VaeResidual) -> Result<()> {
             normalize_activate(ctx, &self.input, &w.norm1, &self.norm1.current)?;
-            self.forward_normalized(ctx, w, policy, None)
+            self.forward_normalized(ctx, w, None)
         }
 
         // The producer has already populated norm1. The optional destination
@@ -553,14 +550,13 @@ mod vae {
             &mut self,
             ctx: &CudaContext,
             w: &VaeResidual,
-            policy: &GemmPolicy,
             next_normalization: Option<(&Tensor, &Tensor)>,
         ) -> Result<()> {
             self.conv1
                 .forward_normalized(ctx, &w.conv1, &w.norm2, &self.norm2.current)?;
             let residual = match (&mut self.shortcut, &w.shortcut) {
                 (Some(shortcut), Some(weights)) => {
-                    shortcut.forward(ctx, weights, policy)?;
+                    shortcut.forward(ctx, weights)?;
                     &shortcut.output
                 }
                 _ => &self.input,
@@ -660,7 +656,6 @@ mod vae {
             &mut self,
             ctx: &CudaContext,
             w: &VaeWeights,
-            gemm: &GemmPolicy,
             attention_policy: &AttentionPolicy,
         ) -> Result<()> {
             channel_l2_norm(
@@ -672,7 +667,7 @@ mod vae {
                     eps: 1e-12,
                 },
             )?;
-            self.qkv.forward(ctx, &w.attention_qkv, gemm)?;
+            self.qkv.forward(ctx, &w.attention_qkv)?;
             let rows = self.q.numel() / 384;
             let table = self.qkv.output.reshape(vec![rows * 3, 384])?;
             for (ids, output) in self.ids.iter().zip([&self.q, &self.k, &self.v]) {
@@ -808,7 +803,9 @@ mod vae {
                 [0; 3],
                 [0; 3],
             )?;
-            let rows = mean_projection.output.numel() / 32;
+            // The head statistics run over the head-normalized activation, whose
+            // last dimension is the VAE latent width (384) regardless of frames.
+            let rows = head_norm.current.numel() / 384;
             let indices: Vec<i32> = (0..rows)
                 .flat_map(|r| (0..16).map(move |c| (r * 32 + c) as i32))
                 .collect();
@@ -859,7 +856,6 @@ mod vae {
             &mut self,
             ctx: &CudaContext,
             w: &VaeWeights,
-            gemm: &GemmPolicy,
             attention: &AttentionPolicy,
         ) -> Result<()> {
             self.input_conv.forward_normalized(
@@ -873,10 +869,9 @@ mod vae {
                 first[0].forward_normalized(
                     ctx,
                     &w.down_blocks[level][0],
-                    gemm,
                     Some((&w.down_blocks[level][1].norm1, &second[0].norm1.current)),
                 )?;
-                second[0].forward_normalized(ctx, &w.down_blocks[level][1], gemm, None)?;
+                second[0].forward_normalized(ctx, &w.down_blocks[level][1], None)?;
                 if level < 3 {
                     let down = &mut self.downsample[level];
                     let norm_weight = &w.down_blocks[level + 1][0].norm1;
@@ -885,7 +880,7 @@ mod vae {
                         (&mut down.temporal, &w.downsample[level].temporal)
                     {
                         down.spatial
-                            .forward(ctx, &w.downsample[level].spatial, gemm)?;
+                            .forward(ctx, &w.downsample[level].spatial)?;
                         temporal.forward_normalized(ctx, weights, norm_weight, normalized)?;
                     } else {
                         down.spatial.forward_normalized(
@@ -897,18 +892,17 @@ mod vae {
                     }
                 }
             }
-            self.middle_before.forward(ctx, &w.middle_before, gemm)?;
-            self.attention.forward(ctx, w, gemm, attention)?;
-            self.middle_after.forward(ctx, &w.middle_after, gemm)?;
+            self.middle_before.forward(ctx, &w.middle_before)?;
+            self.attention.forward(ctx, w, attention)?;
+            self.middle_after.forward(ctx, &w.middle_after)?;
             normalize_activate(
                 ctx,
                 &self.middle_after.output,
                 &w.output_norm,
                 &self.head_norm.current,
             )?;
-            self.head_conv.forward(ctx, &w.output, gemm)?;
-            self.mean_projection
-                .forward(ctx, &w.mean_projection, gemm)?;
+            self.head_conv.forward(ctx, &w.output)?;
+            self.mean_projection.forward(ctx, &w.mean_projection)?;
             embedding_gather(
                 ctx,
                 &self
@@ -984,10 +978,6 @@ mod vae {
                 Some(&first),
             )?;
             let session = ExecutionSession::with_capacity(256 * 1024 * 1024, 0)?;
-            let gemm = GemmPolicy {
-                online_tune: false,
-                ..Default::default()
-            };
             let attention = AttentionPolicy {
                 online_tune: false,
                 ..Default::default()
@@ -1005,15 +995,15 @@ mod vae {
                 Ok(bytes)
             };
             session.prepare(|| {
-                first.forward(&ctx, &weights, &gemm, &attention)?;
-                rest.forward(&ctx, &weights, &gemm, &attention)
+                first.forward(&ctx, &weights, &attention)?;
+                rest.forward(&ctx, &weights, &attention)
             })?;
             ctx.synchronize().map_err(Error::Cuda)?;
             let eager = collect(&first, &rest)?;
             let graph = crate::cuda_cosmos_policy::backend::capture(&ctx, || {
                 session.run(|| {
-                    first.forward(&ctx, &weights, &gemm, &attention)?;
-                    rest.forward(&ctx, &weights, &gemm, &attention)
+                    first.forward(&ctx, &weights, &attention)?;
+                    rest.forward(&ctx, &weights, &attention)
                 })
             })?;
             graph.replay()?;
@@ -1369,10 +1359,8 @@ mod dit {
                 &self.time_hidden,
             )?;
             linear(ctx, &self.time_hidden, &w.time_out, &self.time_global, gemm)?;
-            norm(
-                ctx,
-                NormArgs::rms(time, &w.time_norm, &mut self.time_normalized.clone(), 1e-6),
-            )?;
+            let mut time_normalized = self.time_normalized.clone();
+            norm(ctx, NormArgs::rms(time, &w.time_norm, &mut time_normalized, 1e-6))?;
             activate(
                 ctx,
                 &self.time_normalized,
@@ -1888,10 +1876,8 @@ impl Bf16Blocks {
         gemm: &GemmPolicy,
         attention: &AttentionPolicy,
     ) -> Result<()> {
-        self.first
-            .forward(&self.ctx, &self.weights.vae, gemm, attention)?;
-        self.prefix
-            .forward(&self.ctx, &self.weights.vae, gemm, attention)?;
+        self.first.forward(&self.ctx, &self.weights.vae, attention)?;
+        self.prefix.forward(&self.ctx, &self.weights.vae, attention)?;
         for step in &self.steps {
             self.dit.prepare_modulation(
                 &self.ctx,
@@ -1932,7 +1918,7 @@ impl Bf16Blocks {
                 )?;
             }
         }
-        self.rest.forward(ctx, &self.weights.vae, gemm, attention)?;
+        self.rest.forward(ctx, &self.weights.vae, attention)?;
         copy(
             ctx,
             &self.first.output,
@@ -1941,9 +1927,13 @@ impl Bf16Blocks {
         // Latent 4 (frames 13..16) is never read by condition_map, so the encoder
         // stops after frame 12. Size the copy from the produced latents instead of
         // assuming how many latent frames causal downsampling yields.
-        // Latent slots [FRAME, 2*FRAME) hold latent 1 from the constant prefix;
-        // condition_map reads only latents 0, 2 and 3, so the per-request body
-        // writes straight into slots 2 and 3.
+        // Slots [FRAME, 2*FRAME) hold latent 1 from the constant prefix. Even
+        // though `condition_map` substitutes proprioception at t == 1, the
+        // chunk must still publish its latent: skipping the tail changes the
+        // operator sequence the shared session sees, which shifts the buffer
+        // offsets `rest` later observes and selects different vectorized
+        // kernels. That is numerically visible (joint frame 2 relative L2
+        // 0.46 versus 0.005), so the copy stays.
         let prefix_latents = self.prefix.output.numel();
         let rest_latents = self.rest.output.numel();
         assert!(

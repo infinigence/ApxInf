@@ -346,7 +346,7 @@ gemv(ctx, GemvArgs {                                       // M=1 projection
 })
 ```
 
-The common norm family ABI uses Spec version 6. `operation`, `statistic`,
+The common norm family ABI uses Spec version 10. `operation`, `statistic`,
 `affine`, `gate`, `quantization`, and `numerics` are independent fields; dtype
 is inferred from the Tensor bindings. Weight-offset RMSNorm is selected with
 `NormArgs::with_weight_offset()`. `NormNumerics::StableDecode` and

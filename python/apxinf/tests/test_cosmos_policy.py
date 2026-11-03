@@ -227,3 +227,104 @@ def test_crop_resize_matches_torch_tensor_reference():
                   np.stack([x // 4, y // 3, (x * y) % 256], axis=-1).astype(np.uint8)]:
         reference = functional.resize(torch.from_numpy(image).permute(2, 0, 1), [224, 224], antialias=True)
         np.testing.assert_array_equal(_resize_crop(image), reference.permute(1, 2, 0).numpy())
+
+
+def _gradient_observation():
+    """Non-constant RGB so JPEG, resize and crop offsets are all observable.
+
+    A flat fill survives every preprocessing mistake; the reference recipe's
+    quality-95 JPEG, bicubic resize and 6-pixel crop are only checked by data
+    that varies along both axes.
+    """
+    h = w = 256
+    y, x = np.mgrid[0:h, 0:w]
+    image = np.empty((h, w, 3), np.uint8)
+    image[..., 0] = (x * 255 // (w - 1)).astype(np.uint8)
+    image[..., 1] = (y * 255 // (h - 1)).astype(np.uint8)
+    image[..., 2] = (((x // 8 + y // 8) % 2) * 255).astype(np.uint8)
+    noise = np.random.RandomState(7).randint(-20, 21, image.shape)
+    return (image.astype(np.int16) + noise).clip(0, 255).astype(np.uint8)
+
+
+def test_default_preprocessing_preserves_gradient_direction_and_content(stats):
+    import apxinf.policies.impls.cosmos_policy as implementation
+
+    image = _gradient_observation()
+    prepared = implementation._prepare_image(image)
+    assert prepared.shape == (224, 224, 3) and prepared.dtype == np.uint8
+    # A flipped, transposed or offset crop would break at least one of these.
+    assert prepared[0, 0, 0] < prepared[0, -1, 0]
+    assert prepared[0, 0, 1] < prepared[-1, 0, 1]
+    assert len(np.unique(prepared.reshape(-1, 3), axis=0)) > 1000
+
+    runner = Runner()
+    model = policy(runner, stats)
+    model.infer({"wrist_image": image, "primary_image": image,
+                 "robot": {"state": np.ones(9)}, "prompt": "move the cup"})
+    np.testing.assert_array_equal(runner.calls[0][0][0], prepared)
+    np.testing.assert_array_equal(runner.calls[0][0][1], prepared)
+
+
+def test_crop_resize_golden_is_stable_across_pillow_and_numpy_paths():
+    """Pins the exact pixel values the reference recipe produces.
+
+    The Torch reference test above is skipped when torchvision is absent; this
+    one has no dependency and fails on any change to tap weights, rounding or
+    the 212 -> 224 geometry.
+    """
+    h = w = 212
+    y, x = np.mgrid[0:h, 0:w]
+    image = np.stack([(x * 255 // (w - 1)).astype(np.uint8),
+                      (y * 255 // (h - 1)).astype(np.uint8),
+                      (((x // 7 + y // 7) % 2) * 255).astype(np.uint8)], axis=-1)
+    output = _resize_crop(image)
+    assert output.shape == (224, 224, 3) and output.dtype == np.uint8
+    assert output[0, 0].tolist() == [0, 0, 0]
+    assert output[112, 112].tolist() == [128, 128, 0]
+    assert output[223, 223].tolist() == [255, 255, 0]
+    assert output[100, 100:108, 0].tolist() == [114, 115, 117, 117, 118, 119, 121, 122]
+
+
+def test_crop_rejects_geometry_outside_the_reference_recipe():
+    with pytest.raises(ValueError, match=r"\[212,212,3\] uint8"):
+        _resize_crop(np.zeros((224, 224, 3), np.uint8))
+    with pytest.raises(ValueError, match=r"\[212,212,3\] uint8"):
+        _resize_crop(np.zeros((212, 212, 3), np.float32))
+
+
+def test_proprio_layout_documents_reference_order():
+    from apxinf.policies.impls.cosmos_policy import PROPRIO_LAYOUT
+
+    assert len(PROPRIO_LAYOUT) == 9
+    assert PROPRIO_LAYOUT[:2] == ("gripper_qpos[0]", "gripper_qpos[1]")
+    assert PROPRIO_LAYOUT[2:5] == ("eef_pos[0]", "eef_pos[1]", "eef_pos[2]")
+    assert PROPRIO_LAYOUT[5:] == tuple(f"eef_quat[{i}]" for i in range(4))
+
+
+def test_rejects_task_table_that_does_not_match_cached_embeddings(tmp_path, stats):
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"model_type": "cosmos-policy", "profile": "libero-2b-direct-v1", "num_tasks": 40}))
+    (tmp_path / "tasks.json").write_text(json.dumps({"tasks": ["move the cup"]}))
+    (tmp_path / "libero_dataset_statistics.json").write_text(json.dumps(stats))
+    (tmp_path / "conversion.json").write_text(json.dumps({"output_sha256": {}}))
+    runner = Runner()
+    with pytest.raises(ValueError, match="num_tasks"):
+        AutoPolicy.from_pretrained(tmp_path, model_runner=runner, state_key="state")
+
+
+def test_prepared_assets_verify_declared_hashes(tmp_path, stats):
+    import hashlib
+
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"model_type": "cosmos-policy", "profile": "libero-2b-direct-v1", "num_tasks": 1}))
+    (tmp_path / "tasks.json").write_text(json.dumps({"tasks": ["move the cup"]}))
+    (tmp_path / "libero_dataset_statistics.json").write_text(json.dumps(stats))
+    good = hashlib.sha256((tmp_path / "tasks.json").read_bytes()).hexdigest()
+    manifest = {"output_sha256": {"tasks.json": good}}
+    (tmp_path / "conversion.json").write_text(json.dumps(manifest))
+    runner = Runner()
+    AutoPolicy.from_pretrained(tmp_path, model_runner=runner, state_key="state")
+    manifest["output_sha256"]["tasks.json"] = "0" * 64
+    (tmp_path / "conversion.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="SHA256"):
+        AutoPolicy.from_pretrained(tmp_path, model_runner=Runner(), state_key="state")

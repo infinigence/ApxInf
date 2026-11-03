@@ -5,6 +5,7 @@ This policy owns RGB preprocessing, cached-task selection and physical units.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import time
@@ -18,25 +19,20 @@ from ...processors.transforms import lookup_key
 from ..base import StateConditionedModelRunnerProtocol
 from ..registry import register_policy
 
-try:
-    from ...processors._resize_native import bilinear_upsample_rgb as _native_resize
-except ImportError:
-    _native_resize = None
-
 __all__ = ["CosmosPolicy"]
 
 _PROFILE = "libero-2b-direct-v1"
 _LATENT_SHAPE = (1, 16, 9, 28, 28)
 
+# Reference proprioception order. The checkpoint normalizes and the network
+# consumes these nine values positionally, so a misordered vector has a valid
+# shape and silently changes the action.
+PROPRIO_LAYOUT = ("gripper_qpos[0]", "gripper_qpos[1]",
+                  "eef_pos[0]", "eef_pos[1]", "eef_pos[2]",
+                  "eef_quat[0]", "eef_quat[1]", "eef_quat[2]", "eef_quat[3]")
+
 
 def _resize_crop(image: np.ndarray) -> np.ndarray:
-    if _native_resize is not None and image.dtype == np.uint8 and image.shape == (212, 212, 3):
-        data = _native_resize(np.ascontiguousarray(image), 224, 224)
-        return np.frombuffer(data, dtype=np.uint8).reshape(224, 224, 3)
-    return _resize_crop_numpy(image)
-
-
-def _resize_crop_numpy(image: np.ndarray) -> np.ndarray:
     """212 -> 224 bilinear AA in FP32, followed by Torch's uint8 rounding.
 
     Pillow rounds each separable pass to uint8. The upstream tensor transform
@@ -45,6 +41,8 @@ def _resize_crop_numpy(image: np.ndarray) -> np.ndarray:
     float64 intermediate emulates that rounding for these bounded RGB values;
     rounding both products separately changes pixels exactly at half integers.
     """
+    if image.dtype != np.uint8 or image.shape != (212, 212, 3):
+        raise ValueError("Cosmos Policy crop expects [212,212,3] uint8 RGB")
     scale = np.float32(212 / 224)
     center = (np.arange(224, dtype=np.float32) + np.float32(0.5)) * scale
     low = np.clip(np.floor(center - np.float32(0.5)).astype(np.int64), 0, 211)
@@ -75,6 +73,33 @@ def _prepare_image(value: Any) -> np.ndarray:
         # Upstream uses Pillow's default RGB resize (bicubic) at this stage.
         resized = np.asarray(decoded if decoded.size == (224, 224) else decoded.resize((224, 224)))
     return _resize_crop(resized[6:218, 6:218])
+
+
+def _verify_prepared_assets(root: Path, config: Mapping[str, Any], tasks: Sequence[str]) -> None:
+    """Reject task/embedding tables that no longer line up.
+
+    The native text table is indexed by task position, so a reordered or
+    resized ``tasks.json`` selects the wrong cached embedding without any shape
+    error. ``conversion.json`` records the hashes the converter wrote; when it
+    is present it is authoritative for every file it lists.
+    """
+    declared = config.get("num_tasks")
+    if declared is not None and declared != len(tasks):
+        raise ValueError(
+            f"Cosmos Policy tasks.json has {len(tasks)} tasks but config num_tasks is {declared}")
+    manifest_path = root / "conversion.json"
+    if not manifest_path.is_file():
+        return
+    expected = json.loads(manifest_path.read_text()).get("output_sha256") or {}
+    if not isinstance(expected, Mapping):
+        raise ValueError("Cosmos Policy conversion.json output_sha256 must be an object")
+    for name, digest in expected.items():
+        path = root / name
+        if not path.is_file():
+            raise ValueError(f"Cosmos Policy prepared asset is missing: {name}")
+        actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        if actual != digest:
+            raise ValueError(f"Cosmos Policy prepared asset SHA256 mismatch: {name}")
 
 
 def _range(stats: Mapping[str, Any], name: str, width: int) -> tuple[np.ndarray, np.ndarray]:
@@ -161,6 +186,7 @@ class CosmosPolicy:
         if config.get("model_type") != "cosmos-policy" or config.get("profile") != _PROFILE:
             raise ValueError("Cosmos Policy requires prepared libero-2b-direct-v1 assets")
         tasks = json.loads((root / "tasks.json").read_text())["tasks"]
+        _verify_prepared_assets(root, config, tasks)
         stats = json.loads((root / "libero_dataset_statistics.json").read_text())
         if model_runner is None:
             import apxinf_py

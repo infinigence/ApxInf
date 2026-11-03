@@ -2982,7 +2982,8 @@ fn attention_semantics_use_distinct_native_registries() {
 
 #[test]
 fn video_precision_semantics_reject_incompatible_bindings() {
-    use crate::{ChannelL2NormArgs,F64RecurrenceState,PreparedIndexedMean,PreparedUnfold3d,Unfold3dArgs,Unfold3dGeometry};
+    use crate::{ChannelL2NormArgs,F64RecurrenceState,PreparedIndexedMean,Unfold3dGeometry};
+    use crate::ops::volume::{PreparedUnfold3d,Unfold3dArgs};
     let ctx=CudaContext::new(0).unwrap();
     let input=tensor(0,vec![2,3],&[1.;6]);let weight=tensor(0,vec![3],&[1.;3]);
     let mut out=tensor(0,vec![2,3],&[0.;6]);

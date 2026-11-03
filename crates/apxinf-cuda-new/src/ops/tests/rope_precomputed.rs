@@ -1,9 +1,10 @@
+//! In-crate: the unfused rotation step is `pub(crate)`, and the fused entry
+//! point is its only public form.
 use apxinf_core::{DType, Shape, Tensor};
-use apxinf_cuda_new::ops::rope::apply_precomputed;
-use apxinf_cuda_new::{
-    capture, norm, rms_norm_apply_precomputed, CudaBuffer, CudaContext, NormArgs,
-};
 use half::bf16;
+
+use crate::ops::rope::apply_precomputed;
+use crate::{capture, norm, rms_norm_apply_precomputed, CudaBuffer, CudaContext, NormArgs};
 fn tensor(d: &[usize], v: &[f32], dtype: DType, offset: usize) -> Tensor {
     let bytes: Vec<u8> = if dtype == DType::BF16 {
         v.iter()

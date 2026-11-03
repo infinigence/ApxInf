@@ -7,6 +7,10 @@ use apxinf_core::{DType, Device, Error, Result};
 use std::{cell::RefCell, rc::Rc};
 
 use super::prepare::Plan;
+use crate::cuda_cosmos_policy::model::{
+    ACTION_DIM, ACTION_HORIZON, ACTION_SHAPE, IMAGE_SIZE, INITIAL_LATENT_SHAPE, NUM_TASKS,
+    NUM_VIEWS, STATE_DIM,
+};
 pub(super) fn invalid(message: &str) -> Error {
     Error::Other(format!("Cosmos Policy: {message}"))
 }
@@ -25,10 +29,10 @@ pub(super) fn validate_request(request: &VlaRequest<'_>) -> Result<()> {
         VisionObservation::RgbU8 {
             bytes,
             layout: ImageLayout::Nhwc,
-        } if bytes.len() == 2 * 224 * 224 * 3 => {}
+        } if bytes.len() == NUM_VIEWS * IMAGE_SIZE * IMAGE_SIZE * 3 => {}
         _ => return Err(invalid("expected two 224x224 RGB images")),
     }
-    if o.token_ids[0] >= 40 {
+    if o.token_ids[0] >= NUM_TASKS as u32 {
         return Err(invalid("cached-task ID is outside the supported table"));
     }
     let state = o
@@ -37,7 +41,7 @@ pub(super) fn validate_request(request: &VlaRequest<'_>) -> Result<()> {
         .ok_or_else(|| invalid("normalized proprioception is required"))?;
     if state.device() != Device::Cpu
         || state.dtype() != DType::F32
-        || state.shape().dims() != [9]
+        || state.shape().dims() != [STATE_DIM]
         || state.as_f32()?.iter().any(|v| !v.is_finite())
     {
         return Err(invalid("proprioception must be finite host FP32 [9]"));
@@ -55,7 +59,7 @@ pub(super) fn validate_request(request: &VlaRequest<'_>) -> Result<()> {
     if let InitialLatent::Provided(noise) = request.initial_latent {
         if noise.device() != Device::Cpu
             || noise.dtype() != DType::F32
-            || noise.shape().dims() != [1, 16, 9, 28, 28]
+            || noise.shape().dims() != INITIAL_LATENT_SHAPE
             || noise.as_f32()?.iter().any(|v| !v.is_finite())
         {
             return Err(invalid(
@@ -95,17 +99,17 @@ impl VlaRuntime for ModelRunner {
     }
     fn contract(&self) -> VlaContract {
         VlaContract {
-            action_shape: [16, 7],
-            patch_shape: [224 * 224 * 2, 3],
+            action_shape: ACTION_SHAPE,
+            patch_shape: [IMAGE_SIZE * IMAGE_SIZE * NUM_VIEWS, 3],
             max_token_len: 1,
-            num_views: 2,
-            image_size: 224,
+            num_views: NUM_VIEWS,
+            image_size: IMAGE_SIZE,
             patch_size: 1,
             accepts_rgb_u8: true,
         }
     }
     fn initial_latent_shape(&self) -> Vec<usize> {
-        vec![1, 16, 9, 28, 28]
+        INITIAL_LATENT_SHAPE.to_vec()
     }
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action> {
         validate_request(request)?;
@@ -160,7 +164,7 @@ impl VlaRuntime for ModelRunner {
     }
     fn infer_host_f32(&self, request: &VlaRequest<'_>) -> Result<Vec<f32>> {
         let action = self.infer(request)?;
-        let mut bytes = vec![0; 16 * 7 * 4];
+        let mut bytes = vec![0; ACTION_HORIZON * ACTION_DIM * 4];
         CudaBuffer::from_tensor(action.tensor())
             .map_err(Error::Cuda)?
             .copy_to_host(&mut bytes)

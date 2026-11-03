@@ -322,20 +322,30 @@ retain the input, index map, output and execution; enqueue has no allocation,
 host transfer or tuning. Noncontiguous selection and graph lifetime are tested
 in `tests/mixed_precision_ops.rs`.
 
-## Precomputed standalone rotary embedding
+## Precomputed RMSNorm + rotary embedding
 
-`ops::rope::apply_precomputed(ctx, input, table, output)` extends standalone
-half-split rotation to caller-provided FP32 cosine/sine coefficients. Input and
-output are matching contiguous BF16 `[tokens, heads, head_dim]`; table is FP32
-`[tokens, 2, head_dim/2]`, cosine first and sine second, broadcast over heads.
-Head dimension is positive, even and at most 2048. Each FP32 product and then
-the sum round separately, followed by one BF16 conversion. Coefficients are
-used as supplied, without device trigonometry or FMA contraction. Exact
-input/output aliasing is allowed; partial overlap and table/output overlap are
-rejected. The direct asynchronous enqueue is Graph-safe; the caller retains
-its tensors for graph lifetime. Reference and in-place Graph coverage lives in
-`tests/rope_precomputed.rs`. Existing position-based and packed-QKV contracts
-remain unchanged.
+`ops::rope::rms_norm_apply_precomputed(ctx, input, weight, table, epsilon, output)`
+is the only public precomputed-rotation entry point. It fuses per-head RMSNorm
+with half-split rotation over caller-provided FP32 cosine/sine coefficients.
+Input and output are matching contiguous BF16 `[tokens, heads, head_dim]`;
+weight is BF16 `[head_dim]`; table is FP32 `[tokens, 2, head_dim/2]`, cosine
+first and sine second, broadcast over heads. Head dimension is positive, even
+and at most 2048. The normalized value rounds to BF16 before each FP32 product,
+each product and then the sum round separately, and the result converts to BF16
+once. Coefficients are used as supplied, without device trigonometry or FMA
+contraction. Exact input/output aliasing is allowed; partial overlap and
+weight/table output overlap are rejected. The launcher selects a packed
+eight-element path for aligned 128-wide rows and an explicit staged
+Norm-then-rotation baseline otherwise; neither tunes, persists a recipe, nor
+allocates during enqueue. The caller retains its tensors for graph lifetime.
+Reference and in-place Graph coverage lives in `tests/rms_precomputed_rope.rs`.
+Existing position-based, packed-QKV and vision rotation-table contracts remain
+unchanged.
+
+The bare rotation step is deliberately **not** exported: it is an internal
+composition of this operator, and a second public entry point would let callers
+compose the rounding order by hand. Tests that need the unfused form build it
+from public `norm` plus a CPU reference.
 
 ### Grouped adaptive LayerNorm
 

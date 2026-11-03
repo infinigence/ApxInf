@@ -1,9 +1,13 @@
-//! Public volume lowering, including causal history and captured ownership.
+//! Volume lowering, including causal history and captured ownership.
+//!
+//! This lives in-crate because `PreparedUnfold3d` is not exported: production
+//! reaches the same lowering only through `Conv3d`, and the public Rust wrapper
+//! had no consumer outside these tests.
 use apxinf_core::{DType, Shape, Tensor};
-use apxinf_cuda_new::{
-    capture, CudaBuffer, CudaContext, PreparedUnfold3d, Unfold3dArgs, Unfold3dGeometry,
-};
 use half::bf16;
+
+use crate::{capture, CudaBuffer, CudaContext, Unfold3dGeometry};
+use crate::ops::volume::{PreparedUnfold3d, Unfold3dArgs};
 
 fn upload(shape: Vec<usize>, words: &[u16]) -> Tensor {
     let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();

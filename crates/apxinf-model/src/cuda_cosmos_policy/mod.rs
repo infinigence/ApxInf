@@ -3,7 +3,7 @@
 mod backend;
 mod config;
 #[cfg(feature = "cuda")]
-mod model;
+pub(super) mod model;
 #[cfg(feature = "cuda")]
 mod weights;
 

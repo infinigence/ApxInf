@@ -361,7 +361,12 @@ pub fn apply_vision_2d(
 /// FP32 [tokens, 2, head_dim/2] cosine/sine coefficients, broadcast over heads.
 /// Each product and then the sum round separately to FP32, followed by BF16.
 /// Exact input/output aliasing is supported; partial overlap is rejected.
-pub fn apply_precomputed(
+///
+/// Crate-private: `rms_norm_apply_precomputed` is the only public entry point
+/// for this composition. The bare rotation stays available to the operator's
+/// own contract tests, which need the unfused step to prove the fused kernel
+/// reproduces it.
+pub(crate) fn apply_precomputed(
     ctx: &CudaContext,
     input: &Tensor,
     table: &Tensor,

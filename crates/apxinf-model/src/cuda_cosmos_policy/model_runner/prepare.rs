@@ -1,9 +1,10 @@
-//! Request binding and fixed-profile lifetime for the existing VLA interface.
+//! Prepared execution: stable inputs, graph lifetime and independent action
+//! publication. Spec/request validation lives in `runner.rs`.
 use crate::cuda_cosmos_policy::backend::ops::GemmPolicy;
 use crate::cuda_cosmos_policy::backend::{
     AttentionPolicy, CapturedGraph, CudaBuffer, CudaContext, ExecutionSession,
 };
-use crate::cuda_cosmos_policy::model::{CosmosPolicyModel, Inputs};
+use crate::cuda_cosmos_policy::model::{CosmosPolicyModel, Inputs, ACTION_SHAPE};
 use crate::vla::*;
 use apxinf_core::{DType, Error, NormalGenerator, Result, Tensor};
 use std::{cell::RefCell, rc::Rc};
@@ -109,7 +110,13 @@ impl PreparedInference for Plan {
         state.compute()?;
         // Publish independent device storage. Retained actions survive replay,
         // plan eviction and runner destruction without exposing scratch buffers.
-        let buffer = CudaBuffer::alloc(16 * 7 * 4, state.ctx.device_id()).map_err(Error::Cuda)?;
+        // That ownership rule is what forces a per-request allocation: a pooled
+        // buffer cannot be reclaimed while an `Action` still holds it, so reuse
+        // would either alias a live result or reintroduce the scratch exposure
+        // this copy exists to prevent. 448 bytes from the driver's cache.
+        let buffer =
+            CudaBuffer::alloc(ACTION_SHAPE.iter().product::<usize>() * 4, state.ctx.device_id())
+                .map_err(Error::Cuda)?;
         let output = buffer
             .as_tensor(state.model.actions().shape().clone(), DType::F32)
             .map_err(Error::Cuda)?;

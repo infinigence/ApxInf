@@ -24,7 +24,9 @@ policy = ["apxinf-py>=0.1.0"]
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
 serving = ["msgpack>=1.0.5", "websockets>=14.0"]
 # SentencePiece remains a test-only reference for native differential checks.
-test = ["pytest>=7", "sentencepiece>=0.1.99"]
+# torch/torchvision back the reference-comparison tests for the Cosmos Policy
+# image recipe and the pi0-family fixtures; those tests skip when absent.
+test = ["pytest>=7", "sentencepiece>=0.1.99", "torch>=2.1", "torchvision>=0.16"]
 
 [tool.setuptools.packages.find]
 where = ["."]
