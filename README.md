@@ -240,6 +240,12 @@ Two views, 224x224 NHWC `uint8`, batch 1.
 | Jetson AGX Orin | BF16 | 117.3 ms | 25.34 ms |
 | RTX 4090 | BF16 | 20.9 ms | 5.24 ms |
 
+[Benchmark and task evaluation commands](doc/pi0-fast-benchmark.md).
+For a benchmark without recorded inputs, use `--layer l1 --mode fixed` with the
+survey-derived 12/16/20/28/32/40-token grid described there. It measures controlled
+decode lengths; the historical table above uses the natural-stop measurement
+and has not been replaced by results from this new mode.
+
 ### GR00T N1.7
 
 One or two views, batch 1. Best recorded P50.
@@ -594,9 +600,7 @@ entry point — the raw tokens — and L2 turns them into actions:
 from apxinf import AutoPolicy
 
 policy = AutoPolicy.from_pretrained(
-    "<path-to-model>",
-    precision="bf16",
-    state_key="observation/state",
+    "<path-to-model>", model_variant="bf16", state_key="observation/state",
 )
 
 # L1: raw FAST action tokens, uint32 [max_action_tokens]
@@ -658,15 +662,26 @@ python scripts/bench_pi05.py --model-dir <path-to-model> --model-variant bf16 --
   select the synthetic workload.
 - `--calibration` is FP8-only and synthetic-only; a checkpoint reads
   `calibration.json` from its own directory.
-- `--action-horizon` also applies to a checkpoint — the horizon is a sequence
+- `--action-horizon` also applies to a PI0.5 checkpoint — the horizon is a sequence
   length, not a weight dimension — which is what makes a real checkpoint
   comparable to a synthetic run.
 - `--warmup` / `--samples` set the sampling protocol (default 10 and 30);
   `--out` writes the report as JSON.
 
-Any registered model type works: `AutoPolicy` dispatches on the checkpoint's
-`config.json`, so the same command benchmarks the next model without a flag
-change.
+The command above supports PI0.5 and WallOSS through `AutoPolicy` checkpoint
+selection. `l1` measures `ModelRunner.infer_rgb`; `l2` measures `policy.infer`,
+including preprocessing and postprocessing. These are benchmark labels, not
+separate inference APIs. Both policies expose `prepare_rgb_inputs` so the
+benchmark uses their normal preprocessing, including WallOSS grids and masks.
+The legacy `l0` patch diagnostic remains PI0.5-only.
+
+Use `--model-variant bf16` for either model, or `--model-variant fp8_dynamic`
+for WallOSS dynamic FP8. All built-in policy loaders use `model_variant`;
+unsupported variants fail explicitly. Its specialized shape/stage benchmark is
+`scripts/bench_walloss.py --model-dir <path> --model-variant bf16`.
+Other families' maintained benchmark commands are linked in their model docs;
+registration alone does not guarantee compatibility with this script's
+synthetic observation or measurement layers.
 
 For one-step evaluation, please refer to `doc/run_warmstart_with_onestep.md`
 

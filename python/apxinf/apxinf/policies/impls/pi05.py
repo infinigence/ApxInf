@@ -774,6 +774,11 @@ class Pi05Policy:
                 raise ValueError("noise must contain only finite values")
         return data[RGB], data[TOKEN_IDS], selected_noise, data
 
+    def prepare_rgb_inputs(self, observation: Mapping[str, Any], *, noise=None) -> dict:
+        """Prepare the public RGB call using the normal policy preprocessing path."""
+        rgb, token_ids, selected_noise, _ = self._model_inputs(observation, noise)
+        return dict(rgb_u8=rgb, layout="nhwc", token_ids=token_ids, noise=selected_noise)
+
     def calibrate_observation(
         self, observation: Mapping[str, Any], *, noise: np.ndarray
     ) -> Mapping[str, float]:
