@@ -30,7 +30,7 @@ according to the following quantization contract:
 - `Fp8`: A/B are both E4M3; FP32 `row_scales=[M]` and `channel_scales=[N]` dequantize rows of A and columns of B, respectively.
 - `W8A8`: A/B are both INT8 and use FP32 row/channel scales with the same shapes; output is BF16, `K <= 131071`, and the mode applies only to `gemm` and `gemm_bias`.
 
-`RepackedWeight::upload_w8a8(ctx, host_weight)` accepts canonical CPU INT8
+`RepackedWeight::upload_row_channel(ctx, host_weight)` accepts canonical CPU INT8
 `[K,N]` storage and returns the device tensor together with its shared layout
 state. It uploads fixed NK bytes when the compiled device backend supports the
 row/channel W8A8 contract, otherwise canonical bytes. This choice is independent

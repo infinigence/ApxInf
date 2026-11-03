@@ -116,7 +116,7 @@ wrapper merely to reproduce the names in this table.
 
 PI0.5 device linear weights retain cuda-new `RepackedWeight` layout state next
 to their allocation. INT8 row/channel W8A8 loading uses
-`RepackedWeight::upload_w8a8`: the backend checks compiled device capabilities and
+`RepackedWeight::upload_row_channel`: the backend checks compiled device capabilities and
 K/N geometry, converts canonical CPU bytes to fixed NK layout when supported,
 and uploads only that representation. Otherwise it uploads canonical bytes.
 The layout is committed before any execution exists and does not depend on M;

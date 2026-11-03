@@ -49,7 +49,7 @@ mod linear {
                     .collect::<Vec<_>>(),
             )?;
             let (quantized, scales, input_dim, output_dim) = quantize_output_channels(&packed)?;
-            let (weight, layout) = ops::RepackedWeight::upload_w8a8(
+            let (weight, layout) = ops::RepackedWeight::upload_row_channel(
                 backend,
                 &Tensor::from_i8(vec![input_dim, output_dim], &quantized)?,
             )?;

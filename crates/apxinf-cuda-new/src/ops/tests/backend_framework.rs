@@ -1853,7 +1853,7 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
             .map(|i| ((i / n + 3 * (i % n)) % 13) as i8 - 6)
             .collect::<Vec<_>>();
         let host = Tensor::from_i8(vec![k, n], &source).unwrap();
-        let (b, layout) = RepackedWeight::upload_w8a8(&ctx, &host).unwrap();
+        let (b, layout) = RepackedWeight::upload_row_channel(&ctx, &host).unwrap();
         let physical_layout = layout.state.lock().unwrap().layout;
         assert_eq!(
             physical_layout,

@@ -157,7 +157,7 @@ impl RepackedWeight {
     /// The compiled device backend fixes NK or canonical layout at load time,
     /// independently of activation rows. Only the final representation is
     /// uploaded; all consumers must attach the returned shared layout state.
-    pub fn upload_w8a8(ctx: &crate::CudaContext, weight: &Tensor) -> Result<(Tensor, Self)> {
+    pub fn upload_row_channel(ctx: &crate::CudaContext, weight: &Tensor) -> Result<(Tensor, Self)> {
         use crate::ffi::abi::{gemm as abi, status};
         use apxinf_core::{DType, Device};
 
