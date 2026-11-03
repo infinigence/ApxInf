@@ -212,6 +212,7 @@ impl BiasOrder {
 /// `norm_style` is `[2 * cols]` (scale then shift) and `gate_style` is
 /// `[3 * cols]` whose third segment is the gate; they are not interchangeable.
 pub(crate) struct RawArgs<'a> {
+    pub(crate) intermediate_dtype: DType,
     pub(crate) operation: Operation,
     pub(crate) statistic: Statistic,
     pub(crate) affine: AffineKind,
@@ -343,7 +344,18 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
             "StablePlanning numerics currently requires weight-offset affine",
         ));
     }
-    if dtype == DType::F32
+    if args.intermediate_dtype != DType::F32
+        && !(operation == Operation::Norm && statistic == Statistic::Rms
+            && affine == AffineKind::Weight && gate == GateKind::None
+            && !args.weight_offset && args.quantization == Quantization::None
+            && args.numerics == NormNumerics::Flexible
+            && args.intermediate_dtype == dtype && matches!(dtype, DType::F16 | DType::BF16)) {
+        return Err(invalid("unsupported RMS intermediate dtype contract"));
+    }
+    let plain_f32_layer = operation == Operation::Norm && statistic == Statistic::Layer
+        && affine == AffineKind::Weight && gate == GateKind::None && !args.weight_offset
+        && args.quantization == Quantization::None && args.numerics == NormNumerics::Flexible;
+    if dtype == DType::F32 && !plain_f32_layer
         && !(operation == Operation::Norm
             && statistic == Statistic::Rms
             && affine == AffineKind::Weight
@@ -663,6 +675,31 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         "normalized",
         &mut storage,
     )?;
+    if plain_f32_layer {
+        let output_start = normalized as usize;
+        let output_end = output_start
+            .checked_add(
+                count
+                    .checked_mul(4)
+                    .ok_or_else(|| invalid("LayerNorm size overflow"))?,
+            )
+            .ok_or_else(|| invalid("LayerNorm address overflow"))?;
+        for (pointer, elements) in [(input_pointer, count), (weight, cols), (norm_bias, cols)] {
+            let start = pointer as usize;
+            let end = start
+                .checked_add(
+                    elements
+                        .checked_mul(4)
+                        .ok_or_else(|| invalid("LayerNorm size overflow"))?,
+                )
+                .ok_or_else(|| invalid("LayerNorm address overflow"))?;
+            if start < output_end && output_start < end {
+                return Err(invalid(
+                    "F32 LayerNorm output overlaps an input, weight or bias",
+                ));
+            }
+        }
+    }
     let (quantized, quantized_alignment) = bind_output(
         args.quantized_output,
         args.quantization != Quantization::None,
@@ -694,6 +731,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let dtype_value = dtype_code(dtype)?;
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
+        intermediate_dtype: dtype_code(args.intermediate_dtype)?,
         operation: operation.code(),
         statistic: statistic.code(),
         affine: affine.code(),

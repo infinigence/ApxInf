@@ -218,6 +218,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Re
     }
 
     let dtype = args.query.dtype();
+    if dtype == DType::F32 {
+        return Err(invalid("F32 is supported only for dense Attention"));
+    }
     let q = tensor_storage(ctx, args.query, dtype, q_shape)?;
     let k = tensor_storage(ctx, args.key_cache, dtype, k_shape)?;
     let v = tensor_storage(ctx, args.value_cache, dtype, v_shape)?;
@@ -263,6 +266,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Re
         std::ptr::null()
     };
     let bindings = abi::Bindings {
+        bias: std::ptr::null(),
         query: q.ptr(),
         key: k.ptr(),
         value: v.ptr(),
@@ -279,6 +283,10 @@ pub(crate) fn normalize(ctx: &CudaContext, args: KvCacheAttentionArgs<'_>) -> Re
     }
     Ok(Normalized {
         spec: abi::Spec {
+            bias_alignment: 0,
+            bias_broadcast_batch: 0,
+            input_precision: 0,
+            reserved: 0,
             version: abi::SPEC_VERSION,
             semantic: Semantic::KvCache.abi_value(),
             dtype: dtype_code(dtype)?,

@@ -1,0 +1,495 @@
+# Fast-WAM action inference
+
+> Historical precision/performance results below describe their original snapshots.
+> Default shared-operator arithmetic is unchanged. Fast-WAM text encoding explicitly
+> requests BF16 intermediate materialization through the existing RMSNorm and
+> additive-attention L3 arguments; their reductions and GEMMs still accumulate in F32.
+> GELU, Euler, quantization and H2D retain baseline behavior. Intermediate reference
+> equality is diagnostic, not proof of downstream task quality.
+
+
+The `fastwam` family implements the action-only profile of
+[`lerobot/fastwam_libero_uncond_2cam224`](https://huggingface.co/lerobot/fastwam_libero_uncond_2cam224)
+through the existing `VlaRuntime` and Python `AutoPolicy` interfaces. It does not
+extend the shared observation, action or prepared-inference contracts.
+
+## Supported profile
+
+| Property | Value |
+| --- | --- |
+| Checkpoint revision | `53983e1249b4eb4d89ab42b40b8678a882d331ad` |
+| Reference implementation | LeRobot `146d8474932c8b566717eb2738ba459337ab71c4` |
+| Backend / variant | CUDA through `apxinf-cuda-new`; `bf16` |
+| Images | Two already resized 224 × 224 RGB uint8 views, NHWC or NCHW |
+| Text | UMT5 tokenizer, right-padded to 128 positions |
+| State / actions | 8 normalized state values; 32 × 7 normalized native actions |
+| Schedule | Ten shifted flow steps; supplied noise or keyed native RNG |
+| Scope | One observed frame; action prediction without generated video |
+
+The frozen Wan VAE, UMT5 encoder, video conditioning and all action steps execute
+natively on the GPU. Wan attention uses F32 arithmetic; UMT5 uses BF16 tensors
+with explicit BF16 intermediate boundaries in RMSNorm and additive attention,
+and baseline GELU arithmetic. See the qualification notes below for the independent
+text-output and downstream acceptance results.
+DiT residual state and LayerNorm use F32 to
+avoid repeated BF16 rounding across blocks. The small action input and output
+projections preserve F32 state through Euler integration and the next step. Branch
+projections, gates and schedule deltas retain BF16 rounding. The variant name
+describes checkpoint weights, not the dtype of every intermediate; both small
+action projections' BF16 checkpoint values are promoted exactly to F32 when loading.
+
+Other image resolutions, batch sizes, context lengths, action schedules, model
+variants and video generation are rejected. Image resizing belongs before the
+policy's declared image boundary; this implementation requires the caller to
+supply the reference-preprocessed 224 × 224 images.
+
+## Assets and policy
+
+The model directory must contain the original `config.json`, safetensors and
+LeRobot pre/postprocessor files, including their normalization state files.
+Supply the frozen encoders and tokenizer through the existing `assets` mapping:
+
+```python
+from apxinf import AutoPolicy
+
+policy = AutoPolicy.from_pretrained(
+    "/models/fastwam_libero_uncond_2cam224",
+    device="cuda:0",
+    model_variant="bf16",
+    assets={
+        "text_encoder": "/models/wan22/text_encoder",
+        "vae": "/models/wan22/vae",
+        "tokenizer": "/models/umt5-xxl",
+    },
+)
+result = policy.infer({
+    "observation.images.image": camera_rgb_u8,      # [224,224,3]
+    "observation.images.image2": wrist_rgb_u8,      # [224,224,3]
+    "observation.state": proprioception_f32,        # [8]
+    "task": "pick up the red block and place it in the bowl",
+})
+actions = result["actions"]                         # [32,7], task convention
+```
+
+Alternatively place the assets in `text_encoder/`, `vae/` and `tokenizer/` under
+the checkpoint directory. Loading does not download assets. The encoders are
+from `Wan-AI/Wan2.2-TI2V-5B-Diffusers` revision
+`b8fff7315c768468a5333511427288870b2e9635`; the tokenizer is `google/umt5-xxl`
+revision `66cb9e7e85526fe440a945569e42c72fb6cbc0ad`.
+
+The policy orders camera keys, applies the checkpoint task template, tokenizes,
+normalizes state, unnormalizes actions and applies the checkpoint's gripper
+convention. The Rust boundary receives normalized state and returns normalized
+actions. Direct native callers must provide the same preprocessing. Optional
+`noise=` is a finite float32 array of shape `[32,7]` for deterministic comparisons.
+
+## Execution ownership
+
+`config.rs` and `load.rs` validate the supported architecture and resolve assets.
+Absent `num_inference_steps` defaults to 10; any explicit value must be 10.
+Absent/null `sigma_shift` uses the scheduler shift of 5; an explicit override
+must equal 5. Other values are rejected before device weights are loaded.
+`weights/` maps and packs checkpoint tensors, including time-projection weights
+and fixed position tables. The loader materializes the typed `Bf16Weights` device
+tree before model construction. `model/mod.rs` owns model construction, modality connections and the
+flow schedule. `model/blocks/bf16.rs` owns UMT5, VAE and DiT composition,
+projection/bias rounding and fixed time-modulation preparation. Its BF16
+implementation includes the declared F32 residual and action-projection paths.
+Temporary time-projection weights are released after modulation preparation.
+`backend.rs` only imports safe CUDA resources/operators and adapts host uploads;
+weights never call model forward methods.
+The [family boundary guard](../scripts/check_fastwam_module_boundaries.py)
+checks these owners recursively; it does not replace numerical validation.
+`model_runner/runner.rs` owns request validation and the plan cache;
+`model_runner/prepare.rs` owns input/RNG binding, workspace and CUDA Graph preparation. There are no imports from another model family.
+
+Raw RGB bytes are uploaded unchanged; camera concatenation, layout conversion
+and pixel normalization execute on the device. Encoded conditioning and its
+cross-attention projections are computed once per request and reused across
+all ten action steps. `Model` reports a conservative workspace requirement for
+the fixed profile, including the monotonic graph arena's intermediate tensors.
+Native operator executions own their provider scratch separately.
+
+The native runner supports `Eager`, `RequireGraph` and `PreferGraph` preparation.
+A preferred-graph fallback is exposed through `PreparationStatus`. The default
+inference path requires the complete model graph. Prepared outputs use stable
+storage and may be overwritten by the next run; copy an output before reusing
+the same prepared object when a snapshot is needed.
+
+## Validation
+
+The opt-in checkpoint tests in `cuda_fastwam/model/blocks/bf16.rs` and
+`cuda_fastwam/model_runner/runner.rs` require local
+assets and independent reference captures. They cover encoder boundaries,
+canonical action outputs, complete graph parity, changed image/text/state/noise,
+keyed RNG, invalid specifications and output ownership. The CUDA backend tests
+cover additive/F32 attention, rounded arithmetic, pairwise rotary embeddings,
+image transforms, alias/alignment validation and capture lifetimes.
+
+Qualification on NVIDIA Thor (SM110, CUDA 13.2) uses the pinned checkpoint and
+LeRobot source above, with PyTorch 2.11.0, Transformers 5.5.4 and Diffusers 0.39.0.
+Twelve deterministic synthetic cases vary both cameras, prompt, state and noise.
+For each case, both relative L2 and maximum absolute error against independent
+official FP32 outputs must be no worse than official BF16 error, with a fixed
+`1e-6` comparison allowance. Every passing result below also meets the gate
+without that allowance.
+
+| Path | Cases passed | Relative L2 range | Maximum absolute error range |
+| --- | ---: | ---: | ---: |
+| Native graph and default AutoPolicy | 12/12 | 0.002958–0.007074 | 0.003039–0.009395 |
+| AutoPolicy with cold tuning | 12/12 | 0.002867–0.007082 | 0.003094–0.008858 |
+| AutoPolicy with persisted recipes in a new process | 12/12 | 0.002867–0.007082 | 0.003094–0.008858 |
+
+Canonical eager and whole-model graph outputs are exact. Input updates, keyed RNG,
+invalid-request rejection and retained output/resource lifetimes pass. The new
+process reuses all 45 recipe files without changing their bytes or timestamps;
+canonical actions are exact across cold/warm processes and all twelve error
+measurements agree. UMT5 final output matches the reference exactly; the VAE
+boundary passes its independent precision check. The backend regression suite
+passes 111 library tests and eight public integration tests; two unrelated
+opt-in backend tests remain ignored.
+
+The native UMT5 tokenizer matches 594 independent official token sequences,
+including Unicode whitespace and special-token boundaries. To run its maintained
+asset-backed regression, set `APXINF_FASTWAM_TOKENIZER` to the pinned
+`tokenizer.json` and run `python -m pytest python/apxinf/tests/test_fastwam_policy.py`.
+The policy restores the reference T5 pre-tokenization configuration in memory;
+it does not require Transformers or Python tokenizers at inference time.
+
+These checks establish numerical and runtime behavior for the declared profile.
+Follow the [porting workflow](porting-workflow.md) when qualifying another profile
+or device.
+
+### LIBERO-Spatial rollout pilot
+
+A separate closed-loop pilot on the same Thor ran all ten LIBERO-Spatial tasks,
+using bundled initial state 0 for each task and environment seed 0:
+
+| Runtime | Successful episodes | Pilot success rate |
+| --- | ---: | ---: |
+| Official LeRobot BF16 | 10/10 | 100% |
+| Native default AutoPolicy | 10/10 | 100% |
+
+Both paths used the same checkpoint, fixed action-noise seed 42, ten inference
+steps, and the pinned LeRobot observation processor. The simulator rendered both
+cameras directly at 224 × 224, with relative control at 20 Hz, hard resets, ten
+settling steps, and a 300-action limit. Each prediction produced 32 actions; the
+first ten were executed before replanning. MuJoCo 2.3.7 and robosuite 1.4.1 ran
+in a separate simulator process. Initial-state files and starting observation
+hashes matched exactly across both runs. Success was the simulator's
+`check_success()` result. Native completion took 75–125 steps; official BF16 took
+76–144 steps. The native extension was unchanged from numerical qualification.
+
+This is a ten-episode pilot with one fixed initial state per task, not a full
+LIBERO benchmark or evidence of statistical equivalence. Object, Goal and Long
+suites, additional initial states, and real-robot performance remain untested.
+It does not reproduce published FP32/256-pixel multi-suite benchmark conditions.
+
+## Measured performance and remaining work
+
+On the same Thor, twenty alternating official/native pairs measured host RGB,
+state and task inputs through host action outputs. Both models remained loaded,
+with three warmup pairs after first-call checks. Every official output matched
+its frozen BF16 oracle exactly; every native output repeated exactly and passed
+the FP32 error gate. The native extension used the CUDA build with Rust
+model/core/loader packages at optimization level 2.
+
+| Runtime | Median | p95 |
+| --- | ---: | ---: |
+| Official BF16 | 1091.60 ms | 1152.14 ms |
+| Native default AutoPolicy | 987.10 ms | 1007.05 ms |
+
+The median paired speedup was 1.11×. Another GPU workload was present throughout
+the measured samples: these are shared-device results, not isolated latency or
+a production SLO. The official call includes seeded noise generation and takes
+normalized state; native receives the same supplied noise and additionally
+normalizes state and unnormalizes actions. Both include all model computation
+and host output transfer.
+
+Functional acceptance passes; optimization status is **best effort with
+performance debt**. Independent native processes took about 69 seconds to load
+and 10.85 seconds for the first default/cached call, including graph preparation.
+Cold tuning raised that first call to 14.00 seconds. With both runtimes resident
+in the paired experiment, the first native call took 236.05 seconds; its cause
+has not been isolated. These setup times are excluded from the warm table.
+
+The prepared native process reported approximately 36 GiB of CUDA memory in
+standalone snapshots. Its conservative graph arena reserves 12.14 GiB; neither
+number is a measured allocation peak. Further work should profile first-call
+resource/graph preparation and reuse intermediates between action steps to
+reduce the monotonic arena. The required encoders, ten-step loop and graph
+replay already execute on the GPU without intermediate host round trips.
+
+### FP32 attention optimization (2026-10-26)
+
+A subsequent Thor measurement identified the default FP32 attention provider as
+24.4% of traced kernel time: 660 calls and approximately 104 ms per request.
+The CUDA backend now supplies a pedantic FP32 cuBLAS candidate for dense MHA
+with at most 1024 keys. QK and PV operate directly on interleaved head strides;
+masking and softmax share one kernel. TF32 conversion is disabled. The model's
+precision boundaries, public interfaces and ten-step schedule are unchanged.
+Resource limits, graph preparation and exact recipe selection remain native
+operator responsibilities; GQA and longer keys retain the existing candidates.
+
+Twenty alternating baseline/optimized pairs measured default AutoPolicy with
+autotuning disabled, host RGB/state/task inputs, supplied canonical noise and
+host action outputs. Both models remained resident. Three joint warmup pairs
+followed loading and graph preparation; pair order alternated, and GPU process
+checks before, during and after timing detected only the two benchmark workers.
+
+| Native implementation | Median | p95 |
+| --- | ---: | ---: |
+| Before FP32 attention optimization | 390.64 ms | 395.09 ms |
+| With FP32 cuBLAS attention | 321.85 ms | 322.34 ms |
+
+Median paired speedup is 1.214×, with a 17.6% reduction in median latency.
+These paired results are separate from the earlier shared-device comparison
+against official LeRobot. Loading and first-call setup remain excluded.
+
+Native eager/graph lifecycle, default AutoPolicy, cold tuning and a separate
+warm-cache process each pass all twelve frozen FP32 noninferiority cases without
+using the comparison allowance. Eager, graph and public default outputs agree
+exactly. Cold/warm actions and all error metrics agree exactly, and all 45 recipe
+files retain identical contents and modification times. Backend validation passes
+112 library tests and eight public integration tests; two unrelated opt-in tests
+remain ignored. This optimization did not rerun the LIBERO rollout pilot.
+
+Roofline analysis uses measured streaming-copy bandwidth (231.38 GB/s), pedantic
+SGEMM throughput (6.18 TFLOP/s), actual attention shapes and Nsight Systems
+latencies. Arithmetic intensity uses ideal minimum Q/K/V/output traffic, omitting
+scratch and repeated reads. NCU counter collection was denied by device permissions,
+so these are analytical roofline estimates, not measured DRAM utilization or
+stall attribution. Shared-score-memory, split-value-reduction and static-unrolling
+experiments did not improve all representative shapes and were not adopted.
+
+### Fused attention and conversion reuse (2026-10-27)
+
+The next iteration adds a short dense F32 attention candidate that fuses QK,
+softmax and PV. Four queries reuse vectorized K/V loads, eight-lane groups
+reduce QK and four warps reduce PV; scores stay in shared memory. It needs no
+global score workspace. The provider checks B1, Q16–128, K1–160, D128, equal
+heads, no mask and 16-byte binding alignment; other cases retain existing
+providers. Products and accumulators remain F32, with a different reduction
+order. The model schedule and checkpoint precision boundaries are unchanged.
+
+BF16-to-F32 conversion now uses aligned four-element vectors with scalar
+fallback for tails and unaligned views. Each request also promotes its rounded
+cross-attention context K/V once, then reuses those exact F32 values across the
+ten action steps. This is not a cross-request text cache: changed observations,
+state and prompts still recompute their context on every graph replay.
+
+Two separate twenty-pair, alternating-order experiments on Thor use the same
+default AutoPolicy boundary and GPU-exclusivity checks described above:
+
+| Experiment | Previous cuBLAS median / p95 | Candidate median / p95 |
+| --- | ---: | ---: |
+| Fused attention only | 322.16 / 334.08 ms | 307.88 / 318.82 ms |
+| Fused attention + vector conversion + context promotion reuse | 322.42 / 322.63 ms | 294.05 / 294.62 ms |
+
+The combined change reduces median latency by 8.8% (1.096×); do not combine
+ratios from different experiments. Under separate Nsight Systems tracing,
+F32 attention kernel time falls from 35.49 to 23.79 ms/request and BF16-to-F32
+conversion from 24.11 to 5.79 ms/request. There are 540 fewer conversions and
+1,860 fewer total kernel nodes per request. Trace timings are diagnostic, not
+the unprofiled end-to-end benchmark.
+
+All twelve original FP32 noninferiority cases pass for default, native
+eager/graph, cold tuning and a separate warm-cache process without using the
+comparison allowance. The conversion/reuse changes preserve the fused-only
+canonical actions and all twelve error metrics exactly. Cold/warm actions,
+error metrics and recipe contents/mtimes agree. Backend validation passes
+114 library tests, an additional focused attention-alignment fallback test and
+eight public integration tests; two unrelated opt-in tests remain ignored.
+Compute Sanitizer memcheck and synccheck pass the fused kernel's boundary
+shapes. No additional LIBERO rollouts were performed for this iteration.
+
+The roofline interpretation now distinguishes cache-resident and streaming
+workloads. Thor reports 32 MiB L2; empirical copy throughput is 933–1090 GB/s
+for 4–16 MiB working sets, versus approximately 231 GB/s for streaming data.
+Warm attention microbenchmarks reach 29–33% of the measured 6.18 TFLOP/s F32
+compute ceiling; actual full-model attention reaches about 23–30%. The larger
+32–64% fractions against ideal minimum DRAM traffic are not measured hardware
+utilization. Actual cache/DRAM traffic and stalls remain unknown without NCU
+counters. Larger tiles, register/shared-memory variants and pedantic cuBLASLt
+heuristics were evaluated; none beat the selected candidate across this work.
+
+### Source ownership and capture boundary
+
+The native implementation is `crates/apxinf-model/src/cuda_fastwam/`.
+`model/` connects modalities and owns the fixed flow schedule;
+`model/blocks/bf16.rs` composes DiT, UMT5 and VAE operators. Private inline modules hold the subnetwork implementations; only `Bf16Blocks`
+is exposed to the model. It owns physical conditioning caches, dtype boundaries
+and workspace requirements. `weights/host.rs` owns
+checkpoint storage and source validation; `weights/bf16.rs` owns device weight
+representations and upload/packing in one file, with private inline modules and
+family-level type exports through `weights`, matching PI0.5. This includes explicitly F32 tensors used by
+this implementation. The loader materializes `Bf16Weights` before constructing
+the model. Weight data types use the `*Weights` suffix; Blocks functions consume
+them explicitly rather than adding computation methods to those types. Loading
+uses a consuming checkpoint store for this single implementation, without an
+additional persistent host weight tree. Load-time weight promotion stays in
+weights; activation conversion and layer composition stay in Blocks. Text and VAE computation objects retain their weight trees.
+`model_runner/runner.rs` validates requests and owns the plan cache;
+`model_runner/prepare.rs` owns stable buffers, preparation, capture and replay.
+`backend.rs` remains a safe CUDA import/transfer seam.
+
+The captured graph covers the complete model forward from already bound device
+inputs: RGB canonicalization, VAE, UMT5, video conditioning, all ten action steps
+and the device output copy. Request validation, CPU token/mask construction,
+state/provided-noise conversion and uploads are outside capture. Generated noise
+uses a GPU RNG launch before replay. Python resize/tokenization, policy
+normalization and action postprocessing, and host output download are also
+outside this graph. Whole-model capture does not mean whole-request capture.
+
+The native loader accepts `cuda_fastwam`; existing `fastwam` and `fastwam-cuda`
+selection spellings remain compatible. The Python policy name stays `fastwam`.
+
+### Baseline-first operator inventory
+
+The model uses existing GEMM/GEMM-bias, RMSNorm, GELU/SiLU, EulerUpdate,
+embedding gather, concatenation and BF16/F32 casts. Their baseline numerical
+and transfer contracts are retained. Prepared cuBLAS executions share stream
+resources; their tensor scratch remains execution-local. Added dtype support does not
+change the existing F16/BF16 path.
+
+Remaining capability gaps have concrete call sites in `model/blocks/bf16.rs`:
+
+| Capability | Consumer |
+| --- | --- |
+| RGB layout indices | input canonicalization |
+| im2col | VAE convolutions and video patch projection |
+| space-to-depth | VAE patchification |
+| grouped average | VAE downsampling shortcut |
+| channel L2 normalization | VAE norm |
+| channel standardization | VAE latent output |
+| additive attention | UMT5 relative-position and padding bias |
+| F32 dense attention / LayerNorm | existing F32 DiT state representation |
+| adjacent-pair RoPE | DiT rotary layout |
+| elementwise multiply and row/column broadcast multiply | residuals, gates and masks |
+
+F32 attention alternatives remain in their new dtype domain; existing dense
+F16/BF16 default selection is not displaced. Backend-owned cuBLAS handle/workspace
+sharing bounds the cost of retained GEMM/Attention executions. Any accuracy failure is reported before deciding whether
+an optional arithmetic variant is justified; reference-stage equality alone is
+not a reason to change an existing operator.
+
+
+### Baseline-arithmetic qualification (2026-10-29, commit `19a40227`)
+
+On Thor SM110 / CUDA 13.2, cuda-new passes 102 library tests (two unrelated
+opt-in tests ignored) and seven public integration tests. The VAE F32/BF16
+checkpoint and captured-execution checks pass. Native action inference and
+Python AutoPolicy each pass all twelve frozen cases against the official FP32
+oracle: both relative-L2 and maximum-absolute error are no worse than the
+corresponding official BF16 errors. Native eager/graph parity, input/RNG rebinding,
+layout rejection and retained-output lifetime also pass. No threshold changed.
+
+The BF16 profile materializes schedule deltas in BF16 before promoting them
+for F32 state integration, matching the pinned reference scheduler. This is a
+model-level constant conversion; the generic Euler operator retains its baseline
+arithmetic. GEMM and F32 Attention share backend-owned cuBLAS stream resources.
+A public regression retains sixteen additional tiny GEMM executions after warmup:
+additional device allocation falls from 1,154,490,368 bytes with individual handles
+to zero with shared resources, and graph replay remains correct.
+
+The standalone UMT5 frozen-output test remains failing: relative-L2 is
+0.0711166, maximum-absolute error 0.30664063, versus its unchanged 0.01 relative-L2
+limit. End-to-end action acceptance does not make that independent test pass or
+establish intermediate equality. This revision has no new LIBERO rollout result;
+the historical rollout and latency tables above describe their original snapshots.
+
+### Explicit text intermediate precision (2026-10-29)
+
+The model and weight precision implementations each occupy one `bf16.rs`, matching
+PI05's directory and family-export structure. RMSNorm and additive attention stay
+in their existing operator families. Their L3 `intermediate_dtype` arguments default
+to F32; Fast-WAM text explicitly selects BF16 materialization. RMS reductions and
+attention GEMMs still accumulate in F32. GELU and all default operator paths remain
+unchanged; this is not a global replacement of baseline arithmetic.
+
+Same-input replay of the previously failing LIBERO-Spatial task found no local
+wiring/semantic mismatch: 168 linear, 24 GELU and 74 arithmetic/embedding/mask checks
+were exact; RMS relative-L2 was at most 3.04e-5 and attention versus FP64 at most
+4.91e-5. Chain drift grows substantially around zero-based layers 18–19 FFN/residual
+and layer 22 attention. Independently restoring only RMS/attention intermediate
+boundaries in the reference recovered task 9 (122 steps versus baseline native
+text failure at 300). This intervention isolates a numerical cause in the tested
+path; it is not full-native task qualification.
+
+On Thor SM110 / CUDA 13.2, the changed implementation passes 103 cuda-new library
+tests (two unrelated opt-in tests ignored), seven public integration tests,
+convolution/VAE checks, and the twelve native frozen cases against FP32 with the
+unchanged non-inferiority gates. Whole-model eager/graph parity, input/RNG rebinding
+and output lifetime checks pass. Canonical text cosine improves from 0.997469 to
+0.999507, relative-L2 from 0.0711166 to 0.0314636, and maximum-absolute error from
+0.306641 to 0.0703125. The independent 0.01 text-output threshold still fails and
+has not been relaxed. Task 9 text cosine improves from 0.976986 to 0.999184, but
+improvement is not uniform across all prompts; task-level checks remain necessary.
+
+The new native text substitution passes all ten LIBERO-Spatial tasks (one bundled
+initial state per task), versus 9/10 before the precision change and 10/10 with
+reference text. Task 9 now succeeds in 122 steps. Initial-state, starting-observation,
+BDDL and initialization-file hashes match the reference arm. The native task-9
+embedding also matches the independent two-boundary intervention numerically;
+79 signed-zero bit differences remain. This controlled substitution establishes
+recovery of the diagnosed failure without changing GELU or replacing baseline
+operator defaults. It is a ten-episode pilot, not the full four-suite benchmark.
+
+The rebuilt Python AutoPolicy also passes all ten complete native LIBERO-Spatial
+episodes with the same protocol and matching initial-condition hashes. Task 9
+succeeds in 121 steps, matching the reference success length. This exercises the
+native VAE/text/action pipeline, not only substituted embeddings. The extension
+SHA-256 is `043fe0d3f1c3126969aba5dea48d3c185fa52de949c4498477d5577223991455`.
+These ten successful episodes do not establish statistical equivalence or replace
+the full multi-suite evaluation.
+
+### Main integration and remaining text drift (2026-10-30)
+
+The integration with main `4de8f5cc` uses unified `NormArgs`, attention input-layout
+contracts and the current workspace lifetime rules. Merge regressions were found
+by GPU tests and repaired: broadcast multiplication used an obsolete semantic
+number; F32 LayerNorm lost its overlap rejection; image/pairwise graph retention
+pinned temporary workspace leases only during capture. These fixes do not change
+baseline operator arithmetic or the workspace allocator. A two-allocation
+prepare/capture regression fails before the retention fix and passes afterwards.
+
+Thor regression passes 144 backend tests, seven public integration tests,
+convolution and VAE checkpoint/capture checks, and all twelve native frozen cases
+with whole-model graph/lifetime checks. The backend count includes the new workspace regression.
+The standalone text gate still fails at relative-L2 0.0314636, cosine 0.999507 and
+maximum absolute error 0.0703125; its 0.01 threshold is unchanged. All eleven text
+fixtures are bit-identical to the pre-merge precision revision. Canonical text
+also matches all 338 captured stages and repeats exactly after ten other prompts.
+The previous full-native LIBERO pilot is historical evidence; it has not been
+rerun with this merge.
+
+An independent reference with only GELU changed to F32 arithmetic isolates the
+first remaining canonical divergence to zero-based layer 9 FFN RMSNorm: 16 of
+524288 values differ. For task 3, the first divergence is layer 1 attention
+RMSNorm: 31 values differ. Same-input task-3 replay checks 339 boundaries; 307 are
+exact, and nonzero differences occur only in RMSNorm and attention. Final task-3
+text relative-L2 is 0.146971 and cosine 0.989151, so canonical accuracy alone is
+not representative of every prompt.
+
+Both first RMS divergences were minimized to one 4096-element row. Independent
+CPU F32 reduction trees reproduce the native sums exactly; changing only the
+inverse RMS to the reference value reproduces the reference row. The actual
+kernel reproduces the captured row over 100 repetitions, with zero memcheck
+errors and racecheck hazards. Canonical native/reference inverse RMS differs by
+one F32 ULP; task 3 also differs by one ULP. Direct nearest-even BF16 rounding of independent FP64 arithmetic agrees with
+the native output on both rows. PyTorch FP64-to-BF16 conversion can round through
+F32, so it is not used as the direct-rounding oracle. These
+observations support reduction-order and BF16-boundary amplification, rather
+than a missing term, indexing error or race in these minimized cases. They do not
+establish that matching the reference's reduction order improves mathematical
+accuracy or downstream quality. No global operator replacement or tolerance
+relaxation is justified by this evidence.
+
+For task 3's largest local attention difference (layer 14, relative-L2 0.000356659
+against direct-rounding FP64), a standalone cuBLAS QK → production softmax →
+cuBLAS PV chain is bit-identical to the model's captured output and passes
+memcheck. Separate boundary comparisons find 16 QK values, six softmax
+probabilities, and seven PV values differing from same-input FP64 with direct
+BF16 rounding. This localizes the observed discrepancy to arithmetic and rounding
+inside the individual operations, rather than model layout, masking or reuse.
+All 266 same-input projection/GELU/embedding/residual/multiply/mask checks are exact.

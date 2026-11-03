@@ -229,6 +229,7 @@ fn rms_normalized_fp8(
     ops::norm::norm(
         ctx,
         ops::NormArgs {
+            intermediate_dtype: apxinf_core::DType::F32,
             input,
             output: None,
             kind: ops::NormKind::Rms,
@@ -261,6 +262,7 @@ fn layer_normalized_fp8(
     ops::norm::norm(
         ctx,
         ops::NormArgs {
+            intermediate_dtype: apxinf_core::DType::F32,
             input,
             output: None,
             kind: ops::NormKind::Layer,
@@ -315,6 +317,7 @@ fn adaptive_rms_normalized_fp8(
     ops::norm::norm(
         ctx,
         ops::NormArgs {
+            intermediate_dtype: apxinf_core::DType::F32,
             input,
             output: None,
             kind: ops::NormKind::Rms,

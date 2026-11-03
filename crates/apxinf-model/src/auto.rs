@@ -398,6 +398,14 @@ impl AutoModel {
             return Err(Error::Other("d3-mini requires CUDA support".into()));
         }
 
+        if matches!(model_name, "fastwam" | "fastwam-cuda" | "cuda_fastwam") {
+            #[cfg(feature = "cuda")]
+            return crate::cuda_fastwam::load::load_with_cuda_new(path, device, options);
+
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("Fast-WAM requires CUDA support".into()));
+        }
+
         register_builtin_models();
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
@@ -579,6 +587,9 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "d3-cuda"
             | "smolvla"
             | "smolvla_libero"
+            | "fastwam"
+            | "fastwam-cuda"
+            | "cuda_fastwam"
     ) || matches!(device, Device::Metal(_))
 }
 #[cfg(test)]

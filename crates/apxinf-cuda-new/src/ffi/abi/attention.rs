@@ -4,10 +4,11 @@ pub(crate) use super::types::Policy;
 use super::types::{CudaStream, Runtime};
 use crate::ffi::raw::cuda_runtime::{cudaError_t, cudaStream_t};
 
-pub(crate) const SPEC_VERSION: u32 = 6;
+pub(crate) const SPEC_VERSION: u32 = 7;
 pub(crate) const SEMANTIC_DENSE: u32 = 0;
 pub(crate) const SEMANTIC_KV_CACHE: u32 = 1;
 pub(crate) const SEMANTIC_SEGMENTED: u32 = 2;
+pub(crate) const SEMANTIC_ADDITIVE: u32 = 4;
 
 pub(crate) const QKV_LAYOUT_SEPARATE: u32 = 0;
 pub(crate) const QKV_LAYOUT_PACKED_TOKEN: u32 = 1;
@@ -47,6 +48,10 @@ pub(crate) struct Spec {
     pub offsets_hash: u64,
     pub scale_is_default: u32,
     pub dynamic_decode: u32,
+    pub bias_alignment: u32,
+    pub bias_broadcast_batch: u32,
+    pub input_precision: u32,
+    pub reserved: u32,
     pub numerics: u32,
 }
 
@@ -57,6 +62,7 @@ pub(crate) struct Bindings {
     pub key: *const c_void,
     pub value: *const c_void,
     pub offsets: *const c_void,
+    pub bias: *const c_void,
     pub decode_meta: *const u32,
     pub output: *mut c_void,
     pub stream: CudaStream,

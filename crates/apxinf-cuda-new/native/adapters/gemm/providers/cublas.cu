@@ -1,4 +1,5 @@
 #include "vendor.h"
+#include "../../cublas_resources.h"
 #include "../../../kernels/custom/gemm.cuh"
 #include "../../../kernels/elementwise/broadcast_bf16_f32.cuh"
 
@@ -7,22 +8,17 @@ namespace {
 
 struct CublasState {
   vendor::CommonResources common;
-  cublasHandle_t handle = nullptr;
-  void* workspace = nullptr;
-  size_t workspace_bytes = 0;
+  std::shared_ptr<providers::CublasStreamResources> shared;
   void* dequant_a = nullptr;
   void* dequant_b = nullptr;
 
   ~CublasState() {
     release_resources();
-    if (handle != nullptr) cublasDestroy(handle);
   }
 
   void release_resources() noexcept {
-    if (workspace != nullptr) cudaFree(workspace);
     if (dequant_a != nullptr) cudaFree(dequant_a);
     if (dequant_b != nullptr) cudaFree(dequant_b);
-    workspace = nullptr;
     dequant_a = nullptr;
     dequant_b = nullptr;
     common.release();
@@ -91,7 +87,7 @@ size_t dequantization_resource_requirements(const Spec& spec) {
 size_t cublas_resource_requirements(const Spec& spec) {
   return dequantization_resource_requirements(spec) +
          vendor::common_resource_requirements(cublas_compute_spec(spec), false) +
-         4 * 1024 * 1024;
+         providers::CublasStreamResources::workspace_bytes;
 }
 
 void prepare_cublas(Execution& state) {
@@ -106,15 +102,11 @@ void prepare_cublas(Execution& state) {
     check_cuda(cudaMalloc(&resources->dequant_a, a_bytes));
     check_cuda(cudaMalloc(&resources->dequant_b, b_bytes));
   }
-  check_cublas(cublasCreate(&resources->handle));
-  check_cublas(cublasSetMathMode(
-      resources->handle, uses_legacy_cublas_numerics(state.spec)
-                             ? CUBLAS_DEFAULT_MATH
-                             : CUBLAS_PEDANTIC_MATH));
-  resources->workspace_bytes = 4 * 1024 * 1024;
-  check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
+  resources->shared = providers::acquire_cublas_stream_resources(
+      state.device, static_cast<cudaStream_t>(state.bindings.stream),
+      uses_legacy_cublas_numerics(state.spec) ? CUBLAS_DEFAULT_MATH : CUBLAS_PEDANTIC_MATH);
   state.resource_bytes =
-      resources->common.resource_bytes + resources->workspace_bytes +
+      resources->common.resource_bytes + resources->shared->workspace_bytes +
       dequantization_resource_requirements(state.spec);
   state.provider_state = resources.release();
 }
@@ -191,13 +183,11 @@ cudaError_t launch_cublas(Execution& state) {
       resources.common.unpack_a != nullptr
           ? data_type
           : input_cuda_dtype(compute_spec.a_dtype);
-  check_cublas(cublasSetStream(resources.handle, stream));
-  check_cublas(cublasSetWorkspace(resources.handle, resources.workspace,
-                                  resources.workspace_bytes));
+  std::lock_guard<std::mutex> lock(resources.shared->enqueue_mutex);
   const bool output_major_weight =
       compute_spec.b_layout == APXINF_GEMM_LAYOUT_NK;
   check_cublas(cublasGemmEx(
-      resources.handle,
+      resources.shared->handle,
       output_major_weight ? CUBLAS_OP_T : CUBLAS_OP_N,
       CUBLAS_OP_N, compute_spec.n, compute_spec.m, compute_spec.k,
       alpha_pointer, weight,

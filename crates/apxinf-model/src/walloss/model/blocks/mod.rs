@@ -390,6 +390,7 @@ fn qkv_after_rms(
             ops::norm::norm(
                 context,
                 ops::norm::NormArgs {
+                    intermediate_dtype: apxinf_core::DType::F32,
                     input,
                     output: None,
                     kind: ops::norm::NormKind::Rms,

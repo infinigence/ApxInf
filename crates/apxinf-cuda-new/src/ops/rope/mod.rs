@@ -21,3 +21,8 @@ pub use qkv::{split_grouped_qkv, split_qkv_cache, GroupedQkvRopeArgs, QkvCacheRo
 pub use rope::{
     apply_batched as execute_batched, apply_mrope as execute_mrope, apply_vision_2d, rope,
 };
+
+mod pairwise;
+pub use pairwise::{pairwise_rope, PairwiseRopeArgs, PairwiseRopeTable};
+#[cfg(test)]
+pub const PAIRWISE_DOC_IDS: &[&str] = &["pairwise-rope"];

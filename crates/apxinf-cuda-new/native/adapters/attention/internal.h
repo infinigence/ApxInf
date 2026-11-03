@@ -94,7 +94,15 @@ TuningKeys tuning_keys(const Spec& spec,
 size_t custom_resource_requirements(const Spec& spec, int configuration);
 void prepare_custom(Execution& execution);
 cudaError_t launch_custom(Execution& execution);
+cudaError_t launch_parallel_custom(Execution& execution);
+cudaError_t launch_cooperative_custom(Execution& execution);
+cudaError_t launch_short_f32_custom(Execution& execution);
 void destroy_custom(Execution& execution) noexcept;
+size_t cublas_resource_requirements(const Spec& spec, int configuration);
+void prepare_cublas(Execution& execution);
+cudaError_t launch_f32_cublas(Execution& execution);
+cudaError_t launch_bf16_intermediate_cublas(Execution& execution);
+void destroy_cublas(Execution& execution) noexcept;
 
 cudaError_t launch_output_gate_projection(void* data, const void* projection,
                                           int rows, int heads, int head_dim,

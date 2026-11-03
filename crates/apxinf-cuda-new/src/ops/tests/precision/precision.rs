@@ -706,3 +706,6 @@ fn gemm_geglu_three_view_all_candidates_match_torch() {
         }
     }
 }
+
+#[path = "attention_precision.rs"]
+mod attention_precision;

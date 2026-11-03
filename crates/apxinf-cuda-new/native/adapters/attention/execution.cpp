@@ -33,9 +33,12 @@ void validate_spec(const Spec& spec) {
       spec.qkv_layout == APXINF_ATTENTION_QKV_LAYOUT_SEPARATE &&
       spec.dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
-  if (spec.version != 6 ||
-      spec.semantic > APXINF_ATTENTION_SEMANTIC_SEGMENTED ||
-      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
+  if (spec.version != 7 ||
+      spec.semantic > APXINF_ATTENTION_SEMANTIC_ADDITIVE || spec.semantic == 3 ||
+      (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16 &&
+       !(spec.dtype == APXINF_DTYPE_F32 &&
+         (spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE ||
+          spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE))) ||
       (!native_output && !static_e4m3_output) ||
       spec.mask > APXINF_ATTENTION_MASK_CAUSAL || spec.batch <= 0 ||
       spec.qkv_layout > APXINF_ATTENTION_QKV_LAYOUT_PACKED_TOKEN ||
@@ -52,7 +55,8 @@ void validate_spec(const Spec& spec) {
       spec.numerics > APXINF_ATTENTION_NUMERICS_STABLE) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Attention Spec");
   }
-  if (spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+  if ((spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE ||
+       spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE) &&
       (spec.key_capacity != spec.key_tokens ||
        spec.query_start !=
            (spec.mask == APXINF_ATTENTION_MASK_CAUSAL
@@ -63,6 +67,17 @@ void validate_spec(const Spec& spec) {
        spec.dynamic_decode != 0)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid dense Attention semantic fields");
+  }
+  if (spec.reserved != 0 || spec.input_precision > 1 ||
+      (spec.input_precision == 1 && spec.dtype != APXINF_DTYPE_BF16) ||
+      spec.bias_broadcast_batch > 1 ||
+      (spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE
+           ? (!valid_alignment(spec.bias_alignment) || spec.bias_alignment < 4 ||
+              spec.output_dtype != spec.dtype)
+           : (spec.bias_alignment != 0 || spec.bias_broadcast_batch != 0 ||
+              spec.input_precision != 0))) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid additive Attention semantic fields");
   }
   if (spec.qkv_layout == APXINF_ATTENTION_QKV_LAYOUT_PACKED_TOKEN &&
       (spec.semantic != APXINF_ATTENTION_SEMANTIC_DENSE ||
@@ -154,10 +169,17 @@ void validate_bindings(const Spec& spec,
        (spec.scale_is_default != 0)) ||
       ((spec.semantic == APXINF_ATTENTION_SEMANTIC_SEGMENTED) !=
        (bindings.offsets != nullptr)) ||
+      ((spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE) !=
+       (bindings.bias != nullptr)) ||
       ((spec.dynamic_decode != 0) !=
        (bindings.decode_meta != nullptr))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid Attention bindings");
+  }
+  if (bindings.bias != nullptr &&
+      reinterpret_cast<uintptr_t>(bindings.bias) % spec.bias_alignment != 0) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "Attention bias pointer contradicts recorded alignment");
   }
   if (bindings.offsets != nullptr &&
       reinterpret_cast<uintptr_t>(bindings.offsets) % spec.offsets_alignment != 0) {
@@ -269,6 +291,14 @@ std::vector<float> read_output(const Spec& spec,
                                const apxinf_attention_bindings_t& bindings,
                                size_t count) {
   const auto stream = static_cast<cudaStream_t>(bindings.stream);
+  if (spec.output_dtype == APXINF_DTYPE_F32) {
+    std::vector<float> values(count);
+    apxinf::attention::check_cuda(cudaMemcpyAsync(
+        values.data(), bindings.output, count * sizeof(float),
+        cudaMemcpyDeviceToHost, stream));
+    apxinf::attention::check_cuda(cudaStreamSynchronize(stream));
+    return values;
+  }
   if (spec.output_dtype == APXINF_DTYPE_E4M3) {
     std::vector<uint8_t> storage(count);
     apxinf::attention::check_cuda(cudaMemcpyAsync(
@@ -307,9 +337,15 @@ std::vector<float> read_output(const Spec& spec,
 }
 
 void check_output(const std::vector<float>& actual, const float* expected,
-                  const std::string& label) {
+                  const std::string& label, uint32_t dtype, bool additive) {
   for (size_t index = 0; index < actual.size(); ++index) {
-    const float tolerance = 0.03F + 0.02F * std::abs(expected[index]);
+    const float magnitude = std::abs(expected[index]);
+    const float tolerance = dtype == APXINF_DTYPE_F32
+        ? 2e-5F + 2e-5F * magnitude
+        : additive
+            ? (dtype == APXINF_DTYPE_F16 ? 0.0005F + 0.001F * magnitude
+                                         : 0.002F + 0.008F * magnitude)
+            : 0.03F + 0.02F * magnitude;
     if (!std::isfinite(actual[index]) ||
         std::abs(actual[index] - expected[index]) > tolerance) {
       throw Failure(
@@ -562,7 +598,8 @@ extern "C" apxinf_status_t apxinf_attention_test_validate_candidates(
         apxinf::attention::check_cuda(implementation.enqueue(*candidate));
         check_output(read_output(normalized, *bindings, count), expected_output,
                      std::string(implementation.name) + "#" +
-                         std::to_string(configuration));
+                         std::to_string(configuration), normalized.dtype,
+                     normalized.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE);
         if (policy->graph_safe) {
           auto graph = capture_candidate(implementation, *candidate, stream);
           apxinf::attention::check_cuda(
@@ -572,7 +609,8 @@ extern "C" apxinf_status_t apxinf_attention_test_validate_candidates(
           check_output(
               read_output(normalized, *bindings, count), expected_output,
               std::string(implementation.name) + "#" +
-                  std::to_string(configuration) + " graph");
+                  std::to_string(configuration) + " graph", normalized.dtype,
+                     normalized.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE);
         }
       }
       ++implementations_checked;

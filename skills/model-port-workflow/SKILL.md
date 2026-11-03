@@ -53,7 +53,11 @@ remains the common loader result. `StepModulation` names computed per-step
 scale/shift/gate tensors. Use current source symbols for unmigrated families.
 A single-implementation model does not need a variant enum, generic Blocks or
 additional wrapper just to match PI0.5. Keep model and weights independent of
-runner/capture types; keep concrete precision dispatch out of the runner.
+runner/capture types. For Fast-WAM, load constructs `Bf16Weights`; `*Weights`
+types describe immutable device data, and Blocks functions consume them without
+adding inherent computation methods. Activation conversion belongs to Blocks;
+fixed weight promotion belongs to loading. Keep concrete precision dispatch out
+of the runner.
 
 New accelerator ports must satisfy
 `doc/model-execution-wiring.md#accelerator-port-acceptance`: ApxInf-native GPU
@@ -103,7 +107,10 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    identify explicit dynamic state, prepared shapes and bounded lazy outputs.
    Inspect the safe array/fusion seam in `apxinf-mlx`; keep raw FFI and unsafe
    custom kernels there, without a universal model/runtime wrapper. Use
-   `metal_<family>` for native Metal composition and registration. The evolving
+   `<backend>_<family>` (`cuda_`, `metal_`, `hip_`) for native backend
+   composition and registration, following the model-layer architecture naming
+   rules. Keep host checkpoint storage, device weights, model/blocks computation
+   and runner preparation under their declared owners. The evolving
    cross-backend contract is not a prerequisite: preserve the model's numerical
    recipe and measured performance without introducing per-op trait wrappers.
 5. Classify fused and primitive coverage. If a real gap exists, follow

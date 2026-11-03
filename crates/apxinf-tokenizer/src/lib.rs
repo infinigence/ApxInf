@@ -239,6 +239,18 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
+    /// Load a complete Hugging Face tokenizer JSON document from memory.
+    /// Unlike `from_file`, this does not load adjacent configuration or templates.
+    pub fn from_json(json: &str) -> Result<Self> {
+        let inner = HfTokenizer::from_bytes(json.as_bytes())
+            .map_err(|e| Error::Other(format!("tokenizer load: {e}")))?;
+        Ok(Self {
+            inner,
+            config: TokenizerConfig::default(),
+            chat_template: None,
+        })
+    }
+
     /// Load tokenizer from tokenizer.json, optionally loading tokenizer_config.json
     /// from the same directory for chat template and special tokens.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -727,6 +739,23 @@ mod tests {
         assert_eq!(tokenizer.token_to_id("<|propri|>"), Some(2));
         assert_eq!(tokenizer.token_to_id("<|action|>"), Some(3));
         assert_eq!(tokenizer.encode("<|action|>").unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn in_memory_json_preserves_pipeline_and_rejects_invalid_documents() {
+        let json = r#"{
+            "version":"1.0", "truncation":null, "padding":null,
+            "added_tokens":[], "normalizer":null,
+            "pre_tokenizer":{"type":"WhitespaceSplit"},
+            "post_processor":null, "decoder":null,
+            "model":{"type":"WordLevel","vocab":{"[UNK]":0,"hello":1,"world":2},"unk_token":"[UNK]"}
+        }"#;
+        let tokenizer = Tokenizer::from_json(json).unwrap();
+        assert_eq!(tokenizer.encode("hello\t\nworld").unwrap(), vec![1, 2]);
+        assert_eq!(tokenizer.encode("unknown").unwrap(), vec![0]);
+        assert_eq!(tokenizer.token_to_id("world"), Some(2));
+        assert!(Tokenizer::from_json("not JSON").is_err());
+        assert!(Tokenizer::from_json(r#"{"model":{"type":"Unknown"}}"#).is_err());
     }
 
     #[test]

@@ -61,8 +61,13 @@ def synthetic_observation_for(policy, *, prompt: str = "pick up the block"):
     state_dim = policy.metadata.get("state_dim")
     if state_key is not None and not isinstance(state_dim, int):
         raise ValueError("policy metadata must declare state_dim when state_key is set")
+    image_size = policy.metadata.get("image_size", 256)
+    if not isinstance(image_size, int) or image_size <= 0:
+        raise ValueError("policy metadata image_size must be a positive integer")
     return synthetic_observation(
         image_keys=tuple(image_keys),
+        height=image_size,
+        width=image_size,
         state_key=state_key,
         prompt_key=policy.metadata.get("prompt_key", "prompt"),
         state_dim=state_dim or 0,

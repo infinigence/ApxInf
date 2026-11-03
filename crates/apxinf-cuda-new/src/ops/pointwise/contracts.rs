@@ -11,6 +11,12 @@ pub enum PointwiseSemantic {
     Geglu,
     BiasActivation,
     EulerUpdate,
+    /// Elementwise product of two equally sized tensors.
+    Multiply,
+    /// Multiply each row by a secondary vector `[rows]`.
+    RowMultiply,
+    /// Multiply each row by a secondary vector `[cols]`.
+    BroadcastMultiply,
     Swiglu,
     AddInto,
     SwigluRowwiseE4m3,
@@ -22,6 +28,9 @@ impl PointwiseSemantic {
             Self::Geglu => 0,
             Self::BiasActivation => 1,
             Self::EulerUpdate => 2,
+            Self::Multiply => 6,
+            Self::RowMultiply => 8,
+            Self::BroadcastMultiply => 7,
             Self::Swiglu => 3,
             Self::AddInto => 4,
             Self::SwigluRowwiseE4m3 => 5,
@@ -29,7 +38,10 @@ impl PointwiseSemantic {
     }
 
     fn reads_secondary(self) -> bool {
-        matches!(self, Self::EulerUpdate)
+        matches!(
+            self,
+            Self::EulerUpdate | Self::RowMultiply | Self::Multiply | Self::BroadcastMultiply
+        )
     }
 
     fn may_have_bias(self) -> bool {
@@ -63,7 +75,7 @@ impl PointwiseActivation {
 pub struct PointwiseArgs<'a> {
     pub semantic: PointwiseSemantic,
     pub input: &'a Tensor,
-    /// Euler-update velocity; unused by the other semantics.
+    /// Velocity, elementwise multiplicand, or broadcast column vector.
     pub secondary: Option<&'a Tensor>,
     pub bias: Option<&'a Tensor>,
     pub out: &'a mut Tensor,
@@ -105,19 +117,23 @@ pub(crate) fn invalid(message: impl Into<String>) -> Error {
 
 fn input_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
-        _ => Err(invalid("Pointwise input currently supports F16 and BF16")),
+        _ => Err(invalid(
+            "Pointwise input currently supports F32, F16 and BF16",
+        )),
     }
 }
 
 fn output_dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
+        DType::F32 => Ok(0),
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
         DType::F8E4M3 => Ok(3),
         _ => Err(invalid(
-            "Pointwise output currently supports F16, BF16, and E4M3",
+            "Pointwise output currently supports F32, F16, BF16, and E4M3",
         )),
     }
 }
@@ -302,7 +318,14 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
 
     let (secondary, secondary_alignment) = match args.secondary {
         Some(tensor) => {
-            let buffer = tensor_storage(ctx, tensor, input_dtype, count)?;
+            let secondary_count = if matches!(semantic, PointwiseSemantic::BroadcastMultiply) {
+                cols
+            } else if semantic == PointwiseSemantic::RowMultiply {
+                rows
+            } else {
+                count
+            };
+            let buffer = tensor_storage(ctx, tensor, input_dtype, secondary_count)?;
             let pointer = buffer.ptr() as *const std::ffi::c_void;
             let alignment = alignment_of(buffer.ptr() as usize);
             storage.push(buffer);
@@ -356,6 +379,43 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
             return Err(invalid(
                 "F16-to-E4M3 GeGLU input and output storage must not overlap",
             ));
+        }
+    }
+    if matches!(
+        semantic,
+        PointwiseSemantic::Multiply
+            | PointwiseSemantic::BroadcastMultiply
+            | PointwiseSemantic::RowMultiply
+    ) {
+        if args.input.shape().dims() != dims {
+            return Err(invalid("Pointwise binary input must have the output shape"));
+        }
+        let bytes = count
+            .checked_mul(input_dtype.size_in_bytes())
+            .ok_or_else(|| invalid("Pointwise size overflow"))?;
+        if input as usize != output as usize
+            && storage_ranges_overlap(input as usize, bytes, output as usize, bytes)?
+        {
+            return Err(invalid("Pointwise binary input/output partially overlap"));
+        }
+        let broadcast = matches!(
+            semantic,
+            PointwiseSemantic::BroadcastMultiply | PointwiseSemantic::RowMultiply
+        );
+        let secondary_elements = if semantic == PointwiseSemantic::RowMultiply {
+            rows
+        } else if broadcast {
+            cols
+        } else {
+            count
+        };
+        let secondary_bytes = secondary_elements
+            .checked_mul(input_dtype.size_in_bytes())
+            .ok_or_else(|| invalid("Pointwise size overflow"))?;
+        if (broadcast || secondary as usize != output as usize)
+            && storage_ranges_overlap(secondary as usize, secondary_bytes, output as usize, bytes)?
+        {
+            return Err(invalid("Pointwise binary secondary/output overlap"));
         }
     }
     storage.push(output_buffer);

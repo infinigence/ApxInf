@@ -30,9 +30,74 @@ bool supports_custom(const Spec& spec) {
 }
 
 bool supports_dense_custom(const Spec& spec) {
+  if (spec.qkv_layout != APXINF_ATTENTION_QKV_LAYOUT_SEPARATE ||
+      spec.numerics != APXINF_ATTENTION_NUMERICS_FLEXIBLE) return false;
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
-         supports_custom(spec);
+         (supports_custom(spec) || (spec.dtype == APXINF_DTYPE_F32 &&
+                                   spec.output_dtype == spec.dtype));
 }
+
+bool supports_additive_custom(const Spec& spec) {
+  if (spec.qkv_layout != APXINF_ATTENTION_QKV_LAYOUT_SEPARATE ||
+      spec.numerics != APXINF_ATTENTION_NUMERICS_FLEXIBLE) return false;
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE && spec.input_precision == 0 &&
+         (supports_custom(spec) || (spec.dtype == APXINF_DTYPE_F32 &&
+                                   spec.output_dtype == spec.dtype));
+}
+
+bool supports_parallel_custom(const Spec& spec) {
+  if (spec.qkv_layout != APXINF_ATTENTION_QKV_LAYOUT_SEPARATE ||
+      spec.numerics != APXINF_ATTENTION_NUMERICS_FLEXIBLE) return false;
+  return ((spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+           spec.dtype == APXINF_DTYPE_F32 &&
+           spec.output_dtype == spec.dtype) ||
+          supports_additive_custom(spec)) &&
+         static_cast<uint64_t>(spec.batch) * spec.query_tokens * spec.query_heads <= INT32_MAX;
+}
+
+
+
+// Strided batched GEMMs operate directly on interleaved B,T,H,D MHA.
+// GQA remains with the custom provider; each GEMM batch has one head.
+bool supports_bf16_intermediate(const Spec& spec) {
+  if (spec.qkv_layout != APXINF_ATTENTION_QKV_LAYOUT_SEPARATE ||
+      spec.numerics != APXINF_ATTENTION_NUMERICS_FLEXIBLE) return false;
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_ADDITIVE && spec.input_precision == 1 &&
+         spec.dtype == APXINF_DTYPE_BF16 && spec.output_dtype == spec.dtype &&
+         spec.query_heads == spec.kv_heads && spec.key_tokens <= 1024 &&
+         static_cast<uint64_t>(spec.query_heads) * spec.head_dim <= INT32_MAX &&
+         static_cast<uint64_t>(spec.batch) * spec.query_heads <= INT32_MAX / spec.query_tokens;
+}
+
+bool supports_f32_cublas(const Spec& spec) {
+  if (spec.qkv_layout != APXINF_ATTENTION_QKV_LAYOUT_SEPARATE ||
+      spec.numerics != APXINF_ATTENTION_NUMERICS_FLEXIBLE) return false;
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+         spec.dtype == APXINF_DTYPE_F32 && spec.output_dtype == spec.dtype &&
+         spec.query_heads == spec.kv_heads && spec.key_tokens <= 1024 &&
+         static_cast<uint64_t>(spec.query_heads) * spec.head_dim <= INT32_MAX &&
+         static_cast<uint64_t>(spec.batch) * spec.query_heads <=
+             INT32_MAX / spec.query_tokens;
+}
+
+bool supports_short_f32(const Spec& spec) {
+  if (spec.qkv_layout != APXINF_ATTENTION_QKV_LAYOUT_SEPARATE ||
+      spec.numerics != APXINF_ATTENTION_NUMERICS_FLEXIBLE) return false;
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+         spec.dtype == APXINF_DTYPE_F32 && spec.output_dtype == spec.dtype &&
+         spec.mask == APXINF_ATTENTION_MASK_NONE && spec.batch == 1 &&
+         spec.query_heads == spec.kv_heads && spec.query_heads <= 65535 &&
+         spec.head_dim == 128 && spec.query_tokens >= 16 &&
+         spec.query_tokens <= 128 && spec.key_tokens <= 160;
+}
+
+AlignmentRequirements short_f32_alignment(const Spec&) {
+  return {16, 16, 16, 16};
+}
+
+size_t short_f32_resources(const Spec&, int) { return 0; }
+void prepare_short_f32(Execution&) {}
+void destroy_short_f32(Execution&) noexcept {}
 
 bool supports_kv_cache_custom(const Spec& spec) {
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
@@ -307,6 +372,23 @@ AlignmentRequirements specialized_sm110_alignment(const Spec&) {
 
 const ImplementationRegistry& registry(uint32_t semantic) {
   static const ImplementationRegistry dense_entries = {
+      {kProviderCustom, 7, 1, "custom-short-f32-attention", 0, true, true,
+       true, supports_short_f32, short_f32_alignment,
+       short_f32_resources, one_configuration, prepare_short_f32,
+       launch_short_f32_custom, destroy_short_f32},
+      {kProviderCublas, 2, 1, "cublas-f32-attention", 0, true, true,
+       true, supports_f32_cublas, natural_alignment,
+       cublas_resource_requirements, one_configuration, prepare_cublas,
+       launch_f32_cublas, destroy_cublas},
+      {kProviderCustom, 6, 1, "custom-warp-attention", 0, true, true,
+       true, supports_parallel_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_cooperative_custom, destroy_custom},
+      {kProviderCustom, 5, 1, "custom-parallel-attention", 0, true, true,
+       true, supports_parallel_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_parallel_custom, destroy_custom},
+
 #if defined(APXINF_SEGMENTED_ATTENTION_SM110)
       {kProviderSpecializedSm110, 1, 1, "specialized-d256-causal-sm110",
        apxinf::gemm::kDeviceFeatureFixedSm110, true, true, false,
@@ -349,6 +431,25 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        prepare_cublas_f16, launch_cublas_f16, destroy_cublas_f16},
       {kProviderCustom, 1, 1, "custom-attention-fallback", 0, true, true,
        true, supports_dense_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_custom, destroy_custom},
+  };
+  static const ImplementationRegistry additive_entries = {
+      {kProviderCublas, 3, 2, "cublas-bf16-intermediate-attention", 0, true, true,
+       true, supports_bf16_intermediate, natural_alignment,
+       cublas_resource_requirements, one_configuration, prepare_cublas,
+       launch_bf16_intermediate_cublas, destroy_cublas},
+      {kProviderCustom, 6, 1, "custom-warp-attention", 0, true, true,
+       true, supports_parallel_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_cooperative_custom, destroy_custom},
+      {kProviderCustom, 5, 1, "custom-parallel-attention", 0, true, true,
+       true, supports_parallel_custom, natural_alignment,
+       custom_resource_requirements, one_configuration, prepare_custom,
+       launch_parallel_custom, destroy_custom},
+
+      {kProviderCustom, 4, 1, "custom-additive-attention", 0, true, true,
+       true, supports_additive_custom, natural_alignment,
        custom_resource_requirements, one_configuration, prepare_custom,
        launch_custom, destroy_custom},
   };
@@ -402,6 +503,8 @@ const ImplementationRegistry& registry(uint32_t semantic) {
   switch (semantic) {
     case APXINF_ATTENTION_SEMANTIC_DENSE:
       return dense_entries;
+    case APXINF_ATTENTION_SEMANTIC_ADDITIVE:
+      return additive_entries;
     case APXINF_ATTENTION_SEMANTIC_KV_CACHE:
       return kv_cache_entries;
     case APXINF_ATTENTION_SEMANTIC_SEGMENTED:

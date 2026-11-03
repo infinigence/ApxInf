@@ -914,6 +914,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     ops::norm::norm(
                         self.backend.context(),
                         ops::NormArgs {
+                            intermediate_dtype: apxinf_core::DType::F32,
                             input,
                             output: None,
                             kind: ops::NormKind::Layer,
@@ -1424,6 +1425,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     ops::norm::norm(
                         self.backend.context(),
                         ops::NormArgs {
+                            intermediate_dtype: apxinf_core::DType::F32,
                             input: &hidden,
                             output: Some(&normalized),
                             kind: ops::NormKind::Layer,
@@ -1644,6 +1646,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             ops::norm::norm(
                 self.backend.context(),
                 ops::NormArgs {
+                    intermediate_dtype: apxinf_core::DType::F32,
                     input: &hidden,
                     output: Some(&normalized),
                     kind: ops::NormKind::Layer,
@@ -2946,6 +2949,7 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
                 ops::norm::norm(
                     backend.context(),
                     ops::NormArgs {
+                        intermediate_dtype: apxinf_core::DType::F32,
                         input,
                         output: None,
                         kind: ops::NormKind::Rms,

@@ -15,6 +15,7 @@ const GEMM_INPUT_TREES: &[&str] = &[
 ];
 
 const GEMM_INPUT_FILES: &[&str] = &[
+    "adapters/cublas_resources.h",
     "include/apxinf_cuda/gemm.h",
     "include/apxinf_cuda/gemm_types.h",
     "include/apxinf_cuda/status.h",

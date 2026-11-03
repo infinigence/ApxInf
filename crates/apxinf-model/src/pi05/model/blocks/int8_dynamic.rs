@@ -72,6 +72,7 @@ fn l3_adaptive_rms_bf16(ctx: &Context, input: &Tensor, style: &Tensor, eps: f32)
     ops::norm::norm(
         ctx,
         ops::NormArgs {
+            intermediate_dtype: apxinf_core::DType::F32,
             input,
             output: Some(&output),
             kind: ops::NormKind::Rms,

@@ -2247,6 +2247,7 @@ pub(crate) mod expert {
                     norm::norm(
                         ctx,
                         norm::NormArgs {
+                            intermediate_dtype: apxinf_core::DType::F32,
                             input: &hidden,
                             output: Some(&output),
                             kind: norm::NormKind::Rms,

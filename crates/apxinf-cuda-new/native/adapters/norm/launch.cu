@@ -254,7 +254,15 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
       spec.output_dtype == spec.dtype && spec.quantized_cols == 0 &&
       spec.output_scale_is_unit != 0 &&
       spec.has_native_output == static_cast<uint32_t>(writes_normalized(spec));
-  if (spec.version != APXINF_NORM_SPEC_VERSION ||
+  const bool plain_f32_layer = is_contract(spec, APXINF_NORM_OPERATION_NORM,
+      APXINF_NORM_STATISTIC_LAYER, APXINF_NORM_AFFINE_WEIGHT, APXINF_NORM_GATE_NONE)
+      && spec.numerics == APXINF_NORM_NUMERICS_FLEXIBLE && spec.weight_offset == 0 && unquantized;
+  const bool staged_rms = is_contract(spec, APXINF_NORM_OPERATION_NORM,
+      APXINF_NORM_STATISTIC_RMS, APXINF_NORM_AFFINE_WEIGHT, APXINF_NORM_GATE_NONE)
+      && spec.numerics == APXINF_NORM_NUMERICS_FLEXIBLE && spec.weight_offset == 0 && unquantized
+      && spec.intermediate_dtype == spec.dtype && spec.dtype != APXINF_DTYPE_F32;
+  if ((spec.intermediate_dtype != APXINF_DTYPE_F32 && !staged_rms) ||
+      spec.version != APXINF_NORM_SPEC_VERSION ||
       !valid_contract(spec) ||
       spec.quantization > APXINF_NORM_QUANTIZATION_ROWWISE_I8 ||
       spec.numerics > APXINF_NORM_NUMERICS_STABLE_PLANNING ||
@@ -265,7 +273,7 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
       (stable_decode &&
        (!stable_decode_plain && !stable_decode_residual ||
         spec.quantization != APXINF_NORM_QUANTIZATION_NONE)) ||
-      (spec.dtype == APXINF_DTYPE_F32 &&
+      (spec.dtype == APXINF_DTYPE_F32 && !plain_f32_layer &&
        (!stable_decode || !stable_decode_plain ||
         spec.quantization != APXINF_NORM_QUANTIZATION_NONE)) ||
       (spec.dtype != APXINF_DTYPE_F32 && spec.dtype != APXINF_DTYPE_F16 &&
@@ -742,8 +750,13 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
   if (is_contract(spec, APXINF_NORM_OPERATION_NORM,
                   APXINF_NORM_STATISTIC_RMS,
                   APXINF_NORM_AFFINE_WEIGHT, APXINF_NORM_GATE_NONE)) {
+    if (spec.intermediate_dtype != APXINF_DTYPE_F32) {
+      kernels::rms_norm_staged<T><<<rows, kThreads, 0, stream>>>(
+          input, weight, normalized, rows, cols, bindings.eps);
+    } else {
     kernels::rms_norm<T><<<rows, kThreads, 0, stream>>>(
         input, weight, normalized, rows, cols, bindings.eps);
+    }
   } else if (is_contract(spec, APXINF_NORM_OPERATION_NORM,
                          APXINF_NORM_STATISTIC_LAYER,
                          APXINF_NORM_AFFINE_WEIGHT,
@@ -810,7 +823,11 @@ extern "C" apxinf_status_t apxinf_norm_launch(
     validate_bindings(*spec, *bindings);
     apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
     apxinf::framework::check_cuda(
-        spec->weight_offset != 0
+        spec->intermediate_dtype != APXINF_DTYPE_F32
+            ? (spec->dtype == APXINF_DTYPE_BF16 ? launch<__nv_bfloat16>(*spec, *bindings) : launch<half>(*spec, *bindings))
+            : (spec->dtype == APXINF_DTYPE_F32 && spec->statistic == APXINF_NORM_STATISTIC_LAYER)
+            ? launch<float>(*spec, *bindings)
+            : spec->weight_offset != 0
             ? launch_weight_offset(*spec, *bindings)
             : spec->quantization != APXINF_NORM_QUANTIZATION_NONE
             ? (spec->dtype == APXINF_DTYPE_BF16

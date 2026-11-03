@@ -1,4 +1,4 @@
-use apxinf_core::{Result, Tensor};
+use apxinf_core::{DType, Result, Tensor};
 
 use super::contracts::{
     normalize, AffineKind, BiasOrder, GateKind, NormNumerics, Operation, Quantization, RawArgs,
@@ -69,6 +69,8 @@ pub enum QuantOut<'a> {
 
 /// Plain normalization with caller-owned native and/or quantized outputs.
 pub struct NormArgs<'a> {
+    /// Materialization before affine weighting; reduction accumulation remains F32.
+    pub intermediate_dtype: DType,
     pub input: &'a Tensor,
     pub output: Option<&'a Tensor>,
     pub kind: NormKind,
@@ -90,6 +92,7 @@ impl<'a> NormArgs<'a> {
                 offset: false,
             },
             quantized: None,
+            intermediate_dtype: DType::F32,
             numerics: NormNumerics::Flexible,
             eps,
         }
@@ -112,6 +115,7 @@ impl<'a> NormArgs<'a> {
                 offset: false,
             },
             quantized: None,
+            intermediate_dtype: DType::F32,
             numerics: NormNumerics::Flexible,
             eps,
         }
@@ -201,6 +205,12 @@ fn output_scale(value: Option<QuantOut<'_>>) -> f32 {
 
 /// Execute plain RMSNorm/LayerNorm through the normalization family.
 pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
+    if args.intermediate_dtype != DType::F32
+        && !(args.kind == NormKind::Rms && matches!(args.affine, Affine::Weight { bias: None, offset: false, .. })
+            && args.quantized.is_none() && args.numerics == NormNumerics::Flexible)
+    {
+        return Err(super::contracts::invalid("intermediate dtype requires plain unquantized weighted RMSNorm"));
+    }
     let output_scale = output_scale(args.quantized);
     match args.affine {
         Affine::Weight {
@@ -224,7 +234,8 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
             execute(
                 ctx,
                 RawArgs {
-                    operation: Operation::Norm,
+                    intermediate_dtype: args.intermediate_dtype,
+            operation: Operation::Norm,
                     statistic: Statistic::Rms,
                     affine: AffineKind::Weight,
                     gate: GateKind::None,
@@ -270,7 +281,8 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
             execute(
                 ctx,
                 RawArgs {
-                    operation: Operation::Norm,
+                    intermediate_dtype: args.intermediate_dtype,
+            operation: Operation::Norm,
                     statistic: statistic(args.kind),
                     affine: AffineKind::Weight,
                     gate: GateKind::None,
@@ -297,7 +309,8 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
         Affine::Adaptive { style } => execute(
             ctx,
             RawArgs {
-                operation: Operation::Norm,
+                intermediate_dtype: args.intermediate_dtype,
+            operation: Operation::Norm,
                 statistic: statistic(args.kind),
                 affine: AffineKind::Adaptive,
                 gate: GateKind::None,
@@ -370,7 +383,8 @@ pub fn fused_add_norm(ctx: &CudaContext, args: FusedAddNormArgs<'_>) -> Result<(
         return execute(
             ctx,
             RawArgs {
-                operation: Operation::FusedAddNorm,
+                intermediate_dtype: DType::F32,
+            operation: Operation::FusedAddNorm,
                 statistic: Statistic::Rms,
                 affine: AffineKind::Weight,
                 gate: GateKind::None,
@@ -491,6 +505,7 @@ pub fn fused_add_norm(ctx: &CudaContext, args: FusedAddNormArgs<'_>) -> Result<(
     execute(
         ctx,
         RawArgs {
+            intermediate_dtype: DType::F32,
             operation: Operation::FusedAddNorm,
             statistic: statistic(args.kind),
             affine,
@@ -546,6 +561,7 @@ pub fn residual_add(ctx: &CudaContext, args: ResidualAddArgs<'_>) -> Result<()> 
     execute(
         ctx,
         RawArgs {
+            intermediate_dtype: DType::F32,
             operation: Operation::ResidualAdd,
             statistic: Statistic::None,
             affine: AffineKind::None,

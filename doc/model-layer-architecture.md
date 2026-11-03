@@ -173,6 +173,7 @@ renamed as part of unrelated work.
 | Family / contract | Current organization and limits |
 | --- | --- |
 | PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| Fast-WAM / `VlaRuntime` | `cuda_fastwam/model/blocks/bf16.rs` owns layer composition and fixed modulation preparation; `model/` connects modalities and the schedule, `weights/host.rs` reads checkpoint data, `weights/bf16.rs` materializes `Bf16Weights` and named weight data before model construction; Blocks functions own activation conversion and consume that data without adding inherent methods to weight types, and `model_runner/{runner,prepare}.rs` owns execution; CUDA BF16 action-only fixed profile with native Wan VAE/UMT5, two resized RGB views and ten flow steps; [qualification and limits](fastwam.md) |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | `model/` (`WallossModel` + `ModelVariant` over BF16 and dynamic FP8, `blocks/`), `model_runner/` (`WallossModelRunner`, `prepare.rs`: explicit preparation policy/status, capture during preparation, one implicit plan replaced on shape change), `weights/`; per-request grids via `VlaMetadata::image_grid_thw` kept in the family's plan key; model-reported workspace backed by the config-only `workspace.rs` budget; rejected host requests preserve the cached plan; `check_walloss_module_boundaries.py`. See [WallOSS](walloss.md). |
@@ -188,7 +189,7 @@ separately migrated; do not rename or import them as part of an unrelated port.
 `PreparedInference::status` is `RuntimeManaged`. A successful legacy `prepare`
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
-The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
+The common loader accepts `model_variant` for PI0.5, Qwen-Drive, SmolVLA and Fast-WAM registry
 names, and for every Metal request. Metal admission reaches only a registered
 `metal_` factory, and each MLX family parses its variants locally; the common
 loader does not infer quantization from a shared CUDA precision choice. A new
