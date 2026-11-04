@@ -136,7 +136,7 @@ mod convolution {
     /// 4096-row cap and retained 543 MiB of scratch; 32 MiB retains ~280 MiB
     /// and costs ~210 extra tile launches for the whole request. Smaller
     /// values trade launches faster than they release bytes.
-    const CONV3D_WORKSPACE_LIMIT: usize = 512 * 1024 * 1024;
+    const CONV3D_WORKSPACE_LIMIT: usize = 32 * 1024 * 1024;
 
     pub(in crate::cuda_cosmos_policy::model::blocks::bf16) struct ConvWorkspace {
         convolution: PreparedConv3d,
