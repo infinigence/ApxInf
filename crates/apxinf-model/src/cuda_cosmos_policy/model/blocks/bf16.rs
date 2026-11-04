@@ -2010,6 +2010,10 @@ impl Bf16Blocks {
         &self.joint
     }
     pub fn workspace_bytes(&self) -> usize {
-        256 * 1024 * 1024
+        // All intermediate activations are model-owned persistent fields
+        // (allocated once, reused across requests and captured into the graph),
+        // so the ExecutionSession graph arena is not used for scratch. It still
+        // must be non-zero to construct an ExecutionSession.
+        1
     }
 }
