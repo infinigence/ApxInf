@@ -207,14 +207,11 @@ std::unique_ptr<Execution> fallback(
   constexpr uint32_t kProviderFa2 = 2;
   const auto& implementations = apxinf::attention::registry(spec.semantic);
   auto prepare_first_supported = [&](uint32_t provider_id,
-                                     bool exclude_provider,
-                                     uint32_t implementation_id = 0)
+                                     bool exclude_provider)
       -> std::unique_ptr<Execution> {
     for (const auto& implementation : implementations) {
       if ((provider_id != 0 &&
            (implementation.provider_id == provider_id) == exclude_provider) ||
-          (implementation_id != 0 &&
-           implementation.implementation_id != implementation_id) ||
           !apxinf::attention::supports_device(implementation, device) ||
           !implementation.supports(spec) ||
           (policy.graph_safe && !implementation.graph_safe) ||
@@ -234,21 +231,6 @@ std::unique_ptr<Execution> fallback(
     }
     return nullptr;
   };
-
-  constexpr uint32_t kProviderCutlass = 3;
-  constexpr uint32_t kCutlassPersistent = 2;
-
-  // The persistent-scheduler FMHA candidate (provider 3, implementation 2) is
-  // the only one pinned to the Cosmos Policy joint-latent attention shapes
-  // (1764x{512,1764}x128). It is a distinct implementation of the same math as
-  // the per-tile CUTLASS candidate (implementation 1), so a recipe written for
-  // one never restores the other; falling through would silently drop the
-  // persistent 2-CTA cluster. Select it by its exact identity so the unrelated
-  // 256x256x72 CUTLASS tile keeps its existing FA2-first ordering.
-  if (auto execution = prepare_first_supported(
-          kProviderCutlass, false, kCutlassPersistent)) {
-    return execution;
-  }
 
   // FA2 is the portable, production-scale no-timing baseline.  Trying an
   // exact specialization first made a clean PI0.5 run materially slower than
