@@ -17,7 +17,7 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use apxinf_cuda_new::{transfers as cuda_ops, CudaNewBackend};
 #[cfg(feature = "cuda")]
-use apxinf_core::{Backend, KvCache};
+use apxinf_core::KvCache;
 
 use super::weights::{LlamaWeights, TransformerLayer};
 
