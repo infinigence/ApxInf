@@ -4,6 +4,7 @@ members = [
     "crates/apxinf-cuda-new",
     "crates/apxinf-hip",
     "crates/apxinf-mlx",
+    "crates/apxinf-coreml",
     "crates/apxinf-loader",
     "crates/apxinf-model",
     "crates/apxinf-tokenizer",
@@ -30,6 +31,8 @@ cuda = [
 cuda-no-nvtx = ["dep:apxinf-cuda-new", "apxinf-model/cuda"]
 # Native Apple Metal execution through an explicitly configured MLX C++ SDK.
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "apxinf-model/mlx"]
+# Metal plus Core ML stages on the Apple Neural Engine (for example Clef on GPU+ANE).
+coreml = ["mlx", "apxinf-model/coreml"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # `cuda` already links cuda-new and enables every CUDA model family, Qwen3.8
 # included — see crates/apxinf-model/Cargo.toml.
