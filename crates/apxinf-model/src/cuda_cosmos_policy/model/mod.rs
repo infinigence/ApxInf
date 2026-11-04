@@ -49,7 +49,6 @@ fn schedule() -> Vec<SolverStep> {
 pub(super) struct CosmosPolicyModel {
     blocks: Bf16Blocks,
     steps: usize,
-    constants_prepared: bool,
 }
 impl CosmosPolicyModel {
     pub fn new(
@@ -57,31 +56,16 @@ impl CosmosPolicyModel {
         weights: Rc<Bf16Weights>,
         inputs: &Inputs,
         convolution: &crate::cuda_cosmos_policy::backend::Conv3dPolicy,
+        gemm: &GemmPolicy,
+        attention: &AttentionPolicy,
     ) -> Result<Self> {
         let schedule = schedule();
         Ok(Self {
-            blocks: Bf16Blocks::new(ctx, weights, inputs, &schedule, convolution)?,
+            blocks: Bf16Blocks::new(ctx, weights, inputs, &schedule, convolution, gemm, attention)?,
             steps: schedule.len(),
-            constants_prepared: false,
         })
     }
-    /// Prepare checkpoint-fixed blank-frame features before recording the
-    /// request execution sequence. Inputs and weights are owned by this model.
-    pub fn prepare_constants(
-        &mut self,
-        gemm: &GemmPolicy,
-        attention: &AttentionPolicy,
-    ) -> Result<()> {
-        self.blocks.prepare_constants(gemm, attention)?;
-        self.constants_prepared = true;
-        Ok(())
-    }
     pub fn forward(&mut self, gemm: &GemmPolicy, attention: &AttentionPolicy) -> Result<()> {
-        if !self.constants_prepared {
-            return Err(Error::Other(
-                "Cosmos fixed features have not been prepared".into(),
-            ));
-        }
         self.blocks.encode_observation(gemm, attention)?;
         self.blocks.initial_state()?;
         for step in 0..self.steps {

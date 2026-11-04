@@ -162,6 +162,8 @@ impl ModelRunner {
             self.weights.clone(),
             &inputs,
             &convolution,
+            &gemm,
+            &attention,
         )?;
         let workspace_bytes = model.workspace_bytes();
         let generator = crate::cuda_cosmos_policy::backend::sampling::create_normal_generator(
@@ -201,10 +203,6 @@ impl ModelRunner {
                 attention,
                 ..
             } = &mut state;
-            // Constant computation has a different prepared-operator sequence
-            // from requests. Record it separately, then record only the request
-            // traversal that eager execution and Graph capture will replay.
-            session.prepare(|| model.prepare_constants(gemm, attention))?;
             session.prepare(|| model.forward(gemm, attention))?;
         }
         // The captured traversal replays exactly the operators prepared above;

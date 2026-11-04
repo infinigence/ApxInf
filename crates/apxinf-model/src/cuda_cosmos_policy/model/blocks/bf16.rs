@@ -1668,6 +1668,8 @@ impl Bf16Blocks {
         inputs: &Inputs,
         schedule: &[SolverStep],
         convolution: &crate::cuda_cosmos_policy::backend::Conv3dPolicy,
+        gemm: &GemmPolicy,
+        attention: &AttentionPolicy,
     ) -> Result<Self> {
         let rgb = inputs.rgb.clone();
         let images = bf(&ctx, 2 * PIXELS, 3)?;
@@ -1679,13 +1681,13 @@ impl Bf16Blocks {
             ctx.device_id(),
         )?;
         // Frames 0..4 are the constant -1 padding the model never overwrites, so
-        // their causal activations are computed once in prepare_constants. Only
+        // their causal activations are computed once at construction. Only
         // frames 5..12 (the two camera views) are encoded per request.
         let first_input = slice(&video, 0, PIXELS * 3, vec![1, 224, 224, 3])?;
         let prefix_input = slice(&video, PIXELS * 3, 4 * PIXELS * 3, vec![4, 224, 224, 3])?;
         let rest_input = slice(&video, 5 * PIXELS * 3, 8 * PIXELS * 3, vec![8, 224, 224, 3])?;
-        let first = VaeChunk::prepare(convolution, &ctx, &weights.vae, &first_input, 13, None)?;
-        let prefix = VaeChunk::prepare(
+        let mut first = VaeChunk::prepare(convolution, &ctx, &weights.vae, &first_input, 13, None)?;
+        let mut prefix = VaeChunk::prepare(
             convolution,
             &ctx,
             &weights.vae,
@@ -1832,6 +1834,16 @@ impl Bf16Blocks {
             .map(|i| ((i / 784) * 9 * 784 + 4 * 784 + i % 784) as u32)
             .collect();
         let readout = PreparedIndexedMean::new(&ctx, &joint, &actions, &action_map)?;
+        // Checkpoint-fixed constants: the -1 padding frames and the fixed
+        // 2ab-schedule modulation never change per request, so they are
+        // computed once here, outside the request graph, and reused by every
+        // request traversal. This keeps plan preparation to a single
+        // session.prepare(forward).
+        first.forward(&ctx, &weights.vae, attention)?;
+        prefix.forward(&ctx, &weights.vae, attention)?;
+        for step in &steps {
+            dit.prepare_modulation(&ctx, &weights.dit, &step.time, &step.modulation, gemm)?;
+        }
         Ok(Self {
             ctx,
             weights,
@@ -1865,29 +1877,6 @@ impl Bf16Blocks {
             steps,
             readout,
         })
-    }
-    /// Frame zero is always -1 RGB, independent of every request. Keep its
-    /// intermediate activations alive: the following VAE chunk reads these
-    /// tensors as its causal history. Fixed schedule modulation is prepared here
-    /// too, with shared scratch and identical BF16 operations for all five steps.
-    /// These computations run outside the request graph.
-    pub fn prepare_constants(
-        &mut self,
-        gemm: &GemmPolicy,
-        attention: &AttentionPolicy,
-    ) -> Result<()> {
-        self.first.forward(&self.ctx, &self.weights.vae, attention)?;
-        self.prefix.forward(&self.ctx, &self.weights.vae, attention)?;
-        for step in &self.steps {
-            self.dit.prepare_modulation(
-                &self.ctx,
-                &self.weights.dit,
-                &step.time,
-                &step.modulation,
-                gemm,
-            )?;
-        }
-        Ok(())
     }
     pub fn encode_observation(
         &mut self,
