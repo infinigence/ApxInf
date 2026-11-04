@@ -1,6 +1,10 @@
 //! Native Clef Flash on Apple Metal: Qwen3.5 hybrid backbone (affine Q4) in
-//! the stock MLX-VLM composition, and the BF16 joint schema head. No Python
-//! model execution.
+//! the stock MLX-VLM composition or the optimized GPU composition, and the
+//! BF16 joint schema head. No Python model execution.
+#[cfg(feature = "coreml")]
+mod ane;
+#[cfg(feature = "coreml")]
+mod ane_admission;
 mod config;
 mod encode;
 mod model;
@@ -17,7 +21,7 @@ use crate::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Device, Error, Result};
 use apxinf_mlx::{Array, MlxBackend, MlxDType};
 use apxinf_tokenizer::Tokenizer;
-use model::Network;
+use model::{Composition, Network};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -26,17 +30,28 @@ pub struct ClefRunner {
     network: Network,
 }
 
+/// MLX architectures where the optimized GPU composition passed its quality
+/// and paired latency gates: the M1 Pro (2026-10-17). `auto` uses the
+/// reference composition everywhere else.
+const GPU_QUALIFIED_ARCHITECTURES: &[&str] = &["applegpu_g13s"];
+
 /// Device-independent option admission, checked before the checkpoint is read.
-/// `reference` is the only composition; `auto` selects it.
-fn admit(options: &LoadOptions) -> Result<()> {
-    if !matches!(
-        options.model_variant.as_deref(),
-        None | Some("auto" | "reference")
-    ) {
-        return Err(Error::Contract(
-            "Clef MLX supports the auto and reference variants",
-        ));
-    }
+/// Returns the requested composition; `None` is `auto`, which picks the
+/// composition qualified on the device.
+fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
+    let requested = match options.model_variant.as_deref() {
+        None | Some("auto") => None,
+        Some("reference") => Some(Composition::Reference),
+        #[cfg(feature = "coreml")]
+        Some("gpu-ane-columns") => Some(Composition::GpuAneColumns),
+        #[cfg(feature = "coreml")]
+        Some("gpu-ane-neurons") => Some(Composition::GpuAneNeurons),
+        Some(_) => {
+            return Err(Error::Contract(
+                "Clef MLX variant is unavailable in this build",
+            ))
+        }
+    };
     if !matches!(
         options.precision,
         ModelPrecision::Auto | ModelPrecision::Bf16
@@ -54,7 +69,17 @@ fn admit(options: &LoadOptions) -> Result<()> {
              calibration, synthetic weights and auxiliary assets are unsupported",
         ));
     }
-    Ok(())
+    Ok(requested)
+}
+
+/// `auto` runs an optimized composition only on an architecture where it
+/// qualified.
+fn select(requested: Option<Composition>, architecture: &str) -> Composition {
+    requested.unwrap_or(if GPU_QUALIFIED_ARCHITECTURES.contains(&architecture) {
+        Composition::Gpu
+    } else {
+        Composition::Reference
+    })
 }
 
 pub fn load(
@@ -66,7 +91,7 @@ pub fn load(
     if !matches!(device, Device::Metal(_)) {
         return Err(Error::UnsupportedDevice(device));
     }
-    admit(options)?;
+    let requested = admit(options)?;
     let native = backend
         .as_any()
         .downcast_ref::<MlxBackend>()
@@ -88,12 +113,21 @@ pub fn load(
     let config = Config::from_json(&read("config.json")?, &read("joint_head_config.json")?)?;
     let tokenizer = Tokenizer::from_file(path.join("tokenizer.json"))?;
     let stream = native.stream().clone();
+    let architecture = stream
+        .metal_caps()
+        .map_or("", |caps| caps.architecture.as_str());
+    let composition = select(requested, architecture);
+    if requested.is_none() && composition == Composition::Reference {
+        eprintln!(
+            "Clef: no optimized composition is qualified on {architecture:?}; using the reference composition"
+        );
+    }
     let backbone = weights::Backbone::load(&config, &stream, path)?;
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
     Ok(LoadedModel::Decision(DecisionModel::Schema(Box::new(
         ClefRunner {
             tokenizer,
-            network: Network::new(config, stream, backbone, head)?,
+            network: Network::new(config, stream, backbone, head, composition)?,
         },
     ))))
 }
@@ -157,13 +191,14 @@ mod tests {
 
     #[test]
     fn admission_needs_no_device_or_checkpoint() {
-        assert!(admit(&LoadOptions::default()).is_ok());
-        for variant in ["auto", "reference"] {
+        assert_eq!(admit(&LoadOptions::default()).unwrap(), None);
+        for (variant, composition) in [("auto", None), ("reference", Some(Composition::Reference))]
+        {
             let options = LoadOptions {
                 model_variant: Some(variant.into()),
                 ..LoadOptions::default()
             };
-            assert!(admit(&options).is_ok(), "{variant}");
+            assert_eq!(admit(&options).unwrap(), composition, "{variant}");
         }
         for options in [
             LoadOptions {
@@ -184,6 +219,47 @@ mod tests {
             },
         ] {
             assert!(admit(&options).is_err());
+        }
+    }
+
+    #[test]
+    fn coreml_requires_an_explicit_available_variant() {
+        let options = LoadOptions {
+            model_variant: Some("gpu-ane-columns".into()),
+            ..LoadOptions::default()
+        };
+        #[cfg(feature = "coreml")]
+        {
+            assert_eq!(admit(&options).unwrap(), Some(Composition::GpuAneColumns));
+            assert_eq!(select(admit(&options).unwrap(), ""), Composition::GpuAneColumns);
+        }
+        #[cfg(not(feature = "coreml"))]
+        assert!(admit(&options).is_err());
+        let options = LoadOptions {
+            model_variant: Some("gpu-ane-neurons".into()),
+            ..LoadOptions::default()
+        };
+        #[cfg(feature = "coreml")]
+        {
+            assert_eq!(admit(&options).unwrap(), Some(Composition::GpuAneNeurons));
+            assert_eq!(select(admit(&options).unwrap(), ""), Composition::GpuAneNeurons);
+        }
+        #[cfg(not(feature = "coreml"))]
+        assert!(admit(&options).is_err());
+    }
+
+    #[test]
+    fn auto_runs_each_composition_only_on_its_qualified_architectures() {
+        assert_eq!(select(None, "applegpu_g13s"), Composition::Gpu);
+        assert_eq!(select(None, "applegpu_g16g"), Composition::Reference);
+        for other in ["applegpu_g14g", "applegpu_g13g", ""] {
+            assert_eq!(select(None, other), Composition::Reference, "{other}");
+        }
+        for architecture in ["applegpu_g13s", "applegpu_g16g"] {
+            assert_eq!(
+                select(Some(Composition::Reference), architecture),
+                Composition::Reference
+            );
         }
     }
 }
