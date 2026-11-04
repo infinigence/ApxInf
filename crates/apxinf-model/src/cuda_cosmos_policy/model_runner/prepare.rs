@@ -4,7 +4,8 @@ use crate::cuda_cosmos_policy::backend::ops::GemmPolicy;
 use crate::cuda_cosmos_policy::backend::{
     AttentionPolicy, CapturedGraph, CudaBuffer, CudaContext, ExecutionSession,
 };
-use crate::cuda_cosmos_policy::model::{CosmosPolicyModel, Inputs, ACTION_SHAPE};
+use crate::cuda_cosmos_policy::config::ACTION_SHAPE;
+use crate::cuda_cosmos_policy::model::{CosmosPolicyModel, Inputs};
 use crate::vla::*;
 use apxinf_core::{DType, Error, NormalGenerator, Result, Tensor};
 use std::{cell::RefCell, rc::Rc};

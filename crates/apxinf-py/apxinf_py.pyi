@@ -55,6 +55,7 @@ class ModelRunner:
         sampling_seed: int = ...,
         assets: dict[str, str] | None = ...,
         model_variant: str | None = ...,
+        weight_layout_budget_bytes: int | None = ...,
     ) -> "ModelRunner":
         """Load a checkpoint through the unified ``AutoModel`` frontend.
 
@@ -69,6 +70,12 @@ class ModelRunner:
         the absent views but skips their patch tokens.
         ``num_flow_steps`` and ``flow_start_time`` are PI0.5 deployment overrides.
         ``sampling_seed`` seeds the implicit device-side noise stream.
+        ``weight_layout_budget_bytes`` limits live extra PI0.5 BF16/FP8
+        language gate/up weight layouts. ``None`` permits one extra per weight
+        for concurrent consumers, released with its last execution/graph;
+        retired bases may change layout in place. ``0`` uses canonical layouts.
+        Temporary buffers and execution
+        workspaces are excluded.
         """
         ...
 
@@ -204,7 +211,7 @@ class ModelRunner:
     def accepts_rgb_u8(self) -> bool: ...
 
 class DecisionRunner:
-    """A loaded decision model handle (d3-mini, etc.)."""
+    """A loaded decision model handle for encoded-prompt or schema requests."""
 
     @staticmethod
     def load(
@@ -215,8 +222,9 @@ class DecisionRunner:
     ) -> "DecisionRunner":
         """Load a decision model checkpoint.
 
-        ``model_path`` — directory containing decision_config.json and tokenizer.json.
-        ``device`` — ``cuda:N`` (default ``cuda:0``). d3 is CUDA-only.
+        ``model_path`` is the checkpoint directory detected by AutoModel.
+        ``device`` defaults to ``cuda:0``. D3 requires CUDA; Clef requires
+        ``metal:N`` and a build with the ``mlx`` feature.
         ``autotune`` — tune missing GEMM recipes from the first request.
         ``tuning_dir`` — directory to persist tuning recipes.
         """
@@ -227,7 +235,8 @@ class DecisionRunner:
         token_ids: npt.NDArray[np.uint32],
         candidate_count: int,
     ) -> dict:
-        """Run a text decision and return scored codes.
+        """Run a text decision and return scored codes. Encoded-prompt models
+        (D3) only; a schema model (Clef) raises RuntimeError.
 
         Returns:
             dict with ``selected_index`` (int) and ``scores``
@@ -235,9 +244,26 @@ class DecisionRunner:
         """
         ...
 
+    def decide_schema(self, request_json: str) -> dict:
+        """Run a schema decision on the same loaded model.
+
+        ``request_json`` contains ``{"state": ..., "questions": {id: question}}``.
+        Each question has ``type`` and optional ``instructions`` and ``criteria``.
+        Question IDs must be unique. The model family defines question semantics.
+
+        Returns ``{"answers": [...]}`` in request order. Each answer has
+        ``question_id``, ``selected_index`` and ``scores`` in option order.
+        Each score has ``code``, ``token_id`` (int or None), and ``probability``.
+        Probabilities remain grouped by question without renormalization.
+        Invalid JSON or schema raises ValueError. A model that takes encoded
+        prompts (D3) and other runtime errors raise RuntimeError.
+        """
+        ...
+
     @property
     def codes(self) -> list[str]:
-        """Available code names in the package code table."""
+        """Available code names in the package code table. Encoded-prompt
+        models only; a schema model raises RuntimeError."""
         ...
     @property
     def num_codes(self) -> int:

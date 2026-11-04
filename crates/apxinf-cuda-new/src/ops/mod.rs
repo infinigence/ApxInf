@@ -60,7 +60,7 @@ pub use gemm::{
     gemv, gemv_bias, pack_swiglu_weight_host, BlockQuantizedSwiGluArgs, GemmArgs, GemmBiasArgs,
     GemmBiasGeluArgs, GemmBiasResidualArgs, GemmGegluArgs, GemmNumerics, GemmPolicy,
     GemmQuantization, GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales,
-    WeightVersion,
+    RepackedWeight, WeightVersion,
 };
 pub use norm::{
     channel_l2_norm, channel_l2_norm_silu, fused_add_channel_l2_norm_silu, fused_add_norm,

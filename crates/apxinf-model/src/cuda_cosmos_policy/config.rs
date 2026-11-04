@@ -1,11 +1,29 @@
-use super::model::{
-    ACTION_SHAPE, DENOISER_CALLS, IMAGE_SIZE, INITIAL_LATENT_SHAPE, NUM_TASKS, NUM_VIEWS,
-    STATE_DIM, TEXT_TOKENS, TEXT_WIDTH,
-};
 use apxinf_core::{Error, Result};
 use serde::Deserialize;
 use std::path::Path;
 
+/// The single source of truth for the pinned LIBERO direct profile geometry.
+/// `config.rs` validates the prepared assets against these values, the runner
+/// builds its public `VlaContract` from them, and the blocks allocate from
+/// them, so the numbers are not restated per module.
+pub(crate) const NUM_VIEWS: usize = 2;
+pub(crate) const IMAGE_SIZE: usize = 224;
+pub(crate) const STATE_DIM: usize = 9;
+pub(crate) const DENOISER_CALLS: usize = 5;
+pub(crate) const ACTION_HORIZON: usize = 16;
+pub(crate) const ACTION_DIM: usize = 7;
+pub(crate) const LATENT_FRAMES: usize = 9;
+pub(crate) const LATENT_SIDE: usize = 28;
+pub(crate) const LATENT_CHANNELS: usize = 16;
+pub(crate) const TEXT_TOKENS: usize = 512;
+pub(crate) const TEXT_WIDTH: usize = 1024;
+pub(crate) const NUM_TASKS: usize = 40;
+
+/// `[1, 16, 9, 28, 28]`: the complete joint latent the sampler consumes.
+pub(crate) const INITIAL_LATENT_SHAPE: [usize; 5] =
+    [1, LATENT_CHANNELS, LATENT_FRAMES, LATENT_SIDE, LATENT_SIDE];
+/// `[16, 7]`: the public action chunk, independent of the latent geometry.
+pub(crate) const ACTION_SHAPE: [usize; 2] = [ACTION_HORIZON, ACTION_DIM];
 pub const PROFILE: &str = "libero-2b-direct-v1";
 pub const SOURCE_REVISION: &str = "18a2accadf4e7a3531e56754102af5a24d2316da";
 pub const CHECKPOINT_REVISION: &str = "cb689ec0e3347c13667d70a78a3447388f5c3bb8";

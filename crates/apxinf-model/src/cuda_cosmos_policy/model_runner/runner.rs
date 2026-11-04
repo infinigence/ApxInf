@@ -7,7 +7,7 @@ use apxinf_core::{DType, Device, Error, Result};
 use std::{cell::RefCell, rc::Rc};
 
 use super::prepare::Plan;
-use crate::cuda_cosmos_policy::model::{
+use crate::cuda_cosmos_policy::config::{
     ACTION_DIM, ACTION_HORIZON, ACTION_SHAPE, IMAGE_SIZE, INITIAL_LATENT_SHAPE, NUM_TASKS,
     NUM_VIEWS, STATE_DIM,
 };

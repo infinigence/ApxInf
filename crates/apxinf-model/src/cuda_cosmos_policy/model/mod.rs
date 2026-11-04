@@ -8,29 +8,6 @@ use apxinf_core::{Error, Result, Tensor};
 use blocks::Bf16Blocks;
 use std::rc::Rc;
 
-/// The single source of truth for the pinned LIBERO direct profile geometry.
-/// `config.rs` validates the prepared assets against these values, the runner
-/// builds its public `VlaContract` from them, and the blocks allocate from
-/// them, so the numbers are not restated per module.
-pub(super) const NUM_VIEWS: usize = 2;
-pub(super) const IMAGE_SIZE: usize = 224;
-pub(super) const STATE_DIM: usize = 9;
-pub(super) const DENOISER_CALLS: usize = 5;
-pub(super) const ACTION_HORIZON: usize = 16;
-pub(super) const ACTION_DIM: usize = 7;
-pub(super) const LATENT_FRAMES: usize = 9;
-pub(super) const LATENT_SIDE: usize = 28;
-pub(super) const LATENT_CHANNELS: usize = 16;
-pub(super) const TEXT_TOKENS: usize = 512;
-pub(super) const TEXT_WIDTH: usize = 1024;
-pub(super) const NUM_TASKS: usize = 40;
-
-/// `[1, 16, 9, 28, 28]`: the complete joint latent the sampler consumes.
-pub(super) const INITIAL_LATENT_SHAPE: [usize; 5] =
-    [1, LATENT_CHANNELS, LATENT_FRAMES, LATENT_SIDE, LATENT_SIDE];
-/// `[16, 7]`: the public action chunk, independent of the latent geometry.
-pub(super) const ACTION_SHAPE: [usize; 2] = [ACTION_HORIZON, ACTION_DIM];
-
 /// Canonical device inputs, allocated and rebound by model_runner.
 pub(super) struct Inputs {
     pub rgb: CudaBuffer,

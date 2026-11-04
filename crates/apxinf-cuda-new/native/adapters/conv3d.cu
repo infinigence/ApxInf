@@ -229,7 +229,7 @@ void prepare_lowered(apxinf_runtime_t runtime, Execution& e, uint64_t limit) {
     gp.workspace_limit=(limit-mul(tile_rows,row_bytes))/2;gp.allow_fallback=gp.graph_safe=gp.deterministic=1;
     gp.cache_dir="";
     apxinf_gemm_execution_t raw=nullptr;
-    check_status(apxinf_gemm_prepare(runtime,&gs,&gp,&gb,&raw));
+    check_status(apxinf_gemm_prepare(runtime,&gs,&gp,&gb,&raw,nullptr));
     tile->gemm=std::shared_ptr<apxinf_gemm_execution>(raw,apxinf_gemm_destroy);
     plans[tile->rows]=tile->gemm;
     e.tiles.push_back(std::move(tile));
