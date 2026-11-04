@@ -1064,7 +1064,7 @@ mod dit {
         AttentionArgs, AttentionPolicy, CudaContext, NormArgs, PointwiseActivation,
     };
     use crate::cuda_cosmos_policy::weights::{upload, Attention, DitWeights, Modulation};
-    use apxinf_core::{Result, Tensor};
+    use apxinf_core::{DType, Result, Shape, Tensor};
 
     const TOKENS: usize = 9 * 14 * 14;
     const WIDTH: usize = 2048;
@@ -1147,27 +1147,25 @@ mod dit {
     pub(in crate::cuda_cosmos_policy::model::blocks::bf16) struct Dit {
         pub patches: Tensor,
         pub output: Tensor,
-        pub hidden: Tensor,
-        normalized: Tensor,
-
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        text_kv: Vec<[Tensor; 2]>,
-        attended: Tensor,
-        projected: Tensor,
-        mlp: Tensor,
-        time_hidden: Tensor,
-        time_global: Tensor,
-        time_normalized: Tensor,
-        time_activated: Tensor,
-        modulation_hidden: Tensor,
-        modulation: Tensor,
-        final_modulation: Tensor,
-        final_global: Tensor,
         final_global_ids: Tensor,
         rotary: Rotary,
     }
+
+    /// Per-request intermediate activations. Allocated from the session arena
+    /// at the start of a request traversal and dropped when it completes, so
+    /// these are request-scoped scratch rather than model state.
+    pub(in crate::cuda_cosmos_policy::model::blocks::bf16) struct DitScratch {
+        hidden: Tensor,
+        normalized: Tensor,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        attended: Tensor,
+        projected: Tensor,
+        mlp: Tensor,
+        pub(in crate::cuda_cosmos_policy::model::blocks::bf16) text_kv: Vec<[Tensor; 2]>,
+    }
+
     impl Dit {
         pub fn prepare(ctx: &CudaContext, w: &DitWeights, ntk: [f32; 3]) -> Result<Self> {
             let final_global_ids = indices(
@@ -1179,30 +1177,33 @@ mod dit {
             Ok(Self {
                 patches: bf(ctx, TOKENS, 72)?,
                 output: bf(ctx, TOKENS, 64)?,
-                hidden: bf(ctx, TOKENS, WIDTH)?,
-                normalized: bf(ctx, TOKENS, WIDTH)?,
-
-                q: bf(ctx, TOKENS, WIDTH)?,
-                k: bf(ctx, TOKENS, WIDTH)?,
-                v: bf(ctx, TOKENS, WIDTH)?,
+                final_global_ids,
+                rotary: Rotary::new(ctx, w, ntk)?,
+            })
+        }
+        /// Arena bytes required by one DiT request traversal (all DitScratch
+        /// tensors coexist for the whole forward pass).
+        pub(super) fn scratch_bytes(w: &DitWeights) -> usize {
+            let core = TOKENS * WIDTH * 2 * 7 + TOKENS * 8192 * 2;
+            let text_kv = 2 * 512 * WIDTH * 2 * w.blocks.len();
+            core + text_kv
+        }
+        pub(super) fn scratch(&self, ctx: &CudaContext, w: &DitWeights) -> Result<DitScratch> {
+            let a = |rows: usize, cols: usize| ctx.allocate_output(Shape::new(vec![rows, cols]), DType::BF16);
+            Ok(DitScratch {
+                hidden: a(TOKENS, WIDTH)?,
+                normalized: a(TOKENS, WIDTH)?,
+                q: a(TOKENS, WIDTH)?,
+                k: a(TOKENS, WIDTH)?,
+                v: a(TOKENS, WIDTH)?,
+                attended: a(TOKENS, WIDTH)?,
+                projected: a(TOKENS, WIDTH)?,
+                mlp: a(TOKENS, 8192)?,
                 text_kv: w
                     .blocks
                     .iter()
-                    .map(|_| Ok([bf(ctx, 512, WIDTH)?, bf(ctx, 512, WIDTH)?]))
+                    .map(|_| Ok([a(512, WIDTH)?, a(512, WIDTH)?]))
                     .collect::<Result<_>>()?,
-                attended: bf(ctx, TOKENS, WIDTH)?,
-                projected: bf(ctx, TOKENS, WIDTH)?,
-                mlp: bf(ctx, TOKENS, 8192)?,
-                time_hidden: bf(ctx, 9, WIDTH)?,
-                time_global: bf(ctx, 9, 6144)?,
-                time_normalized: bf(ctx, 9, WIDTH)?,
-                time_activated: bf(ctx, 9, WIDTH)?,
-                modulation_hidden: bf(ctx, 9, 256)?,
-                modulation: bf(ctx, 9, 6144)?,
-                final_modulation: bf(ctx, 9, 4096)?,
-                final_global: bf(ctx, 9, 4096)?,
-                final_global_ids,
-                rotary: Rotary::new(ctx, w, ntk)?,
             })
         }
         fn compute_modulation(
@@ -1210,32 +1211,37 @@ mod dit {
             ctx: &CudaContext,
             w: &Modulation,
             final_layer: bool,
+            time_activated: &Tensor,
+            modulation_hidden: &Tensor,
+            modulation: &Tensor,
+            time_global: &Tensor,
+            final_modulation: &Tensor,
+            final_global: &Tensor,
             policy: &GemmPolicy,
         ) -> Result<()> {
-            linear(
-                ctx,
-                &self.time_activated,
-                &w.down,
-                &self.modulation_hidden,
-                policy,
-            )?;
-            let (modulation, global) = if final_layer {
-                (&self.final_modulation, &self.final_global)
+            linear(ctx, time_activated, &w.down, modulation_hidden, policy)?;
+            let (out, global) = if final_layer {
+                (final_modulation, final_global)
             } else {
-                (&self.modulation, &self.time_global)
+                (modulation, time_global)
             };
-            linear(ctx, &self.modulation_hidden, &w.up, modulation, policy)?;
-            add(ctx, modulation, global, modulation)?;
+            linear(ctx, modulation_hidden, &w.up, out, policy)?;
+            add(ctx, out, global, out)?;
             Ok(())
         }
-        fn modulate(&self, ctx: &CudaContext, modulation: &Tensor) -> Result<()> {
+        fn modulate(
+            &self,
+            ctx: &CudaContext,
+            scratch: &DitScratch,
+            modulation: &Tensor,
+        ) -> Result<()> {
             let parts = modulation.numel() / (9 * WIDTH);
             let style = modulation.reshape(vec![9, parts, WIDTH])?;
             norm(
                 ctx,
                 NormArgs {
-                    input: &self.hidden,
-                    output: Some(&self.normalized),
+                    input: &scratch.hidden,
+                    output: Some(&scratch.normalized),
                     kind: NormKind::Layer,
                     affine: Affine::GroupedAdaptive {
                         style: &style,
@@ -1256,9 +1262,10 @@ mod dit {
             ctx: &CudaContext,
             w: &DitWeights,
             text: &Tensor,
+            text_kv: &[[Tensor; 2]],
             gemm: &GemmPolicy,
         ) -> Result<()> {
-            for (block, [k, v]) in w.blocks.iter().zip(&self.text_kv) {
+            for (block, [k, v]) in w.blocks.iter().zip(text_kv) {
                 let w = &block.cross_attention;
                 linear(ctx, text, &w.k, k, gemm)?;
                 linear(ctx, text, &w.v, v, gemm)?;
@@ -1272,6 +1279,7 @@ mod dit {
         fn attend(
             &self,
             ctx: &CudaContext,
+            scratch: &DitScratch,
             w: &Attention,
             text: Option<&[Tensor; 2]>,
             gemm: &GemmPolicy,
@@ -1279,40 +1287,41 @@ mod dit {
         ) -> Result<()> {
             let (k, v) = match text {
                 Some([k, v]) => (k, v),
-                None => (&self.k, &self.v),
+                None => (&scratch.k, &scratch.v),
             };
             if text.is_none() {
                 // Independent projections share the normalized input. Prepare V
                 // first, then consume each Q/K projection immediately.
-                linear(ctx, &self.normalized, &w.v, v, gemm)?;
-                linear(ctx, &self.normalized, &w.q, &self.q, gemm)?;
-                self.rotary.apply_normalized(ctx, &self.q, &w.q_norm)?;
-                linear(ctx, &self.normalized, &w.k, k, gemm)?;
+                linear(ctx, &scratch.normalized, &w.v, v, gemm)?;
+                linear(ctx, &scratch.normalized, &w.q, &scratch.q, gemm)?;
+                self.rotary.apply_normalized(ctx, &scratch.q, &w.q_norm)?;
+                linear(ctx, &scratch.normalized, &w.k, k, gemm)?;
                 self.rotary.apply_normalized(ctx, k, &w.k_norm)?;
             } else {
-                linear(ctx, &self.normalized, &w.q, &self.q, gemm)?;
+                linear(ctx, &scratch.normalized, &w.q, &scratch.q, gemm)?;
                 norm(
                     ctx,
                     NormArgs::rms(
-                        &matrix(&self.q, 128)?,
+                        &matrix(&scratch.q, 128)?,
                         &w.q_norm,
-                        &mut matrix(&self.q, 128)?,
+                        &mut matrix(&scratch.q, 128)?,
                         1e-6,
                     ),
                 )?;
             }
-            let q = self.q.reshape(vec![1, TOKENS, 16, 128])?;
+            let q = scratch.q.reshape(vec![1, TOKENS, 16, 128])?;
             let k = k.reshape(vec![1, k.numel() / WIDTH, 16, 128])?;
             let v = v.reshape(k.shape().clone())?;
-            let mut out = self.attended.reshape(q.shape().clone())?;
+            let mut out = scratch.attended.reshape(q.shape().clone())?;
             let mut args = AttentionArgs::new(&q, &k, &v, &mut out);
             args.policy = policy.clone();
             attention(ctx, args)?;
-            linear(ctx, &self.attended, &w.output, &self.projected, gemm)
+            linear(ctx, &scratch.attended, &w.output, &scratch.projected, gemm)
         }
         fn residual_modulate(
             &self,
             ctx: &CudaContext,
+            scratch: &DitScratch,
             modulation: &Tensor,
             next: &Tensor,
         ) -> Result<()> {
@@ -1321,15 +1330,15 @@ mod dit {
             fused_add_norm(
                 ctx,
                 FusedAddNormArgs {
-                    input: &self.projected,
+                    input: &scratch.projected,
                     bias: None,
-                    residual: &self.hidden,
+                    residual: &scratch.hidden,
                     gate: Some(ResidualGate::GroupedStyle {
                         style: &gate,
                         numerics: NormNumerics::StagedBf16,
                     }),
-                    hidden: &self.hidden,
-                    normalized: Some(&self.normalized),
+                    hidden: &scratch.hidden,
+                    normalized: Some(&scratch.normalized),
                     kind: NormKind::Layer,
                     affine: Affine::GroupedAdaptive {
                         style: &style,
@@ -1350,32 +1359,34 @@ mod dit {
             prepared: &StepModulation,
             gemm: &GemmPolicy,
         ) -> Result<()> {
-            linear(ctx, time, &w.time_in, &self.time_hidden, gemm)?;
+            let time_hidden = bf(ctx, 9, WIDTH)?;
+            let time_global = bf(ctx, 9, 6144)?;
+            let time_normalized = bf(ctx, 9, WIDTH)?;
+            let time_activated = bf(ctx, 9, WIDTH)?;
+            let modulation_hidden = bf(ctx, 9, 256)?;
+            let modulation = bf(ctx, 9, 6144)?;
+            let final_modulation = bf(ctx, 9, 4096)?;
+            let final_global = bf(ctx, 9, 4096)?;
+            linear(ctx, time, &w.time_in, &time_hidden, gemm)?;
             activate(
                 ctx,
-                &self.time_hidden,
+                &time_hidden,
                 None,
                 PointwiseActivation::Silu,
-                &self.time_hidden,
+                &time_hidden,
             )?;
-            linear(ctx, &self.time_hidden, &w.time_out, &self.time_global, gemm)?;
-            let mut time_normalized = self.time_normalized.clone();
-            norm(ctx, NormArgs::rms(time, &w.time_norm, &mut time_normalized, 1e-6))?;
+            linear(ctx, &time_hidden, &w.time_out, &time_global, gemm)?;
+            let mut time_normalized_view = time_normalized.clone();
+            norm(ctx, NormArgs::rms(time, &w.time_norm, &mut time_normalized_view, 1e-6))?;
             activate(
                 ctx,
-                &self.time_normalized,
+                &time_normalized,
                 None,
                 PointwiseActivation::Silu,
-                &self.time_activated,
+                &time_activated,
             )?;
-            gather(
-                ctx,
-                &self.time_global,
-                &self.final_global_ids,
-                WIDTH,
-                &self.final_global,
-            )?;
-            super::copy(ctx, &self.time_global, &prepared.time_global)?;
+            gather(ctx, &time_global, &self.final_global_ids, WIDTH, &final_global)?;
+            super::copy(ctx, &time_global, &prepared.time_global)?;
             for (block, styles) in w.blocks.iter().zip(&prepared.blocks) {
                 for (weights, style) in [
                     &block.self_modulation,
@@ -1385,73 +1396,100 @@ mod dit {
                 .into_iter()
                 .zip(styles)
                 {
-                    self.compute_modulation(ctx, weights, false, gemm)?;
-                    super::copy(ctx, &self.modulation, style)?;
+                    self.compute_modulation(
+                        ctx,
+                        weights,
+                        false,
+                        &time_activated,
+                        &modulation_hidden,
+                        &modulation,
+                        &time_global,
+                        &final_modulation,
+                        &final_global,
+                        gemm,
+                    )?;
+                    super::copy(ctx, &modulation, style)?;
                 }
             }
-            self.compute_modulation(ctx, &w.final_modulation, true, gemm)?;
-            super::copy(ctx, &self.final_modulation, &prepared.final_style)
+            self.compute_modulation(
+                ctx,
+                &w.final_modulation,
+                true,
+                &time_activated,
+                &modulation_hidden,
+                &modulation,
+                &time_global,
+                &final_modulation,
+                &final_global,
+                gemm,
+            )?;
+            super::copy(ctx, &final_modulation, &prepared.final_style)
         }
         pub fn forward(
             &self,
             ctx: &CudaContext,
             w: &DitWeights,
             prepared: &StepModulation,
+            scratch: &DitScratch,
             gemm: &GemmPolicy,
             attention: &AttentionPolicy,
         ) -> Result<()> {
-            self.forward_observed(ctx, w, prepared, gemm, attention, |_, _| Ok(()))
+            self.forward_observed(ctx, w, prepared, scratch, gemm, attention, |_, _| Ok(()))
         }
         pub fn forward_observed(
             &self,
             ctx: &CudaContext,
             w: &DitWeights,
             prepared: &StepModulation,
+            scratch: &DitScratch,
             gemm: &GemmPolicy,
             attention: &AttentionPolicy,
             mut observe: impl FnMut(&str, &Tensor) -> Result<()>,
         ) -> Result<()> {
-            linear(ctx, &self.patches, &w.patch, &self.hidden, gemm)?;
-            observe("patch", &self.hidden)?;
+            linear(ctx, &self.patches, &w.patch, &scratch.hidden, gemm)?;
+            observe("patch", &scratch.hidden)?;
             observe("time_lora", &prepared.time_global)?;
-            self.modulate(ctx, &prepared.blocks[0][0])?;
+            self.modulate(ctx, &scratch, &prepared.blocks[0][0])?;
             for (index, block) in w.blocks.iter().enumerate() {
-                self.attend(ctx, &block.self_attention, None, gemm, attention)?;
+                self.attend(ctx, &scratch, &block.self_attention, None, gemm, attention)?;
                 self.residual_modulate(
                     ctx,
+                    &scratch,
                     &prepared.blocks[index][0],
                     &prepared.blocks[index][1],
                 )?;
                 self.attend(
                     ctx,
+                    &scratch,
                     &block.cross_attention,
-                    Some(&self.text_kv[index]),
+                    Some(&scratch.text_kv[index]),
                     gemm,
                     attention,
                 )?;
                 self.residual_modulate(
                     ctx,
+                    &scratch,
                     &prepared.blocks[index][1],
                     &prepared.blocks[index][2],
                 )?;
-                linear_gelu_exact(ctx, &self.normalized, &block.mlp_up, &self.mlp, gemm)?;
-                linear(ctx, &self.mlp, &block.mlp_down, &self.projected, gemm)?;
+                linear_gelu_exact(ctx, &scratch.normalized, &block.mlp_up, &scratch.mlp, gemm)?;
+                linear(ctx, &scratch.mlp, &block.mlp_down, &scratch.projected, gemm)?;
                 let next = prepared
                     .blocks
                     .get(index + 1)
                     .map(|styles| &styles[0])
                     .unwrap_or(&prepared.final_style);
-                self.residual_modulate(ctx, &prepared.blocks[index][2], next)?;
+                self.residual_modulate(ctx, &scratch, &prepared.blocks[index][2], next)?;
                 match index {
-                    0 => observe("block0", &self.hidden)?,
-                    13 => observe("block13", &self.hidden)?,
-                    27 => observe("block27", &self.hidden)?,
+                    0 => observe("block0", &scratch.hidden)?,
+                    13 => observe("block13", &scratch.hidden)?,
+                    27 => observe("block27", &scratch.hidden)?,
                     _ => {}
                 }
             }
             linear(
                 ctx,
-                &self.normalized,
+                &scratch.normalized,
                 &w.final_projection,
                 &self.output,
                 gemm,
@@ -1500,11 +1538,13 @@ mod dit {
             session.prepare(|| dit.prepare_modulation(&ctx, &weights, &time, &prepared, &gemm))?;
             let mut failures = Vec::new();
             session.prepare(|| {
-            dit.project_text(&ctx, &weights, &text, &gemm)?;
+            let scratch = dit.scratch(&ctx, &weights)?;
+            dit.project_text(&ctx, &weights, &text, &scratch.text_kv, &gemm)?;
             dit.forward_observed(
                 &ctx,
                 &weights,
                 &prepared,
+                &scratch,
                 &gemm,
                 &attention,
                 |name, tensor| {
@@ -1559,8 +1599,9 @@ mod dit {
             let eager = std::fs::read(root.join("dit-native-final.bf16"))?;
             let graph = crate::cuda_cosmos_policy::backend::capture(&ctx, || {
                 session.run(|| {
-                    dit.project_text(&ctx, &weights, &text, &gemm)?;
-                    dit.forward(&ctx, &weights, &prepared, &gemm, &attention)
+                    let scratch = dit.scratch(&ctx, &weights)?;
+                    dit.project_text(&ctx, &weights, &text, &scratch.text_kv, &gemm)?;
+                    dit.forward(&ctx, &weights, &prepared, &scratch, &gemm, &attention)
                 })
             })?;
             graph.replay()?;
@@ -1576,7 +1617,7 @@ mod dit {
     }
 }
 use self::{
-    dit::{Dit, StepModulation},
+    dit::{Dit, DitScratch, StepModulation},
     tensor_ops::*,
     vae::VaeChunk,
 };
@@ -1882,6 +1923,7 @@ impl Bf16Blocks {
         &mut self,
         gemm: &GemmPolicy,
         attention: &AttentionPolicy,
+        scratch: &DitScratch,
     ) -> Result<()> {
         let ctx = &self.ctx;
         let mut images = self.images.clone();
@@ -1953,8 +1995,13 @@ impl Bf16Blocks {
         )?;
         cast(ctx, &self.condition_bf16, &self.condition)?;
         gather(ctx, &self.weights.text, &self.task, 512 * 1024, &self.text)?;
-        self.dit
-            .project_text(ctx, &self.weights.dit, &self.text, gemm)
+        self.dit.project_text(
+            ctx,
+            &self.weights.dit,
+            &self.text,
+            &scratch.text_kv,
+            gemm,
+        )
     }
     pub fn initial_state(&self) -> Result<()> {
         let ctx = &self.ctx;
@@ -1967,6 +2014,7 @@ impl Bf16Blocks {
         index: usize,
         gemm: &GemmPolicy,
         attention: &AttentionPolicy,
+        scratch: &DitScratch,
     ) -> Result<()> {
         let ctx = &self.ctx;
         let step = &self.steps[index];
@@ -1980,8 +2028,14 @@ impl Bf16Blocks {
             1,
             &self.dit.patches,
         )?;
-        self.dit
-            .forward(ctx, &self.weights.dit, &step.modulation, gemm, attention)?;
+        self.dit.forward(
+            ctx,
+            &self.weights.dit,
+            &step.modulation,
+            scratch,
+            gemm,
+            attention,
+        )?;
         gather(
             ctx,
             &self.dit.output,
@@ -2002,6 +2056,17 @@ impl Bf16Blocks {
     pub fn finish(&self) -> Result<()> {
         self.readout.enqueue()
     }
+    /// One request traversal: allocate the per-request DiT scratch from the
+    /// session arena, then encode, denoise and read out.
+    pub fn forward(&mut self, gemm: &GemmPolicy, attention: &AttentionPolicy) -> Result<()> {
+        let scratch = self.dit.scratch(&self.ctx, &self.weights.dit)?;
+        self.encode_observation(gemm, attention, &scratch)?;
+        self.initial_state()?;
+        for step in 0..self.steps.len() {
+            self.denoise_step(step, gemm, attention, &scratch)?;
+        }
+        self.finish()
+    }
     pub fn actions(&self) -> &Tensor {
         &self.actions
     }
@@ -2010,10 +2075,8 @@ impl Bf16Blocks {
         &self.joint
     }
     pub fn workspace_bytes(&self) -> usize {
-        // All intermediate activations are model-owned persistent fields
-        // (allocated once, reused across requests and captured into the graph),
-        // so the ExecutionSession graph arena is not used for scratch. It still
-        // must be non-zero to construct an ExecutionSession.
-        1
+        // The per-request DiT scratch lives in the session arena; its size is
+        // the peak (every DitScratch tensor coexists during forward).
+        dit::Dit::scratch_bytes(&self.weights.dit)
     }
 }

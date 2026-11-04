@@ -66,12 +66,7 @@ impl CosmosPolicyModel {
         })
     }
     pub fn forward(&mut self, gemm: &GemmPolicy, attention: &AttentionPolicy) -> Result<()> {
-        self.blocks.encode_observation(gemm, attention)?;
-        self.blocks.initial_state()?;
-        for step in 0..self.steps {
-            self.blocks.denoise_step(step, gemm, attention)?;
-        }
-        self.blocks.finish()
+        self.blocks.forward(gemm, attention)
     }
     pub fn actions(&self) -> &Tensor {
         self.blocks.actions()
