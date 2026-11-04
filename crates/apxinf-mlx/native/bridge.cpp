@@ -43,6 +43,7 @@ int apx_mlx_sync(void* p){TRY mx::synchronize(*static_cast<S*>(p));CATCH}
 int apx_mlx_memory_stats(size_t* active,size_t* cache,size_t* peak){TRY *active=mx::get_active_memory();*cache=mx::get_cache_memory();*peak=mx::get_peak_memory();CATCH}
 int apx_mlx_reset_peak_memory(void){TRY mx::reset_peak_memory();CATCH}
 int apx_mlx_clear_cache(void){TRY mx::clear_cache();CATCH}
+int apx_mlx_set_cache_limit(size_t limit,size_t* previous){TRY *previous=mx::set_cache_limit(limit);CATCH}
 // gpu::device_info returns MLX's function-local static map, so both strings
 // live for the process. `architecture` is what MLX's own Metal dispatch reads.
 int apx_mlx_device_info(int32_t index,const char** name,const char** architecture){TRY
@@ -115,6 +116,13 @@ int apx_mlx_op(void* stream,int32_t op,const void* const* inputs,size_t count,co
  case 47:return mx::addmm(a.at(0),a.at(1),a.at(2),f(0),f(1),s);
  case 48:return mx::linalg::norm(a.at(0),std::vector<int>(iv.begin()+1,iv.end()),i(0)!=0,s);
  case 49:return mx::softmax(a.at(0),i(0),i(1)!=0,s);
+ case 50:return mx::tanh(a.at(0),s);
+ case 51:return mx::sqrt(a.at(0),s);
+ case 52:return mx::clip(a.at(0),a.at(1),a.at(2),s);
+ case 53:return mx::conv2d(a.at(0),a.at(1),{i(0),i(1)},{i(2),i(3)},{i(4),i(5)},i(6),s);
+ case 54:return mx::repeat(a.at(0),i(0),i(1),s);
+ case 55:return mx::random::key((uint64_t(uint32_t(i(1)))<<32)|uint64_t(uint32_t(i(0))));
+ case 56:return mx::random::normal(shape(ints+1,nints-1),dtype(i(0)),std::nullopt,std::nullopt,a.at(0),s);
  default:throw std::invalid_argument("unknown MLX bridge operation");}}();
  *out=new A(std::move(result));CATCH}
 int apx_mlx_compile_new(apx_mlx_callback cb,void* ctx,size_t outputs,int32_t shapeless,void** out){TRY
@@ -135,8 +143,8 @@ int apx_mlx_safetensors_load(const char* path,void** out,size_t* count){TRY
  std::sort(entries->begin(),entries->end(),[](const auto& a,const auto& b){return a.first<b.first;});*count=entries->size();*out=entries.release();CATCH}
 int apx_mlx_safetensors_entry(const void* p,size_t i,const char** name,void** out){TRY const auto& entry=static_cast<const Loaded*>(p)->at(i);*out=new A(entry.second);*name=entry.first.c_str();CATCH}
 void apx_mlx_safetensors_free(void* p){delete static_cast<Loaded*>(p);}
-int apx_mlx_metal_new(const char* name,const char* source,const char* header,const char* const* ins,size_t ni,const char* const* outs,size_t no,void** out){TRY
- std::vector<std::string> input_names,output_names;for(size_t i=0;i<ni;++i)input_names.emplace_back(ins[i]);for(size_t i=0;i<no;++i)output_names.emplace_back(outs[i]);*out=new K(mx::fast::metal_kernel(name,input_names,output_names,source,header,true,false));CATCH}
+int apx_mlx_metal_new(const char* name,const char* source,const char* header,const char* const* ins,size_t ni,const char* const* outs,size_t no,int row_contiguous,void** out){TRY
+ std::vector<std::string> input_names,output_names;for(size_t i=0;i<ni;++i)input_names.emplace_back(ins[i]);for(size_t i=0;i<no;++i)output_names.emplace_back(outs[i]);*out=new K(mx::fast::metal_kernel(name,input_names,output_names,source,header,row_contiguous!=0,false));CATCH}
 void apx_mlx_metal_free(void* p){delete static_cast<K*>(p);}
 int apx_mlx_metal_call(void* stream,void* kernel,const void* const* inputs,size_t ni,const int32_t* dims,const size_t* ranks,const int32_t* dtypes,size_t no,const int32_t* grid,const int32_t* group,const char* const* tnames,const int32_t* tkinds,const int32_t* tvalues,size_t nt,void** outputs){TRY
  std::vector<mx::Shape> shapes;std::vector<mx::Dtype> types;size_t offset=0;for(size_t j=0;j<no;++j){shapes.push_back(shape(dims+offset,ranks[j]));offset+=ranks[j];types.push_back(dtype(dtypes[j]));}
