@@ -207,9 +207,12 @@ impl ModelRunner {
             session.prepare(|| model.prepare_constants(gemm, attention))?;
             session.prepare(|| model.forward(gemm, attention))?;
         }
+        // The captured traversal replays exactly the operators prepared above;
+        // lookup hits the session cache, so keeping `online_tune` true is safe
+        // and keeps the execution key (which includes `online_tune`) identical
+        // to the preparation pass. Turning it off here would change that key
+        // and surface a spurious "cache miss during capture".
         self.ctx.synchronize().map_err(Error::Cuda)?;
-        state.gemm.online_tune = false;
-        state.attention.online_tune = false;
         let mut mode = ExecutionMode::Eager;
         let mut fallback_reason = None;
         if policy != ExecutionPolicy::Eager {
