@@ -286,3 +286,94 @@ fn half_split_rope_rotates_leading_pairs_and_copies_the_rest() -> Result<()> {
     assert!(HalfSplitRope::new(&s, 3).is_err());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn interleaved_qk_norm_rope_matches_composed_operators() -> Result<()> {
+    use apxinf_mlx::fusions::InterleavedQkNormRope;
+    let s = Stream::metal(0)?;
+    let (len, heads, dim) = (6, 2, 128);
+    let width = heads * dim;
+    let q = Array::from_f32(&s, &[1, len, width], &data(len * width, 37, 0.07))?.cast(D::BF16)?;
+    let k = Array::from_f32(&s, &[1, len, width], &data(len * width, 41, 0.05))?.cast(D::BF16)?;
+    let wq = Array::from_f32(
+        &s,
+        &[dim],
+        &data(dim, 7, 0.25)
+            .iter()
+            .map(|v| v + 1.)
+            .collect::<Vec<_>>(),
+    )?
+    .cast(D::BF16)?;
+    let wk = Array::from_f32(
+        &s,
+        &[dim],
+        &data(dim, 5, 0.2).iter().map(|v| v + 1.).collect::<Vec<_>>(),
+    )?
+    .cast(D::BF16)?;
+    let angles: Vec<f32> = (0..len * dim / 2)
+        .map(|i| (i / (dim / 2)) as f32 * 0.3f32.powi((i % (dim / 2)) as i32 % 9))
+        .collect();
+    let cos = Array::from_f32(
+        &s,
+        &[len, dim / 2],
+        &angles.iter().map(|a| a.cos()).collect::<Vec<_>>(),
+    )?;
+    let sin = Array::from_f32(
+        &s,
+        &[len, dim / 2],
+        &angles.iter().map(|a| a.sin()).collect::<Vec<_>>(),
+    )?;
+    let (fq, fk) = InterleavedQkNormRope::new(&s)?.call(&q, &k, &wq, &wk, &cos, &sin, heads)?;
+    assert_eq!(
+        (fq.shape(), fq.dtype()),
+        (&[1, heads, len, dim][..], D::BF16)
+    );
+
+    // Composed path of mflux Qwen21Attention._project (norm, FP32 rope, transpose).
+    let composed = |x: &Array, w: &Array| -> Result<Vec<f32>> {
+        let x = x.reshape(&[1, len, heads, dim])?.fast_rms_norm(w, 1e-6)?;
+        let pairs = x.cast(D::F32)?.reshape(&[1, len, heads, dim / 2, 2])?;
+        let (re, im) = (
+            pairs
+                .slice_axis(4, 0, 1)?
+                .reshape(&[1, len, heads, dim / 2])?,
+            pairs
+                .slice_axis(4, 1, 2)?
+                .reshape(&[1, len, heads, dim / 2])?,
+        );
+        let c = cos.reshape(&[1, len, 1, dim / 2])?;
+        let sn = sin.reshape(&[1, len, 1, dim / 2])?;
+        let out_re = re.mul(&c)?.sub(&im.mul(&sn)?)?;
+        let out_im = re.mul(&sn)?.add(&im.mul(&c)?)?;
+        let shape = [1, len, heads, dim / 2, 1];
+        Array::concat(&[&out_re.reshape(&shape)?, &out_im.reshape(&shape)?], 4)?
+            .reshape(&[1, len, heads, dim])?
+            .cast(D::BF16)?
+            .transpose(&[0, 2, 1, 3])?
+            .to_f32_vec()
+    };
+    let (rq, rk) = (composed(&q, &wq)?, composed(&k, &wk)?);
+    let (aq, ak) = (fq.to_f32_vec()?, fk.to_f32_vec()?);
+    let exact = aq
+        .iter()
+        .zip(&rq)
+        .chain(ak.iter().zip(&rk))
+        .filter(|(a, b)| a == b)
+        .count();
+    println!(
+        "interleaved Q/K norm-RoPE: {exact} / {} bitwise equal",
+        aq.len() * 2
+    );
+    assert_within(&aq, &rq, 1. / 128., 1e-3);
+    assert_within(&ak, &rk, 1. / 128., 1e-3);
+    let fused = InterleavedQkNormRope::new(&s)?;
+    assert!(fused.call(&q, &k, &wq, &wk, &cos, &sin, 3).is_err());
+    assert!(fused
+        .call(&q, &k, &wq.cast(D::F32)?, &wk, &cos, &sin, heads)
+        .is_err());
+    assert!(fused
+        .call(&q, &k, &wq, &wk, &cos.cast(D::BF16)?, &sin, heads)
+        .is_err());
+    Ok(())
+}
