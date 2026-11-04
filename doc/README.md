@@ -16,6 +16,7 @@ model-specific examples and historical evidence link back to it.
 | A required safe device operation is missing | [Adding New Kernels](adding-new-kernels.md) |
 | Designing the native MLX backend or migrating a qualified Mac model | [MLX Backend](mlx-backend.md) — ownership, supported selections and execution contracts |
 | Running PI0.5 on AMD (HIP), comparing it with CUDA, or extending it | [PI0.5 on HIP](hip-pi05.md) — layout, entry points, validation and status |
+| Running the PI0.5 FP32 reference on CPU | [PI0.5 CPU reference](pi05-cpu-reference.md) — build, input and execution contracts, numerical validation |
 
 PI0.5 currently separates `model/`, `model_runner/` and `weights/`. Its
 [component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)
