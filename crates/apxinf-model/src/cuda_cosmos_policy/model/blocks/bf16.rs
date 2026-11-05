@@ -786,15 +786,10 @@ mod vae {
             let mut args = AttentionArgs::new(&q, &k, &v, &mut attended);
             args.policy = attention_policy.clone();
             attention(ctx, args)?;
-            let out_shape = conv_output_shape(
-                attended.shape().dims(),
-                &w.attention_output,
-                0,
-                [1; 3],
-                [0; 3],
-                [0; 3],
-            )?;
-            let mut output = ctx.allocate_output(Shape::new(out_shape.to_vec()), DType::BF16)?;
+            // The residual skip is the 2D-spatial input, so the projection output
+            // must keep the input's `[t, h, w, c]` layout (the projection conv
+            // itself runs on the flattened `attended` activation).
+            let mut output = ctx.allocate_output(Shape::new(dims.to_vec()), DType::BF16)?;
             conv_residual(
                 ctx,
                 policy,
@@ -891,9 +886,14 @@ mod vae {
                         )?;
                         transient += output_bytes(&temporal_shape);
                         current_shape = temporal_shape;
-                        total_frames = (total_frames - 1) / 2 + 1;
                     } else {
                         current_shape = spatial_shape;
+                    }
+                    // The whole-timeline frame count halves at every temporal
+                    // decimation level regardless of this chunk's history, so
+                    // every chunk shares the same CausalActivation capacity.
+                    if w.downsample[level].temporal.is_some() {
+                        total_frames = (total_frames - 1) / 2 + 1;
                     }
                 }
             }
@@ -933,14 +933,8 @@ mod vae {
                 [0; 3],
             )?); // projection
             let attention = SpatialAttention::prepare(ctx, &middle_before_shape)?;
-            let attention_output_shape = conv_output_shape(
-                &[t, pixels, 1, c],
-                &w.attention_output,
-                0,
-                [1; 3],
-                [0; 3],
-                [0; 3],
-            )?;
+            // The projection output keeps the 2D-spatial input layout.
+            let attention_output_shape = middle_before_shape;
             let (middle_after, middle_after_shape, middle_after_bytes) = Residual::prepare(
                 ctx,
                 &w.middle_after,
@@ -1116,10 +1110,10 @@ mod vae {
                     }
                 }
             }
-            let middle = self
+            let middle_before_out = self
                 .middle_before
                 .forward(ctx, policy, &w.middle_before, &current)?;
-            let attended = self.attention.forward(ctx, policy, w, attention, &middle)?;
+            let attended = self.attention.forward(ctx, policy, w, attention, &middle_before_out)?;
             let middle = self
                 .middle_after
                 .forward(ctx, policy, &w.middle_after, &attended)?;
