@@ -445,13 +445,14 @@ the ~24 VAE convolutions. The family now passes 32 MiB instead of 512 MiB:
 lowering derives the tile height from that budget, and 512 MiB let every stage
 run at its 4096-row cap and retained 543 MiB of scratch, while 32 MiB retains
 about 280 MiB and costs roughly 210 additional tile launches across the whole
-request. Smaller values trade launches faster than they release bytes. The prefix chunk's
-head tail is deliberately *not* skipped even though `condition_map` substitutes
-proprioception at t == 1 and never reads latent 1: removing it changes the
-operator sequence the shared session observes, which shifts the buffer offsets
-the following chunk sees and selects different vectorized kernels. That is
-numerically visible (joint frame 2 relative L2 0.46 versus 0.005), so the
-redundant copy stays as a stability constraint, not dead work.
+request. Smaller values trade launches faster than they release bytes. The prefix chunk's head tail is deliberately *not* skipped even though
+`condition_map` substitutes proprioception at t == 1 and never reads latent 1.
+The reason is causal history, not buffer timing: the following chunk's head
+convolution reads `head_norm.causal`, which spans the prefix head-norm's
+trailing frames. Skipping the prefix head normalization left those frames
+unwritten and the following chunk read stale memory (joint frame 2 relative L2
+0.46 versus 0.005). Keep the head computation; only the latent-1 copy into the
+unused condition slot is what condition_map skips.
 
 
 Vectorized Conv3d input/history materialization reduces a subsequent matched

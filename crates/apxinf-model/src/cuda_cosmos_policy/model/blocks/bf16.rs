@@ -1954,12 +1954,12 @@ impl Bf16Blocks {
         // stops after frame 12. Size the copy from the produced latents instead of
         // assuming how many latent frames causal downsampling yields.
         // Slots [FRAME, 2*FRAME) hold latent 1 from the constant prefix. Even
-        // though `condition_map` substitutes proprioception at t == 1, the
-        // chunk must still publish its latent: skipping the tail changes the
-        // operator sequence the shared session sees, which shifts the buffer
-        // offsets `rest` later observes and selects different vectorized
-        // kernels. That is numerically visible (joint frame 2 relative L2
-        // 0.46 versus 0.005), so the copy stays.
+        // though `condition_map` substitutes proprioception at t == 1 and never
+        // reads that slot, the prefix chunk must still run its full head: the
+        // next chunk's head convolution reads `head_norm.causal`, which includes
+        // the prefix head-norm's trailing frames as causal history. Skipping the
+        // prefix head normalization left that history unwritten, so the next
+        // chunk read stale memory (joint frame 2 relative L2 0.46). Keep it.
         let prefix_latents = self.prefix.output.numel();
         let rest_latents = self.rest.output.numel();
         assert!(
