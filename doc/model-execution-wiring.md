@@ -202,6 +202,20 @@ implements this ownership. Persistent KV/state stays outside provider scratch;
 see the [ownership contract](model-layer-architecture.md#repacked-gemm-weight-ownership).
 This contract is cuda-new-specific; other backends own their workspace
 preparation and lease APIs.
+
+Right-size the activation arena to its measured peak. The arena reservation is
+an upper bound, not a prediction: seed `ExecutionSession` with a generous
+capacity (a hard-coded reservation or a conservative shape formula), then call
+`ExecutionSession::prepare_right_sized(device, margin, operation)` before
+capture. It runs `operation` once to measure the arena's high-water mark,
+rebuilds the arena to that mark plus `margin`, and runs `operation` again. The
+traversal must be shape-deterministic (the measured peak is independent of the
+arena's base address, which 256-byte alignment preserves) and idempotent with
+respect to persistent device state it mutates — reset such state at the start of
+`operation`, since it runs twice. Qwen-Drive's
+[`model_runner/prepare.rs`](../crates/apxinf-model/src/qwen_drive/model_runner/prepare.rs)
+right-sizes a former 32 GiB reservation to the measured peak; because a captured
+graph cannot be re-pointed at a different arena, this happens before capture.
 Capture and eager call the same model semantics. Update captured input contents
 in place and replay through the prepared object.
 

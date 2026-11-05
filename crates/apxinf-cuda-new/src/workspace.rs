@@ -361,6 +361,54 @@ impl ExecutionSession {
         self.inner.workspace.used()
     }
 
+    /// Right-size this session's arena to what `operation` actually needs.
+    ///
+    /// Runs `operation` — one shape-deterministic prepare traversal — against
+    /// the current arena to measure its high-water mark, then rebuilds the
+    /// arena to that mark plus `margin` and runs `operation` once more. Returns
+    /// the second traversal's result. The arena is only ever rebuilt smaller,
+    /// so a caller may seed it with a generous upper bound (a hard-coded
+    /// reservation, a conservative shape formula) and have it shrink to the
+    /// measured peak.
+    ///
+    /// The contract on `operation`:
+    ///
+    /// * It must run a complete prepare traversal via [`prepare_with_session`]
+    ///   against the `&ExecutionSession` it receives, so the arena's free-list
+    ///   high-water mark reflects the traversal's live extent.
+    /// * It must be shape-deterministic: the allocation sequence — and hence
+    ///   the measured peak — must not depend on the arena's base address.
+    ///   [`GraphWorkspace`] sub-allocations are 256-byte aligned and the base is
+    ///   `cudaMalloc`-aligned, so this holds for any address-independent
+    ///   forward.
+    /// * It must be idempotent with respect to persistent device state it
+    ///   mutates (a recurrent/planning state, for example, is reset at the
+    ///   start of `operation`), since it is invoked twice.
+    ///
+    /// A captured CUDA graph cannot be re-pointed at a different arena, so call
+    /// this before capture. The measurement traversal's native plans are
+    /// dropped with the provisional arena; the second traversal re-prepares
+    /// them against the right-sized one.
+    pub fn prepare_right_sized<T>(
+        &mut self,
+        device: usize,
+        margin: usize,
+        mut operation: impl FnMut(&Self) -> Result<T>,
+    ) -> Result<T> {
+        operation(self)?;
+        let peak = self.used();
+        let exact = peak.saturating_add(margin);
+        if exact < self.capacity() {
+            // Rebuild the activation arena only; the provider workspace (native
+            // GEMM/Attention scratch) is shared with the caller and survives the
+            // resize, so a runner that shares one scratch across profiles keeps
+            // that bound intact.
+            let scratch = self.inner.scratch.clone();
+            *self = Self::with_provider_workspace(GraphWorkspace::new(exact, device)?, scratch);
+        }
+        operation(self)
+    }
+
     /// Traverse the real execution once before graph capture.
     ///
     /// This allocates deterministic workspace slices, prepares native resources,
