@@ -122,13 +122,13 @@ mod tensor_ops {
 mod convolution {
     use crate::cuda_cosmos_policy::backend::{
         fused_add_channel_l2_norm_silu, pointwise, residual_add, BiasOrder, Conv3dArgs,
-        Conv3dPolicy, CudaBuffer, CudaContext, FusedAddChannelL2NormArgs, PointwiseArgs,
-        PointwiseSemantic, PreparedConv3d, ResidualAddArgs, Unfold3dGeometry,
+        Conv3dPolicy, CudaContext, FusedAddChannelL2NormArgs, PointwiseArgs, PointwiseSemantic,
+        PreparedConv3d, ResidualAddArgs, Unfold3dGeometry,
     };
     use crate::cuda_cosmos_policy::weights::Conv;
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
-    /// Per-convolution scratch budget. Every `ConvWorkspace` keeps its own
+    /// Per-convolution scratch budget. Every prepared execution keeps its own
     /// lowered tile buffers alive for the plan's lifetime, so this value is
     /// effectively multiplied by the ~24 VAE convolutions rather than shared.
     /// Lowering derives `tile_rows = limit / (2 * (k + n) * 2)`, so the bound
@@ -138,180 +138,306 @@ mod convolution {
     /// values trade launches faster than they release bytes.
     const CONV3D_WORKSPACE_LIMIT: usize = 32 * 1024 * 1024;
 
-    pub(in crate::cuda_cosmos_policy::model::blocks::bf16) struct ConvWorkspace {
-        convolution: PreparedConv3d,
-        pub output: Tensor,
-    }
-    impl ConvWorkspace {
-        pub fn prepare(
-            policy: &Conv3dPolicy,
-            ctx: &CudaContext,
-            weights: &Conv,
-            input: &Tensor,
-            history: Option<&Tensor>,
-            stride: [usize; 3],
-            padding_before: [usize; 3],
-            padding_after: [usize; 3],
-        ) -> Result<Self> {
-            let dims = input.shape().dims();
-            if dims.len() != 4 || dims[3] != weights.input_channels || dims.contains(&0) {
+    /// Pure output-shape computation shared by every VAE convolution.
+    pub(in crate::cuda_cosmos_policy::model::blocks::bf16) fn conv_output_shape(
+        dims: &[usize],
+        weights: &Conv,
+        history_frames: usize,
+        stride: [usize; 3],
+        padding_before: [usize; 3],
+        padding_after: [usize; 3],
+    ) -> Result<[usize; 4]> {
+        if dims.len() != 4 || dims[3] != weights.input_channels || dims.contains(&0) {
+            return Err(Error::Other(
+                "Cosmos VAE convolution input geometry mismatch".into(),
+            ));
+        }
+        let mut output = [0usize; 4];
+        for axis in 0..3 {
+            let padded = dims[axis]
+                .checked_add(padding_before[axis])
+                .and_then(|v| v.checked_add(padding_after[axis]))
+                .and_then(|v| v.checked_add(if axis == 0 { history_frames } else { 0 }))
+                .ok_or_else(|| Error::Other("Cosmos VAE convolution extent overflow".into()))?;
+            if stride[axis] == 0 || padded < weights.kernel[axis] {
                 return Err(Error::Other(
-                    "Cosmos VAE convolution input geometry mismatch".into(),
+                    "Cosmos VAE convolution padding/stride mismatch".into(),
                 ));
             }
-            let mut output_shape = vec![0; 4];
-            for axis in 0..3 {
-                let padded = dims[axis]
-                    .checked_add(padding_before[axis])
-                    .and_then(|v| v.checked_add(padding_after[axis]))
-                    .and_then(|v| {
-                        v.checked_add(if axis == 0 {
-                            history.map_or(0, |h| h.shape().dims()[0])
-                        } else {
-                            0
-                        })
-                    })
-                    .ok_or_else(|| Error::Other("Cosmos VAE convolution extent overflow".into()))?;
-                if stride[axis] == 0 || padded < weights.kernel[axis] {
-                    return Err(Error::Other(
-                        "Cosmos VAE convolution padding/stride mismatch".into(),
-                    ));
-                }
-                output_shape[axis] = (padded - weights.kernel[axis]) / stride[axis] + 1;
-            }
-            output_shape[3] = weights.output_channels;
-            let bytes = output_shape
-                .iter()
-                .try_fold(2usize, |a, &b| a.checked_mul(b))
-                .ok_or_else(|| Error::Other("Cosmos VAE convolution output overflow".into()))?;
-            let mut output = CudaBuffer::alloc(bytes, ctx.device_id())
-                .map_err(Error::Cuda)?
-                .as_tensor(Shape::new(output_shape), DType::BF16)
-                .map_err(Error::Cuda)?;
-            let convolution = PreparedConv3d::with_policy(
-                ctx,
-                Conv3dArgs {
-                    input,
-                    history,
-                    weight: &weights.linear.weight,
-                    geometry: Unfold3dGeometry {
-                        kernel: weights.kernel,
-                        stride,
-                        padding_before,
-                        padding_after,
-                    },
-                    out: &mut output,
-                    workspace_limit: CONV3D_WORKSPACE_LIMIT,
-                },
-                policy,
-            )?;
-            Ok(Self {
-                convolution,
-                output,
-            })
+            output[axis] = (padded - weights.kernel[axis]) / stride[axis] + 1;
         }
-        pub fn forward(&mut self, ctx: &CudaContext, weights: &Conv) -> Result<()> {
-            self.convolution.enqueue()?;
-            if let Some(bias) = &weights.linear.bias {
-                // Preserve the convolution-output BF16 rounding before bias.
-                let input = self.output.reshape(vec![
-                    self.output.numel() / weights.output_channels,
-                    weights.output_channels,
-                ])?;
-                let mut output = input.clone();
-                let mut args =
-                    PointwiseArgs::new(PointwiseSemantic::BiasActivation, &input, &mut output);
-                args.bias = Some(bias);
-                pointwise(ctx, args)?;
-            }
-            Ok(())
-        }
-        /// Materialize the biased result and the next channel normalization together.
-        pub fn forward_normalized(
-            &mut self,
-            ctx: &CudaContext,
-            weights: &Conv,
-            norm_weight: &Tensor,
-            normalized: &Tensor,
-        ) -> Result<()> {
-            self.convolution.enqueue()?;
-            let shape = vec![
-                self.output.numel() / weights.output_channels,
-                weights.output_channels,
-            ];
-            let input = self.output.reshape(shape.clone())?;
-            let mut normalized = normalized.reshape(shape)?;
-            fused_add_channel_l2_norm_silu(
-                ctx,
-                FusedAddChannelL2NormArgs {
-                    input: &input,
-                    bias: weights.linear.bias.as_ref(),
-                    residual: None,
-                    hidden: &input,
-                    weight: norm_weight,
-                    normalized: &mut normalized,
-                    eps: 1e-12,
-                },
-            )
-        }
+        output[3] = weights.output_channels;
+        Ok(output)
+    }
 
-        /// Preserve the staged residual output while producing its next normalization.
-        pub fn forward_residual_normalized(
-            &mut self,
-            ctx: &CudaContext,
-            weights: &Conv,
-            residual: &Tensor,
-            output: &Tensor,
-            norm_weight: &Tensor,
-            normalized: &Tensor,
-        ) -> Result<()> {
-            self.convolution.enqueue()?;
-            let shape = vec![
-                self.output.numel() / weights.output_channels,
-                weights.output_channels,
-            ];
-            let mut normalized = normalized.reshape(shape.clone())?;
-            fused_add_channel_l2_norm_silu(
-                ctx,
-                FusedAddChannelL2NormArgs {
-                    input: &self.output.reshape(shape.clone())?,
-                    bias: weights.linear.bias.as_ref(),
-                    residual: Some(&residual.reshape(shape.clone())?),
-                    hidden: &output.reshape(shape)?,
-                    weight: norm_weight,
-                    normalized: &mut normalized,
-                    eps: 1e-12,
-                },
-            )
-        }
+    pub(in crate::cuda_cosmos_policy::model::blocks::bf16) fn output_bytes(
+        shape: &[usize; 4],
+    ) -> usize {
+        shape.iter().product::<usize>() * 2
+    }
 
-        /// Publish a residual result without materializing a biased convolution intermediate.
-        /// `self.output` remains convolution scratch; temporal history uses normalized inputs.
-        pub fn forward_residual(
-            &mut self,
-            ctx: &CudaContext,
-            weights: &Conv,
-            residual: &Tensor,
-            output: &Tensor,
-        ) -> Result<()> {
-            self.convolution.enqueue()?;
-            let shape = vec![
-                self.output.numel() / weights.output_channels,
-                weights.output_channels,
-            ];
-            residual_add(
-                ctx,
-                ResidualAddArgs {
-                    input: &self.output.reshape(shape.clone())?,
-                    bias: weights.linear.bias.as_ref(),
-                    residual: &residual.reshape(shape.clone())?,
-                    hidden: &output.reshape(shape)?,
-                    gate: None,
-                    // Conv output rounds first, bias addition rounds before residual addition.
-                    bias_order: BiasOrder::BiasThenResidual,
+    fn history_frames(history: Option<&Tensor>) -> usize {
+        history.map_or(0, |h| h.shape().dims()[0])
+    }
+
+    fn matrix(t: &Tensor, cols: usize) -> Result<Tensor> {
+        t.reshape(vec![t.numel() / cols, cols])
+    }
+
+    /// Enqueue a causal THWC convolution into `output` (no bias).
+    fn conv_raw(
+        ctx: &CudaContext,
+        policy: &Conv3dPolicy,
+        weights: &Conv,
+        input: &Tensor,
+        history: Option<&Tensor>,
+        stride: [usize; 3],
+        padding_before: [usize; 3],
+        padding_after: [usize; 3],
+        output: &mut Tensor,
+    ) -> Result<()> {
+        let conv = PreparedConv3d::with_policy(
+            ctx,
+            Conv3dArgs {
+                input,
+                history,
+                weight: &weights.linear.weight,
+                geometry: Unfold3dGeometry {
+                    kernel: weights.kernel,
+                    stride,
+                    padding_before,
+                    padding_after,
                 },
-            )
+                out: output,
+                workspace_limit: CONV3D_WORKSPACE_LIMIT,
+            },
+            policy,
+        )?;
+        conv.enqueue()
+    }
+
+    fn bias_in_place(ctx: &CudaContext, weights: &Conv, output: &Tensor) -> Result<()> {
+        if let Some(bias) = &weights.linear.bias {
+            let input = matrix(output, weights.output_channels)?;
+            let mut out = input.clone();
+            let mut args = PointwiseArgs::new(PointwiseSemantic::BiasActivation, &input, &mut out);
+            args.bias = Some(bias);
+            pointwise(ctx, args)?;
         }
+        Ok(())
+    }
+
+    /// Convolution plus staged bias, into `output`.
+    pub(in crate::cuda_cosmos_policy::model::blocks::bf16) fn conv_bias(
+        ctx: &CudaContext,
+        policy: &Conv3dPolicy,
+        weights: &Conv,
+        input: &Tensor,
+        history: Option<&Tensor>,
+        stride: [usize; 3],
+        padding_before: [usize; 3],
+        padding_after: [usize; 3],
+        output: &mut Tensor,
+    ) -> Result<()> {
+        conv_raw(
+            ctx,
+            policy,
+            weights,
+            input,
+            history,
+            stride,
+            padding_before,
+            padding_after,
+            output,
+        )?;
+        bias_in_place(ctx, weights, output)
+    }
+
+    /// Convolution plus fused bias/channel-L2-norm/SiLU into `normalized`. The
+    /// raw convolution output stays in `conv_out`, which the caller owns (it is
+    /// the residual skip connection and may be a persistent buffer).
+    pub(in crate::cuda_cosmos_policy::model::blocks::bf16) fn conv_materialize_norm_silu_into(
+        ctx: &CudaContext,
+        policy: &Conv3dPolicy,
+        weights: &Conv,
+        input: &Tensor,
+        history: Option<&Tensor>,
+        stride: [usize; 3],
+        padding_before: [usize; 3],
+        padding_after: [usize; 3],
+        norm_weight: &Tensor,
+        normalized: &Tensor,
+        conv_out: &mut Tensor,
+    ) -> Result<()> {
+        conv_raw(
+            ctx,
+            policy,
+            weights,
+            input,
+            history,
+            stride,
+            padding_before,
+            padding_after,
+            conv_out,
+        )?;
+        let mat = matrix(conv_out, weights.output_channels)?;
+        let mut n = matrix(normalized, weights.output_channels)?;
+        fused_add_channel_l2_norm_silu(
+            ctx,
+            FusedAddChannelL2NormArgs {
+                input: &mat,
+                bias: weights.linear.bias.as_ref(),
+                residual: None,
+                hidden: &mat,
+                weight: norm_weight,
+                normalized: &mut n,
+                eps: 1e-12,
+            },
+        )
+    }
+
+    /// Convolution plus fused bias/channel-L2-norm/SiLU, returning the raw
+    /// convolution output as a transient, pooled skip connection.
+    pub(in crate::cuda_cosmos_policy::model::blocks::bf16) fn conv_materialize_norm_silu(
+        ctx: &CudaContext,
+        policy: &Conv3dPolicy,
+        weights: &Conv,
+        input: &Tensor,
+        history: Option<&Tensor>,
+        stride: [usize; 3],
+        padding_before: [usize; 3],
+        padding_after: [usize; 3],
+        norm_weight: &Tensor,
+        normalized: &Tensor,
+    ) -> Result<Tensor> {
+        let shape = conv_output_shape(
+            input.shape().dims(),
+            weights,
+            history_frames(history),
+            stride,
+            padding_before,
+            padding_after,
+        )?;
+        let mut conv_out = ctx.allocate_output(Shape::new(shape.to_vec()), DType::BF16)?;
+        conv_materialize_norm_silu_into(
+            ctx,
+            policy,
+            weights,
+            input,
+            history,
+            stride,
+            padding_before,
+            padding_after,
+            norm_weight,
+            normalized,
+            &mut conv_out,
+        )?;
+        Ok(conv_out)
+    }
+
+    /// Convolution plus fused bias/residual/channel-L2-norm/SiLU: materializes
+    /// `hidden` (the residual output) and writes `normalized`.
+    pub(in crate::cuda_cosmos_policy::model::blocks::bf16) fn conv_residual_norm_silu(
+        ctx: &CudaContext,
+        policy: &Conv3dPolicy,
+        weights: &Conv,
+        input: &Tensor,
+        history: Option<&Tensor>,
+        stride: [usize; 3],
+        padding_before: [usize; 3],
+        padding_after: [usize; 3],
+        residual: &Tensor,
+        hidden: &mut Tensor,
+        norm_weight: &Tensor,
+        normalized: &Tensor,
+    ) -> Result<()> {
+        let shape = conv_output_shape(
+            input.shape().dims(),
+            weights,
+            history_frames(history),
+            stride,
+            padding_before,
+            padding_after,
+        )?;
+        let mut conv_out = ctx.allocate_output(Shape::new(shape.to_vec()), DType::BF16)?;
+        conv_raw(
+            ctx,
+            policy,
+            weights,
+            input,
+            history,
+            stride,
+            padding_before,
+            padding_after,
+            &mut conv_out,
+        )?;
+        let cols = weights.output_channels;
+        let mat = matrix(&conv_out, cols)?;
+        let residual = matrix(residual, cols)?;
+        let hidden = matrix(hidden, cols)?;
+        let mut normalized = matrix(normalized, cols)?;
+        fused_add_channel_l2_norm_silu(
+            ctx,
+            FusedAddChannelL2NormArgs {
+                input: &mat,
+                bias: weights.linear.bias.as_ref(),
+                residual: Some(&residual),
+                hidden: &hidden,
+                weight: norm_weight,
+                normalized: &mut normalized,
+                eps: 1e-12,
+            },
+        )
+    }
+
+    /// Convolution plus bias/residual into `hidden`.
+    pub(in crate::cuda_cosmos_policy::model::blocks::bf16) fn conv_residual(
+        ctx: &CudaContext,
+        policy: &Conv3dPolicy,
+        weights: &Conv,
+        input: &Tensor,
+        history: Option<&Tensor>,
+        stride: [usize; 3],
+        padding_before: [usize; 3],
+        padding_after: [usize; 3],
+        residual: &Tensor,
+        hidden: &mut Tensor,
+    ) -> Result<()> {
+        let shape = conv_output_shape(
+            input.shape().dims(),
+            weights,
+            history_frames(history),
+            stride,
+            padding_before,
+            padding_after,
+        )?;
+        let mut conv_out = ctx.allocate_output(Shape::new(shape.to_vec()), DType::BF16)?;
+        conv_raw(
+            ctx,
+            policy,
+            weights,
+            input,
+            history,
+            stride,
+            padding_before,
+            padding_after,
+            &mut conv_out,
+        )?;
+        let cols = weights.output_channels;
+        let mat = matrix(&conv_out, cols)?;
+        let residual = matrix(residual, cols)?;
+        let hidden = matrix(hidden, cols)?;
+        residual_add(
+            ctx,
+            ResidualAddArgs {
+                input: &mat,
+                bias: weights.linear.bias.as_ref(),
+                residual: &residual,
+                hidden: &hidden,
+                gate: None,
+                bias_order: BiasOrder::BiasThenResidual,
+            },
+        )
     }
 }
 
@@ -319,6 +445,10 @@ mod vae {
     //! Causal Wan2.1 encoder. Cache edges point at preceding chunk activations;
     //! every inference recomputes the singleton chunk before consuming those edges.
     //! No activation state crosses observation boundaries.
+    use super::convolution::{
+        conv_bias, conv_materialize_norm_silu, conv_materialize_norm_silu_into, conv_output_shape,
+        conv_residual, conv_residual_norm_silu, output_bytes,
+    };
     use crate::cuda_cosmos_policy::backend::ops::embedding_gather;
     use crate::cuda_cosmos_policy::backend::{
         attention, channel_l2_norm, channel_l2_norm_silu, pointwise, AttentionArgs,
@@ -327,8 +457,7 @@ mod vae {
     };
     use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
-    use super::convolution::ConvWorkspace;
-    use crate::cuda_cosmos_policy::weights::{upload, Conv, VaeResidual, VaeWeights};
+    use crate::cuda_cosmos_policy::weights::{upload, VaeResidual, VaeWeights};
 
     fn alloc(ctx: &CudaContext, shape: Vec<usize>) -> Result<Tensor> {
         let bytes = shape.iter().product::<usize>() * 2;
@@ -386,9 +515,7 @@ mod vae {
             let end = start
                 .checked_add(shape[0])
                 .filter(|&end| end <= capacity)
-                .ok_or_else(|| {
-                    Error::Other("causal activation exceeds prepared timeline".into())
-                })?;
+                .ok_or_else(|| Error::Other("causal activation exceeds prepared timeline".into()))?;
             let view = |start: usize, frames: usize| -> Result<Tensor> {
                 let mut dims = shape.to_vec();
                 dims[0] = frames;
@@ -410,24 +537,6 @@ mod vae {
         }
     }
 
-    fn causal_activation(
-        policy: &Conv3dPolicy,
-        ctx: &CudaContext,
-        weights: &Conv,
-        input: &CausalActivation,
-    ) -> Result<ConvWorkspace> {
-        ConvWorkspace::prepare(
-            policy,
-            ctx,
-            weights,
-            &input.causal,
-            None,
-            [1; 3],
-            [0, 1, 1],
-            [0, 1, 1],
-        )
-    }
-
     fn matrix(t: &Tensor) -> Result<Tensor> {
         let channels = *t.shape().dims().last().unwrap();
         t.reshape(vec![t.numel() / channels, channels])
@@ -445,27 +554,6 @@ mod vae {
             .map_err(Error::Cuda)?
             .as_tensor(Shape::new(shape), DType::BF16)
             .map_err(Error::Cuda)
-    }
-
-    fn causal(
-        policy: &Conv3dPolicy,
-        ctx: &CudaContext,
-        weights: &Conv,
-        input: &Tensor,
-        previous: Option<&Tensor>,
-    ) -> Result<ConvWorkspace> {
-        let history = previous.map(|p| tail(p, 2)).transpose()?;
-        let past = history.as_ref().map_or(0, |h| h.shape().dims()[0]);
-        ConvWorkspace::prepare(
-            policy,
-            ctx,
-            weights,
-            input,
-            history.as_ref(),
-            [1; 3],
-            [2 - past, 1, 1],
-            [0, 1, 1],
-        )
     }
 
     fn normalize_activate(
@@ -488,133 +576,156 @@ mod vae {
     }
 
     struct Residual {
-        input: Tensor,
         norm1: CausalActivation,
-        conv1: ConvWorkspace,
         norm2: CausalActivation,
-        conv2: ConvWorkspace,
-        shortcut: Option<ConvWorkspace>,
-        output: Tensor,
     }
 
     impl Residual {
         fn prepare(
-            policy: &Conv3dPolicy,
             ctx: &CudaContext,
             w: &VaeResidual,
-            input: &Tensor,
+            input_shape: &[usize],
             total_frames: usize,
             previous: Option<&Self>,
-        ) -> Result<Self> {
+        ) -> Result<(Self, [usize; 4], usize)> {
             let norm1 = CausalActivation::prepare(
                 ctx,
-                input.shape().dims(),
+                input_shape,
                 total_frames,
                 previous.map(|p| &p.norm1),
             )?;
-            let conv1 = causal_activation(policy, ctx, &w.conv1, &norm1)?;
+            let conv1_shape =
+                conv_output_shape(norm1.causal.shape().dims(), &w.conv1, 0, [1; 3], [0, 1, 1], [0, 1, 1])?;
             let norm2 = CausalActivation::prepare(
                 ctx,
-                conv1.output.shape().dims(),
+                &conv1_shape,
                 total_frames,
                 previous.map(|p| &p.norm2),
             )?;
-            let conv2 = causal_activation(policy, ctx, &w.conv2, &norm2)?;
-            let shortcut = w
-                .shortcut
-                .as_ref()
-                .map(|weight| {
-                    ConvWorkspace::prepare(policy, ctx, weight, input, None, [1; 3], [0; 3], [0; 3])
-                })
-                .transpose()?;
-            let output = alloc(ctx, conv2.output.shape().dims().to_vec())?;
-            Ok(Self {
-                input: input.clone(),
-                norm1,
-                conv1,
-                norm2,
-                conv2,
-                shortcut,
-                output,
-            })
-        }
-
-        fn forward(&mut self, ctx: &CudaContext, w: &VaeResidual) -> Result<()> {
-            normalize_activate(ctx, &self.input, &w.norm1, &self.norm1.current)?;
-            self.forward_normalized(ctx, w, None)
-        }
-
-        // The producer has already populated norm1. The optional destination
-        // composes this residual update with the following block's normalization.
-        fn forward_normalized(
-            &mut self,
-            ctx: &CudaContext,
-            w: &VaeResidual,
-            next_normalization: Option<(&Tensor, &Tensor)>,
-        ) -> Result<()> {
-            self.conv1
-                .forward_normalized(ctx, &w.conv1, &w.norm2, &self.norm2.current)?;
-            let residual = match (&mut self.shortcut, &w.shortcut) {
-                (Some(shortcut), Some(weights)) => {
-                    shortcut.forward(ctx, weights)?;
-                    &shortcut.output
-                }
-                _ => &self.input,
-            };
-            if let Some((weight, normalized)) = next_normalization {
-                self.conv2.forward_residual_normalized(
-                    ctx,
-                    &w.conv2,
-                    residual,
-                    &self.output,
-                    weight,
-                    normalized,
-                )
-            } else {
-                self.conv2
-                    .forward_residual(ctx, &w.conv2, residual, &self.output)
+            let conv2_shape =
+                conv_output_shape(norm2.causal.shape().dims(), &w.conv2, 0, [1; 3], [0, 1, 1], [0, 1, 1])?;
+            let mut bytes = output_bytes(&conv1_shape) + output_bytes(&conv2_shape);
+            if let Some(shortcut) = &w.shortcut {
+                bytes += output_bytes(&conv_output_shape(
+                    input_shape,
+                    shortcut,
+                    0,
+                    [1; 3],
+                    [0; 3],
+                    [0; 3],
+                )?);
             }
+            Ok((Self { norm1, norm2 }, conv2_shape, bytes))
         }
-    }
 
-    struct Downsample {
-        spatial: ConvWorkspace,
-        temporal: Option<ConvWorkspace>,
+        /// Conv1 (fused into `norm2`) then conv2 (fused into `output` and, when
+        /// present, the next residual's `norm1`). Returns the residual output,
+        /// which is the skip connection for the next residual.
+        fn forward_normalized(
+            &self,
+            ctx: &CudaContext,
+            policy: &Conv3dPolicy,
+            w: &VaeResidual,
+            input: &Tensor,
+            next_normalization: Option<(&Tensor, &Tensor)>,
+        ) -> Result<Tensor> {
+            conv_materialize_norm_silu(
+                ctx,
+                policy,
+                &w.conv1,
+                &self.norm1.causal,
+                None,
+                [1; 3],
+                [0, 1, 1],
+                [0, 1, 1],
+                &w.norm2,
+                &self.norm2.current,
+            )?;
+            let residual = if let Some(shortcut) = &w.shortcut {
+                let shape = conv_output_shape(
+                    input.shape().dims(),
+                    shortcut,
+                    0,
+                    [1; 3],
+                    [0; 3],
+                    [0; 3],
+                )?;
+                let mut out = ctx.allocate_output(Shape::new(shape.to_vec()), DType::BF16)?;
+                conv_bias(
+                    ctx,
+                    policy,
+                    shortcut,
+                    input,
+                    None,
+                    [1; 3],
+                    [0; 3],
+                    [0; 3],
+                    &mut out,
+                )?;
+                out
+            } else {
+                input.clone()
+            };
+            let shape = conv_output_shape(
+                self.norm2.causal.shape().dims(),
+                &w.conv2,
+                0,
+                [1; 3],
+                [0, 1, 1],
+                [0, 1, 1],
+            )?;
+            let mut output = ctx.allocate_output(Shape::new(shape.to_vec()), DType::BF16)?;
+            if let Some((next_weight, next_normalized)) = next_normalization {
+                conv_residual_norm_silu(
+                    ctx,
+                    policy,
+                    &w.conv2,
+                    &self.norm2.causal,
+                    None,
+                    [1; 3],
+                    [0, 1, 1],
+                    [0, 1, 1],
+                    &residual,
+                    &mut output,
+                    next_weight,
+                    next_normalized,
+                )?;
+            } else {
+                conv_residual(
+                    ctx,
+                    policy,
+                    &w.conv2,
+                    &self.norm2.causal,
+                    None,
+                    [1; 3],
+                    [0, 1, 1],
+                    [0, 1, 1],
+                    &residual,
+                    &mut output,
+                )?;
+            }
+            Ok(output)
+        }
+
+        fn forward(
+            &self,
+            ctx: &CudaContext,
+            policy: &Conv3dPolicy,
+            w: &VaeResidual,
+            input: &Tensor,
+        ) -> Result<Tensor> {
+            normalize_activate(ctx, input, &w.norm1, &self.norm1.current)?;
+            self.forward_normalized(ctx, policy, w, input, None)
+        }
     }
 
     struct SpatialAttention {
-        input: Tensor,
-        normalized: Tensor,
-        qkv: ConvWorkspace,
         ids: [Tensor; 3],
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        attended: Tensor,
-        projection: ConvWorkspace,
-        output: Tensor,
     }
 
     impl SpatialAttention {
-        fn prepare(
-            policy: &Conv3dPolicy,
-            ctx: &CudaContext,
-            w: &VaeWeights,
-            input: &Tensor,
-        ) -> Result<Self> {
-            let dims = input.shape().dims();
-            let (t, pixels, c) = (dims[0], dims[1] * dims[2], dims[3]);
-            let normalized = alloc(ctx, dims.to_vec())?;
-            let qkv = ConvWorkspace::prepare(
-                policy,
-                ctx,
-                &w.attention_qkv,
-                &normalized,
-                None,
-                [1; 3],
-                [0; 3],
-                [0; 3],
-            )?;
+        fn prepare(ctx: &CudaContext, dims: &[usize]) -> Result<Self> {
+            let (t, pixels) = (dims[0], dims[1] * dims[2]);
             let ids = [0, 1, 2].map(|part| {
                 let indices: Vec<i32> =
                     (0..t * pixels).map(|row| (row * 3 + part) as i32).collect();
@@ -623,188 +734,244 @@ mod vae {
                     ctx.device_id(),
                 )
             });
-            let [q_ids, k_ids, v_ids] = ids;
-            let q = alloc(ctx, vec![t, pixels, 1, c])?;
-            let k = alloc(ctx, vec![t, pixels, 1, c])?;
-            let v = alloc(ctx, vec![t, pixels, 1, c])?;
-            let attended = alloc(ctx, dims.to_vec())?;
-            let projection = ConvWorkspace::prepare(
-                policy,
+            let [a, b, c] = ids;
+            Ok(Self {
+                ids: [a?, b?, c?],
+            })
+        }
+
+        fn forward(
+            &self,
+            ctx: &CudaContext,
+            policy: &Conv3dPolicy,
+            w: &VaeWeights,
+            attention_policy: &AttentionPolicy,
+            input: &Tensor,
+        ) -> Result<Tensor> {
+            let dims = input.shape().dims();
+            let (t, pixels, c) = (dims[0], dims[1] * dims[2], dims[3]);
+            let normalized = ctx.allocate_output(Shape::new(dims.to_vec()), DType::BF16)?;
+            channel_l2_norm(
                 ctx,
+                ChannelL2NormArgs {
+                    input: &matrix(input)?,
+                    weight: &w.attention_norm,
+                    out: &mut matrix(&normalized)?,
+                    eps: 1e-12,
+                },
+            )?;
+            let qkv_shape = conv_output_shape(dims, &w.attention_qkv, 0, [1; 3], [0; 3], [0; 3])?;
+            let mut qkv = ctx.allocate_output(Shape::new(qkv_shape.to_vec()), DType::BF16)?;
+            conv_bias(
+                ctx,
+                policy,
+                &w.attention_qkv,
+                &normalized,
+                None,
+                [1; 3],
+                [0; 3],
+                [0; 3],
+                &mut qkv,
+            )?;
+            let rows = t * pixels;
+            let table = qkv.reshape(vec![rows * 3, c])?;
+            let mut q = ctx.allocate_output(Shape::new(vec![t, pixels, 1, c]), DType::BF16)?;
+            let mut k = ctx.allocate_output(Shape::new(vec![t, pixels, 1, c]), DType::BF16)?;
+            let mut v = ctx.allocate_output(Shape::new(vec![t, pixels, 1, c]), DType::BF16)?;
+            for (ids, output) in self.ids.iter().zip([&mut q, &mut k, &mut v]) {
+                embedding_gather(ctx, &table, ids, &output.reshape(vec![rows, c])?)?;
+            }
+            let mut attended =
+                ctx.allocate_output(Shape::new(q.shape().dims().to_vec()), DType::BF16)?;
+            let mut args = AttentionArgs::new(&q, &k, &v, &mut attended);
+            args.policy = attention_policy.clone();
+            attention(ctx, args)?;
+            let out_shape = conv_output_shape(
+                attended.shape().dims(),
+                &w.attention_output,
+                0,
+                [1; 3],
+                [0; 3],
+                [0; 3],
+            )?;
+            let mut output = ctx.allocate_output(Shape::new(out_shape.to_vec()), DType::BF16)?;
+            conv_residual(
+                ctx,
+                policy,
                 &w.attention_output,
                 &attended,
                 None,
                 [1; 3],
                 [0; 3],
                 [0; 3],
+                input,
+                &mut output,
             )?;
-            Ok(Self {
-                input: input.clone(),
-                normalized,
-                qkv,
-                ids: [q_ids?, k_ids?, v_ids?],
-                q,
-                k,
-                v,
-                attended,
-                projection,
-                output: alloc(ctx, dims.to_vec())?,
-            })
-        }
-
-        fn forward(
-            &mut self,
-            ctx: &CudaContext,
-            w: &VaeWeights,
-            attention_policy: &AttentionPolicy,
-        ) -> Result<()> {
-            channel_l2_norm(
-                ctx,
-                ChannelL2NormArgs {
-                    input: &matrix(&self.input)?,
-                    weight: &w.attention_norm,
-                    out: &mut matrix(&self.normalized)?,
-                    eps: 1e-12,
-                },
-            )?;
-            self.qkv.forward(ctx, &w.attention_qkv)?;
-            let rows = self.q.numel() / 384;
-            let table = self.qkv.output.reshape(vec![rows * 3, 384])?;
-            for (ids, output) in self.ids.iter().zip([&self.q, &self.k, &self.v]) {
-                embedding_gather(ctx, &table, ids, &output.reshape(vec![rows, 384])?)?;
-            }
-            let mut output = self.attended.reshape(self.q.shape().clone())?;
-            let mut args = AttentionArgs::new(&self.q, &self.k, &self.v, &mut output);
-            args.policy = attention_policy.clone();
-            attention(ctx, args)?;
-            self.projection
-                .forward_residual(ctx, &w.attention_output, &self.input, &self.output)
+            Ok(output)
         }
     }
 
     pub(in crate::cuda_cosmos_policy::model::blocks::bf16) struct VaeChunk {
         input: Tensor,
-        input_conv: ConvWorkspace,
         blocks: Vec<[Residual; 2]>,
-        downsample: Vec<Downsample>,
+        spatial: Vec<Tensor>,
         middle_before: Residual,
         attention: SpatialAttention,
         middle_after: Residual,
         head_norm: CausalActivation,
-        head_conv: ConvWorkspace,
-        mean_projection: ConvWorkspace,
         mean_indices: Tensor,
         negative_mean: Tensor,
         inverse_std: Tensor,
         pub output: Tensor,
+        transient_bytes: usize,
     }
 
     impl VaeChunk {
         pub fn prepare(
-            policy: &Conv3dPolicy,
             ctx: &CudaContext,
             w: &VaeWeights,
             input: &Tensor,
             total_frames: usize,
             previous: Option<&Self>,
         ) -> Result<Self> {
-            let input_conv = causal(policy, ctx, &w.input, input, previous.map(|p| &p.input))?;
-            let mut current = input_conv.output.clone();
+            let mut transient = 0usize;
+            // The first convolution reads the previous chunk's input tail as
+            // causal history; its output is this chunk's first skip connection.
+            let past = previous.map_or(0, |p| p.input.shape().dims()[0].min(2));
+            let input_conv_shape = conv_output_shape(
+                input.shape().dims(),
+                &w.input,
+                past,
+                [1; 3],
+                [2 - past, 1, 1],
+                [0, 1, 1],
+            )?;
+            transient += output_bytes(&input_conv_shape);
+            let mut current_shape = input_conv_shape;
             let mut total_frames = total_frames;
             let mut blocks = Vec::new();
-            let mut downsample = Vec::new();
+            let mut spatial = Vec::new();
             for (level, weights) in w.down_blocks.iter().enumerate() {
-                let first = Residual::prepare(
-                    policy,
+                let (first, first_shape, first_bytes) = Residual::prepare(
                     ctx,
                     &weights[0],
-                    &current,
+                    &current_shape,
                     total_frames,
                     previous.map(|p| &p.blocks[level][0]),
                 )?;
-                let second = Residual::prepare(
-                    policy,
+                transient += first_bytes;
+                let (second, second_shape, second_bytes) = Residual::prepare(
                     ctx,
                     &weights[1],
-                    &first.output,
+                    &first_shape,
                     total_frames,
                     previous.map(|p| &p.blocks[level][1]),
                 )?;
-                current = second.output.clone();
+                transient += second_bytes;
+                current_shape = second_shape;
                 blocks.push([first, second]);
                 if level < 3 {
-                    let spatial = ConvWorkspace::prepare(
-                        policy,
-                        ctx,
+                    let spatial_shape = conv_output_shape(
+                        &current_shape,
                         &w.downsample[level].spatial,
-                        &current,
-                        None,
+                        0,
                         [1, 2, 2],
                         [0; 3],
                         [0, 1, 1],
                     )?;
-                    let temporal = match (&w.downsample[level].temporal, previous) {
-                        (Some(weight), Some(p)) => {
-                            let history = tail(&p.downsample[level].spatial.output, 1)?;
-                            Some(ConvWorkspace::prepare(
-                                policy,
-                                ctx,
-                                weight,
-                                &spatial.output,
-                                Some(&history),
-                                [2, 1, 1],
-                                [0; 3],
-                                [0; 3],
-                            )?)
-                        }
-                        _ => None, // The initial singleton bypasses temporal decimation.
-                    };
-                    current = temporal
-                        .as_ref()
-                        .map_or(&spatial.output, |t| &t.output)
-                        .clone();
-                    downsample.push(Downsample { spatial, temporal });
-                    if w.downsample[level].temporal.is_some() {
+                    spatial.push(alloc(ctx, spatial_shape.to_vec())?);
+                    if let (Some(temporal), Some(_)) = (&w.downsample[level].temporal, previous) {
+                        let temporal_shape = conv_output_shape(
+                            &spatial_shape,
+                            temporal,
+                            1,
+                            [2, 1, 1],
+                            [0; 3],
+                            [0; 3],
+                        )?;
+                        transient += output_bytes(&temporal_shape);
+                        current_shape = temporal_shape;
                         total_frames = (total_frames - 1) / 2 + 1;
+                    } else {
+                        current_shape = spatial_shape;
                     }
                 }
             }
-            let middle_before = Residual::prepare(
-                policy,
+            let (middle_before, middle_before_shape, middle_before_bytes) = Residual::prepare(
                 ctx,
                 &w.middle_before,
-                &current,
+                &current_shape,
                 total_frames,
                 previous.map(|p| &p.middle_before),
             )?;
-            let attention = SpatialAttention::prepare(policy, ctx, w, &middle_before.output)?;
-            let middle_after = Residual::prepare(
-                policy,
-                ctx,
-                &w.middle_after,
-                &attention.output,
-                total_frames,
-                previous.map(|p| &p.middle_after),
-            )?;
-            let head_norm = CausalActivation::prepare(
-                ctx,
-                middle_after.output.shape().dims(),
-                total_frames,
-                previous.map(|p| &p.head_norm),
-            )?;
-            let head_conv = causal_activation(policy, ctx, &w.output, &head_norm)?;
-            let mean_projection = ConvWorkspace::prepare(
-                policy,
-                ctx,
-                &w.mean_projection,
-                &head_conv.output,
-                None,
+            transient += middle_before_bytes;
+            // Spatial attention intermediates (normalized, qkv, q/k/v, attended,
+            // projection) are pooled per request.
+            let (t, h, ww, c) = (
+                middle_before_shape[0],
+                middle_before_shape[1],
+                middle_before_shape[2],
+                middle_before_shape[3],
+            );
+            let pixels = h * ww;
+            transient += output_bytes(&middle_before_shape); // normalized
+            transient += output_bytes(&conv_output_shape(
+                &middle_before_shape,
+                &w.attention_qkv,
+                0,
+                [1; 3],
+                [0; 3],
+                [0; 3],
+            )?); // qkv
+            transient += [t, pixels, 1, c].iter().product::<usize>() * 2 * 4; // q, k, v, attended
+            transient += output_bytes(&conv_output_shape(
+                &[t, pixels, 1, c],
+                &w.attention_output,
+                0,
+                [1; 3],
+                [0; 3],
+                [0; 3],
+            )?); // projection
+            let attention = SpatialAttention::prepare(ctx, &middle_before_shape)?;
+            let attention_output_shape = conv_output_shape(
+                &[t, pixels, 1, c],
+                &w.attention_output,
+                0,
                 [1; 3],
                 [0; 3],
                 [0; 3],
             )?;
-            // The head statistics run over the head-normalized activation, whose
-            // last dimension is the VAE latent width (384) regardless of frames.
+            let (middle_after, middle_after_shape, middle_after_bytes) = Residual::prepare(
+                ctx,
+                &w.middle_after,
+                &attention_output_shape,
+                total_frames,
+                previous.map(|p| &p.middle_after),
+            )?;
+            transient += middle_after_bytes;
+            let head_norm = CausalActivation::prepare(
+                ctx,
+                &middle_after_shape,
+                total_frames,
+                previous.map(|p| &p.head_norm),
+            )?;
+            let head_shape = conv_output_shape(
+                head_norm.causal.shape().dims(),
+                &w.output,
+                0,
+                [1; 3],
+                [0, 1, 1],
+                [0, 1, 1],
+            )?;
+            transient += output_bytes(&head_shape);
+            transient += output_bytes(&conv_output_shape(
+                &head_shape,
+                &w.mean_projection,
+                0,
+                [1; 3],
+                [0; 3],
+                [0; 3],
+            )?);
             let rows = head_norm.current.numel() / 384;
             let indices: Vec<i32> = (0..rows)
                 .flat_map(|r| (0..16).map(move |c| (r * 32 + c) as i32))
@@ -831,84 +998,175 @@ mod vae {
                 &Tensor::from_bf16(vec![rows, 16], &inverse.repeat(rows))?,
                 ctx.device_id(),
             )?;
-            let mut shape = mean_projection.output.shape().dims().to_vec();
+            let mut shape = head_shape;
             shape[3] = 16;
-            let output = alloc(ctx, shape)?;
+            let output = alloc(ctx, shape.to_vec())?;
             Ok(Self {
                 input: input.clone(),
-                input_conv,
                 blocks,
-                downsample,
+                spatial,
                 middle_before,
                 attention,
                 middle_after,
                 head_norm,
-                head_conv,
-                mean_projection,
                 mean_indices,
                 negative_mean,
                 inverse_std,
                 output,
+                transient_bytes: transient,
             })
         }
 
         pub fn forward(
-            &mut self,
+            &self,
             ctx: &CudaContext,
+            policy: &Conv3dPolicy,
             w: &VaeWeights,
             attention: &AttentionPolicy,
+            previous: Option<&Self>,
         ) -> Result<()> {
-            self.input_conv.forward_normalized(
+            let history = previous.map(|p| tail(&p.input, 2)).transpose()?;
+            let past = history.as_ref().map_or(0, |h| h.shape().dims()[0]);
+            let mut current = conv_materialize_norm_silu(
                 ctx,
+                policy,
                 &w.input,
+                &self.input,
+                history.as_ref(),
+                [1; 3],
+                [2 - past, 1, 1],
+                [0, 1, 1],
                 &w.down_blocks[0][0].norm1,
                 &self.blocks[0][0].norm1.current,
             )?;
             for level in 0..4 {
-                let (first, second) = self.blocks[level].split_at_mut(1);
-                first[0].forward_normalized(
+                let first = &self.blocks[level][0];
+                let second = &self.blocks[level][1];
+                let first_out = first.forward_normalized(
                     ctx,
+                    policy,
                     &w.down_blocks[level][0],
-                    Some((&w.down_blocks[level][1].norm1, &second[0].norm1.current)),
+                    &current,
+                    Some((&w.down_blocks[level][1].norm1, &second.norm1.current)),
                 )?;
-                second[0].forward_normalized(ctx, &w.down_blocks[level][1], None)?;
+                let second_out = second.forward_normalized(
+                    ctx,
+                    policy,
+                    &w.down_blocks[level][1],
+                    &first_out,
+                    None,
+                )?;
+                current = second_out;
                 if level < 3 {
-                    let down = &mut self.downsample[level];
+                    let mut sp = self.spatial[level].clone();
                     let norm_weight = &w.down_blocks[level + 1][0].norm1;
                     let normalized = &self.blocks[level + 1][0].norm1.current;
-                    if let (Some(temporal), Some(weights)) =
-                        (&mut down.temporal, &w.downsample[level].temporal)
-                    {
-                        down.spatial
-                            .forward(ctx, &w.downsample[level].spatial)?;
-                        temporal.forward_normalized(ctx, weights, norm_weight, normalized)?;
-                    } else {
-                        down.spatial.forward_normalized(
+                    if let (Some(temporal), Some(prev)) = (&w.downsample[level].temporal, previous) {
+                        conv_bias(
                             ctx,
+                            policy,
                             &w.downsample[level].spatial,
+                            &current,
+                            None,
+                            [1, 2, 2],
+                            [0; 3],
+                            [0, 1, 1],
+                            &mut sp,
+                        )?;
+                        let hist = tail(&prev.spatial[level], 1)?;
+                        let shape = conv_output_shape(
+                            sp.shape().dims(),
+                            temporal,
+                            1,
+                            [2, 1, 1],
+                            [0; 3],
+                            [0; 3],
+                        )?;
+                        let mut temporal_out =
+                            ctx.allocate_output(Shape::new(shape.to_vec()), DType::BF16)?;
+                        conv_materialize_norm_silu_into(
+                            ctx,
+                            policy,
+                            temporal,
+                            &sp,
+                            Some(&hist),
+                            [2, 1, 1],
+                            [0; 3],
+                            [0; 3],
                             norm_weight,
                             normalized,
+                            &mut temporal_out,
                         )?;
+                        current = temporal_out;
+                    } else {
+                        conv_materialize_norm_silu_into(
+                            ctx,
+                            policy,
+                            &w.downsample[level].spatial,
+                            &current,
+                            None,
+                            [1, 2, 2],
+                            [0; 3],
+                            [0, 1, 1],
+                            norm_weight,
+                            normalized,
+                            &mut sp,
+                        )?;
+                        current = sp;
                     }
                 }
             }
-            self.middle_before.forward(ctx, &w.middle_before)?;
-            self.attention.forward(ctx, w, attention)?;
-            self.middle_after.forward(ctx, &w.middle_after)?;
-            normalize_activate(
-                ctx,
-                &self.middle_after.output,
-                &w.output_norm,
-                &self.head_norm.current,
+            let middle = self
+                .middle_before
+                .forward(ctx, policy, &w.middle_before, &current)?;
+            let attended = self.attention.forward(ctx, policy, w, attention, &middle)?;
+            let middle = self
+                .middle_after
+                .forward(ctx, policy, &w.middle_after, &attended)?;
+            normalize_activate(ctx, &middle, &w.output_norm, &self.head_norm.current)?;
+            let head_shape = conv_output_shape(
+                self.head_norm.causal.shape().dims(),
+                &w.output,
+                0,
+                [1; 3],
+                [0, 1, 1],
+                [0, 1, 1],
             )?;
-            self.head_conv.forward(ctx, &w.output)?;
-            self.mean_projection.forward(ctx, &w.mean_projection)?;
+            let mut head_out = ctx.allocate_output(Shape::new(head_shape.to_vec()), DType::BF16)?;
+            conv_bias(
+                ctx,
+                policy,
+                &w.output,
+                &self.head_norm.causal,
+                None,
+                [1; 3],
+                [0, 1, 1],
+                [0, 1, 1],
+                &mut head_out,
+            )?;
+            let mean_shape = conv_output_shape(
+                head_out.shape().dims(),
+                &w.mean_projection,
+                0,
+                [1; 3],
+                [0; 3],
+                [0; 3],
+            )?;
+            let mut mean_out = ctx.allocate_output(Shape::new(mean_shape.to_vec()), DType::BF16)?;
+            conv_bias(
+                ctx,
+                policy,
+                &w.mean_projection,
+                &head_out,
+                None,
+                [1; 3],
+                [0; 3],
+                [0; 3],
+                &mut mean_out,
+            )?;
             embedding_gather(
                 ctx,
-                &self
-                    .mean_projection
-                    .output
-                    .reshape(vec![self.mean_projection.output.numel(), 1])?,
+                &mean_out.reshape(vec![mean_out.numel(), 1])?,
                 &self.mean_indices,
                 &self.output.reshape(vec![self.output.numel(), 1])?,
             )?;
@@ -920,6 +1178,10 @@ mod vae {
             let mut args = PointwiseArgs::new(PointwiseSemantic::Multiply, &input, &mut out);
             args.secondary = Some(&self.inverse_std);
             pointwise(ctx, args)
+        }
+
+        pub(in crate::cuda_cosmos_policy::model::blocks::bf16) fn transient_bytes(&self) -> usize {
+            self.transient_bytes
         }
     }
 
@@ -955,29 +1217,16 @@ mod vae {
                 .map_err(Error::Cuda)?
                 .as_tensor(Shape::new(vec![16, 224, 224, 3]), DType::BF16)
                 .map_err(Error::Cuda)?;
-            let mut first = VaeChunk::prepare(
-                &Conv3dPolicy {
-                    online_tune: true,
-                    ..Default::default()
-                },
-                &ctx,
-                &weights,
-                &first,
-                17,
-                None,
+            let policy = Conv3dPolicy {
+                online_tune: true,
+                ..Default::default()
+            };
+            let first = VaeChunk::prepare(&ctx, &weights, &first, 17, None)?;
+            let rest = VaeChunk::prepare(&ctx, &weights, &rest, 17, Some(&first))?;
+            let session = ExecutionSession::with_capacity(
+                first.transient_bytes() + rest.transient_bytes(),
+                0,
             )?;
-            let mut rest = VaeChunk::prepare(
-                &Conv3dPolicy {
-                    online_tune: true,
-                    ..Default::default()
-                },
-                &ctx,
-                &weights,
-                &rest,
-                17,
-                Some(&first),
-            )?;
-            let session = ExecutionSession::with_capacity(256 * 1024 * 1024, 0)?;
             let attention = AttentionPolicy {
                 online_tune: false,
                 ..Default::default()
@@ -995,15 +1244,15 @@ mod vae {
                 Ok(bytes)
             };
             session.prepare(|| {
-                first.forward(&ctx, &weights, &attention)?;
-                rest.forward(&ctx, &weights, &attention)
+                first.forward(&ctx, &policy, &weights, &attention, None)?;
+                rest.forward(&ctx, &policy, &weights, &attention, Some(&first))
             })?;
             ctx.synchronize().map_err(Error::Cuda)?;
             let eager = collect(&first, &rest)?;
             let graph = crate::cuda_cosmos_policy::backend::capture(&ctx, || {
                 session.run(|| {
-                    first.forward(&ctx, &weights, &attention)?;
-                    rest.forward(&ctx, &weights, &attention)
+                    first.forward(&ctx, &policy, &weights, &attention, None)?;
+                    rest.forward(&ctx, &policy, &weights, &attention, Some(&first))
                 })
             })?;
             graph.replay()?;
@@ -1049,6 +1298,7 @@ mod vae {
         }
     }
 }
+
 mod dit {
     //! Complete joint-latent transformer. All 1,764 tokens pass through every block.
     //! Scratch is reused between blocks and denoising steps; it contains no runner
@@ -1672,6 +1922,7 @@ struct Step {
 pub(in crate::cuda_cosmos_policy::model) struct Bf16Blocks {
     pub ctx: Rc<CudaContext>,
     weights: Rc<Bf16Weights>,
+    convolution: crate::cuda_cosmos_policy::backend::Conv3dPolicy,
     pub rgb: CudaBuffer,
     pub proprio: Tensor,
     pub task: Tensor,
@@ -1728,9 +1979,8 @@ impl Bf16Blocks {
         let first_input = slice(&video, 0, PIXELS * 3, vec![1, 224, 224, 3])?;
         let prefix_input = slice(&video, PIXELS * 3, 4 * PIXELS * 3, vec![4, 224, 224, 3])?;
         let rest_input = slice(&video, 5 * PIXELS * 3, 8 * PIXELS * 3, vec![8, 224, 224, 3])?;
-        let mut first = VaeChunk::prepare(convolution, &ctx, &weights.vae, &first_input, 13, None)?;
-        let mut prefix = VaeChunk::prepare(
-            convolution,
+        let first = VaeChunk::prepare(&ctx, &weights.vae, &first_input, 13, None)?;
+        let prefix = VaeChunk::prepare(
             &ctx,
             &weights.vae,
             &prefix_input,
@@ -1738,7 +1988,6 @@ impl Bf16Blocks {
             Some(&first),
         )?;
         let rest = VaeChunk::prepare(
-            convolution,
             &ctx,
             &weights.vae,
             &rest_input,
@@ -1877,14 +2126,15 @@ impl Bf16Blocks {
         // computed once here, outside the request graph, and reused by every
         // request traversal. This keeps plan preparation to a single
         // session.prepare(forward).
-        first.forward(&ctx, &weights.vae, attention)?;
-        prefix.forward(&ctx, &weights.vae, attention)?;
+        first.forward(&ctx, convolution, &weights.vae, attention, None)?;
+        prefix.forward(&ctx, convolution, &weights.vae, attention, Some(&first))?;
         for step in &steps {
             dit.prepare_modulation(&ctx, &weights.dit, &step.time, &step.modulation, gemm)?;
         }
         Ok(Self {
             ctx,
             weights,
+            convolution: convolution.clone(),
             rgb,
             proprio,
             task,
@@ -1944,7 +2194,8 @@ impl Bf16Blocks {
                 )?;
             }
         }
-        self.rest.forward(ctx, &self.weights.vae, attention)?;
+        self.rest
+            .forward(ctx, &self.convolution, &self.weights.vae, attention, Some(&self.prefix))?;
         copy(
             ctx,
             &self.first.output,
@@ -2070,11 +2321,12 @@ impl Bf16Blocks {
     pub fn workspace_bytes(&self) -> usize {
         // The session arena holds everything allocate_output hands out during
         // one request traversal: the whole-forward DiT scratch, the
-        // request-scoped condition buffers, and the per-step scratch/network
-        // temporaries.
+        // request-scoped condition buffers, the per-request VAE intermediates,
+        // and the per-step scratch/network temporaries.
         let dit = dit::Dit::scratch_bytes(&self.weights.dit);
         let condition = LATENT * 4 + LATENT * 2; // condition (F32) + condition_bf16 (BF16)
         let step = LATENT * 4 + LATENT * 2; // step_scratch (F32) + network_output (BF16)
-        dit + condition + step
+        let vae = self.rest.transient_bytes();
+        dit + condition + step + vae
     }
 }
