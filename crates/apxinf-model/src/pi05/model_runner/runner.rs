@@ -13,7 +13,7 @@ use crate::vla::{
     PreparationStatus, PreparedInference, VisionObservation, VlaRequest, VlaRuntime,
 };
 
-use super::prepare::CapturedGraph;
+use super::prepare::{CapturedGraph, WORKSPACE_MARGIN};
 use crate::pi05::backend::{
     self, ops, transfers, Context, DeviceBuffer, ExecutionSession, GraphWorkspace,
     ImageLayout as KernelImageLayout, ProviderWorkspace,
@@ -375,35 +375,40 @@ impl Pi05ModelRunner {
         token_ids: DeviceBuffer,
         raw_images: Option<DeviceBuffer>,
     ) -> Result<EagerInputs> {
-        let session = ExecutionSession::with_provider_workspace(
+        let mut session = ExecutionSession::with_provider_workspace(
             GraphWorkspace::new(
                 self.model.workspace_requirements(spec.token_count)?.bytes,
                 self.backend.device_id(),
             )?,
             self.provider_workspace.clone(),
         );
-        let inputs = EagerInputs {
+        let raw_rgb = raw_images.is_some();
+        // Right-size the arena before building the persistent inputs struct. The
+        // traversal below inlines `eager_traversal`'s RGB prefix so it can run
+        // against `session` without borrowing the whole `EagerInputs` (which
+        // owns that session and would otherwise conflict with the resize).
+        let output = session.prepare_right_sized(
+            self.backend.device_id(),
+            WORKSPACE_MARGIN,
+            |session| {
+                ops::prepare_with_session(session, || {
+                    if let (Some(raw), Some(layout)) = (&raw_images, spec.image_layout) {
+                        self.model
+                            .preprocess_rgb(raw, &patches, kernel_image_layout(layout))?;
+                    }
+                    self.model.infer(&patches, &token_ids, spec.token_count, &noise, raw_rgb)
+                })
+            },
+        )?;
+        backend::synchronize(&self.backend)?;
+        drop(output);
+        Ok(EagerInputs {
             patches,
             raw_images,
             noise,
             token_ids,
             session,
-        };
-        let raw_rgb = inputs.raw_images.is_some();
-        let output = ops::prepare_with_session(&inputs.session, || {
-            eager_traversal(&self.model, spec, &inputs, || {
-                self.model.infer(
-                    &inputs.patches,
-                    &inputs.token_ids,
-                    spec.token_count,
-                    &inputs.noise,
-                    raw_rgb,
-                )
-            })
-        })?;
-        backend::synchronize(&self.backend)?;
-        drop(output);
-        Ok(inputs)
+        })
     }
 
     fn build_eager(&self, spec: &InferenceSpec) -> Result<Pi05PreparedInference> {
