@@ -5,6 +5,7 @@ mod norm;
 
 pub use contracts::{BiasOrder, NormNumerics};
 pub use norm::{
-    fused_add_norm, norm, residual_add, Affine, FusedAddNormArgs, NormArgs, NormKind, QuantOut,
-    ResidualAddArgs, ResidualGate,
+    channel_l2_norm, channel_l2_norm_silu, fused_add_channel_l2_norm_silu, fused_add_norm, norm,
+    residual_add, Affine, ChannelL2NormArgs, FusedAddChannelL2NormArgs, FusedAddNormArgs, NormArgs,
+    NormKind, QuantOut, ResidualAddArgs, ResidualGate,
 };

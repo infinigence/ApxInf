@@ -19,6 +19,9 @@ __device__ inline float to_float(__nv_bfloat16 value) {
   return __bfloat162float(value);
 }
 
+template <>
+__device__ inline float to_float(float value) { return value; }
+
 template <class T>
 __device__ T from_float(float value);
 
@@ -30,6 +33,38 @@ __device__ inline __half from_float(float value) {
 template <>
 __device__ inline __nv_bfloat16 from_float(float value) {
   return __float2bfloat16(value);
+}
+
+template <>
+__device__ inline float from_float(float value) { return value; }
+
+template <class T>
+__global__ void multiply(const T* a, const T* b, T* out, int64_t count) {
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += int64_t(gridDim.x) * blockDim.x)
+    out[i] = from_float<T>(__fmul_rn(to_float(a[i]), to_float(b[i])));
+}
+
+// Aligned BF16 binary operations: one 16-byte transaction per eight elements.
+// Both inputs are loaded before writing, preserving exact in-place operation.
+template <bool Euler>
+__global__ void binary_bf16_vec8(const uint4* a, const uint4* b, uint4* out,
+                                int64_t vectors, float dt) {
+  union Pack { uint4 words; unsigned short lanes[8]; };
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < vectors; i += int64_t(gridDim.x) * blockDim.x) {
+    Pack x, y, z;
+    x.words = a[i];
+    y.words = b[i];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      float av = __bfloat162float(__ushort_as_bfloat16(x.lanes[j]));
+      float bv = __bfloat162float(__ushort_as_bfloat16(y.lanes[j]));
+      float value = Euler ? av + dt * bv : __fmul_rn(av, bv);
+      z.lanes[j] = __bfloat16_as_ushort(__float2bfloat16(value));
+    }
+    out[i] = z.words;
+  }
 }
 
 __device__ __forceinline__ float gelu_tanh(float value) {

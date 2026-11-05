@@ -1,6 +1,7 @@
 #include "internal.h"
 
 #include <algorithm>
+#include <cublas_v2.h>
 
 #ifndef APXINF_ATTENTION_BUILD_ID
 #define APXINF_ATTENTION_BUILD_ID "attention-development"
@@ -25,6 +26,11 @@ TuningKeys tuning_keys(const Spec& spec,
   int driver_version = 0;
   check_cuda(cudaRuntimeGetVersion(&runtime_version));
   check_cuda(cudaDriverGetVersion(&driver_version));
+  int blas_major = 0, blas_minor = 0, blas_patch = 0;
+  if (cublasGetProperty(MAJOR_VERSION, &blas_major) != CUBLAS_STATUS_SUCCESS ||
+      cublasGetProperty(MINOR_VERSION, &blas_minor) != CUBLAS_STATUS_SUCCESS ||
+      cublasGetProperty(PATCH_LEVEL, &blas_patch) != CUBLAS_STATUS_SUCCESS)
+    throw Failure(APXINF_STATUS_PROVIDER_ERROR, "cannot query cuBLAS Attention version");
   cudaDeviceProp properties{};
   check_cuda(cudaGetDeviceProperties(&properties, device));
 
@@ -41,6 +47,7 @@ TuningKeys tuning_keys(const Spec& spec,
       << "|sms=" << properties.multiProcessorCount
       << "|cuda=" << cuda_compat_version(runtime_version)
       << "|driver=" << cuda_compat_version(driver_version)
+      << "|cublas=" << blas_major << '.' << blas_minor << '.' << blas_patch
       // Flexible numerics retains the pre-v5 normalized suffix. The build
       // fingerprint still invalidates recipes when candidate code changes.
       << "|op|" << spec.version << '|' << spec.semantic << '|'

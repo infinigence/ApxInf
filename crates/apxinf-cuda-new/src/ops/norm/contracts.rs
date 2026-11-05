@@ -9,6 +9,9 @@ pub(crate) enum Operation {
     Norm,
     FusedAddNorm,
     ResidualAdd,
+    NormSilu,
+    BiasNormSilu,
+    FusedAddNormSilu,
 }
 
 impl Operation {
@@ -17,6 +20,9 @@ impl Operation {
             Self::Norm => 0,
             Self::FusedAddNorm => 1,
             Self::ResidualAdd => 2,
+            Self::NormSilu => 3,
+            Self::BiasNormSilu => 4,
+            Self::FusedAddNormSilu => 5,
         }
     }
 }
@@ -26,6 +32,7 @@ pub(crate) enum Statistic {
     None,
     Rms,
     Layer,
+    ChannelL2,
 }
 
 impl Statistic {
@@ -34,6 +41,7 @@ impl Statistic {
             Self::None => 0,
             Self::Rms => 1,
             Self::Layer => 2,
+            Self::ChannelL2 => 3,
         }
     }
 }
@@ -91,6 +99,9 @@ pub enum NormNumerics {
     /// the planning kernels. This is a numerical contract, not a provider
     /// request.
     StablePlanning,
+    /// Round LayerNorm, (1 + scale), their product, and shifted result to BF16;
+    /// for a grouped gated residual, round the product before residual addition.
+    StagedBf16,
 }
 
 impl NormNumerics {
@@ -99,6 +110,7 @@ impl NormNumerics {
             Self::Flexible => 0,
             Self::StableDecode => 1,
             Self::StablePlanning => 2,
+            Self::StagedBf16 => 3,
         }
     }
 }
@@ -115,7 +127,13 @@ impl Quantization {
 }
 
 fn writes_hidden(operation: Operation) -> bool {
-    operation != Operation::Norm
+    matches!(
+        operation,
+        Operation::FusedAddNorm
+            | Operation::ResidualAdd
+            | Operation::BiasNormSilu
+            | Operation::FusedAddNormSilu
+    )
 }
 
 fn writes_normalized(operation: Operation) -> bool {
@@ -123,7 +141,14 @@ fn writes_normalized(operation: Operation) -> bool {
 }
 
 fn reads_residual(operation: Operation) -> bool {
-    writes_hidden(operation)
+    writes_hidden(operation) && operation != Operation::BiasNormSilu
+}
+
+fn channel_update(operation: Operation) -> bool {
+    matches!(
+        operation,
+        Operation::BiasNormSilu | Operation::FusedAddNormSilu
+    )
 }
 
 fn reads_weight(affine: AffineKind) -> bool {
@@ -155,8 +180,13 @@ fn valid_contract(
     matches!(
         (operation, statistic, affine, gate),
         (
+            Operation::NormSilu | Operation::BiasNormSilu | Operation::FusedAddNormSilu,
+            Statistic::ChannelL2,
+            AffineKind::Weight,
+            GateKind::None
+        ) | (
             Operation::Norm,
-            Statistic::Rms | Statistic::Layer,
+            Statistic::Rms | Statistic::Layer | Statistic::ChannelL2,
             AffineKind::Weight,
             GateKind::None
         ) | (
@@ -176,7 +206,7 @@ fn valid_contract(
             GateKind::None
         ) | (
             Operation::FusedAddNorm,
-            Statistic::Rms,
+            Statistic::Rms | Statistic::Layer,
             AffineKind::Adaptive,
             GateKind::Style
         ) | (
@@ -220,6 +250,8 @@ pub(crate) struct RawArgs<'a> {
     pub(crate) numerics: NormNumerics,
     pub(crate) bias_order: BiasOrder,
     pub(crate) weight_offset: bool,
+    pub(crate) grouped_style: bool,
+    pub(crate) shift_first: bool,
     pub(crate) input: &'a Tensor,
     pub(crate) bias: Option<&'a Tensor>,
     pub(crate) residual: Option<&'a Tensor>,
@@ -300,6 +332,30 @@ fn tensor_storage(
 pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normalized> {
     let operation = args.operation;
     let statistic = args.statistic;
+    if statistic == Statistic::ChannelL2
+        && !(args.input.dtype() == DType::BF16
+            && matches!(
+                operation,
+                Operation::Norm
+                    | Operation::NormSilu
+                    | Operation::BiasNormSilu
+                    | Operation::FusedAddNormSilu
+            )
+            && args.affine == AffineKind::Weight
+            && args.gate == GateKind::None
+            && args.quantization == Quantization::None
+            && args.numerics == NormNumerics::Flexible
+            && !args.weight_offset)
+    {
+        return Err(invalid(
+            "ChannelL2 requires plain unquantized BF16 weighted normalization",
+        ));
+    }
+    if channel_update(operation) && args.bias_order != BiasOrder::BiasThenResidual {
+        return Err(invalid(
+            "channel update requires staged BF16 bias/residual rounding",
+        ));
+    }
     let affine = args.affine;
     let gate = args.gate;
     if !valid_contract(operation, statistic, affine, gate) {
@@ -320,6 +376,78 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     let cols_abi = i32::try_from(cols)
         .map_err(|_| invalid("Norm column count exceeds the CUDA kernel range"))?;
     let dtype = args.input.dtype();
+    let (style_group_rows, style_parts, style_elements) = if args.grouped_style {
+        let grouped_norm = operation == Operation::Norm
+            && statistic == Statistic::Layer
+            && affine == AffineKind::Adaptive
+            && gate == GateKind::None;
+        let grouped_gate = operation == Operation::ResidualAdd
+            && statistic == Statistic::None
+            && affine == AffineKind::None
+            && gate == GateKind::Style
+            && !args.shift_first;
+        let grouped_fused = operation == Operation::FusedAddNorm
+            && statistic == Statistic::Layer
+            && affine == AffineKind::Adaptive
+            && gate == GateKind::Style;
+        if !(grouped_norm || grouped_gate || grouped_fused)
+            || dtype != DType::BF16
+            || args.quantization != Quantization::None
+            || args.numerics != NormNumerics::StagedBf16
+            || args.bias_order != BiasOrder::SingleRound
+            || args.weight_offset
+            || args.bias.is_some()
+        {
+            return Err(invalid(
+                "grouped style requires staged BF16 adaptive LayerNorm or gated residual",
+            ));
+        }
+        let style = if grouped_gate {
+            args.gate_style
+        } else {
+            args.norm_style
+        }
+        .ok_or_else(|| invalid("missing grouped style"))?;
+        let dims = style.shape().dims();
+        if dims.len() != 3
+            || dims[0] == 0
+            || rows % dims[0] != 0
+            || !(dims[1] == 2 || dims[1] == 3)
+            || dims[2] != cols
+            || (grouped_gate && dims[1] != 3)
+        {
+            return Err(invalid(
+                "grouped style must be [groups, 2 or 3, cols], groups must divide rows",
+            ));
+        }
+        if grouped_fused
+            && args.gate_style.map(|g| g.shape().dims()) != Some(&[dims[0], 3, cols][..])
+        {
+            return Err(invalid(
+                "grouped gate and normalization styles must share groups and columns",
+            ));
+        }
+        let elements = dims[0]
+            .checked_mul(dims[1])
+            .and_then(|n| n.checked_mul(cols))
+            .ok_or_else(|| invalid("grouped style size overflow"))?;
+        (rows / dims[0], dims[1], elements)
+    } else {
+        if args.shift_first
+            || args.numerics == NormNumerics::StagedBf16
+            || (statistic == Statistic::Layer && gate == GateKind::Style)
+        {
+            return Err(invalid(
+                "staged BF16 numerics requires grouped adaptive style",
+            ));
+        }
+        (
+            0,
+            0,
+            cols.checked_mul(2)
+                .ok_or_else(|| invalid("Norm style size overflow"))?,
+        )
+    };
     if args.weight_offset {
         let plain = operation == Operation::Norm && args.numerics != NormNumerics::StableDecode;
         let fused =
@@ -384,10 +512,12 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         ));
     }
     if args.bias_order == BiasOrder::BiasThenResidual
-        && (operation == Operation::Norm || gate != GateKind::None || statistic == Statistic::Rms)
+        && (matches!(operation, Operation::Norm | Operation::NormSilu)
+            || gate != GateKind::None
+            || statistic == Statistic::Rms)
     {
         return Err(invalid(
-            "BiasThenResidual requires ungated residual add or fused LayerNorm",
+            "BiasThenResidual requires an ungated residual, LayerNorm, or channel update",
         ));
     }
     let count = rows
@@ -475,9 +605,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         "norm_bias",
         &mut storage,
     )?;
-    let norm_style_elements = cols
-        .checked_mul(2)
-        .ok_or_else(|| invalid("Norm style size overflow"))?;
+    let norm_style_elements = style_elements;
     let (norm_style, norm_style_alignment) = bind_vector(
         args.norm_style,
         reads_norm_style(operation, affine),
@@ -485,9 +613,15 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         "norm_style",
         &mut storage,
     )?;
-    let gate_style_elements = cols
-        .checked_mul(3)
-        .ok_or_else(|| invalid("Norm gate style size overflow"))?;
+    let gate_style_elements = if args.grouped_style && gate == GateKind::Style {
+        (rows / style_group_rows)
+            .checked_mul(3)
+            .and_then(|n| n.checked_mul(cols))
+            .ok_or_else(|| invalid("Norm gate style size overflow"))?
+    } else {
+        cols.checked_mul(3)
+            .ok_or_else(|| invalid("Norm gate style size overflow"))?
+    };
     let (gate_style, gate_style_alignment) = bind_vector(
         args.gate_style,
         reads_gate_style(gate),
@@ -691,9 +825,98 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         ));
     }
 
+    if args.grouped_style {
+        let overlaps = |a: usize, an: usize, b: usize, bn: usize| {
+            a < b.saturating_add(bn) && b < a.saturating_add(an)
+        };
+        let bytes = count
+            .checked_mul(2)
+            .ok_or_else(|| invalid("Norm size overflow"))?;
+        for out in [hidden as usize, normalized as usize]
+            .into_iter()
+            .filter(|&p| p != 0)
+        {
+            for input in [input_pointer as usize, residual as usize]
+                .into_iter()
+                .filter(|&p| p != 0)
+            {
+                if out != input && overlaps(out, bytes, input, bytes) {
+                    return Err(invalid(
+                        "grouped outputs cannot partially overlap activation inputs",
+                    ));
+                }
+            }
+            for (style, elements) in [
+                (norm_style as usize, norm_style_elements),
+                (gate_style as usize, gate_style_elements),
+            ] {
+                if style != 0
+                    && overlaps(
+                        out,
+                        bytes,
+                        style,
+                        elements
+                            .checked_mul(2)
+                            .ok_or_else(|| invalid("Norm style size overflow"))?,
+                    )
+                {
+                    return Err(invalid(
+                        "grouped outputs cannot overlap conditioning styles",
+                    ));
+                }
+            }
+        }
+        if !hidden.is_null()
+            && !normalized.is_null()
+            && overlaps(hidden as usize, bytes, normalized as usize, bytes)
+        {
+            return Err(invalid(
+                "grouped hidden and normalized outputs must be disjoint",
+            ));
+        }
+    }
+    if channel_update(operation) {
+        let bytes = count
+            .checked_mul(2)
+            .ok_or_else(|| invalid("Norm size overflow"))?;
+        let vector_bytes = cols
+            .checked_mul(2)
+            .ok_or_else(|| invalid("Norm size overflow"))?;
+        let overlaps = |a: usize, an: usize, b: usize, bn: usize| {
+            a < b.saturating_add(bn) && b < a.saturating_add(an)
+        };
+        if overlaps(hidden as usize, bytes, normalized as usize, bytes) {
+            return Err(invalid(
+                "channel hidden and normalized outputs must be disjoint",
+            ));
+        }
+        for out in [hidden as usize, normalized as usize] {
+            for input in [input_pointer as usize, residual as usize]
+                .into_iter()
+                .filter(|&p| p != 0)
+            {
+                if out != input && overlaps(out, bytes, input, bytes) {
+                    return Err(invalid(
+                        "channel outputs cannot partially overlap activation inputs",
+                    ));
+                }
+            }
+            for vector in [weight as usize, bias as usize]
+                .into_iter()
+                .filter(|&p| p != 0)
+            {
+                if overlaps(out, bytes, vector, vector_bytes) {
+                    return Err(invalid("channel outputs cannot overlap weight or bias"));
+                }
+            }
+        }
+    }
     let dtype_value = dtype_code(dtype)?;
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
+        style_group_rows: style_group_rows as i64,
+        style_parts: style_parts as u32,
+        shift_first: u32::from(args.shift_first),
         operation: operation.code(),
         statistic: statistic.code(),
         affine: affine.code(),

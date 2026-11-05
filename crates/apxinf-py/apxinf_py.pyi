@@ -33,6 +33,11 @@ class _PackedRgbU8:
 class ModelRunner:
     """A loaded VLA model handle exposing its bare-model inference contract."""
 
+    @property
+    def initial_latent_shape(self) -> list[int]:
+        """Complete noise geometry declared by the runtime, including batch if required."""
+        ...
+
     @staticmethod
     def load(
         model: str,
@@ -162,8 +167,10 @@ class ModelRunner:
         token_ids: npt.NDArray[np.uint32],
         noise: npt.NDArray[np.float32] | None = ...,
         action_mask: npt.NDArray[np.float32] | None = ...,
+        state: npt.NDArray[np.float32] | None = ...,
+        image_grid_thw: npt.NDArray[np.uint32] | None = ...,
     ) -> npt.NDArray[np.float32]:
-        """L1: infer from resized RGB uint8. Returns normalized-domain action."""
+        """L1: RGB inference; supplied noise must match ``initial_latent_shape``."""
         ...
 
     def _calibrate_rgb(

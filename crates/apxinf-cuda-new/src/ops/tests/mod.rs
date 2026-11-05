@@ -16,3 +16,5 @@ mod nvfp4_precision;
 mod operator_doc;
 #[path = "precision/precision.rs"]
 mod precision;
+mod rope_precomputed;
+mod volume_lowering;
