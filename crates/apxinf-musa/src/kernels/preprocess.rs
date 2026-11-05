@@ -467,7 +467,15 @@ mod tests {
             &ctx, &images, &wrong_dtype, views, image_size, patch_size, ImageLayout::Nhwc,
         )
         .expect_err("an f32 patch tensor must be refused");
-        assert!(error.to_string().contains("mismatch"), "{error}");
+        // `require_output_tensor` names the expected dtype/shape/device and the
+        // actual ones; assert both sides rather than a word the template never
+        // carried.
+        let message = error.to_string();
+        assert!(
+            message.contains("expects BF16"),
+            "unhelpful refusal: {message}"
+        );
+        assert!(message.contains("got f32"), "unhelpful refusal: {message}");
 
         // A patch tensor of the wrong shape.
         let wrong_shape = bf16_tensor(&ctx, &[views * side * side + 1, 3 * patch_size * patch_size])

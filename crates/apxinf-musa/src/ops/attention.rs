@@ -2,9 +2,9 @@
 
 use apxinf_core::{Error, Result, Tensor};
 
-use super::require_unit_output_scale;
+use super::{require_deterministic, require_unit_output_scale, require_workspace};
 use crate::kernels::attention as kernels;
-use crate::kernels::not_ported;
+use crate::kernels::{not_ported, TacticDispatch};
 use crate::MusaContext;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,32 +15,61 @@ pub enum AttentionMask {
 
 /// What a model wants from dense attention, declared at load.
 ///
-/// **Carried, not consumed**, for the reason [`GemmPolicy`] documents: the
-/// session `configure_tuning` builds is what decides the tactic, so these
-/// fields are accepted and ignored here.
-///
-/// [`GemmPolicy`]: super::gemm::GemmPolicy
+/// Every field is either enforced here or refused by name. `graph_safe` is the
+/// exception in form rather than in effect: MUSA's routes are capture-safe
+/// unconditionally, so `true` (the requirement) and `false` (a weaker request)
+/// are both satisfied.
 #[derive(Clone, Debug)]
 pub struct AttentionPolicy {
+    /// Bounds the bytes the operator allocates for itself. Attention writes only
+    /// the caller's output and allocates no intermediate, so any limit —
+    /// including zero — is satisfied. Vendor-library internal workspaces are
+    /// outside this backend's accounting.
     pub workspace_limit: usize,
-    pub online_tune: bool,
+    /// `false` requires the measured packed decode route for a decode-shaped
+    /// call, per build: the assembly build's packed decode kernel, or the
+    /// MUTLASS build's packed tile 128 (9..=16 query rows). The general D256
+    /// assembly, and the MUTLASS unpacked tile 192 for 17..=256 rows, are
+    /// substitutes and are refused. A prefix pass uses the general route by
+    /// construction and is not a fallback.
     pub allow_fallback: bool,
+    /// Both values are accepted; see the type-level note.
     pub graph_safe: bool,
+    /// Bitwise determinism is not guaranteed across the available routes, so
+    /// `true` is refused rather than accepted without the guarantee.
     pub deterministic: bool,
-    /// None uses the context's tuning directory; Some("") disables disk caching.
-    pub cache_dir: Option<String>,
 }
 
 impl Default for AttentionPolicy {
     fn default() -> Self {
         Self {
             workspace_limit: 256 * 1024 * 1024,
-            online_tune: true,
             allow_fallback: true,
             graph_safe: true,
             deterministic: false,
-            cache_dir: None,
         }
+    }
+}
+
+/// The constraints this backend carries into one attention call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdmittedAttentionPolicy {
+    tactic: TacticDispatch,
+}
+
+impl AttentionPolicy {
+    /// Validate every field and keep only what execution must honour.
+    fn admit(&self, operation: &str) -> Result<AdmittedAttentionPolicy> {
+        require_deterministic(operation, self.deterministic)?;
+        // Attention allocates no workspace of its own.
+        require_workspace(operation, 0, self.workspace_limit)?;
+        Ok(AdmittedAttentionPolicy {
+            tactic: if self.allow_fallback {
+                TacticDispatch::AllowFallback
+            } else {
+                TacticDispatch::RequireExact
+            },
+        })
     }
 }
 
@@ -79,6 +108,7 @@ pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
     if args.mask == AttentionMask::Causal {
         return Err(not_ported("causal attention"));
     }
+    let admitted = args.policy.admit("attention")?;
     let query_dims = args.query.shape().dims();
     let [batch, tokens, heads, head_dim] = query_dims else {
         return Err(Error::Other(format!(
@@ -112,7 +142,15 @@ pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
         let mut value = args.value.reshape(vec![batch * tokens, heads, head_dim])?;
         // The vision kernel folds the batch into the token axis; it reads
         // `tokens_per_batch` to keep the per-image spans apart.
-        kernels::mha_bf16_into(ctx, &mut query, &mut key, &mut value, &mut out, tokens)
+        kernels::mha_bf16_into_with(
+            ctx,
+            &mut query,
+            &mut key,
+            &mut value,
+            &mut out,
+            tokens,
+            admitted.tactic,
+        )
     } else {
         if batch != 1 {
             return Err(not_ported("batched decode attention"));
@@ -127,7 +165,15 @@ pub fn attention(ctx: &MusaContext, args: AttentionArgs<'_>) -> Result<()> {
         // accepted rank describes the same bytes of one contiguous buffer.
         let key = args.key.reshape(vec![key_tokens, head_dim])?;
         let value = args.value.reshape(vec![key_tokens, head_dim])?;
-        kernels::mqa_bf16_into(ctx, &mut query, &key, &value, &mut out, key_tokens)
+        kernels::mqa_bf16_into_with(
+            ctx,
+            &mut query,
+            &key,
+            &value,
+            &mut out,
+            key_tokens,
+            admitted.tactic,
+        )
     }
 }
 
@@ -142,5 +188,68 @@ fn key_rows(tensor: &Tensor, head_dim: usize, name: &str) -> Result<usize> {
         _ => Err(Error::Other(format!(
             "MUSA attention expects a {name} cache of [rows, {head_dim}], got {dims:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    fn policy() -> AttentionPolicy {
+        AttentionPolicy::default()
+    }
+
+    #[test]
+    fn the_default_policy_is_admitted() {
+        let admitted = policy().admit("attention").expect("the default policy");
+        assert_eq!(admitted.tactic, TacticDispatch::AllowFallback);
+    }
+
+    #[test]
+    fn deterministic_is_refused() {
+        let error = AttentionPolicy {
+            deterministic: true,
+            ..policy()
+        }
+        .admit("attention")
+        .expect_err("there is no bitwise-determinism contract to honour");
+        assert!(error.to_string().contains("deterministic"), "{error}");
+    }
+
+    #[test]
+    fn allow_fallback_false_requires_an_exact_tactic() {
+        let admitted = AttentionPolicy {
+            allow_fallback: false,
+            ..policy()
+        }
+        .admit("attention")
+        .expect("a valid policy");
+        assert_eq!(admitted.tactic, TacticDispatch::RequireExact);
+    }
+
+    #[test]
+    fn a_zero_workspace_limit_is_satisfied() {
+        assert!(AttentionPolicy {
+            workspace_limit: 0,
+            ..policy()
+        }
+        .admit("attention")
+        .is_ok());
+    }
+
+    #[test]
+    fn graph_safe_is_accepted_either_way() {
+        assert!(AttentionPolicy {
+            graph_safe: true,
+            ..policy()
+        }
+        .admit("attention")
+        .is_ok());
+        assert!(AttentionPolicy {
+            graph_safe: false,
+            ..policy()
+        }
+        .admit("attention")
+        .is_ok());
     }
 }

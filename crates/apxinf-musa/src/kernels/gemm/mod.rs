@@ -21,7 +21,10 @@ mod w8a8;
 
 pub use assembly::{prepare_bf16_nn_weight, prepare_bf16_nt_weight};
 
-pub use bf16::{gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused, gemm_bf16_into};
+pub use bf16::{
+    gemm_bf16 as bf16, gemm_bf16_geglu_fused as bf16_geglu_fused, gemm_bf16_into,
+    gemm_bf16_into_with,
+};
 pub use qint8_tiles::serves as w8a8_tile_serves;
 pub use w8a8::{
     adaptive_layer_norm_quantize_w8a8_activation, decode_scope as w8a8_decode_scope,

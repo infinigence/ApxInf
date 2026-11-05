@@ -87,8 +87,8 @@ pub(crate) fn load_model_runner(
         Some(synthetic) => Pi05Weights::synthetic(&config, synthetic.seed)?,
         None => Pi05Weights::from_safetensors(&config, path)?,
     };
-    let policies = l3_policies(options);
-    install_tactics(&backend, &policies)?;
+    let policies = L3Policies::default();
+    install_tactics(&backend, options)?;
     let model = match model_variant {
         ModelVariantChoice::Int8Dynamic | ModelVariantChoice::Int8DynamicNoEncode => {
             let scope = match model_variant {
@@ -139,22 +139,41 @@ pub(crate) fn load_model_runner(
     })
 }
 
-/// `--tactics` names a GEMM tactic directory. MUSA's store is a directory, not
-/// a CUDA recipe tree with a legacy `.json` spelling, so the path is taken as
-/// given.
+/// Where this load's tactic store lives.
 ///
-/// This is the *declaration*; [`install_tactics`] is what enacts it. [`L3Policies`]
-/// travels with the model because the typed operator contracts carry one, but no
-/// kernel reads it per call — tactic selection is the context's session.
-fn l3_policies(options: &LoadOptions) -> L3Policies {
-    let cache_dir = options
-        .tuning_path
-        .as_ref()
-        .map(|path| path.to_string_lossy().into_owned());
-    L3Policies::for_recipe(cache_dir, options.autotune)
+/// `None` uses the directory derived from the running device; `Some("")` is the
+/// policy's own spelling for "no disk caching"; `Some(dir)` names the directory
+/// (the loader appends `tactics.json` itself).
+///
+/// This is the declaration; [`install_tactics`] is what enacts it. The operator
+/// policies no longer carry `cache_dir` / `online_tune`: tuning is resolved
+/// once here, and a per-call copy could only drift from it.
+fn tuning_paths(
+    cache_dir: Option<&Path>,
+    caps: &backend::MusaDeviceCaps,
+    versions: &backend::MusaLibraryVersions,
+) -> Option<backend::tuning::TuningPaths> {
+    match cache_dir {
+        Some(directory) if directory.as_os_str().is_empty() => None,
+        Some(directory) => Some(backend::tuning::TuningPaths::for_directory(directory)),
+        None => Some(backend::tuning::TuningPaths::resolve_for_device(
+            "configs/tuning",
+            caps,
+            versions,
+        )),
+    }
 }
 
-/// Install the tactic database [`l3_policies`] declares.
+/// Whether autotuning may measure missing shapes this session.
+fn tuning_mode(autotune: bool) -> backend::tuning::TuningMode {
+    if autotune {
+        backend::tuning::TuningMode::AutoTune
+    } else {
+        backend::tuning::TuningMode::Inference
+    }
+}
+
+/// Install the tactic database [`tuning_paths`] declares.
 ///
 /// Once, at load, before the model prepares or captures anything: a capture
 /// must not be where a provider first gets chosen, and a weight prepared under
@@ -163,30 +182,20 @@ fn l3_policies(options: &LoadOptions) -> L3Policies {
 /// A missing database is not an error: every shape then resolves to its safe
 /// inference default, and failing here would report "this device has not been
 /// measured" as though the checkpoint were broken.
-fn install_tactics(backend: &Context, policies: &L3Policies) -> Result<()> {
-    let paths = match policies.gemm.cache_dir.as_deref() {
-        // `Some("")` is the policy's own spelling for "no disk caching".
-        Some("") => None,
-        Some(directory) => Some(backend::tuning::TuningPaths::for_directory(directory)),
-        None => Some(backend::tuning::TuningPaths::resolve_for_device(
-            "configs/tuning",
-            backend.caps(),
-            backend.library_versions(),
-        )),
-    };
+fn install_tactics(backend: &Context, options: &LoadOptions) -> Result<()> {
+    let paths = tuning_paths(
+        options.tuning_path.as_deref(),
+        backend.caps(),
+        backend.library_versions(),
+    );
     let database = paths
         .as_ref()
         .filter(|paths| paths.tactics.is_file())
         .map(|paths| backend::tuning::TuningDb::from_json_file(&paths.tactics))
         .transpose()?;
-    let mode = if policies.gemm.online_tune {
-        backend::tuning::TuningMode::AutoTune
-    } else {
-        backend::tuning::TuningMode::Inference
-    };
     backend::tuning::configure_tuning(
         backend,
-        mode,
+        tuning_mode(options.autotune),
         database.as_slice(),
         paths,
     )
@@ -218,59 +227,70 @@ mod tests {
         path
     }
 
-    fn assert_recipe_policy(
-        policies: &L3Policies,
-        expected_cache: Option<&str>,
-        expected_online_tune: bool,
-    ) {
-        assert_eq!(policies.gemm.cache_dir.as_deref(), expected_cache);
-        assert_eq!(policies.attention.cache_dir.as_deref(), expected_cache);
-        assert_eq!(policies.gemm.online_tune, expected_online_tune);
-        assert_eq!(policies.attention.online_tune, expected_online_tune);
+    fn caps() -> backend::MusaDeviceCaps {
+        backend::MusaDeviceCaps {
+            device_name: "M1000".into(),
+            compute_major: 2,
+            compute_minor: 2,
+            mp: 22,
+            multiprocessor_count: 8,
+            arch_family: apxinf_musa::MusaArchFamily::Mp22,
+            hardware_warp_size: 128,
+        }
+    }
+
+    fn versions() -> backend::MusaLibraryVersions {
+        backend::MusaLibraryVersions {
+            musa: 1,
+            mublas_lt: 0,
+            binaries: [("libmublas.so".to_string(), "test".to_string())].into(),
+        }
     }
 
     #[test]
-    fn tactics_path_is_taken_as_given() {
+    fn an_empty_cache_dir_disables_disk_caching() {
+        assert!(tuning_paths(Some(Path::new("")), &caps(), &versions()).is_none());
+    }
+
+    #[test]
+    fn a_named_directory_is_taken_as_given() {
         let directory = temporary_directory("tactics");
-        let legacy = directory.join("legacy-tactics.json");
-        let options = LoadOptions {
-            tuning_path: Some(legacy.clone()),
-            autotune: false,
-            ..LoadOptions::default()
-        };
-
-        let policies = l3_policies(&options);
-        assert_recipe_policy(&policies, legacy.to_str(), false);
+        let requested = directory.join("explicit.recipes");
+        let paths = tuning_paths(Some(requested.as_path()), &caps(), &versions())
+            .expect("a named directory");
+        assert_eq!(paths.directory, requested);
+        assert_eq!(paths.tactics, requested.join("tactics.json"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
-    fn disabled_autotune_and_cache_path_survive() {
-        let directory = temporary_directory("autotune");
-        let cache = directory.join("explicit.recipes");
-        let options = LoadOptions {
-            tuning_path: Some(cache.clone()),
-            autotune: true,
-            ..LoadOptions::default()
-        };
+    fn the_default_follows_the_running_device() {
+        let paths = tuning_paths(None, &caps(), &versions()).expect("the default");
+        assert_eq!(paths.directory, Path::new("configs/tuning/musa/m1000-mp22"));
+    }
 
-        let policies = l3_policies(&options);
-        assert_recipe_policy(&policies, cache.to_str(), true);
-        std::fs::remove_dir_all(directory).unwrap();
+    #[test]
+    fn autotune_selects_the_mode() {
+        assert_eq!(tuning_mode(true), backend::tuning::TuningMode::AutoTune);
+        assert_eq!(tuning_mode(false), backend::tuning::TuningMode::Inference);
     }
 
     /// The declaration has to reach the context, or `--tactics` is a lie: a
     /// policy a caller can read back but no kernel consults is the gap this
-    /// closes. `l3_policies` builds the declaration; this is its installation.
+    /// closes. [`tuning_paths`] builds the declaration; this is its
+    /// installation.
     #[test]
     #[ignore = "requires a physical MUSA device"]
     fn the_declared_tactics_directory_is_installed_on_the_context() {
         let backend = Context::new(0).expect("MUSA device 0");
         let directory = temporary_directory("installed");
-        let policies =
-            L3Policies::for_recipe(Some(directory.to_string_lossy().into_owned()), true);
+        let options = LoadOptions {
+            tuning_path: Some(directory.clone()),
+            autotune: true,
+            ..LoadOptions::default()
+        };
 
-        install_tactics(&backend, &policies).expect("install");
+        install_tactics(&backend, &options).expect("install");
 
         let session = backend.tuning();
         assert_eq!(session.mode(), backend::tuning::TuningMode::AutoTune);

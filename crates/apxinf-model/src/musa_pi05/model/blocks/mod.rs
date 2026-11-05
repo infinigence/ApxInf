@@ -81,42 +81,6 @@ pub(in crate::musa_pi05) struct L3Policies {
     pub attention: backend::ops::AttentionPolicy,
 }
 
-impl L3Policies {
-    pub(in crate::musa_pi05) fn for_recipe(cache_dir: Option<String>, online_tune: bool) -> Self {
-        Self {
-            gemm: backend::ops::GemmPolicy {
-                cache_dir: cache_dir.clone(),
-                online_tune,
-                ..backend::ops::GemmPolicy::default()
-            },
-            attention: backend::ops::AttentionPolicy {
-                cache_dir,
-                online_tune,
-                ..backend::ops::AttentionPolicy::default()
-            },
-        }
-    }
-
-    #[cfg(test)]
-    pub(in crate::musa_pi05) fn snapshot(&self) -> L3PolicySnapshot {
-        L3PolicySnapshot {
-            gemm_cache_dir: self.gemm.cache_dir.clone(),
-            gemm_online_tune: self.gemm.online_tune,
-            attention_cache_dir: self.attention.cache_dir.clone(),
-            attention_online_tune: self.attention.online_tune,
-        }
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq)]
-pub(in crate::musa_pi05) struct L3PolicySnapshot {
-    pub gemm_cache_dir: Option<String>,
-    pub gemm_online_tune: bool,
-    pub attention_cache_dir: Option<String>,
-    pub attention_online_tune: bool,
-}
-
 /// Internal, statically dispatched seam. The associated state types retain
 /// each Block's physical representation without exposing dtype tests to Model.
 pub trait Blocks {

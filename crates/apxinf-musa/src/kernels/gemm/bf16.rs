@@ -15,7 +15,9 @@ use crate::ffi;
 use crate::kernels::contracts::{checked_i32, tensor_ptr};
 #[cfg(not(apxinf_musa_available))]
 use crate::kernels::native_unavailable;
-use crate::kernels::not_ported;
+use crate::kernels::{not_ported, TacticDispatch};
+#[cfg(apxinf_musa_available)]
+use crate::tuning::{choose_bf16, Bf16Choice, TuningMode};
 
 /// Physical BF16 GEMM contract: `[M, K] @ [K, N] -> [M, N]`.
 ///
@@ -37,6 +39,29 @@ pub fn gemm_bf16_into(
     weight: &Tensor,
     output: &mut Tensor,
 ) -> Result<()> {
+    gemm_bf16_into_with(
+        ctx,
+        activation,
+        weight,
+        output,
+        TacticDispatch::AllowFallback,
+    )
+}
+
+/// [`gemm_bf16_into`] with the caller's fallback constraint.
+///
+/// `TacticDispatch::RequireExact` refuses a bucket extrapolation and the vendor
+/// default when no record covers this exact shape (autotuning may measure one,
+/// which is not a fallback). The assembly route is a platform optimisation, not
+/// a tactic fallback: when a registered weight and a supported shape select it,
+/// it runs under either dispatch.
+pub fn gemm_bf16_into_with(
+    ctx: &MusaContext,
+    activation: &Tensor,
+    weight: &Tensor,
+    output: &mut Tensor,
+    tactic: TacticDispatch,
+) -> Result<()> {
     let (rows, inner, cols) = require_contraction(ctx, activation, weight, "gemm")?;
     // Calibration observes the operands the GEMM actually consumes, so the
     // notification happens before the computation, as on CUDA.
@@ -47,7 +72,7 @@ pub fn gemm_bf16_into(
         n: cols,
         k: inner,
     })?;
-    launch(ctx, activation, weight, output, rows, inner, cols)
+    launch(ctx, activation, weight, output, rows, inner, cols, tactic)
 }
 
 fn require_contraction(
@@ -99,6 +124,7 @@ fn launch(
     rows: usize,
     inner: usize,
     cols: usize,
+    tactic: TacticDispatch,
 ) -> Result<()> {
     let assembly = if super::in_decode_scope() {
         super::assembly::launch(ctx, activation, weight, output, rows, cols, inner)?
@@ -109,34 +135,39 @@ fn launch(
         return Ok(());
     }
     let tuning = ctx.tuning();
-    let provider = match tuning.bf16_provider(rows, cols, inner) {
+    let decision = choose_bf16(
+        tuning.bf16_provider(rows, cols, inner),
+        tuning.autotune_enabled(),
+        tactic.requires_exact(),
+        rows,
+        cols,
+        inner,
+    )?;
+    let provider = match decision {
         // A record measured at this very shape is the answer in every mode.
-        Some(resolved) if resolved.source == crate::tuning::TacticMatch::Exact => resolved.provider,
+        Bf16Choice::Exact(provider) => provider,
         // Autotuning upgrades everything else — a bucket-derived guess as much
         // as a miss — into a measurement of this shape, which is CUDA's rule
         // too (`needs_exact` is true for a bucket match, see
         // `crates/apxinf-cuda/src/kernels/gemm/plan.rs:99`). It is also what
         // lets a tuning run densify the records at the shapes a deployment
         // actually reaches.
-        _ if tuning.autotune_enabled() => tune(ctx, activation, weight, output, rows, cols, inner)?,
+        Bf16Choice::Measure => tune(ctx, activation, weight, output, rows, cols, inner)?,
         // Inference, and a recorded M within a factor of two: an extrapolation,
         // taken and said once per bucket.
-        Some(resolved) => {
-            crate::tuning::note_bf16_bucket(
-                rows,
-                cols,
-                inner,
-                resolved.recorded_m,
-                resolved.provider,
-            );
-            resolved.provider
+        Bf16Choice::Bucket {
+            provider,
+            recorded_m,
+        } => {
+            crate::tuning::note_bf16_bucket(rows, cols, inner, recorded_m, provider);
+            provider
         }
         // Inference, and nothing within a factor of two: muBLAS. Said once per
         // shape — but not while autotuning merely *suppresses* tuning (warm-up
         // and capture run under `without_autotune`), where the fallback is
         // transient and the generation bump re-captures with a tuned provider.
-        None => {
-            if tuning.mode() == crate::tuning::TuningMode::Inference {
+        Bf16Choice::Miss => {
+            if tuning.mode() == TuningMode::Inference {
                 crate::tuning::note_bf16_miss(rows, cols, inner);
             }
             crate::tuning::Bf16Provider::Mublas
@@ -317,6 +348,7 @@ fn launch(
     _rows: usize,
     _inner: usize,
     _cols: usize,
+    _tactic: TacticDispatch,
 ) -> Result<()> {
     Err(native_unavailable("gemm::bf16"))
 }
@@ -402,13 +434,14 @@ mod tests {
     //! `MusaContext`, and constructing one requires a device. A validation test
     //! that cannot be written is better than one that silently skips.
 
-    use apxinf_core::Shape;
+    use apxinf_core::{DType, Shape};
 
     use crate::context::MusaContext;
-    use crate::kernels::gemm::bf16::gemm_bf16;
+    use crate::kernels::gemm::bf16::{gemm_bf16, gemm_bf16_into_with};
     use crate::kernels::test_support::{
         from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values,
     };
+    use crate::kernels::TacticDispatch;
 
     /// One shape, sampled the way the port's muBLAS probe samples: a
     /// few rows and columns, accumulated over the full contraction in f64.
@@ -476,5 +509,147 @@ mod tests {
         ] {
             check_shape(&ctx, m, k, n);
         }
+    }
+
+    /// `allow_fallback = false` must not return success for a shape no record
+    /// covers. `(3, 5, 2)` is outside the assembly's `k % 32` rule, so the
+    /// provider path is the one under test; the context starts with an empty
+    /// inference session.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn a_required_exact_tactic_is_refused_without_a_record() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let (m, k, n) = (3, 5, 2);
+        let activation = upload(&ctx, &values(m * k, 0x5eed_1234), Shape::new(vec![m, k]));
+        let weight = upload(&ctx, &values(k * n, 0x0bad_c0de), Shape::new(vec![k, n]));
+        let mut output = ctx
+            .allocate_output(Shape::new(vec![m, n]), DType::BF16)
+            .expect("an output");
+
+        let error = gemm_bf16_into_with(
+            &ctx,
+            &activation,
+            &weight,
+            &mut output,
+            TacticDispatch::RequireExact,
+        )
+        .expect_err("no tactic record covers this shape");
+        assert!(
+            error.to_string().contains("allow_fallback=false"),
+            "{error}"
+        );
+
+        gemm_bf16_into_with(
+            &ctx,
+            &activation,
+            &weight,
+            &mut output,
+            TacticDispatch::AllowFallback,
+        )
+        .expect("the muBLAS default is allowed");
+    }
+}
+
+/// The fallback rule, without a device.
+///
+/// `choose_bf16` takes the resolved record and the autotune flag as values, so
+/// every branch is reachable here; the device tests above cover what happens
+/// after a provider is chosen.
+#[cfg(test)]
+mod policy_tests {
+    use crate::tuning::{choose_bf16, Bf16Choice, Bf16Provider, ResolvedBf16, TacticMatch};
+
+    fn resolved(provider: Bf16Provider, source: TacticMatch, recorded_m: usize) -> ResolvedBf16 {
+        ResolvedBf16 {
+            provider,
+            source,
+            recorded_m,
+        }
+    }
+
+    #[test]
+    fn an_exact_tactic_is_honoured_when_fallback_is_forbidden() {
+        let decision = choose_bf16(
+            Some(resolved(Bf16Provider::Mudnn, TacticMatch::Exact, 10)),
+            false,
+            true,
+            10,
+            1024,
+            1024,
+        )
+        .expect("an exact record satisfies the constraint");
+        assert!(matches!(decision, Bf16Choice::Exact(Bf16Provider::Mudnn)));
+    }
+
+    #[test]
+    fn a_bucket_is_refused_when_fallback_is_forbidden() {
+        let error = choose_bf16(
+            Some(resolved(Bf16Provider::Mudnn, TacticMatch::Bucket, 10)),
+            false,
+            true,
+            11,
+            1024,
+            1024,
+        )
+        .expect_err("a neighbouring record is an extrapolation, not an exact tactic");
+        assert!(error.to_string().contains("neighbouring record"), "{error}");
+    }
+
+    #[test]
+    fn a_miss_is_refused_when_fallback_is_forbidden() {
+        let error = choose_bf16(None, false, true, 11, 1024, 1024)
+            .expect_err("the muBLAS default is a fallback");
+        assert!(error.to_string().contains("no tactic record"), "{error}");
+    }
+
+    #[test]
+    fn autotuning_is_not_a_fallback() {
+        let decision = choose_bf16(
+            Some(resolved(Bf16Provider::Mudnn, TacticMatch::Bucket, 10)),
+            true,
+            true,
+            11,
+            1024,
+            1024,
+        )
+        .expect("a measurement writes the exact record the caller demanded");
+        assert_eq!(decision, Bf16Choice::Measure);
+    }
+
+    #[test]
+    fn an_exact_record_is_not_re_measured() {
+        let decision = choose_bf16(
+            Some(resolved(Bf16Provider::Mudnn, TacticMatch::Exact, 11)),
+            true,
+            true,
+            11,
+            1024,
+            1024,
+        )
+        .expect("an exact record");
+        assert!(matches!(decision, Bf16Choice::Exact(Bf16Provider::Mudnn)));
+    }
+
+    #[test]
+    fn allowed_fallback_keeps_the_bucket_and_the_default() {
+        assert_eq!(
+            choose_bf16(
+                Some(resolved(Bf16Provider::Mudnn, TacticMatch::Bucket, 10)),
+                false,
+                false,
+                11,
+                1024,
+                1024,
+            )
+            .expect("a bucket is served when it is allowed"),
+            Bf16Choice::Bucket {
+                provider: Bf16Provider::Mudnn,
+                recorded_m: 10,
+            }
+        );
+        assert_eq!(
+            choose_bf16(None, false, false, 11, 1024, 1024).expect("the default is allowed"),
+            Bf16Choice::Miss
+        );
     }
 }

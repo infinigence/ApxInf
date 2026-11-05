@@ -9,8 +9,6 @@ use blocks::Blocks;
 mod blocks;
 mod model;
 pub(in crate::musa_pi05) use blocks::L3Policies;
-#[cfg(test)]
-pub(in crate::musa_pi05) use blocks::L3PolicySnapshot;
 pub use model::{
     build_bf16_model, build_int8_dynamic_model, upload_time_embeddings_bf16,
     upload_time_embeddings_int8_dynamic,

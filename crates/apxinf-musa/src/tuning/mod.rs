@@ -346,6 +346,63 @@ pub(crate) struct ResolvedBf16 {
     pub recorded_m: usize,
 }
 
+/// The tactic decision for one BF16 GEMM shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Bf16Choice {
+    /// A record measured at this shape.
+    Exact(Bf16Provider),
+    /// A record measured at a neighbouring shape in the same bucket.
+    Bucket {
+        provider: Bf16Provider,
+        recorded_m: usize,
+    },
+    /// Measure this shape and persist the winner.
+    Measure,
+    /// No record covers this shape; use the safe default.
+    Miss,
+}
+
+/// Decide how one BF16 GEMM shape is served.
+///
+/// Pure: the caller resolves the record and the autotune flag from the session,
+/// which keeps the whole decision testable without a device. `require_exact` is
+/// the caller's `allow_fallback = false`.
+///
+/// An exact record is the answer in every mode. Autotuning may turn a bucket or
+/// a miss into a measurement, which is not a fallback: the measurement writes
+/// the exact record the caller demanded. Without autotuning, a bucket is an
+/// extrapolation and a miss is the vendor default; `require_exact` refuses both
+/// rather than returning success for a constraint that did not hold.
+pub(crate) fn choose_bf16(
+    resolved: Option<ResolvedBf16>,
+    autotune: bool,
+    require_exact: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<Bf16Choice> {
+    match resolved {
+        Some(resolved) if resolved.source == TacticMatch::Exact => {
+            Ok(Bf16Choice::Exact(resolved.provider))
+        }
+        _ if autotune => Ok(Bf16Choice::Measure),
+        Some(resolved) if !require_exact => Ok(Bf16Choice::Bucket {
+            provider: resolved.provider,
+            recorded_m: resolved.recorded_m,
+        }),
+        Some(resolved) => Err(musa_error(format!(
+            "gemm {m}x{k}x{n} has no record measured at this shape; allow_fallback=false \
+             forbids the neighbouring record at m={}",
+            resolved.recorded_m
+        ))),
+        None if require_exact => Err(musa_error(format!(
+            "gemm {m}x{k}x{n} has no tactic record; allow_fallback=false forbids the muBLAS \
+             default. Enable autotuning or allow fallback"
+        ))),
+        None => Ok(Bf16Choice::Miss),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum NoteKind {
     Bucket,
@@ -1172,17 +1229,24 @@ mod shipped_tests {
     /// filled so the struct is whole, and a wrong value there would fail the
     /// same comparison for a different reason (`stale_reason` checks `mp`, not
     /// the minor).
-    fn caps_of(db: &TuningDb) -> MusaDeviceCaps {
-        let mp = db.fingerprint.mp.expect("the database carries an mp") as u32;
-        MusaDeviceCaps {
-            device_name: db.device_name().expect("the database names its device").to_string(),
+    fn caps_of(db: &TuningDb) -> std::result::Result<MusaDeviceCaps, String> {
+        let mp = db
+            .fingerprint
+            .mp
+            .ok_or_else(|| "the database carries no mp".to_string())? as u32;
+        let device_name = db
+            .device_name()
+            .ok_or_else(|| "the database names no device".to_string())?
+            .to_string();
+        Ok(MusaDeviceCaps {
+            device_name,
             compute_major: mp / 10,
             compute_minor: mp % 10,
             mp,
             multiprocessor_count: 0,
             arch_family: MusaArchFamily::from_mp(mp),
             hardware_warp_size: 128,
-        }
+        })
     }
 
     /// The fingerprint a database records, as the running side would report it.
@@ -1194,94 +1258,190 @@ mod shipped_tests {
     /// the parser rejects — an unknown provider, a non-`kn` layout, a duplicate
     /// shape — makes `build_store` return an empty store, which is what the
     /// count below reads.
-    fn recorded_versions(db: &TuningDb) -> MusaLibraryVersions {
+    fn recorded_versions(db: &TuningDb) -> std::result::Result<MusaLibraryVersions, String> {
         let stored = db
             .fingerprint
             .library_versions
             .as_ref()
-            .expect("the database carries library fingerprints");
-        MusaLibraryVersions {
+            .ok_or_else(|| "the database carries no library fingerprint".to_string())?;
+        let binaries = stored["binaries"]
+            .as_object()
+            .ok_or_else(|| "the database carries no binaries map".to_string())?;
+        Ok(MusaLibraryVersions {
             musa: stored["musa"].as_i64().unwrap_or_default() as i32,
             mublas_lt: stored["mublas_lt"].as_u64().unwrap_or_default() as usize,
-            binaries: stored["binaries"]
-                .as_object()
-                .expect("the fingerprint carries a binaries map")
+            binaries: binaries
                 .iter()
                 .map(|(name, value)| (name.clone(), value.as_str().unwrap_or_default().to_string()))
                 .collect(),
+        })
+    }
+
+    /// Validate one database against the build that is reading it.
+    ///
+    /// Returns the reason rather than panicking so the fixture tests below can
+    /// assert rejection without catching a panic.
+    fn check_shipped_database(root: &Path, tactics: &Path) -> std::result::Result<(), String> {
+        let db = TuningDb::from_json_file(tactics)
+            .map_err(|error| format!("{tactics:?} does not parse: {error}"))?;
+        let caps = caps_of(&db)?;
+
+        // The directory name and the file name are `TuningPaths`', from the
+        // device the database itself names — not a copy of the rule here.
+        // A database filed under a name nothing looks up is a database that
+        // is never loaded, and the reason would be in this test's comment
+        // rather than in anyone's head.
+        let expected = TuningPaths::for_device(root, &caps).tactics;
+        if expected.canonicalize().ok() != tactics.canonicalize().ok() {
+            return Err(format!(
+                "{tactics:?} is not where `TuningPaths::for_device` looks for this device; a \
+                 database filed under a name nothing derives is one nothing loads"
+            ));
         }
+
+        // A database for another generation is another binary's
+        // (`KERNEL_BUILD_ID` hashes the offload arch), so only this
+        // generation's can carry this build's id. Checked before the load
+        // below, which a stale id empties out and so would report as "no
+        // record loaded" — true, and not the reason.
+        if Some(caps.mp) == built_mp()
+            && db.fingerprint.kernel_build_id.as_deref() != Some(crate::KERNEL_BUILD_ID)
+        {
+            return Err(format!(
+                "{tactics:?} was tuned for another kernel build. Editing anything under \
+                 `crates/apxinf-musa/adapters/` — including a comment — rewrites the id; \
+                 regenerate with `scripts/bench_pi05_musa.py --autotune`"
+            ));
+        }
+
+        // Counted rather than hardcoded, so a database covering more shapes
+        // is fine and a database that lost a record is not.
+        if db.record_count() == 0 {
+            return Err(format!("{tactics:?} carries no records"));
+        }
+        let store = db.build_store(&caps, &recorded_versions(&db)?);
+        if store.bf16.len() != db.record_count() {
+            return Err(format!(
+                "{} of {} records in {tactics:?} did not load",
+                db.record_count() - store.bf16.len(),
+                db.record_count()
+            ));
+        }
+        // The bucket index is derived from those records, so it can neither
+        // invent one nor lose one: a bucket entry must never reach the
+        // record list, which is what `record_bf16` would write back.
+        if store.records.len() != db.record_count() {
+            return Err(format!(
+                "a derived entry reached the record list in {tactics:?}"
+            ));
+        }
+        if store.bf16_buckets.len() > store.bf16.len() {
+            return Err(format!("{tactics:?} has more buckets than records"));
+        }
+        Ok(())
     }
 
     #[test]
     fn every_shipped_database_is_one_this_build_can_load() {
         let root = tuning_root();
+        let musa = root.join("musa");
+        // A clean checkout ships no MUSA database: `--autotune` writes one under
+        // `configs/tuning/musa`, which is a local artifact. Validate whatever is
+        // present, and say so when there is nothing to validate, rather than
+        // failing a checkout that has never been tuned.
+        //
+        // The same test covers a future shipped database (S5000, for example):
+        // a `tactics.json` that appears here is checked by the rules below.
         let mut checked = 0;
-        let directories = std::fs::read_dir(root.join("musa"))
-            .unwrap_or_else(|error| panic!("no MUSA tuning tree at {root:?}: {error}"));
-        for entry in directories {
-            let directory = entry.expect("a directory entry").path();
-            if !directory.is_dir() {
-                continue;
+        if musa.is_dir() {
+            for entry in std::fs::read_dir(&musa).expect("a readable MUSA tuning tree") {
+                let directory = entry.expect("a directory entry").path();
+                if !directory.is_dir() {
+                    continue;
+                }
+                let tactics = directory.join("tactics.json");
+                if !tactics.is_file() {
+                    continue;
+                }
+                if let Err(reason) = check_shipped_database(&root, &tactics) {
+                    panic!("{reason}");
+                }
+                checked += 1;
             }
-            let tactics = directory.join("tactics.json");
-            let db = TuningDb::from_json_file(&tactics)
-                .unwrap_or_else(|error| panic!("{tactics:?} does not parse: {error}"));
-            let caps = caps_of(&db);
-
-            // The directory name and the file name are `TuningPaths`', from the
-            // device the database itself names — not a copy of the rule here.
-            // A database filed under a name nothing looks up is a database that
-            // is never loaded, and the reason would be in this test's comment
-            // rather than in anyone's head.
-            let expected = TuningPaths::for_device(&root, &caps).tactics;
-            assert_eq!(
-                expected.canonicalize().ok(),
-                tactics.canonicalize().ok(),
-                "{tactics:?} is not where `TuningPaths::for_device` looks for this device; a \
-                 database filed under a name nothing derives is one nothing loads"
-            );
-
-            // A database for another generation is another binary's
-            // (`KERNEL_BUILD_ID` hashes the offload arch), so only this
-            // generation's can carry this build's id. Checked before the load
-            // below, which a stale id empties out and so would report as "no
-            // record loaded" — true, and not the reason.
-            if Some(caps.mp) == built_mp() {
-                assert_eq!(
-                    db.fingerprint.kernel_build_id.as_deref(),
-                    Some(crate::KERNEL_BUILD_ID),
-                    "{tactics:?} was tuned for another kernel build. Editing anything under \
-                     `crates/apxinf-musa/adapters/` — including a comment — rewrites the id; \
-                     regenerate with `scripts/bench_pi05_musa.py --autotune`"
-                );
-            }
-
-            // Counted rather than hardcoded, so a database covering more shapes
-            // is fine and a database that lost a record is not.
-            assert!(db.record_count() > 0, "{tactics:?} carries no records");
-            let store = db.build_store(&caps, &recorded_versions(&db));
-            assert_eq!(
-                store.bf16.len(),
-                db.record_count(),
-                "{} of {} records in {tactics:?} did not load",
-                db.record_count() - store.bf16.len(),
-                db.record_count()
-            );
-            // The bucket index is derived from those records, so it can neither
-            // invent one nor lose one: a bucket entry must never reach the
-            // record list, which is what `record_bf16` would write back.
-            assert_eq!(
-                store.records.len(),
-                db.record_count(),
-                "a derived entry reached the record list in {tactics:?}"
-            );
-            assert!(
-                store.bf16_buckets.len() <= store.bf16.len(),
-                "{tactics:?} has more buckets than records"
-            );
-
-            checked += 1;
         }
-        assert!(checked > 0, "no MUSA database is checked in under {root:?}");
+        if checked == 0 {
+            eprintln!(
+                "no MUSA tuning database is shipped under {musa:?}; \
+                 `scripts/bench_pi05_musa.py --autotune` writes one locally"
+            );
+        }
+    }
+
+    // ── Fixtures ────────────────────────────────────────────────────────────
+
+    /// A throwaway tuning root for one fixture database.
+    fn fixture_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "apxinf-musa-tuning-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock after the epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("a temporary tuning root");
+        root
+    }
+
+    /// Write one M1000/mp22 database where `TuningPaths` derives its name.
+    fn write_fixture_database(root: &Path, kernel_build_id: &str) -> PathBuf {
+        let directory = root.join("musa").join("m1000-mp22");
+        std::fs::create_dir_all(&directory).expect("the fixture directory");
+        let tactics = directory.join("tactics.json");
+        let document = serde_json::json!({
+            "device_name": "M1000",
+            "mp": 22,
+            "kernel_build_id": kernel_build_id,
+            "library_versions": {
+                "musa": 1,
+                "mublas_lt": 0,
+                "binaries": {"libmublas.so": "fixture"}
+            },
+            "records": [
+                {"op": "bf16_gemm", "m": 10, "n": 1024, "k": 1024,
+                 "layout": "kn", "backend": "mudnn"}
+            ]
+        });
+        std::fs::write(
+            &tactics,
+            serde_json::to_vec_pretty(&document).expect("serialisable"),
+        )
+        .expect("the fixture database");
+        tactics
+    }
+
+    #[test]
+    fn a_database_this_build_can_load_passes_the_shipped_check() {
+        let root = fixture_root("valid");
+        let tactics = write_fixture_database(&root, crate::KERNEL_BUILD_ID);
+        let result = check_shipped_database(&root, &tactics);
+        std::fs::remove_dir_all(&root).ok();
+        result.unwrap_or_else(|reason| panic!("{reason}"));
+    }
+
+    #[test]
+    fn a_database_from_another_kernel_build_is_refused() {
+        let root = fixture_root("stale");
+        let tactics = write_fixture_database(&root, "kb-another-build");
+        let result = check_shipped_database(&root, &tactics);
+        std::fs::remove_dir_all(&root).ok();
+        let reason = result.expect_err("a database for another build must not load");
+        // A build for another MP generation skips the id comparison above; the
+        // load then reports the records that did not arrive. Both name the
+        // cause closely enough for a maintainer to regenerate the database.
+        assert!(
+            reason.contains("another kernel build") || reason.contains("did not load"),
+            "the refusal does not name the kernel build: {reason}"
+        );
     }
 }

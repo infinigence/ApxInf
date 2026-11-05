@@ -37,6 +37,25 @@ pub(crate) fn not_ported(operation: &'static str) -> Error {
     Error::UnsupportedOp(operation)
 }
 
+/// Whether an operator may substitute a tactic when nothing covers its exact
+/// shape.
+///
+/// `AllowFallback` is the default for every kernel entry point. `RequireExact`
+/// is a caller's `allow_fallback = false`: the dispatcher must find a record
+/// measured at this exact shape (or measure one) instead of extrapolating from
+/// a neighbouring record or silently using the vendor default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TacticDispatch {
+    AllowFallback,
+    RequireExact,
+}
+
+impl TacticDispatch {
+    pub(crate) const fn requires_exact(self) -> bool {
+        matches!(self, Self::RequireExact)
+    }
+}
+
 /// Map a native kernel's C ABI status into an error, naming the operator.
 ///
 /// Every native operator in this crate reaches its kernel the same way, so the

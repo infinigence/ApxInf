@@ -6,7 +6,7 @@ use crate::musa_pi05::backend::{
         gemm as l3_gemm, gemm_geglu as l3_gemm_geglu, pointwise as l3_pointwise,
         rms_norm as l3_rms_norm, reserve_prefix as l3_reserve_prefix, rope as l3_rope,
         AttentionArgs, GatherArgs, GatherSemantic, GemmArgs, GemmGegluArgs, PointwiseActivation,
-        PointwiseArgs, PointwiseSemantic, RmsNormArgs, RopeArgs, RopeSemantic, WeightVersion,
+        PointwiseArgs, PointwiseSemantic, RmsNormArgs, RopeArgs, RopeSemantic,
     },
     Context, DeviceBuffer,
 };
@@ -132,8 +132,9 @@ fn gemm_geglu_bf16(
         )));
     }
     let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1] / 2]), DType::BF16)?;
-    let mut gemm = GemmArgs::new(activation, canonical_weight, &mut output)
-        .with_immutable_weight(WeightVersion::new(1));
+    // The weight is registered immutably at load (`prepare_assembly_weights`);
+    // there is no per-call candidate cache for a version token to key.
+    let mut gemm = GemmArgs::new(activation, canonical_weight, &mut output);
     gemm.policy = policies.gemm.clone();
     l3_gemm_geglu(ctx, GemmGegluArgs { gemm })?;
     Ok(output)

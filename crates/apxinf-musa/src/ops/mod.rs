@@ -25,7 +25,7 @@ pub mod w8a8;
 pub use attention::{attention, AttentionArgs, AttentionMask, AttentionPolicy};
 pub use cache::{concat_rows, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherSemantic, PatchGeometry as GatherPatchGeometry};
-pub use gemm::{gemm, gemm_geglu, GemmArgs, GemmGegluArgs, GemmPolicy, GemmQuantization, WeightVersion};
+pub use gemm::{gemm, gemm_geglu, GemmArgs, GemmGegluArgs, GemmPolicy, GemmQuantization};
 pub use norm::{
     adaptive_rms_norm, ada_gate_residual_rms_norm, bias_residual, bias_residual_layer_norm,
     bias_residual_rms_norm, layer_norm, rms_norm, AdaGateResidualRmsNormArgs,
@@ -37,7 +37,7 @@ pub use rope::{rope, RopeArgs, RopeSemantic};
 
 pub use crate::workspace::{ExecutionSession, GraphWorkspace};
 
-use apxinf_core::{Error, Result};
+use apxinf_core::{DType, Error, Result};
 
 /// Run a fixed-shape forward pass that may prepare native executions.
 pub fn prepare_with_session<T>(
@@ -64,6 +64,47 @@ fn require_unit_output_scale(operation: &str, output_scale: f32) -> Result<()> {
     if output_scale != 1.0 {
         return Err(Error::Other(format!(
             "MUSA {operation} writes BF16 only; output_scale {output_scale} needs a quantized output"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an accumulation precision this backend's GEMM cannot produce.
+///
+/// The adapter's numerical contract is `MUBLAS_COMPUTE_32F`: f32 accumulators,
+/// one rounding at the output. A narrower accumulator would round per
+/// contraction step and move the numbers, so the request is refused rather than
+/// answered with different arithmetic.
+fn require_f32_accumulation(operation: &str, dtype: DType) -> Result<()> {
+    if dtype != DType::F32 {
+        return Err(Error::Other(format!(
+            "MUSA {operation} accumulates in F32; accumulation_dtype {dtype} is not supported"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a request for a guarantee this backend cannot make.
+fn require_deterministic(operation: &str, deterministic: bool) -> Result<()> {
+    if deterministic {
+        return Err(Error::Other(format!(
+            "MUSA {operation} cannot guarantee bitwise determinism across its providers; \
+             deterministic=true is refused rather than accepted without the guarantee"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a workspace cap below what the operator must allocate for itself.
+///
+/// `required` counts only the intermediate the operator allocates on the
+/// caller's behalf; vendor-library internal workspaces are outside this
+/// backend's accounting and are documented as such.
+fn require_workspace(operation: &str, required: usize, limit: usize) -> Result<()> {
+    if required > limit {
+        return Err(Error::Other(format!(
+            "MUSA {operation} needs {required} bytes of its own workspace, above the caller's \
+             workspace_limit {limit}"
         )));
     }
     Ok(())

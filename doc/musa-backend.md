@@ -159,6 +159,9 @@ that do not change a value:
   live as long as the graph does, unlike a temporary built before the region.
 - Decode GEMMs run on the MP22 assembly tiles, and the encode path takes the
   registered variant for its shapes. Both are prepared at load.
+- Immutable weights are registered once at load (`prepare_assembly_weights`),
+  held for the context's lifetime, and must not be mutated afterwards. There is
+  no per-call candidate cache, so there is no weight-version token to key one.
 - The prefix cache reserves the action rows, so language layers write K/V
   straight into it.
 
@@ -356,6 +359,42 @@ Records are bound to the kernel build id, the MP generation, the device name and
 the vendor library fingerprints. A database that does not match is ignored with
 a printed reason rather than silently used: a stale one measures another build,
 and copying one between machines is the usual way that happens.
+
+No MUSA database is checked into this repository today. M1000's shapes are
+already covered closely enough that autotuning produces no measurable gain, so
+the directory above is an artifact of a local tuning run rather than a shipped
+file. A checkout without `configs/tuning/musa` is normal: every shape uses the
+safe default, and `cargo test -p apxinf-musa --lib` validates a database only
+when one is present. The same test covers an S5000 asset if one is added later.
+
+Tuning itself is a load-time setting: `--tactics` and `--autotune` live in
+`LoadOptions` and are installed once before prepare or capture. They are not
+part of the per-call operator policy.
+
+## Operator policies
+
+`GemmPolicy` and `AttentionPolicy` are enforced at the operator entry point,
+not carried and ignored:
+
+- `accumulation_dtype` must be F32 — the adapter's `MUBLAS_COMPUTE_32F`
+  contract. Anything else is refused.
+- `workspace_limit` bounds the bytes the operator allocates for itself: none for
+  a plain GEMM or attention, `rows × gate_cols × 2` for `gemm_geglu`. Vendor
+  libraries allocate their own internal workspaces outside this accounting.
+- `allow_fallback = false` requires a tactic record measured at the exact shape.
+  A bucket extrapolation or the muBLAS default is refused; autotuning may
+  measure the shape and write the record. On attention it requires the packed
+  decode route for a decode-shaped call, per build: the assembly build's packed
+  decode kernel, or the MUTLASS build's packed tile 128 (9..=16 query rows).
+  The general D256 assembly, and the MUTLASS unpacked tile 192 for 17..=256
+  rows, are slower substitutes and are refused; from 257 rows the unpacked tile
+  is MATE's own choice, and a prefix pass uses the general route by
+  construction. The assembly GEMM route is a platform optimisation and does not
+  count as a fallback.
+- `deterministic = true` is refused: there is no bitwise-determinism contract
+  across the available providers.
+- `graph_safe` is accepted either way: MUSA's routes are capture-safe
+  unconditionally, so `false` is a weaker request that is satisfied too.
 
 ## Measuring a change
 

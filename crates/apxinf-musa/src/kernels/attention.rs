@@ -24,7 +24,7 @@ use crate::ffi::mublas::check_mublas;
 use crate::kernels::check_native;
 #[cfg(not(apxinf_musa_available))]
 use crate::kernels::native_unavailable;
-use crate::kernels::not_ported;
+use crate::kernels::{not_ported, TacticDispatch};
 
 /// The ABI both strided-batch GEMM adapters share: f32 operands, and BF16
 /// operands with an f32 result. The argument lists are identical, so which one
@@ -168,6 +168,51 @@ fn note_general_fallback(tokens: usize, capacity: usize) {
     });
 }
 
+/// The rule [`note_general_fallback`] states, made refusable.
+///
+/// A decode-shaped call (fewer query rows than KV rows) that the packed decode
+/// kernels do not serve runs the general assembly: correct, 2.3x slower, and a
+/// substitute for the measured route. `RequireExact` turns that substitution
+/// into a refusal. A prefix pass (`tokens >= capacity`) uses the general kernel
+/// by construction; there is nothing to substitute.
+///
+/// `tokens != PACKED_DECODE_TOKENS` is `fa_d256_variant`'s `General` rule,
+/// restated here so this check has no dependency on the build's feature gates.
+#[cfg_attr(not(any(apxinf_musa_available, test)), allow(dead_code))]
+fn require_packed_decode(tokens: usize, capacity: usize, tactic: TacticDispatch) -> Result<()> {
+    if tactic.requires_exact() && tokens != PACKED_DECODE_TOKENS && tokens < capacity {
+        return Err(Error::Other(format!(
+            "MUSA mqa {tokens} query rows over {capacity} KV rows: allow_fallback=false \
+             requires the packed decode kernel, which is built for {PACKED_DECODE_TOKENS} rows; \
+             the general D256 assembly is a substitute"
+        )));
+    }
+    Ok(())
+}
+
+/// The MUTLASS build's version of the same rule.
+///
+/// `mp31_fa_variant` serves 9..=16 query rows from the packed decode tile 128.
+/// From 17 to 256 rows the packed count lands in MATE's 192 bucket, but this
+/// build freezes only the unpacked tile 192, so those decode-shaped calls run a
+/// substitute and `RequireExact` refuses them. From 257 rows the unpacked tile
+/// is MATE's own choice, and a prefix pass (`tokens >= capacity`) uses the
+/// general kernel by construction.
+///
+/// `mp31_fa_variant` is the authority; this restates its boundaries so the
+/// check compiles without the two feature gates that hide it.
+#[cfg_attr(not(any(apxinf_musa_available, test)), allow(dead_code))]
+fn require_mutlass_decode(tokens: usize, capacity: usize, tactic: TacticDispatch) -> Result<()> {
+    if tactic.requires_exact() && tokens < capacity && (17..=256).contains(&tokens) {
+        return Err(Error::Other(format!(
+            "MUSA mqa {tokens} query rows over {capacity} KV rows: allow_fallback=false \
+             requires the packed decode tile, and this MUTLASS build serves 17..=256 rows \
+             only from the unpacked tile 192 substitute"
+        )));
+    }
+    Ok(())
+}
+
 /// Multi-query attention over a prefix.
 ///
 /// `key_tokens` bounds how many rows of `k`/`v` participate, which is what
@@ -205,6 +250,32 @@ pub fn mqa_bf16_into(
     v: &Tensor,
     output: &mut Tensor,
     key_tokens: usize,
+) -> Result<()> {
+    mqa_bf16_into_with(
+        ctx,
+        q,
+        k,
+        v,
+        output,
+        key_tokens,
+        TacticDispatch::AllowFallback,
+    )
+}
+
+/// [`mqa_bf16_into`] with the caller's fallback constraint.
+///
+/// `TacticDispatch::RequireExact` refuses the general D256 assembly for a
+/// decode-shaped call (fewer query rows than KV rows), where the packed decode
+/// kernels are the measured route. A prefix pass uses the general kernel by
+/// construction and is not a fallback.
+pub fn mqa_bf16_into_with(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &mut Tensor,
+    key_tokens: usize,
+    tactic: TacticDispatch,
 ) -> Result<()> {
     let (tokens, heads, head_dim) = require_3d_bf16(ctx, q, "mqa", "q")?;
     if (heads, head_dim) != (ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM) {
@@ -253,7 +324,7 @@ pub fn mqa_bf16_into(
         heads,
         head_dim,
     })?;
-    launch_mqa(ctx, q, k, v, output, tokens, available, key_tokens)
+    launch_mqa(ctx, q, k, v, output, tokens, available, key_tokens, tactic)
 }
 
 /// The launch, split by whether this build has a MUSA toolkit.
@@ -268,13 +339,17 @@ fn launch_mqa(
     tokens: usize,
     capacity: usize,
     key_tokens: usize,
+    tactic: TacticDispatch,
 ) -> Result<()> {
     // Two kernels, two targets, and the choice is a property of the build
     // rather than of the call: `kernels/asm/` is the assembly generation and
     // `kernels/mutlass_fmha/` is the vendored one, so a build has at most one.
     match d256_route() {
         D256Route::Assembly => {}
-        D256Route::Mutlass => return launch_mqa_mutlass(ctx, q, k, v, output, tokens, key_tokens),
+        D256Route::Mutlass => {
+            require_mutlass_decode(tokens, capacity, tactic)?;
+            return launch_mqa_mutlass(ctx, q, k, v, output, tokens, key_tokens);
+        }
         D256Route::Unsupported => {
             return Err(Error::Other(format!(
                 "MUSA attention::mqa_bf16 has no kernel for {}: the vendored D256 assembly is \
@@ -287,6 +362,7 @@ fn launch_mqa(
             )));
         }
     }
+    require_packed_decode(tokens, capacity, tactic)?;
     let variant = fa_d256_variant(tokens, capacity);
     if variant == AsmFaVariant::General {
         note_general_fallback(tokens, capacity);
@@ -468,6 +544,7 @@ fn launch_mqa(
     _tokens: usize,
     _capacity: usize,
     _key_tokens: usize,
+    _tactic: TacticDispatch,
 ) -> Result<()> {
     Err(native_unavailable("attention::mqa_bf16"))
 }
@@ -505,6 +582,32 @@ pub fn mha_bf16_into(
     v: &Tensor,
     output: &mut Tensor,
     tokens_per_batch: usize,
+) -> Result<()> {
+    mha_bf16_into_with(
+        ctx,
+        q,
+        k,
+        v,
+        output,
+        tokens_per_batch,
+        TacticDispatch::AllowFallback,
+    )
+}
+
+/// [`mha_bf16_into`] with the caller's fallback constraint.
+///
+/// The vision path has one kernel route — a fixed 72-column-per-head mapping
+/// built for the tower's windows — so there is no alternative tactic to fall
+/// back to. Both dispatch values are honoured identically; the parameter is
+/// carried so the op contract has one shape for both attention paths.
+pub fn mha_bf16_into_with(
+    ctx: &MusaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    output: &mut Tensor,
+    tokens_per_batch: usize,
+    _tactic: TacticDispatch,
 ) -> Result<()> {
     let (tokens, heads, head_dim) = require_3d_bf16(ctx, q, "mha", "q")?;
     for (name, tensor) in [("k", k), ("v", v)] {
@@ -1024,11 +1127,12 @@ mod tests {
     use apxinf_core::{DType, Shape};
 
     use crate::context::MusaContext;
-    use crate::kernels::attention::{mha_bf16, mqa_bf16, split_qkv_bias_bf16};
+    use crate::kernels::attention::{mha_bf16, mqa_bf16, mqa_bf16_into_with, split_qkv_bias_bf16};
     use crate::kernels::attention::{ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM, VISION_HEAD_DIM};
     use crate::kernels::test_support::{
         from_bf16_bits, gate_for, read_back, to_bf16_bits, upload, values, zeros_as,
     };
+    use crate::kernels::TacticDispatch;
 
     fn check(ctx: &MusaContext, tokens: usize, heads: usize, head_dim: usize, bias: bool) {
         let width = heads * head_dim;
@@ -1593,5 +1697,104 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("mqa v expects bf16"), "{message}");
+    }
+
+    /// `allow_fallback = false` refuses the general D256 assembly on a
+    /// decode-shaped call: the packed decode kernel is the measured route.
+    #[test]
+    #[ignore = "needs a MUSA device"]
+    fn mqa_without_fallback_refuses_a_general_variant_decode_shape() {
+        let ctx = MusaContext::new(0).expect("MUSA device 0");
+        let (tokens, capacity) = (3usize, 8usize);
+        let q = upload(
+            &ctx,
+            &values(tokens * ASSEMBLY_HEADS * ASSEMBLY_HEAD_DIM, 0x5eed_1234),
+            Shape::new(vec![tokens, ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM]),
+        );
+        let k = upload(
+            &ctx,
+            &values(capacity * ASSEMBLY_HEAD_DIM, 0x0bad_c0de),
+            Shape::new(vec![capacity, ASSEMBLY_HEAD_DIM]),
+        );
+        let v = upload(
+            &ctx,
+            &values(capacity * ASSEMBLY_HEAD_DIM, 0x0bad_c0de),
+            Shape::new(vec![capacity, ASSEMBLY_HEAD_DIM]),
+        );
+        let mut output = ctx
+            .allocate_output(
+                Shape::new(vec![tokens, ASSEMBLY_HEADS, ASSEMBLY_HEAD_DIM]),
+                DType::BF16,
+            )
+            .expect("an output");
+
+        let error = mqa_bf16_into_with(
+            &ctx,
+            &q,
+            &k,
+            &v,
+            &mut output,
+            capacity,
+            TacticDispatch::RequireExact,
+        )
+        .expect_err("the general D256 assembly is a substitute");
+        assert!(error.to_string().contains("packed decode"), "{error}");
+    }
+}
+
+/// The D256 fallback rule, without a device.
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn a_general_decode_shape_is_refused_when_exact_is_required() {
+        let error = require_packed_decode(3, 8, TacticDispatch::RequireExact)
+            .expect_err("the general assembly is a substitute on a decode shape");
+        assert!(error.to_string().contains("packed decode"), "{error}");
+    }
+
+    #[test]
+    fn the_packed_decode_shape_is_not_a_fallback() {
+        assert!(
+            require_packed_decode(PACKED_DECODE_TOKENS, 532, TacticDispatch::RequireExact).is_ok()
+        );
+    }
+
+    #[test]
+    fn a_prefix_pass_is_not_a_fallback() {
+        assert!(require_packed_decode(522, 522, TacticDispatch::RequireExact).is_ok());
+    }
+
+    #[test]
+    fn allowing_fallback_accepts_the_general_kernel() {
+        assert!(require_packed_decode(3, 8, TacticDispatch::AllowFallback).is_ok());
+    }
+
+    #[test]
+    fn a_mutlass_packed_decode_shape_is_not_a_fallback() {
+        assert!(require_mutlass_decode(10, 532, TacticDispatch::RequireExact).is_ok());
+    }
+
+    #[test]
+    fn a_mutlass_unpacked_substitute_is_refused_when_exact_is_required() {
+        let error = require_mutlass_decode(20, 532, TacticDispatch::RequireExact)
+            .expect_err("17..=256 rows run the unpacked tile in place of MATE's packed 192");
+        assert!(error.to_string().contains("packed decode"), "{error}");
+    }
+
+    #[test]
+    fn a_mutlass_prefix_pass_is_not_a_fallback() {
+        assert!(require_mutlass_decode(522, 522, TacticDispatch::RequireExact).is_ok());
+    }
+
+    #[test]
+    fn a_mutlass_mate_choice_is_not_a_fallback() {
+        assert!(require_mutlass_decode(300, 532, TacticDispatch::RequireExact).is_ok());
+    }
+
+    #[test]
+    fn allowing_fallback_accepts_the_mutlass_substitute() {
+        assert!(require_mutlass_decode(20, 532, TacticDispatch::AllowFallback).is_ok());
     }
 }

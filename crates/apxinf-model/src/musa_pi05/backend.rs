@@ -12,7 +12,7 @@ use apxinf_core::{NormalGenerator, Result, Tensor};
 
 pub(crate) use apxinf_musa::{
     ops, CapturedGraph, ExecutionSession, MusaBuffer as DeviceBuffer, MusaContext as Context,
-    OperationShape,
+    MusaDeviceCaps, MusaLibraryVersions, OperationShape,
 };
 
 pub(crate) use apxinf_musa::sampling;

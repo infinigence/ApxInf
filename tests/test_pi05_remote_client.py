@@ -103,14 +103,14 @@ class CodecParityTest(unittest.TestCase):
         np.testing.assert_array_equal(decoded["image"], value["image"])
 
     def test_upstream_openpi_agrees_when_it_is_installed(self):
-        if not _module_available("openpi_client.msgpack_numpy"):
-            self.skipTest("the upstream openpi_client package is not installed")
-        from openpi_client.msgpack_numpy import packer as upstream_packer
+        upstream_packer = _upstream_packer()
+        if upstream_packer is None:
+            self.skipTest("openpi_client.msgpack_numpy.Packer is not available")
 
         for value in _codec_samples():
             with self.subTest(value=type(value).__name__):
                 self.assertEqual(
-                    pi05_remote_client.packer().pack(value), upstream_packer().pack(value)
+                    pi05_remote_client.packer().pack(value), upstream_packer.pack(value)
                 )
 
     def test_unsupported_dtypes_are_refused_rather_than_mangled(self):
@@ -120,13 +120,19 @@ class CodecParityTest(unittest.TestCase):
                     pi05_remote_client.pack_numpy(np.zeros(2, dtype=dtype))
 
 
-def _module_available(name: str) -> bool:
-    import importlib.util
+def _upstream_packer():
+    """The upstream codec, or ``None`` when this host has no usable one.
 
+    ``openpi-client==0.1.2`` exposes ``Packer`` (a configured
+    ``msgpack.Packer``); older or forked releases may expose neither that name
+    nor the module. Probe the *symbol* the test actually calls, so a module that
+    imports but lacks ``Packer`` skips instead of failing with an ImportError.
+    """
     try:
-        return importlib.util.find_spec(name) is not None
-    except ModuleNotFoundError:
-        return False
+        from openpi_client.msgpack_numpy import Packer
+    except ImportError:  # no module, or a release without `Packer`
+        return None
+    return Packer()
 
 
 # ── Timing map ───────────────────────────────────────────────────────────────

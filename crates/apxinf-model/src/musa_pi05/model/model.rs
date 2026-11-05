@@ -103,14 +103,6 @@ impl ModelVariant {
         }
     }
 
-    #[cfg(test)]
-    pub(in crate::musa_pi05) fn l3_policy_snapshot(&self) -> super::L3PolicySnapshot {
-        match self {
-            Self::Bf16 { model, .. } => model.blocks.policies.snapshot(),
-            Self::Int8Dynamic { model, .. } => model.blocks.policies.snapshot(),
-        }
-    }
-
     pub(in crate::musa_pi05) fn workspace_requirements(
         &self,
         token_count: usize,
