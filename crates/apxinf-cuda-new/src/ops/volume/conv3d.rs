@@ -51,6 +51,23 @@ struct Execution {
     _storage: Vec<CudaBuffer>,
     stream: Arc<CudaStream>,
 }
+/// Session-cache identity: the conv geometry plus the bound storage addresses
+/// and selection policy. Identical bindings reuse one native execution across
+/// prepare and capture.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ExecutionKey {
+    spec: abi::ConvSpec,
+    device: usize,
+    input: usize,
+    history: usize,
+    weight: usize,
+    output: usize,
+    stream: usize,
+    workspace_limit: u64,
+    online_tune: bool,
+    allow_fallback: bool,
+    cache_dir: Option<String>,
+}
 fn product(dims: &[usize]) -> Result<usize> {
     dims.iter()
         .try_fold(1usize, |a, &b| a.checked_mul(b))
@@ -66,9 +83,6 @@ impl PreparedConv3d {
         args: Conv3dArgs<'_>,
         selection: &Conv3dPolicy,
     ) -> Result<Self> {
-        if !crate::workspace::may_prepare_native_resources() {
-            return Err(invalid("Conv3d must be prepared before capture"));
-        }
         let d = args.input.shape().dims();
         let w = args.weight.shape().dims();
         if d.len() != 4 || d.contains(&0) || w.len() != 2 || w.contains(&0) {
@@ -168,6 +182,28 @@ impl PreparedConv3d {
             reserved: 0,
             cache_dir: cache_dir.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
         };
+        let key = ExecutionKey {
+            spec,
+            device: ctx.device_id(),
+            input: input.ptr() as usize,
+            history: history.as_ref().map_or(0, |h| h.ptr() as usize),
+            weight: weight.ptr() as usize,
+            output: out.ptr() as usize,
+            stream: ctx.stream().handle() as usize,
+            workspace_limit: args.workspace_limit as u64,
+            online_tune: selection.online_tune,
+            allow_fallback: selection.allow_fallback,
+            cache_dir: selection.cache_dir.clone(),
+        };
+        if let Some(execution) = crate::workspace::lookup_execution(&key) {
+            crate::workspace::use_execution(&execution)?;
+            return Ok(Self(execution));
+        }
+        if !crate::workspace::may_prepare_native_resources() {
+            return Err(invalid(
+                "Conv3d cache miss during capture; prepare the same bindings first",
+            ));
+        }
         let mut raw = std::ptr::null_mut();
         unsafe {
             status::check(abi::apxinf_conv3d_prepare(
@@ -180,11 +216,14 @@ impl PreparedConv3d {
         }
         let mut storage = vec![input, weight, out];
         storage.extend(history);
-        Ok(Self(Rc::new(Execution {
+        let execution = Rc::new(Execution {
             raw: NonNull::new(raw).ok_or_else(|| invalid("null Conv3d execution"))?,
             _storage: storage,
             stream: ctx.shared_stream(),
-        })))
+        });
+        crate::workspace::store_execution(key, Rc::clone(&execution));
+        crate::workspace::use_execution(&execution)?;
+        Ok(Self(execution))
     }
     pub fn enqueue(&self) -> Result<()> {
         crate::workspace::validate_capture_target(

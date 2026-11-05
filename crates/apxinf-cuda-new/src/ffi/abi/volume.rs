@@ -2,6 +2,7 @@ use super::types::{CudaStream, Runtime};
 use std::ffi::c_void;
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Spec {
     pub version: u32,
     pub reserved: u32,
@@ -36,6 +37,7 @@ unsafe extern "C" {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ConvSpec {
     pub geometry: Spec,
     pub output_channels: i64,
