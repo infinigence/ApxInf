@@ -218,7 +218,11 @@ impl PreparedConv3d {
         storage.extend(history);
         let execution = Rc::new(Execution {
             raw: NonNull::new(raw).ok_or_else(|| invalid("null Conv3d execution"))?,
-            _storage: storage,
+            // Retain only the graph-owned arena storage, not the per-tensor
+            // leases: a pooled output must be reusable after its producer is
+            // dead, and pinning the lease would make prepare/capture bindings
+            // asymmetric. Matches GEMM's `retained_for_execution`.
+            _storage: storage.iter().map(CudaBuffer::retained_for_execution).collect(),
             stream: ctx.shared_stream(),
         });
         crate::workspace::store_execution(key, Rc::clone(&execution));
