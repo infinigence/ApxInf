@@ -6,6 +6,10 @@
 extern "C" {
 #endif
 
+apxinf_status_t apxinf_attention_gate_launch(
+    apxinf_runtime_t runtime, const apxinf_attention_gate_spec_t* spec,
+    const apxinf_attention_gate_bindings_t* bindings);
+
 typedef struct apxinf_attention_execution* apxinf_attention_execution_t;
 
 apxinf_status_t apxinf_attention_prepare(

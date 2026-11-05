@@ -15,7 +15,7 @@ use apxinf_loader::safetensors;
 
 use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
 #[cfg(feature = "cuda")]
-use crate::accelerator::cuda::downcast as cuda_backend;
+use crate::accelerator::downcast_cuda_new as cuda_backend;
 use crate::accelerator::create_backend;
 use super::config::Qwen3VLConfig;
 use super::weights::Qwen3VLTextWeights;
@@ -580,7 +580,7 @@ fn transpose_tensor_bf16_or_f32(t: &Tensor, backend: &dyn Backend) -> Result<Ten
 }
 
 /// Build fused weight matrices (qkv_packed, gate_up_packed) for the fused
-/// decode path. No-op if `Backend::concat_2d` returns Unsupported (CPU).
+/// decode path. Unsupported backends skip the fused weights.
 fn pack_fused_weights(weights: &mut Qwen3VLTextWeights, backend: &dyn Backend) {
     for layer in &mut weights.layers {
         if let Ok(packed) = backend.concat_2d(&[&layer.wq, &layer.wk, &layer.wv]) {

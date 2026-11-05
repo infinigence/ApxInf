@@ -9,7 +9,8 @@
  * one onto a single input index.
  *
  *   EMBEDDING_LOOKUP  table [vocab_size, cols], ids [rows] (u32)
- *                     -> output [rows, cols], scaled by sqrt(cols).
+ *                     -> output [rows, cols]. `embedding_scale` selects
+ *                     plain lookup or sqrt(cols) scaling.
  *                     Out-of-range ids produce zeros.
  *
  *   BIAS_POSITION     input [rows, cols], position [tokens_per_view, cols],
@@ -32,7 +33,12 @@ typedef enum {
   APXINF_GATHER_SEMANTIC_REPLACE_ROWS = 3,
 } apxinf_gather_semantic_t;
 
-#define APXINF_GATHER_SPEC_VERSION 2u
+typedef enum {
+  APXINF_GATHER_EMBEDDING_SCALE_NONE = 0,
+  APXINF_GATHER_EMBEDDING_SCALE_SQRT_WIDTH = 1,
+} apxinf_gather_embedding_scale_t;
+
+#define APXINF_GATHER_SPEC_VERSION 3u
 
 typedef struct {
   uint32_t version;
@@ -40,6 +46,8 @@ typedef struct {
   uint32_t dtype;
   /* A null bias is a different kernel path, so it belongs to the identity. */
   uint32_t has_bias;
+  /* EMBEDDING_LOOKUP only. */
+  uint32_t embedding_scale;
   /* EMBEDDING_LOOKUP only. */
   uint32_t vocab_size;
   /* REPLACE_ROWS only. */

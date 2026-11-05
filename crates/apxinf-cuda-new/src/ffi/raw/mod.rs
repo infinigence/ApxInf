@@ -1,3 +1,4 @@
+pub(crate) mod cublas;
 pub(crate) mod cuda_runtime;
 pub(crate) mod sampling;
 

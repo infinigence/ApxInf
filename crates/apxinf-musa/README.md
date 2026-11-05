@@ -1,6 +1,7 @@
 # apxinf-musa
 
-MUSA backend for ApxInf — the Moore Threads counterpart of `apxinf-cuda`.
+MUSA backend for ApxInf, with an independent Moore Threads runtime derived
+from the former `apxinf-cuda` backend.
 
 Installing the MUSA driver and SDK on an M1000 is covered by Moore Threads'
 [environment setup guide](https://docs.mthreads.com/vllm-musa-m1000/vllm-musa-m1000-doc-online/AIModule/AIModule1.4.1+vllm1.4.2/environment_setup/).
@@ -16,9 +17,10 @@ Installing the MUSA driver and SDK on an M1000 is covered by Moore Threads'
 | PI0.5 INT8 (W8A8) routes | in place: `int8_dynamic` and `int8_dynamic_no_encode`, fused GeGLU quantization, NN/NT decode images |
 | Fixed-shape preparation and capture | in place: per-stream vendor handles, same-stream warm-up, per-session shape coverage |
 
-This file is the status summary. The architecture, the relationship to the two
-CUDA trees, the INT8 routes, capture, the tuning database, serving and the
-accuracy gate live in [the backend document](../../doc/musa-backend.md).
+This file is the status summary. The architecture, the relationship to the
+current CUDA runtime and its predecessor, the INT8 routes, capture, the tuning
+database, serving and the accuracy gate live in
+[the backend document](../../doc/musa-backend.md).
 
 Capture is the contract to read before changing any operator: vendor state is
 created on first use per shape and per stream, and only outside capture. An

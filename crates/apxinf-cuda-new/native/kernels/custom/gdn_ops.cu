@@ -472,18 +472,6 @@ __global__ void gated_norm_quantize_kernel(
         __bfloat162float(rounded) * inverse_scale, __NV_SATFINITE, __NV_E4M3);
   }
 }
-
-
-// Widen FP16 back to BF16. The FlashInfer scan emits FP16; everything
-// downstream of it in this model is BF16.
-__global__ void widen_f16_to_bf16_kernel(const __half* __restrict__ input,
-                                         __nv_bfloat16* __restrict__ output,
-                                         long long count) {
-  const long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= count) return;
-  output[index] = __float2bfloat16(__half2float(input[index]));
-}
-
 // Prepare a chunk of the GDN projection for the FlashInfer prefill kernel.
 //
 // That kernel wants what ours does not: q, k and v split into separate
@@ -770,17 +758,6 @@ __global__ void gdn_prepare_prefill_warp_kernel(
 }
 
 }  // namespace
-
-int gdn_widen_f16_to_bf16(const void* input, void* output, long long count,
-                          cudaStream_t stream) {
-  if (count <= 0) return -1;
-  const int threads = 256;
-  const long long blocks = (count + threads - 1) / threads;
-  widen_f16_to_bf16_kernel<<<(int)blocks, threads, 0, stream>>>(
-      static_cast<const __half*>(input),
-      static_cast<__nv_bfloat16*>(output), count);
-  return cudaGetLastError() == cudaSuccess ? 0 : -2;
-}
 
 int gdn_conv_prepare(const void* input, const void* weight,
                                void* window, void* q_out, void* k_out,
@@ -1390,12 +1367,6 @@ int launch_chunk_scan(const __nv_bfloat16* q, const __nv_bfloat16* k,
   const int num_chunks = seq_padded / CHUNK;
   const size_t shared = sizeof(ChunkSharedT<CHUNK, QKT, MT>);
   auto kernel = chunk_scan_kernel_t<CHUNK, QKT, MT, MINBLK>;
-  static bool configured = false;
-  if (!configured) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)shared);
-    configured = true;
-  }
   kernel<<<v_heads, kDim, shared, stream>>>(q, k, v, g, b, out, q_row_stride,
                                             k_row_stride, v_row_stride, state,
                                             seq_padded, v_heads, k_heads,
@@ -1691,13 +1662,6 @@ int launch_chunk_scan_v0(const __nv_bfloat16* q, const __nv_bfloat16* k,
                          cudaStream_t stream) {
   const int num_chunks = seq_padded / kChunk;
   const size_t shared = sizeof(ChunkShared);
-  static bool configured = false;
-  if (!configured) {
-    cudaFuncSetAttribute(chunk_scan_kernel_v0,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)shared);
-    configured = true;
-  }
   chunk_scan_kernel_v0<<<v_heads, kDim, shared, stream>>>(
       q, k, v, g, b, out, q_row_stride, k_row_stride, v_row_stride, state,
       seq_padded, v_heads, k_heads, num_chunks);
@@ -1713,7 +1677,44 @@ int smem_variant() {
   return e ? atoi(e) : 8;
 }
 
+template <int CHUNK, typename QKT, typename MT, int MINBLK>
+int prepare_chunk_scan_variant() {
+  const size_t shared = sizeof(ChunkSharedT<CHUNK, QKT, MT>);
+  if (shared <= 48u * 1024u) return 0;
+  return static_cast<int>(cudaFuncSetAttribute(
+      chunk_scan_kernel_t<CHUNK, QKT, MT, MINBLK>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared)));
+}
+
 }  // namespace
+
+int gdn_chunk_scan_prepare(int device) {
+  const cudaError_t selected = cudaSetDevice(device);
+  if (selected != cudaSuccess) return static_cast<int>(selected);
+#define APXINF_GDN_PREPARE(CHUNK_, QKT_, MT_, MINBLK_) \
+  prepare_chunk_scan_variant<CHUNK_, QKT_, MT_, MINBLK_>()
+  switch (smem_variant()) {
+    case 0:
+      return static_cast<int>(cudaFuncSetAttribute(
+          chunk_scan_kernel_v0, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(sizeof(ChunkShared))));
+    case 1: return APXINF_GDN_PREPARE(64, float, float, 2);
+    case 2: return APXINF_GDN_PREPARE(32, float, float, 4);
+    case 3: return APXINF_GDN_PREPARE(64, bf16, float, 2);
+    case 4: return APXINF_GDN_PREPARE(64, bf16, bf16, 3);
+    case 5: return APXINF_GDN_PREPARE(32, bf16, float, 6);
+    case 6: return APXINF_GDN_PREPARE(32, float, float, 2);
+    case 7: return APXINF_GDN_PREPARE(16, float, float, 6);
+    case 8: return APXINF_GDN_PREPARE(32, float, float, 3);
+    case 9: return APXINF_GDN_PREPARE(32, float, bf16, 3);
+    case 10: return APXINF_GDN_PREPARE(16, float, float, 2);
+    case 11: return APXINF_GDN_PREPARE(16, float, float, 3);
+    case 12: return APXINF_GDN_PREPARE(16, float, float, 4);
+    case 13: return APXINF_GDN_PREPARE(32, float, float, 5);
+    default: return APXINF_GDN_PREPARE(32, float, float, 3);
+  }
+#undef APXINF_GDN_PREPARE
+}
 
 int gdn_chunk_scan(const void* q, const void* k, const void* v, const void* g,
                    const void* beta, void* out, void* state, int seq_padded,

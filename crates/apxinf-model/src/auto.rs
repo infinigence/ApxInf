@@ -5,9 +5,12 @@ use std::path::{Path, PathBuf};
 
 use apxinf_core::{DType, Device, Error, Result, Tensor};
 
-use crate::accelerator::create_backend;
+use crate::accelerator::create_backend_with_recipe_options;
 use crate::builtin::register_builtin_models;
-use crate::d3::{DecisionInput, DecisionOutput, DecisionRuntime};
+use crate::decision::{
+    CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionSchema,
+    SchemaDecisionOutput,
+};
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
@@ -45,8 +48,8 @@ pub struct LoadOptions {
     /// `config.json:model_type`.
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
-    /// auto, bf16, fp8_static and int8_dynamic. Native Metal Qwen3/MiniCPM5
-    /// variants are parsed by their family loader. Other families migrate separately.
+    /// auto, bf16, fp8_static and int8_dynamic. Native Metal families parse
+    /// their own variants. Other families migrate separately.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
@@ -60,6 +63,11 @@ pub struct LoadOptions {
     /// For cuda-new, override the recipe directory. None uses the shared
     /// hardware/toolkit tuning directory; legacy JSON records are not loaded.
     pub tuning_path: Option<PathBuf>,
+    /// CUDA PI0.5 BF16/FP8: maximum extra bytes for language gate/up layout copies.
+    /// None permits one extra live layout per weight for concurrent consumers.
+    /// Copies die with their last execution/graph; retired bases can transition
+    /// in place. Some(0) fixes canonical without additional copies.
+    pub weight_layout_budget_bytes: Option<usize>,
     /// Additional named model artifacts that are not embedded in the primary
     /// checkpoint. Model loaders must reject missing or unknown required
     /// assets instead of discovering them through process-global state.
@@ -98,7 +106,7 @@ pub enum LoadedModel {
         generation_defaults: GenerationOptions,
     },
     Vla(Box<dyn VlaRuntime>),
-    Decision(Box<dyn DecisionRuntime>),
+    Decision(DecisionModel),
 }
 
 impl LoadedModel {
@@ -125,21 +133,41 @@ impl LoadedModel {
         }
     }
 
-    pub fn decision_mut(&mut self) -> Result<&mut dyn DecisionRuntime> {
+    pub fn decision_model_mut(&mut self) -> Result<&mut DecisionModel> {
         match self {
-            Self::Decision(model) => Ok(&mut **model),
+            Self::Decision(model) => Ok(model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
+    }
+
+    /// The encoded-prompt runtime of a code decision model.
+    pub fn decision_mut(&mut self) -> Result<&mut dyn CodeDecisionRuntime> {
+        self.decision_model_mut()?.code_mut()
     }
 
     pub fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
         self.decision_mut()?.decide(input)
     }
 
+    /// Score named schema questions on a schema decision model.
+    pub fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
+        self.decision_model_mut()?
+            .schema_mut()?
+            .decide_schema(request)
+    }
+
     pub fn decision_code_names(&self) -> Result<&[String]> {
         match self {
-            Self::Decision(model) => Ok(model.code_names()),
+            Self::Decision(model) => Ok(model.code()?.code_names()),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+        }
+    }
+
+    pub fn decision_capabilities(&self) -> Result<LlmCapabilities> {
+        match self {
+            Self::Decision(model) => Ok(model.capabilities()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
@@ -147,7 +175,7 @@ impl LoadedModel {
 
     pub fn decision_token_ids(&self) -> Result<&[u32]> {
         match self {
-            Self::Decision(model) => Ok(model.token_ids()),
+            Self::Decision(model) => Ok(model.code()?.token_ids()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
@@ -322,6 +350,10 @@ impl AutoModel {
         // Decision 3.0 deliberately preserves the base Qwen3.5 model_type in
         // config.json. Its package-level format is the discriminator; without
         // this check it is incorrectly routed to the Qwen3.8 NVFP4 loader.
+        // Clef keeps the Qwen3.5 model_type; its joint schema head identifies it.
+        if model_dir.join("joint_head_config.json").is_file() {
+            return Ok("clef".to_owned());
+        }
         let decision_path = model_dir.join("decision_config.json");
         if decision_path.is_file() {
             let raw = std::fs::read_to_string(&decision_path).map_err(|error| {
@@ -441,11 +473,13 @@ impl AutoModel {
                 })?
         };
         // Resolve admission before touching a device or loading checkpoint data.
-        let backend = create_backend(device)?;
         #[cfg(feature = "cuda")]
-        if let Some(cuda) = crate::accelerator::cuda::downcast(&*backend) {
-            configure_cuda_tuning(cuda, path, options)?;
-        }
+        let backend = {
+            let recipe = cuda_recipe_options(options)?;
+            create_backend_with_recipe_options(device, recipe.online_tune, recipe.cache_dir)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let backend = create_backend_with_recipe_options(device, options.autotune, None)?;
         let mut loaded = factory(path, device, backend, options)?;
         if let LoadedModel::Text {
             generation_defaults,
@@ -475,7 +509,7 @@ pub(crate) fn cuda_recipe_options(options: &LoadOptions) -> Result<CudaRecipeOpt
     let cache_dir = options
         .tuning_path
         .as_deref()
-        .map(exact_recipe_directory)
+        .and_then(|path| (!is_source_hardware_tactics(path)).then(|| exact_recipe_directory(path)))
         .map(|path| {
             path.to_str().map(str::to_owned).ok_or_else(|| {
                 Error::Other(format!(
@@ -489,6 +523,28 @@ pub(crate) fn cuda_recipe_options(options: &LoadOptions) -> Result<CudaRecipeOpt
         cache_dir,
         online_tune: options.autotune,
     })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn is_source_hardware_tactics(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("tactics.json") {
+        return false;
+    }
+    let Some(device_directory) = path.parent() else {
+        return false;
+    };
+    let Some(vendor_directory) = device_directory.parent() else {
+        return false;
+    };
+    let Some(tuning_directory) = vendor_directory.parent() else {
+        return false;
+    };
+    let Some(configs_directory) = tuning_directory.parent() else {
+        return false;
+    };
+    vendor_directory.file_name().and_then(|name| name.to_str()) == Some("nvidia")
+        && tuning_directory.file_name().and_then(|name| name.to_str()) == Some("tuning")
+        && configs_directory.file_name().and_then(|name| name.to_str()) == Some("configs")
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -619,69 +675,6 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
         "pi05" | "qwen_drive" | "d3" | "smolvla" | "smolvla_libero"
     ) || matches!(device, Device::Metal(_))
 }
-
-#[cfg(feature = "cuda")]
-fn configure_cuda_tuning(
-    cuda: &apxinf_cuda::CudaBackend,
-    model_path: &Path,
-    options: &LoadOptions,
-) -> Result<()> {
-    use apxinf_cuda::tuning::{TuningDb, TuningMode, TuningPaths};
-
-    let default_paths = TuningPaths::resolve_for_cuda(
-        "configs/tuning",
-        cuda.context().caps(),
-        cuda.context().library_versions(),
-    );
-    let model_root = if model_path.is_dir() {
-        model_path
-    } else {
-        model_path.parent().unwrap_or_else(|| Path::new("."))
-    };
-    let legacy_path = model_root.join("tactics.json");
-    let selected = select_cuda_tuning_database_path(&default_paths.tactics, &legacy_path, options);
-    let database = selected
-        .as_deref()
-        .map(TuningDb::from_json_file)
-        .transpose()?;
-    let paths = options
-        .tuning_path
-        .clone()
-        .map(TuningPaths::from_tactics)
-        .unwrap_or(default_paths);
-    let mode = if options.autotune {
-        TuningMode::AutoTune
-    } else {
-        TuningMode::Inference
-    };
-    apxinf_cuda::kernels::gemm::configure_tuning(
-        cuda.context(),
-        mode,
-        database.as_ref().map(std::slice::from_ref).unwrap_or(&[]),
-        Some(paths),
-    )
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn select_cuda_tuning_database_path(
-    default_path: &Path,
-    legacy_path: &Path,
-    options: &LoadOptions,
-) -> Option<PathBuf> {
-    match options.tuning_path.as_ref() {
-        Some(path) if path.is_file() => Some(path.clone()),
-        Some(_) if options.autotune => None,
-        Some(path) => Some(path.clone()),
-        None => default_path
-            .is_file()
-            .then(|| default_path.to_path_buf())
-            .or_else(|| {
-                (options.synthetic.is_none() && legacy_path.is_file())
-                    .then(|| legacy_path.to_path_buf())
-            }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +693,26 @@ mod tests {
         assert!(recipe.online_tune);
         options.autotune = false;
         assert!(!cuda_recipe_options(&options).unwrap().online_tune);
+    }
+
+    #[test]
+    fn source_hardware_tactics_defer_to_the_native_toolkit_directory() {
+        let options = LoadOptions {
+            tuning_path: Some(PathBuf::from(
+                "/checkout/configs/tuning/nvidia/thor-sm110/tactics.json",
+            )),
+            ..LoadOptions::default()
+        };
+        assert_eq!(cuda_recipe_options(&options).unwrap().cache_dir, None);
+
+        let options = LoadOptions {
+            tuning_path: Some(PathBuf::from("/checkpoint/tactics.json")),
+            ..LoadOptions::default()
+        };
+        assert_eq!(
+            cuda_recipe_options(&options).unwrap().cache_dir.as_deref(),
+            Some("/checkpoint/tactics.recipes")
+        );
     }
 
     #[test]
@@ -734,6 +747,21 @@ mod tests {
                     Err(Error::UnsupportedDevice(Device::Metal(0)))
                 ),
                 "accepted {name}"
+            );
+        }
+        // A variant neither bypasses the family requirement nor reaches a device.
+        for name in ["llama", "qwen3_vl"] {
+            let options = LoadOptions {
+                model_name: Some(name.into()),
+                model_variant: Some("bf16-compiled".into()),
+                ..LoadOptions::default()
+            };
+            assert!(
+                matches!(
+                    AutoModel::load_model(Device::Metal(0), path, &options),
+                    Err(Error::UnsupportedDevice(Device::Metal(0)))
+                ),
+                "accepted {name} with a variant"
             );
         }
     }
@@ -773,16 +801,13 @@ mod tests {
             "minicpm5",
             "metal_minicpm5",
             "minicpm5-mlx",
+            "llama",
+            "qwen3_vl",
         ] {
             assert!(supports_model_variant(name, Device::Metal(0)));
             assert!(!supports_model_variant(name, Device::Cpu));
             assert!(!supports_model_variant(name, Device::Cuda(0)));
         }
-        // Metal defers to the family factory, which parses its own variant; an
-        // unregistered family still fails before the checkpoint is opened.
-        assert!(supports_model_variant("llama", Device::Metal(0)));
-        assert!(supports_model_variant("qwen3_vl", Device::Metal(0)));
-        assert!(!supports_model_variant("llama", Device::Cpu));
         assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
         assert!(supports_model_variant("pi05-hip", Device::Hip(0)));
         assert!(supports_model_variant("pi05-musa", Device::Musa(0)));
@@ -859,54 +884,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         path
-    }
-
-    #[test]
-    fn synthetic_load_ignores_model_local_legacy_tactics() {
-        let directory = temporary_directory("synthetic-tactics");
-        let default_path = directory.join("missing-hardware-tactics.json");
-        let legacy_path = directory.join("tactics.json");
-        std::fs::write(&legacy_path, "{}").unwrap();
-        let options = LoadOptions {
-            synthetic: Some(SyntheticWeights { seed: 0 }),
-            ..LoadOptions::default()
-        };
-
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            None
-        );
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &LoadOptions::default()),
-            Some(legacy_path)
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn synthetic_load_still_uses_hardware_or_explicit_tactics() {
-        let directory = temporary_directory("explicit-tactics");
-        let default_path = directory.join("hardware.json");
-        let legacy_path = directory.join("tactics.json");
-        let explicit_path = directory.join("explicit.json");
-        std::fs::write(&default_path, "{}").unwrap();
-        std::fs::write(&legacy_path, "{}").unwrap();
-        std::fs::write(&explicit_path, "{}").unwrap();
-        let mut options = LoadOptions {
-            synthetic: Some(SyntheticWeights { seed: 0 }),
-            ..LoadOptions::default()
-        };
-
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            Some(default_path.clone())
-        );
-        options.tuning_path = Some(explicit_path.clone());
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            Some(explicit_path)
-        );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

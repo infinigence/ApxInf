@@ -7,6 +7,17 @@ This document lists only **what the model layer may call**: the public items of 
 crate root and the `ops` module. The internals of `ffi`, `workspace`, and `graph` are
 out of scope.
 
+The mechanically discovered `src/ops` public-item inventory is available with:
+
+```bash
+python3 scripts/check_cuda_new_architecture.py --list
+```
+
+CI runs the same checker without `--list`. It rejects new L3 names that expose dtype,
+layout, fixed shape, or implementation details; direct model calls into cuda-new FFI;
+and CUDA `__global__` definitions under `native/adapters`. Existing naming debt is an
+explicit, shrinking allowlist in the checker and must not grow during migration.
+
 Contents:
 
 1. Overview (§1)
@@ -123,13 +134,15 @@ pub struct GemmPolicy {
 }
 ```
 
-### 3.2 GEMM family (4 semantics)
+### 3.2 GEMM family (6 semantics)
 
 ```rust
 ops::gemm(ctx, GemmArgs) -> Result<()>                      // Y = alpha·A@B / output_scale
 ops::gemm_bias(ctx, GemmBiasArgs { gemm, bias }) -> Result<()>
 ops::gemm_bias_gelu(ctx, GemmBiasGeluArgs { gemm, bias }) -> Result<()>
+ops::gemm_bias_residual(ctx, GemmBiasResidualArgs { gemm, bias, residual }) -> Result<()>
 ops::gemm_geglu(ctx, GemmGegluArgs { gemm }) -> Result<()>  // B=[K,2N], gate/up halves
+ops::gemm_swiglu(ctx, GemmSwiGluArgs { gemm }) -> Result<()> // paired gate/up layout
 ```
 
 `GemmArgs` fields and constructors:
@@ -140,19 +153,35 @@ pub struct GemmArgs<'a> {
     pub b: &'a Tensor,               // [K, N] ([N, K/2] packed for NVFP4)
     pub out: &'a mut Tensor,         // [M, N] row-major
     pub quantization: GemmQuantization<'a>,
+    pub weight_layout: GemmWeightLayout,
     pub alpha: f32,
     pub output_scale: f32,
     pub policy: GemmPolicy,
     pub weight_version: Option<WeightVersion>,
 }
 
+pub enum GemmNumerics {
+    Default,
+    LegacyCublas, // established BF16 reduction order; still selected by native dispatch
+}
+
 GemmArgs::new(a, b, out)                          // plain floating-point GEMM
-GemmArgs::fp8(a, row_scales, b, channel_scales, out)
-GemmArgs::w8a8(a, row_scales, b, channel_scales, out)
-GemmArgs::nvfp4(a, a_block_scales, b, b_block_scales, block_size, alpha, out)
+GemmArgs::row_channel_quantized(a, row_scales, b, channel_scales, out)
+    // FP8 versus INT8 and accumulation dtype are inferred from the operands
+GemmArgs::block_quantized(a, a_block_scales, b, b_block_scales,
+                          block_size, alpha, out)
 args.with_immutable_weight(WeightVersion::new(v)) // asserts the weight is immutable,
                                                   // letting candidates cache a prepacked copy
 ```
+
+`GemmWeightLayout` is `Kn` for canonical `[K,N]` weights, `OutputMajor` for
+checkpoint `[N,K]` weights, or `GateUpPairs { pair_width }` for the
+`gemm_swiglu` paired gate/up encoding. Layout is data interpretation in the
+contract; provider padding and vectorization remain candidate-private.
+`GemmPolicy::numerics` expresses a numerical compatibility requirement rather
+than a provider name in the L3 function. `LegacyCublas` is accepted only for
+unit-scale canonical BF16 `gemm`; native selection restricts that contract to
+the matching cuBLAS candidate.
 
 `GemmQuantization`: `None` / `Fp8UnitScale` / `Fp8 { row_scales, channel_scales }` /
 `W8A8 { row_scales, channel_scales }` / `Nvfp4 { a_block_scales, b_block_scales, block_size }`.
@@ -207,80 +236,203 @@ gdn_prepare_prefill(ctx, fused, q_out, k_out, v_out, g, alpha,
                     tokens, row_width, k_heads, v_heads, dim, epsilon)    // prefill input reordering
 gdn_conv_prepare(ctx, input, weight, window, q_out, k_out, v_out, decay, alpha,
                  tokens, k_heads, v_heads, epsilon)
-gdn_gated_norm(ctx, input, gate, weight, output, epsilon)                 // gated RMSNorm
-gdn_gated_norm_seq(ctx, input, gate, weight, output, tokens, heads, head_dim, epsilon)
-gdn_gated_norm_seq_f16(ctx, ...same as above...)
-gdn_gated_norm_quantize(ctx, input, gate, weight, output, quantized, epsilon, input_scale)
+gdn_gated_norm(ctx, GdnGatedNormArgs {                                   // gated RMSNorm
+    input,
+    gate: GdnGate::Dense(gate)
+        | GdnGate::Strided { tensor, column_offset, heads },
+    weight, output,
+    quantized: Option<GdnQuantizedOutput { tensor, input_scale }>,
+    epsilon,
+})
 gdn_causal_conv_step(ctx, window, input, weight, output)                  // causal conv, one step
 gdn_causal_conv_forward(ctx, input, weight, output, window, tokens, channels, kernel_width)
-gdn_decay_and_beta(ctx, a, b, a_log, dt_bias, decay, beta)
-gdn_decay_and_beta_seq(ctx, a, b, a_log, dt_bias, decay, beta, tokens, heads)
+gdn_decay_and_beta(ctx, GdnDecayAndBetaArgs {                            // decay/beta preparation
+    a, b, a_log, dt_bias, decay, beta,
+})
 gdn_l2_normalize_heads(ctx, data, epsilon)                                // per-head L2 norm of q/k
-gdn_chunk_scan(ctx, q, k, v, g, beta, out, state, v_heads, k_heads, chunk_size)  // reference impl
-gdn_chunk_scan_interleaved(ctx, fused, g, beta, out, state,
-                           seq_padded, row_width, offsets, v_heads, k_heads, chunk_size, k_dim)
-gdn_widen_f16_to_bf16(ctx, input, output, count)
+gdn_chunk_scan(ctx, GdnChunkScanArgs {                                    // reference scan
+    input: GdnChunkScanInput::Split { q, k, v }
+         | GdnChunkScanInput::Interleaved { fused, offsets },
+    gate_log, beta, output, state, key_heads, chunk_size,
+})
 ```
 
-### 4.2 `ops::` attention companions (`attn_ops.rs`)
+`gdn_gated_norm` infers single-step versus sequence execution from rank 2/3,
+infers F16/BF16 input handling from the input Tensor, and selects the preserved
+quantizing implementation only when `quantized` is present. `GdnGate::Dense`
+binds a gate with the normalized input's logical shape;
+`GdnGate::Strided` binds the planning layout where gate heads occupy a slice of
+a wider row. The old `_seq`, `_seq_f16`, `_quantize`, and planning-specific
+gated-RMS names are private L1 implementation details, not L3 APIs.
+
+`gdn_decay_and_beta` infers recurrent-step versus sequence execution from rank 1/2.
+`gdn_chunk_scan` expresses split and interleaved Q/K/V as one input-layout binding and
+infers sequence length, row width, value heads and head dimension from its tensors.
+The preserved `_seq` and `_interleaved` native launch details are not public L3 entries.
+
+### 4.2 RoPE and attention companions
 
 ```rust
 partial_rope(ctx, data, positions, rotary_width, theta)    // partial rotary embedding, in place
-head_rms_norm(ctx, data, weight, epsilon)                  // per-head RMSNorm, in place
+decode_rotation(ctx, DecodeRotationArgs { ... })           // one-token 1-D/multimodal rotation
+decode_rope(ctx, DecodeRopeArgs::new(...))                 // rotate Q/K and append head-major K/V
+split_qkv_vision(ctx, VisionQkvRopeArgs { ... })           // packed vision QKV + bias + 2-D RoPE
+split_qkv_axial_rope(ctx, AxialRopeArgs { ... })           // caller-owned packed QKV split + axial RoPE
+split_qkv_mrope_cache(ctx, MropeCacheArgs { ... })         // packed GQA split + mRoPE + token-major cache write
+split_qkv_cache(ctx, QkvCacheRopeArgs { ... })             // Q/K norm + partial RoPE + token-major cache write
+split_grouped_qkv(ctx, GroupedQkvRopeArgs { ... })         // group-major Q/G/K/V split + Q/K norm + partial RoPE
 split_query_and_gate(ctx, fused, query, gate)              // q_proj output split
-apply_output_gate(ctx, data, gate)                         // sigmoid output gate, in place
+apply_output_gate(ctx, OutputGateArgs { ... })             // sigmoid output gate, source/numerics in the contract
 ```
 
-### 4.3 `ops::` MLP building blocks (`mlp.rs`)
+Decode callers bind caller-owned Tensor views. The raw fixed-workspace
+launchers are private to the RoPE family. `DecodeRopeArgs` preserves the
+legacy head-major cache layout `[1, kv_heads, capacity, head_dim]`; scheduling
+and dtype-specific native symbols are not exposed to models.
+
+`OutputGateArgs::source` distinguishes a dense gate tensor from a gate embedded
+in an interleaved projection row. `OutputGateNumerics::RoundedSigmoid` preserves
+the Qwen-Drive checkpoint's BF16 rounding before multiplication; it is a
+numerics field rather than a planning-specific entry point. Head-major backend
+decode helpers live under crate-root `runtime::attention`, not `ops`.
+
+`VisionQkvRopeArgs::rotation` selects either position IDs or a precomputed
+rotation table as semantic input. The SM87 `[512, 16, 64]` vec2 launcher is an
+internal candidate selected by the RoPE family; its shape, hardware gate, and
+implementation name are not exposed to model callers.
+
+`AxialRopeArgs::numerics` carries the established pre-rotation BF16 rounding
+policy when a model requires it. `MropeCacheArgs` carries Q/KV head geometry,
+three rotary sections, and the cache offset; the model does not call a fused
+attention ABI or select the underlying fixed kernel.
+
+### 4.3 Norm and related fixed building blocks
 
 ```rust
-rms_norm(ctx, input, weight, output, epsilon)
+ops::norm::norm(ctx, NormArgs {
+    input, output, kind,
+    affine: Affine::Weight { weight, bias, offset }
+          | Affine::Adaptive { style }
+          | Affine::WeightedAdaptive { weight, scale, shift },
+    quantized, numerics, eps,
+})
+ops::fused_add_norm(ctx, FusedAddNormArgs {
+    input, residual,
+    gate: None | Some(ResidualGate::PackedStyle(style))
+               | Some(ResidualGate::UnitOffset(gate)),
+    hidden, normalized, kind, affine, quantized, numerics, bias_order, eps,
+})
+ops::residual_add(ctx, ResidualAddArgs {
+    input, residual, gate, hidden, bias_order, ..
+})
 swiglu(ctx, fused, output)                                 // fused=[.., 2N] → [.., N]
 add_into(ctx, addend, accumulator)                         // accumulator += addend
+elementwise::add(ctx, left, right, output)                 // caller-owned F32/F16/BF16 output
+elementwise::mul(ctx, left, right, output)                 // caller-owned F32/BF16 output
+elementwise::scale(ctx, input, output, factor)             // caller-owned F16/BF16 output
 quantize_fp8_per_tensor(ctx, input, output, input_scale)
-fp8_gemv(ctx, weight, activation, output, alpha)           // M=1 projection
-nvfp4_gemv(ctx, weight, weight_scales, activation, activation_scales, output, alpha)
+gemv(ctx, GemvArgs {                                       // M=1 projection
+    weight, activation, output,
+    block_scales: Option<GemvBlockScales {
+        weight, activation, block_size,
+    }),
+    alpha,
+})
 ```
 
-### 4.4 `ops::` model level (`model.rs`)
+The common norm family ABI uses Spec version 6. `operation`, `statistic`,
+`affine`, `gate`, `quantization`, and `numerics` are independent fields; dtype
+is inferred from the Tensor bindings. Weight-offset RMSNorm is selected with
+`NormArgs::with_weight_offset()`. `NormNumerics::StableDecode` and
+`NormNumerics::StablePlanning` preserve the established reduction and BF16
+rounding orders without exposing a provider name. Weighted-adaptive affine,
+unit-offset residual gating, and strided GDN gating likewise remain behind the
+formal semantic entries; their exact kernels are private candidates/launchers,
+not additional public functions. Input/output aliasing selects the preserved
+head candidate without creating another public function.
+
+`elementwise::add`, `elementwise::mul`, and `elementwise::scale` infer dtype
+from their Tensor bindings. They do not allocate output storage; models and
+backend adapters use `CudaContext::allocate_output` before invoking the
+semantic operation. The former public raw decode add/mul wrappers have been
+removed. Llama's fixed decode workspace exposes Tensor views over the same
+buffers, preserving the existing kernels and launch parameters.
+
+### 4.4 `ops::preprocess`
+
+```rust
+preprocess(ctx, PreprocessArgs {
+    images, patches, lookup_table,
+    spec: PreprocessSpec { layout, geometry, normalization },
+})
+pixel_shuffle_4(ctx, input, tokens_per_view)
+```
+
+`PatchGeometry` describes uniform images or heterogeneous rectangular frame
+grids, including patch size, temporal patch size, and spatial merge size.
+`PatchNormalization` selects unit-range, mean/std, or caller-supplied lookup
+normalization. Input bytes are semantically RGB u8; output dtype is inferred
+from `patches`. The three former implementation-shaped RGB entry points are
+private dispatch targets and retain their original kernels and arithmetic.
+
+### 4.5 `ops::` sampling and embedding
 
 ```rust
 embedding_gather(ctx, table, ids, output)                  // embedding row gather
-argmax(ctx, logits, index)                                 // greedy sampling; index is a 1-element I32
+argmax(ctx, ArgmaxArgs::new(logits, index))                // index is a 1-element I32
+argmax(ctx, ArgmaxArgs::new(logits, index).with_remap(remap))
+                                                            // optional I32 token-id remap
 ```
 
-### 4.5 `ops::` NVFP4 quantization (`gemm/nvfp4_scales.rs`)
+The logits dtype is inferred from the tensor. Unsupported dtypes are rejected by
+the sampling family instead of selecting a dtype-named L3 entry point.
 
-Prepares packed operands and block scales for `GemmArgs::nvfp4` / `nvfp4_gemv`:
+### 4.6 `ops::` block quantization (`quantization/block.rs`)
+
+Prepares packed operands and block scales for `GemmArgs::block_quantized` / block-quantized
+`gemv`:
 
 ```rust
-nvfp4_pack_block_scales(ctx, source, destination, rows, k, block_size)
+pack_block_scales(ctx, PackBlockScalesArgs {
+    source, output, rows, k, block_size,
+})
     // rewrites checkpoint row-major block scales into the kernel atom layout; once at load time
 
-nvfp4_quantize_activation(ctx, activation, packed, scales, input_scale, block_size, layout)
-nvfp4_quantize_rms_norm(ctx, input, norm_weight, packed, scales,
-                        epsilon, input_scale, block_size, layout)   // RMSNorm + quantize fused
-nvfp4_quantize_swiglu(ctx, fused, packed, scales, input_scale, block_size, layout)  // SwiGLU + quantize fused
+block_quantize(ctx, BlockQuantizationArgs::activation(
+    activation, packed, scales, input_scale, block_size, layout,
+))
+block_quantize(ctx, BlockQuantizationArgs::rms_norm(
+    input, norm_weight, packed, scales, epsilon, input_scale, block_size, layout,
+))
+block_quantize(ctx, BlockQuantizationArgs::swiglu(
+    fused, packed, scales, input_scale, block_size, layout,
+))
 
 pub enum ScaleLayout { RowMajor, GemmAtom }   // which scale layout to emit: GEMV reads RowMajor, GEMM reads GemmAtom
 
-nvfp4_gemm_swiglu(ctx, activation, activation_scales, weight, weight_scales,
-                  output, output_scales, alpha, input_global_scale,
-                  down_inverse_global_scale)
+gemm_swiglu(ctx, GemmSwiGluArgs::block_quantized(
+    activation, activation_scales, weight, weight_scales,
+    output, output_scales, alpha, input_global_scale,
+    down_inverse_global_scale,
+))
     // fixed NVFP4 GEMM+SwiGLU+requantize path; availability: §6 NVFP4_GEMM_SWIGLU
 ```
 
-### 4.6 Host helpers (no GPU work)
+The concrete packed format is inferred from the tensors. NVFP4 remains the
+private L2/native implementation name; it is not part of the public L3 function
+name.
+
+### 4.7 Host helpers (no GPU work)
 
 ```rust
 ops::rotary_dim(head_dim, partial_rotary_factor) -> usize
 ops::gdn_state_elements(v_heads, v_dim, k_dim) -> usize
 ops::gdn_prefill_workspace_bytes(v_heads, num_seqs) -> usize
 ops::decode_attention_workspace_bytes() -> usize
-ops::nvfp4_scale_buffer_bytes(rows, k, block_size) -> Result<usize>
+ops::block_scale_buffer_bytes(rows, k, block_size) -> Result<usize>
 ```
 
-### 4.7 Fixed decode attention (`kv_cache_attention.rs`)
+### 4.8 Fixed decode attention (`kv_cache_attention.rs`)
 
 ```rust
 ops::decode_attention(ctx, query, key_cache, value_cache, output, workspace,
@@ -341,7 +493,7 @@ dependents can branch:
 
 | Constant | `true` means | When `false` |
 |---|---|---|
-| `NVFP4_GEMM_SWIGLU` | the SM110 native NVFP4 GEMM + SwiGLU implementation was compiled | `ops::nvfp4_gemm_swiglu` returns UNSUPPORTED; take the generic path |
+| `NVFP4_GEMM_SWIGLU` | the SM110 native NVFP4 GEMM + SwiGLU implementation was compiled | `ops::gemm_swiglu` with `GemmSwiGluArgs::BlockQuantized` returns UNSUPPORTED; take the generic path |
 | `FA2_DECODE` | the allocation-free FA2 decode kernel was compiled | `ops::decode_attention` returns UNSUPPORTED; use `kv_cache_attention` |
 
 ---

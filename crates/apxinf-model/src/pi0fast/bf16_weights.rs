@@ -8,12 +8,6 @@ use super::{device_weights::concat_host_2d, LinearWeights};
 pub struct Bf16LinearWeights {
     /// Physical row-major `[input, output]` matrix.
     pub weight: Tensor,
-    /// Reserved for the packed dual-GeGLU layout used by the π0.5 runtime.
-    /// π0-FAST packs gate/up plainly today (`false`, no alternates), so every
-    /// fused-GeGLU call takes the plain path.
-    pub bf16_dual_geglu_interleaved: bool,
-    pub bf16_dual_geglu_auto_interleaved: Option<Tensor>,
-    pub bf16_sm89_geglu_interleaved: Option<Tensor>,
     pub bias: Option<Tensor>,
 }
 
@@ -26,7 +20,9 @@ impl Bf16LinearWeights {
     /// remain one tensor-core GEMM.
     pub fn from_host_parts(linears: &[&LinearWeights], backend: &dyn Backend) -> Result<Self> {
         if linears.is_empty() {
-            return Err(Error::Other("cannot pack an empty BF16 linear group".into()));
+            return Err(Error::Other(
+                "cannot pack an empty BF16 linear group".into(),
+            ));
         }
         let plain_weight = concat_host_2d(
             &linears
@@ -50,13 +46,7 @@ impl Bf16LinearWeights {
                 "cannot pack BF16 projections with mixed bias presence".into(),
             ));
         };
-        Ok(Self {
-            weight,
-            bf16_dual_geglu_interleaved: false,
-            bf16_dual_geglu_auto_interleaved: None,
-            bf16_sm89_geglu_interleaved: None,
-            bias,
-        })
+        Ok(Self { weight, bias })
     }
 }
 
@@ -121,6 +111,5 @@ mod tests {
         assert_eq!(packed.weight.shape().dims(), &[2, 4]);
         assert_eq!(packed.weight.dtype(), DType::BF16);
         assert!(packed.bias.is_none());
-        assert!(!packed.bf16_dual_geglu_interleaved);
     }
 }

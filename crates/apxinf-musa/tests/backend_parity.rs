@@ -1,26 +1,15 @@
-//! Every environment variable the GPU backends read, and what each has on the
-//! other side.
+//! Environment variables read by the current CUDA and MUSA backends.
 //!
-//! The backends are ports of one another and carry parallel infrastructure, and
-//! an earlier version of this file was going to compare those files line by
-//! line. It cannot: `buffer.rs` differs on 250 of its 393 code lines and most of
-//! that is legitimate — a port is allowed to be better in places. A divergence
-//! budget over those numbers would be stale on the day it was written and would
-//! be "updated" rather than read.
+//! CUDA uses `apxinf-cuda-new`: both its Rust runtime and native C++/CUDA
+//! implementation read configuration. MUSA retains an independent runtime and
+//! PI0.5 model port. The legacy `apxinf-cuda` tree has been removed, so its
+//! allocation and attention switches are no longer CUDA counterparts.
 //!
-//! What *is* bounded and worth locking down is the **user-facing knob surface**.
-//! A variable that works on one backend and not the other, or that means the
-//! same thing under two spellings, is a defect a user meets and the repository
-//! does not currently say anything about. The table below is the documentation
-//! as well as the check, and it is read from three trees: the CUDA backend, the
-//! MUSA backend, and the MUSA model port (`apxinf-model/src/musa_pi05`), whose
-//! INT8 knobs are user-facing even though they live above the backend crate.
-//!
-//! It does not catch everything. `APXINF_CUDA_ALLOC_CACHE=0` and
-//! `APXINF_MUSA_ALLOC_CACHE=0` disagreed about *polarity* while agreeing about
-//! their names, and this table declared them counterparts while that was true.
-//! What the table does is make the pairing visible at the one moment a person is
-//! looking: when they add or move a knob.
+//! This table checks literal environment reads in those source trees, including
+//! diagnostic reads in inline tests but excluding dedicated test directories.
+//! It records differences without requiring the backends to share an API.
+//! A declared counterpart must exist on the other backend; the table cannot
+//! establish that two switches have identical defaults or numerical effects.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -38,101 +27,132 @@ struct Knob {
 }
 
 const KNOBS: &[Knob] = &[
-    // ── The three the two backends genuinely share ─────────────────────────
-    Knob {
-        name: "APXINF_CUDA_POISON_ALLOC",
-        counterpart: Some("APXINF_MUSA_POISON_ALLOC"),
-        note: "fill every allocation with 0xFF so a read-before-write shows up in the result",
-    },
-    Knob {
-        name: "APXINF_CUDA_ALLOC_CACHE",
-        counterpart: Some("APXINF_MUSA_ALLOC_CACHE"),
-        note: "opt in to the stream-ordered free list. On CUDA the cache is on and `=0` \
-               turns it off; on MUSA it is off and any other value turns it on — the \
-               defaults differ because only CUDA's has the measurement behind it, and \
-               `=0` means \"off\" on both",
-    },
-    Knob {
-        name: "APXINF_CUDA_ALLOC_CACHE_MB",
-        counterpart: Some("APXINF_MUSA_ALLOC_CACHE_MB"),
-        note: "cap on bytes the free list retains, default 4096",
-    },
-    // ── The same knob under two names ──────────────────────────────────────
-    Knob {
-        name: "APXINF_MHA_NAIVE",
-        counterpart: Some("APXINF_MUSA_BF16_MHA"),
-        note: "force the legacy vision MHA. **The spellings differ and so does the \
-               polarity**: CUDA reads its presence, MUSA needs `=legacy`. Declared here \
-               rather than renamed, because renaming either is a breaking change for \
-               whoever scripts it — but a reader who knows one should know the other",
-    },
-    // ── MUSA's half of the three shared knobs ──────────────────────────────
-    Knob {
-        name: "APXINF_MUSA_POISON_ALLOC",
-        counterpart: Some("APXINF_CUDA_POISON_ALLOC"),
-        note: "see the CUDA row: the same diagnostic, the same `0xFF`",
-    },
-    Knob {
-        name: "APXINF_MUSA_ALLOC_CACHE",
-        counterpart: Some("APXINF_CUDA_ALLOC_CACHE"),
-        note: "see the CUDA row. Off by default here, on by default there, and `=0` \
-               turns it off on both",
-    },
-    Knob {
-        name: "APXINF_MUSA_ALLOC_CACHE_MB",
-        counterpart: Some("APXINF_CUDA_ALLOC_CACHE_MB"),
-        note: "see the CUDA row: the same cap, the same default",
-    },
-    // ── CUDA-only: knobs whose subject the MUSA port has not reached ────────
-    Knob {
-        name: "APXINF_ATTN_COMPOSED_DECODE",
-        counterpart: None,
-        note: "CUDA's composed-decode attention path; no MUSA equivalent",
-    },
-    Knob {
-        name: "APXINF_ATTN_COMPOSED_PREFILL",
-        counterpart: None,
-        note: "CUDA's composed-prefill attention path; no MUSA equivalent",
-    },
+    // Current CUDA runtime (Rust and native C++/CUDA).
     Knob {
         name: "APXINF_DISABLE_FA2_SPLITKV",
         counterpart: None,
-        note: "CUDA's FlashAttention-2 split-KV switch. MUSA's D256 attention splits \
-               inside the vendored assembly and has no counterpart",
+        note: "disable CUDA FlashAttention-2 split-KV candidates; MUSA has no equivalent switch",
     },
     Knob {
-        name: "APXINF_GEMM_DUMP_SHAPES",
+        name: "APXINF_FA2_DECODE_SPLITS",
         counterpart: None,
-        note: "CUDA GEMM shape logging; MUSA logs through MTTX instead (doc/pi05-mttx.md)",
+        note: "select one or five splits for the fixed CUDA FA2 decode kernel",
+    },
+    Knob {
+        name: "APXINF_FP8_GEMV_SHARED",
+        counterpart: None,
+        note: "enable the shared-memory CUDA FP8 GEMV path for supported shapes with =1",
+    },
+    Knob {
+        name: "APXINF_FP8_NATIVE_PAIR",
+        counterpart: None,
+        note: "enable native paired CUDA FP8 quantization for aligned inputs with =1",
+    },
+    Knob {
+        name: "APXINF_GDN_CONV_PAIR",
+        counterpart: None,
+        note: "enable paired-channel CUDA GDN prefill convolution with =1",
+    },
+    Knob {
+        name: "APXINF_GDN_PREFILL_TILE",
+        counterpart: None,
+        note: "set the positive token tile size for CUDA GDN prefill convolution",
+    },
+    Knob {
+        name: "APXINF_GDN_PREFILL_TILED",
+        counterpart: None,
+        note: "select tiled CUDA GDN prefill implementations; no MUSA GDN port exists",
+    },
+    Knob {
+        name: "APXINF_GDN_PREPARE_PARALLEL",
+        counterpart: None,
+        note: "select the CUDA GDN prefill preparation implementation; no MUSA equivalent",
+    },
+    Knob {
+        name: "APXINF_GDN_SMEM_VARIANT",
+        counterpart: None,
+        note: "select the CUDA GDN shared-memory precision variant; the default is eight",
+    },
+    Knob {
+        name: "APXINF_GEMM_CUBLASLT_NVFP4",
+        counterpart: None,
+        note: "admit native cuBLASLt NVFP4 GEMM candidates on supported toolkits with =1",
+    },
+    Knob {
+        name: "APXINF_GEMM_FP8_F32_PROJECTION",
+        counterpart: None,
+        note: "force CUDA FP8 projection outputs to F32 for numerical comparison",
+    },
+    Knob {
+        name: "APXINF_GEMM_REPORT",
+        counterpart: None,
+        note: "report CUDA GEMM choices and weight layout transitions on stderr",
+    },
+    Knob {
+        name: "APXINF_GR00T_BF16_LEGACY_QK_MROPE_THREADS",
+        counterpart: None,
+        note: "restore legacy GR00T QK MRoPE thread geometry on CUDA SM87",
+    },
+    Knob {
+        name: "APXINF_GR00T_BF16_LEGACY_VISION_POINTWISE_PACK",
+        counterpart: None,
+        note: "disable the CUDA SM87 GR00T vectorized vision pointwise packing path",
+    },
+    Knob {
+        name: "APXINF_GR00T_FP8_LEGACY_STATIC_QUANT",
+        counterpart: None,
+        note: "disable the packed CUDA SM110 GR00T static FP8 quantization path",
+    },
+    Knob {
+        name: "APXINF_GR00T_LEGACY_QK_MROPE_THREADS",
+        counterpart: None,
+        note: "restore legacy GR00T QK MRoPE thread geometry on CUDA SM110",
+    },
+    Knob {
+        name: "APXINF_GR00T_W8A8_LEGACY_VISION_POINTWISE_PACK",
+        counterpart: None,
+        note: "disable the CUDA SM87 GR00T vectorized vision pointwise packing path",
+    },
+    Knob {
+        name: "APXINF_NVFP4_VECTOR_QUANT",
+        counterpart: None,
+        note: "override CUDA NVFP4 vector quantization selection for supported input shapes",
     },
     Knob {
         name: "APXINF_PREFILL_SDPA_LEGACY",
         counterpart: None,
-        note: "CUDA prefill SDPA selection; no MUSA equivalent",
+        note: "keep the legacy CUDA prefill SDPA route instead of the native attention fast path",
     },
     Knob {
-        name: "APXINF_VISION_FA2",
+        name: "APXINF_QWEN38_NVFP4_DP4A",
         counterpart: None,
-        note: "CUDA vision FlashAttention-2 selection; MUSA's is \
-               `APXINF_MUSA_BF16_MHA`",
+        note: "enable the CUDA NVFP4 DP4A GEMV path for aligned inputs with =1",
     },
     Knob {
-        name: "APXINF_VISION_SCORES_FP32",
+        name: "APXINF_QWEN38_VECTOR_ELEMENTWISE",
         counterpart: None,
-        note: "CUDA vision score-dtype switch. The measurement it belongs to is \
-               CUDA's; the MUSA port has no counterpart and should not grow one \
-               without its own",
+        note: "enable vectorized CUDA elementwise and quantization paths for supported inputs with =1",
+    },
+    // MUSA backend and its independent PI0.5 port.
+    Knob {
+        name: "APXINF_MUSA_POISON_ALLOC",
+        counterpart: None,
+        note: "fill MUSA allocations with 0xFF to expose reads before writes; cuda-new no longer reads APXINF_CUDA_POISON_ALLOC",
     },
     Knob {
-        name: "APXINF_VISION_SDPA_LEGACY",
+        name: "APXINF_MUSA_ALLOC_CACHE",
         counterpart: None,
-        note: "CUDA vision SDPA selection; no MUSA equivalent",
+        note: "opt in to the MUSA stream-ordered free list; unset or =0 disables it; cuda-new has no matching environment switch",
     },
-    // ── MUSA-only: knobs written for this port's diagnostics ───────────────
+    Knob {
+        name: "APXINF_MUSA_ALLOC_CACHE_MB",
+        counterpart: None,
+        note: "cap bytes retained by the MUSA allocation cache in MiB, default 4096; cuda-new has no matching environment switch",
+    },
     Knob {
         name: "APXINF_MUSA_BF16_MHA",
-        counterpart: Some("APXINF_MHA_NAIVE"),
-        note: "`=legacy` forces the legacy vision MHA; see the pairing above",
+        counterpart: None,
+        note: "=legacy selects the MUSA legacy vision MHA; cuda-new no longer reads APXINF_MHA_NAIVE",
     },
     Knob {
         name: "APXINF_MUSA_FA_REPLAY_DIR",
@@ -144,9 +164,7 @@ const KNOBS: &[Knob] = &[
     Knob {
         name: "APXINF_MUSA_OUTPUT_FILL",
         counterpart: None,
-        note: "`=poison` fills every operator output on the no-graph path to prove \
-               nothing reads it unwritten. The default is dirty, measured on M1000; CUDA \
-               clears unconditionally and has no switch",
+        note: "=poison fills MUSA operator outputs outside graph capture to detect unwritten reads; the default leaves outputs dirty",
     },
     Knob {
         name: "APXINF_MUSA_WORKSPACE_SLACK",
@@ -155,7 +173,6 @@ const KNOBS: &[Knob] = &[
                memory instead of the next allocation. A diagnostic for a suspected \
                kernel overrun",
     },
-    // ── The MUSA model port's INT8 knobs ───────────────────────────────────
     Knob {
         name: "APXINF_INT8_EQUALIZATION",
         counterpart: None,
@@ -195,12 +212,35 @@ fn workspace_root() -> PathBuf {
         .expect("the crate lives inside the workspace")
 }
 
-/// Every `APXINF_*` name `env::var`/`env::var_os` is called with under `root`.
+/// Literal `APXINF_*` arguments of Rust and native environment reads.
+fn names_in_source(text: &str, calls: &[&str], into: &mut BTreeSet<String>) {
+    for call in calls {
+        for (index, _) in text.match_indices(call) {
+            // Computed names and function references are not literal reads.
+            let rest = text[index + call.len()..].trim_start();
+            let Some(rest) = rest.strip_prefix('(') else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('"') else {
+                continue;
+            };
+            let Some(close) = rest.find('"') else {
+                continue;
+            };
+            let name = &rest[..close];
+            if name.starts_with("APXINF_") {
+                into.insert(name.to_string());
+            }
+        }
+    }
+}
+
+/// Read both Rust and native implementation sources, failing on missing trees.
 fn environment_names(root: &Path, into: &mut BTreeSet<String>) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
+    let entries = std::fs::read_dir(root)
+        .unwrap_or_else(|error| panic!("cannot scan {}: {error}", root.display()));
+    for entry in entries {
+        let entry = entry.expect("read source directory entry");
         let path = entry.path();
         if path.is_dir() {
             // Integration tests read nothing a user configures.
@@ -210,27 +250,14 @@ fn environment_names(root: &Path, into: &mut BTreeSet<String>) {
             environment_names(&path, into);
             continue;
         }
-        if path.extension().is_none_or(|extension| extension != "rs") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
+        let calls: &[&str] = match path.extension().and_then(|extension| extension.to_str()) {
+            Some("rs") => &["env::var", "env::var_os"],
+            Some("c" | "cc" | "cpp" | "h" | "hpp" | "cu" | "cuh") => &["getenv"],
+            _ => continue,
         };
-        for (index, _) in text.match_indices("env::var") {
-            // `env::var("NAME")` or `env::var_os("NAME")`; anything else (a
-            // computed name) is skipped rather than guessed at.
-            let rest = &text[index..];
-            let Some(open) = rest.find('(') else { continue };
-            let rest = &rest[open + 1..];
-            let Some(rest) = rest.trim_start().strip_prefix('"') else {
-                continue;
-            };
-            let Some(close) = rest.find('"') else { continue };
-            let name = &rest[..close];
-            if name.starts_with("APXINF_") {
-                into.insert(name.to_string());
-            }
-        }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+        names_in_source(&text, calls, into);
     }
 }
 
@@ -241,10 +268,12 @@ fn read_names(source_dir: &str) -> BTreeSet<String> {
     names
 }
 
-/// The three trees whose `APXINF_*` reads this table covers.
+/// Current CUDA implementation, MUSA implementation and MUSA model port.
 fn backend_knobs() -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+    let mut cuda = read_names("crates/apxinf-cuda-new/src");
+    cuda.extend(read_names("crates/apxinf-cuda-new/native"));
     (
-        read_names("crates/apxinf-cuda/src"),
+        cuda,
         read_names("crates/apxinf-musa/src"),
         read_names("crates/apxinf-model/src/musa_pi05"),
     )
@@ -310,14 +339,17 @@ fn every_declared_counterpart_is_read_by_the_other_backend() {
         let Some(counterpart) = knob.counterpart else {
             continue;
         };
-        // Whichever side this row is on, the named counterpart has to exist in
-        // the union. Both rows of a pair name each other, so a one-sided edit
+        // The named counterpart has to exist on the other backend.
+        // Both rows of a pair name each other, so a one-sided edit
         // fails on the row that stayed behind.
         if !cuda.contains(knob.name) && !musa.contains(knob.name) && !model.contains(knob.name) {
             continue; // the first assertion already reported this
         }
-        if !cuda.contains(counterpart) && !musa.contains(counterpart) && !model.contains(counterpart)
-        {
+        let counterpart_exists = (cuda.contains(knob.name)
+            && (musa.contains(counterpart) || model.contains(counterpart)))
+            || ((musa.contains(knob.name) || model.contains(knob.name))
+                && cuda.contains(counterpart));
+        if !counterpart_exists {
             broken.push(format!("{} -> {counterpart}", knob.name));
         }
     }
@@ -362,20 +394,43 @@ fn a_pair_names_the_same_knob_from_both_sides() {
 /// tests above would pass by finding nothing and comparing nothing.
 #[test]
 fn the_scanner_finds_both_backends() {
-    let (cuda, musa, model) = backend_knobs();
-    assert!(
-        cuda.len() >= 10,
-        "the CUDA knob scan found {} names; the reader is broken, not the crate",
-        cuda.len()
-    );
-    assert!(
-        musa.len() >= 5,
-        "the MUSA knob scan found {} names; the reader is broken, not the crate",
-        musa.len()
-    );
-    assert!(
-        model.len() >= 4,
-        "the MUSA model scan found {} names; the reader is broken, not the crate",
-        model.len()
+    for (tree, representative) in [
+        ("crates/apxinf-cuda-new/src", "APXINF_GEMM_REPORT"),
+        (
+            "crates/apxinf-cuda-new/native",
+            "APXINF_DISABLE_FA2_SPLITKV",
+        ),
+        ("crates/apxinf-musa/src", "APXINF_MUSA_ALLOC_CACHE"),
+        (
+            "crates/apxinf-model/src/musa_pi05",
+            "APXINF_INT8_EQUALIZATION",
+        ),
+    ] {
+        assert!(
+            read_names(tree).contains(representative),
+            "{tree} did not yield {representative}"
+        );
+    }
+}
+
+#[test]
+fn scanner_reads_rust_and_native_literal_arguments() {
+    let source = r#"
+        std::env::var("APXINF_RUST");
+        std::env::var_os ("APXINF_RUST_OS");
+        std::getenv("APXINF_CPP");
+        getenv ( "APXINF_C" );
+        std::env::var(computed_name);
+        getenv(computed_name);
+        std::env::var("UNRELATED");
+    "#;
+    let mut names = BTreeSet::new();
+    names_in_source(source, &["env::var", "env::var_os", "getenv"], &mut names);
+    assert_eq!(
+        names,
+        ["APXINF_RUST", "APXINF_RUST_OS", "APXINF_CPP", "APXINF_C"]
+            .into_iter()
+            .map(String::from)
+            .collect()
     );
 }

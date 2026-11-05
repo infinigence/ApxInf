@@ -3,21 +3,18 @@
 //! Same layer topology, norms, RoPE, attention, residual paths and
 //! `gelu(gate) * up` epilogue as `bf16_executor`. The single difference is that
 //! every projection quantizes its BF16 activation to E4M3 under a calibrated
-//! per-tensor scale and then dispatches to `gemm::fp8_bf16`, whose BF16 output
-//! feeds the unchanged BF16 tail.
+//! per-tensor scale and then dispatches through the formal GEMM contract with
+//! `Fp8UnitScale`; its BF16 output feeds the unchanged BF16 tail.
 //!
-//! The fused dual-GeGLU epilogue is not used here: π0-FAST packs gate/up plainly
-//! (`dual_geglu_interleaved = false`), and at one token the extra BF16 pass over
-//! the `[1, 2*mlp]` gate/up result is a few tens of kilobytes against a hundred
-//! megabytes of weights.
+//! The fused dual-GeGLU epilogue is not used here: π0-FAST packs gate/up plainly,
+//! and at one token the extra BF16 pass over the `[1, 2*mlp]` gate/up result is a
+//! few tens of kilobytes against a hundred megabytes of weights.
 
-use super::backend::{kernels, Context};
-use apxinf_core::{Result, Tensor};
-use kernels::{activation, attention, fused, gemm, norm, quantization, rope};
+use super::backend::{ops, Context};
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
+use ops::{gemm, pointwise, quantization};
 
-use super::{
-    Fp8DeviceLanguageLayer, Fp8DeviceVisionBlock, Pi0FastLanguageConfig,
-};
+use super::{Fp8DeviceLanguageLayer, Fp8DeviceVisionBlock, Pi0FastLanguageConfig};
 
 /// Activation scales for one vision block, one per GEMM input.
 #[derive(Clone, Copy, Debug)]
@@ -128,6 +125,117 @@ impl Pi0FastFp8Scales {
     }
 }
 
+fn bias_activation(
+    ctx: &Context,
+    input: &Tensor,
+    bias: Option<&Tensor>,
+    activation: ops::PointwiseActivation,
+) -> Result<Tensor> {
+    let mut output = ctx.allocate_output(input.shape().clone(), input.dtype())?;
+    let mut args =
+        ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, input, &mut output);
+    args.bias = bias;
+    args.activation = activation;
+    ops::pointwise(ctx, args)?;
+    Ok(output)
+}
+
+fn geglu(ctx: &Context, gate_up: &Tensor) -> Result<Tensor> {
+    let dims = gate_up.shape().dims();
+    if dims.len() != 2 || dims[1] % 2 != 0 {
+        return Err(Error::Other(
+            "PI0-FAST GeGLU requires [rows,2*cols] input".into(),
+        ));
+    }
+    let mut output =
+        ctx.allocate_output(Shape::new(vec![dims[0], dims[1] / 2]), gate_up.dtype())?;
+    let args = ops::PointwiseArgs::new(ops::PointwiseSemantic::Geglu, gate_up, &mut output);
+    ops::pointwise(ctx, args)?;
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_qkv_rope(
+    ctx: &Context,
+    qkv: &Tensor,
+    bias: Option<&Tensor>,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    position_offset: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let tokens =
+        qkv.shape().dims().first().copied().ok_or_else(|| {
+            Error::Other("PI0-FAST packed QKV must have a token dimension".into())
+        })?;
+    let mut query =
+        ctx.allocate_output(Shape::new(vec![tokens, q_heads, head_dim]), qkv.dtype())?;
+    let kv_shape = Shape::new(vec![tokens, kv_heads, head_dim]);
+    let mut key = ctx.allocate_output(kv_shape.clone(), qkv.dtype())?;
+    let mut value = ctx.allocate_output(kv_shape, qkv.dtype())?;
+    ops::rope(
+        ctx,
+        ops::RopeArgs {
+            semantic: ops::RopeSemantic::SplitQkvRope,
+            qkv,
+            bias,
+            q: &mut query,
+            k: &mut key,
+            v: &mut value,
+            q_heads,
+            kv_heads,
+            head_dim,
+            theta,
+            position_offset,
+            kv_output_offset: 0,
+        },
+    )?;
+    Ok((query, key, value))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_qkv_rope_into_cache(
+    ctx: &Context,
+    qkv: &Tensor,
+    bias: Option<&Tensor>,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    position_offset: usize,
+    key_cache: &Tensor,
+    value_cache: &Tensor,
+    output_offset: usize,
+) -> Result<Tensor> {
+    let tokens =
+        qkv.shape().dims().first().copied().ok_or_else(|| {
+            Error::Other("PI0-FAST packed QKV must have a token dimension".into())
+        })?;
+    let mut query =
+        ctx.allocate_output(Shape::new(vec![tokens, q_heads, head_dim]), qkv.dtype())?;
+    let mut key = key_cache.clone();
+    let mut value = value_cache.clone();
+    ops::rope(
+        ctx,
+        ops::RopeArgs {
+            semantic: ops::RopeSemantic::SplitQkvRope,
+            qkv,
+            bias,
+            q: &mut query,
+            k: &mut key,
+            v: &mut value,
+            q_heads,
+            kv_heads,
+            head_dim,
+            theta,
+            position_offset,
+            kv_output_offset: output_offset,
+        },
+    )?;
+    Ok(query)
+}
+
 pub struct Fp8LanguageLayerOutput {
     pub hidden: Tensor,
     pub key: Tensor,
@@ -146,9 +254,13 @@ pub fn language_layer_fp8(
     rms_eps: f32,
     rope_theta: f32,
 ) -> Result<Fp8LanguageLayerOutput> {
-    let normalized = norm::rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
+    let normalized = ctx.allocate_output(input.shape().clone(), input.dtype())?;
+    ops::norm::norm(
+        ctx,
+        ops::NormArgs::rms(input, &weights.input_norm_scale, &normalized, rms_eps),
+    )?;
     let qkv = fp8_projection(ctx, &normalized, &weights.qkv, scales.qkv_input)?;
-    let qkv = rope::split_qkv_apply_bf16(
+    let (query, key, value) = split_qkv_rope(
         ctx,
         &qkv,
         weights.qkv.bias.as_ref(),
@@ -162,30 +274,55 @@ pub fn language_layer_fp8(
     if !compute_tail {
         return Ok(Fp8LanguageLayerOutput {
             hidden: input.clone(),
-            key: qkv.k.reshape(vec![tokens, config.head_dim])?,
-            value: qkv.v.reshape(vec![tokens, config.head_dim])?,
+            key: key.reshape(vec![tokens, config.head_dim])?,
+            value: value.reshape(vec![tokens, config.head_dim])?,
         });
     }
-    let attention = attention::mqa_bf16(ctx, &qkv.q, &qkv.k, &qkv.v, tokens)?
+    let attention = super::attention_mqa(ctx, &query, &key, &value, tokens)?
         .reshape(vec![tokens, config.num_heads * config.head_dim])?;
     let projected = fp8_projection(ctx, &attention, &weights.output, scales.attention_output)?;
-    let fused = fused::bias_residual_rms_bf16(
+    let residual = ctx.allocate_output(projected.shape().clone(), DType::BF16)?;
+    let normalized = ctx.allocate_output(projected.shape().clone(), DType::BF16)?;
+    ops::fused_add_norm(
         ctx,
-        &projected,
-        weights.output.bias.as_ref(),
-        input,
-        &weights.post_attention_norm_scale,
-        rms_eps,
+        ops::FusedAddNormArgs {
+            input: &projected,
+            bias: weights.output.bias.as_ref(),
+            residual: input,
+            gate: None,
+            hidden: &residual,
+            normalized: Some(&normalized),
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Weight {
+                weight: &weights.post_attention_norm_scale,
+                bias: None,
+                offset: false,
+            },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
+            eps: rms_eps,
+        },
     )?;
-    let gate_up = fp8_projection(ctx, &fused.normalized, &weights.gate_up, scales.gate_up_input)?;
-    let activated = activation::geglu_bf16(ctx, &gate_up)?;
+    let gate_up = fp8_projection(ctx, &normalized, &weights.gate_up, scales.gate_up_input)?;
+    let activated = geglu(ctx, &gate_up)?;
     let projected = fp8_projection(ctx, &activated, &weights.down, scales.down_input)?;
-    let hidden =
-        fused::bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
+    let hidden = ctx.allocate_output(projected.shape().clone(), DType::BF16)?;
+    ops::residual_add(
+        ctx,
+        ops::ResidualAddArgs {
+            input: &projected,
+            bias: weights.down.bias.as_ref(),
+            residual: &residual,
+            gate: None,
+            hidden: &hidden,
+            bias_order: ops::BiasOrder::SingleRound,
+        },
+    )?;
     Ok(Fp8LanguageLayerOutput {
         hidden,
-        key: qkv.k.reshape(vec![tokens, config.head_dim])?,
-        value: qkv.v.reshape(vec![tokens, config.head_dim])?,
+        key: key.reshape(vec![tokens, config.head_dim])?,
+        value: value.reshape(vec![tokens, config.head_dim])?,
     })
 }
 
@@ -200,32 +337,66 @@ pub fn vision_layer_fp8(
     head_dim: usize,
     layer_norm_eps: f32,
 ) -> Result<Tensor> {
-    let normalized = norm::layer_bf16(
+    let normalized = ctx.allocate_output(input.shape().clone(), input.dtype())?;
+    ops::norm::norm(
         ctx,
-        input,
-        &weights.norm1.weight,
-        &weights.norm1.bias,
-        layer_norm_eps,
+        ops::NormArgs::layer(
+            input,
+            &weights.norm1.weight,
+            &weights.norm1.bias,
+            &normalized,
+            layer_norm_eps,
+        ),
     )?;
     let qkv = fp8_projection(ctx, &normalized, &weights.qkv, scales.qkv_input)?;
-    let qkv =
-        attention::split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
-    let attention = attention::mha_bf16(ctx, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
+    let qkv = super::split_qkv_bias(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
+    let attention = super::attention_mha(ctx, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
         .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
     let projected = fp8_projection(ctx, &attention, &weights.output, scales.attention_output)?;
-    let fused = fused::bias_residual_layer_bf16(
+    let hidden = ctx.allocate_output(projected.shape().clone(), DType::BF16)?;
+    let normalized = ctx.allocate_output(projected.shape().clone(), DType::BF16)?;
+    ops::fused_add_norm(
         ctx,
-        &projected,
-        weights.output.bias.as_ref(),
-        input,
-        &weights.norm2.weight,
-        &weights.norm2.bias,
-        layer_norm_eps,
+        ops::FusedAddNormArgs {
+            input: &projected,
+            bias: weights.output.bias.as_ref(),
+            residual: input,
+            gate: None,
+            hidden: &hidden,
+            normalized: Some(&normalized),
+            kind: ops::NormKind::Layer,
+            affine: ops::Affine::Weight {
+                weight: &weights.norm2.weight,
+                bias: Some(&weights.norm2.bias),
+                offset: false,
+            },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
+            eps: layer_norm_eps,
+        },
     )?;
-    let activation = fp8_projection(ctx, &fused.normalized, &weights.fc1, scales.fc1_input)?;
-    let activation = activation::bias_gelu_bf16(ctx, &activation, weights.fc1.bias.as_ref())?;
+    let activation = fp8_projection(ctx, &normalized, &weights.fc1, scales.fc1_input)?;
+    let activation = bias_activation(
+        ctx,
+        &activation,
+        weights.fc1.bias.as_ref(),
+        pointwise::PointwiseActivation::Gelu,
+    )?;
     let projection = fp8_projection(ctx, &activation, &weights.fc2, scales.fc2_input)?;
-    fused::bias_residual_bf16(ctx, &projection, weights.fc2.bias.as_ref(), &fused.hidden)
+    let output = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    ops::residual_add(
+        ctx,
+        ops::ResidualAddArgs {
+            input: &projection,
+            bias: weights.fc2.bias.as_ref(),
+            residual: &hidden,
+            gate: None,
+            hidden: &output,
+            bias_order: ops::BiasOrder::SingleRound,
+        },
+    )?;
+    Ok(output)
 }
 
 /// One cached (single-token) language layer for the autoregressive loop.
@@ -243,9 +414,13 @@ pub fn language_layer_cached_decode_fp8(
     rope_theta: f32,
 ) -> Result<Tensor> {
     let tokens = input.shape().dims()[0];
-    let normalized = norm::rms_bf16(ctx, input, &weights.input_norm_scale, rms_eps)?;
+    let normalized = ctx.allocate_output(input.shape().clone(), input.dtype())?;
+    ops::norm::norm(
+        ctx,
+        ops::NormArgs::rms(input, &weights.input_norm_scale, &normalized, rms_eps),
+    )?;
     let qkv = fp8_projection(ctx, &normalized, &weights.qkv, scales.qkv_input)?;
-    let q = rope::apply_q_write_kv_bf16(
+    let q = split_qkv_rope_into_cache(
         ctx,
         &qkv,
         weights.qkv.bias.as_ref(),
@@ -258,21 +433,49 @@ pub fn language_layer_cached_decode_fp8(
         value_cache,
         position_offset,
     )?;
-    let attention = attention::mqa_bf16(ctx, &q, key_cache, value_cache, position_offset + tokens)?
-        .reshape(vec![tokens, config.num_heads * config.head_dim])?;
+    let attention =
+        super::attention_mqa(ctx, &q, key_cache, value_cache, position_offset + tokens)?
+            .reshape(vec![tokens, config.num_heads * config.head_dim])?;
     let projected = fp8_projection(ctx, &attention, &weights.output, scales.attention_output)?;
-    let fused = fused::bias_residual_rms_bf16(
+    let residual = ctx.allocate_output(projected.shape().clone(), DType::BF16)?;
+    let normalized = ctx.allocate_output(projected.shape().clone(), DType::BF16)?;
+    ops::fused_add_norm(
         ctx,
-        &projected,
-        weights.output.bias.as_ref(),
-        input,
-        &weights.post_attention_norm_scale,
-        rms_eps,
+        ops::FusedAddNormArgs {
+            input: &projected,
+            bias: weights.output.bias.as_ref(),
+            residual: input,
+            gate: None,
+            hidden: &residual,
+            normalized: Some(&normalized),
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Weight {
+                weight: &weights.post_attention_norm_scale,
+                bias: None,
+                offset: false,
+            },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
+            eps: rms_eps,
+        },
     )?;
-    let gate_up = fp8_projection(ctx, &fused.normalized, &weights.gate_up, scales.gate_up_input)?;
-    let activated = activation::geglu_bf16(ctx, &gate_up)?;
+    let gate_up = fp8_projection(ctx, &normalized, &weights.gate_up, scales.gate_up_input)?;
+    let activated = geglu(ctx, &gate_up)?;
     let projected = fp8_projection(ctx, &activated, &weights.down, scales.down_input)?;
-    fused::bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)
+    let hidden = ctx.allocate_output(projected.shape().clone(), DType::BF16)?;
+    ops::residual_add(
+        ctx,
+        ops::ResidualAddArgs {
+            input: &projected,
+            bias: weights.down.bias.as_ref(),
+            residual: &residual,
+            gate: None,
+            hidden: &hidden,
+            bias_order: ops::BiasOrder::SingleRound,
+        },
+    )?;
+    Ok(hidden)
 }
 
 /// Quantize `input` to E4M3, then run the FP8 GEMM with a BF16 output.
@@ -284,6 +487,18 @@ pub(super) fn fp8_projection(
     weight: &super::Fp8LinearWeights,
     activation_scale: f32,
 ) -> Result<Tensor> {
-    let quantized = quantization::quantize_bf16_e4m3(ctx, input, activation_scale)?;
-    gemm::fp8_bf16(ctx, &quantized, activation_scale, weight.as_kernel_view())
+    let quantized = quantization::quantize_fixed_scale(ctx, input, activation_scale)?;
+    let a = quantized.shape().dims();
+    let b = weight.weight.shape().dims();
+    if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+        return Err(Error::Other(format!(
+            "PI0-FAST FP8 GEMM shape mismatch: {a:?} @ {b:?}"
+        )));
+    }
+    let mut output = ctx.allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
+    let mut args = gemm::GemmArgs::new(&quantized, &weight.weight, &mut output);
+    args.quantization = gemm::GemmQuantization::Fp8UnitScale;
+    args.alpha = activation_scale * weight.weight_scale;
+    gemm::gemm(ctx, args)?;
+    Ok(output)
 }

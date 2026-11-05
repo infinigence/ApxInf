@@ -10,6 +10,7 @@ pub struct GemmBiasGeluArgs<'a> {
 }
 
 pub fn gemm_bias_gelu(ctx: &CudaContext, args: GemmBiasGeluArgs<'_>) -> Result<()> {
+    super::observer::observe(&args.gemm)?;
     execution::execute(
         ctx,
         normalize(ctx, args.gemm, Semantic::GemmBiasGelu, Some(args.bias))?,

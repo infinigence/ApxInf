@@ -4,15 +4,15 @@
 //! as E4M3; biases stay BF16 and are applied by the consumer, exactly as in the
 //! BF16 path.
 //!
-//! The dispatch that consumes these matrices is `gemm::fp8_bf16`, whose output is
-//! **BF16**. That choice is what keeps the change small: norms, RoPE, attention,
-//! the KV cache, the argmax and the tied embedding lookup all keep operating on
-//! BF16 and are reused verbatim from the BF16 module.
+//! The formal GEMM contract consumes these matrices with `Fp8UnitScale` and a
+//! **BF16** output. Norms, RoPE, attention, the KV cache, the argmax and the tied
+//! embedding lookup therefore keep operating on BF16 and are reused verbatim
+//! from the BF16 module.
 
 use apxinf_core::{Backend, Error, Result, Tensor};
 
 #[cfg(feature = "cuda")]
-use super::backend::{kernels, RuntimeBackend};
+use super::backend::{ops, RuntimeBackend};
 use super::{bf16_weights::concat_biases_bf16, device_weights::concat_host_2d, LinearWeights};
 
 /// Largest finite NVIDIA/CUDA E4M3 value (`0x7e`).
@@ -32,18 +32,6 @@ pub struct Fp8LinearWeights {
 }
 
 impl Fp8LinearWeights {
-    #[cfg(feature = "cuda")]
-    pub fn as_kernel_view(&self) -> kernels::gemm::Fp8WeightView<'_> {
-        kernels::gemm::Fp8WeightView {
-            values_e4m3: &self.weight,
-            scale: self.weight_scale,
-            // π0-FAST packs gate/up plainly, so the interleaved dual-GeGLU
-            // layouts the π0.5 runtime uses never apply here.
-            dual_geglu_interleaved: false,
-            dual_geglu_auto_interleaved: None,
-        }
-    }
-
     pub fn from_host(linear: &LinearWeights, backend: &dyn Backend) -> Result<Self> {
         Self::from_host_parts(&[linear], backend)
     }
@@ -113,7 +101,7 @@ pub fn quantize_e4m3_absmax_to_device(
                 .collect::<Vec<_>>(),
         )?;
         let f16 = backend.to_device(&f16_host)?;
-        let weight = kernels::quantization::quantize_f16_e4m3(cuda.context(), &f16, scale)?;
+        let weight = ops::quantization::quantize_fixed_scale(cuda.context(), &f16, scale)?;
         Ok((weight, scale))
     }
     #[cfg(not(feature = "cuda"))]

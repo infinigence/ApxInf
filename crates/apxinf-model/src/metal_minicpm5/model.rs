@@ -482,7 +482,7 @@ impl LlmTrait for MiniCpm5 {
             } else {
                 TextPreparationState::Unprepared
             },
-            implementation: "apxinf/minicpm5/mlx-0.31.2",
+            implementation: "apxinf/minicpm5/mlx-0.32.3",
             variant: Some(match self.variant {
                 Variant::Public => "bf16-public",
                 Variant::Compiled => "bf16-compiled",

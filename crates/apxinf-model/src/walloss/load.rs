@@ -14,7 +14,6 @@ use super::model::{ModelVariant, WallossSchedule};
 use super::model_runner::WallossModelRunner;
 use super::weights::{WallossDynamicFp8Weights, WallossWeights};
 use super::{WallossConfig, WallossImageProcessorConfig};
-use crate::accelerator::cuda::downcast_arc;
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 
 pub(crate) fn load_registered(
@@ -40,7 +39,7 @@ pub(crate) fn load_registered(
                 .into(),
         ));
     }
-    let backend = downcast_arc(backend)
+    let backend = crate::accelerator::downcast_cuda_new_arc(backend)
         .ok_or_else(|| Error::Other("walloss is only registered for CUDA".into()))?;
     if !matches!(device, Device::Cuda(_)) {
         return Err(Error::Other("walloss is only registered for CUDA".into()));

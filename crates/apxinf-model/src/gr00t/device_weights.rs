@@ -138,18 +138,6 @@ pub(super) trait DeviceLinearWeights: Debug {
         Ok(None)
     }
 
-    /// Return a precision-specific, bit-compatible packed bias-then-residual
-    /// result when the output width satisfies that implementation's contract.
-    fn packed_bias_then_residual(
-        &self,
-        _projection: &Tensor,
-        _bias: Option<&Tensor>,
-        _residual: &Tensor,
-        _backend: &RuntimeBackend,
-    ) -> Result<Option<Tensor>> {
-        Ok(None)
-    }
-
     /// Return a fused adaptive-normalization plus reusable quantization when
     /// this precision has an exact model-neutral kernel for that composition.
     fn adaptive_layer_norm_quantized(

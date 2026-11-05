@@ -294,6 +294,6 @@ A new board stays on the cuBLAS default until it runs its own autotune
 (`Model.load(..., tactics=<db>, autotune=True)`, or
 `devlocal/pi0-fast/scripts/autotune_decode_gemv.py --phase tune`).
 
-The FP8-to-BF16 projections have their own records (`op=fp8_bf16`) in the same
-database and likewise ship only a Thor entry: on another board FP8 keeps the
-cuBLASLt default until that board runs its own autotune.
+The FP8-to-BF16 projections use the formal GEMM recipe key with
+`Fp8UnitScale` quantization and likewise ship only a Thor entry: on another
+board FP8 keeps the default candidate until that board runs its own autotune.

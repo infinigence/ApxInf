@@ -12,7 +12,7 @@ pub(crate) mod model;
 pub mod model_runner;
 pub mod weights;
 #[cfg(feature = "cuda")]
-pub use backend::kernels::fixed_profile::FIXED_SCENE_TOKENS;
+pub const FIXED_SCENE_TOKENS: usize = 3387;
 pub use config::QwenDriveConfig;
 #[cfg(feature = "cuda")]
 pub use model_runner::QwenDriveModelRunner;

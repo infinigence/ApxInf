@@ -223,7 +223,7 @@ fn attention_sm100_fmha_candidate_matches_reference() {
 }
 
 #[test]
-fn attention_f16_vision_uses_fa2_and_matches_reference() {
+fn attention_f16_vision_recipe_miss_uses_fa2_and_matches_reference() {
     let ctx = CudaContext::new(0).unwrap();
     let (batch, tokens, heads, head_dim) = (1, 256, 16, 72);
     let elements = batch * tokens * heads * head_dim;
@@ -233,7 +233,8 @@ fn attention_f16_vision_uses_fa2_and_matches_reference() {
     let value = f16_tensor(0, shape.clone(), &vec![1.0; elements]);
     let mut out = zeros_tensor(0, shape, DType::F16);
     let mut args = AttentionArgs::new(&query, &key, &value, &mut out);
-    args.policy.allow_fallback = false;
+    args.policy.online_tune = false;
+    args.policy.cache_dir = Some(String::new());
     args.policy.graph_safe = true;
     let normalized = super::attention_contracts::normalize(&ctx, args).unwrap();
     super::attention_execution::validate_candidates(&ctx, &normalized, &vec![1.0; elements])
@@ -270,21 +271,36 @@ fn attention_f16_language_mqa_uses_fa2() {
 #[test]
 fn attention_f16_action_cache_uses_fa2() {
     let ctx = CudaContext::new(0).unwrap();
-    let (batch, query_tokens, key_tokens, query_heads, kv_heads, head_dim) =
-        (1, 10, 532, 8, 1, 256);
+    let (batch, query_tokens, key_tokens, key_capacity, query_heads, kv_heads, head_dim) =
+        (1, 10, 532, 640, 8, 1, 256);
     let query_shape = vec![batch, query_tokens, query_heads, head_dim];
-    let cache_shape = vec![batch, key_tokens, kv_heads, head_dim];
+    let cache_shape = vec![batch, key_capacity, kv_heads, head_dim];
     let query = zeros_tensor(0, query_shape.clone(), DType::F16);
     let key = zeros_tensor(0, cache_shape.clone(), DType::F16);
-    let value = zeros_tensor(0, cache_shape, DType::F16);
-    let mut out = zeros_tensor(0, query_shape, DType::F16);
+    let value = f16_tensor(
+        0,
+        cache_shape.clone(),
+        &vec![1.0; batch * key_capacity * kv_heads * head_dim],
+    );
+    let mut out = zeros_tensor(0, query_shape.clone(), DType::F16);
     let mut args = KvCacheAttentionArgs::new(&query, &key, &value, &mut out).non_causal();
+    args.valid_key_tokens = key_tokens;
     args.policy.allow_fallback = false;
     let normalized = super::normalize_kv_cache_attention(&ctx, args).unwrap();
+    super::attention_execution::validate_candidates(
+        &ctx,
+        &normalized,
+        &vec![1.0; batch * query_tokens * query_heads * head_dim],
+    )
+    .unwrap();
     let execution = super::attention_execution::prepare(&ctx, normalized).unwrap();
     assert!(
-        execution.summary().starts_with("flash-attention-2-split-kv ")
-            || execution.summary().starts_with("flash-attention-2-kv-cache "),
+        execution
+            .summary()
+            .starts_with("flash-attention-2-split-kv ")
+            || execution
+                .summary()
+                .starts_with("flash-attention-2-kv-cache "),
         "unexpected F16 action KV-cache provider: {}",
         execution.summary()
     );
@@ -371,6 +387,9 @@ fn profile_pi05_f16_attention_shapes() {
 #[test]
 fn attention_f16_mqa_522_uses_direct_e4m3_fa2() {
     let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm < 100 {
+        return;
+    }
     let (batch, tokens, query_heads, kv_heads, head_dim) = (1, 522, 8, 1, 256);
     let query_shape = vec![batch, tokens, query_heads, head_dim];
     let kv_shape = vec![batch, tokens, kv_heads, head_dim];
@@ -480,7 +499,7 @@ fn gemm_all_candidates_match_torch() {
     let row_scales = scales(0, f::ROW_SCALES);
     let channel_scales = scales(0, f::CHANNEL_SCALES);
     let mut out = zeros_tensor(0, vec![f::M, f::N], DType::F32);
-    let mut args = GemmArgs::fp8(&a, &row_scales, &b, &channel_scales, &mut out);
+    let mut args = GemmArgs::row_channel_quantized(&a, &row_scales, &b, &channel_scales, &mut out);
     configure_torch_case(&mut args, f::FP8_SCALED_ALPHA, f::FP8_SCALED_OUTPUT_SCALE);
     validate_all_candidates(
         &ctx,
@@ -497,7 +516,7 @@ fn gemm_all_candidates_match_torch() {
     let row_scales = scales(0, f::ROW_SCALES);
     let channel_scales = scales(0, f::CHANNEL_SCALES);
     let mut out = zeros_tensor(0, vec![f::M, f::N], DType::BF16);
-    let mut args = GemmArgs::w8a8(&a, &row_scales, &b, &channel_scales, &mut out);
+    let mut args = GemmArgs::row_channel_quantized(&a, &row_scales, &b, &channel_scales, &mut out);
     configure_torch_case(&mut args, f::W8A8_ALPHA, f::W8A8_OUTPUT_SCALE);
     validate_all_candidates(
         &ctx,
@@ -536,7 +555,7 @@ fn gemm_bias_all_candidates_match_torch() {
     let row_scales = scales(0, f::ROW_SCALES);
     let channel_scales = scales(0, f::CHANNEL_SCALES);
     let mut out = zeros_tensor(0, vec![f::M, f::N], DType::F32);
-    let mut args = GemmArgs::fp8(&a, &row_scales, &b, &channel_scales, &mut out);
+    let mut args = GemmArgs::row_channel_quantized(&a, &row_scales, &b, &channel_scales, &mut out);
     configure_torch_case(&mut args, f::FP8_SCALED_ALPHA, f::FP8_SCALED_OUTPUT_SCALE);
     validate_all_candidates(
         &ctx,
@@ -554,7 +573,7 @@ fn gemm_bias_all_candidates_match_torch() {
     let row_scales = scales(0, f::ROW_SCALES);
     let channel_scales = scales(0, f::CHANNEL_SCALES);
     let mut out = zeros_tensor(0, vec![f::M, f::N], DType::BF16);
-    let mut args = GemmArgs::w8a8(&a, &row_scales, &b, &channel_scales, &mut out);
+    let mut args = GemmArgs::row_channel_quantized(&a, &row_scales, &b, &channel_scales, &mut out);
     configure_torch_case(&mut args, f::W8A8_ALPHA, f::W8A8_OUTPUT_SCALE);
     validate_all_candidates(
         &ctx,
@@ -593,7 +612,7 @@ fn gemm_bias_gelu_all_candidates_match_torch() {
     let row_scales = scales(0, f::ROW_SCALES);
     let channel_scales = scales(0, f::CHANNEL_SCALES);
     let mut out = zeros_tensor(0, vec![f::M, f::N], DType::F32);
-    let mut args = GemmArgs::fp8(&a, &row_scales, &b, &channel_scales, &mut out);
+    let mut args = GemmArgs::row_channel_quantized(&a, &row_scales, &b, &channel_scales, &mut out);
     configure_torch_case(&mut args, f::FP8_SCALED_ALPHA, f::FP8_SCALED_OUTPUT_SCALE);
     validate_all_candidates(
         &ctx,

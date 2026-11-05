@@ -20,6 +20,11 @@ __device__ inline float to_float(__nv_bfloat16 value) {
   return __bfloat162float(value);
 }
 
+template <>
+__device__ inline float to_float(float value) {
+  return value;
+}
+
 template <class T>
 __device__ T from_float(float value);
 
@@ -33,19 +38,24 @@ __device__ inline __nv_bfloat16 from_float(float value) {
   return __float2bfloat16(value);
 }
 
-// Token-embedding gather, scaled by sqrt(width).
+template <>
+__device__ inline float from_float(float value) {
+  return value;
+}
+
+// Token-embedding gather, optionally scaled by sqrt(width).
 //
 // The scale is not optional: the Gemma backbone folds it into the embedding
 // lookup.  The legacy backend also carries an unscaled same-named overload
-// that differs only by `uint32_t` versus `int` parameters; dropping the scale
-// silently destroys the model output, so this port keeps one signature and
-// always scales.  Out-of-range ids produce zeros rather than reading past the
-// table.
-template <class T>
+// that differs only by `uint32_t` versus `int` parameters. `Scale=true`
+// preserves the Gemma path; `Scale=false` serves the portable backend's plain
+// embedding contract. Out-of-range ids produce zeros rather than reading past
+// the table.
+template <class T, bool Scale = true>
 __global__ void embedding_lookup(const T* table, const uint32_t* ids, T* output,
                                  int tokens, int width, int vocab_size) {
   const int64_t count = static_cast<int64_t>(tokens) * width;
-  const float normalizer = sqrtf(static_cast<float>(width));
+  const float normalizer = Scale ? sqrtf(static_cast<float>(width)) : 1.0f;
   int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
   for (; index < count; index += stride) {

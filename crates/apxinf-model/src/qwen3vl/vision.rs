@@ -83,13 +83,32 @@ fn forward_impl(
 
     // ── 24 vision blocks ────────────────────────────────────────────
     let mut deepstack_hidden_states: Vec<Tensor> = Vec::with_capacity(3);
+    let dump_all_blocks =
+        dump.is_some() && std::env::var_os("APXINF_QWEN3VL_DUMP_ALL_BLOCKS").is_some();
+    let dump_block10_ops =
+        dump.is_some() && std::env::var_os("APXINF_QWEN3VL_DUMP_BLOCK10_OPS").is_some();
     for (i, blk) in w.blocks.iter().enumerate() {
         let _blk_range = crate::profiling::trace::range(&format!("vision_block_{i}"));
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &x, &format!("{d}_block10_input"))?;
+            }
+        }
         // pre-attn LayerNorm
         let normed = b.layer_norm(&x, &blk.norm1_w, &blk.norm1_b, eps)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &normed, &format!("{d}_block10_norm1"))?;
+            }
+        }
         // QKV: [N, 1024] @ [1024, 3072] → [N, 3072]
         let qkv = b.matmul(&normed, &blk.qkv_w)?;
         let qkv = b.add_bias(&qkv, &blk.qkv_b)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &qkv, &format!("{d}_block10_qkv"))?;
+            }
+        }
         // Split Q/K/V: qkv is [N, 3072] = [N, 3, 1024] interleaved as
         // (q[N,0:1024], k[N,1024:2048], v[N,2048:3072]). Reshape to
         // [N, 3, n_heads, head_dim] then split.
@@ -106,31 +125,88 @@ fn forward_impl(
         // Vision 2D-RoPE on Q and K
         let q = b.rope_vision_2d(&q, n_heads, head_dim, 10000.0, &pos_ids)?;
         let k = b.rope_vision_2d(&k, n_heads, head_dim, 10000.0, &pos_ids)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &q, &format!("{d}_block10_q"))?;
+                dump_tensor(b, &k, &format!("{d}_block10_k"))?;
+                dump_tensor(b, &v, &format!("{d}_block10_v"))?;
+            }
+        }
 
         // Non-causal full attention
         let attn_out = b.vision_sdpa(&q, &k, &v, n_patches, n_heads, head_dim)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &attn_out, &format!("{d}_block10_sdpa"))?;
+            }
+        }
         // Output projection + residual
         let attn_out = b.matmul(&attn_out, &blk.proj_w)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &attn_out, &format!("{d}_block10_proj_linear"))?;
+            }
+        }
         let attn_out = b.add_bias(&attn_out, &blk.proj_b)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &attn_out, &format!("{d}_block10_proj"))?;
+            }
+        }
         x = b.add(&x, &attn_out)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &x, &format!("{d}_block10_attn_residual"))?;
+            }
+        }
 
         // pre-MLP LayerNorm
         let normed = b.layer_norm(&x, &blk.norm2_w, &blk.norm2_b, eps)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &normed, &format!("{d}_block10_norm2"))?;
+            }
+        }
         // FC1 + GELU
         let h1 = b.matmul(&normed, &blk.fc1_w)?;
         let h1 = b.add_bias(&h1, &blk.fc1_b)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &h1, &format!("{d}_block10_fc1"))?;
+            }
+        }
         let h1 = b.gelu_tanh(&h1)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &h1, &format!("{d}_block10_gelu"))?;
+            }
+        }
         // FC2 + residual
         let h2 = b.matmul(&h1, &blk.fc2_w)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &h2, &format!("{d}_block10_fc2_linear"))?;
+            }
+        }
         let h2 = b.add_bias(&h2, &blk.fc2_b)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &h2, &format!("{d}_block10_fc2"))?;
+            }
+        }
         x = b.add(&x, &h2)?;
+        if dump_block10_ops && i == 10 {
+            if let Some(d) = dump {
+                dump_tensor(b, &x, &format!("{d}_block10_output"))?;
+            }
+        }
 
         // Capture deepstack states at the configured block indexes.
         if vc.deepstack_visual_indexes.contains(&i) {
             deepstack_hidden_states.push(x.clone());
         }
         if let Some(d) = dump {
-            if i < 2 || i == vc.depth - 1 {
+            if dump_all_blocks || i < 2 || i == vc.depth - 1 {
                 dump_tensor(b, &x, &format!("{d}_post_block_{i}"))?;
             }
         }
@@ -275,7 +351,8 @@ fn compute_pos_embeds(
         .map_err(|e| apxinf_core::Error::Other(format!("pos_embed table: {e}")))?;
     // table is [2304, 1024] = [48*48, hidden].
 
-    // Bilinear-interpolate to (h, width) → [h*width, hidden].
+    // Keep the pre-migration interpolation contract: accumulate bilinear
+    // terms in F32, then round once when materializing the BF16 tensor.
     let mut interp = vec![0.0f32; h * width * hidden];
     for hi in 0..h {
         let hf = hi as f32 * (grid_side - 1) as f32 / (h - 1).max(1) as f32;
@@ -294,9 +371,9 @@ fn compute_pos_embeds(
                 let v10 = table[(h1 * grid_side + w0) * hidden + c];
                 let v11 = table[(h1 * grid_side + w1) * hidden + c];
                 interp[dst + c] = (1.0 - dh) * (1.0 - dw) * v00
-                                + (1.0 - dh) * dw       * v01
-                                + dh       * (1.0 - dw) * v10
-                                + dh       * dw       * v11;
+                    + (1.0 - dh) * dw * v01
+                    + dh * (1.0 - dw) * v10
+                    + dh * dw * v11;
             }
         }
     }
@@ -327,7 +404,6 @@ fn compute_pos_embeds(
         }
     }
 
-    // Cast to bf16 (to match x's dtype) and upload.
     let bf16: Vec<half::bf16> = permuted.iter().map(|&v| half::bf16::from_f32(v)).collect();
     let tensor = Tensor::from_bf16(vec![n_tokens, hidden], &bf16)?;
     b.to_device(&tensor)

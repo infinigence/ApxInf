@@ -296,11 +296,7 @@ impl VisionScratch {
             key: device_tensor(ctx, &heads, bf16)?,
             value: device_tensor(ctx, &heads, bf16)?,
             // Dense Attention wants a leading batch axis; the rows are identical.
-            attn: device_tensor(
-                ctx,
-                &[1, patches, VISION_HEADS, VISION_HEAD_DIM],
-                bf16,
-            )?,
+            attn: device_tensor(ctx, &[1, patches, VISION_HEADS, VISION_HEAD_DIM], bf16)?,
             projected: device_tensor(ctx, &rows, bf16)?,
             mlp_hidden: device_tensor(ctx, &[patches, VISION_INTERMEDIATE], bf16)?,
             mlp_out: device_tensor(ctx, &rows, bf16)?,
@@ -342,7 +338,9 @@ fn gemm_bias_gelu_into(
     let input_dims = input.shape().dims();
     let weight_dims = weight.shape().dims();
     if input_dims.len() != 2 || weight_dims.len() != 2 || input_dims[1] != weight_dims[0] {
-        return Err(Error::Other("qwen38 vision GELU GEMM shape mismatch".into()));
+        return Err(Error::Other(
+            "qwen38 vision GELU GEMM shape mismatch".into(),
+        ));
     }
     ops::gemm_bias_gelu(
         ctx,
@@ -361,10 +359,7 @@ fn layer_norm_into(
     out: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
-    ops::layer_norm(
-        ctx,
-        ops::LayerNormArgs::new(input, weight, bias, out, eps),
-    )
+    ops::norm::norm(ctx, ops::NormArgs::layer(input, weight, bias, out, eps))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -378,18 +373,26 @@ fn bias_residual_layer_norm_into(
     normalized: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
-    ops::bias_residual_layer_norm(
+    ops::fused_add_norm(
         ctx,
-        ops::BiasResidualLayerNormArgs::new(
+        ops::FusedAddNormArgs {
             input,
-            None,
+            bias: None,
             residual,
-            weight,
-            norm_bias,
+            gate: None,
             hidden,
-            normalized,
+            normalized: Some(normalized),
+            kind: ops::NormKind::Layer,
+            affine: ops::Affine::Weight {
+                weight,
+                bias: Some(norm_bias),
+                offset: false,
+            },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
             eps,
-        ),
+        },
     )
 }
 
@@ -436,7 +439,7 @@ fn forward_device(
         &weights.patch_b,
         &mut current,
     )?;
-    ops::mlp::add_into(ctx, &scratch.pos_embeds, &current)?;
+    ops::add_into(ctx, &scratch.pos_embeds, &current)?;
     dump_vision_stage("00_patch_position", &current)?;
     layer_norm_into(
         ctx,
@@ -459,6 +462,7 @@ fn forward_device(
                 key: &mut key,
                 value: &mut value,
                 theta: 10_000.0,
+                numerics: ops::AxialRopeNumerics::Flexible,
             },
         )?;
         // Dense Attention, not `ops::segmented_attention`: a single image is
@@ -585,11 +589,7 @@ pub(crate) fn embed_and_replace(
     }
     let row_map = upload_u32(ctx, &row_map)?;
     let mut output = device_tensor(ctx, &[token_ids.len(), hidden], DType::BF16)?;
-    let mut gather = ops::GatherArgs::new(
-        ops::GatherSemantic::ReplaceRows,
-        &base,
-        &mut output,
-    );
+    let mut gather = ops::GatherArgs::new(ops::GatherSemantic::ReplaceRows, &base, &mut output);
     gather.replacement = Some(visual);
     gather.row_map = Some(&row_map);
     ops::gather(ctx, gather)?;

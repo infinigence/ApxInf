@@ -22,11 +22,11 @@ fn overflow() -> Error {
     Error::Other("walloss workspace size overflows usize".into())
 }
 
-/// Conservative live-tensor budget for the BF16/FP8 forward implementations.
-/// KV persists across all language layers and denoising steps. Layer scratch
-/// is reused, so only KV scales with depth. Include padded vision SwiGLU,
-/// FP8 conversion/attention scratch and 50% allocator-fragmentation headroom.
-/// This is capacity, not a claim that every supported shape fits device RAM.
+/// Conservative allocation budget for the BF16/FP8 forward implementations.
+/// Lease-backed workspace slices are reused after the last tensor owner drops,
+/// so scratch scales with simultaneously live blocks rather than every layer
+/// or denoising step. KV persists across layers and steps. Keep 50% headroom
+/// for alignment, allocator fragmentation, and shape-dependent overlap.
 pub(super) fn workspace_bytes(config: &WallossConfig, rows: usize, prefix: usize) -> Result<usize> {
     let text = &config.text;
     let vision = &config.vision;
@@ -81,8 +81,8 @@ pub(super) fn workspace_bytes(config: &WallossConfig, rows: usize, prefix: usize
             action.state_hidden_size,
         ])?,
     ])?;
-    // Summing phase budgets also retains vision outputs during language and
-    // prefix KV during actions. Fixed reserve covers alignment/small scratch.
+    // Summing phase budgets retains vision outputs during language and prefix
+    // KV during actions. Fixed reserve covers alignment and small scratch.
     let bytes = sum(&[16 << 20, cache, language, vision_scratch, action_scratch])?;
     sum(&[bytes, bytes / 2])
 }

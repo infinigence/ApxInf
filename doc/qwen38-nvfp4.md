@@ -45,15 +45,11 @@ cargo build --features cuda --release --bin apxinf
 ./target/release/apxinf generate \
     --model <path-to-Qwen3.8-27B-NVFP4> \
     --device cuda \
+    --chat-options '{"enable_thinking": false}' \
     --prompt "What is the capital of France? Answer in one sentence."
 ```
 
 ```
-<think>
-The user asks for the capital of France ... This is a straightforward
-factual question.
-</think>
-
 The capital of France is Paris.
 
 === Generation Profile ===
@@ -63,8 +59,11 @@ Generation TPS:   12.92 tok/s
 =========================
 ```
 
-The prompt is rendered with the checkpoint's own `chat_template.jinja`; the
-model reasons inside `<think>…</think>` before answering.
+The prompt is rendered with the checkpoint's own `chat_template.jinja`. This
+short-answer example disables thinking explicitly so the default 50-token CLI
+budget is spent on the answer instead of the checkpoint's xhigh reasoning
+trace. Omit `--chat-options` or set `enable_thinking` to `true` when that trace
+is wanted, and raise `--max-tokens` accordingly.
 
 | Flag | Effect |
 |---|---|
@@ -101,8 +100,8 @@ Jetson AGX Thor, locked clocks (1575 MHz GPC):
 
 - Quantizer contract suites: `qwen38_fp8_quant_contract`,
   `qwen38_nvfp4_quant_contract` (`apxinf-cuda-new`).
-- The 2048-token end-to-end benchmark exercises `ops::nvfp4_gemm_swiglu` in
-  every layer, checks deterministic generated tokens, and compares the token
+- The 2048-token end-to-end benchmark exercises `ops::gemm_swiglu` with the
+  block-quantized binding in every layer, checks deterministic generated tokens, and compares the token
   hash with the accepted reference run. Other prompt lengths exercise the
   generic fallback.
 

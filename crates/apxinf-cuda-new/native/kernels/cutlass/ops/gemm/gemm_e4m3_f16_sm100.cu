@@ -184,9 +184,10 @@ struct Fp8RowwiseGemm {
   using ElementOutput = cutlass::bfloat16_t;
   using ElementAccumulator = float;
   using LayoutA = cutlass::layout::RowMajor;
-  // Dynamic weights are packed output-major as contiguous [N, K]. The GEMM
-  // consumes the same allocation as logical B=[K, N] through ColumnMajor.
-  using LayoutB = cutlass::layout::ColumnMajor;
+  // cuda-new's GEMM contract stores B as canonical contiguous [K, N]. Keep
+  // this rowwise path on the same physical layout instead of assuming the
+  // legacy output-major [N, K] allocation.
+  using LayoutB = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
   static constexpr int AlignmentInput = 16;
   static constexpr int AlignmentOutput = 8;
@@ -339,7 +340,7 @@ int launch(
   StrideA stride_a = cutlass::make_cute_packed_stride(
       StrideA{}, cute::make_shape(m, k, 1));
   StrideB stride_b = cutlass::make_cute_packed_stride(
-      StrideB{}, cute::make_shape(n, k, 1));
+      StrideB{}, cute::make_shape(k, n, 1));
   StrideD stride_d = cutlass::make_cute_packed_stride(
       StrideD{}, cute::make_shape(m, n, 1));
   typename Kernel::MainloopArguments mainloop{

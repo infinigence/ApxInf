@@ -1,11 +1,10 @@
 # MUSA backend
 
-`crates/apxinf-musa` runs ApxInf on Moore Threads MUSA devices. It is a port of
-the CUDA path rather than a reimplementation: the module layout, the operator
-signatures, the tensor contracts and the workspace discipline are the CUDA
-crate's, and the differences are MUSA's own names (`musaMalloc` for
-`cudaMalloc`, `--offload-arch=mp_22` for `-arch=sm_xx`, `musart`/`mublas` for
-`cudart`/`cublas`).
+`crates/apxinf-musa` runs ApxInf on Moore Threads MUSA devices. Its runtime was
+ported from the former `apxinf-cuda` backend, preserving its allocation,
+tensor and workspace contracts while using MUSA's own APIs (`musaMalloc`,
+`musart` and `mublas`). The current CUDA runtime is `apxinf-cuda-new`; the two
+backends evolve independently.
 
 PI0.5 reaches it through `crates/apxinf-model/src/musa_pi05/`, a
 backend-native port that **copies** what it needs instead of sharing the CUDA
@@ -57,6 +56,11 @@ caller that names the backend it means still reaches the family. The name is
 admission only — it does not bind the device, which is what decides which
 backend runs.
 
+`ModelRunner.load(..., execution=...)` accepts `eager`, `prefer-graph` and
+`require-graph` for MUSA PI0.5. Omitting it keeps `prefer-graph`. The separate
+`weight_layout_budget_bytes` option is implemented by CUDA PI0.5 BF16/FP8;
+it does not control MUSA allocations.
+
 `crates/apxinf-musa` builds without a toolkit: with `MUSA_PATH` unset or
 pointing nowhere, the build compiles the no-device configuration, warns, and
 exposes `MUSA_AVAILABLE = false`, which is how a caller can tell. That is
@@ -98,20 +102,22 @@ stops being invisible.
 
 ## Relationship to the CUDA backends
 
-There are two CUDA trees upstream and they are different designs, so "the same
-as CUDA" does not name one thing. `apxinf-cuda` keeps a `kernels/` facade over
-flat `adapters/*.cu`; `apxinf-cuda-new` has no facade and splits every operator
-into contract and launch halves. This backend is a hybrid on purpose:
+The legacy `apxinf-cuda` tree was removed when all CUDA families migrated to
+`apxinf-cuda-new`. Its source at
+[`01232a9a`](https://github.com/infinigence/ApxInf/tree/01232a9a8220977a76094907eaed6da2ef1ba0db/crates/apxinf-cuda)
+is the historical origin of MUSA's runtime, not a second live dependency.
+The current relationship is:
 
-- **Surface follows cuda-new.** The typed `ops/` contract, `ExecutionSession`
-  and `graph::capture` are shaped after `apxinf-cuda-new`, because PI0.5's model
-  code is written against them.
+- **Surface serves the MUSA port.** The typed `ops/` contract, `ExecutionSession`
+  and `graph::capture` were shaped after `apxinf-cuda-new`. They cover the
+  independent `musa_pi05` BF16/INT8 paths; CUDA-only additions such as
+  `RepackedWeight` do not automatically become MUSA requirements.
 - **Interior follows legacy CUDA.** `kernels/`, `ffi/`, `buffer`/`context`/
   `stream`/`device_caps` and the flat `adapters/*.mu` are ported from
   `apxinf-cuda`, which is the tree this backend was taken from.
 - **Kernels are a subset, rewritten where the hardware forced it.** 35 device
-  kernels against upstream's 221; the 16 that keep the same name are the ones
-  PI0.5 uses. Their bodies differ where M1000 made the upstream shape wrong:
+  kernels against the original CUDA tree's 221; the 16 that keep the same name
+  are the ones PI0.5 uses. Their bodies differ where M1000 made the upstream shape wrong:
   row-grid launches (64-bit integer division is a software routine here), a
   precomputed RoPE frequency table, register-cached W8A8 quantization, FP16
   scales with a 512-entry zero pad for the `s8mma` tiles, and `copysign`
@@ -121,12 +127,18 @@ into contract and launch halves. This backend is a hybrid on purpose:
   rewritten kernel reviewable against its origin; it is not something to trim
   into line with upstream.
 
-What is *not* different: the `kernels/custom` file set maps one-for-one onto
-`apxinf-cuda`'s, `custom_kernels.mu` uses the same anonymous-namespace plus
+Relative to that historical source, the `kernels/custom` file set maps one-for-one
+onto `apxinf-cuda`'s, `custom_kernels.mu` uses the same anonymous-namespace plus
 single-C-ABI translation-unit pattern, and every ported `extern "C"` signature
 has the same parameter order and meaning. Where a signature does differ —
 `quantize_rows_bf16_int8` grew the per-channel equalization vector — the adapter
 README says so.
+
+`scripts/check_ops_contract_surface.py` checks the operators imported by the
+MUSA model port, including its INT8 path. `crates/apxinf-musa/tests/backend_parity.rs`
+checks literal environment reads in the current CUDA Rust/native sources and
+MUSA backend/model sources. Its table documents the current differences;
+removed legacy CUDA allocation switches are not MUSA counterparts.
 
 ## PI0.5 on MUSA
 

@@ -18,9 +18,9 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use super::backend::{kernels, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
-use apxinf_core::{Backend, Error, Result, Tensor};
-use kernels::{cache, elementwise, embedding, gemm, norm, sampling, GraphWorkspace};
+use super::backend::{ops, Context, DeviceBuffer as CudaBuffer, RuntimeBackend};
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
+use ops::{cache, elementwise, sampling, ExecutionSession};
 
 use super::calibration::Pi0FastCalibrationObserver;
 use super::{
@@ -28,9 +28,43 @@ use super::{
     vision_patch_embed_f32_bf16, Pi0FastConfig, StaticBf16Pi0FastWeights,
 };
 
+fn add_optional_bias(ctx: &Context, input: &Tensor, bias: Option<&Tensor>) -> Result<Tensor> {
+    let Some(bias) = bias else {
+        return Ok(input.clone());
+    };
+    let mut output = ctx.allocate_output(input.shape().clone(), input.dtype())?;
+    let mut args =
+        ops::PointwiseArgs::new(ops::PointwiseSemantic::BiasActivation, input, &mut output);
+    args.bias = Some(bias);
+    args.activation = ops::PointwiseActivation::None;
+    ops::pointwise(ctx, args)?;
+    Ok(output)
+}
+
+fn embedding_lookup(
+    ctx: &Context,
+    table: &Tensor,
+    ids: &CudaBuffer,
+    tokens: usize,
+) -> Result<Tensor> {
+    let dims = table.shape().dims();
+    if dims.len() != 2 {
+        return Err(Error::Other(
+            "PI0-FAST embedding table must be rank 2".into(),
+        ));
+    }
+    let mut output = ctx.allocate_output(Shape::new(vec![tokens, dims[1]]), table.dtype())?;
+    let mut args = ops::GatherArgs::new(ops::GatherSemantic::EmbeddingLookup, table, &mut output);
+    args.ids = Some(ids);
+    args.vocab_size = dims[0];
+    args.embedding_scale = ops::EmbeddingScale::None;
+    ops::gather(ctx, args)?;
+    Ok(output)
+}
+
 /// Conservative arena reservation for one `infer` traversal.
 ///
-/// [`GraphWorkspace`] is a bump arena: every buffer `output_buffer` hands out
+/// [`ExecutionSession`] is a bump arena: every buffer `output_buffer` hands out
 /// during a call stays live until the scope ends, so the capacity has to cover
 /// the *sum* of the call's intermediates rather than their peak. The estimate
 /// follows `infer_arena` op by op and is deliberately generous; an
@@ -108,10 +142,15 @@ pub struct Pi0FastBf16Runtime {
     weights: Arc<StaticBf16Pi0FastWeights>,
     /// Maps the pruned LM-head columns back to global token ids; see
     /// [`super::action_head_remap`].
-    lm_head_remap: CudaBuffer,
+    lm_head_remap: Tensor,
     /// Persistent arena for the per-call intermediates. Without it every
     /// intermediate is a raw `cudaMalloc`/`cudaFree` pair.
-    arena: Mutex<Option<GraphWorkspace>>,
+    arena: Mutex<Option<ArenaState>>,
+}
+
+struct ArenaState {
+    token_count: usize,
+    session: ExecutionSession,
 }
 
 impl Pi0FastBf16Runtime {
@@ -142,8 +181,8 @@ impl Pi0FastBf16Runtime {
         self.backend.context()
     }
 
-    /// Run `operation` inside the persistent arena, growing it when a call
-    /// needs more room than the current one provides.
+    /// Run `operation` inside the persistent arena. A prompt-length change
+    /// replaces the session so shape-specific prepared executions stay bounded.
     fn with_arena<T>(
         &self,
         token_count: usize,
@@ -154,16 +193,16 @@ impl Pi0FastBf16Runtime {
             .arena
             .lock()
             .map_err(|_| Error::Other("π0-FAST arena mutex is poisoned".into()))?;
-        if arena
-            .as_ref()
-            .is_none_or(|workspace| workspace.capacity() < capacity)
-        {
-            *arena = Some(GraphWorkspace::new(capacity, self.ctx().device_id())?);
+        if arena.as_ref().is_none_or(|state| {
+            state.token_count != token_count || state.session.capacity() < capacity
+        }) {
+            *arena = Some(ArenaState {
+                token_count,
+                session: ExecutionSession::with_capacity(capacity, self.ctx().device_id())?,
+            });
         }
-        kernels::with_workspace_eager(
-            arena.as_ref().expect("arena is populated above"),
-            operation,
-        )
+        let state = arena.as_ref().expect("arena is populated above");
+        ops::prepare_with_session(&state.session, operation)
     }
 
     /// Bytes of the arena the last call used.
@@ -171,7 +210,7 @@ impl Pi0FastBf16Runtime {
         self.arena
             .lock()
             .ok()
-            .and_then(|arena| arena.as_ref().map(|workspace| workspace.used()))
+            .and_then(|arena| arena.as_ref().map(|state| state.session.used()))
             .unwrap_or(0)
     }
 
@@ -185,7 +224,7 @@ impl Pi0FastBf16Runtime {
     ///
     /// `patches` is the FP32 patch-major tensor PaliGemma's SigLIP tower
     /// consumes; the BF16 encoder input is produced inside the patch embedding.
-    
+
     fn embed_images(&self, patches: &Tensor) -> Result<Tensor> {
         let config = &self.config;
         let weights = &self.weights;
@@ -207,15 +246,25 @@ impl Pi0FastBf16Runtime {
                 config.layer_norm_eps,
             )?;
         }
-        let hidden = norm::layer_bf16(
+        let normalized = self
+            .ctx()
+            .allocate_output(hidden.shape().clone(), hidden.dtype())?;
+        ops::norm::norm(
             self.ctx(),
-            &hidden,
-            &weights.vision_post_norm.weight,
-            &weights.vision_post_norm.bias,
-            config.layer_norm_eps,
+            ops::NormArgs::layer(
+                &hidden,
+                &weights.vision_post_norm.weight,
+                &weights.vision_post_norm.bias,
+                &normalized,
+                config.layer_norm_eps,
+            ),
         )?;
-        let projected = gemm::bf16(self.ctx(), &hidden, &weights.multimodal_projector.weight)?;
-        elementwise::bias_bf16(
+        let projected = super::bf16_executor::plain_gemm(
+            self.ctx(),
+            &normalized,
+            &weights.multimodal_projector.weight,
+        )?;
+        add_optional_bias(
             self.ctx(),
             &projected,
             weights.multimodal_projector.bias.as_ref(),
@@ -255,8 +304,7 @@ impl Pi0FastBf16Runtime {
             &self.config,
             &self.weights,
         )?);
-        let _guard =
-            kernels::gemm::install_bf16_observer(observer.clone())?;
+        let _guard = ops::gemm::install_gemm_observer(observer.clone())?;
         let _ = self.infer(patches, token_ids, token_count, stop_token)?;
         self.backend.synchronize()?;
         observer.records()
@@ -281,15 +329,17 @@ impl Pi0FastBf16Runtime {
 
         let image = self.embed_images(patches)?;
         let language = self.embed_tokens(token_ids, token_count)?;
-        let prefix = elementwise::concat_rows_bf16(self.ctx(), &image, &language)?;
+        let prefix = elementwise::concat_rows(self.ctx(), &image, &language)?;
 
         let (hidden, keys, values) = self.decode_prefix(prefix, max_sequence)?;
         let prefix_len = token_count + config.patch_tokens();
 
         let step_bytes = std::mem::size_of::<u32>();
-        let tokens =
-            CudaBuffer::alloc(config.max_action_tokens * step_bytes, self.ctx().device_id())
-                .map_err(Error::Cuda)?;
+        let tokens = CudaBuffer::alloc(
+            config.max_action_tokens * step_bytes,
+            self.ctx().device_id(),
+        )
+        .map_err(Error::Cuda)?;
         let mut logits = self.lm_head(&hidden)?;
 
         // One generated token per step: argmax on device, feed the id straight
@@ -302,13 +352,19 @@ impl Pi0FastBf16Runtime {
             let slot = tokens
                 .view(step * step_bytes, step_bytes)
                 .map_err(Error::Cuda)?;
-            sampling::argmax_bf16_remapped_into(
+            let slot_tensor = slot
+                .as_tensor(Shape::new(vec![1]), DType::I32)
+                .map_err(Error::Cuda)?;
+            sampling::argmax(
                 self.ctx(),
-                &logits,
-                &self.lm_head_remap,
-                &slot,
+                sampling::ArgmaxArgs::new(&logits, &slot_tensor).with_remap(&self.lm_head_remap),
             )?;
             if let Some(stop) = stop_token {
+                // cuda-new launches argmax on its non-default context stream,
+                // while CudaBuffer::copy_to_host uses a synchronous default-
+                // stream copy.  Unlike the legacy runtime, that copy does not
+                // order itself after work on a non-blocking stream.
+                self.ctx().synchronize().map_err(Error::Cuda)?;
                 let mut raw = [0u8; 4];
                 slot.copy_to_host(&mut raw).map_err(Error::Cuda)?;
                 if u32::from_ne_bytes(raw) == stop {
@@ -337,7 +393,9 @@ impl Pi0FastBf16Runtime {
         }
 
         let mut bytes = vec![0u8; produced * step_bytes];
-        tokens.copy_to_host(&mut bytes).map_err(Error::Cuda)?;
+        tokens
+            .copy_to_host_on(&mut bytes, self.ctx().stream())
+            .map_err(Error::Cuda)?;
         Ok(bytes
             .chunks_exact(4)
             .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
@@ -366,12 +424,12 @@ impl Pi0FastBf16Runtime {
                 config.rope_theta,
             )?;
             hidden = output.hidden;
-            keys.push(cache::reserve_prefix_bf16(
+            keys.push(cache::reserve_prefix(
                 self.ctx(),
                 &output.key,
                 max_sequence,
             )?);
-            values.push(cache::reserve_prefix_bf16(
+            values.push(cache::reserve_prefix(
                 self.ctx(),
                 &output.value,
                 max_sequence,
@@ -383,18 +441,28 @@ impl Pi0FastBf16Runtime {
         index
             .copy_from_host(&((rows - 1) as u32).to_ne_bytes())
             .map_err(Error::Cuda)?;
-        let last = elementwise::gather_rows_bf16(self.ctx(), &hidden, &index, 1)?;
+        let last = elementwise::gather_rows(self.ctx(), &hidden, &index, 1)?;
         Ok((last, keys, values))
     }
 
     fn lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
-        let normalized = norm::rms_bf16(
+        let normalized = self
+            .ctx()
+            .allocate_output(hidden.shape().clone(), hidden.dtype())?;
+        ops::norm::norm(
             self.ctx(),
-            hidden,
-            &self.weights.language_final_norm_scale,
-            self.config.rms_norm_eps,
+            ops::NormArgs::rms(
+                hidden,
+                &self.weights.language_final_norm_scale,
+                &normalized,
+                self.config.rms_norm_eps,
+            ),
         )?;
-        super::bf16_executor::decode_projection(self.ctx(), &normalized, &self.weights.lm_head.weight)
+        super::bf16_executor::decode_projection(
+            self.ctx(),
+            &normalized,
+            &self.weights.lm_head.weight,
+        )
     }
 
     /// Look up `token_count` ids and scale by PaliGemma's `sqrt(width)`.
@@ -405,7 +473,11 @@ impl Pi0FastBf16Runtime {
     /// action token, and the autoregressive feedback loop all share this path.
     fn embed_tokens(&self, ids: &CudaBuffer, token_count: usize) -> Result<Tensor> {
         let width = self.config.language.width;
-        let tensor = embedding::lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
-        elementwise::scale(self.ctx(), &tensor, (width as f32).sqrt())
+        let tensor = embedding_lookup(self.ctx(), &self.weights.token_embedding, ids, token_count)?;
+        let output = self
+            .ctx()
+            .allocate_output(tensor.shape().clone(), tensor.dtype())?;
+        elementwise::scale(self.ctx(), &tensor, &output, (width as f32).sqrt())?;
+        Ok(output)
     }
 }

@@ -180,7 +180,7 @@ class QwenDrivePolicy:
             "action_horizon": int(self.config["num_future_points"]),
             "action_dim": int(self.config["trajectory_point_dim"]),
             "num_inference_steps": self.num_steps,
-            "native_executor": "apxinf-cuda",
+            "native_executor": "apxinf-cuda-new",
         }
 
     # ------------------------------------------------------------------ construction

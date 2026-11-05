@@ -5,12 +5,39 @@ use super::launch;
 use crate::ffi::abi::rope as abi;
 use crate::{CudaBuffer, CudaContext, CudaDeviceAddress};
 
-/// Single-token graph-safe decode transform.
+/// Position convention for a single-token graph-safe decode rotation.
+#[derive(Clone, Copy, Debug)]
+pub enum DecodeRotationPosition {
+    /// Standard half-split rotary embedding using one scalar position.
+    OneDimensional(CudaDeviceAddress),
+    /// Interleaved temporal/height/width rotary embedding. `positions`
+    /// points to three device-visible `u32` values.
+    Multimodal {
+        positions: CudaDeviceAddress,
+        sections: [usize; 3],
+    },
+}
+
+/// Rotate one token from caller-owned input into caller-owned output.
+///
+/// Both tensors are `[heads, head_dim]`. The dtype is inferred from the
+/// tensors: one-dimensional rotation supports F32 and BF16, while multimodal
+/// rotation preserves the existing BF16-only kernel contract.
+pub struct DecodeRotationArgs<'a> {
+    pub input: &'a Tensor,
+    pub output: &'a mut Tensor,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub theta: f32,
+    pub position: DecodeRotationPosition,
+}
+
+/// Single-token graph-safe Q/K/V transform with a head-major KV cache.
 ///
 /// Q/K/V inputs are `[1, 1, heads, head_dim]`. Q is rotated into
 /// `query_out`; K is rotated directly into `key_cache`; V is appended to
-/// `value_cache`. Both caches use the canonical token-major layout
-/// `[1, cache_capacity, kv_heads, head_dim]`.
+/// `value_cache`. Both caches preserve the legacy head-major layout
+/// `[1, kv_heads, cache_capacity, head_dim]`.
 ///
 /// `position` points to one device-visible `u32`. Its address is stable and
 /// is captured as a stable binding address, but its value is read by the
@@ -89,8 +116,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
     if q_shape.len() != 4 || k_shape.len() != 4 || v_shape.len() != 4 {
         return Err(invalid("dynamic decode RoPE requires rank-4 Q/K/V"));
     }
-    let (batch, tokens, q_heads, head_dim) =
-        (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
+    let (batch, tokens, q_heads, head_dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
     let (k_batch, k_tokens, kv_heads, k_head_dim) =
         (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
     let cache_shape = args.key_cache.shape().dims();
@@ -109,22 +135,12 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
         || args.query_out.shape().dims() != q_shape
         || cache_shape.len() != 4
         || cache_shape[0] != 1
-        || cache_shape[1] == 0
-        || cache_shape[2] != kv_heads
+        || cache_shape[1] != kv_heads
+        || cache_shape[2] == 0
         || cache_shape[3] != head_dim
         || args.value_cache.shape().dims() != cache_shape
     {
         return Err(invalid("invalid dynamic decode RoPE shape contract"));
-    }
-    // The decode cache-append kernels index the cache head-major
-    // ([kv_heads, capacity, head_dim]); the token-major contract shared with
-    // prefill `rope` and `kv_cache_attention` only coincides with that layout
-    // for a single KV head. Reject multi-head caches until the kernels write
-    // token-major.
-    if kv_heads != 1 {
-        return Err(invalid(
-            "dynamic decode RoPE currently requires kv_heads == 1 (MQA)",
-        ));
     }
     if !args.theta.is_finite() || args.theta <= 0.0 {
         return Err(invalid(
@@ -136,10 +152,12 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
             "dynamic decode RoPE position address device/size mismatch",
         ));
     }
-    let cache_capacity = cache_shape[1];
+    let cache_capacity = cache_shape[2];
     for value in [q_heads, kv_heads, head_dim, cache_capacity] {
         if value > i32::MAX as usize {
-            return Err(invalid("dynamic decode RoPE dimension exceeds native limits"));
+            return Err(invalid(
+                "dynamic decode RoPE dimension exceeds native limits",
+            ));
         }
     }
 
@@ -156,6 +174,10 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
         semantic: 2,
         dtype: 2,
         has_bias: 0,
+        layout: abi::LAYOUT_SEPARATE_QKV,
+        cache_write: abi::CACHE_WRITE_HEAD_MAJOR,
+        rotation_source: abi::ROTATION_DEVICE_SCALAR,
+        rotary_convention: abi::CONVENTION_HALF_SPLIT,
         q_heads: q_heads as u32,
         kv_heads: kv_heads as u32,
         head_dim: head_dim as u32,
@@ -167,7 +189,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
         bias_alignment: 256,
         q_alignment: alignment(q_out.ptr()),
         kv_alignment: alignment(key_cache.ptr()),
-        position_alignment: alignment(position.cast()),
+        rotation_alignment: alignment(position.cast()),
         tokens: 1,
         cache_capacity: cache_capacity as i64,
     };
@@ -180,6 +202,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
         key_input: key_input.ptr(),
         value_input: value_input.ptr(),
         position,
+        rotation_table: std::ptr::null(),
         stream: ctx.stream().handle(),
         theta: args.theta,
         position_offset: 0,
@@ -195,4 +218,57 @@ pub(crate) fn normalize(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<N
 /// Apply dynamic single-token RoPE and append K/V into token-major caches.
 pub fn decode_rope(ctx: &CudaContext, args: DecodeRopeArgs<'_>) -> Result<()> {
     launch::execute(ctx, normalize(ctx, args)?)
+}
+
+/// Apply the selected single-token rotation using the unchanged fixed decode
+/// kernels. Raw buffer launchers stay private to the RoPE family.
+pub fn decode_rotation(ctx: &CudaContext, args: DecodeRotationArgs<'_>) -> Result<()> {
+    if args.heads == 0
+        || args.head_dim == 0
+        || args.head_dim % 2 != 0
+        || args.input.shape().dims() != [args.heads, args.head_dim]
+        || args.output.shape().dims() != [args.heads, args.head_dim]
+        || args.input.dtype() != args.output.dtype()
+        || args.input.device() != Device::Cuda(ctx.device_id())
+        || args.output.device() != Device::Cuda(ctx.device_id())
+    {
+        return Err(invalid("invalid decode rotation tensor contract"));
+    }
+    let input = CudaBuffer::from_tensor(args.input).map_err(Error::Cuda)?;
+    let output = CudaBuffer::from_tensor(args.output).map_err(Error::Cuda)?;
+    match args.position {
+        DecodeRotationPosition::OneDimensional(position) => super::fixed::apply_into(
+            ctx,
+            args.input.dtype(),
+            &input,
+            &output,
+            args.head_dim,
+            args.heads,
+            args.theta,
+            position,
+        ),
+        DecodeRotationPosition::Multimodal {
+            positions,
+            sections,
+        } => {
+            if args.input.dtype() != DType::BF16
+                || sections.iter().sum::<usize>() != args.head_dim / 2
+            {
+                return Err(invalid(
+                    "multimodal decode rotation requires BF16 and sections summing to head_dim/2",
+                ));
+            }
+            super::fixed::apply_mrope_into(
+                ctx,
+                &input,
+                &output,
+                args.head_dim,
+                args.heads,
+                args.theta,
+                positions,
+                sections[1],
+                sections[2],
+            )
+        }
+    }
 }

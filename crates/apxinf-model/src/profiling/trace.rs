@@ -12,7 +12,7 @@
 //! both records NVTX only and MUSA's ranges appear only in a build without it.
 
 #[cfg(feature = "cuda")]
-pub use crate::accelerator::cuda::nvtx::{range, Range};
+pub use apxinf_cuda_new::nvtx::{range, Range};
 
 /// MUSA speaks NVTX's protocol, so the model's ranges reach msys unchanged.
 #[cfg(all(feature = "musa", not(feature = "cuda")))]

@@ -19,6 +19,8 @@ pub enum QuantizationSemantic {
     SliceColumnsBf16,
     /// BF16 to signed INT8 with one computed F32 scale per row.
     RowwiseI8,
+    /// Rounded SiLU(gate) multiplied by `secondary`, then rowwise INT8.
+    SiluMulRowwiseI8,
 }
 
 impl QuantizationSemantic {
@@ -31,17 +33,23 @@ impl QuantizationSemantic {
             Self::CastF32ToBf16 => 6,
             Self::SliceColumnsBf16 => 3,
             Self::RowwiseI8 => 4,
+            Self::SiluMulRowwiseI8 => 7,
         }
     }
 
     fn has_row_scales(self) -> bool {
-        matches!(self, Self::RowwiseE4m3 | Self::RowwiseI8)
+        matches!(
+            self,
+            Self::RowwiseE4m3 | Self::RowwiseI8 | Self::SiluMulRowwiseI8
+        )
     }
 }
 
 pub struct QuantizationArgs<'a> {
     pub semantic: QuantizationSemantic,
     pub input: &'a Tensor,
+    /// Required only by [`QuantizationSemantic::SiluMulRowwiseI8`].
+    pub secondary: Option<&'a Tensor>,
     pub out: &'a mut Tensor,
     /// Required for rowwise quantization and otherwise forbidden.
     pub scales: Option<&'a mut Tensor>,
@@ -54,6 +62,7 @@ impl<'a> QuantizationArgs<'a> {
         Self {
             semantic,
             input,
+            secondary: None,
             out,
             scales: None,
             scale: 1.0,
@@ -118,7 +127,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
     let (rows, input_cols, output_cols) = match semantic {
         QuantizationSemantic::RowwiseE4m3
         | QuantizationSemantic::SliceColumnsBf16
-        | QuantizationSemantic::RowwiseI8 => {
+        | QuantizationSemantic::RowwiseI8
+        | QuantizationSemantic::SiluMulRowwiseI8 => {
             let input_shape = args.input.shape().dims();
             let output_shape = args.out.shape().dims();
             if input_shape.len() != 2
@@ -182,6 +192,14 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
             }
             (DType::BF16, DType::I8)
         }
+        QuantizationSemantic::SiluMulRowwiseI8 => {
+            if output_cols != input_cols {
+                return Err(invalid(
+                    "SiLU-multiply rowwise INT8 output shape must match input",
+                ));
+            }
+            (DType::BF16, DType::I8)
+        }
     };
     if args.input.dtype() != expected_input || args.out.dtype() != expected_output {
         return Err(invalid("Quantization tensor dtype disagrees with semantic"));
@@ -205,6 +223,36 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
     let output_alignment = alignment_of(output_buffer.ptr() as usize);
 
     let mut storage = vec![input_buffer, output_buffer];
+    let (secondary, secondary_alignment) = match args.secondary {
+        Some(tensor) if semantic == QuantizationSemantic::SiluMulRowwiseI8 => {
+            if tensor.dtype() != DType::BF16 || tensor.shape() != args.input.shape() {
+                return Err(invalid(
+                    "SiLU-multiply secondary input must match the BF16 gate tensor",
+                ));
+            }
+            let buffer = tensor_buffer(ctx, tensor, input_numel)?;
+            if buffer.ptr() as *mut std::ffi::c_void == output {
+                return Err(invalid(
+                    "SiLU-multiply secondary input must not alias output",
+                ));
+            }
+            let pointer = buffer.ptr() as *const std::ffi::c_void;
+            let alignment = alignment_of(buffer.ptr() as usize);
+            storage.push(buffer);
+            (pointer, alignment)
+        }
+        Some(_) => {
+            return Err(invalid(
+                "Quantization semantic does not take a secondary input",
+            ))
+        }
+        None if semantic == QuantizationSemantic::SiluMulRowwiseI8 => {
+            return Err(invalid(
+                "SiLU-multiply rowwise quantization requires a secondary input",
+            ))
+        }
+        None => (std::ptr::null(), 256),
+    };
     let (scales, scales_alignment) = match args.scales {
         Some(scales) if semantic.has_row_scales() => {
             if scales.dtype() != DType::F32 || scales.shape().dims() != [rows] {
@@ -212,6 +260,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
             }
             let buffer = tensor_buffer(ctx, scales, rows)?;
             if buffer.ptr() as *const std::ffi::c_void == input
+                || buffer.ptr() as *const std::ffi::c_void == secondary
                 || buffer.ptr() as *mut std::ffi::c_void == output
             {
                 return Err(invalid(
@@ -240,6 +289,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
             output_dtype: dtype_code(expected_output),
             scale_dtype: dtype_code(DType::F32),
             input_alignment,
+            secondary_alignment,
             output_alignment,
             scales_alignment,
             rows: rows as i64,
@@ -248,6 +298,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
         },
         bindings: abi::Bindings {
             input,
+            secondary,
             output,
             scales,
             stream: ctx.stream().handle(),

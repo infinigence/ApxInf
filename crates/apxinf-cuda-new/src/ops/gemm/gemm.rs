@@ -5,5 +5,6 @@ use super::gemm_execution as execution;
 use crate::CudaContext;
 
 pub fn gemm(ctx: &CudaContext, args: GemmArgs<'_>) -> Result<()> {
+    super::observer::observe(&args)?;
     execution::execute(ctx, normalize(ctx, args, Semantic::Gemm, None)?)
 }

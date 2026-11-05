@@ -15,6 +15,10 @@
 
 #include "flashinfer_gdn.h"
 
+// The kernel translation unit (flashinfer_gdn_launch.cu) only builds for the
+// sm100-family targets — it emits tcgen05 and TMA. On builds without such a
+// target, build.rs compiles flashinfer_gdn_stub.cpp instead, which defines
+// this symbol as an unsupported-status stub so the link still closes.
 extern "C" int apxinf_flashinfer_gdn_launch(
     const void* map_q, const void* map_k, const void* map_v,
     const void* map_out, float* gate_log, float* beta, int* cu_seqlens,

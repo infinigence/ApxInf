@@ -329,12 +329,15 @@ fn forward_language_device(
         vec![1, text.hidden_size],
         DType::BF16,
     )?;
-    ops::mlp::rms_norm(
+    ops::norm::norm(
         ctx,
-        &last,
-        &weights.final_norm,
-        &scratch.last_norm_bf16,
-        text.rms_norm_eps,
+        ops::NormArgs::rms(
+            &last,
+            &weights.final_norm,
+            &scratch.last_norm_bf16,
+            text.rms_norm_eps,
+        )
+        .with_weight_offset(),
     )?;
     ops::quantization(
         ctx,
@@ -395,12 +398,10 @@ fn full_attention(
         vec![tokens, text.hidden_size],
         DType::BF16,
     )?;
-    ops::mlp::rms_norm(
+    ops::norm::norm(
         ctx,
-        &hidden,
-        &layer.input_norm,
-        &normalized,
-        text.rms_norm_eps,
+        ops::NormArgs::rms(&hidden, &layer.input_norm, &normalized, text.rms_norm_eps)
+            .with_weight_offset(),
     )?;
 
     let mut q_fused = prefix(
@@ -438,25 +439,35 @@ fn full_attention(
         DType::BF16,
     )?;
     ops::split_query_and_gate(ctx, &q_fused_heads, &query, &gate)?;
-    ops::head_rms_norm(
-        ctx,
-        &prefix(
-            &scratch.query,
-            vec![tokens * text.num_attention_heads, text.head_dim],
-            DType::BF16,
-        )?,
-        &layer.q_norm,
-        text.rms_norm_eps,
+    let query_norm_rows = prefix(
+        &scratch.query,
+        vec![tokens * text.num_attention_heads, text.head_dim],
+        DType::BF16,
     )?;
-    ops::head_rms_norm(
+    ops::norm::norm(
         ctx,
-        &prefix(
-            &scratch.key,
-            vec![tokens * text.num_key_value_heads, text.head_dim],
-            DType::BF16,
-        )?,
-        &layer.k_norm,
-        text.rms_norm_eps,
+        ops::NormArgs::rms(
+            &query_norm_rows,
+            &layer.q_norm,
+            &query_norm_rows,
+            text.rms_norm_eps,
+        )
+        .with_weight_offset(),
+    )?;
+    let key_norm_rows = prefix(
+        &scratch.key,
+        vec![tokens * text.num_key_value_heads, text.head_dim],
+        DType::BF16,
+    )?;
+    ops::norm::norm(
+        ctx,
+        ops::NormArgs::rms(
+            &key_norm_rows,
+            &layer.k_norm,
+            &key_norm_rows,
+            text.rms_norm_eps,
+        )
+        .with_weight_offset(),
     )?;
     let positions = prefix(&scratch.positions, vec![tokens], DType::I32)?;
     let rotary = ops::rotary_dim(text.head_dim, text.partial_rotary_factor);
@@ -541,7 +552,7 @@ fn full_attention(
         vec![tokens, text.num_attention_heads * text.head_dim],
         DType::BF16,
     )?;
-    ops::apply_output_gate(ctx, &attention, &gate)?;
+    ops::apply_output_gate(ctx, ops::OutputGateArgs::new(&attention, &gate))?;
     let mut projected = prefix(
         &scratch.projected,
         vec![tokens, text.hidden_size],
@@ -566,12 +577,10 @@ fn gdn(
         vec![tokens, text.hidden_size],
         DType::BF16,
     )?;
-    ops::mlp::rms_norm(
+    ops::norm::norm(
         ctx,
-        &hidden,
-        &layer.input_norm,
-        &normalized,
-        text.rms_norm_eps,
+        ops::NormArgs::rms(&hidden, &layer.input_norm, &normalized, text.rms_norm_eps)
+            .with_weight_offset(),
     )?;
 
     let key_width = text.linear_num_key_heads * text.linear_key_head_dim;
@@ -604,16 +613,16 @@ fn gdn(
         vec![tokens, text.linear_num_value_heads],
         DType::F32,
     )?;
-    ops::gdn_decay_and_beta_seq(
+    ops::gdn_decay_and_beta(
         ctx,
-        &a,
-        &b,
-        &layer.a_log,
-        &layer.dt_bias,
-        &decay,
-        &beta,
-        tokens,
-        text.linear_num_value_heads,
+        ops::GdnDecayAndBetaArgs {
+            a: &a,
+            b: &b,
+            a_log: &layer.a_log,
+            dt_bias: &layer.dt_bias,
+            decay: &decay,
+            beta: &beta,
+        },
     )?;
 
     let z_heads = prefix(
@@ -716,16 +725,16 @@ fn gdn(
             1,
             1.0 / (text.linear_key_head_dim as f32).sqrt(),
         )?;
-        ops::gdn_gated_norm_seq_f16(
+        ops::gdn_gated_norm(
             ctx,
-            &out_rows,
-            &z_heads,
-            &layer.gated_norm,
-            &gated,
-            tokens,
-            text.linear_num_value_heads,
-            text.linear_value_head_dim,
-            text.rms_norm_eps,
+            ops::GdnGatedNormArgs {
+                input: &out_rows,
+                gate: ops::GdnGate::Dense(&z_heads),
+                weight: &layer.gated_norm,
+                output: &gated,
+                quantized: None,
+                epsilon: text.rms_norm_eps,
+            },
         )?;
     } else {
         let conv = prefix(&scratch.gdn_conv, vec![tokens, qkv_width], DType::BF16)?;
@@ -763,20 +772,20 @@ fn gdn(
             ],
             DType::BF16,
         )?;
-        ops::gdn_chunk_scan_interleaved(
+        ops::gdn_chunk_scan(
             ctx,
-            &fused_padded,
-            &decay_padded,
-            &beta_padded,
-            &readout_padded,
-            &scratch.gdn_state,
-            scratch.padded,
-            qkv_width,
-            [0, key_width, 2 * key_width],
-            text.linear_num_value_heads,
-            text.linear_num_key_heads,
-            GDN_CHUNK,
-            text.linear_key_head_dim,
+            ops::GdnChunkScanArgs {
+                input: ops::GdnChunkScanInput::Interleaved {
+                    fused: &fused_padded,
+                    offsets: [0, key_width, 2 * key_width],
+                },
+                gate_log: &decay_padded,
+                beta: &beta_padded,
+                output: &readout_padded,
+                state: &scratch.gdn_state,
+                key_heads: text.linear_num_key_heads,
+                chunk_size: GDN_CHUNK,
+            },
         )?;
         let readout = prefix(
             &scratch.gdn_readout,
@@ -787,16 +796,16 @@ fn gdn(
             ],
             DType::BF16,
         )?;
-        ops::gdn_gated_norm_seq(
+        ops::gdn_gated_norm(
             ctx,
-            &readout,
-            &z_heads,
-            &layer.gated_norm,
-            &gated,
-            tokens,
-            text.linear_num_value_heads,
-            text.linear_value_head_dim,
-            text.rms_norm_eps,
+            ops::GdnGatedNormArgs {
+                input: &readout,
+                gate: ops::GdnGate::Dense(&z_heads),
+                weight: &layer.gated_norm,
+                output: &gated,
+                quantized: None,
+                epsilon: text.rms_norm_eps,
+            },
         )?;
     }
     let gated_flat = prefix(&scratch.gdn_gated, vec![tokens, value_width], DType::BF16)?;
@@ -832,7 +841,10 @@ fn mlp(
         vec![tokens, text.hidden_size],
         DType::BF16,
     )?;
-    ops::mlp::rms_norm(ctx, &hidden, norm, &normalized, text.rms_norm_eps)?;
+    ops::norm::norm(
+        ctx,
+        ops::NormArgs::rms(&hidden, norm, &normalized, text.rms_norm_eps).with_weight_offset(),
+    )?;
     let mut fused = prefix(
         &scratch.mlp_fused,
         vec![tokens, 2 * text.intermediate_size],
@@ -844,7 +856,7 @@ fn mlp(
         vec![tokens, text.intermediate_size],
         DType::BF16,
     )?;
-    ops::mlp::swiglu(ctx, &fused, &activation)?;
+    ops::pointwise::swiglu_into(ctx, &fused, &activation)?;
     let mut projected = prefix(
         &scratch.projected,
         vec![tokens, text.hidden_size],

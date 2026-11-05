@@ -20,7 +20,7 @@
 //!
 //! ```text
 //! bash crates/apxinf-cuda-new/test-new.sh \
-//!   test -p apxinf-cuda --test qwen38_flashinfer_gdn -- --include-ignored --nocapture
+//!   test -p apxinf-cuda-new --test qwen38_flashinfer_gdn -- --include-ignored --nocapture
 //! ```
 
 use apxinf_core::{DType, Shape, Tensor};
@@ -64,7 +64,10 @@ fn f32_bytes(values: &[f32]) -> Vec<u8> {
 
 fn read_bf16(tensor: &Tensor, count: usize) -> Vec<f32> {
     let mut bytes = vec![0u8; count * 2];
-    CudaBuffer::from_tensor(tensor).unwrap().copy_to_host(&mut bytes).unwrap();
+    CudaBuffer::from_tensor(tensor)
+        .unwrap()
+        .copy_to_host(&mut bytes)
+        .unwrap();
     bytes
         .chunks_exact(2)
         .map(|r| f32::from_bits((u16::from_le_bytes([r[0], r[1]]) as u32) << 16))
@@ -73,7 +76,10 @@ fn read_bf16(tensor: &Tensor, count: usize) -> Vec<f32> {
 
 fn read_f16(tensor: &Tensor, count: usize) -> Vec<f32> {
     let mut bytes = vec![0u8; count * 2];
-    CudaBuffer::from_tensor(tensor).unwrap().copy_to_host(&mut bytes).unwrap();
+    CudaBuffer::from_tensor(tensor)
+        .unwrap()
+        .copy_to_host(&mut bytes)
+        .unwrap();
     bytes
         .chunks_exact(2)
         .map(|r| half::f16::from_bits(u16::from_le_bytes([r[0], r[1]])).to_f32())
@@ -82,7 +88,10 @@ fn read_f16(tensor: &Tensor, count: usize) -> Vec<f32> {
 
 fn read_f32(tensor: &Tensor, count: usize) -> Vec<f32> {
     let mut bytes = vec![0u8; count * 4];
-    CudaBuffer::from_tensor(tensor).unwrap().copy_to_host(&mut bytes).unwrap();
+    CudaBuffer::from_tensor(tensor)
+        .unwrap()
+        .copy_to_host(&mut bytes)
+        .unwrap();
     bytes
         .chunks_exact(4)
         .map(|r| f32::from_le_bytes([r[0], r[1], r[2], r[3]]))
@@ -116,7 +125,15 @@ fn cosine_rel_l2(got: &[f32], want: &[f32]) -> (f64, f64) {
 #[allow(clippy::type_complexity)]
 fn make_inputs(
     seq: usize,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> (
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+) {
     let mut q = vec![0.0f32; seq * Q_HEADS * HEAD_DIM];
     let mut k = vec![0.0f32; seq * Q_HEADS * HEAD_DIM];
     let mut v = vec![0.0f32; seq * V_HEADS * HEAD_DIM];
@@ -159,26 +176,71 @@ fn flashinfer_gdn_matches_our_chunk_scan() {
     let ctx = CudaContext::new(0).unwrap();
     let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
 
-    for &(seq, nonzero_initial) in &[(CHUNK, false), (2 * CHUNK, false),
-        (512, false), (1024, false), (2048, false),
-        (CHUNK, true), (2 * CHUNK, true), (2048, true)] {
+    for &(seq, nonzero_initial) in &[
+        (CHUNK, false),
+        (2 * CHUNK, false),
+        (512, false),
+        (1024, false),
+        (2048, false),
+        (CHUNK, true),
+        (2 * CHUNK, true),
+        (2048, true),
+    ] {
         let (q, k, v, g, beta, q_raw, k_raw) = make_inputs(seq);
         let initial_state: Vec<f32> = (0..V_HEADS * HEAD_DIM * HEAD_DIM)
-            .map(|index| if nonzero_initial { (index as f32 * 0.013).sin() * 0.05 } else { 0.0 })
+            .map(|index| {
+                if nonzero_initial {
+                    (index as f32 * 0.013).sin() * 0.05
+                } else {
+                    0.0
+                }
+            })
             .collect();
 
         // --- our scan: BF16, q/k interleaved is not needed here, and it
         // normalizes and scales internally.
-        let q_bf = upload(&ctx, &bf16_bytes(&q), vec![seq, Q_HEADS, HEAD_DIM], DType::BF16);
-        let k_bf = upload(&ctx, &bf16_bytes(&k), vec![seq, Q_HEADS, HEAD_DIM], DType::BF16);
-        let v_bf = upload(&ctx, &bf16_bytes(&v), vec![seq, V_HEADS, HEAD_DIM], DType::BF16);
+        let q_bf = upload(
+            &ctx,
+            &bf16_bytes(&q),
+            vec![seq, Q_HEADS, HEAD_DIM],
+            DType::BF16,
+        );
+        let k_bf = upload(
+            &ctx,
+            &bf16_bytes(&k),
+            vec![seq, Q_HEADS, HEAD_DIM],
+            DType::BF16,
+        );
+        let v_bf = upload(
+            &ctx,
+            &bf16_bytes(&v),
+            vec![seq, V_HEADS, HEAD_DIM],
+            DType::BF16,
+        );
         let g_ours = upload(&ctx, &f32_bytes(&g), vec![seq, V_HEADS], DType::F32);
         let beta_ours = upload(&ctx, &f32_bytes(&beta), vec![seq, V_HEADS], DType::F32);
         let out_ours = zeros(&ctx, vec![seq, V_HEADS, HEAD_DIM], DType::BF16);
-        let state_ours = upload(&ctx, &f32_bytes(&initial_state), vec![V_HEADS, HEAD_DIM, HEAD_DIM], DType::F32);
+        let state_ours = upload(
+            &ctx,
+            &f32_bytes(&initial_state),
+            vec![V_HEADS, HEAD_DIM, HEAD_DIM],
+            DType::F32,
+        );
         ops::gdn_chunk_scan(
-            &ctx, &q_bf, &k_bf, &v_bf, &g_ours, &beta_ours, &out_ours, &state_ours,
-            V_HEADS, Q_HEADS, CHUNK,
+            &ctx,
+            ops::GdnChunkScanArgs {
+                input: ops::GdnChunkScanInput::Split {
+                    q: &q_bf,
+                    k: &k_bf,
+                    v: &v_bf,
+                },
+                gate_log: &g_ours,
+                beta: &beta_ours,
+                output: &out_ours,
+                state: &state_ours,
+                key_heads: Q_HEADS,
+                chunk_size: CHUNK,
+            },
         )
         .unwrap();
 
@@ -222,16 +284,24 @@ fn flashinfer_gdn_matches_our_chunk_scan() {
         let g_fi = zeros(&ctx, vec![seq, V_HEADS], DType::F32);
         let g_log = upload(&ctx, &f32_bytes(&g), vec![seq, V_HEADS], DType::F32);
         ops::gdn_prepare_prefill(
-            &ctx, &fused, &q_h, &k_h, &v_h, &g_log, &g_fi, seq, row_width,
-            Q_HEADS, V_HEADS, HEAD_DIM, 1e-6,
+            &ctx, &fused, &q_h, &k_h, &v_h, &g_log, &g_fi, seq, row_width, Q_HEADS, V_HEADS,
+            HEAD_DIM, 1e-6,
         )
         .unwrap();
         let beta_fi = upload(&ctx, &f32_bytes(&beta), vec![seq, V_HEADS], DType::F32);
         let out_fi = zeros(&ctx, vec![seq, V_HEADS, HEAD_DIM], DType::F16);
-        let state_fi = upload(&ctx, &f32_bytes(&initial_state), vec![V_HEADS, HEAD_DIM, HEAD_DIM], DType::F32);
+        let state_fi = upload(
+            &ctx,
+            &f32_bytes(&initial_state),
+            vec![V_HEADS, HEAD_DIM, HEAD_DIM],
+            DType::F32,
+        );
         let cu = upload(
             &ctx,
-            &[0i32, seq as i32].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>(),
+            &[0i32, seq as i32]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect::<Vec<u8>>(),
             vec![2],
             DType::I32,
         );
@@ -240,8 +310,8 @@ fn flashinfer_gdn_matches_our_chunk_scan() {
         let workspace = zeros(&ctx, vec![workspace_bytes / 4], DType::F32);
 
         ops::gdn_prefill(
-            &ctx, &q_h, &k_h, &v_h, &out_fi, &g_fi, &beta_fi, &cu, &state_fi,
-            &workspace, seq, Q_HEADS, V_HEADS, 1, scale,
+            &ctx, &q_h, &k_h, &v_h, &out_fi, &g_fi, &beta_fi, &cu, &state_fi, &workspace, seq,
+            Q_HEADS, V_HEADS, 1, scale,
         )
         .unwrap();
         ctx.synchronize().unwrap();
@@ -264,16 +334,24 @@ state: cosine {state_cos:.6} relL2 {state_rel:.5}"
         // beside a perfectly healthy cosine, which is the signature of a
         // tiny denominator rather than a wrong answer.
         let rms = |values: &[f32]| -> f64 {
-            (values.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>()
+            (values
+                .iter()
+                .map(|x| (*x as f64) * (*x as f64))
+                .sum::<f64>()
                 / values.len() as f64)
                 .sqrt()
         };
         let peak = |values: &[f32]| -> f64 {
-            values.iter().fold(0.0f64, |acc, x| acc.max((*x as f64).abs()))
+            values
+                .iter()
+                .fold(0.0f64, |acc, x| acc.max((*x as f64).abs()))
         };
         println!(
             "           state rms ours={:.3e} fi={:.3e}  peak ours={:.3e} fi={:.3e}",
-            rms(&ours_state), rms(&fi_state), peak(&ours_state), peak(&fi_state)
+            rms(&ours_state),
+            rms(&fi_state),
+            peak(&ours_state),
+            peak(&fi_state)
         );
 
         // BF16 carries 8 mantissa bits against FP16's 10, over the same
@@ -294,7 +372,11 @@ state: cosine {state_cos:.6} relL2 {state_rel:.5}"
         // what happens, so the magnitudes are asserted too.
         let ours_rms = rms(&ours_state);
         let fi_rms = rms(&fi_state);
-        let ratio = if ours_rms > 0.0 { fi_rms / ours_rms } else { f64::INFINITY };
+        let ratio = if ours_rms > 0.0 {
+            fi_rms / ours_rms
+        } else {
+            f64::INFINITY
+        };
         assert!(
             ratio > 0.5 && ratio < 2.0,
             "seq={seq}: FlashInfer state magnitude is {ratio:.3e}x ours \

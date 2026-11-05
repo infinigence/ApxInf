@@ -1,9 +1,9 @@
 //! Native-BF16 GR00T device weights.
 
-use apxinf_core::{Backend, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
 
 use super::action_weights::Gr00tLinearWeights;
-use super::backend::{kernels, RuntimeBackend};
+use super::backend::{ops, RuntimeBackend};
 use super::device_weights::DeviceLinearWeights;
 
 #[derive(Debug)]
@@ -33,23 +33,25 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
 
     fn forward(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
         super::calibration::observe(&self.calibration_name, input)?;
-        kernels::gemm::bf16(backend.context(), input, &self.weights.weight)
+        let a = input.shape().dims();
+        let b = self.weights.weight.shape().dims();
+        if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+            return Err(Error::Other(format!(
+                "GR00T BF16 GEMM shape mismatch: {a:?} @ {b:?}"
+            )));
+        }
+        let mut output = backend
+            .context()
+            .allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
+        ops::gemm::gemm(
+            backend.context(),
+            ops::gemm::GemmArgs::new(input, &self.weights.weight, &mut output),
+        )?;
+        Ok(output)
     }
 
     fn bias(&self) -> Option<&Tensor> {
         Some(&self.weights.bias)
-    }
-
-    fn packed8_bias(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Option<Tensor>> {
-        super::backend::try_packed8_bias_activation(backend, input, &self.weights.bias, 0)
-    }
-
-    fn packed8_bias_gelu(
-        &self,
-        input: &Tensor,
-        backend: &RuntimeBackend,
-    ) -> Result<Option<Tensor>> {
-        super::backend::try_packed8_bias_activation(backend, input, &self.weights.bias, 1)
     }
 
     fn bias_residual_adaptive_layer_norm(
@@ -68,15 +70,30 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
         {
             return Ok(None);
         }
-        let fused = kernels::fused::bias_then_residual_adaptive_layer_bf16_cached_1536(
+        let hidden = backend
+            .context()
+            .allocate_output(projection.shape().clone(), DType::BF16)?;
+        let normalized = backend
+            .context()
+            .allocate_output(projection.shape().clone(), DType::BF16)?;
+        ops::fused_add_norm(
             backend.context(),
-            projection,
-            &self.weights.bias,
-            residual,
-            modulation,
-            eps,
+            ops::FusedAddNormArgs {
+                input: projection,
+                bias: Some(&self.weights.bias),
+                residual,
+                gate: None,
+                hidden: &hidden,
+                normalized: Some(&normalized),
+                kind: ops::NormKind::Layer,
+                affine: ops::Affine::Adaptive { style: modulation },
+                quantized: None,
+                numerics: ops::NormNumerics::Flexible,
+                bias_order: ops::BiasOrder::BiasThenResidual,
+                eps,
+            },
         )?;
-        Ok(Some((fused.hidden, fused.normalized)))
+        Ok(Some((hidden, normalized)))
     }
 
     fn bias_residual_layer_norm(
@@ -97,16 +114,34 @@ impl DeviceLinearWeights for Gr00tBf16LinearWeights {
         {
             return Ok(None);
         }
-        let fused = kernels::fused::bias_then_residual_layer_bf16_cached_1536(
+        let hidden = backend
+            .context()
+            .allocate_output(projection.shape().clone(), DType::BF16)?;
+        let normalized = backend
+            .context()
+            .allocate_output(projection.shape().clone(), DType::BF16)?;
+        ops::fused_add_norm(
             backend.context(),
-            projection,
-            &self.weights.bias,
-            residual,
-            norm_weight,
-            norm_bias,
-            eps,
+            ops::FusedAddNormArgs {
+                input: projection,
+                bias: Some(&self.weights.bias),
+                residual,
+                gate: None,
+                hidden: &hidden,
+                normalized: Some(&normalized),
+                kind: ops::NormKind::Layer,
+                affine: ops::Affine::Weight {
+                    weight: norm_weight,
+                    bias: Some(norm_bias),
+                    offset: false,
+                },
+                quantized: None,
+                numerics: ops::NormNumerics::Flexible,
+                bias_order: ops::BiasOrder::BiasThenResidual,
+                eps,
+            },
         )?;
-        Ok(Some((fused.hidden, fused.normalized)))
+        Ok(Some((hidden, normalized)))
     }
 
     fn supports_fused_self_qkv(&self) -> bool {

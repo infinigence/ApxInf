@@ -10,8 +10,9 @@ mod linear {
 
     #[derive(Debug)]
     pub struct Fp8StaticLinearWeights {
-        /// `[input, output]` CUDA E4M3 matrix.
+        /// Logical `[input, output]` E4M3 matrix; `layout` tracks physical packing.
         pub weight: Tensor,
+        pub layout: crate::pi05::backend::ops::RepackedWeight,
         pub weight_scale: f32,
         /// Bias stays FP16 and is fused into the consumer kernel.
         pub bias: Option<Tensor>,
@@ -26,6 +27,14 @@ mod linear {
         /// one absmax quantization scale. This produces graph-ready QKV and
         /// gate/up matrices without runtime concatenation or mixed descales.
         pub fn from_host_parts(linears: &[&LinearWeights], context: &Context) -> Result<Self> {
+            Self::from_host_parts_with_cache(linears, context, None)
+        }
+
+        pub(super) fn from_host_parts_with_cache(
+            linears: &[&LinearWeights],
+            context: &Context,
+            extra_bytes: Option<usize>,
+        ) -> Result<Self> {
             if linears.is_empty() {
                 return Err(Error::Other("cannot pack an empty FP8 linear group".into()));
             }
@@ -44,6 +53,10 @@ mod linear {
                 .map(|bias| backend::to_device(context, bias))
                 .transpose()?;
             Ok(Self {
+                layout: match extra_bytes {
+                    Some(bytes) => ops::RepackedWeight::with_layout_cache(&weight, bytes)?,
+                    None => ops::RepackedWeight::new(&weight)?,
+                },
                 weight,
                 weight_scale,
                 bias,
@@ -139,49 +152,13 @@ mod linear {
             let zero = linear(&[0.0, 0.0], [1, 2], None);
             assert_eq!(pack_host_parts(&[&zero]).unwrap().1, 1.0);
         }
-
-        #[test]
-        #[ignore = "requires CUDA"]
-        fn gpu_weight_quantization_matches_legacy_bytes() {
-            use apxinf_core::Backend;
-
-            let context = Context::new(0).unwrap();
-            let legacy = apxinf_cuda::CudaBackend::new(0).unwrap();
-            for maximum in [448.0, 13.3, 0.0] {
-                let mut values = (0..512)
-                    .map(|index| (index as f32 / 511.0 - 0.5) * maximum)
-                    .collect::<Vec<_>>();
-                values.extend([maximum, 0.01513671875, 1.0004]);
-                if maximum == 0.0 {
-                    values.fill(0.0);
-                }
-                let source = linear(&values, [1, values.len()], None);
-                let (host, scale, _) = pack_host_parts(&[&source]).unwrap();
-                let input = legacy.to_device(&host).unwrap();
-                let expected = apxinf_cuda::kernels::quantization::quantize_f16_e4m3(
-                    legacy.context(),
-                    &input,
-                    scale,
-                )
-                .unwrap();
-                legacy.context().synchronize().unwrap();
-                let expected = legacy.to_cpu(&expected).unwrap();
-                let actual = Fp8StaticLinearWeights::from_host(&source, &context).unwrap();
-                context.synchronize().unwrap();
-                let actual = backend::to_cpu(&actual.weight).unwrap();
-                assert_eq!(actual.as_f8_e4m3().unwrap(), expected.as_f8_e4m3().unwrap());
-                if maximum == 448.0 {
-                    assert_eq!(actual.as_f8_e4m3().unwrap()[513], 0x08);
-                }
-            }
-        }
     }
 }
 pub use linear::*;
 // Fully materialized static-FP8 π0.5 weights.
 
-use apxinf_core::{Result, Tensor};
 use crate::pi05::backend::Context;
+use apxinf_core::{Result, Tensor};
 
 use crate::pi05::{
     ActionLayerWeights, AdaRmsNormWeights, LanguageLayerWeights, LayerNormWeights, Pi05Weights,
@@ -244,6 +221,17 @@ pub struct Fp8StaticWeights {
 
 impl Fp8StaticWeights {
     pub fn from_host(weights: &Pi05Weights, backend: &Context) -> Result<Self> {
+        Self::from_host_with_layout_budget(weights, backend, usize::MAX)
+    }
+
+    /// Bound additional physical layouts for language gate/up weights. Zero
+    /// selects canonical before any execution; otherwise each eligible layer
+    /// reserves capacity for one extra layout, allocated only when selected.
+    pub fn from_host_with_layout_budget(
+        weights: &Pi05Weights,
+        backend: &Context,
+        mut extra_bytes: usize,
+    ) -> Result<Self> {
         let vision_layers = weights
             .vision
             .blocks
@@ -253,7 +241,25 @@ impl Fp8StaticWeights {
         let language_layers = weights
             .language_layers
             .iter()
-            .map(|layer| Fp8StaticDeviceLanguageLayer::from_host(layer, backend))
+            .map(|layer| {
+                let bytes = layer
+                    .mlp
+                    .gate
+                    .weight
+                    .shape()
+                    .numel()
+                    .checked_add(layer.mlp.up.weight.shape().numel())
+                    .ok_or_else(|| {
+                        apxinf_core::Error::Other("FP8 layout budget size overflow".into())
+                    })?;
+                let reserved = if extra_bytes >= bytes {
+                    extra_bytes -= bytes;
+                    bytes
+                } else {
+                    0
+                };
+                Fp8StaticDeviceLanguageLayer::from_host(layer, backend, reserved)
+            })
             .collect::<Result<Vec<_>>>()?;
         let action_layers = weights
             .action_layers
@@ -314,7 +320,11 @@ impl Fp8StaticDeviceVisionBlock {
 }
 
 impl Fp8StaticDeviceLanguageLayer {
-    fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
+    fn from_host(
+        weights: &LanguageLayerWeights,
+        backend: &Context,
+        layout_bytes: usize,
+    ) -> Result<Self> {
         Ok(Self {
             input_norm_scale: fp16_to_device(&weights.input_norm_scale, backend)?,
             qkv: Fp8StaticLinearWeights::from_host_parts(
@@ -327,9 +337,10 @@ impl Fp8StaticDeviceLanguageLayer {
             )?,
             output: Fp8StaticLinearWeights::from_host(&weights.attention.output, backend)?,
             post_attention_norm_scale: fp16_to_device(&weights.post_attention_norm_scale, backend)?,
-            gate_up: Fp8StaticLinearWeights::from_host_parts(
+            gate_up: Fp8StaticLinearWeights::from_host_parts_with_cache(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,
+                Some(layout_bytes),
             )?,
             down: Fp8StaticLinearWeights::from_host(&weights.mlp.down, backend)?,
         })

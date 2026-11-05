@@ -100,7 +100,7 @@ fn graph_safe_autotune_captures_the_winner() {
 }
 
 #[test]
-fn merged_gemm_contract_rejects_pre_merge_spec_version() {
+fn gemm_contract_rejects_previous_spec_version() {
     let ctx = CudaContext::new(0).unwrap();
     let activation = zeros_tensor(0, vec![1, 16], DType::BF16);
     let weight = zeros_tensor(0, vec![16, 16], DType::BF16);
@@ -108,10 +108,10 @@ fn merged_gemm_contract_rejects_pre_merge_spec_version() {
     let args = GemmArgs::new(&activation, &weight, &mut output);
     let mut normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
-    assert_eq!(normalized.spec.version, 6);
-    normalized.spec.version = 5;
+    assert_eq!(normalized.spec.version, 9);
+    normalized.spec.version = 8;
     let error = match super::execution::prepare(&ctx, normalized) {
-        Ok(_) => panic!("pre-merge GEMM spec must be rejected"),
+        Ok(_) => panic!("previous GEMM spec must be rejected"),
         Err(error) => error,
     };
     assert!(error.to_string().contains("invalid GEMM Spec"), "{error}");
@@ -337,13 +337,13 @@ fn gpu_e2e_candidate_alignment_is_selected_and_keyed_from_actual_bindings() {
     let execution = super::execution::prepare(&ctx, misaligned).unwrap();
     let summary = execution.summary().to_owned();
     eprintln!("GPU_ALIGNMENT_MISALIGNED {summary}");
-    assert!(summary.contains("cutlass-fp8=skip(alignment)"), "{summary}");
     assert!(
         summary.contains("cublasLt+custom-epilogue=skip(alignment)"),
         "{summary}"
     );
     assert!(
-        summary.contains("cublasLt-native-fp8+custom-epilogue=skip(alignment)"),
+        summary.contains("cublasLt-native-fp8+custom-epilogue=skip(alignment)")
+            || summary.contains("cublasLt-native-fp8+custom-epilogue=skip(device)"),
         "{summary}"
     );
     assert!(
@@ -459,11 +459,9 @@ fn e4m3_value(code: u8) -> f32 {
 /// `fp8_unit_scale_bf16_output_does_not_round_through_f16` also runs
 /// `validate_candidates`, but at M=1, K=16, N=16 -- one tile, one K iteration,
 /// and a single output row. A mainloop or epilogue that indexes wrongly
-/// across tiles passes that and fails here. This matters because the CUTLASS
-/// FP8 candidate accepts BF16 outputs, which is every projection in the
-/// Qwen3.8 checkpoint, and `validate_candidates` rejects an implementation
-/// that has no executable configuration -- so this also proves the candidate
-/// is genuinely reached rather than silently skipped.
+/// across tiles passes that and fails here. The translated CUTLASS FP8 kernel
+/// deliberately remains F16-only: its BF16 template is not production-safe,
+/// so BF16 projections must stay on the validated vendor candidates.
 #[test]
 fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     let ctx = CudaContext::new(0).unwrap();
@@ -471,8 +469,12 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // A spread of finite E4M3 codes. Constant operands would hide an indexing
     // fault, because every element of the result would be identical.
     const CODES: [u8; 8] = [0x38, 0x3c, 0x34, 0x40, 0xb8, 0x30, 0x44, 0xbc];
-    let a_codes: Vec<u8> = (0..m * k).map(|i| CODES[(i * 7 + 1) % CODES.len()]).collect();
-    let b_codes: Vec<u8> = (0..k * n).map(|i| CODES[(i * 5 + 3) % CODES.len()]).collect();
+    let a_codes: Vec<u8> = (0..m * k)
+        .map(|i| CODES[(i * 7 + 1) % CODES.len()])
+        .collect();
+    let b_codes: Vec<u8> = (0..k * n)
+        .map(|i| CODES[(i * 5 + 3) % CODES.len()])
+        .collect();
     let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &a_codes);
     let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &b_codes);
     let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
@@ -484,8 +486,8 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
         for column in 0..n {
             let mut accumulator = 0.0f32;
             for index in 0..k {
-                accumulator += e4m3_value(a_codes[row * k + index])
-                    * e4m3_value(b_codes[index * n + column]);
+                accumulator +=
+                    e4m3_value(a_codes[row * k + index]) * e4m3_value(b_codes[index * n + column]);
             }
             expected[row * n + column] = accumulator * alpha;
         }
@@ -493,7 +495,10 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     // Guard the magnitude as well as the direction: a candidate that is the
     // right shape and the wrong scale scores near-perfect cosine.
     let peak = expected.iter().fold(0.0f32, |best, v| best.max(v.abs()));
-    assert!(peak > 0.1 && peak < 1.0e4, "degenerate reference peak {peak}");
+    assert!(
+        peak > 0.1 && peak < 1.0e4,
+        "degenerate reference peak {peak}"
+    );
 
     let mut args = GemmArgs::new(&a, &b, &mut out);
     args.quantization = GemmQuantization::Fp8UnitScale;
@@ -510,8 +515,10 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     let summary = execution.summary().to_owned();
     eprintln!("GPU_BF16_FP8_CANDIDATES {summary}");
     assert!(
-        summary.contains("cutlass-fp8#"),
-        "the CUTLASS FP8 candidate was not reached for a BF16 output: {summary}"
+        !summary.starts_with("cutlass-fp8 ")
+            && (!summary.contains("cutlass-fp8=")
+                || summary.contains("cutlass-fp8=skip(contract)")),
+        "the F16-only CUTLASS candidate was admitted for BF16: {summary}"
     );
     execution.enqueue().unwrap();
     ctx.synchronize().unwrap();
@@ -526,7 +533,42 @@ fn gpu_e2e_bf16_fp8_candidates_reproduce_a_multi_tile_projection() {
     eprintln!("GPU_BF16_FP8_RELATIVE_L2 {relative_l2:.6}");
     // BF16 carries 8 mantissa bits, so a correct kernel lands near 1e-3. The
     // bound is deliberately far above that and far below any real fault.
-    assert!(relative_l2 < 0.01, "winner drifted by relative L2 {relative_l2}");
+    assert!(
+        relative_l2 < 0.01,
+        "winner drifted by relative L2 {relative_l2}"
+    );
+}
+
+#[test]
+fn gr00t_m41_fp8_down_projection_rejects_the_unvalidated_cutlass_bf16_candidate() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (41, 6144, 1536);
+    let a = zeros_tensor(0, vec![m, k], DType::F8E4M3);
+    let b = zeros_tensor(0, vec![k, n], DType::F8E4M3);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let cache_dir = scratch_cache_dir("gr00t-fp8-down-projection");
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.quantization = GemmQuantization::Fp8UnitScale;
+    args.alpha = 0.0123;
+    args.policy.online_tune = false;
+    args.policy.allow_fallback = true;
+    args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+
+    assert!(
+        super::execution::seed_recipe(&ctx, &normalized, 3, 1, 1, 0).is_err(),
+        "the unvalidated CUTLASS BF16 recipe must not be restorable"
+    );
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    assert!(
+        !execution.summary().starts_with("cutlass-fp8 "),
+        "unsafe candidate selected: {}",
+        execution.summary()
+    );
+    execution.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    std::fs::remove_dir_all(cache_dir).unwrap();
 }
 
 #[test]
@@ -833,10 +875,20 @@ fn gpu_e2e_persisted_recipe_restores_in_new_process() {
 fn gpu_e2e_default_cache_and_autotune_switches() {
     const CHILD_PHASE: &str = "APXINF_DEFAULT_RECIPE_CHILD";
     if let Ok(phase) = std::env::var(CHILD_PHASE) {
-        let allow_tune = !matches!(phase.as_str(), "cold" | "restore" | "override-restore");
-        let ctx = CudaContext::new_with_autotune(0, allow_tune).unwrap();
+        let allow_tune = !matches!(
+            phase.as_str(),
+            "cold" | "restore" | "override-restore" | "context-restore"
+        );
+        let context_cache = matches!(phase.as_str(), "context-override" | "context-restore")
+            .then(|| "context-recipes".to_owned());
+        let has_context_cache = context_cache.is_some();
+        let ctx = CudaContext::new_with_recipe_options(0, allow_tune, context_cache).unwrap();
         let default_dir = std::path::Path::new(ctx.default_cache_dir());
-        assert!(default_dir.starts_with("configs/tuning/nvidia"));
+        if !has_context_cache {
+            assert!(default_dir.starts_with("configs/tuning/nvidia"));
+        } else {
+            assert_eq!(default_dir, std::path::Path::new("context-recipes"));
+        }
         if phase == "cold" {
             std::fs::create_dir_all(default_dir).unwrap();
             std::fs::write(default_dir.join("tactics.json"), "not a recipe database").unwrap();
@@ -851,7 +903,7 @@ fn gpu_e2e_default_cache_and_autotune_switches() {
         let online_tune = phase != "policy-off";
         let expected = match phase.as_str() {
             "cold" | "policy-off" => "source=fallback",
-            "restore" | "warm-enabled" | "override-restore" => "source=recipe",
+            "restore" | "warm-enabled" | "override-restore" | "context-restore" => "source=recipe",
             _ => "source=tuned",
         };
         let input = tensor(0, vec![4, 8], &[0.5; 32]);
@@ -928,7 +980,9 @@ fn gpu_e2e_default_cache_and_autotune_switches() {
         ("warm-enabled", 2),
         ("override", 4),
         ("override-restore", 4),
-        ("no-persistence", 4),
+        ("context-override", 6),
+        ("context-restore", 6),
+        ("no-persistence", 6),
     ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
@@ -1033,7 +1087,7 @@ fn quantization_contract_becomes_part_of_the_gemm_key() {
     let mut fp8_out = zeros_tensor(0, vec![m, n], DType::BF16);
     let fp8 = super::contracts::normalize(
         &ctx,
-        GemmArgs::fp8(&fp8_a, &row_scales, &fp8_b, &channel_scales, &mut fp8_out),
+        GemmArgs::row_channel_quantized(&fp8_a, &row_scales, &fp8_b, &channel_scales, &mut fp8_out),
         super::contracts::Semantic::Gemm,
         None,
     )
@@ -1046,7 +1100,7 @@ fn quantization_contract_becomes_part_of_the_gemm_key() {
     let mut int8_out = zeros_tensor(0, vec![m, n], DType::BF16);
     let w8a8 = super::contracts::normalize(
         &ctx,
-        GemmArgs::w8a8(
+        GemmArgs::row_channel_quantized(
             &int8_a,
             &row_scales,
             &int8_b,
@@ -1072,7 +1126,8 @@ fn scaled_fp8_and_w8a8_use_the_canonical_kn_weight_contract() {
     let fp8_a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &vec![0x38; m * k]);
     let fp8_b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &vec![0x38; k * n]);
     let mut fp8_out = zeros_tensor(0, vec![m, n], DType::BF16);
-    let mut fp8_args = GemmArgs::fp8(&fp8_a, &row_scales, &fp8_b, &channel_scales, &mut fp8_out);
+    let mut fp8_args =
+        GemmArgs::row_channel_quantized(&fp8_a, &row_scales, &fp8_b, &channel_scales, &mut fp8_out);
     fp8_args.policy.online_tune = false;
     gemm(&ctx, fp8_args).unwrap();
     let fp8_values = values(&fp8_out);
@@ -1082,7 +1137,7 @@ fn scaled_fp8_and_w8a8_use_the_canonical_kn_weight_contract() {
     let int8_a = bytes_tensor(0, vec![m, k], DType::I8, &vec![1; m * k]);
     let int8_b = bytes_tensor(0, vec![k, n], DType::I8, &vec![1; k * n]);
     let mut int8_out = zeros_tensor(0, vec![m, n], DType::BF16);
-    let mut int8_args = GemmArgs::w8a8(
+    let mut int8_args = GemmArgs::row_channel_quantized(
         &int8_a,
         &row_scales,
         &int8_b,
@@ -1090,22 +1145,32 @@ fn scaled_fp8_and_w8a8_use_the_canonical_kn_weight_contract() {
         &mut int8_out,
     );
     int8_args.policy.online_tune = false;
-    gemm(&ctx, int8_args).unwrap();
+    int8_args.policy.cache_dir = Some(String::new());
+    let normalized =
+        super::contracts::normalize(&ctx, int8_args, super::contracts::Semantic::Gemm, None)
+            .unwrap();
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    assert!(execution
+        .summary()
+        .starts_with("cublasLt+custom-epilogue config=0 "));
+    assert!(execution.summary().contains("source=fallback"));
+    execution.enqueue().unwrap();
+    ctx.synchronize().unwrap();
     let int8_values = values(&int8_out);
     assert!(int8_values[..n].iter().all(|&value| value == 16.0));
     assert!(int8_values[n..].iter().all(|&value| value == 8.0));
 }
 
 #[test]
-fn w8a8_orin_shape_uses_direct_cutlass_candidate() {
+fn w8a8_output_major_orin_shape_uses_family_cutlass_candidate() {
     let ctx = CudaContext::new(0).unwrap();
     let (m, k, n) = (41, 1536, 6144);
     let mut a_data = vec![0; m * k];
     for row in 0..m {
         a_data[row * k + (row * 37) % k] = 1;
     }
-    let b_data = (0..k * n)
-        .map(|index| ((3 * (index / n) + 5 * (index % n)) % 7 + 1) as u8)
+    let b_data = (0..n * k)
+        .map(|index| ((3 * (index % k) + 5 * (index / k)) % 7 + 1) as u8)
         .collect::<Vec<_>>();
     let row_scale_values = (0..m)
         .map(|row| if row % 2 == 0 { 0.5 } else { 1.0 })
@@ -1114,11 +1179,12 @@ fn w8a8_orin_shape_uses_direct_cutlass_candidate() {
         .map(|column| if column % 2 == 0 { 2.0 } else { 1.0 })
         .collect::<Vec<_>>();
     let a = bytes_tensor(0, vec![m, k], DType::I8, &a_data);
-    let b = bytes_tensor(0, vec![k, n], DType::I8, &b_data);
+    let b = bytes_tensor(0, vec![n, k], DType::I8, &b_data);
     let row_scales = scales(0, &row_scale_values);
     let channel_scales = scales(0, &channel_scale_values);
     let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
-    let mut args = GemmArgs::w8a8(&a, &row_scales, &b, &channel_scales, &mut out)
+    let mut args = GemmArgs::row_channel_quantized(&a, &row_scales, &b, &channel_scales, &mut out)
+        .with_output_major_weight()
         .with_immutable_weight(WeightVersion::new(1));
     args.policy.online_tune = false;
     args.policy.allow_fallback = ctx.caps().sm != 87;
@@ -1127,14 +1193,15 @@ fn w8a8_orin_shape_uses_direct_cutlass_candidate() {
 
     let normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    assert_eq!(normalized.spec.b_layout, 1);
     if ctx.caps().sm == 87 {
-        super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
+        super::execution::seed_recipe(&ctx, &normalized, 3, 8, 1, 0).unwrap();
     }
     let execution = super::execution::prepare(&ctx, normalized).unwrap();
     if ctx.caps().sm == 87 {
         assert!(execution
             .summary()
-            .starts_with("cutlass-w8a8-sm87 config=0 "));
+            .starts_with("cutlass-w8a8-m41-n6144-k1536-sm87 config=0 "));
         assert!(execution.summary().contains("source=recipe"));
     } else {
         assert!(execution
@@ -1152,10 +1219,142 @@ fn w8a8_orin_shape_uses_direct_cutlass_candidate() {
     for row in 0..m {
         let input = (row * 37) % k;
         for column in 0..n {
-            let expected = b_data[input * n + column] as f32
+            let expected = b_data[column * k + input] as f32
                 * row_scale_values[row]
                 * channel_scale_values[column];
             assert_eq!(actual[row * n + column], expected);
+        }
+    }
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn w8a8_output_major_bias_shape_uses_family_cutlass_candidate() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (41, 1536, 4608);
+    let mut a_data = vec![0; m * k];
+    for row in 0..m {
+        a_data[row * k + (row * 29) % k] = 1;
+    }
+    let b_data = (0..n * k)
+        .map(|index| ((2 * (index % k) + 3 * (index / k)) % 5 + 1) as u8)
+        .collect::<Vec<_>>();
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &a_data);
+    let b = bytes_tensor(0, vec![n, k], DType::I8, &b_data);
+    let row_scales = scales(0, &vec![1.0; m]);
+    let channel_scales = scales(0, &vec![1.0; n]);
+    let bias = tensor(0, vec![n], &vec![1.0; n]);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let mut args = GemmArgs::row_channel_quantized(&a, &row_scales, &b, &channel_scales, &mut out)
+        .with_output_major_weight()
+        .with_immutable_weight(WeightVersion::new(1));
+    args.policy.online_tune = false;
+    args.policy.allow_fallback = ctx.caps().sm != 87;
+    let cache_dir = scratch_cache_dir("w8a8-bias-sm87-cutlass");
+    args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+
+    let normalized = super::contracts::normalize(
+        &ctx,
+        args,
+        super::contracts::Semantic::GemmBias,
+        Some(&bias),
+    )
+    .unwrap();
+    if ctx.caps().sm == 87 {
+        super::execution::seed_recipe(&ctx, &normalized, 3, 9, 1, 0).unwrap();
+    }
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    if ctx.caps().sm == 87 {
+        assert!(execution
+            .summary()
+            .starts_with("cutlass-w8a8-bias-m41-n4608-k1536-sm87 config=0 "));
+        assert!(execution.summary().contains("source=recipe"));
+    } else {
+        assert!(execution
+            .summary()
+            .starts_with("cublas+custom-epilogue config=0 "));
+        assert!(execution.summary().contains("source=fallback"));
+    }
+
+    execution.enqueue().unwrap();
+    let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    let actual = values(&out);
+    for row in 0..m {
+        let input = (row * 29) % k;
+        for column in 0..n {
+            let expected = b_data[column * k + input] as f32 + 1.0;
+            assert_eq!(actual[row * n + column], expected);
+        }
+    }
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn w8a8_output_major_bias_gelu_shape_uses_family_cutlass_candidate() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (41, 1536, 6144);
+    let mut a_data = vec![0; m * k];
+    for row in 0..m {
+        a_data[row * k + (row * 31) % k] = 1;
+    }
+    let b_data = (0..n * k)
+        .map(|index| ((2 * (index % k) + 3 * (index / k)) % 5 + 1) as u8)
+        .collect::<Vec<_>>();
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &a_data);
+    let b = bytes_tensor(0, vec![n, k], DType::I8, &b_data);
+    let row_scales = scales(0, &vec![1.0; m]);
+    let channel_scales = scales(0, &vec![1.0; n]);
+    let bias = tensor(0, vec![n], &vec![0.5; n]);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let mut args = GemmArgs::row_channel_quantized(&a, &row_scales, &b, &channel_scales, &mut out)
+        .with_output_major_weight()
+        .with_immutable_weight(WeightVersion::new(1));
+    args.policy.online_tune = false;
+    args.policy.allow_fallback = ctx.caps().sm != 87;
+    let cache_dir = scratch_cache_dir("w8a8-bias-gelu-sm87-cutlass");
+    args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+
+    let normalized = super::contracts::normalize(
+        &ctx,
+        args,
+        super::contracts::Semantic::GemmBiasGelu,
+        Some(&bias),
+    )
+    .unwrap();
+    if ctx.caps().sm == 87 {
+        super::execution::seed_recipe(&ctx, &normalized, 3, 10, 1, 0).unwrap();
+    }
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    if ctx.caps().sm == 87 {
+        assert!(execution
+            .summary()
+            .starts_with("cutlass-w8a8-bias-gelu-m41-n6144-k1536-sm87 config=0 "));
+        assert!(execution.summary().contains("source=recipe"));
+    } else {
+        assert!(execution
+            .summary()
+            .starts_with("cublas+custom-epilogue config=0 "));
+        assert!(execution.summary().contains("source=fallback"));
+    }
+
+    execution.enqueue().unwrap();
+    let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    let actual = values(&out);
+    for row in 0..m {
+        let input = (row * 31) % k;
+        for column in 0..n {
+            let projected = b_data[column * k + input] as f32 + 0.5;
+            let expected = 0.5
+                * projected
+                * (1.0
+                    + (0.797_884_6 * (projected + 0.044_715 * projected * projected * projected))
+                        .tanh());
+            let expected = bf16::from_f32(expected).to_f32();
+            assert!((actual[row * n + column] - expected).abs() <= 0.03125);
         }
     }
     std::fs::remove_dir_all(cache_dir).unwrap();
@@ -1170,6 +1369,7 @@ fn execution_session_reuses_one_native_execution_across_forward_traversals() {
     let session = ExecutionSession::with_capacity(4096, 0).unwrap();
 
     super::execution::reset_execution_create_count();
+    super::execution::reset_execution_sync_count();
     prepare_with_session(&session, || {
         let mut args = GemmArgs::new(&a, &b, &mut out);
         args.policy.online_tune = false;
@@ -1177,6 +1377,11 @@ fn execution_session_reuses_one_native_execution_across_forward_traversals() {
     })
     .unwrap();
     assert_eq!(super::execution::execution_create_count(), 1);
+    assert_eq!(
+        super::execution::execution_sync_count(),
+        0,
+        "prepare should queue work on the session stream and let the session boundary synchronize"
+    );
     super::execution::reset_execution_sync_count();
 
     for _ in 0..2 {
@@ -1192,6 +1397,7 @@ fn execution_session_reuses_one_native_execution_across_forward_traversals() {
     // one explicit enqueue. Repeating it must hit the session Execution.
     assert_eq!(super::execution::execution_create_count(), 1);
     assert_eq!(super::execution::execution_sync_count(), 0);
+    ctx.synchronize().unwrap();
     assert!(values(&out).iter().all(|&value| value == 3.0));
 }
 
@@ -1294,6 +1500,9 @@ fn tuning_isolated_from_user_buffers_and_replay_results() {
 #[test]
 fn gpu_e2e_three_view_split_geglu_recipe_resources_and_replay() {
     let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 110 {
+        return;
+    }
     let directory = FrameworkTestDirectory::new();
     let activation = zeros_tensor(0, vec![778, 2048], DType::F8E4M3);
     let weight = zeros_tensor(0, vec![2048, 32768], DType::F8E4M3);
@@ -1365,6 +1574,9 @@ fn gpu_e2e_three_view_split_geglu_recipe_resources_and_replay() {
 #[test]
 fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
     let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 110 {
+        return;
+    }
     let (m, k, n) = (522, 2048, 32768);
     let a = zeros_tensor(0, vec![m, k], DType::F8E4M3);
     let b = zeros_tensor(0, vec![k, n], DType::F8E4M3);
@@ -1493,4 +1705,846 @@ fn gpu_e2e_cutlass_geglu_prepack_is_bound_to_allocation_and_version() {
 
     drop(mutable);
     std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn gpu_repacked_weight_rejects_independent_state_and_canonical_alias() {
+    let ctx = CudaContext::new(0).unwrap();
+    let b = zeros_tensor(0, vec![16, 16], DType::BF16);
+    let alias = b.clone();
+    let state = crate::ops::RepackedWeight::new(&b).unwrap();
+    assert!(crate::ops::RepackedWeight::new(&alias).is_err());
+    let shared = state.clone();
+    assert!(std::sync::Arc::ptr_eq(&state.state, &shared.state));
+    let view = CudaBuffer::from_tensor(&b)
+        .unwrap()
+        .view(32, 256)
+        .unwrap()
+        .as_tensor(Shape::new(vec![8, 16]), DType::BF16)
+        .unwrap();
+    assert!(crate::ops::RepackedWeight::new(&view).is_err());
+    let independent = zeros_tensor(0, vec![16, 16], DType::BF16);
+    assert!(crate::ops::RepackedWeight::new(&independent).is_ok());
+    // Even after the public state is dropped, aliases must not become canonical.
+    drop(state);
+    drop(shared);
+    for (k, binding) in [(16, &alias), (8, &view)] {
+        let a = zeros_tensor(0, vec![1, k], DType::BF16);
+        let mut out = zeros_tensor(0, vec![1, 16], DType::BF16);
+        let normalized = super::contracts::normalize(
+            &ctx,
+            GemmArgs::new(&a, binding, &mut out),
+            super::contracts::Semantic::Gemm,
+            None,
+        )
+        .unwrap();
+        let error = super::execution::prepare(&ctx, normalized)
+            .err()
+            .expect("canonical alias must fail");
+        assert!(error.to_string().contains("layout state"), "{error}");
+    }
+}
+
+#[test]
+fn gpu_repacked_registration_does_not_retain_allocation() {
+    let _ctx = CudaContext::new(0).unwrap();
+    let b = zeros_tensor(0, vec![16, 16], DType::BF16);
+    let buffer = CudaBuffer::from_tensor(&b).unwrap();
+    let owner = std::sync::Arc::downgrade(buffer.allocation_owner());
+    let state = crate::ops::RepackedWeight::new(&b).unwrap();
+    drop(buffer);
+    drop(b);
+    assert!(owner.upgrade().is_some());
+    drop(state);
+    assert!(
+        owner.upgrade().is_none(),
+        "registry must not retain GPU memory"
+    );
+    // A new allocation (including an address reused by CUDA) can be adopted.
+    let next = zeros_tensor(0, vec![16, 16], DType::BF16);
+    assert!(crate::ops::RepackedWeight::new(&next).is_ok());
+}
+
+#[test]
+fn gpu_canonical_weight_does_not_opt_into_inplace_packing() {
+    let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 87 {
+        return;
+    }
+    let (m, k, n) = (8, 256, 128);
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &vec![1; m * k]);
+    let source = (0..k * n).map(|i| (i % 7) as u8).collect::<Vec<_>>();
+    let b = bytes_tensor(0, vec![k, n], DType::I8, &source);
+    let rows = scales(0, &vec![1.0; m]);
+    let channels = scales(0, &vec![1.0; n]);
+    let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let cache = scratch_cache_dir("canonical-weight");
+    let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut out)
+        .with_immutable_weight(WeightVersion::new(7));
+    args.policy.online_tune = false;
+    args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+    let normalized =
+        super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
+    // An immutable Tensor is still canonical; only RepackedWeight permits mutation.
+    assert!(super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).is_err());
+    let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    execution.enqueue().unwrap();
+    ctx.synchronize().unwrap();
+    let mut actual = vec![0; source.len()];
+    CudaBuffer::from_tensor(&b)
+        .unwrap()
+        .copy_to_host(&mut actual)
+        .unwrap();
+    assert_eq!(actual, source);
+    for (i, value) in values(&out).into_iter().enumerate() {
+        let expected = (0..k)
+            .map(|row| source[row * n + i % n] as f32)
+            .sum::<f32>();
+        assert_eq!(value, bf16::from_f32(expected).to_f32());
+    }
+    std::fs::remove_dir_all(cache).unwrap();
+}
+
+#[test]
+fn gpu_fixed_weight_keeps_choice_after_canonical_commit() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (10, 1024, 2560);
+    let b = zeros_tensor(0, vec![k, n], DType::BF16);
+    let weight = RepackedWeight::new(&b).unwrap();
+    let cache = scratch_cache_dir("fixed-weight-choice");
+    // Distinct live IO allocations force two native executions for one weight.
+    let inputs = [
+        zeros_tensor(0, vec![m, k], DType::BF16),
+        zeros_tensor(0, vec![m, k], DType::BF16),
+    ];
+    for (step, a) in inputs.iter().enumerate() {
+        let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+        let mut args = GemmArgs::new(a, &b, &mut out).with_repacked_weight(&weight);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+        let mut normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        normalized.spec.b_layout = weight.state.lock().unwrap().layout;
+        // Before canonical commit the request uses layout=0. Afterwards it
+        // uses layout=4, but that must not discard the already selected tactic.
+        let provider = if step == 0 { 2 } else { 1 };
+        super::execution::seed_recipe(&ctx, &normalized, provider, 1, 1, 0).unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        assert!(
+            execution
+                .summary()
+                .starts_with("cublasLt+custom-epilogue config=0 "),
+            "new IO must preserve the weight's first choice, got {}",
+            execution.summary(),
+        );
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(weight.state.lock().unwrap().layout, 4);
+    }
+    std::fs::remove_dir_all(cache).unwrap();
+}
+
+#[test]
+fn gpu_w8a8_load_fixes_layout_before_prepare() {
+    let ctx = CudaContext::new(0).unwrap();
+    for (k, n) in [(64, 128), (63, 127)] {
+        let source = (0..k * n)
+            .map(|i| ((i / n + 3 * (i % n)) % 13) as i8 - 6)
+            .collect::<Vec<_>>();
+        let host = Tensor::from_i8(vec![k, n], &source).unwrap();
+        let (b, layout) = RepackedWeight::upload_row_channel(&ctx, &host).unwrap();
+        let physical_layout = layout.state.lock().unwrap().layout;
+        assert_eq!(
+            physical_layout,
+            if ctx.caps().sm == 87 && k % 16 == 0 && n % 8 == 0 {
+                1
+            } else {
+                4
+            }
+        );
+        let mut initial = vec![0; source.len()];
+        CudaBuffer::from_tensor(&b)
+            .unwrap()
+            .copy_to_host(&mut initial)
+            .unwrap();
+        for row in 0..k {
+            for col in 0..n {
+                let offset = if physical_layout == 1 {
+                    col * k + row
+                } else {
+                    row * n + col
+                };
+                assert_eq!(initial[offset], source[row * n + col] as u8);
+            }
+        }
+        let channels = scales(0, &vec![1.0; n]);
+        let cache = scratch_cache_dir("w8a8-load-layout");
+        for m in [1, 8, 17] {
+            let mut input = vec![0; m * k];
+            for row in 0..m {
+                input[row * k + row % k] = 1;
+            }
+            let a = bytes_tensor(0, vec![m, k], DType::I8, &input);
+            let rows = scales(0, &vec![1.0; m]);
+            // Exercise both the native NK implementation and vendor fallback.
+            for native in [false, true] {
+                if native && physical_layout != 1 {
+                    continue;
+                }
+                let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+                let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut out)
+                    .with_repacked_weight(&layout);
+                args.policy.online_tune = false;
+                args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+                let mut normalized =
+                    super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                        .unwrap();
+                normalized.spec.b_layout = physical_layout;
+                if native {
+                    super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
+                }
+                let execution = super::execution::prepare(&ctx, normalized).unwrap();
+                if native {
+                    assert!(execution
+                        .summary()
+                        .starts_with("cutlass-w8a8-sm87 config=0 "));
+                }
+                execution.enqueue().unwrap();
+                ctx.synchronize().unwrap();
+                for (i, value) in values(&out).into_iter().enumerate() {
+                    assert_eq!(value, source[(i / n) % k * n + i % n] as f32);
+                }
+                assert_eq!(layout.state.lock().unwrap().layout, physical_layout);
+                let mut after = vec![0; initial.len()];
+                CudaBuffer::from_tensor(&b)
+                    .unwrap()
+                    .copy_to_host(&mut after)
+                    .unwrap();
+                assert_eq!(
+                    after, initial,
+                    "prepare must not transform loaded W8A8 weights"
+                );
+            }
+        }
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+}
+
+#[test]
+fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
+    let ctx = CudaContext::new(0).unwrap();
+    if ctx.caps().sm != 87 {
+        eprintln!("W8A8 inplace lifecycle regression requires SM87");
+        return;
+    }
+    let (k, n) = (64, 128);
+    let source = (0..k * n)
+        .map(|i| ((i / n + 3 * (i % n)) % 7) as u8)
+        .collect::<Vec<_>>();
+    let b = bytes_tensor(0, vec![k, n], DType::I8, &source);
+    let layout = crate::ops::RepackedWeight::new(&b).unwrap();
+    let channels = scales(0, &vec![1.0; n]);
+    let cache_dir = scratch_cache_dir("inplace-weight-lifecycle");
+    let mut retained_graph = None;
+    let mut retained_output = None;
+    for (run, m) in [8, 17, 8].into_iter().enumerate() {
+        let mut input = vec![0; m * k];
+        for row in 0..m {
+            input[row * k + row % k] = 1;
+        }
+        let a = bytes_tensor(0, vec![m, k], DType::I8, &input);
+        let rows = scales(0, &vec![1.0; m]);
+        let mut output = zeros_tensor(0, vec![m, n], DType::BF16);
+        let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut output)
+            .with_repacked_weight(&layout);
+        args.policy.online_tune = false;
+        args.policy.allow_fallback = false;
+        args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        let mut normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        normalized.spec.b_layout = layout.state.lock().unwrap().layout;
+        if run == 0 {
+            let expected = (0..m * n)
+                .map(|i| source[(i / n) % k * n + i % n] as f32)
+                .collect::<Vec<_>>();
+            super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
+            let mut unchanged = vec![0; source.len()];
+            CudaBuffer::from_tensor(&b)
+                .unwrap()
+                .copy_to_host(&mut unchanged)
+                .unwrap();
+            assert_eq!(
+                unchanged, source,
+                "candidate trials must not rewrite model weights"
+            );
+        }
+        super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        assert!(execution.summary().contains("workspace=0 "));
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        for (index, actual) in values(&output).into_iter().enumerate() {
+            assert_eq!(actual, source[(index / n) % k * n + index % n] as f32);
+        }
+        if run == 0 {
+            let mut packed = vec![0; k * n];
+            CudaBuffer::from_tensor(&b)
+                .unwrap()
+                .copy_to_host(&mut packed)
+                .unwrap();
+            for row in 0..k {
+                for col in 0..n {
+                    assert_eq!(packed[col * k + row], source[row * n + col]);
+                }
+            }
+            let mut canonical_output = zeros_tensor(0, vec![m, n], DType::BF16);
+            let args =
+                GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut canonical_output);
+            let normalized =
+                super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                    .unwrap();
+            let error = super::execution::prepare(&ctx, normalized)
+                .err()
+                .expect("packed bytes cannot be consumed as canonical");
+            assert!(error.to_string().contains("layout state"), "{error}");
+            retained_graph = Some(crate::capture(&ctx, || execution.enqueue()).unwrap());
+            retained_output = Some(output);
+        }
+        // No session or execution cache remains for the next set of IO.
+    }
+    retained_graph.as_ref().unwrap().replay().unwrap();
+    ctx.synchronize().unwrap();
+    for (index, actual) in values(retained_output.as_ref().unwrap())
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(actual, source[(index / n) % k * n + index % n] as f32);
+    }
+    // A shape/semantic change may use the layout-aware portable baseline.
+    let a = bytes_tensor(0, vec![1, k], DType::I8, &vec![1; k]);
+    let rows = scales(0, &[1.0]);
+    let mut output = zeros_tensor(0, vec![1, n], DType::BF16);
+    let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut output)
+        .with_repacked_weight(&layout);
+    args.policy.online_tune = false;
+    args.policy.cache_dir = Some(String::new());
+    crate::ops::gemm(&ctx, args).unwrap();
+    for (col, actual) in values(&output).into_iter().enumerate() {
+        let sum = (0..k).map(|row| source[row * n + col] as f32).sum::<f32>();
+        assert_eq!(actual, bf16::from_f32(sum).to_f32());
+    }
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn gpu_repacked_geglu_preserves_old_graph_and_generic_shape() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n, implementation, version) = match ctx.caps().sm {
+        89 => (10, 1024, 8192, 4, 1),
+        100 | 101 | 110 => (522, 2048, 32768, 3, 2),
+        _ => {
+            eprintln!("GeGLU packing regression requires SM89 or SM100-family");
+            return;
+        }
+    };
+    let b_data = (0..k * n)
+        .map(|i| ((i / n + 3 * (i % n)) % 17) as f32 / 16.0 - 0.5)
+        .collect::<Vec<_>>();
+    let bytes = b_data
+        .iter()
+        .flat_map(|&v| bf16::from_f32(v).to_bits().to_ne_bytes())
+        .collect::<Vec<_>>();
+    let b = bytes_tensor(0, vec![k, n], DType::BF16, &bytes);
+    let layout = crate::ops::RepackedWeight::new(&b).unwrap();
+    let cache_dir = scratch_cache_dir("inplace-geglu-lifecycle");
+    let mut graph = None;
+    let mut graph_output = None;
+    for (run, rows) in [m, 1, m].into_iter().enumerate() {
+        let mut input = vec![bf16::ZERO; rows * k];
+        for row in 0..rows {
+            input[row * k + row % k] = bf16::ONE;
+        }
+        let input_bytes = input
+            .iter()
+            .flat_map(|v| v.to_bits().to_ne_bytes())
+            .collect::<Vec<_>>();
+        let a = bytes_tensor(0, vec![rows, k], DType::BF16, &input_bytes);
+        let mut out = zeros_tensor(0, vec![rows, n / 2], DType::BF16);
+        let mut args = GemmArgs::new(&a, &b, &mut out).with_repacked_weight(&layout);
+        args.policy.online_tune = false;
+        args.policy.allow_fallback = rows == 1;
+        args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        let mut normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::GemmGeglu, None)
+                .unwrap();
+        normalized.spec.b_layout = layout.state.lock().unwrap().layout;
+        if rows != 1 {
+            super::execution::seed_recipe(&ctx, &normalized, 3, implementation, version, 0)
+                .unwrap();
+        }
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        if rows != 1 {
+            assert!(execution.summary().contains("workspace=0 "));
+        }
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        let check = |out: &Tensor| {
+            for (i, actual) in values(out).into_iter().enumerate() {
+                let row = i / (n / 2);
+                let col = i % (n / 2);
+                let gate = b_data[(row % k) * n + col];
+                let up = b_data[(row % k) * n + col + n / 2];
+                let expected = 0.5
+                    * gate
+                    * (1.0 + (0.7978845608 * (gate + 0.044715 * gate.powi(3))).tanh())
+                    * up;
+                assert!(
+                    (actual - expected).abs() < 0.003,
+                    "{i}: {actual} vs {expected}"
+                );
+            }
+        };
+        check(&out);
+        if run == 0 {
+            graph = Some(crate::capture(&ctx, || execution.enqueue()).unwrap());
+            graph_output = Some(out);
+        } else {
+            graph.as_ref().unwrap().replay().unwrap();
+            ctx.synchronize().unwrap();
+            check(graph_output.as_ref().unwrap());
+        }
+    }
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn gpu_repacked_fp8_crosses_geglu_and_plain_gemm() {
+    let ctx = CudaContext::new(0).unwrap();
+    if !matches!(ctx.caps().sm, 100 | 101 | 110) {
+        eprintln!("FP8 packing regression requires SM100-family");
+        return;
+    }
+    let (k, n) = (2048, 32768);
+    let codes = [0x20, 0x28, 0x30, 0x38];
+    let bytes = (0..k * n)
+        .map(|i| {
+            let (r, c) = (i / n, i % n);
+            codes[(r + c / 128 + c + usize::from(c >= n / 2)) % codes.len()]
+        })
+        .collect::<Vec<_>>();
+    let canonical = bytes_tensor(0, vec![k, n], DType::F8E4M3, &bytes);
+    let committed = bytes_tensor(0, vec![k, n], DType::F8E4M3, &bytes);
+    let layout = crate::ops::RepackedWeight::new(&committed).unwrap();
+    let cache_dir = scratch_cache_dir("inplace-fp8-cross-semantic");
+    for m in [522, 1, 522] {
+        let fused = m != 1;
+        let mut a_bytes = vec![0; m * k];
+        for row in 0..m {
+            a_bytes[row * k + row % k] = 0x38;
+        }
+        let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &a_bytes);
+        let dtype = if fused { DType::F8E4M3 } else { DType::F16 };
+        let width = if fused { n / 2 } else { n };
+        let mut expected = zeros_tensor(0, vec![m, width], dtype);
+        let mut actual = zeros_tensor(0, vec![m, width], dtype);
+        for (b, out, state) in [
+            (&canonical, &mut expected, None),
+            (&committed, &mut actual, Some(&layout)),
+        ] {
+            let mut args = GemmArgs::new(&a, b, out).with_immutable_weight(WeightVersion::new(0));
+            if let Some(state) = state {
+                args = args.with_repacked_weight(state);
+            }
+            args.quantization = GemmQuantization::Fp8UnitScale;
+            args.policy.online_tune = false;
+            args.policy.allow_fallback = !fused || state.is_none();
+            args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+            let semantic = if fused {
+                super::contracts::Semantic::GemmGeglu
+            } else {
+                super::contracts::Semantic::Gemm
+            };
+            let mut normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
+            if let Some(state) = state {
+                normalized.spec.b_layout = state.state.lock().unwrap().layout;
+            }
+            if fused && state.is_some() {
+                super::execution::seed_recipe(&ctx, &normalized, 3, 2, 2, 0).unwrap();
+            }
+            let execution = super::execution::prepare(&ctx, normalized).unwrap();
+            execution.enqueue().unwrap();
+        }
+        ctx.synchronize().unwrap();
+        let read = |tensor: &Tensor| {
+            let buffer = CudaBuffer::from_tensor(tensor).unwrap();
+            let mut bytes = vec![0; buffer.len()];
+            buffer.copy_to_host(&mut bytes).unwrap();
+            bytes
+        };
+        assert_eq!(read(&actual), read(&expected), "M={m}");
+        assert_eq!(
+            read(&canonical),
+            bytes,
+            "reference weights remain canonical"
+        );
+    }
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn gpu_shared_weight_layouts_are_deduplicated_and_graph_safe() {
+    let ctx = CudaContext::new(0).unwrap();
+    if !matches!(ctx.caps().sm, 100 | 101 | 110) {
+        return;
+    }
+    let (k, n) = (2048, 32768);
+    let codes = [0x20, 0x28, 0x30, 0x38];
+    let source = (0..k * n)
+        .map(|i| codes[(i / n + i % n + i / 128) % 4])
+        .collect::<Vec<_>>();
+    for order in [[522, 523, 533, 524], [523, 522, 524, 533]] {
+        let canonical = bytes_tensor(0, vec![k, n], DType::F8E4M3, &source);
+        let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &source);
+        let weight = crate::ops::RepackedWeight::with_layout_cache(&b, k * n).unwrap();
+        let cache = scratch_cache_dir("shared-layouts");
+        let mut executions = Vec::new();
+        let mut outputs = Vec::new();
+        let mut expected_bytes = Vec::new();
+        let mut original_graph = None;
+        let mut committed = None;
+        for m in order {
+            let fused = matches!(m, 522 | 533);
+            let mut data = vec![0; m * k];
+            for row in 0..m {
+                data[row * k + row % k] = 0x38;
+            }
+            let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &data);
+            let shape = vec![m, if fused { n / 2 } else { n }];
+            let dtype = if fused { DType::F8E4M3 } else { DType::F16 };
+            let semantic = if fused {
+                super::contracts::Semantic::GemmGeglu
+            } else {
+                super::contracts::Semantic::Gemm
+            };
+            let (id, version) = if fused { (2, 2) } else { (1, 1) };
+            let mut expected = zeros_tensor(0, shape.clone(), dtype);
+            let mut args = GemmArgs::new(&a, &canonical, &mut expected)
+                .with_immutable_weight(WeightVersion::new(0));
+            args.quantization = GemmQuantization::Fp8UnitScale;
+            args.policy.online_tune = false;
+            args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+            let normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
+            // Byte-compare against the same provider so the assertion measures
+            // layout conversion, not cross-provider numerics.
+            super::execution::seed_recipe(&ctx, &normalized, 3, id, version, 0).unwrap();
+            super::execution::prepare(&ctx, normalized)
+                .unwrap()
+                .enqueue()
+                .unwrap();
+            ctx.synchronize().unwrap();
+            let mut out = zeros_tensor(0, shape, dtype);
+            let mut args = GemmArgs::new(&a, &b, &mut out).with_repacked_weight(&weight);
+            args.quantization = GemmQuantization::Fp8UnitScale;
+            args.policy.online_tune = false;
+            args.policy.allow_fallback = false;
+            args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+            let normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
+            super::execution::seed_recipe(&ctx, &normalized, 3, id, version, 0).unwrap();
+            let execution = super::execution::prepare(&ctx, normalized).unwrap();
+            execution.enqueue().unwrap();
+            ctx.synchronize().unwrap();
+            let read = |t: &Tensor| {
+                let buffer = CudaBuffer::from_tensor(t).unwrap();
+                let mut bytes = vec![0; buffer.len()];
+                buffer.copy_to_host(&mut bytes).unwrap();
+                bytes
+            };
+            let expected = read(&expected);
+            assert_eq!(read(&out), expected, "M={m}");
+            let bytes = read(&b);
+            if let Some(ref old) = committed {
+                assert_eq!(&bytes, old, "base changed after first prepare");
+            } else {
+                committed = Some(bytes);
+            }
+            if original_graph.is_none() {
+                original_graph = Some(crate::capture(&ctx, || execution.enqueue()).unwrap());
+            }
+            executions.push(execution);
+            outputs.push(out);
+            expected_bytes.push(expected);
+        }
+        {
+            let state = weight.state.lock().unwrap();
+            let cache = state.cache.as_ref().unwrap();
+            assert_eq!(
+                cache.buffers.len(),
+                1,
+                "four profiles need only two physical layouts"
+            );
+            assert_eq!(cache.extra_bytes(), k * n);
+            assert_eq!(state.choices.len(), 4);
+        }
+        // Both layouts coexist inside one graph, and an older graph remains valid.
+        let graph = crate::capture(&ctx, || {
+            for e in &executions {
+                e.enqueue()?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        drop(executions);
+        drop(weight);
+        drop(b);
+        graph.replay().unwrap();
+        original_graph.unwrap().replay().unwrap();
+        ctx.synchronize().unwrap();
+        for (out, expected) in outputs.iter().zip(expected_bytes) {
+            let buffer = CudaBuffer::from_tensor(out).unwrap();
+            let mut actual = vec![0; buffer.len()];
+            buffer.copy_to_host(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+}
+
+#[test]
+fn gpu_weight_relayout_is_bit_preserving() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (k, n) = (16, 512);
+    for (dtype, size) in [
+        (DType::F8E4M3, 1),
+        (DType::BF16, 2),
+        (DType::I8, 1),
+        (DType::F32, 4),
+    ] {
+        let bytes = (0..k * n * size)
+            .map(|i| (i * 37 % 256) as u8)
+            .collect::<Vec<_>>();
+        let source = bytes_tensor(0, vec![k, n], dtype, &bytes);
+        let a = CudaBuffer::from_tensor(&source).unwrap();
+        let b = CudaBuffer::alloc(bytes.len(), 0).unwrap();
+        let c = CudaBuffer::alloc(bytes.len(), 0).unwrap();
+        for layout in 1..=4 {
+            unsafe {
+                crate::ffi::abi::status::check(crate::ffi::abi::gemm::apxinf_gemm_relayout_weight(
+                    a.ptr(),
+                    b.ptr(),
+                    k as i64,
+                    n as i64,
+                    super::contracts::dtype(dtype).unwrap(),
+                    4,
+                    layout,
+                    ctx.stream().handle(),
+                ))
+                .unwrap();
+                crate::ffi::abi::status::check(crate::ffi::abi::gemm::apxinf_gemm_relayout_weight(
+                    b.ptr(),
+                    c.ptr(),
+                    k as i64,
+                    n as i64,
+                    super::contracts::dtype(dtype).unwrap(),
+                    layout,
+                    4,
+                    ctx.stream().handle(),
+                ))
+                .unwrap();
+            }
+            let mut actual = vec![0; bytes.len()];
+            c.copy_to_host(&mut actual).unwrap();
+            assert_eq!(actual, bytes);
+        }
+    }
+}
+
+#[test]
+fn gpu_shared_weight_zero_budget_stays_canonical() {
+    let ctx = CudaContext::new(0).unwrap();
+    let b = tensor(0, vec![16, 16], &vec![1.0; 256]);
+    let state = crate::ops::RepackedWeight::with_layout_cache(&b, 0).unwrap();
+    for m in [1, 2] {
+        let a = tensor(0, vec![m, 16], &vec![1.0; m * 16]);
+        let mut out = tensor(0, vec![m, 16], &vec![0.0; m * 16]);
+        let mut args = GemmArgs::new(&a, &b, &mut out).with_repacked_weight(&state);
+        args.policy.online_tune = false;
+        let normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        let e = super::execution::prepare(&ctx, normalized).unwrap();
+        e.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        assert!(values(&out).iter().all(|x| *x == 16.0));
+    }
+    let guard = state.state.lock().unwrap();
+    assert_eq!(guard.layout, 4);
+    assert!(guard.cache.as_ref().unwrap().buffers.is_empty());
+}
+
+#[test]
+fn gpu_shared_weight_storage_retires_with_graphs_and_base_can_change_layout() {
+    let ctx = CudaContext::new(0).unwrap();
+    if !matches!(ctx.caps().sm, 100 | 101 | 110) {
+        return;
+    }
+    let (k, n) = (2048, 32768);
+    let codes = [0x20, 0x28, 0x30, 0x38];
+    let source = (0..k * n)
+        .map(|i| codes[(i / n + i % n + i / 128) % 4])
+        .collect::<Vec<_>>();
+    let b = bytes_tensor(0, vec![k, n], DType::F8E4M3, &source);
+    let weight = crate::ops::RepackedWeight::with_layout_cache(&b, k * n).unwrap();
+    let cache_dir = scratch_cache_dir("graph-owned-layouts");
+    let read = |tensor: &Tensor| {
+        let buffer = CudaBuffer::from_tensor(tensor).unwrap();
+        let mut bytes = vec![0; buffer.len()];
+        buffer.copy_to_host(&mut bytes).unwrap();
+        bytes
+    };
+    let prepare = |m: usize, fused: bool| {
+        let mut data = vec![0; m * k];
+        for row in 0..m {
+            data[row * k + row % k] = 0x38;
+        }
+        let a = bytes_tensor(0, vec![m, k], DType::F8E4M3, &data);
+        let mut out = zeros_tensor(
+            0,
+            vec![m, if fused { n / 2 } else { n }],
+            if fused { DType::F8E4M3 } else { DType::F16 },
+        );
+        let mut args = GemmArgs::new(&a, &b, &mut out).with_repacked_weight(&weight);
+        args.quantization = GemmQuantization::Fp8UnitScale;
+        args.policy.online_tune = false;
+        args.policy.allow_fallback = false;
+        args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
+        let semantic = if fused {
+            super::contracts::Semantic::GemmGeglu
+        } else {
+            super::contracts::Semantic::Gemm
+        };
+        let normalized = super::contracts::normalize(&ctx, args, semantic, None).unwrap();
+        let (id, version) = if fused { (2, 2) } else { (1, 1) };
+        super::execution::seed_recipe(&ctx, &normalized, 3, id, version, 0).unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        (execution, out)
+    };
+    let (first, first_out) = prepare(522, true);
+    let first_values = read(&first_out);
+    let original_pointer = CudaBuffer::from_tensor(&b).unwrap().ptr();
+    let packed = read(&b);
+    assert_ne!(packed, source);
+    let first_graph = crate::capture(&ctx, || first.enqueue()).unwrap();
+    let (second, second_out) = prepare(523, false);
+    let second_values = read(&second_out);
+    let second_graph = crate::capture(&ctx, || second.enqueue()).unwrap();
+    let (extra, allocation) = {
+        let state = weight.state.lock().unwrap();
+        assert_eq!(state.layout, 2, "old graph still leases the base");
+        let extra = state.cache.as_ref().unwrap().buffers[&4].clone();
+        let allocation =
+            std::sync::Arc::downgrade(extra.upgrade().unwrap().buffer.allocation_owner());
+        (extra, allocation)
+    };
+    drop(second);
+    assert!(
+        extra.upgrade().is_some(),
+        "graph retains the execution's storage"
+    );
+    first_graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(read(&first_out), first_values);
+    assert_eq!(read(&b), packed, "live graph forbids base mutation");
+    drop(first_graph);
+    drop(first);
+    // The base is now unused, but the second graph still needs canonical.
+    // Another canonical-only profile shares that existing extra allocation.
+    let (coexisting, _) = prepare(524, false);
+    assert_eq!(weight.state.lock().unwrap().layout, 2);
+    assert_eq!(
+        weight
+            .state
+            .lock()
+            .unwrap()
+            .cache
+            .as_ref()
+            .unwrap()
+            .extra_bytes(),
+        k * n
+    );
+    drop(second_graph);
+    assert!(
+        extra.upgrade().is_some(),
+        "another execution still leases the layout"
+    );
+    drop(coexisting);
+    assert!(
+        extra.upgrade().is_none(),
+        "retired graph releases extra layout"
+    );
+    assert_eq!(
+        allocation.strong_count(),
+        0,
+        "weak model metadata owns no allocation"
+    );
+    assert_eq!(weight.state.lock().unwrap().base_lease.strong_count(), 0);
+
+    // Known canonical choice survives as CPU metadata. No extra allocation
+    // survives: reuse the original address after the last old reader retires.
+    let (third, third_out) = prepare(523, false);
+    {
+        let state = weight.state.lock().unwrap();
+        assert_eq!(state.layout, 4);
+        assert_eq!(state.buffer.ptr(), original_pointer);
+        assert_eq!(state.cache.as_ref().unwrap().extra_bytes(), 0);
+    }
+    assert_eq!(read(&b), source);
+    assert_eq!(read(&third_out), second_values);
+    assert!(third.summary().contains("source=profile-choice"));
+    drop(third);
+    let (fourth, fourth_out) = prepare(522, true);
+    assert_eq!(weight.state.lock().unwrap().layout, 2);
+    assert_eq!(
+        weight
+            .state
+            .lock()
+            .unwrap()
+            .cache
+            .as_ref()
+            .unwrap()
+            .extra_bytes(),
+        0
+    );
+    assert_eq!(read(&fourth_out), first_values);
+    drop(fourth);
+    std::fs::remove_dir_all(cache_dir).unwrap();
+}
+
+#[test]
+fn execution_session_distinguishes_selection_policies() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = tensor(0, vec![2, 3], &[1.0; 6]);
+    let b = tensor(0, vec![3, 4], &[1.0; 12]);
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let mut out = tensor(0, vec![2, 4], &[0.0; 8]);
+    prepare_with_session(&session, || {
+        let mut create = |online_tune| {
+            let mut args = GemmArgs::new(&a, &b, &mut out);
+            args.policy.online_tune = online_tune;
+            args.policy.cache_dir = Some(String::new());
+            let normalized =
+                super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)?;
+            super::execution::prepare(&ctx, normalized)
+        };
+        let first = create(false)?;
+        let second = create(true)?;
+        let repeated = create(true)?;
+        assert!(!std::rc::Rc::ptr_eq(&first, &second));
+        assert!(std::rc::Rc::ptr_eq(&second, &repeated));
+        Ok(())
+    })
+    .unwrap();
 }
