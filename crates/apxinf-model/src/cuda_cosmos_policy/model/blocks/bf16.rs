@@ -1677,6 +1677,11 @@ pub(in crate::cuda_cosmos_policy::model) struct Bf16Blocks {
     pub task: Tensor,
     pub noise: Tensor,
     pub actions: Tensor,
+    /// Solver state. `joint` is the per-step joint latent (read by the action
+    /// readout after the final step); `state`/`scaled_noise` are the FP32 views
+    /// bound by the FP64 recurrence reset/update executions. They accumulate
+    /// across the five denoising steps, so they are request-scoped state rather
+    /// than per-step scratch and stay as fields.
     pub joint: Tensor,
     images: Tensor,
     video: Tensor,
@@ -1685,17 +1690,13 @@ pub(in crate::cuda_cosmos_policy::model) struct Bf16Blocks {
     rest: VaeChunk,
     condition_source: Tensor,
     condition_map: Tensor,
-    condition_bf16: Tensor,
-    condition: Tensor,
     latent_input: Tensor,
     latent_view: Tensor,
     patch_map: Tensor,
     unpatch_map: Tensor,
-    network_output: Tensor,
     text: Tensor,
     dit: Dit,
     state: Tensor,
-    scratch: Tensor,
     scaled_noise: Tensor,
     eighty: Tensor,
     reset: PreparedRecurrence,
@@ -1770,8 +1771,6 @@ impl Bf16Blocks {
             }
         }
         let condition_map = indices(&ctx, &cond_map)?;
-        let condition_bf16 = bf(&ctx, 1, LATENT)?;
-        let condition = alloc(&ctx, vec![1, LATENT], DType::F32)?;
         let mut latent = vec![half::bf16::ZERO; 18 * 9 * 784];
         latent[16 * 9 * 784..16 * 9 * 784 + 4 * 784].fill(half::bf16::ONE);
         let latent_input = upload(
@@ -1810,13 +1809,11 @@ impl Bf16Blocks {
             }
         }
         let unpatch_map = indices(&ctx, &unpatch)?;
-        let network_output = bf(&ctx, 1, LATENT)?;
         let text = bf(&ctx, 512, 1024)?;
         // Pinned LIBERO runtime: spatial extrapolation 3, temporal 1.
         let spatial_ntk = 3f64.powf(42. / 40.) as f32;
         let dit = Dit::prepare(&ctx, &weights.dit, [1., spatial_ntk, spatial_ntk])?;
         let state = alloc(&ctx, vec![1, LATENT], DType::F32)?;
-        let scratch = alloc(&ctx, vec![1, LATENT], DType::F32)?;
         let joint = alloc(&ctx, vec![1, LATENT], DType::F32)?;
         let scaled_noise = alloc(&ctx, vec![1, LATENT], DType::F32)?;
         let eighty = constant_f32(&ctx, &vec![80.; LATENT])?;
@@ -1901,17 +1898,13 @@ impl Bf16Blocks {
             rest,
             condition_source,
             condition_map,
-            condition_bf16,
-            condition,
             latent_input,
             latent_view,
             patch_map,
             unpatch_map,
-            network_output,
             text,
             dit,
             state,
-            scratch,
             scaled_noise,
             eighty,
             reset,
@@ -1924,6 +1917,8 @@ impl Bf16Blocks {
         gemm: &GemmPolicy,
         attention: &AttentionPolicy,
         scratch: &DitScratch,
+        condition: &Tensor,
+        condition_bf16: &Tensor,
     ) -> Result<()> {
         let ctx = &self.ctx;
         let mut images = self.images.clone();
@@ -1986,14 +1981,8 @@ impl Bf16Blocks {
             &self.proprio,
             &slice(&self.condition_source, 5 * FRAME, 9, vec![1, 9])?,
         )?;
-        gather(
-            ctx,
-            &self.condition_source,
-            &self.condition_map,
-            1,
-            &self.condition_bf16,
-        )?;
-        cast(ctx, &self.condition_bf16, &self.condition)?;
+        gather(ctx, &self.condition_source, &self.condition_map, 1, condition_bf16)?;
+        cast(ctx, condition_bf16, condition)?;
         gather(ctx, &self.weights.text, &self.task, 512 * 1024, &self.text)?;
         self.dit.project_text(
             ctx,
@@ -2015,12 +2004,16 @@ impl Bf16Blocks {
         gemm: &GemmPolicy,
         attention: &AttentionPolicy,
         scratch: &DitScratch,
+        condition: &Tensor,
     ) -> Result<()> {
         let ctx = &self.ctx;
         let step = &self.steps[index];
-        multiply(ctx, &self.state, &step.input_scale, &self.scratch)?;
-        add(ctx, &self.scratch, &self.condition, &self.scratch)?;
-        cast(ctx, &self.scratch, &self.latent_view)?;
+        // Per-step temporaries from the session arena; dropped at step end.
+        let step_scratch = ctx.allocate_output(Shape::new(vec![1, LATENT]), DType::F32)?;
+        let network_output = ctx.allocate_output(Shape::new(vec![1, LATENT]), DType::BF16)?;
+        multiply(ctx, &self.state, &step.input_scale, &step_scratch)?;
+        add(ctx, &step_scratch, condition, &step_scratch)?;
+        cast(ctx, &step_scratch, &self.latent_view)?;
         gather(
             ctx,
             &self.latent_input,
@@ -2036,18 +2029,12 @@ impl Bf16Blocks {
             gemm,
             attention,
         )?;
-        gather(
-            ctx,
-            &self.dit.output,
-            &self.unpatch_map,
-            1,
-            &self.network_output,
-        )?;
-        cast(ctx, &self.network_output, &self.scratch)?;
-        multiply(ctx, &self.scratch, &step.output_scale, &self.scratch)?;
+        gather(ctx, &self.dit.output, &self.unpatch_map, 1, &network_output)?;
+        cast(ctx, &network_output, &step_scratch)?;
+        multiply(ctx, &step_scratch, &step.output_scale, &step_scratch)?;
         multiply(ctx, &self.state, &step.input_scale, &self.joint)?;
-        add(ctx, &self.joint, &self.scratch, &self.joint)?;
-        add(ctx, &self.joint, &self.condition, &self.joint)?;
+        add(ctx, &self.joint, &step_scratch, &self.joint)?;
+        add(ctx, &self.joint, condition, &self.joint)?;
         if let Some(update) = &step.update {
             update.enqueue()?;
         }
@@ -2060,10 +2047,16 @@ impl Bf16Blocks {
     /// session arena, then encode, denoise and read out.
     pub fn forward(&mut self, gemm: &GemmPolicy, attention: &AttentionPolicy) -> Result<()> {
         let scratch = self.dit.scratch(&self.ctx, &self.weights.dit)?;
-        self.encode_observation(gemm, attention, &scratch)?;
+        let condition = self
+            .ctx
+            .allocate_output(Shape::new(vec![1, LATENT]), DType::F32)?;
+        let condition_bf16 = self
+            .ctx
+            .allocate_output(Shape::new(vec![1, LATENT]), DType::BF16)?;
+        self.encode_observation(gemm, attention, &scratch, &condition, &condition_bf16)?;
         self.initial_state()?;
         for step in 0..self.steps.len() {
-            self.denoise_step(step, gemm, attention, &scratch)?;
+            self.denoise_step(step, gemm, attention, &scratch, &condition)?;
         }
         self.finish()
     }
@@ -2075,8 +2068,13 @@ impl Bf16Blocks {
         &self.joint
     }
     pub fn workspace_bytes(&self) -> usize {
-        // The per-request DiT scratch lives in the session arena; its size is
-        // the peak (every DitScratch tensor coexists during forward).
-        dit::Dit::scratch_bytes(&self.weights.dit)
+        // The session arena holds everything allocate_output hands out during
+        // one request traversal: the whole-forward DiT scratch, the
+        // request-scoped condition buffers, and the per-step scratch/network
+        // temporaries.
+        let dit = dit::Dit::scratch_bytes(&self.weights.dit);
+        let condition = LATENT * 4 + LATENT * 2; // condition (F32) + condition_bf16 (BF16)
+        let step = LATENT * 4 + LATENT * 2; // step_scratch (F32) + network_output (BF16)
+        dit + condition + step
     }
 }

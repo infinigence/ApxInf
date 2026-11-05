@@ -4,7 +4,7 @@ use super::{
     backend::{ops::GemmPolicy, AttentionPolicy, CudaBuffer, CudaContext},
     weights::Bf16Weights,
 };
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{Result, Tensor};
 use blocks::Bf16Blocks;
 use std::rc::Rc;
 
