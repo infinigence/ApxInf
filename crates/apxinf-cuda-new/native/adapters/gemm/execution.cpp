@@ -926,3 +926,17 @@ extern "C" apxinf_status_t apxinf_gemm_test_seed_recipe(
                                serialized.str());
   });
 }
+
+extern "C" uint64_t apxinf_gemm_scratch_bytes(apxinf_gemm_execution_t handle) {
+  return handle == nullptr ? 0 : reinterpret_cast<Execution*>(handle)->scratch.bytes();
+}
+extern "C" apxinf_status_t apxinf_gemm_bind_scratch(
+    apxinf_gemm_execution_t handle, void* buffer, uint64_t bytes) {
+  return apxinf::framework::abi_boundary([&] {
+    if (handle == nullptr) {
+      throw apxinf::framework::Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                                       "null scratch execution");
+    }
+    reinterpret_cast<Execution*>(handle)->scratch.bind(buffer, bytes);
+  });
+}

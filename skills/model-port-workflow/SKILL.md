@@ -94,7 +94,11 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
 4. Create an execution ledger from reference semantics through safe device calls.
    Inspect maintained model/Blocks implementations and fused interfaces before the
    portable backend trait. Account for tensor lifetime, reusable KV/state,
-   workspace, host traffic, and graph eligibility. Define the intended whole
+   activation workspace, persistent KV/state, provider scratch, host traffic,
+   and graph eligibility. For cuda-new, let the runner own `ProviderWorkspace`
+   and pass it to profile sessions; follow the sharing and lifetime contract in
+   [Model Layer Architecture](../../doc/model-layer-architecture.md#repacked-gemm-weight-ownership).
+   Define the intended whole
    graph or Vision/Language/Action graph boundaries, stable buffers,
    input-update mechanism, and capture blockers. Completion: every graph row
    resolves to an ApxInf-native implementation, a private scaffold with a

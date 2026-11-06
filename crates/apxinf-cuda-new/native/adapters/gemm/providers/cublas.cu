@@ -19,9 +19,6 @@ struct CublasState {
   }
 
   void release_resources() noexcept {
-    if (workspace != nullptr) cudaFree(workspace);
-    if (dequant_a != nullptr) cudaFree(dequant_a);
-    if (dequant_b != nullptr) cudaFree(dequant_b);
     workspace = nullptr;
     dequant_a = nullptr;
     dequant_b = nullptr;
@@ -104,14 +101,14 @@ size_t cublas_resource_requirements(const Spec& spec) {
 void prepare_cublas(Execution& state) {
   auto resources = std::make_unique<CublasState>();
   const Spec compute_spec = cublas_compute_spec(state.spec);
-  vendor::allocate_common_resources(compute_spec, resources->common, false);
+  vendor::allocate_common_resources(state, compute_spec, resources->common, false);
   if (needs_safe_dequantization(state.spec)) {
     const size_t a_bytes = static_cast<size_t>(state.spec.m * state.spec.k) *
                            dtype_bytes(APXINF_DTYPE_BF16);
     const size_t b_bytes = static_cast<size_t>(state.spec.k * state.spec.n) *
                            dtype_bytes(APXINF_DTYPE_BF16);
-    check_cuda(cudaMalloc(&resources->dequant_a, a_bytes));
-    check_cuda(cudaMalloc(&resources->dequant_b, b_bytes));
+    state.scratch.allocate(&resources->dequant_a, a_bytes);
+    state.scratch.allocate(&resources->dequant_b, b_bytes);
   }
   check_cublas(cublasCreate(&resources->handle));
   check_cublas(cublasSetMathMode(
@@ -119,7 +116,7 @@ void prepare_cublas(Execution& state) {
                              ? CUBLAS_DEFAULT_MATH
                              : CUBLAS_PEDANTIC_MATH));
   resources->workspace_bytes = 4 * 1024 * 1024;
-  check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
+  state.scratch.allocate(&resources->workspace, resources->workspace_bytes);
   state.resource_bytes =
       resources->common.resource_bytes + resources->workspace_bytes +
       dequantization_resource_requirements(state.spec);

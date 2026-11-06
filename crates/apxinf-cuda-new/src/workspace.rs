@@ -198,9 +198,40 @@ fn merge_adjacent_free_blocks(free_blocks: &mut BTreeMap<usize, usize>) {
     *free_blocks = merged;
 }
 
+/// Runner-owned temporary storage shared by serial operators and profiles.
+/// Separate streams/devices receive disjoint blocks. Clones share ownership;
+/// executions retain their actual block so growth never invalidates old graphs.
+#[derive(Clone, Default)]
+pub struct ProviderWorkspace {
+    buffers: Rc<RefCell<HashMap<(usize, usize), CudaBuffer>>>,
+}
+
+// Type-erased caches retain typed lookup while supporting generation pruning.
+trait ExecutionCache: Any {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn retire_unused(&mut self, generation: u64);
+}
+
+struct TypedExecutionCache<K, V>(HashMap<K, (Rc<V>, Cell<u64>)>);
+
+impl<K: Eq + Hash + 'static, V: Any> ExecutionCache for TypedExecutionCache<K, V> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn retire_unused(&mut self, generation: u64) {
+        self.0.retain(|_, (_, used)| used.get() == generation);
+    }
+}
+
 struct ExecutionSessionInner {
-    workspace: GraphWorkspace,
-    caches: RefCell<HashMap<TypeId, Box<dyn Any>>>,
+    workspace: Rc<GraphWorkspace>,
+    scratch: ProviderWorkspace,
+    caches: RefCell<HashMap<TypeId, Box<dyn ExecutionCache>>>,
+    generation: Cell<u64>,
     prepared_sequence: RefCell<Vec<usize>>,
     sequence_cursor: Cell<usize>,
 }
@@ -211,12 +242,14 @@ impl ExecutionSessionInner {
         K: Eq + Hash + 'static,
         V: Any,
     {
-        self.caches
-            .borrow()
+        let caches = self.caches.borrow();
+        let cache = caches
             .get(&TypeId::of::<(K, V)>())?
-            .downcast_ref::<HashMap<K, Rc<V>>>()?
-            .get(key)
-            .cloned()
+            .as_any()
+            .downcast_ref::<TypedExecutionCache<K, V>>()?;
+        let (value, used) = cache.0.get(key)?;
+        used.set(self.generation.get());
+        Some(value.clone())
     }
 
     fn store<K, V>(&self, key: K, value: Rc<V>)
@@ -227,11 +260,16 @@ impl ExecutionSessionInner {
         let mut caches = self.caches.borrow_mut();
         let cache = caches
             .entry(TypeId::of::<(K, V)>())
-            .or_insert_with(|| Box::new(HashMap::<K, Rc<V>>::new()));
+            .or_insert_with(|| Box::new(TypedExecutionCache::<K, V>(HashMap::new())));
+        // Values and per-entry generation marks have interior mutability only
+        // for lookup; insertion uses the concrete cache's Any identity below.
+        let cache = cache
+            .as_any_mut()
+            .downcast_mut::<TypedExecutionCache<K, V>>()
+            .expect("execution cache type identity collision");
         cache
-            .downcast_mut::<HashMap<K, Rc<V>>>()
-            .expect("execution cache type identity collision")
-            .insert(key, value);
+            .0
+            .insert(key, (value, Cell::new(self.generation.get())));
     }
 }
 
@@ -245,10 +283,16 @@ pub struct ExecutionSession {
 
 impl ExecutionSession {
     pub fn new(workspace: GraphWorkspace) -> Self {
+        Self::with_provider_workspace(workspace, ProviderWorkspace::default())
+    }
+
+    pub fn with_provider_workspace(workspace: GraphWorkspace, scratch: ProviderWorkspace) -> Self {
         Self {
             inner: Rc::new(ExecutionSessionInner {
-                workspace,
+                workspace: Rc::new(workspace),
+                scratch,
                 caches: RefCell::new(HashMap::new()),
+                generation: Cell::new(0),
                 prepared_sequence: RefCell::new(Vec::new()),
                 sequence_cursor: Cell::new(0),
             }),
@@ -274,8 +318,10 @@ impl ExecutionSession {
     /// Traverse the real execution once before graph capture.
     ///
     /// This allocates deterministic workspace slices, prepares native resources,
-    /// and records the order of prepared operators. Stateless operators execute
-    /// directly and do not enter the cache or sequence.
+    /// and records the order of prepared operators. Reuses matching bindings
+    /// and retires unused bindings after traversal; captured graphs retain
+    /// their own resources.
+    /// Stateless operators execute directly and do not enter the cache or sequence.
     pub fn prepare<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         prepare_with_session(self, operation)
     }
@@ -328,6 +374,15 @@ fn with_session_phase<T>(
         }
         session.inner.workspace.reset()?;
         if prepare {
+            // Stable arena bindings must remain cache hits across eager requests.
+            // Retire only entries not used by this traversal, after it completes.
+            let generation = session
+                .inner
+                .generation
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("execution generation overflow".into()))?;
+            session.inner.generation.set(generation);
             session.inner.prepared_sequence.borrow_mut().clear();
         }
         session.inner.sequence_cursor.set(0);
@@ -337,8 +392,16 @@ fn with_session_phase<T>(
             session: previous,
             preparing: previous_preparing,
         };
-        retain_resource(&session.inner);
+        // Captures need the activation arena and each used execution, not the
+        // mutable binding cache. Retaining the whole session would pin a later
+        // eager generation merely because an older graph is still alive.
+        retain_resource(&session.inner.workspace);
         let result = operation();
+        if prepare {
+            for cache in session.inner.caches.borrow_mut().values_mut() {
+                cache.retire_unused(session.inner.generation.get());
+            }
+        }
         if result.is_ok()
             && !prepare
             && session.inner.sequence_cursor.get() != session.inner.prepared_sequence.borrow().len()
@@ -562,4 +625,78 @@ pub(crate) fn output_buffer_tail_zeroed(
         }
         Ok(buffer)
     })
+}
+
+/// Scratch is separate from activation liveness and persistent KV/state. Each
+/// stream uses its own block. Growth preserves old bindings retained by graphs.
+/// Powers of two bound the total retained generations to less than twice the
+/// largest block, rather than the sum of all operator requirements.
+pub(crate) fn provider_scratch(
+    ctx: &crate::CudaContext,
+    bytes: usize,
+) -> Result<Option<CudaBuffer>> {
+    if bytes == 0 {
+        return Ok(None);
+    }
+    ACTIVE_SESSION.with(|active| {
+        let inner = active.get();
+        if inner.is_null() {
+            return Ok(None);
+        }
+        let inner = unsafe { &*inner };
+        let key = (ctx.device_id(), ctx.stream().handle() as usize);
+        let mut scratch = inner.scratch.buffers.borrow_mut();
+        if !scratch
+            .get(&key)
+            .is_some_and(|buffer| buffer.len() >= bytes)
+        {
+            let capacity = bytes
+                .checked_next_power_of_two()
+                .ok_or_else(|| Error::Other("provider scratch capacity overflow".into()))?;
+            scratch.insert(
+                key,
+                CudaBuffer::alloc(capacity, ctx.device_id()).map_err(Error::Cuda)?,
+            );
+        }
+        Ok(scratch.get(&key).cloned())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_scratch_shares_serial_profiles_isolates_streams_and_keeps_old_blocks() {
+        let ctx = crate::CudaContext::new(0).unwrap();
+        let other = crate::CudaContext::new(0).unwrap();
+        let pool = ProviderWorkspace::default();
+        let first = ExecutionSession::with_provider_workspace(
+            GraphWorkspace::new(256, 0).unwrap(),
+            pool.clone(),
+        );
+        let second =
+            ExecutionSession::with_provider_workspace(GraphWorkspace::new(256, 0).unwrap(), pool);
+        let small = first
+            .prepare(|| Ok(provider_scratch(&ctx, 257)?.unwrap()))
+            .unwrap();
+        let same = second
+            .prepare(|| Ok(provider_scratch(&ctx, 500)?.unwrap()))
+            .unwrap();
+        assert_eq!(small.ptr(), same.ptr());
+        let separate = second
+            .prepare(|| Ok(provider_scratch(&other, 500)?.unwrap()))
+            .unwrap();
+        assert_ne!(small.ptr(), separate.ptr());
+        small.copy_from_host(&vec![42; small.len()]).unwrap();
+        let large = second
+            .prepare(|| Ok(provider_scratch(&ctx, 1025)?.unwrap()))
+            .unwrap();
+        assert_ne!(small.ptr(), large.ptr());
+        drop(first);
+        drop(second);
+        let mut bytes = vec![0; small.len()];
+        small.copy_to_host(&mut bytes).unwrap();
+        assert!(bytes.iter().all(|&x| x == 42));
+    }
 }

@@ -55,6 +55,10 @@ apxinf_status_t apxinf_gemm_relayout_weight(
     const void* source, void* destination, int64_t k, int64_t n,
     uint32_t dtype, uint32_t source_layout, uint32_t target_layout,
     apxinf_cuda_stream_t stream);
+// Final prepare only: bind before enqueue/capture. Caller retains the buffer
+// for execution/graph lifetime and serializes users of the same scratch block.
+uint64_t apxinf_gemm_scratch_bytes(apxinf_gemm_execution_t execution);
+apxinf_status_t apxinf_gemm_bind_scratch(apxinf_gemm_execution_t execution, void* buffer, uint64_t bytes);
 void apxinf_gemm_destroy(apxinf_gemm_execution_t execution);
 const char* apxinf_gemm_summary(apxinf_gemm_execution_t execution);
 

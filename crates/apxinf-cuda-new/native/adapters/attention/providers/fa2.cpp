@@ -88,11 +88,6 @@ struct Fa2SplitKvState {
   float* softmax_lse_accum = nullptr;
   float* output_accum = nullptr;
 
-  ~Fa2SplitKvState() {
-    if (output_accum != nullptr) cudaFree(output_accum);
-    if (softmax_lse_accum != nullptr) cudaFree(softmax_lse_accum);
-    if (softmax_lse != nullptr) cudaFree(softmax_lse);
-  }
 };
 
 size_t checked_multiply(size_t lhs, size_t rhs, const char* label) {
@@ -147,7 +142,7 @@ void prepare_fa2(Execution& execution) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "FA2 softmax LSE workspace exceeds policy");
   }
-  check_cuda(cudaMalloc(&state->softmax_lse, bytes));
+  execution.scratch.allocate(&state->softmax_lse, bytes);
   execution.resource_bytes = bytes;
   execution.provider_state = state.release();
 }
@@ -211,9 +206,9 @@ void prepare_fa2_splitkv(Execution& execution) {
       static_cast<size_t>(execution.configuration) * lse_bytes;
   const size_t output_accum_bytes =
       static_cast<size_t>(execution.configuration) * lse_bytes * spec.head_dim;
-  check_cuda(cudaMalloc(&state->softmax_lse, lse_bytes));
-  check_cuda(cudaMalloc(&state->softmax_lse_accum, lse_accum_bytes));
-  check_cuda(cudaMalloc(&state->output_accum, output_accum_bytes));
+  execution.scratch.allocate(&state->softmax_lse, lse_bytes);
+  execution.scratch.allocate(&state->softmax_lse_accum, lse_accum_bytes);
+  execution.scratch.allocate(&state->output_accum, output_accum_bytes);
   execution.resource_bytes = required;
   execution.provider_state = state.release();
 }
@@ -415,7 +410,6 @@ cudaError_t launch_fa2(Execution& execution) {
 void destroy_fa2(Execution& execution) noexcept {
   auto* state = static_cast<Fa2State*>(execution.provider_state);
   if (state == nullptr) return;
-  if (state->softmax_lse != nullptr) cudaFree(state->softmax_lse);
   delete state;
   execution.provider_state = nullptr;
 }

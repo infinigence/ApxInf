@@ -126,15 +126,12 @@ CommonResources::~CommonResources() {
 }
 
 void CommonResources::release() noexcept {
-  if (projection != nullptr) cudaFree(projection);
-  if (unpack_a != nullptr) cudaFree(unpack_a);
-  if (unpack_b != nullptr) cudaFree(unpack_b);
   projection = nullptr;
   unpack_a = nullptr;
   unpack_b = nullptr;
 }
 
-void allocate_common_resources(const Spec& spec,
+void allocate_common_resources(Execution& state, const Spec& spec,
                                CommonResources& resources,
                                bool native_fp8,
                                bool native_bias_epilogue) {
@@ -154,8 +151,8 @@ void allocate_common_resources(const Spec& spec,
         spec.m * spec.k * dtype_bytes(resources.projection_dtype);
     const size_t b_bytes =
         spec.k * spec.n * dtype_bytes(resources.projection_dtype);
-    check_cuda(cudaMalloc(&resources.unpack_a, a_bytes));
-    check_cuda(cudaMalloc(&resources.unpack_b, b_bytes));
+    state.scratch.allocate(&resources.unpack_a, a_bytes);
+    state.scratch.allocate(&resources.unpack_b, b_bytes);
     resources.resource_bytes += a_bytes + b_bytes;
   }
 
@@ -175,7 +172,7 @@ void allocate_common_resources(const Spec& spec,
   if (needs_postprocess) {
     const size_t bytes =
         spec.m * spec.n * dtype_bytes(resources.projection_dtype);
-    check_cuda(cudaMalloc(&resources.projection, bytes));
+    state.scratch.allocate(&resources.projection, bytes);
     resources.resource_bytes += bytes;
   }
 }
