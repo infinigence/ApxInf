@@ -9,6 +9,7 @@ apxinf-core = { path = "../apxinf-core" }
 apxinf-mlx = { path = "../apxinf-mlx", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
 apxinf-hip = { path = "../apxinf-hip", optional = true }
+apxinf-ascend = { path = "../apxinf-ascend", optional = true }
 apxinf-loader = { path = "../apxinf-loader" }
 thiserror = "1"
 once_cell = "1"
@@ -32,6 +33,8 @@ pi05-only = ["cuda"]
 # AMD ROCm/HIP inference, independent of both CUDA features: either, both or
 # neither can be enabled.
 hip = ["dep:apxinf-hip"]
+# Huawei Ascend NPU inference, independent of CUDA/HIP.
+ascend = ["dep:apxinf-ascend"]
 
 [[example]]
 name = "pi05_bench"
