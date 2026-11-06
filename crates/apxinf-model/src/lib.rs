@@ -18,6 +18,8 @@ pub mod metal_clef;
 pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3;
+#[cfg(feature = "musa")]
+pub mod musa_pi05;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
