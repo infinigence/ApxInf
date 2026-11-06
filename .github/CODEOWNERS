@@ -1,0 +1,4 @@
+# Keep the automation policy and its write boundary under explicit owner review.
+/.github/workflows/apxinf-ai-review.yml @ChenxiHe231
+/.github/codex/ @ChenxiHe231
+/.github/skills/apxinf-code-review/ @ChenxiHe231
