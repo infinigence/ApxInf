@@ -16,6 +16,8 @@ model-specific examples and historical evidence link back to it.
 | A required safe device operation is missing | [Adding New Kernels](adding-new-kernels.md) |
 | Designing the native MLX backend or migrating a qualified Mac model | [MLX Backend](mlx-backend.md) — ownership, supported selections and execution contracts |
 | Running PI0.5 on AMD (HIP), comparing it with CUDA, or extending it | [PI0.5 on HIP](hip-pi05.md) — layout, entry points, validation and status |
+| Building, tuning or measuring the Moore Threads backend | [MUSA Backend](musa-backend.md) — build, generations, INT8 routes, capture, tactics database and the accuracy gate |
+| Profiling PI0.5 on MUSA with msys | [Profiling PI0.5 on MUSA](pi05-mttx.md) — markers, recordings and the two known reading defects |
 | Proposing Apple Neural Engine execution through Core ML | [Core ML and ANE](coreml-ane.md) — proposal under upstream review |
 
 PI0.5 currently separates `model/`, `model_runner/` and `weights/`. Its
@@ -38,6 +40,7 @@ Qwen3.8-27B-NVFP4 is a text LLM behind `LlmTrait` with the same
 - [model-port-workflow](../skills/model-port-workflow/SKILL.md): a complete new-family port, including module ownership, registration, public integration and GPU evidence.
 - [analyze-model-impl](../skills/analyze-model-impl/SKILL.md): trace the selected implementation from model/runner through actual backend calls; source inspection alone is not a benchmark.
 - [l3-reference-testing](../skills/l3-reference-testing/SKILL.md): independent numerical tests for `apxinf-cuda-new` L3 semantics/candidates; these are separate from current PI0.5 backend and model-level acceptance.
+- [copy-drift-audit](../skills/copy-drift-audit/SKILL.md): audit a backend-native port's copied files against the family source they came from, with one import watermark per file; upstream changes are adjudicated, not treated as defects.
 
 Skills resolve these documents from the checkout/worktree being modified,
 even when installed globally through a symlink to another branch. Repository
