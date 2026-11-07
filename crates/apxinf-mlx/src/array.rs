@@ -181,6 +181,14 @@ impl Stream {
         self.record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
         check(unsafe { ffi::apx_mlx_eval(self.raw(), p.as_ptr(), p.len()) })
     }
+    /// Enqueues evaluation of `arrays` and returns without waiting, so host
+    /// work (such as a Neural Engine prediction) overlaps the device. A later
+    /// [`eval`](Self::eval), download or dependent evaluation waits for it.
+    pub fn async_eval(&self, arrays: &[Array]) -> Result<()> {
+        let p = self.inputs(arrays.iter())?;
+        self.record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_async_eval(p.as_ptr(), p.len()) })
+    }
     fn raw(&self) -> ffi::Handle {
         self.0.raw.as_ptr()
     }
@@ -366,6 +374,19 @@ impl Array {
         check(unsafe {
             ffi::apx_mlx_array_read(self.stream().raw(), self.raw(), out.as_mut_ptr(), out.len())
         })?;
+        self.stream()
+            .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
+        Ok(out)
+    }
+    /// Like [`to_bytes`](Self::to_bytes), but waits only for this array's
+    /// computation, not for other work queued on its stream, and adds no
+    /// operation: work submitted later with [`Stream::async_eval`] keeps
+    /// running. The array must be row-contiguous (for example a kernel output).
+    pub fn to_bytes_ready(&self) -> Result<Vec<u8>> {
+        let mut out = vec![0; self.numel() * self.dtype().size_in_bytes()];
+        self.stream()
+            .record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_array_read_ready(self.raw(), out.as_mut_ptr(), out.len()) })?;
         self.stream()
             .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
         Ok(out)
@@ -877,6 +898,19 @@ impl Compiled {
         self.call_and_eval(inputs)?;
         let before = self.trace.stream.counters().trace_callbacks;
         let output = self.call_and_eval(inputs)?;
+        if self.trace.stream.counters().trace_callbacks != before {
+            return Err(error("MLX prepared profile retraced on replay; required compiled execution is unavailable"));
+        }
+        Ok(output)
+    }
+
+    /// Compile an exact input profile and verify reuse without evaluating it.
+    /// This prepares the MLX graph, not Metal pipelines or allocator workspaces.
+    /// The first evaluation can still incur device compilation and allocation.
+    pub fn prepare_trace(&self, inputs: &[Array]) -> Result<Vec<Array>> {
+        self.call(inputs)?;
+        let before = self.trace.stream.counters().trace_callbacks;
+        let output = self.call(inputs)?;
         if self.trace.stream.counters().trace_callbacks != before {
             return Err(error("MLX prepared profile retraced on replay; required compiled execution is unavailable"));
         }

@@ -4,6 +4,8 @@ mod array;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod backend;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod bf16_qk_table_rope;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod device_caps;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod ffi;
@@ -13,7 +15,7 @@ pub use array::{
     MetalKernel, MlxDType, Stream, StreamCounters, TemplateArg,
 };
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
-pub use backend::MlxBackend;
+pub use backend::{greedy_token_arrays, MlxBackend};
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use device_caps::MetalDeviceCaps;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
