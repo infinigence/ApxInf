@@ -1,0 +1,1837 @@
+
+    .text
+    .protected  mate_fa_d256_mp22
+    .globl  mate_fa_d256_mp22
+    .p2align    8
+    .type   mate_fa_d256_mp22,@function
+mate_fa_d256_mp22:
+[NswD---] BIT.LUT.AND R0, AR0, SH44
+[NwsD---] BIT.LUT.XOR R28, R0, C33
+[NswD---] BIT.LUT.XOR R29, R0, C45
+[NwsD---] BIT.LUT.XOR R30, R0, C61
+[NswD---] BIT.LUT.XOR R31, R0, SH40
+[N--D--s] MOV.LD.LM.B32 R5, LM4
+[N--D--s] MOV.LD.LM.B32 R6, LM5
+[NwwDwww] CTRL.NOP
+[N--D--s] MOV.LD.LM.B32 R16, LM6
+[NwwDwww] CTRL.NOP
+[NwsD---] BIT.ROT.LSL R9, C45, R16
+[NwwDs--] DMA.LD.B32 R17, SH[16:17], R9, _, _, _, _, SH[16:18]
+[NwwDwww] CTRL.NOP
+[NwwDs--] DMA.LD.B32 R19, SH[20:21], R9, _, _, _, _, SH[20:22]
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R9.s32, C61.s32
+[NwwDs--] DMA.LD.B32 R18, SH[16:17], R9, _, _, _, _, SH[16:18]
+[NwwDwww] CTRL.NOP
+[NwsD---] FOP.MOV R20, C0
+[NswD---] INT.MADD R20.s32, SH25.s32, R20.s32, R16.s32
+[NwsD---] BIT.ROT.LSL R5, C80, R5
+[NswD---] INT.ADD R5.s32, R5.s32, R17.s32
+[NwsD---] INT.BYP.TGE p0, R5.s32, R18.s32
+[NwwD---] CTRL.BR.ALLP0T FINISH
+[NswD---] FOP.MOV R7, C0
+[NwsD---] BIT.AND.LSR R1, C45, SH41, R0
+[NswD---] BIT.AND.LSL R2, C33, C50, R0
+[NwsD---] BIT.ROT.LSR R10, C79, R0
+[NswD---] BIT.ROT.LSL R10, C50, R10
+[NwsD---] INT.ADD R2.s32, R2.s32, R10.s32
+[NswD---] BIT.ROT.LSR R3, C79, R0
+[NwsD---] BIT.ROT.LSL R3, C45, R3
+[NswD---] BIT.AND.LSR R10, C50, C78, R0
+[NwsD---] INT.ADD R3.s32, R3.s32, R10.s32
+[NswD---] BIT.AND.LSR R4, C80, SH41, R0
+[NwsD---] BIT.ROT.LSL R4, C50, R4
+[NswD---] BIT.LUT.AND R10, C59, R0
+[NwsD---] INT.ADD R4.s32, R4.s32, R10.s32
+[NswD---] INT.ADD R11.s32, R1.s32, R5.s32
+[NwsD---] BIT.ROT.LSL R9, SH39, R11
+[NswD---] BIT.ROT.LSL R10, C46, R6
+[NwsD---] INT.ADD R9.s32, R9.s32, R10.s32
+[NswD---] INT.ADD R9.s32, R9.s32, R2.s32
+[NwsD---] BIT.ROT.LSL R9, C33, R9
+[NswD---] FOP.MOV R21, R9
+[NwsD---] INT.ADD R24.s32, R21.s32, C0.s32
+[NswD---] INT.ADD R25.s32, R21.s32, C115.s32
+[NwsD---] INT.ADD R26.s32, R21.s32, SH40.s32
+[NswD---] INT.ADD R27.s32, R21.s32, SH73.s32
+[NwwDs--] DMA.LD.B32 R144, SH[4:5], R24, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R145, SH[4:5], R25, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R146, SH[4:5], R26, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R147, SH[4:5], R27, _, _, _, _, SH[4:6]
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R24.s32, R21.s32, SH42.s32
+[NswD---] INT.ADD R25.s32, R21.s32, SH74.s32
+[NwsD---] INT.ADD R26.s32, R21.s32, SH43.s32
+[NswD---] INT.ADD R27.s32, R21.s32, SH75.s32
+[NwwDs--] DMA.LD.B32 R148, SH[4:5], R24, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R149, SH[4:5], R25, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R150, SH[4:5], R26, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R151, SH[4:5], R27, _, _, _, _, SH[4:6]
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R24.s32, R21.s32, SH45.s32
+[NswD---] INT.ADD R25.s32, R21.s32, SH76.s32
+[NwsD---] INT.ADD R26.s32, R21.s32, SH46.s32
+[NswD---] INT.ADD R27.s32, R21.s32, SH77.s32
+[NwwDs--] DMA.LD.B32 R152, SH[4:5], R24, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R153, SH[4:5], R25, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R154, SH[4:5], R26, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R155, SH[4:5], R27, _, _, _, _, SH[4:6]
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R24.s32, R21.s32, SH47.s32
+[NswD---] INT.ADD R25.s32, R21.s32, SH78.s32
+[NwsD---] INT.ADD R26.s32, R21.s32, SH48.s32
+[NswD---] INT.ADD R27.s32, R21.s32, SH79.s32
+[NwwDs--] DMA.LD.B32 R156, SH[4:5], R24, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R157, SH[4:5], R25, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R158, SH[4:5], R26, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R159, SH[4:5], R27, _, _, _, _, SH[4:6]
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R24.s32, R21.s32, SH49.s32
+[NswD---] INT.ADD R25.s32, R21.s32, SH80.s32
+[NwsD---] INT.ADD R26.s32, R21.s32, SH50.s32
+[NswD---] INT.ADD R27.s32, R21.s32, SH81.s32
+[NwwDs--] DMA.LD.B32 R160, SH[4:5], R24, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R161, SH[4:5], R25, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R162, SH[4:5], R26, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R163, SH[4:5], R27, _, _, _, _, SH[4:6]
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R24.s32, R21.s32, SH51.s32
+[NswD---] INT.ADD R25.s32, R21.s32, SH82.s32
+[NwsD---] INT.ADD R26.s32, R21.s32, SH52.s32
+[NswD---] INT.ADD R27.s32, R21.s32, SH83.s32
+[NwwDs--] DMA.LD.B32 R164, SH[4:5], R24, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R165, SH[4:5], R25, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R166, SH[4:5], R26, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R167, SH[4:5], R27, _, _, _, _, SH[4:6]
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R24.s32, R21.s32, SH53.s32
+[NswD---] INT.ADD R25.s32, R21.s32, SH84.s32
+[NwsD---] INT.ADD R26.s32, R21.s32, SH54.s32
+[NswD---] INT.ADD R27.s32, R21.s32, SH85.s32
+[NwwDs--] DMA.LD.B32 R168, SH[4:5], R24, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R169, SH[4:5], R25, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R170, SH[4:5], R26, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R171, SH[4:5], R27, _, _, _, _, SH[4:6]
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R24.s32, R21.s32, SH55.s32
+[NswD---] INT.ADD R25.s32, R21.s32, SH86.s32
+[NwsD---] INT.ADD R26.s32, R21.s32, SH56.s32
+[NswD---] INT.ADD R27.s32, R21.s32, SH87.s32
+[NwwDs--] DMA.LD.B32 R172, SH[4:5], R24, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R173, SH[4:5], R25, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R174, SH[4:5], R26, _, _, _, _, SH[4:6]
+[N--Ds--] DMA.LD.B32 R175, SH[4:5], R27, _, _, _, _, SH[4:6]
+[NwwDwww] CTRL.NOP
+[NwsD---] FOP.MOV R32, C0
+[NswD---] FOP.MOV R33, C0
+[NwsD---] FOP.MOV R34, C0
+[NswD---] FOP.MOV R35, C0
+[NwsD---] FOP.MOV R36, C0
+[NswD---] FOP.MOV R37, C0
+[NwsD---] FOP.MOV R38, C0
+[NswD---] FOP.MOV R39, C0
+[NwsD---] FOP.MOV R40, C0
+[NswD---] FOP.MOV R41, C0
+[NwsD---] FOP.MOV R42, C0
+[NswD---] FOP.MOV R43, C0
+[NwsD---] FOP.MOV R44, C0
+[NswD---] FOP.MOV R45, C0
+[NwsD---] FOP.MOV R46, C0
+[NswD---] FOP.MOV R47, C0
+[NwsD---] FOP.MOV R48, C0
+[NswD---] FOP.MOV R49, C0
+[NwsD---] FOP.MOV R50, C0
+[NswD---] FOP.MOV R51, C0
+[NwsD---] FOP.MOV R52, C0
+[NswD---] FOP.MOV R53, C0
+[NwsD---] FOP.MOV R54, C0
+[NswD---] FOP.MOV R55, C0
+[NwsD---] FOP.MOV R56, C0
+[NswD---] FOP.MOV R57, C0
+[NwsD---] FOP.MOV R58, C0
+[NswD---] FOP.MOV R59, C0
+[NwsD---] FOP.MOV R60, C0
+[NswD---] FOP.MOV R61, C0
+[NwsD---] FOP.MOV R62, C0
+[NswD---] FOP.MOV R63, C0
+[NwsD---] FOP.MOV R64, C0
+[NswD---] FOP.MOV R65, C0
+[NwsD---] FOP.MOV R66, C0
+[NswD---] FOP.MOV R67, C0
+[NwsD---] FOP.MOV R68, C0
+[NswD---] FOP.MOV R69, C0
+[NwsD---] FOP.MOV R70, C0
+[NswD---] FOP.MOV R71, C0
+[NwsD---] FOP.MOV R72, C0
+[NswD---] FOP.MOV R73, C0
+[NwsD---] FOP.MOV R74, C0
+[NswD---] FOP.MOV R75, C0
+[NwsD---] FOP.MOV R76, C0
+[NswD---] FOP.MOV R77, C0
+[NwsD---] FOP.MOV R78, C0
+[NswD---] FOP.MOV R79, C0
+[NwsD---] FOP.MOV R80, C0
+[NswD---] FOP.MOV R81, C0
+[NwsD---] FOP.MOV R82, C0
+[NswD---] FOP.MOV R83, C0
+[NwsD---] FOP.MOV R84, C0
+[NswD---] FOP.MOV R85, C0
+[NwsD---] FOP.MOV R86, C0
+[NswD---] FOP.MOV R87, C0
+[NwsD---] FOP.MOV R88, C0
+[NswD---] FOP.MOV R89, C0
+[NwsD---] FOP.MOV R90, C0
+[NswD---] FOP.MOV R91, C0
+[NwsD---] FOP.MOV R92, C0
+[NswD---] FOP.MOV R93, C0
+[NwsD---] FOP.MOV R94, C0
+[NswD---] FOP.MOV R95, C0
+[NwsD---] FOP.MOV R104, SH88
+[NswD---] FOP.MOV R108, C0
+[NwsD---] FOP.MOV R105, SH88
+[NswD---] FOP.MOV R109, C0
+[NwsD---] FOP.MOV R106, SH88
+[NswD---] FOP.MOV R110, C0
+[NwsD---] FOP.MOV R107, SH88
+[NswD---] FOP.MOV R111, C0
+[NwsD---] FOP.MOV R8, C0
+[NswD---] INT.BYP.TLE p0, R19.s32, C0.s32
+[NwwD---] CTRL.BR.ALLP0T OUTPUT
+[NwsD---] INT.ADD R11.s32, R3.s32, C0.s32
+[NswD---] INT.ADD R12.s32, R4.s32, C0.s32
+[NwsD---] INT.MADD R136.s32, SH40.s32, R12.s32, R11.s32
+[NswD---] INT.ADD R12.s32, R4.s32, C39.s32
+[NwsD---] INT.MADD R137.s32, SH40.s32, R12.s32, R11.s32
+[NswD---] INT.ADD R11.s32, R3.s32, C46.s32
+[NwsD---] INT.ADD R12.s32, R4.s32, C0.s32
+[NswD---] INT.MADD R138.s32, SH40.s32, R12.s32, R11.s32
+[NwsD---] INT.ADD R12.s32, R4.s32, C39.s32
+[NswD---] INT.MADD R139.s32, SH40.s32, R12.s32, R11.s32
+[NwsD---] INT.ADD R11.s32, R3.s32, C39.s32
+[NswD---] INT.ADD R12.s32, R4.s32, C0.s32
+[NwsD---] INT.MADD R140.s32, SH40.s32, R12.s32, R11.s32
+[NswD---] INT.ADD R12.s32, R4.s32, C39.s32
+[NwsD---] INT.MADD R141.s32, SH40.s32, R12.s32, R11.s32
+[NswD---] INT.ADD R11.s32, R3.s32, C48.s32
+[NwsD---] INT.ADD R12.s32, R4.s32, C0.s32
+[NswD---] INT.MADD R142.s32, SH40.s32, R12.s32, R11.s32
+[NwsD---] INT.ADD R12.s32, R4.s32, C39.s32
+[NswD---] INT.MADD R143.s32, SH40.s32, R12.s32, R11.s32
+[NwsD---] INT.BYP.TL p0, R19.s32, SH40.s32
+[NwwD---] CTRL.BR.ALLP0T KV_TAIL
+KV_LOOP:
+[NswD---] INT.ADD R11.s32, R1.s32, R8.s32
+[NwsD---] INT.ADD R15.s32, R11.s32, R20.s32
+[NswD---] BIT.ROT.LSL R9, C46, R15
+[NwsD---] INT.ADD R9.s32, R9.s32, R2.s32
+[NswD---] BIT.ROT.LSL R9, C33, R9
+[NwsD---] FOP.MOV R22, R9
+[NswD---] INT.ADD R24.s32, R22.s32, C0.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH57.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH40.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH58.s32
+[NwwDs--] DMA.LD.B32 R120, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R121, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R122, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R123, SH[8:9], R27, _, _, _, _, SH[8:10]
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH42.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH59.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH43.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH60.s32
+[NwwDs--] DMA.LD.B32 R124, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R125, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R126, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R127, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R144[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.col, 0
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R146[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.col, 0
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH45.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH61.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH46.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH62.s32
+[NwwDs--] DMA.LD.B32 R120, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R121, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R122, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R123, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R148[2:1][1:1].bf16.row, R124[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R150[2:1][1:1].bf16.row, R126[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH47.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH63.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH48.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH64.s32
+[NwwDs--] DMA.LD.B32 R124, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R125, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R126, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R127, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R152[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R154[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH49.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH65.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH50.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH66.s32
+[NwwDs--] DMA.LD.B32 R120, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R121, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R122, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R123, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R156[2:1][1:1].bf16.row, R124[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R158[2:1][1:1].bf16.row, R126[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH51.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH67.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH52.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH68.s32
+[NwwDs--] DMA.LD.B32 R124, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R125, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R126, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R127, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R160[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R162[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH53.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH69.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH54.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH70.s32
+[NwwDs--] DMA.LD.B32 R120, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R121, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R122, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R123, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R164[2:1][1:1].bf16.row, R124[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R166[2:1][1:1].bf16.row, R126[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH55.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH71.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH56.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH72.s32
+[NwwDs--] DMA.LD.B32 R124, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R125, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R126, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R127, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R168[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R170[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R172[2:1][1:1].bf16.row, R124[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R174[2:1][1:1].bf16.row, R126[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R96, R96, R128
+[NwsD---] FOP.ADD R97, R97, R129
+[NswD---] FOP.ADD R98, R98, R130
+[NwsD---] FOP.ADD R99, R99, R131
+[NswD---] FOP.ADD R100, R100, R132
+[NwsD---] FOP.ADD R101, R101, R133
+[NswD---] FOP.ADD R102, R102, R134
+[NwsD---] FOP.ADD R103, R103, R135
+[NswD---] FOP.MUL R96, SH28, R96
+[NwsD---] FOP.MUL R97, SH28, R97
+[NswD---] FOP.MUL R98, SH28, R98
+[NwsD---] FOP.MUL R99, SH28, R99
+[NswD---] FOP.MUL R100, SH28, R100
+[NwsD---] FOP.MUL R101, SH28, R101
+[NswD---] FOP.MUL R102, SH28, R102
+[NwsD---] FOP.MUL R103, SH28, R103
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R96, R97
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] FOP.CMP_MOVC.MAX.TST R116, R116, R104
+[NswD---] FOP.ADD R112, R104, R116.neg
+[NwsD---] FOP.MOV R104, R116
+[NswD---] FOP.ADD R96, R96, R116.neg
+[NwsD---] FOP.ADD R97, R97, R116.neg
+[NwwD--s] AF32.EXP2 R112, R112
+[N--D--s] AF32.EXP2 R96, R96
+[N--D--s] AF32.EXP2 R97, R97
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R116, R96, R97
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] FOP.FMA R108, R108, R112, R116
+[N--D---] FOP.MUL R32, R32, R112
+[N--D---] FOP.MUL R33, R33, R112
+[N--D---] FOP.MUL R40, R40, R112
+[N--D---] FOP.MUL R41, R41, R112
+[N--D---] FOP.MUL R48, R48, R112
+[N--D---] FOP.MUL R49, R49, R112
+[N--D---] FOP.MUL R56, R56, R112
+[N--D---] FOP.MUL R57, R57, R112
+[N--D---] FOP.MUL R64, R64, R112
+[N--D---] FOP.MUL R65, R65, R112
+[N--D---] FOP.MUL R72, R72, R112
+[N--D---] FOP.MUL R73, R73, R112
+[N--D---] FOP.MUL R80, R80, R112
+[N--D---] FOP.MUL R81, R81, R112
+[N--D---] FOP.MUL R88, R88, R112
+[Ns-D---] FOP.MUL R89, R89, R112
+[Nw-D---] CTRL.NOP
+[NwwD-s-] LDMA.WR.B32.BST1 R96, R136, X4, 128, BURST_STRIDE=4
+[N--D-s-] LDMA.WR.B32.BST1 R97, R137, X4, 128, BURST_STRIDE=4
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R98, R99
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] FOP.CMP_MOVC.MAX.TST R116, R116, R105
+[NswD---] FOP.ADD R113, R105, R116.neg
+[NwsD---] FOP.MOV R105, R116
+[NswD---] FOP.ADD R98, R98, R116.neg
+[NwsD---] FOP.ADD R99, R99, R116.neg
+[NwwD--s] AF32.EXP2 R113, R113
+[N--D--s] AF32.EXP2 R98, R98
+[N--D--s] AF32.EXP2 R99, R99
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R116, R98, R99
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] FOP.FMA R109, R109, R113, R116
+[N--D---] FOP.MUL R34, R34, R113
+[N--D---] FOP.MUL R35, R35, R113
+[N--D---] FOP.MUL R42, R42, R113
+[N--D---] FOP.MUL R43, R43, R113
+[N--D---] FOP.MUL R50, R50, R113
+[N--D---] FOP.MUL R51, R51, R113
+[N--D---] FOP.MUL R58, R58, R113
+[N--D---] FOP.MUL R59, R59, R113
+[N--D---] FOP.MUL R66, R66, R113
+[N--D---] FOP.MUL R67, R67, R113
+[N--D---] FOP.MUL R74, R74, R113
+[N--D---] FOP.MUL R75, R75, R113
+[N--D---] FOP.MUL R82, R82, R113
+[N--D---] FOP.MUL R83, R83, R113
+[N--D---] FOP.MUL R90, R90, R113
+[Ns-D---] FOP.MUL R91, R91, R113
+[Nw-D---] CTRL.NOP
+[NwwD-s-] LDMA.WR.B32.BST1 R98, R138, X4, 128, BURST_STRIDE=4
+[N--D-s-] LDMA.WR.B32.BST1 R99, R139, X4, 128, BURST_STRIDE=4
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R100, R101
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] FOP.CMP_MOVC.MAX.TST R116, R116, R106
+[NswD---] FOP.ADD R114, R106, R116.neg
+[NwsD---] FOP.MOV R106, R116
+[NswD---] FOP.ADD R100, R100, R116.neg
+[NwsD---] FOP.ADD R101, R101, R116.neg
+[NwwD--s] AF32.EXP2 R114, R114
+[N--D--s] AF32.EXP2 R100, R100
+[N--D--s] AF32.EXP2 R101, R101
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R116, R100, R101
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] FOP.FMA R110, R110, R114, R116
+[N--D---] FOP.MUL R36, R36, R114
+[N--D---] FOP.MUL R37, R37, R114
+[N--D---] FOP.MUL R44, R44, R114
+[N--D---] FOP.MUL R45, R45, R114
+[N--D---] FOP.MUL R52, R52, R114
+[N--D---] FOP.MUL R53, R53, R114
+[N--D---] FOP.MUL R60, R60, R114
+[N--D---] FOP.MUL R61, R61, R114
+[N--D---] FOP.MUL R68, R68, R114
+[N--D---] FOP.MUL R69, R69, R114
+[N--D---] FOP.MUL R76, R76, R114
+[N--D---] FOP.MUL R77, R77, R114
+[N--D---] FOP.MUL R84, R84, R114
+[N--D---] FOP.MUL R85, R85, R114
+[N--D---] FOP.MUL R92, R92, R114
+[Ns-D---] FOP.MUL R93, R93, R114
+[Nw-D---] CTRL.NOP
+[NwwD-s-] LDMA.WR.B32.BST1 R100, R140, X4, 128, BURST_STRIDE=4
+[N--D-s-] LDMA.WR.B32.BST1 R101, R141, X4, 128, BURST_STRIDE=4
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R102, R103
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] FOP.CMP_MOVC.MAX.TST R116, R116, R107
+[NswD---] FOP.ADD R115, R107, R116.neg
+[NwsD---] FOP.MOV R107, R116
+[NswD---] FOP.ADD R102, R102, R116.neg
+[NwsD---] FOP.ADD R103, R103, R116.neg
+[NwwD--s] AF32.EXP2 R115, R115
+[N--D--s] AF32.EXP2 R102, R102
+[N--D--s] AF32.EXP2 R103, R103
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R116, R102, R103
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] FOP.FMA R111, R111, R115, R116
+[N--D---] FOP.MUL R38, R38, R115
+[N--D---] FOP.MUL R39, R39, R115
+[N--D---] FOP.MUL R46, R46, R115
+[N--D---] FOP.MUL R47, R47, R115
+[N--D---] FOP.MUL R54, R54, R115
+[N--D---] FOP.MUL R55, R55, R115
+[N--D---] FOP.MUL R62, R62, R115
+[N--D---] FOP.MUL R63, R63, R115
+[N--D---] FOP.MUL R70, R70, R115
+[N--D---] FOP.MUL R71, R71, R115
+[N--D---] FOP.MUL R78, R78, R115
+[N--D---] FOP.MUL R79, R79, R115
+[N--D---] FOP.MUL R86, R86, R115
+[N--D---] FOP.MUL R87, R87, R115
+[N--D---] FOP.MUL R94, R94, R115
+[Ns-D---] FOP.MUL R95, R95, R115
+[Nw-D---] CTRL.NOP
+[NwwD-s-] LDMA.WR.B32.BST1 R102, R142, X4, 128, BURST_STRIDE=4
+[N--D-s-] LDMA.WR.B32.BST1 R103, R143, X4, 128, BURST_STRIDE=4
+[NwwDwww] CTRL.NOP
+[NswD---] AP.BARRIER LM0
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R12.s32, R2.s32, C0.s32
+[NwsD---] INT.ADD R11.s32, R1.s32, C0.s32
+[NswD---] INT.MADD R24.s32, SH40.s32, R12.s32, R11.s32
+[NwsD---] INT.ADD R11.s32, R1.s32, C39.s32
+[NswD---] INT.MADD R25.s32, SH40.s32, R12.s32, R11.s32
+[NwwD-s-] LDMA.RD.B64.BST1 R[116:117], R24, X4, 128, BURST_STRIDE=8
+[N--D-s-] LDMA.RD.B64.BST1 R[118:119], R25, X4, 128, BURST_STRIDE=8
+[NwwDwww] CTRL.NOP
+[NwsD---] FOP.ADD R124.l.bf16, R116, C0
+[NswD---] FOP.ADD R124.h.bf16, R117, C0
+[NwsD---] FOP.ADD R125.l.bf16, R118, C0
+[NswD---] FOP.ADD R125.h.bf16, R119, C0
+[NwsD---] BIT.ROT.LSR R11, C50, R0
+[NswD---] INT.ADD R11.s32, R11.s32, C0.s32
+[NwsD---] INT.ADD R11.s32, R11.s32, R8.s32
+[NswD---] BIT.AND.LSL R12, C33, C59, R0
+[NwsD---] INT.ADD R15.s32, R11.s32, R20.s32
+[NswD---] BIT.ROT.LSL R9, C46, R15
+[NwsD---] INT.ADD R9.s32, R9.s32, R12.s32
+[NswD---] BIT.ROT.LSL R9, C33, R9
+[NwsD---] FOP.MOV R23, R9
+[NswD---] INT.ADD R24.s32, R23.s32, C0.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH40.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH42.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH43.s32
+[NwwDs--] DMA.LD.B32 R120, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R121, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R122, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R123, SH[12:13], R27, _, _, _, _, SH[12:14]
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R23.s32, SH45.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH46.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH47.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH48.s32
+[NwwDs--] DMA.LD.B32 R128, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R129, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R130, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R131, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R32[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.row, R32[4:2][2:1].f32
+[N-sD---] MMA.323216 R40[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.row, R40[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R23.s32, SH49.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH50.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH51.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH52.s32
+[NwwDs--] DMA.LD.B32 R120, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R121, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R122, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R123, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R48[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R128[1:1][2:1].bf16.row, R48[4:2][2:1].f32
+[N-sD---] MMA.323216 R56[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R130[1:1][2:1].bf16.row, R56[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R23.s32, SH53.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH54.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH55.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH56.s32
+[NwwDs--] DMA.LD.B32 R128, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R129, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R130, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R131, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R64[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.row, R64[4:2][2:1].f32
+[N-sD---] MMA.323216 R72[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.row, R72[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[Ns-D---] MMA.323216 R80[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R128[1:1][2:1].bf16.row, R80[4:2][2:1].f32
+[N-sD---] MMA.323216 R88[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R130[1:1][2:1].bf16.row, R88[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R12.s32, R2.s32, C39.s32
+[NwsD---] INT.ADD R11.s32, R1.s32, C0.s32
+[NswD---] INT.MADD R24.s32, SH40.s32, R12.s32, R11.s32
+[NwsD---] INT.ADD R11.s32, R1.s32, C39.s32
+[NswD---] INT.MADD R25.s32, SH40.s32, R12.s32, R11.s32
+[NwwD-s-] LDMA.RD.B64.BST1 R[116:117], R24, X4, 128, BURST_STRIDE=8
+[N--D-s-] LDMA.RD.B64.BST1 R[118:119], R25, X4, 128, BURST_STRIDE=8
+[NwwDwww] CTRL.NOP
+[NwsD---] FOP.ADD R124.l.bf16, R116, C0
+[NswD---] FOP.ADD R124.h.bf16, R117, C0
+[NwsD---] FOP.ADD R125.l.bf16, R118, C0
+[NswD---] FOP.ADD R125.h.bf16, R119, C0
+[NwsD---] BIT.ROT.LSR R11, C50, R0
+[NswD---] INT.ADD R11.s32, R11.s32, C39.s32
+[NwsD---] INT.ADD R11.s32, R11.s32, R8.s32
+[NswD---] BIT.AND.LSL R12, C33, C59, R0
+[NwsD---] INT.ADD R15.s32, R11.s32, R20.s32
+[NswD---] BIT.ROT.LSL R9, C46, R15
+[NwsD---] INT.ADD R9.s32, R9.s32, R12.s32
+[NswD---] BIT.ROT.LSL R9, C33, R9
+[NwsD---] FOP.MOV R23, R9
+[NswD---] INT.ADD R24.s32, R23.s32, C0.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH40.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH42.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH43.s32
+[NwwDs--] DMA.LD.B32 R120, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R121, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R122, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R123, SH[12:13], R27, _, _, _, _, SH[12:14]
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R23.s32, SH45.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH46.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH47.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH48.s32
+[NwwDs--] DMA.LD.B32 R128, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R129, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R130, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R131, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R32[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.row, R32[4:2][2:1].f32
+[N-sD---] MMA.323216 R40[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.row, R40[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R23.s32, SH49.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH50.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH51.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH52.s32
+[NwwDs--] DMA.LD.B32 R120, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R121, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R122, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R123, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R48[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R128[1:1][2:1].bf16.row, R48[4:2][2:1].f32
+[N-sD---] MMA.323216 R56[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R130[1:1][2:1].bf16.row, R56[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R23.s32, SH53.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH54.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH55.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH56.s32
+[NwwDs--] DMA.LD.B32 R128, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R129, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R130, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R131, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R64[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.row, R64[4:2][2:1].f32
+[N-sD---] MMA.323216 R72[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.row, R72[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[Ns-D---] MMA.323216 R80[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R128[1:1][2:1].bf16.row, R80[4:2][2:1].f32
+[N-sD---] MMA.323216 R88[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R130[1:1][2:1].bf16.row, R88[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] AP.BARRIER LM0
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R8.s32, R8.s32, SH40.s32
+[NwsD---] INT.ADD R10.s32, R8.s32, SH40.s32
+[NswD---] INT.BYP.TLE p0, R10.s32, R19.s32
+[NwwD---] CTRL.BR.ALLP0T KV_LOOP
+[NwsD---] INT.BYP.TGE p0, R8.s32, R19.s32
+[NwwD---] CTRL.BR.ALLP0T OUTPUT
+KV_TAIL:
+[NswD---] INT.ADD R11.s32, R1.s32, R8.s32
+[NwsD---] INT.ADD R15.s32, R11.s32, R20.s32
+[NswD---] BIT.ROT.LSL R9, C46, R15
+[NwsD---] INT.ADD R9.s32, R9.s32, R2.s32
+[NswD---] BIT.ROT.LSL R9, C33, R9
+[NwsD---] FOP.MOV R22, R9
+[NswD---] INT.ADD R24.s32, R22.s32, C0.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH57.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH40.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH58.s32
+[NwwDs--] DMA.LD.B32 R120, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R121, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R122, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R123, SH[8:9], R27, _, _, _, _, SH[8:10]
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH42.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH59.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH43.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH60.s32
+[NwwDs--] DMA.LD.B32 R124, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R125, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R126, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R127, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R144[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.col, 0
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R146[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.col, 0
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH45.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH61.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH46.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH62.s32
+[NwwDs--] DMA.LD.B32 R120, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R121, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R122, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R123, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R148[2:1][1:1].bf16.row, R124[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R150[2:1][1:1].bf16.row, R126[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH47.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH63.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH48.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH64.s32
+[NwwDs--] DMA.LD.B32 R124, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R125, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R126, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R127, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R152[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R154[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH49.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH65.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH50.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH66.s32
+[NwwDs--] DMA.LD.B32 R120, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R121, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R122, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R123, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R156[2:1][1:1].bf16.row, R124[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R158[2:1][1:1].bf16.row, R126[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH51.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH67.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH52.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH68.s32
+[NwwDs--] DMA.LD.B32 R124, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R125, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R126, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R127, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R160[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R162[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH53.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH69.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH54.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH70.s32
+[NwwDs--] DMA.LD.B32 R120, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R121, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R122, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R123, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R164[2:1][1:1].bf16.row, R124[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R166[2:1][1:1].bf16.row, R126[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R24.s32, R22.s32, SH55.s32
+[NwsD---] INT.ADD R25.s32, R22.s32, SH71.s32
+[NswD---] INT.ADD R26.s32, R22.s32, SH56.s32
+[NwsD---] INT.ADD R27.s32, R22.s32, SH72.s32
+[NwwDs--] DMA.LD.B32 R124, SH[8:9], R24, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R125, SH[8:9], R25, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R126, SH[8:9], R26, _, _, _, _, SH[8:10]
+[N--Ds--] DMA.LD.B32 R127, SH[8:9], R27, _, _, _, _, SH[8:10]
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R168[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R170[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[Ns-D---] MMA.323216 R96[4:2][2:1].f32, R172[2:1][1:1].bf16.row, R124[1:1][2:1].bf16.col, R96[4:2][2:1].f32
+[N-sD---] MMA.323216 R128[4:2][2:1].f32, R174[2:1][1:1].bf16.row, R126[1:1][2:1].bf16.col, R128[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R96, R96, R128
+[NwsD---] FOP.ADD R97, R97, R129
+[NswD---] FOP.ADD R98, R98, R130
+[NwsD---] FOP.ADD R99, R99, R131
+[NswD---] FOP.ADD R100, R100, R132
+[NwsD---] FOP.ADD R101, R101, R133
+[NswD---] FOP.ADD R102, R102, R134
+[NwsD---] FOP.ADD R103, R103, R135
+[NswD---] FOP.MUL R96, SH28, R96
+[NwsD---] FOP.MUL R97, SH28, R97
+[NswD---] FOP.MUL R98, SH28, R98
+[NwsD---] FOP.MUL R99, SH28, R99
+[NswD---] FOP.MUL R100, SH28, R100
+[NwsD---] FOP.MUL R101, SH28, R101
+[NswD---] FOP.MUL R102, SH28, R102
+[NwsD---] FOP.MUL R103, SH28, R103
+[NswD---] INT.ADD R12.s32, R4.s32, C0.s32
+[NwsD---] INT.ADD R12.s32, R12.s32, R8.s32
+[NswD---] INT.BYP.TGE p0, R12.s32, R19.s32
+[NwsD---] P0 FOP.MOV R96, SH88
+[NswD---] P0 FOP.MOV R98, SH88
+[NwsD---] P0 FOP.MOV R100, SH88
+[NswD---] P0 FOP.MOV R102, SH88
+[NwsD---] INT.ADD R12.s32, R4.s32, C39.s32
+[NswD---] INT.ADD R12.s32, R12.s32, R8.s32
+[NwsD---] INT.BYP.TGE p0, R12.s32, R19.s32
+[NswD---] P0 FOP.MOV R97, SH88
+[NwsD---] P0 FOP.MOV R99, SH88
+[NswD---] P0 FOP.MOV R101, SH88
+[NwsD---] P0 FOP.MOV R103, SH88
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R96, R97
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] FOP.CMP_MOVC.MAX.TST R116, R116, R104
+[NswD---] FOP.ADD R112, R104, R116.neg
+[NwsD---] FOP.MOV R104, R116
+[NswD---] FOP.ADD R96, R96, R116.neg
+[NwsD---] FOP.ADD R97, R97, R116.neg
+[NwwD--s] AF32.EXP2 R112, R112
+[N--D--s] AF32.EXP2 R96, R96
+[N--D--s] AF32.EXP2 R97, R97
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R116, R96, R97
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] FOP.FMA R108, R108, R112, R116
+[N--D---] FOP.MUL R32, R32, R112
+[N--D---] FOP.MUL R33, R33, R112
+[N--D---] FOP.MUL R40, R40, R112
+[N--D---] FOP.MUL R41, R41, R112
+[N--D---] FOP.MUL R48, R48, R112
+[N--D---] FOP.MUL R49, R49, R112
+[N--D---] FOP.MUL R56, R56, R112
+[N--D---] FOP.MUL R57, R57, R112
+[N--D---] FOP.MUL R64, R64, R112
+[N--D---] FOP.MUL R65, R65, R112
+[N--D---] FOP.MUL R72, R72, R112
+[N--D---] FOP.MUL R73, R73, R112
+[N--D---] FOP.MUL R80, R80, R112
+[N--D---] FOP.MUL R81, R81, R112
+[N--D---] FOP.MUL R88, R88, R112
+[Ns-D---] FOP.MUL R89, R89, R112
+[Nw-D---] CTRL.NOP
+[NwwD-s-] LDMA.WR.B32.BST1 R96, R136, X4, 128, BURST_STRIDE=4
+[N--D-s-] LDMA.WR.B32.BST1 R97, R137, X4, 128, BURST_STRIDE=4
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R98, R99
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] FOP.CMP_MOVC.MAX.TST R116, R116, R105
+[NswD---] FOP.ADD R113, R105, R116.neg
+[NwsD---] FOP.MOV R105, R116
+[NswD---] FOP.ADD R98, R98, R116.neg
+[NwsD---] FOP.ADD R99, R99, R116.neg
+[NwwD--s] AF32.EXP2 R113, R113
+[N--D--s] AF32.EXP2 R98, R98
+[N--D--s] AF32.EXP2 R99, R99
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R116, R98, R99
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] FOP.FMA R109, R109, R113, R116
+[N--D---] FOP.MUL R34, R34, R113
+[N--D---] FOP.MUL R35, R35, R113
+[N--D---] FOP.MUL R42, R42, R113
+[N--D---] FOP.MUL R43, R43, R113
+[N--D---] FOP.MUL R50, R50, R113
+[N--D---] FOP.MUL R51, R51, R113
+[N--D---] FOP.MUL R58, R58, R113
+[N--D---] FOP.MUL R59, R59, R113
+[N--D---] FOP.MUL R66, R66, R113
+[N--D---] FOP.MUL R67, R67, R113
+[N--D---] FOP.MUL R74, R74, R113
+[N--D---] FOP.MUL R75, R75, R113
+[N--D---] FOP.MUL R82, R82, R113
+[N--D---] FOP.MUL R83, R83, R113
+[N--D---] FOP.MUL R90, R90, R113
+[Ns-D---] FOP.MUL R91, R91, R113
+[Nw-D---] CTRL.NOP
+[NwwD-s-] LDMA.WR.B32.BST1 R98, R138, X4, 128, BURST_STRIDE=4
+[N--D-s-] LDMA.WR.B32.BST1 R99, R139, X4, 128, BURST_STRIDE=4
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R100, R101
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] FOP.CMP_MOVC.MAX.TST R116, R116, R106
+[NswD---] FOP.ADD R114, R106, R116.neg
+[NwsD---] FOP.MOV R106, R116
+[NswD---] FOP.ADD R100, R100, R116.neg
+[NwsD---] FOP.ADD R101, R101, R116.neg
+[NwwD--s] AF32.EXP2 R114, R114
+[N--D--s] AF32.EXP2 R100, R100
+[N--D--s] AF32.EXP2 R101, R101
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R116, R100, R101
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] FOP.FMA R110, R110, R114, R116
+[N--D---] FOP.MUL R36, R36, R114
+[N--D---] FOP.MUL R37, R37, R114
+[N--D---] FOP.MUL R44, R44, R114
+[N--D---] FOP.MUL R45, R45, R114
+[N--D---] FOP.MUL R52, R52, R114
+[N--D---] FOP.MUL R53, R53, R114
+[N--D---] FOP.MUL R60, R60, R114
+[N--D---] FOP.MUL R61, R61, R114
+[N--D---] FOP.MUL R68, R68, R114
+[N--D---] FOP.MUL R69, R69, R114
+[N--D---] FOP.MUL R76, R76, R114
+[N--D---] FOP.MUL R77, R77, R114
+[N--D---] FOP.MUL R84, R84, R114
+[N--D---] FOP.MUL R85, R85, R114
+[N--D---] FOP.MUL R92, R92, R114
+[Ns-D---] FOP.MUL R93, R93, R114
+[Nw-D---] CTRL.NOP
+[NwwD-s-] LDMA.WR.B32.BST1 R100, R140, X4, 128, BURST_STRIDE=4
+[N--D-s-] LDMA.WR.B32.BST1 R101, R141, X4, 128, BURST_STRIDE=4
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R102, R103
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.CMP_MOVC.MAX.TST R116, R116, R119
+[NwsD---] FOP.CMP_MOVC.MAX.TST R116, R116, R107
+[NswD---] FOP.ADD R115, R107, R116.neg
+[NwsD---] FOP.MOV R107, R116
+[NswD---] FOP.ADD R102, R102, R116.neg
+[NwsD---] FOP.ADD R103, R103, R116.neg
+[NwwD--s] AF32.EXP2 R115, R115
+[N--D--s] AF32.EXP2 R102, R102
+[N--D--s] AF32.EXP2 R103, R103
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R116, R102, R103
+[NwsD---] SHUFFLE.IDX R119, R116, R28, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R29, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R30, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] SHUFFLE.IDX R119, R116, R31, SH44
+[NswD---] FOP.ADD R116, R116, R119
+[NwsD---] FOP.FMA R111, R111, R115, R116
+[N--D---] FOP.MUL R38, R38, R115
+[N--D---] FOP.MUL R39, R39, R115
+[N--D---] FOP.MUL R46, R46, R115
+[N--D---] FOP.MUL R47, R47, R115
+[N--D---] FOP.MUL R54, R54, R115
+[N--D---] FOP.MUL R55, R55, R115
+[N--D---] FOP.MUL R62, R62, R115
+[N--D---] FOP.MUL R63, R63, R115
+[N--D---] FOP.MUL R70, R70, R115
+[N--D---] FOP.MUL R71, R71, R115
+[N--D---] FOP.MUL R78, R78, R115
+[N--D---] FOP.MUL R79, R79, R115
+[N--D---] FOP.MUL R86, R86, R115
+[N--D---] FOP.MUL R87, R87, R115
+[N--D---] FOP.MUL R94, R94, R115
+[Ns-D---] FOP.MUL R95, R95, R115
+[Nw-D---] CTRL.NOP
+[NwwD-s-] LDMA.WR.B32.BST1 R102, R142, X4, 128, BURST_STRIDE=4
+[N--D-s-] LDMA.WR.B32.BST1 R103, R143, X4, 128, BURST_STRIDE=4
+[NwwDwww] CTRL.NOP
+[NswD---] AP.BARRIER LM0
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R12.s32, R2.s32, C0.s32
+[NwsD---] INT.ADD R11.s32, R1.s32, C0.s32
+[NswD---] INT.MADD R24.s32, SH40.s32, R12.s32, R11.s32
+[NwsD---] INT.ADD R11.s32, R1.s32, C39.s32
+[NswD---] INT.MADD R25.s32, SH40.s32, R12.s32, R11.s32
+[NwwD-s-] LDMA.RD.B64.BST1 R[116:117], R24, X4, 128, BURST_STRIDE=8
+[N--D-s-] LDMA.RD.B64.BST1 R[118:119], R25, X4, 128, BURST_STRIDE=8
+[NwwDwww] CTRL.NOP
+[NwsD---] FOP.ADD R124.l.bf16, R116, C0
+[NswD---] FOP.ADD R124.h.bf16, R117, C0
+[NwsD---] FOP.ADD R125.l.bf16, R118, C0
+[NswD---] FOP.ADD R125.h.bf16, R119, C0
+[NwsD---] BIT.ROT.LSR R11, C50, R0
+[NswD---] INT.ADD R11.s32, R11.s32, C0.s32
+[NwsD---] INT.ADD R11.s32, R11.s32, R8.s32
+[NswD---] BIT.AND.LSL R12, C33, C59, R0
+[NwsD---] INT.ADD R15.s32, R11.s32, R20.s32
+[NswD---] BIT.ROT.LSL R9, C46, R15
+[NwsD---] INT.ADD R9.s32, R9.s32, R12.s32
+[NswD---] BIT.ROT.LSL R9, C33, R9
+[NwsD---] FOP.MOV R23, R9
+[NswD---] INT.ADD R24.s32, R23.s32, C0.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH40.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH42.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH43.s32
+[NwwDs--] DMA.LD.B32 R120, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R121, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R122, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R123, SH[12:13], R27, _, _, _, _, SH[12:14]
+[NwwDwww] CTRL.NOP
+[NswD---] INT.BYP.TGE p0, R11.s32, R19.s32
+[NwsD---] P0 FOP.MOV R120, C0
+[NswD---] P0 FOP.MOV R121, C0
+[NwsD---] P0 FOP.MOV R122, C0
+[NswD---] P0 FOP.MOV R123, C0
+[NwsD---] INT.ADD R24.s32, R23.s32, SH45.s32
+[NswD---] INT.ADD R25.s32, R23.s32, SH46.s32
+[NwsD---] INT.ADD R26.s32, R23.s32, SH47.s32
+[NswD---] INT.ADD R27.s32, R23.s32, SH48.s32
+[NwwDs--] DMA.LD.B32 R128, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R129, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R130, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R131, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R32[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.row, R32[4:2][2:1].f32
+[N-sD---] MMA.323216 R40[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.row, R40[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NwsD---] P0 FOP.MOV R128, C0
+[NswD---] P0 FOP.MOV R129, C0
+[NwsD---] P0 FOP.MOV R130, C0
+[NswD---] P0 FOP.MOV R131, C0
+[NwsD---] INT.ADD R24.s32, R23.s32, SH49.s32
+[NswD---] INT.ADD R25.s32, R23.s32, SH50.s32
+[NwsD---] INT.ADD R26.s32, R23.s32, SH51.s32
+[NswD---] INT.ADD R27.s32, R23.s32, SH52.s32
+[NwwDs--] DMA.LD.B32 R120, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R121, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R122, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R123, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R48[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R128[1:1][2:1].bf16.row, R48[4:2][2:1].f32
+[N-sD---] MMA.323216 R56[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R130[1:1][2:1].bf16.row, R56[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NwsD---] P0 FOP.MOV R120, C0
+[NswD---] P0 FOP.MOV R121, C0
+[NwsD---] P0 FOP.MOV R122, C0
+[NswD---] P0 FOP.MOV R123, C0
+[NwsD---] INT.ADD R24.s32, R23.s32, SH53.s32
+[NswD---] INT.ADD R25.s32, R23.s32, SH54.s32
+[NwsD---] INT.ADD R26.s32, R23.s32, SH55.s32
+[NswD---] INT.ADD R27.s32, R23.s32, SH56.s32
+[NwwDs--] DMA.LD.B32 R128, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R129, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R130, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R131, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R64[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.row, R64[4:2][2:1].f32
+[N-sD---] MMA.323216 R72[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.row, R72[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NwsD---] P0 FOP.MOV R128, C0
+[NswD---] P0 FOP.MOV R129, C0
+[NwsD---] P0 FOP.MOV R130, C0
+[NswD---] P0 FOP.MOV R131, C0
+[Ns-D---] MMA.323216 R80[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R128[1:1][2:1].bf16.row, R80[4:2][2:1].f32
+[N-sD---] MMA.323216 R88[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R130[1:1][2:1].bf16.row, R88[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R12.s32, R2.s32, C39.s32
+[NswD---] INT.ADD R11.s32, R1.s32, C0.s32
+[NwsD---] INT.MADD R24.s32, SH40.s32, R12.s32, R11.s32
+[NswD---] INT.ADD R11.s32, R1.s32, C39.s32
+[NwsD---] INT.MADD R25.s32, SH40.s32, R12.s32, R11.s32
+[NwwD-s-] LDMA.RD.B64.BST1 R[116:117], R24, X4, 128, BURST_STRIDE=8
+[N--D-s-] LDMA.RD.B64.BST1 R[118:119], R25, X4, 128, BURST_STRIDE=8
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.ADD R124.l.bf16, R116, C0
+[NwsD---] FOP.ADD R124.h.bf16, R117, C0
+[NswD---] FOP.ADD R125.l.bf16, R118, C0
+[NwsD---] FOP.ADD R125.h.bf16, R119, C0
+[NswD---] BIT.ROT.LSR R11, C50, R0
+[NwsD---] INT.ADD R11.s32, R11.s32, C39.s32
+[NswD---] INT.ADD R11.s32, R11.s32, R8.s32
+[NwsD---] BIT.AND.LSL R12, C33, C59, R0
+[NswD---] INT.ADD R15.s32, R11.s32, R20.s32
+[NwsD---] BIT.ROT.LSL R9, C46, R15
+[NswD---] INT.ADD R9.s32, R9.s32, R12.s32
+[NwsD---] BIT.ROT.LSL R9, C33, R9
+[NswD---] FOP.MOV R23, R9
+[NwsD---] INT.ADD R24.s32, R23.s32, C0.s32
+[NswD---] INT.ADD R25.s32, R23.s32, SH40.s32
+[NwsD---] INT.ADD R26.s32, R23.s32, SH42.s32
+[NswD---] INT.ADD R27.s32, R23.s32, SH43.s32
+[NwwDs--] DMA.LD.B32 R120, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R121, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R122, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R123, SH[12:13], R27, _, _, _, _, SH[12:14]
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.BYP.TGE p0, R11.s32, R19.s32
+[NswD---] P0 FOP.MOV R120, C0
+[NwsD---] P0 FOP.MOV R121, C0
+[NswD---] P0 FOP.MOV R122, C0
+[NwsD---] P0 FOP.MOV R123, C0
+[NswD---] INT.ADD R24.s32, R23.s32, SH45.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH46.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH47.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH48.s32
+[NwwDs--] DMA.LD.B32 R128, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R129, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R130, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R131, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R32[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.row, R32[4:2][2:1].f32
+[N-sD---] MMA.323216 R40[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.row, R40[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] P0 FOP.MOV R128, C0
+[NwsD---] P0 FOP.MOV R129, C0
+[NswD---] P0 FOP.MOV R130, C0
+[NwsD---] P0 FOP.MOV R131, C0
+[NswD---] INT.ADD R24.s32, R23.s32, SH49.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH50.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH51.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH52.s32
+[NwwDs--] DMA.LD.B32 R120, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R121, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R122, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R123, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R48[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R128[1:1][2:1].bf16.row, R48[4:2][2:1].f32
+[N-sD---] MMA.323216 R56[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R130[1:1][2:1].bf16.row, R56[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] P0 FOP.MOV R120, C0
+[NwsD---] P0 FOP.MOV R121, C0
+[NswD---] P0 FOP.MOV R122, C0
+[NwsD---] P0 FOP.MOV R123, C0
+[NswD---] INT.ADD R24.s32, R23.s32, SH53.s32
+[NwsD---] INT.ADD R25.s32, R23.s32, SH54.s32
+[NswD---] INT.ADD R26.s32, R23.s32, SH55.s32
+[NwsD---] INT.ADD R27.s32, R23.s32, SH56.s32
+[NwwDs--] DMA.LD.B32 R128, SH[12:13], R24, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R129, SH[12:13], R25, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R130, SH[12:13], R26, _, _, _, _, SH[12:14]
+[N--Ds--] DMA.LD.B32 R131, SH[12:13], R27, _, _, _, _, SH[12:14]
+[Ns-D---] MMA.323216 R64[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R120[1:1][2:1].bf16.row, R64[4:2][2:1].f32
+[N-sD---] MMA.323216 R72[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R122[1:1][2:1].bf16.row, R72[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] P0 FOP.MOV R128, C0
+[NwsD---] P0 FOP.MOV R129, C0
+[NswD---] P0 FOP.MOV R130, C0
+[NwsD---] P0 FOP.MOV R131, C0
+[Ns-D---] MMA.323216 R80[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R128[1:1][2:1].bf16.row, R80[4:2][2:1].f32
+[N-sD---] MMA.323216 R88[4:2][2:1].f32, R124[2:1][1:1].bf16.row, R130[1:1][2:1].bf16.row, R88[4:2][2:1].f32
+[NwwDwww] CTRL.NOP
+[NswD---] AP.BARRIER LM0
+[NwwDwww] CTRL.NOP
+OUTPUT:
+[NswD---] FOP.CMP_MOVC.MAX.TST R108, R108, C1
+[NwsD---] AF32.RCP R108, R108
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R11.s32, R3.s32, C0.s32
+[NwsD---] INT.ADD R11.s32, R11.s32, R5.s32
+[NswD---] BIT.ROT.LSL R9, SH39, R11
+[NwsD---] BIT.ROT.LSL R10, C46, R6
+[NswD---] INT.ADD R9.s32, R9.s32, R10.s32
+[NwsD---] INT.ADD R9.s32, R9.s32, R4.s32
+[NswD---] BIT.ROT.LSL R9, C33, R9
+[NwsD---] FOP.MOV R21, R9
+[NswD---] INT.BYP.TL p0, R11.s32, R18.s32
+[NwsD---] INT.ADD R9.s32, R21.s32, C0.s32
+[NswD---] FOP.MUL R32.l.bf16, R32, R108
+[NwwD--s] P0 DMA.ST.B16 R32.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH40.s32
+[NswD---] FOP.MUL R33.l.bf16, R33, R108
+[NwwD--s] P0 DMA.ST.B16 R33.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH42.s32
+[NswD---] FOP.MUL R40.l.bf16, R40, R108
+[NwwD--s] P0 DMA.ST.B16 R40.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH43.s32
+[NswD---] FOP.MUL R41.l.bf16, R41, R108
+[NwwD--s] P0 DMA.ST.B16 R41.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH45.s32
+[NswD---] FOP.MUL R48.l.bf16, R48, R108
+[NwwD--s] P0 DMA.ST.B16 R48.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH46.s32
+[NswD---] FOP.MUL R49.l.bf16, R49, R108
+[NwwD--s] P0 DMA.ST.B16 R49.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH47.s32
+[NswD---] FOP.MUL R56.l.bf16, R56, R108
+[NwwD--s] P0 DMA.ST.B16 R56.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH48.s32
+[NswD---] FOP.MUL R57.l.bf16, R57, R108
+[NwwD--s] P0 DMA.ST.B16 R57.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH49.s32
+[NswD---] FOP.MUL R64.l.bf16, R64, R108
+[NwwD--s] P0 DMA.ST.B16 R64.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH50.s32
+[NswD---] FOP.MUL R65.l.bf16, R65, R108
+[NwwD--s] P0 DMA.ST.B16 R65.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH51.s32
+[NswD---] FOP.MUL R72.l.bf16, R72, R108
+[NwwD--s] P0 DMA.ST.B16 R72.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH52.s32
+[NswD---] FOP.MUL R73.l.bf16, R73, R108
+[NwwD--s] P0 DMA.ST.B16 R73.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH53.s32
+[NswD---] FOP.MUL R80.l.bf16, R80, R108
+[NwwD--s] P0 DMA.ST.B16 R80.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH54.s32
+[NswD---] FOP.MUL R81.l.bf16, R81, R108
+[NwwD--s] P0 DMA.ST.B16 R81.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH55.s32
+[NswD---] FOP.MUL R88.l.bf16, R88, R108
+[NwwD--s] P0 DMA.ST.B16 R88.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH56.s32
+[NswD---] FOP.MUL R89.l.bf16, R89, R108
+[NwwD--s] P0 DMA.ST.B16 R89.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] FOP.CMP_MOVC.MAX.TST R109, R109, C1
+[NswD---] AF32.RCP R109, R109
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R11.s32, R3.s32, C46.s32
+[NswD---] INT.ADD R11.s32, R11.s32, R5.s32
+[NwsD---] BIT.ROT.LSL R9, SH39, R11
+[NswD---] BIT.ROT.LSL R10, C46, R6
+[NwsD---] INT.ADD R9.s32, R9.s32, R10.s32
+[NswD---] INT.ADD R9.s32, R9.s32, R4.s32
+[NwsD---] BIT.ROT.LSL R9, C33, R9
+[NswD---] FOP.MOV R21, R9
+[NwsD---] INT.BYP.TL p0, R11.s32, R18.s32
+[NswD---] INT.ADD R9.s32, R21.s32, C0.s32
+[NwsD---] FOP.MUL R34.l.bf16, R34, R109
+[NwwD--s] P0 DMA.ST.B16 R34.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH40.s32
+[NwsD---] FOP.MUL R35.l.bf16, R35, R109
+[NwwD--s] P0 DMA.ST.B16 R35.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH42.s32
+[NwsD---] FOP.MUL R42.l.bf16, R42, R109
+[NwwD--s] P0 DMA.ST.B16 R42.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH43.s32
+[NwsD---] FOP.MUL R43.l.bf16, R43, R109
+[NwwD--s] P0 DMA.ST.B16 R43.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH45.s32
+[NwsD---] FOP.MUL R50.l.bf16, R50, R109
+[NwwD--s] P0 DMA.ST.B16 R50.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH46.s32
+[NwsD---] FOP.MUL R51.l.bf16, R51, R109
+[NwwD--s] P0 DMA.ST.B16 R51.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH47.s32
+[NwsD---] FOP.MUL R58.l.bf16, R58, R109
+[NwwD--s] P0 DMA.ST.B16 R58.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH48.s32
+[NwsD---] FOP.MUL R59.l.bf16, R59, R109
+[NwwD--s] P0 DMA.ST.B16 R59.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH49.s32
+[NwsD---] FOP.MUL R66.l.bf16, R66, R109
+[NwwD--s] P0 DMA.ST.B16 R66.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH50.s32
+[NwsD---] FOP.MUL R67.l.bf16, R67, R109
+[NwwD--s] P0 DMA.ST.B16 R67.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH51.s32
+[NwsD---] FOP.MUL R74.l.bf16, R74, R109
+[NwwD--s] P0 DMA.ST.B16 R74.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH52.s32
+[NwsD---] FOP.MUL R75.l.bf16, R75, R109
+[NwwD--s] P0 DMA.ST.B16 R75.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH53.s32
+[NwsD---] FOP.MUL R82.l.bf16, R82, R109
+[NwwD--s] P0 DMA.ST.B16 R82.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH54.s32
+[NwsD---] FOP.MUL R83.l.bf16, R83, R109
+[NwwD--s] P0 DMA.ST.B16 R83.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH55.s32
+[NwsD---] FOP.MUL R90.l.bf16, R90, R109
+[NwwD--s] P0 DMA.ST.B16 R90.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH56.s32
+[NwsD---] FOP.MUL R91.l.bf16, R91, R109
+[NwwD--s] P0 DMA.ST.B16 R91.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] FOP.CMP_MOVC.MAX.TST R110, R110, C1
+[NwsD---] AF32.RCP R110, R110
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R11.s32, R3.s32, C39.s32
+[NwsD---] INT.ADD R11.s32, R11.s32, R5.s32
+[NswD---] BIT.ROT.LSL R9, SH39, R11
+[NwsD---] BIT.ROT.LSL R10, C46, R6
+[NswD---] INT.ADD R9.s32, R9.s32, R10.s32
+[NwsD---] INT.ADD R9.s32, R9.s32, R4.s32
+[NswD---] BIT.ROT.LSL R9, C33, R9
+[NwsD---] FOP.MOV R21, R9
+[NswD---] INT.BYP.TL p0, R11.s32, R18.s32
+[NwsD---] INT.ADD R9.s32, R21.s32, C0.s32
+[NswD---] FOP.MUL R36.l.bf16, R36, R110
+[NwwD--s] P0 DMA.ST.B16 R36.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH40.s32
+[NswD---] FOP.MUL R37.l.bf16, R37, R110
+[NwwD--s] P0 DMA.ST.B16 R37.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH42.s32
+[NswD---] FOP.MUL R44.l.bf16, R44, R110
+[NwwD--s] P0 DMA.ST.B16 R44.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH43.s32
+[NswD---] FOP.MUL R45.l.bf16, R45, R110
+[NwwD--s] P0 DMA.ST.B16 R45.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH45.s32
+[NswD---] FOP.MUL R52.l.bf16, R52, R110
+[NwwD--s] P0 DMA.ST.B16 R52.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH46.s32
+[NswD---] FOP.MUL R53.l.bf16, R53, R110
+[NwwD--s] P0 DMA.ST.B16 R53.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH47.s32
+[NswD---] FOP.MUL R60.l.bf16, R60, R110
+[NwwD--s] P0 DMA.ST.B16 R60.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH48.s32
+[NswD---] FOP.MUL R61.l.bf16, R61, R110
+[NwwD--s] P0 DMA.ST.B16 R61.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH49.s32
+[NswD---] FOP.MUL R68.l.bf16, R68, R110
+[NwwD--s] P0 DMA.ST.B16 R68.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH50.s32
+[NswD---] FOP.MUL R69.l.bf16, R69, R110
+[NwwD--s] P0 DMA.ST.B16 R69.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH51.s32
+[NswD---] FOP.MUL R76.l.bf16, R76, R110
+[NwwD--s] P0 DMA.ST.B16 R76.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH52.s32
+[NswD---] FOP.MUL R77.l.bf16, R77, R110
+[NwwD--s] P0 DMA.ST.B16 R77.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH53.s32
+[NswD---] FOP.MUL R84.l.bf16, R84, R110
+[NwwD--s] P0 DMA.ST.B16 R84.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH54.s32
+[NswD---] FOP.MUL R85.l.bf16, R85, R110
+[NwwD--s] P0 DMA.ST.B16 R85.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH55.s32
+[NswD---] FOP.MUL R92.l.bf16, R92, R110
+[NwwD--s] P0 DMA.ST.B16 R92.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R9.s32, R21.s32, SH56.s32
+[NswD---] FOP.MUL R93.l.bf16, R93, R110
+[NwwD--s] P0 DMA.ST.B16 R93.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NwsD---] FOP.CMP_MOVC.MAX.TST R111, R111, C1
+[NswD---] AF32.RCP R111, R111
+[NwwDwww] CTRL.NOP
+[NwsD---] INT.ADD R11.s32, R3.s32, C48.s32
+[NswD---] INT.ADD R11.s32, R11.s32, R5.s32
+[NwsD---] BIT.ROT.LSL R9, SH39, R11
+[NswD---] BIT.ROT.LSL R10, C46, R6
+[NwsD---] INT.ADD R9.s32, R9.s32, R10.s32
+[NswD---] INT.ADD R9.s32, R9.s32, R4.s32
+[NwsD---] BIT.ROT.LSL R9, C33, R9
+[NswD---] FOP.MOV R21, R9
+[NwsD---] INT.BYP.TL p0, R11.s32, R18.s32
+[NswD---] INT.ADD R9.s32, R21.s32, C0.s32
+[NwsD---] FOP.MUL R38.l.bf16, R38, R111
+[NwwD--s] P0 DMA.ST.B16 R38.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH40.s32
+[NwsD---] FOP.MUL R39.l.bf16, R39, R111
+[NwwD--s] P0 DMA.ST.B16 R39.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH42.s32
+[NwsD---] FOP.MUL R46.l.bf16, R46, R111
+[NwwD--s] P0 DMA.ST.B16 R46.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH43.s32
+[NwsD---] FOP.MUL R47.l.bf16, R47, R111
+[NwwD--s] P0 DMA.ST.B16 R47.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH45.s32
+[NwsD---] FOP.MUL R54.l.bf16, R54, R111
+[NwwD--s] P0 DMA.ST.B16 R54.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH46.s32
+[NwsD---] FOP.MUL R55.l.bf16, R55, R111
+[NwwD--s] P0 DMA.ST.B16 R55.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH47.s32
+[NwsD---] FOP.MUL R62.l.bf16, R62, R111
+[NwwD--s] P0 DMA.ST.B16 R62.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH48.s32
+[NwsD---] FOP.MUL R63.l.bf16, R63, R111
+[NwwD--s] P0 DMA.ST.B16 R63.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH49.s32
+[NwsD---] FOP.MUL R70.l.bf16, R70, R111
+[NwwD--s] P0 DMA.ST.B16 R70.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH50.s32
+[NwsD---] FOP.MUL R71.l.bf16, R71, R111
+[NwwD--s] P0 DMA.ST.B16 R71.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH51.s32
+[NwsD---] FOP.MUL R78.l.bf16, R78, R111
+[NwwD--s] P0 DMA.ST.B16 R78.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH52.s32
+[NwsD---] FOP.MUL R79.l.bf16, R79, R111
+[NwwD--s] P0 DMA.ST.B16 R79.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH53.s32
+[NwsD---] FOP.MUL R86.l.bf16, R86, R111
+[NwwD--s] P0 DMA.ST.B16 R86.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH54.s32
+[NwsD---] FOP.MUL R87.l.bf16, R87, R111
+[NwwD--s] P0 DMA.ST.B16 R87.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH55.s32
+[NwsD---] FOP.MUL R94.l.bf16, R94, R111
+[NwwD--s] P0 DMA.ST.B16 R94.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+[NswD---] INT.ADD R9.s32, R21.s32, SH56.s32
+[NwsD---] FOP.MUL R95.l.bf16, R95, R111
+[NwwD--s] P0 DMA.ST.B16 R95.l, SH[0:1], R9
+[NwwDwww] CTRL.NOP
+FINISH:
+[NwwD---] CTRL.END
+
+.Lfunc_end0:
+    .size   mate_fa_d256_mp22, .Lfunc_end0-mate_fa_d256_mp22
+
+
+
+
+    .type   llvm.mtgpu.kernel.mate_fa_d256_mp22.sm,@object
+    .local  llvm.mtgpu.kernel.mate_fa_d256_mp22.sm
+    .comm   llvm.mtgpu.kernel.mate_fa_d256_mp22.sm,4096,4
+
+    .addrsig
+    .mtgpu_metadata.start
+---
+mtgpu.kernels:
+  - .arch_id:        220
+    .args:
+      - .argBase:
+          .address_space:  0
+          .align:          16
+          .isVolatile:     false
+          .layout:         0
+          .name:           out
+          .offset:         0
+          .reg_bank:       3
+          .size:           16
+          .type:           25
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          16
+          .isVolatile:     false
+          .layout:         0
+          .name:           q
+          .offset:         4
+          .reg_bank:       3
+          .size:           16
+          .type:           25
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          16
+          .isVolatile:     false
+          .layout:         0
+          .name:           k
+          .offset:         8
+          .reg_bank:       3
+          .size:           16
+          .type:           25
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          16
+          .isVolatile:     false
+          .layout:         0
+          .name:           v
+          .offset:         12
+          .reg_bank:       3
+          .size:           16
+          .type:           25
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          16
+          .isVolatile:     false
+          .layout:         0
+          .name:           cuq
+          .offset:         16
+          .reg_bank:       3
+          .size:           16
+          .type:           25
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          16
+          .isVolatile:     false
+          .layout:         0
+          .name:           usedk
+          .offset:         20
+          .reg_bank:       3
+          .size:           16
+          .type:           25
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          4
+          .isVolatile:     false
+          .layout:         0
+          .name:           sq
+          .offset:         24
+          .reg_bank:       3
+          .size:           4
+          .type:           6
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          4
+          .isVolatile:     false
+          .layout:         0
+          .name:           sk
+          .offset:         25
+          .reg_bank:       3
+          .size:           4
+          .type:           6
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          4
+          .isVolatile:     false
+          .layout:         0
+          .name:           hq
+          .offset:         26
+          .reg_bank:       3
+          .size:           4
+          .type:           6
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          4
+          .isVolatile:     false
+          .layout:         0
+          .name:           hkv
+          .offset:         27
+          .reg_bank:       3
+          .size:           4
+          .type:           6
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          4
+          .isVolatile:     false
+          .layout:         0
+          .name:           scale_log2
+          .offset:         28
+          .reg_bank:       3
+          .size:           4
+          .type:           8
+        .input_mode:     0
+        .kind:           18
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           prog_size
+          .offset:         29
+          .reg_bank:       3
+          .size:           4
+          .type:           7
+        .input_mode:     0
+        .kind:           35
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           prog_addr
+          .offset:         30
+          .reg_bank:       3
+          .size:           8
+          .type:           10
+        .input_mode:     0
+        .kind:           33
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           gridDim_x
+          .offset:         32
+          .reg_bank:       3
+          .size:           4
+          .type:           0
+        .input_mode:     0
+        .kind:           13
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           gridDim_y
+          .offset:         33
+          .reg_bank:       3
+          .size:           4
+          .type:           0
+        .input_mode:     0
+        .kind:           14
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           gridDim_z
+          .offset:         34
+          .reg_bank:       3
+          .size:           4
+          .type:           0
+        .input_mode:     0
+        .kind:           15
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           blockDim_x
+          .offset:         35
+          .reg_bank:       3
+          .size:           4
+          .type:           0
+        .input_mode:     0
+        .kind:           9
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           Global Spill Base
+          .offset:         36
+          .reg_bank:       3
+          .size:           8
+          .type:           18
+        .input_mode:     0
+        .kind:           19
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           Core Number
+          .offset:         38
+          .reg_bank:       3
+          .size:           4
+          .type:           7
+        .input_mode:     0
+        .kind:           23
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           blockIdx_x
+          .offset:         4
+          .reg_bank:       5
+          .size:           4
+          .type:           0
+        .input_mode:     0
+        .kind:           5
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           blockIdx_y
+          .offset:         5
+          .reg_bank:       5
+          .size:           4
+          .type:           0
+        .input_mode:     0
+        .kind:           6
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           blockIdx_z
+          .offset:         6
+          .reg_bank:       5
+          .size:           4
+          .type:           0
+        .input_mode:     0
+        .kind:           7
+      - .argBase:
+          .address_space:  0
+          .align:          0
+          .isVolatile:     false
+          .layout:         0
+          .name:           threadIdx_x
+          .offset:         0
+          .reg_bank:       2
+          .size:           4
+          .type:           0
+        .input_mode:     0
+        .kind:           1
+    .async_bar_count: 0
+    .attr_reg_count: 1
+    .attrs:          {}
+    .barrier_coef:   0
+    .clusterX:       0
+    .clusterY:       0
+    .clusterZ:       0
+    .coef_reg_count: 0
+    .const_calc_kernel: !str ''
+    .constcalc_temp_reg_count: 0
+    .global_atomic_count: 0
+    .has_barrier:    true
+    .has_cluster_barrier: false
+    .has_texture: false
+    .has_sqmma_conv:    false
+    .imm_info:
+      .offset:         39
+      .reg_bank:       3
+      .size:           200
+      .values:
+        - 11
+        - 32
+        - 63
+        - 64
+        - 96
+        - 127
+        - 128
+        - 160
+        - 192
+        - 224
+        - 256
+        - 288
+        - 320
+        - 352
+        - 384
+        - 416
+        - 448
+        - 480
+        - 8192
+        - 8224
+        - 8256
+        - 8288
+        - 8320
+        - 8352
+        - 8384
+        - 8416
+        - 8448
+        - 8480
+        - 8512
+        - 8544
+        - 8576
+        - 8608
+        - 8640
+        - 8672
+        - 65568
+        - 65600
+        - 65632
+        - 65664
+        - 65696
+        - 65728
+        - 65760
+        - 65792
+        - 65824
+        - 65856
+        - 65888
+        - 65920
+        - 65952
+        - 65984
+        - 66016
+        - 4286578687
+    .indirect_call_flag: false
+    .call_flag: false
+    .internal_reg_count: 0
+    .local_mem_used_in_cluster: 0
+    .max_block_size: 1
+    .name:           mate_fa_d256_mp22
+    .private_memory_size: 0
+    .shared_memory_size: 4224
+    .shared_reg_count: 89
+    .slot_reg_count: 0
+    .temp_reg_count: 176
+    .wave_mode:      0
+mtgpu.version:
+  - 2
+  - 2
+...
+
+    .mtgpu_metadata.end
