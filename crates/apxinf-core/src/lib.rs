@@ -36,12 +36,17 @@ pub enum Device {
     /// crates reject it through the fallback arm they already have for
     /// non-CUDA devices.
     Hip(usize),
+    /// A Moore Threads GPU addressed through MUSA.
+    Musa(usize),
     Metal(usize),
 }
 
 impl Device {
     pub fn is_gpu(&self) -> bool {
-        matches!(self, Device::Cuda(_) | Device::Hip(_) | Device::Metal(_))
+        matches!(
+            self,
+            Device::Cuda(_) | Device::Hip(_) | Device::Musa(_) | Device::Metal(_)
+        )
     }
 }
 
@@ -51,6 +56,7 @@ impl std::fmt::Display for Device {
             Device::Cpu => write!(f, "cpu"),
             Device::Cuda(id) => write!(f, "cuda:{id}"),
             Device::Hip(id) => write!(f, "hip:{id}"),
+            Device::Musa(id) => write!(f, "musa:{id}"),
             Device::Metal(id) => write!(f, "metal:{id}"),
         }
     }
