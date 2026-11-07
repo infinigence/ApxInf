@@ -10,6 +10,7 @@ extern "C" {
     pub fn apx_mlx_memory_stats(active: *mut usize, cache: *mut usize, peak: *mut usize) -> i32;
     pub fn apx_mlx_reset_peak_memory() -> i32;
     pub fn apx_mlx_clear_cache() -> i32;
+    pub fn apx_mlx_set_cache_limit(limit: usize, previous: *mut usize) -> i32;
     pub fn apx_mlx_device_info(
         index: i32,
         name: *mut *const c_char,
@@ -40,6 +41,7 @@ extern "C" {
         len: usize,
     ) -> i32;
     pub fn apx_mlx_eval(stream: Handle, arrays: *const *const c_void, count: usize) -> i32;
+    pub fn apx_mlx_async_eval(arrays: *const *const c_void, count: usize) -> i32;
     pub fn apx_mlx_op(
         stream: Handle,
         op: i32,

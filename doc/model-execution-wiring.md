@@ -21,6 +21,13 @@ prepare static metadata, submit fixed control flow and receive results. CPU
 intermediate computation and D2H/H2D round trips remain private correctness
 scaffolds and must be replaced before port completion.
 
+The requesting Metal maintainer accepted a limited fixed-profile Clef GPU+ANE
+boundary on 2026-10-19. Its native Core ML execution and permitted host work
+are defined only by the [scoped handoff decision](coreml-ane.md#scoped-host-handoff-decision).
+All placement, transfer, numerical, performance, preparation, resource and
+lifetime evidence there remains required. This does not relax GPU-only or
+CUDA acceptance, authorize other host operators or qualify either composition.
+
 For CUDA targets, fixed profiles must support CUDA Graph acceleration. Prefer one graph from
 canonical device inputs to outputs. For a VLA where concrete blockers prevent
 one graph, the accepted fallback partition covers Vision, Language and Action
