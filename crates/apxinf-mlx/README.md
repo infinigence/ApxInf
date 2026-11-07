@@ -59,6 +59,10 @@ entry from the compiler cache of the thread that created it. Dropping a Rust
 `Compiled` uses that ownership path;
 the bridge does not clear other functions' compiler caches.
 
+`Stream::async_eval` enqueues evaluation and returns, so host work such as a
+Neural Engine prediction overlaps the GPU; a later evaluation, download or
+dependent operation waits for it.
+
 `Stream::counters()` snapshots cumulative trace callbacks, explicit upload and
 download bytes, and evaluation boundaries (including downloads). Cloned streams
 share counters; separate logical streams do not. Byte counters report bridge
@@ -131,8 +135,12 @@ Kernel templates take dtype, integer and boolean arguments (`TemplateArg`).
 An integer template is a specialization fact: each distinct value builds and
 caches a separate Metal pipeline the first time it is used.
 
-The Clef-derived fusions are `Q4TransposeDecode`, `PadRowsF16`,
-`SplitF16Gemm`, `GatedDeltaRecurrence` and `HalfSplitRope`. They decode affine Q4 group-64
-weights to FP16 for one call only; they keep no decoded weight resident.
+The Clef fusions are `Q4TransposeDecode`, `PadRowsF16`, `SplitF16Gemm`,
+`GatedDeltaRecurrence`, `HalfSplitRope`, `Q4RowDecodeF16`, `F16Gemm`,
+`F16GateSwiglu` and `CausalDepthwiseConv`, with the `GatedDeltaLayout::EightLanes`
+recurrence. They decode affine Q4 group-64 weights to FP16 for one call
+only; they keep no decoded weight resident. `F16GateSwiglu` includes MLX
+0.32.3's Steel loader, MMA and transform headers as installed (MIT). The two
+recurrence layouts change only the reduction order, not the operation.
 Their tests compare each kernel with MLX operators or a host reference on
 small shapes. They do not qualify the Clef model.

@@ -96,6 +96,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "apxinf-coreml"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "cc",
+ "half",
+ "prost",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "apxinf-cuda-new"
 version = "0.1.0"
 dependencies = [
@@ -144,6 +156,7 @@ name = "apxinf-model"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-coreml",
  "apxinf-cuda-new",
  "apxinf-hip",
  "apxinf-loader",
@@ -152,6 +165,7 @@ dependencies = [
  "apxinf-tokenizer",
  "half",
  "once_cell",
+ "prost",
  "serde",
  "serde_json",
  "sha2",

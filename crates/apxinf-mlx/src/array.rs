@@ -56,6 +56,12 @@ pub fn memory_stats() -> Result<MemoryStats> {
 pub fn reset_peak_memory() -> Result<()> {
     check(unsafe { ffi::apx_mlx_reset_peak_memory() })
 }
+/// Cap the process-wide MLX allocator cache at `limit` bytes; returns the previous limit.
+pub fn set_cache_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_cache_limit(limit, &mut previous) })?;
+    Ok(previous)
+}
 /// Release cached allocator buffers process-wide. Active arrays remain valid.
 /// Synchronize first when measuring release, and use an isolated test process.
 pub fn clear_cache() -> Result<()> {
@@ -180,6 +186,14 @@ impl Stream {
         let p = self.inputs(arrays.iter())?;
         self.record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
         check(unsafe { ffi::apx_mlx_eval(self.raw(), p.as_ptr(), p.len()) })
+    }
+    /// Enqueues evaluation of `arrays` and returns without waiting, so host
+    /// work (such as a Neural Engine prediction) overlaps the device. A later
+    /// [`eval`](Self::eval), download or dependent evaluation waits for it.
+    pub fn async_eval(&self, arrays: &[Array]) -> Result<()> {
+        let p = self.inputs(arrays.iter())?;
+        self.record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_async_eval(p.as_ptr(), p.len()) })
     }
     fn raw(&self) -> ffi::Handle {
         self.0.raw.as_ptr()
@@ -366,6 +380,19 @@ impl Array {
         check(unsafe {
             ffi::apx_mlx_array_read(self.stream().raw(), self.raw(), out.as_mut_ptr(), out.len())
         })?;
+        self.stream()
+            .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
+        Ok(out)
+    }
+    /// Like [`to_bytes`](Self::to_bytes), but waits only for this array's
+    /// computation, not for other work queued on its stream, and adds no
+    /// operation: work submitted later with [`Stream::async_eval`] keeps
+    /// running. The array must be row-contiguous (for example a kernel output).
+    pub fn to_bytes_ready(&self) -> Result<Vec<u8>> {
+        let mut out = vec![0; self.numel() * self.dtype().size_in_bytes()];
+        self.stream()
+            .record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_array_read_ready(self.raw(), out.as_mut_ptr(), out.len()) })?;
         self.stream()
             .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
         Ok(out)

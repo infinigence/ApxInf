@@ -180,6 +180,65 @@ impl Q4TransposeDecode {
     }
 }
 
+/// Decodes an affine Q4 group-64 weight `[N, K]` (packed U32 `[N, K / 8]`,
+/// BF16 scales and biases `[N, K / 64]`) into row-major FP16 `[N, K]`, one
+/// packed word per thread: `scale * q + bias` in FP16 with the scale and bias
+/// rounded to FP16 first, the expression of MLX `dequantize` with FP16 scales.
+pub struct Q4RowDecodeF16 {
+    kernel: MetalKernel,
+}
+
+impl Q4RowDecodeF16 {
+    pub fn new(stream: &Stream) -> Result<Self> {
+        Ok(Self {
+            kernel: MetalKernel::new(
+                stream,
+                "apxinf_q4g64_row_decode_f16",
+                &["weight", "scales", "biases"],
+                &["out"],
+                include_str!("../native/q4_row_decode_f16.metal"),
+                "",
+            )?,
+        })
+    }
+
+    pub fn call(&self, weight: &Array, scales: &Array, biases: &Array) -> Result<Array> {
+        let [rows, words] = *weight.shape() else {
+            return Err(Error::Contract("Q4 row decode weight must be rank 2"));
+        };
+        let k = check_q4_decode(rows, words, 0, rows)?;
+        if weight.dtype() != MlxDType::U32
+            || [scales, biases]
+                .iter()
+                .any(|a| a.shape() != [rows, k / 64] || a.dtype() != MlxDType::BF16)
+        {
+            return Err(Error::Contract(
+                "Q4 row decode requires U32 [N, K/8] with BF16 [N, K/64] scales and biases",
+            ));
+        }
+        check_index_extent(
+            rows,
+            k,
+            u32::MAX as usize,
+            "Q4 row decode output index exceeds u32",
+        )?;
+        // SAFETY: one thread per packed word `i < N * K / 8`; it reads word i
+        // and group `i / 8`, both inside the guarded `[N, K/8]` and `[N, K/64]`
+        // inputs (eight words per 64-wide group), and writes two FP16 vectors
+        // at `2 i` and `2 i + 1`, which cover output elements `8 i .. 8 i + 8`.
+        let out = unsafe {
+            self.kernel.call(
+                &[weight.clone(), scales.clone(), biases.clone()],
+                &[(&[rows, k], MlxDType::F16)],
+                [rows * words, 1, 1],
+                [256, 1, 1],
+                &[],
+            )?
+        };
+        Ok(out.into_iter().next().unwrap())
+    }
+}
+
 /// Number of rows after padding `tokens` up to a multiple of 64.
 /// Returns an error if the padded count cannot fit in `usize`.
 pub fn padded_rows(tokens: usize) -> Result<usize> {
@@ -275,7 +334,11 @@ impl SplitF16Gemm {
         })
     }
 
-    fn check(x: &Array, tokens: usize, weight: &Array) -> Result<(usize, usize, usize, usize)> {
+    pub(crate) fn check(
+        x: &Array,
+        tokens: usize,
+        weight: &Array,
+    ) -> Result<(usize, usize, usize, usize)> {
         let [1, padded, k] = *x.shape() else {
             return Err(Error::Contract("split GEMM input must be [1, P, K]"));
         };
@@ -337,6 +400,53 @@ impl SplitF16Gemm {
                     ("K", TemplateArg::Int(k as i32)),
                     ("NW", TemplateArg::Int(half as i32)),
                     ("N", TemplateArg::Int(full as i32)),
+                ],
+            )?
+        };
+        Ok(out.into_iter().next().unwrap())
+    }
+}
+
+/// FP16 `[1, P, K] x [K, N]` GEMM with FP32 accumulation and BF16 output
+/// `[1, T, N]`, in one pass: four SIMD groups of 32 x 32 per 64 x 64 tile
+/// with Steel's unpipelined K loop. Rows at and after `T` are
+/// padding and are never stored.
+pub struct F16Gemm {
+    kernel: MetalKernel,
+}
+
+impl F16Gemm {
+    pub fn new(stream: &Stream) -> Result<Self> {
+        Ok(Self {
+            kernel: MetalKernel::new(
+                stream,
+                "apxinf_f16_gemm_bf16_steel_loop",
+                &["x", "weight"],
+                &["out"],
+                include_str!("../native/f16_gemm_bf16_steel.metal"),
+                include_str!("../native/simdgroup_mma.h"),
+            )?,
+        })
+    }
+
+    pub fn call(&self, x: &Array, tokens: usize, weight: &Array) -> Result<Array> {
+        let (padded, k, n, _) = SplitF16Gemm::check(x, tokens, weight)?;
+        // SAFETY: each 128-thread group (four SIMD groups of 32 x 32) owns
+        // the 64 x 64 tile at rows `64 * group.y < P` and columns
+        // `64 * group.x < N`. A and B loads index rows < P of x and rows < K,
+        // columns < N of the weight, K a multiple of 16 so every half4 load
+        // stays in a row; stores are limited to rows < T of `[1, T, N]` and
+        // tiles do not overlap. The shared check also bounds `[T, 2 N]`.
+        let out = unsafe {
+            self.kernel.call(
+                &[x.clone(), weight.clone()],
+                &[(&[1, tokens, n], MlxDType::BF16)],
+                [n / 64 * 128, padded / 64, 1],
+                [128, 1, 1],
+                &[
+                    ("T", TemplateArg::Int(tokens as i32)),
+                    ("K", TemplateArg::Int(k as i32)),
+                    ("N", TemplateArg::Int(n as i32)),
                 ],
             )?
         };
