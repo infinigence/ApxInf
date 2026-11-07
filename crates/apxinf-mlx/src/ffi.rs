@@ -10,6 +10,11 @@ extern "C" {
     pub fn apx_mlx_memory_stats(active: *mut usize, cache: *mut usize, peak: *mut usize) -> i32;
     pub fn apx_mlx_reset_peak_memory() -> i32;
     pub fn apx_mlx_clear_cache() -> i32;
+    pub fn apx_mlx_device_info(
+        index: i32,
+        name: *mut *const c_char,
+        architecture: *mut *const c_char,
+    ) -> i32;
     pub fn apx_mlx_array_new(
         stream: Handle,
         shape: *const i32,
@@ -70,6 +75,18 @@ extern "C" {
         bits: i32,
         outputs: *mut Handle,
     ) -> i32;
+    pub fn apx_mlx_safetensors_load(
+        path: *const c_char,
+        out: *mut Handle,
+        count: *mut usize,
+    ) -> i32;
+    pub fn apx_mlx_safetensors_entry(
+        loaded: *const c_void,
+        index: usize,
+        name: *mut *const c_char,
+        array: *mut Handle,
+    ) -> i32;
+    pub fn apx_mlx_safetensors_free(loaded: Handle);
     pub fn apx_mlx_metal_new(
         name: *const c_char,
         source: *const c_char,

@@ -1,5 +1,10 @@
 //! Safe, shape-bound device fusions with explicit rounding contracts.
 pub use crate::bf16_qk_table_rope::Bf16QkTableRope;
+pub use crate::gated_delta::GatedDeltaRecurrence;
+pub use crate::half_split_rope::HalfSplitRope;
+pub use crate::q4_f16::{
+    padded_rows, PadRowsF16, Q4DecodeArithmetic, Q4TransposeDecode, SplitF16Gemm,
+};
 pub use crate::qk_norm_rope::QkNormRope;
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
