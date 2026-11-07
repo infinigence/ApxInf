@@ -6,9 +6,9 @@ an external model provider. Initial target: Qwen/Qwen3-0.6B revision
 `c1899de289a04d12100db370d81485cdf75e47ca`, original BF16 weights, batch one,
 Apple Silicon macOS.
 
-Checkpoint loading admits only the 0.6B geometry above and caps the request
-profile at 2048 tokens, even though the checkpoint advertises 40960. Other
-geometry and larger contexts require a separately verified migration profile.
+Checkpoint loading admits only the 0.6B geometry above. The request limit is
+40960 total tokens, including the prompt and reserved output. Other geometry,
+RoPE scaling and contexts beyond the checkpoint limit are rejected.
 
 `config.rs` reads the explicit `head_dim` (128 for this checkpoint), independently
 of `hidden_size / num_attention_heads` (64). Sliding-window attention, RoPE
@@ -40,8 +40,12 @@ compilation boundary and valid-length attention remain explicit.
 
 `Qwen3Model::prepare(prompt_len, max_new_tokens)` allocates a bounded KV profile
 and warms its sequence shapes before inference. Capacity rounds up to 256 tokens
-within the smaller checkpoint/2048-token profile limit. Growing capacity
-requires a fresh request.
+within the smaller checkpoint/40960-token limit. A new request can grow or
+shrink this allocation after reset. RoPE tables use the same capacity.
+Compiled decode slices attention to the next 256-token boundary of the active
+prefix and masks unwritten positions. Requests with capacity at most 2048 keep
+their original attention shape. Preparation warms every admitted one-row
+attention bucket, including bucket crossings in direct `forward` calls.
 `LlmTrait::prewarm_decode` invokes this preparation for the shared generation
 driver; failures invalidate the next fallible operation. Direct callers must
 prepare every sequence length they use. `reset` returns to
@@ -58,6 +62,19 @@ in chunks of at most 512, evaluating only updated KV; then consume the last
 token and return `[1,vocab_size]`. The chunk head is never evaluated. The shared
 generation driver uses this hook, while `forward` continues
 to return every row. All prompt chunk shapes are warmed by `prepare`.
+
+Long generation prepares the 512-token chunks and final row. It does not prepare
+a full prompt-sized `forward` above 2048 rows; that call fails explicitly.
+This avoids allocating a large `[prompt,vocabulary]` result during generation.
+
+On a 16 GiB host, the BF16 KV budget is
+`2 * 28 layers * 8 KV heads * 128 channels * 2 bytes = 112 KiB/token`.
+At 40960 tokens the live cache is 4.375 GiB, both RoPE tables total 20 MiB,
+and one shared immutable reset buffer is 80 MiB. These are tensor sizes,
+excluding weights, allocator cache and temporary arrays. Request execution
+releases old state handles before evaluation so native buffer reuse is possible.
+The qualification runs enforce a 12 GiB physical process limit, leaving room
+for macOS and the other jobs; the context limit is not a reservation of that RAM.
 
 Load through `AutoModel` with `model_name=metal_qwen3` (or checkpoint detection),
 `Device::Metal(0)`, BF16, and the desired `model_variant`. The native CLI uses:
