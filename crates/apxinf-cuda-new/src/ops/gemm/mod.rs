@@ -10,6 +10,8 @@ mod gemm_swiglu;
 mod gemv;
 pub(crate) mod nvfp4_scales;
 mod observer;
+mod weight;
+pub use weight::RepackedWeight;
 
 pub use contracts::{
     GemmArgs, GemmNumerics, GemmPolicy, GemmQuantization, GemmWeightLayout, WeightVersion,

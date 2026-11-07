@@ -152,6 +152,29 @@ higher-rank convolutional weights require semantics-aware flattening.
 Keep source weights, device weights, and precision-specific packed weights as
 separate concepts when their lifecycles differ. Perform stable transformations
 once during load, not in every inference.
+For cuda-new GEMMs that may repack, retain `RepackedWeight` beside the model's
+weight allocation and attach it to every GEMM consumer. The first preparation
+selects a kernel, repacks through a local temporary, writes back to the same
+allocation, and releases the temporary; later executions reuse that layout across
+IO addresses and shapes. Do not read committed bytes as a canonical tensor or
+create independent layout states for aliases of the same allocation. Reload
+weights after a failed layout commit, and retire old graph readers before
+replacing storage.
+cuda-new rejects independent states for the same allocation and ordinary
+canonical GEMM bindings to adopted storage, including views. Dropping the state
+does not make its surviving tensor aliases canonical again. This enforcement
+does not make raw tensor readback/export layout-aware.
+For weights shared across shapes or semantics, use `with_layout_cache` with an
+explicit extra-weight budget when their optimal implementations require different
+physical layouts. It caches CPU selection metadata separately; executions own
+physical-storage leases and the model retains weak extra-layout entries. When
+all readers of the base retire, prepare may transition that allocation in place.
+Concurrent incompatible consumers share extra layouts, reclaimed with their
+last execution/graph. Preparation never overwrites a live reader's bytes. A zero budget fixes canonical before
+any execution. Benchmark every consumer and both preparation orders, including
+prepare time, live/peak allocations and steady replay; a layout-aware fallback
+establishes correctness but not performance parity.
+
 
 ### Model mathematics
 

@@ -21,7 +21,9 @@ dependencies = [
 # A live Pi05Policy binds the PyO3 model handle (Phase 1).
 policy = ["apxinf-py>=0.1.0"]
 # The OpenPI-compatible websocket server (apxinf.serving) needs the transport deps.
-serving = ["msgpack>=1.0.5", "websockets>=14.0"]
+# 15 is the floor because `scripts/pi05_remote_client.py` connects with
+# `proxy=` named, which the sync client only accepts from 15.0 on.
+serving = ["msgpack>=1.0.5", "websockets>=15.0"]
 # SentencePiece remains a test-only reference for native differential checks.
 test = ["pytest>=7", "sentencepiece>=0.1.99"]
 

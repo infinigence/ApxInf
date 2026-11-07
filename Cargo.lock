@@ -83,6 +83,7 @@ dependencies = [
  "apxinf-loader",
  "apxinf-mlx",
  "apxinf-model",
+ "apxinf-musa",
  "apxinf-tokenizer",
  "clap",
  "half",
@@ -153,6 +154,7 @@ dependencies = [
  "apxinf-hip",
  "apxinf-loader",
  "apxinf-mlx",
+ "apxinf-musa",
  "apxinf-tokenizer",
  "half",
  "once_cell",
@@ -160,6 +162,17 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "apxinf-musa"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "bytemuck",
+ "half",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

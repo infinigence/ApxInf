@@ -62,6 +62,8 @@ Orin devices, and supports BF16, FP8 and INT8 precisions.
           </li>
           <li>Apple Metal
           </li>
+          <li>Moore Threads MUSA
+          </li>
         </ul>
       </td>
     </tr>
