@@ -255,14 +255,15 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 
 ### Where backend-native model code lives
 
-A model written directly against one backend's native API (cuda-new, MLX, HIP),
-rather than through `dyn Backend`, is a **port**. Ports follow one rule, whether
-or not another backend already implements the same family:
+A model written directly against one backend's native API (cuda-new, MLX, HIP,
+MUSA), rather than through `dyn Backend`, is a **port**. Ports follow one rule,
+whether or not another backend already implements the same family:
 
 1. **A port is a top-level module `<backend>_<family>/`** in `apxinf-model/src/`,
-   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`. For example
-   `metal_qwen3/` is the Metal port of Qwen3; a CUDA port of the same family would
-   be `cuda_qwen3/`, beside it rather than inside it.
+   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`, `musa_`. For
+   example `metal_qwen3/` is the Metal port of Qwen3, `musa_pi05/` is the MUSA
+   port of PI0.5, and a CUDA port of the same family would be `cuda_qwen3/`,
+   beside it rather than inside it.
 2. **A port is self-contained.** It depends only on the core crates
    (`apxinf-core`, `apxinf-loader`), its backend crate, and the cross-model
    interfaces (`vla`, `llm_trait`, `auto`/`registry`, `LoadOptions`). It never
@@ -297,6 +298,7 @@ renamed as part of unrelated work.
 | Family / contract | Current organization and limits |
 | --- | --- |
 | PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| PI0.5 / `VlaRuntime`, MUSA | Independent `musa_pi05/` (`config.rs`, `math.rs`, `load.rs`, `model/`, `model_runner/`, `weights/`); `model_variant` selects `auto` (resolves to BF16), `bf16`, `int8_dynamic` or `int8_dynamic_no_encode`, while `fp8_static` is rejected before weights load; eager and captured execution, a prepared-shape ledger and a load-time tactic database. See [MUSA backend](musa-backend.md). |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | `model/` (`WallossModel` + `ModelVariant` over BF16 and dynamic FP8, `blocks/`), `model_runner/` (`WallossModelRunner`, `prepare.rs`: explicit preparation policy/status, capture during preparation, one implicit plan replaced on shape change), `weights/`; per-request grids via `VlaMetadata::image_grid_thw` kept in the family's plan key; model-reported workspace backed by the config-only `workspace.rs` budget; rejected host requests preserve the cached plan; `check_walloss_module_boundaries.py`. See [WallOSS](walloss.md). |
