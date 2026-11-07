@@ -42,8 +42,9 @@ use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::{
-    AutoModel, DecisionInput, ImageLayout, LoadOptions, LoadedModel, ModelPrecision, Observation,
-    Pi05Config, SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout, LoadOptions,
+    LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer, SyntheticWeights,
+    VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
@@ -67,7 +68,11 @@ impl HfTokenizer {
     }
 
     #[pyo3(name = "encode_with_special_tokens", signature = (text, add_special_tokens))]
-    fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> PyResult<Vec<u32>> {
+    fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> PyResult<Vec<u32>> {
         self.inner
             .encode_with_special_tokens(text, add_special_tokens)
             .map_err(runtime_err)
@@ -122,7 +127,7 @@ fn parse_device(spec: &str) -> PyResult<Device> {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
                 PyValueError::new_err(format!(
-                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0` or `metal:0`)"
+                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0`, `musa:0` or `metal:0`)"
                 ))
             })?;
             (kind, index)
@@ -132,10 +137,11 @@ fn parse_device(spec: &str) -> PyResult<Device> {
     match kind {
         "cuda" => Ok(Device::Cuda(index)),
         "hip" => Ok(Device::Hip(index)),
+        "musa" => Ok(Device::Musa(index)),
         "metal" | "mlx" => Ok(Device::Metal(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|metal|mlx|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|musa|metal|mlx|cpu)"
         ))),
     }
 }
@@ -148,6 +154,17 @@ fn parse_precision(spec: &str) -> PyResult<ModelPrecision> {
         "int8" | "w8a8" => Ok(ModelPrecision::W8A8),
         other => Err(PyValueError::new_err(format!(
             "apxinf_py.load: unknown precision `{other}` (expected auto|fp8|bf16|int8)"
+        ))),
+    }
+}
+
+fn parse_execution_policy(spec: &str) -> PyResult<ExecutionPolicy> {
+    match spec {
+        "eager" => Ok(ExecutionPolicy::Eager),
+        "prefer-graph" => Ok(ExecutionPolicy::PreferGraph),
+        "require-graph" => Ok(ExecutionPolicy::RequireGraph),
+        other => Err(PyValueError::new_err(format!(
+            "apxinf_py.load: unknown execution `{other}` (expected eager|prefer-graph|require-graph)"
         ))),
     }
 }
@@ -240,8 +257,45 @@ impl PackedRgbU8 {
     }
 }
 
-/// Decision model runner (d3-mini, etc.). Loads via `AutoModel` and exposes a
-/// single `decide(token_ids, candidate_count)` method that returns scored codes.
+fn decision_output_to_python<'py>(
+    py: Python<'py>,
+    answer: &DecisionOutput,
+) -> PyResult<Bound<'py, PyDict>> {
+    let scores = PyList::empty_bound(py);
+    for score in &answer.scores {
+        let score_dict = PyDict::new_bound(py);
+        score_dict.set_item("code", &score.code)?;
+        score_dict.set_item("token_id", score.token_id)?;
+        score_dict.set_item("probability", score.probability)?;
+        scores.append(score_dict)?;
+    }
+    let result = PyDict::new_bound(py);
+    result.set_item("selected_index", answer.selected_index)?;
+    result.set_item("scores", scores)?;
+    Ok(result)
+}
+
+fn schema_answer_to_python<'py>(
+    py: Python<'py>,
+    answer: &SchemaDecisionAnswer,
+) -> PyResult<Bound<'py, PyDict>> {
+    let scores = PyList::empty_bound(py);
+    for score in &answer.scores {
+        let score_dict = PyDict::new_bound(py);
+        score_dict.set_item("code", &score.code)?;
+        score_dict.set_item("token_id", py.None())?;
+        score_dict.set_item("probability", score.probability)?;
+        scores.append(score_dict)?;
+    }
+    let result = PyDict::new_bound(py);
+    result.set_item("question_id", &answer.question_id)?;
+    result.set_item("selected_index", answer.selected_index)?;
+    result.set_item("scores", scores)?;
+    Ok(result)
+}
+
+/// Decision model runner (d3-mini, Clef, etc.). Loads via `AutoModel` and exposes
+/// encoded-prompt and schema requests through the same model handle.
 #[pyclass(unsendable)]
 pub struct DecisionRunner {
     model: LoadedModel,
@@ -253,8 +307,8 @@ pub struct DecisionRunner {
 impl DecisionRunner {
     /// Load a decision model checkpoint.
     ///
-    /// * `model_path` — directory containing decision_config.json and tokenizer.json.
-    /// * `device` — `cuda:N` (default `cuda:0`). d3 is CUDA-only.
+    /// * `model_path` — checkpoint directory detected by `AutoModel`.
+    /// * `device` — defaults to `cuda:0`; Clef requires `metal:N` and `mlx` support.
     /// * `autotune` — tune missing GEMM recipes from the first request.
     /// * `tuning_dir` — directory to persist tuning recipes.
     #[staticmethod]
@@ -273,7 +327,7 @@ impl DecisionRunner {
         };
         let model = AutoModel::load_model(device, &model_path, &options).map_err(runtime_err)?;
         // Verify this is actually a decision model.
-        model.decision_code_names().map_err(|_| {
+        model.decision_capabilities().map_err(|_| {
             PyValueError::new_err(format!(
                 "apxinf_py.DecisionRunner.load: {:?} is not a decision model",
                 model_path
@@ -308,22 +362,20 @@ impl DecisionRunner {
             .model
             .decide(DecisionInput::text(ids, candidate_count))
             .map_err(runtime_err)?;
+        Python::with_gil(|py| Ok(decision_output_to_python(py, &output)?.into()))
+    }
+
+    fn decide_schema(&mut self, request_json: &str) -> PyResult<PyObject> {
+        let schema = DecisionSchema::from_json(request_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let output = self.model.decide_schema(&schema).map_err(runtime_err)?;
         Python::with_gil(|py| {
-            let score_dicts: Vec<PyObject> = output
-                .scores
-                .iter()
-                .map(|score| {
-                    let d = PyDict::new_bound(py);
-                    d.set_item("code", &score.code).unwrap();
-                    d.set_item("token_id", score.token_id).unwrap();
-                    d.set_item("probability", score.probability).unwrap();
-                    d.into()
-                })
-                .collect();
-            let scores = PyList::new_bound(py, &score_dicts);
+            let answers = PyList::empty_bound(py);
+            for answer in &output.answers {
+                answers.append(schema_answer_to_python(py, answer)?)?;
+            }
             let result = PyDict::new_bound(py);
-            result.set_item("selected_index", output.selected_index)?;
-            result.set_item("scores", scores)?;
+            result.set_item("answers", answers)?;
             Ok(result.into())
         })
     }
@@ -966,8 +1018,7 @@ impl ModelRunner {
         rng: RngKey,
         grids: Option<&[[u32; 3]]>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let request =
-            VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
+        let request = VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
         let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
         self.action_array(py, flat)
     }
@@ -996,8 +1047,7 @@ impl ModelRunner {
         rng: RngKey,
         grids: Option<&[[u32; 3]]>,
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, BTreeMap<String, f64>)> {
-        let request =
-            VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
+        let request = VlaRequest::generated_with_metadata(&observation, rng, grid_metadata(grids));
         let (flat, profile) = self
             .model
             .infer_host_f32_profiled(&request)
@@ -1030,6 +1080,12 @@ impl ModelRunner {
     ///   the same weights load and run at the requested chunk length.
     /// * `num_views` - serve fewer cameras than the checkpoint declares.
     ///
+    /// `execution` selects how the MUSA PI0.5 runtime builds the plans it
+    /// caches for repeated inference: `"eager"` never captures, `"prefer-graph"`
+    /// (the default when omitted) captures and falls back to eager, and
+    /// `"require-graph"` turns a capture failure into an error. The mode a run
+    /// actually took is reported by [`Self::execution_mode`].
+    ///
     /// `num_views` exists because a deployment often has fewer cameras than the
     /// checkpoint was trained with. Dropping the trailing views is numerically
     /// equivalent to openpi zero-padding and masking them - a masked view is
@@ -1038,7 +1094,7 @@ impl ModelRunner {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None, weight_layout_budget_bytes=None, execution=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -1055,6 +1111,8 @@ impl ModelRunner {
         sampling_seed: u64,
         assets: Option<BTreeMap<String, PathBuf>>,
         model_variant: Option<String>,
+        weight_layout_budget_bytes: Option<usize>,
+        execution: Option<&str>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -1097,12 +1155,14 @@ impl ModelRunner {
             model_name: Some(model.to_owned()),
             precision: parse_precision(precision)?,
             model_variant,
+            weight_layout_budget_bytes,
             calibration_path: calibration,
             tuning_path: tactics,
             assets: assets.unwrap_or_default(),
             autotune,
             num_views,
             config,
+            execution_policy: execution.map(parse_execution_policy).transpose()?,
             ..LoadOptions::default()
         };
         let loaded = AutoModel::load_model(device, &path, &options).map_err(runtime_err)?;
@@ -1812,6 +1872,18 @@ impl ModelRunner {
         Ok(self.model.vla().map_err(runtime_err)?.model_variant())
     }
 
+    /// Execution path the runtime is actually on: `"unprepared"`, `"eager"`,
+    /// `"graph"`, `"invalidated"` or `"runtime-managed"`.
+    ///
+    /// Ask after a run, not after loading: the plan is built on first use. A
+    /// `"eager"` here after asking for `"require-graph"` cannot happen - that
+    /// combination fails the run - while after `"prefer-graph"` it means the
+    /// capture fell back.
+    #[getter]
+    fn execution_mode(&self) -> PyResult<&'static str> {
+        Ok(self.model.vla().map_err(runtime_err)?.execution_mode())
+    }
+
     #[getter]
     fn action_dim(&self) -> usize {
         self.action_shape()[1]
@@ -1885,11 +1957,241 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
 
+    mod decision {
+        use super::*;
+        use apxinf_model::{
+            CodeDecisionRuntime, DecisionModel, DecisionOutput, DecisionSchema, DecisionScore,
+            LlmCapabilities, SchemaDecisionAnswer, SchemaDecisionOutput, SchemaDecisionRuntime,
+            SchemaDecisionScore,
+        };
+
+        const REQUEST: &str = include_str!("../../../tests/fixtures/decision/schema.json");
+
+        struct StubCodeRuntime {
+            output: Option<apxinf_core::Result<DecisionOutput>>,
+        }
+
+        impl CodeDecisionRuntime for StubCodeRuntime {
+            fn capabilities(&self) -> LlmCapabilities {
+                LlmCapabilities::TEXT_ONLY
+            }
+
+            fn decide(&mut self, input: DecisionInput<'_>) -> apxinf_core::Result<DecisionOutput> {
+                assert_eq!(input.token_ids, [17, 42]);
+                assert!(input.image.is_none());
+                assert_eq!(input.candidate_count, 2);
+                self.output.take().expect("unexpected inference call")
+            }
+
+            fn code_names(&self) -> &[String] {
+                &[]
+            }
+
+            fn token_ids(&self) -> &[u32] {
+                &[]
+            }
+        }
+
+        struct StubSchemaRuntime {
+            schema: DecisionSchema,
+            output: Option<apxinf_core::Result<SchemaDecisionOutput>>,
+        }
+
+        impl SchemaDecisionRuntime for StubSchemaRuntime {
+            fn capabilities(&self) -> LlmCapabilities {
+                LlmCapabilities::TEXT_ONLY
+            }
+
+            fn decide_schema(
+                &mut self,
+                schema: &DecisionSchema,
+            ) -> apxinf_core::Result<SchemaDecisionOutput> {
+                assert_eq!(*schema, self.schema);
+                assert_eq!(
+                    schema
+                        .questions
+                        .iter()
+                        .map(|question| question.id.as_str())
+                        .collect::<Vec<_>>(),
+                    ["zeta", "alpha"]
+                );
+                self.output.take().expect("unexpected schema call")
+            }
+        }
+
+        fn schema_runner(output: apxinf_core::Result<SchemaDecisionOutput>) -> DecisionRunner {
+            DecisionRunner {
+                model: LoadedModel::Decision(DecisionModel::Schema(Box::new(StubSchemaRuntime {
+                    schema: DecisionSchema::from_json(REQUEST).unwrap(),
+                    output: Some(output),
+                }))),
+                device: Device::Cpu,
+                model_path: PathBuf::from("/unused-checkpoint"),
+            }
+        }
+
+        fn schema_output() -> SchemaDecisionOutput {
+            SchemaDecisionOutput {
+                answers: vec![
+                    SchemaDecisionAnswer {
+                        question_id: "zeta".into(),
+                        selected_index: 1,
+                        scores: vec![
+                            SchemaDecisionScore {
+                                code: "go".into(),
+                                probability: 0.25,
+                            },
+                            SchemaDecisionScore {
+                                code: "stay".into(),
+                                probability: 0.75,
+                            },
+                        ],
+                    },
+                    SchemaDecisionAnswer {
+                        question_id: "alpha".into(),
+                        selected_index: 1,
+                        scores: vec![
+                            SchemaDecisionScore {
+                                code: "low".into(),
+                                probability: 0.125,
+                            },
+                            SchemaDecisionScore {
+                                code: "medium".into(),
+                                probability: 0.5,
+                            },
+                            SchemaDecisionScore {
+                                code: "high".into(),
+                                probability: 0.375,
+                            },
+                        ],
+                    },
+                ],
+            }
+        }
+
+        #[test]
+        fn schema_dispatch_preserves_question_order_and_scores() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let runner = Py::new(py, schema_runner(Ok(schema_output()))).unwrap();
+                let kwargs = PyDict::new_bound(py);
+                kwargs.set_item("request_json", REQUEST).unwrap();
+                let result = runner
+                    .bind(py)
+                    .call_method("decide_schema", (), Some(&kwargs))
+                    .unwrap();
+                let locals = PyDict::new_bound(py);
+                locals.set_item("result", result).unwrap();
+                py.run_bound(
+                    "assert result == {'answers': [\n\
+                        {'question_id': 'zeta', 'selected_index': 1, 'scores': [\n\
+                            {'code': 'go', 'token_id': None, 'probability': 0.25},\n\
+                            {'code': 'stay', 'token_id': None, 'probability': 0.75}]},\n\
+                        {'question_id': 'alpha', 'selected_index': 1, 'scores': [\n\
+                            {'code': 'low', 'token_id': None, 'probability': 0.125},\n\
+                            {'code': 'medium', 'token_id': None, 'probability': 0.5},\n\
+                            {'code': 'high', 'token_id': None, 'probability': 0.375}]}]}",
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            });
+        }
+
+        #[test]
+        fn encoded_decision_keeps_existing_output() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let output = DecisionOutput {
+                    selected_index: 1,
+                    scores: vec![
+                        DecisionScore {
+                            code: "A".into(),
+                            token_id: 101,
+                            probability: 0.25,
+                        },
+                        DecisionScore {
+                            code: "B".into(),
+                            token_id: 102,
+                            probability: 0.75,
+                        },
+                    ],
+                };
+                let runner = Py::new(
+                    py,
+                    DecisionRunner {
+                        model: LoadedModel::Decision(DecisionModel::Code(Box::new(
+                            StubCodeRuntime {
+                                output: Some(Ok(output)),
+                            },
+                        ))),
+                        device: Device::Cpu,
+                        model_path: PathBuf::from("/unused-checkpoint"),
+                    },
+                )
+                .unwrap();
+                let token_ids = vec![17u32, 42].into_pyarray_bound(py);
+                let result = runner
+                    .bind(py)
+                    .call_method1("decide", (token_ids, 2))
+                    .unwrap();
+                let locals = PyDict::new_bound(py);
+                locals.set_item("result", result).unwrap();
+                py.run_bound(
+                    "assert result == {'selected_index': 1, 'scores': [\n\
+                        {'code': 'A', 'token_id': 101, 'probability': 0.25},\n\
+                        {'code': 'B', 'token_id': 102, 'probability': 0.75}]}",
+                    None,
+                    Some(&locals),
+                )
+                .unwrap();
+            });
+        }
+
+        #[test]
+        fn schema_errors_reach_python() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let runner = Py::new(
+                    py,
+                    schema_runner(Err(apxinf_core::Error::Other(
+                        "schema rejected by runtime".into(),
+                    ))),
+                )
+                .unwrap();
+                for invalid in [
+                    "not JSON",
+                    r#"{"state": {}, "questions": {}}"#,
+                    r#"{"state": {}, "questions": {"q": {"type": "choice"}, "q": {"type": "score"}}}"#,
+                    r#"{"state": {}, "questions": {"q": {"type": "choice", "unknown": true}}}"#,
+                ] {
+                    let error = runner
+                        .bind(py)
+                        .call_method1("decide_schema", (invalid,))
+                        .unwrap_err();
+                    assert!(error.is_instance_of::<PyValueError>(py), "{error}");
+                    assert!(error.to_string().contains("decision request:"), "{error}");
+                }
+                let error = runner
+                    .bind(py)
+                    .call_method1("decide_schema", (REQUEST,))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyRuntimeError>(py), "{error}");
+                assert!(
+                    error.to_string().contains("schema rejected by runtime"),
+                    "{error}"
+                );
+            });
+        }
+    }
+
     #[test]
     fn parses_device_forms() {
         assert!(matches!(parse_device("cuda").unwrap(), Device::Cuda(0)));
         assert!(matches!(parse_device("hip").unwrap(), Device::Hip(0)));
         assert!(matches!(parse_device("hip:2").unwrap(), Device::Hip(2)));
+        assert!(matches!(parse_device("musa").unwrap(), Device::Musa(0)));
+        assert!(matches!(parse_device("musa:1").unwrap(), Device::Musa(1)));
         assert!(matches!(parse_device("cuda:1").unwrap(), Device::Cuda(1)));
         assert!(matches!(parse_device("cpu").unwrap(), Device::Cpu));
         assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));

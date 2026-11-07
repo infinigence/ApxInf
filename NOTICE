@@ -1,5 +1,34 @@
 The upstream ApxInf license remains Apache-2.0 (see LICENSE).
 
+Vendored MUSA code under crates/apxinf-musa/kernels/ retains the following
+notices. Paths are relative to the repository root.
+
+MATE (MUSA AI Tensor Engine), https://github.com/MooreThreads/mate
+Apache License 2.0; full text at
+crates/apxinf-musa/kernels/mutlass_fmha/LICENSES/LICENSE.mate.txt.
+  - crates/apxinf-musa/kernels/mutlass_fmha/mate/data/include/mate/ is tag
+    v0.2.7 verbatim.
+  - crates/apxinf-musa/kernels/asm/fa_d256_mp22*.asm are rendered from MATE's
+    flash-attention assembly sources.
+
+MUTLASS (Moore Threads), https://github.com/MooreThreads/mutlass
+Copyright (c) 2024-2024 Moore Threads Technology Co., Ltd. BSD-3-Clause; full
+text at crates/apxinf-musa/kernels/mutlass_fmha/LICENSES/LICENSE.mutlass.txt.
+Individual headers also carry NVIDIA's BSD-3-Clause notices.
+  - crates/apxinf-musa/kernels/mutlass_fmha/mate/data/mutlass/include/ is
+    commit 78b34951 verbatim, the revision MATE v0.2.7 pins.
+
+gemm-mate, Apache License 2.0; full text at
+crates/apxinf-musa/kernels/asm/LICENSE.gemm-mate.
+  - crates/apxinf-musa/kernels/asm/asm_bf16bf16gemm_{nt,nn}_tc_*.asm come from
+    it at base revision 3b2909364fc48450f8f004dde3902b1cf67aadbf.
+
+muDNN (Moore Threads). These images are rendered from muDNN's ComputeAsmKern
+templates, and several carry local patches; the README beside them records each
+one's provenance.
+  - crates/apxinf-musa/kernels/asm/qint8_*.asm
+  - crates/apxinf-musa/kernels/asm/asm_bf16bf16gemm_nn_tc_*_{normal,wide}_{mfast,nfast}.asm
+
 Native MLX model and kernel adaptations retain the following notices.
 
 EngineTailor: https://github.com/qhy991/EngineTailor
@@ -15,6 +44,16 @@ compilation derive from target 1dc682fcde3a80cd6917d0b06d124a79caa112aa.
 MiniCPM5 tapped verification, padded independent M1 projections and DSpark
 integration derive from target df20140e26ea1ef0951747fa192a3891afa24845.
 These revisions describe provenance, not qualification of the ApxInf port.
+
+The Clef Q4 decode, row padding, FP16 GEMM and gated delta recurrence kernels
+are adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin.
+
+The gated delta recurrence and the half-split rotary embedding kernel adapt
+MLX-VLM 0.7.4, revision 00093678a1f6bd513212d94778ffc381d6d731bf.
+Copyright (c) 2025 Prince Canuma. MIT License.
+
+The split GEMM fragment layout follows MLX 0.32.3 Steel mma.h.
+Copyright (c) 2024 Apple Inc. MIT License.
 
 The DSpark adaptation also derives from mlx-dspark, revision
 d6042f38f0aa7dd3e03a2a406111d725056d45a3.

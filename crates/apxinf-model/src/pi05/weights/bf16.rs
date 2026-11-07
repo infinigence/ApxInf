@@ -10,9 +10,9 @@ mod linear {
 
     #[derive(Debug)]
     pub struct Bf16LinearWeights {
-        /// Canonical row-major `[input, output]` matrix. Candidate-specific
-        /// preparation belongs to cuda-new and is never stored in model state.
+        /// `[input, output]` matrix; `layout` tracks committed physical packing.
         pub weight: Tensor,
+        pub layout: crate::pi05::backend::ops::RepackedWeight,
         pub bias: Option<Tensor>,
     }
 
@@ -24,6 +24,14 @@ mod linear {
         /// Pack projections along the output dimension so QKV and gate/up each
         /// remain one tensor-core GEMM, matching the static FP8 computation schedule.
         pub fn from_host_parts(linears: &[&LinearWeights], context: &Context) -> Result<Self> {
+            Self::from_host_parts_with_cache(linears, context, None)
+        }
+
+        pub(super) fn from_host_parts_with_cache(
+            linears: &[&LinearWeights],
+            context: &Context,
+            extra_bytes: Option<usize>,
+        ) -> Result<Self> {
             if linears.is_empty() {
                 return Err(Error::Other(
                     "cannot pack an empty BF16 linear group".into(),
@@ -39,18 +47,27 @@ mod linear {
             let bias = if linears.iter().all(|linear| linear.bias.is_none()) {
                 None
             } else if linears.iter().all(|linear| linear.bias.is_some()) {
-                Some(backend::to_device(context, &concat_biases_bf16(
-                    &linears
-                        .iter()
-                        .map(|linear| linear.bias.as_ref().unwrap())
-                        .collect::<Vec<_>>(),
-                )?)?)
+                Some(backend::to_device(
+                    context,
+                    &concat_biases_bf16(
+                        &linears
+                            .iter()
+                            .map(|linear| linear.bias.as_ref().unwrap())
+                            .collect::<Vec<_>>(),
+                    )?,
+                )?)
             } else {
                 return Err(Error::Other(
                     "cannot pack BF16 projections with mixed bias presence".into(),
                 ));
             };
             Ok(Self {
+                layout: match extra_bytes {
+                    Some(bytes) => crate::pi05::backend::ops::RepackedWeight::with_layout_cache(
+                        &weight, bytes,
+                    )?,
+                    None => crate::pi05::backend::ops::RepackedWeight::new(&weight)?,
+                },
                 weight,
                 bias,
             })
@@ -110,18 +127,15 @@ mod linear {
                 v.bias.as_ref().unwrap(),
             ])
             .unwrap();
-            assert_eq!(
-                biases.to_f32_vec().unwrap(),
-                vec![1., 2., 3., 4.]
-            );
+            assert_eq!(biases.to_f32_vec().unwrap(), vec![1., 2., 3., 4.]);
         }
     }
 }
 pub use linear::*;
 // Fully materialized native-BF16 π0.5 weights.
 
-use apxinf_core::{Result, Tensor};
 use crate::pi05::backend::Context;
+use apxinf_core::{Result, Tensor};
 
 use crate::pi05::{
     ActionLayerWeights, AdaRmsNormWeights, LanguageLayerWeights, LayerNormWeights, Pi05Weights,
@@ -184,6 +198,16 @@ pub struct Bf16Weights {
 
 impl Bf16Weights {
     pub fn from_host(weights: &Pi05Weights, backend: &Context) -> Result<Self> {
+        Self::from_host_with_layout_budget(weights, backend, usize::MAX)
+    }
+
+    /// Reserve extra physical layouts only for heterogeneous language gate/up
+    /// consumers; all other weights retain their single-allocation path.
+    pub fn from_host_with_layout_budget(
+        weights: &Pi05Weights,
+        backend: &Context,
+        mut extra_bytes: usize,
+    ) -> Result<Self> {
         Ok(Self {
             patch_embedding: Bf16LinearWeights::from_host(
                 &weights.vision.patch_embedding,
@@ -208,7 +232,26 @@ impl Bf16Weights {
             language_layers: weights
                 .language_layers
                 .iter()
-                .map(|layer| Bf16DeviceLanguageLayer::from_host(layer, backend))
+                .map(|layer| {
+                    let bytes = layer
+                        .mlp
+                        .gate
+                        .weight
+                        .shape()
+                        .numel()
+                        .checked_add(layer.mlp.up.weight.shape().numel())
+                        .and_then(|elements| elements.checked_mul(2))
+                        .ok_or_else(|| {
+                            apxinf_core::Error::Other("BF16 layout budget size overflow".into())
+                        })?;
+                    let reserved = if extra_bytes >= bytes {
+                        extra_bytes -= bytes;
+                        bytes
+                    } else {
+                        0
+                    };
+                    Bf16DeviceLanguageLayer::from_host(layer, backend, reserved)
+                })
                 .collect::<Result<Vec<_>>>()?,
             language_final_norm_scale: bf16_to_device(&weights.language_final_norm_scale, backend)?,
             action_layers: weights
@@ -251,7 +294,11 @@ impl Bf16DeviceVisionBlock {
 }
 
 impl Bf16DeviceLanguageLayer {
-    fn from_host(weights: &LanguageLayerWeights, backend: &Context) -> Result<Self> {
+    fn from_host(
+        weights: &LanguageLayerWeights,
+        backend: &Context,
+        layout_bytes: usize,
+    ) -> Result<Self> {
         Ok(Self {
             input_norm_scale: bf16_to_device(&weights.input_norm_scale, backend)?,
             qkv: Bf16LinearWeights::from_host_parts(
@@ -264,9 +311,10 @@ impl Bf16DeviceLanguageLayer {
             )?,
             output: Bf16LinearWeights::from_host(&weights.attention.output, backend)?,
             post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm_scale, backend)?,
-            gate_up: Bf16LinearWeights::from_host_parts(
+            gate_up: Bf16LinearWeights::from_host_parts_with_cache(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,
+                Some(layout_bytes),
             )?,
             down: Bf16LinearWeights::from_host(&weights.mlp.down, backend)?,
         })
