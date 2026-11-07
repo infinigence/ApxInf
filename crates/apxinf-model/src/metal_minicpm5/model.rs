@@ -1,7 +1,9 @@
 //! Native MiniCPM5 forward and request state. No Python model provider.
 //! Arithmetic/schedule adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin.
 use super::{
-    config::{Config, Variant, CONTEXT_CAPACITY},
+    config::{
+        attention_width, prefill_lengths, Config, Variant, DSPARK_CONTEXT_CAPACITY, PREFILL_CHUNK,
+    },
     math,
     weights::Weights,
 };
@@ -30,6 +32,7 @@ pub struct MiniCpm5 {
     local: Option<LocalMath>,
     swiglu: Compiled,
     step: Option<Compiled>,
+    decode_positions: HashMap<usize, Array>,
     states: Vec<Array>,
     capacity: usize,
     pub(crate) offset: usize,
@@ -52,7 +55,7 @@ impl MiniCpm5 {
         config.validate()?;
         let stream = backend.stream();
         let epsilon = Array::scalar(stream, config.rms_norm_eps, MlxDType::F32)?;
-        let (cos, sin) = math::tables(stream, CONTEXT_CAPACITY)?;
+        let (cos, sin) = math::tables(stream, 256)?;
         let local = if variant == Variant::Public {
             None
         } else {
@@ -77,6 +80,7 @@ impl MiniCpm5 {
             local,
             swiglu,
             step: None,
+            decode_positions: HashMap::new(),
             states: Vec::new(),
             capacity: 0,
             offset: 0,
@@ -102,18 +106,11 @@ impl MiniCpm5 {
     }
 
     fn prepare_inner(&mut self, prompt: usize, output: usize) -> Result<()> {
-        let total = prompt
-            .checked_add(output)
-            .ok_or(Error::Contract("MiniCPM context overflow"))?;
-        if prompt == 0 || total > CONTEXT_CAPACITY {
-            return Err(Error::Contract(
-                "MiniCPM5 supports B1 with at most 4096 consumed positions",
-            ));
-        }
-        let capacity = total.max(1).div_ceil(256) * 256;
+        let capacity = self.config.request_capacity(self.variant, prompt, output)?;
         if self.capacity == capacity
             && self.prepared_prompt == Some(prompt)
             && self.failure.is_none()
+            && !self.states.is_empty()
         {
             return Ok(());
         }
@@ -123,7 +120,14 @@ impl MiniCpm5 {
             ));
         }
         if self.capacity != capacity || self.states.is_empty() {
+            self.states.clear();
+            self.step = None;
+            self.decode_positions.clear();
+            self.capacity = 0;
             let stream = self.backend.stream();
+            let (cos, sin) = math::tables(stream, capacity)?;
+            self.cos = cos;
+            self.sin = sin;
             let mut states = Vec::with_capacity(84);
             for _ in 0..84 {
                 states.push(Array::zeros(
@@ -136,7 +140,7 @@ impl MiniCpm5 {
             let step = if self.variant == Variant::Public {
                 None
             } else {
-                Some(self.compile_step(capacity)?)
+                Some(self.compile_step()?)
             };
             self.states = states;
             self.capacity = capacity;
@@ -144,22 +148,25 @@ impl MiniCpm5 {
         }
         // Warm shape-dependent RoPE traces used by prefill. Norm and SwiGLU
         // are shapeless; changed request values are never captured.
-        if let Some(local) = &self.local {
-            let stream = self.backend.stream();
-            let zeros = Array::zeros(stream, &[1, prompt, 2048], MlxDType::BF16)?;
-            local.norm.prepare(&[zeros, self.weights.norm.clone()])?;
-            for heads in [2, 16] {
-                let zeros = Array::zeros(stream, &[1, heads, prompt, 128], MlxDType::BF16)?;
-                local.rope.prepare(&[
-                    zeros,
-                    self.cos.slice_axis(2, 0, prompt)?,
-                    self.sin.slice_axis(2, 0, prompt)?,
-                ])?;
+        let lengths = prefill_lengths(prompt);
+        for &rows in &lengths {
+            if let Some(local) = &self.local {
+                let stream = self.backend.stream();
+                let zeros = Array::zeros(stream, &[1, rows, 2048], MlxDType::BF16)?;
+                local.norm.prepare(&[zeros, self.weights.norm.clone()])?;
+                for heads in [2, 16] {
+                    let zeros = Array::zeros(stream, &[1, heads, rows, 128], MlxDType::BF16)?;
+                    local.rope.prepare(&[
+                        zeros,
+                        self.cos.slice_axis(2, 0, rows)?,
+                        self.sin.slice_axis(2, 0, rows)?,
+                    ])?;
+                }
             }
         }
         // MLX-LM's public activation is compiled too. Its warmup is independent
         // of the optional norm/RoPE seams and covers eager prompt/decode shapes.
-        for rows in [prompt, 1] {
+        for rows in lengths.into_iter().chain(std::iter::once(1)) {
             let activation = Array::zeros(self.backend.stream(), &[1, rows, 6144], MlxDType::BF16)?;
             self.swiglu.prepare(&[activation.clone(), activation])?;
         }
@@ -170,10 +177,24 @@ impl MiniCpm5 {
             } else {
                 1
             };
-            for rows in 1..=max_rows {
-                let tokens = Array::from_i32(self.backend.stream(), &[1, rows], &vec![0; rows])?;
-                let args = self.step_inputs(tokens, 0, rows)?;
-                step.prepare(&args)?;
+            let first = attention_width(self.variant, prompt, capacity);
+            let mut width = first;
+            loop {
+                if !self.decode_positions.contains_key(&width) {
+                    let positions =
+                        Array::arange(self.backend.stream(), 0., width as f32, 1., MlxDType::I32)?;
+                    for rows in 1..=max_rows {
+                        let tokens =
+                            Array::from_i32(self.backend.stream(), &[1, rows], &vec![0; rows])?;
+                        let args = self.step_inputs(tokens, 0, rows, &self.states, &positions)?;
+                        step.prepare(&args)?;
+                    }
+                    self.decode_positions.insert(width, positions);
+                }
+                if width == capacity {
+                    break;
+                }
+                width = (width + 256).min(capacity);
             }
         }
         self.failure = None;
@@ -198,35 +219,38 @@ impl MiniCpm5 {
         }
     }
 
-    fn step_inputs(&self, tokens: Array, position: usize, rows: usize) -> Result<Vec<Array>> {
+    fn step_inputs(
+        &self,
+        tokens: Array,
+        position: usize,
+        rows: usize,
+        states: &[Array],
+        positions: &Array,
+    ) -> Result<Vec<Array>> {
         let mut args = vec![
             tokens,
             Array::from_i32(self.backend.stream(), &[1], &[position as i32])?,
             self.cos.slice_axis(2, position, position + rows)?,
             self.sin.slice_axis(2, position, position + rows)?,
+            positions.clone(),
         ];
-        args.extend(self.states.iter().cloned());
+        args.extend(states.iter().cloned());
         Ok(args)
     }
 
-    fn compile_step(&self, capacity: usize) -> Result<Compiled> {
+    fn compile_step(&self) -> Result<Compiled> {
         let stream = self.backend.stream();
         let packed = Rc::new(PackedResidualRmsNorm::new(
             stream,
             self.config.rms_norm_eps,
         )?);
-        let positions = Array::arange(stream, 0., capacity as f32, 1., MlxDType::I32)?;
         let weights = self.weights.clone();
         let eps = self.epsilon.clone();
         let tapped = self.variant == Variant::DSpark;
         Compiled::new(stream, 85 + usize::from(tapped), move |a| {
             let rows = a[0].shape()[1];
-            let row_ids = Array::arange(a[0].stream(), 0., rows as f32, 1., MlxDType::I32)?
-                .reshape(&[rows, 1])?;
-            let mask = positions
-                .reshape(&[1, capacity])?
-                .less_equal(&a[1].add(&row_ids)?)?
-                .reshape(&[1, 1, rows, capacity])?;
+            let width = a[4].shape()[0];
+            let mask = math::causal_mask(&a[4], &a[1], rows)?;
             let mut x = weights.embedding.take(&a[0], 0)?;
             let mut delta: Option<Array> = None;
             let mut states = Vec::with_capacity(84);
@@ -268,10 +292,16 @@ impl MiniCpm5 {
                     .transpose(&[0, 2, 1, 3])?;
                 let q = math::rotate(&q, &a[2], &a[3])?;
                 let k = math::rotate(&k, &a[2], &a[3])?;
-                let keys = a[4 + 2 * i].slice_update(&k, &a[1], &[2])?;
-                let values = a[5 + 2 * i].slice_update(&v, &a[1], &[2])?;
+                let keys = a[5 + 2 * i].slice_update(&k, &a[1], &[2])?;
+                let values = a[6 + 2 * i].slice_update(&v, &a[1], &[2])?;
                 let attention = q
-                    .sdpa(&keys, &values, 128f32.powf(-0.5), false, Some(&mask))?
+                    .sdpa(
+                        &keys.slice_axis(2, 0, width)?,
+                        &values.slice_axis(2, 0, width)?,
+                        128f32.powf(-0.5),
+                        false,
+                        Some(&mask),
+                    )?
                     .transpose(&[0, 2, 1, 3])?
                     .reshape(&[1, rows, 2048])?;
                 let attention_delta = project(&attention, &w.o)?;
@@ -297,7 +327,13 @@ impl MiniCpm5 {
         })
     }
 
-    fn eager(&self, tokens: &Array, position: usize, last_only: bool) -> Result<Vec<Array>> {
+    fn eager(
+        &self,
+        tokens: &Array,
+        position: usize,
+        last_only: bool,
+        previous: &[Array],
+    ) -> Result<Vec<Array>> {
         let rows = tokens.shape()[1];
         let end = position + rows;
         let index = Array::from_i32(self.backend.stream(), &[1], &[position as i32])?;
@@ -335,8 +371,8 @@ impl MiniCpm5 {
                 .transpose(&[0, 2, 1, 3])?;
             let q = self.rotate(&q, &cos, &sin)?;
             let k = self.rotate(&k, &cos, &sin)?;
-            let keys = self.states[2 * i].slice_update(&k, &index, &[2])?;
-            let values = self.states[2 * i + 1].slice_update(&v, &index, &[2])?;
+            let keys = previous[2 * i].slice_update(&k, &index, &[2])?;
+            let values = previous[2 * i + 1].slice_update(&v, &index, &[2])?;
             let attention = q
                 .sdpa(
                     &keys.slice_axis(2, 0, end)?,
@@ -388,7 +424,7 @@ impl MiniCpm5 {
             || position != self.offset
             || position
                 .checked_add(ids.len())
-                .is_none_or(|n| n > CONTEXT_CAPACITY)
+                .is_none_or(|n| n > self.capacity)
         {
             return Err(Error::Contract(
                 "invalid MiniCPM tokens, position, or context",
@@ -397,8 +433,11 @@ impl MiniCpm5 {
         if self.states.is_empty() || self.prepared_prompt.is_none() {
             return Err(Error::Contract("prepare MiniCPM before inference"));
         }
-        let admitted = if position == 0 {
-            self.prepared_prompt == Some(ids.len())
+        let prompt = self.prepared_prompt.unwrap();
+        let admitted = if prompt > DSPARK_CONTEXT_CAPACITY && position < prompt {
+            position % PREFILL_CHUNK == 0 && ids.len() == PREFILL_CHUNK.min(prompt - position)
+        } else if position == 0 {
+            prompt == ids.len()
         } else {
             ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8)
         };
@@ -407,40 +446,52 @@ impl MiniCpm5 {
                 "MiniCPM input shape is outside its prepared prompt/decode profile",
             ));
         }
-        if position + ids.len() > self.capacity {
-            return Err(Error::Contract("request exceeds prepared MiniCPM capacity"));
-        }
         let result = (|| {
-            let ids = ids.iter().map(|&v| v as i32).collect::<Vec<_>>();
-            let tokens = Array::from_i32(self.backend.stream(), &[1, ids.len()], &ids)?;
-            let compiled = position > 0
-                && (ids.len() == 1 || (self.variant == Variant::DSpark && ids.len() <= 8));
-            let output = match (&self.step, compiled) {
-                (Some(step), true) => {
-                    step.call(&self.step_inputs(tokens, position, ids.len())?)?
-                }
-                _ => self.eager(&tokens, position, last_only)?,
-            };
+            let tokens = Array::from_i32(
+                self.backend.stream(),
+                &[1, ids.len()],
+                &ids.iter().map(|&v| v as i32).collect::<Vec<_>>(),
+            )?;
+            let output = self.run_graph(tokens, position, last_only)?;
             self.backend.stream().eval(&output)?;
-            Ok::<_, Error>(output)
+            Ok::<_, Error>(self.install_output(output, position + ids.len()))
         })();
-        match result {
-            Ok(mut output) => {
-                let logits = output.remove(0);
-                self.last_taps = if self.variant == Variant::DSpark {
-                    output.pop()
-                } else {
-                    None
-                };
-                self.states = output;
-                self.offset = position + ids.len();
-                Ok(logits)
-            }
-            Err(e) => {
-                self.failure = Some(e.to_string());
-                Err(e)
-            }
+        if let Err(error) = &result {
+            self.failure = Some(error.to_string());
         }
+        result
+    }
+
+    fn run_graph(&mut self, tokens: Array, position: usize, last_only: bool) -> Result<Vec<Array>> {
+        let rows = tokens.numel();
+        let previous = std::mem::take(&mut self.states);
+        let compiled =
+            position > 0 && (rows == 1 || (self.variant == Variant::DSpark && rows <= 8));
+        let output = match (&self.step, compiled) {
+            (Some(step), true) => {
+                let width = attention_width(self.variant, position + rows, self.capacity);
+                let positions = self
+                    .decode_positions
+                    .get(&width)
+                    .ok_or(Error::Contract("MiniCPM attention width was not prepared"))?;
+                step.call(&self.step_inputs(tokens, position, rows, &previous, positions)?)?
+            }
+            _ => self.eager(&tokens, position, last_only, &previous)?,
+        };
+        drop(previous);
+        Ok(output)
+    }
+
+    fn install_output(&mut self, mut output: Vec<Array>, end: usize) -> Array {
+        let logits = output.remove(0);
+        self.last_taps = if self.variant == Variant::DSpark {
+            output.pop()
+        } else {
+            None
+        };
+        self.states = output;
+        self.offset = end;
+        logits
     }
 
     pub(crate) fn trim_to(&mut self, position: usize) -> Result<()> {
@@ -453,7 +504,76 @@ impl MiniCpm5 {
     }
 }
 
+impl crate::mlx_decode::DeviceDecode for MiniCpm5 {
+    fn stream(&self) -> &apxinf_mlx::Stream {
+        self.backend.stream()
+    }
+    fn decode(&mut self, token: &Array) -> Result<Array> {
+        if self.failure.is_some() || self.offset >= self.capacity || self.prepared_prompt.is_none()
+        {
+            return Err(Error::Contract(
+                "MiniCPM decode requires valid prepared capacity",
+            ));
+        }
+        let result = self.run_graph(
+            token.cast(MlxDType::I32)?.reshape(&[1, 1])?,
+            self.offset,
+            false,
+        );
+        match result {
+            Ok(output) => Ok(self.install_output(output, self.offset + 1)),
+            Err(error) => {
+                self.failure = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+    fn finish_decode(&mut self, outcome: crate::mlx_decode::DecodeFinish) -> Result<()> {
+        if let Err(error) = self.backend.stream().synchronize() {
+            self.failure = Some(error.to_string());
+            return Err(error);
+        }
+        match outcome {
+            crate::mlx_decode::DecodeFinish::PublishedPosition(position)
+                if self.failure.is_none()
+                    && position <= self.offset
+                    && self.offset - position <= 1 =>
+            {
+                self.trim_to(position)
+            }
+            crate::mlx_decode::DecodeFinish::Invalidated => {
+                self.failure
+                    .get_or_insert_with(|| "greedy request failed or was abandoned".into());
+                Ok(())
+            }
+            _ => {
+                self.failure = Some("invalid greedy rollback position".into());
+                Err(Error::Contract("invalid MiniCPM greedy rollback position"))
+            }
+        }
+    }
+}
+
 impl LlmTrait for MiniCpm5 {
+    fn token_sequence<'a>(
+        &'a mut self,
+        first: Tensor,
+        sampler: Box<dyn apxinf_core::TokenSampler>,
+        params: &apxinf_core::TokenSamplingParams,
+        prompt_end: u32,
+    ) -> Result<Box<dyn crate::llm_trait::TokenSequence + 'a>> {
+        if self.variant == Variant::Compiled && crate::mlx_decode::enabled(params) {
+            let first = self.backend.array(&first)?;
+            Ok(Box::new(crate::mlx_decode::GreedySequence::new(
+                self, first, prompt_end,
+            )?))
+        } else {
+            Ok(Box::new(crate::llm_trait::SyncTokenSequence::new(
+                self, first, sampler, prompt_end,
+            )))
+        }
+    }
+
     fn preparation_status(&self) -> TextPreparationStatus {
         let ready =
             self.failure.is_none() && self.prepared_prompt.is_some() && !self.states.is_empty();
@@ -470,7 +590,7 @@ impl LlmTrait for MiniCpm5 {
                 scopes.push(TextCompilationScope::DecodeStep);
             }
             lengths.extend(1..=max_rows);
-            lengths.extend(self.prepared_prompt);
+            lengths.extend(prefill_lengths(self.prepared_prompt.unwrap()));
             lengths.sort_unstable();
             lengths.dedup();
         }
@@ -530,7 +650,28 @@ impl LlmTrait for MiniCpm5 {
         if input.image.is_some() {
             return Err(Error::Contract("MiniCPM5 is text-only"));
         }
-        let logits = self.run_tokens(input.token_ids, 0, true)?;
+        if self.offset != 0
+            || self.prepared_prompt != Some(input.token_ids.len())
+            || input.token_ids.is_empty()
+            || input
+                .token_ids
+                .iter()
+                .any(|&id| id as usize >= self.config.vocab_size)
+        {
+            return Err(Error::Contract(
+                "MiniCPM prefill requires the complete prepared prompt and valid token IDs",
+            ));
+        }
+        let chunk_size = if input.token_ids.len() > DSPARK_CONTEXT_CAPACITY {
+            PREFILL_CHUNK
+        } else {
+            input.token_ids.len()
+        };
+        let mut logits = None;
+        for chunk in input.token_ids.chunks(chunk_size) {
+            logits = Some(self.run_tokens(chunk, self.offset, true)?);
+        }
+        let logits = logits.unwrap();
         self.backend
             .from_array(logits.reshape(&[1, self.vocab_size()])?)
     }

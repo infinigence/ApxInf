@@ -48,8 +48,19 @@ Keep `forward(token_ids, start_pos)` full: its result is
 `[seq_len, vocab_size]`. A generation-oriented `prefill(LlmInput)` may consume
 the complete prompt into state and return only `[1, vocab_size]`; the shared
 sampler takes the last row. Qwen3's native prefill evaluates cache-only chunks
-before its final token, and MiniCPM5 applies its head only to the final prompt
-row. Specialized speculative generation belongs to the request-level hook.
+before its final token. MiniCPM5 applies its head to the final row of each
+prefill chunk and returns the last chunk's result. Long generation preparation
+may admit bounded chunk shapes without admitting a full prompt-sized forward;
+report those actual shapes in `preparation_status`. Specialized speculative
+generation belongs to the request-level hook.
+
+For asynchronous ordinary decode, opt into `token_sequence` and retain the
+shared publication/EOS/cancellation loop. Keep public `forward` synchronous.
+Test one-step lookahead, discarded EOS work, cancellation, position restoration,
+error cleanup and the synchronous fallback through `LoadedModel`. With P prompt
+tokens and N published tokens, the retained position is P+N.saturating_sub(1).
+The MLX cursor in `mlx_decode.rs` is shared model-layer scheduling; family KV
+and graph construction remain local.
 
 A small model commonly starts with:
 

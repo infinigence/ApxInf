@@ -3,8 +3,16 @@
 use apxinf_core::{Error, Result};
 use serde::Deserialize;
 
-/// The source-bound migration profile; larger contexts need separate evidence.
-pub const MAX_CONTEXT: usize = 2048;
+/// Maximum total positions in the Qwen3-0.6B checkpoint.
+pub const MAX_CONTEXT: usize = 40960;
+
+pub(super) fn attention_width(end: usize, capacity: usize) -> usize {
+    if capacity <= 2048 {
+        capacity
+    } else {
+        (end.div_ceil(256) * 256).min(capacity)
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Qwen3Config {
@@ -30,6 +38,19 @@ pub struct Qwen3Config {
 }
 
 impl Qwen3Config {
+    pub(super) fn request_capacity(&self, prompt: usize, output: usize) -> Result<usize> {
+        let total = prompt
+            .checked_add(output)
+            .ok_or_else(|| Error::Other("Qwen3 context overflow".into()))?;
+        let limit = self.max_position_embeddings.min(MAX_CONTEXT);
+        if prompt == 0 || total > limit {
+            return Err(Error::Other(format!(
+                "Qwen3 requires a nonempty prompt and prompt + output <= {limit}"
+            )));
+        }
+        Ok(total.div_ceil(256).saturating_mul(256).min(limit))
+    }
+
     pub fn validate_checkpoint_scope(&self) -> Result<()> {
         if (
             self.hidden_size,
@@ -177,6 +198,21 @@ mod tests {
         c.validate_checkpoint_scope().unwrap();
         c.hidden_size = 2048;
         assert!(c.validate_checkpoint_scope().is_err());
-        assert_eq!(MAX_CONTEXT, 2048);
+        assert_eq!(MAX_CONTEXT, 40960);
+    }
+
+    #[test]
+    fn request_capacity_grows_with_demand_and_respects_checkpoint() {
+        let mut c = Qwen3Config::from_json(&valid().to_string()).unwrap();
+        assert_eq!(c.request_capacity(1, 0).unwrap(), 256);
+        assert_eq!(c.request_capacity(255, 1).unwrap(), 256);
+        assert_eq!(c.request_capacity(256, 1).unwrap(), 512);
+        assert_eq!(c.request_capacity(40832, 128).unwrap(), 40960);
+        assert!(c.request_capacity(40833, 128).is_err());
+        assert!(c.request_capacity(0, 1).is_err());
+        assert!(c.request_capacity(usize::MAX, 1).is_err());
+        c.max_position_embeddings = 300;
+        assert_eq!(c.request_capacity(300, 0).unwrap(), 300);
+        assert!(c.request_capacity(300, 1).is_err());
     }
 }
