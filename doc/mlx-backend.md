@@ -130,6 +130,54 @@ Use `--keep-special-tokens` when special-token text carries application meaning;
 chat options containing `tools` enable this behavior automatically. MiniCPM's
 `<function>`/`<param>` tags must survive decoding for valid tool XML.
 
+### Implemented image selection
+
+[`metal_qwen_image`](../crates/apxinf-model/src/metal_qwen_image/README.md)
+runs Qwen-Image-2.1 text-to-image from the mflux 4-bit
+export (affine Q4 DiT, BF16 text encoder, F32 VAE decoder) and follows the
+mflux f0bf9cf0 txt2img path with `--low-ram`. The export has no top-level
+`config.json`; detection reads the transformer index. The family admits 40
+linear steps at guidance 1, batch 1, and positive sides that are multiples of
+16 up to 32768, with at most 174762 image tokens. The family README derives
+this execution bound; it is not a memory-capacity guarantee. The family
+returns RGB8 through `ImageRuntime`; the CLI writes binary PPM, so no image
+codec dependency is added.
+
+- Loading reads the tokenizer, checks every text-encoder tensor header, and
+  loads the DiT and VAE decoder with complete key, shape and dtype checks.
+- A request reads the text encoder one layer at a time and frees each layer.
+  The DiT computes the text-prefix K/V once and then runs one compiled image
+  forward per step. On `applegpu_g16g` (M4), the architecture where they were
+  qualified, the default `auto` variant runs each image block as seven fused
+  kernels for 1024..=4096 aligned image tokens; these round differently from
+  mflux, so `auto` images there are not bit-identical to `reference`. For
+  other aligned counts of at least 1024 tokens it uses the MPP GEMM for image
+  projections after a load-time probe of the three projection shapes at 1024
+  rows; matching that probe does not qualify all weights, shapes or image
+  outputs. Other architectures use quantized matmul.
+  `model_variant=reference` skips MPP and uses quantized matmul for all Q4
+  projections, without changing the scheduler or other execution paths. The DiT
+  is released before the tiled VAE decode (512 px tiles, 128 px overlap) and
+  read again by the next request, as `--low-ram` does.
+- The pure image-forward callable prepares the request's exact first-step
+  inputs twice and supplies its second output to the first solver update.
+  Later steps execute once each; all 40 original BF16 updates are unchanged.
+  This is request-local velocity compilation, not a compiled scheduler or
+  rollout. Local activations are prepared separately. VAE overlap accumulation,
+  normalization and final channel rounding use safe device arrays; the final
+  download contains completed integer channels for RGB8 serialization.
+- The checkpoint weights are under the Qwen Research License, which permits
+  non-commercial use only. APXinf ships no weights.
+
+```sh
+cargo run --features mlx -- generate-image --model /path/to/Qwen-Image-2.1-MLX-4bit \
+  --width 1024 --height 576 --seed 42 --prompt 'A lighthouse at dusk' \
+  --output lighthouse.ppm
+```
+
+Add `--model-variant reference` to select the quantized-matmul reference path.
+Omitting it or using `--model-variant auto` preserves the optimization target.
+
 ## Clef decision preparation
 
 The `metal_clef` decision family prepares its existing shapeless decay/beta
