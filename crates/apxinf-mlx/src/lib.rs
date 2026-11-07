@@ -4,6 +4,8 @@ mod array;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod backend;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod causal_conv;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod device_caps;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod ffi;
@@ -18,6 +20,8 @@ pub use backend::MlxBackend;
 pub use device_caps::MetalDeviceCaps;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub mod fusions;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod gate_swiglu;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod gated_delta;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
