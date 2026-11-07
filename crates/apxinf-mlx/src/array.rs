@@ -51,15 +51,40 @@ pub fn memory_stats() -> Result<MemoryStats> {
     })?;
     Ok(stats)
 }
+pub fn loaded_library_path() -> Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut path = std::ptr::null();
+    check(unsafe { ffi::apx_mlx_loaded_library_path(&mut path) })?;
+    if path.is_null() {
+        return Err(error("Loaded MLX library path is absent"));
+    }
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    Ok(std::ffi::OsStr::from_bytes(bytes).into())
+}
 /// Reset the process-wide peak allocator observation. Use an isolated process
 /// for qualification; another model in this process shares the observation.
 pub fn reset_peak_memory() -> Result<()> {
     check(unsafe { ffi::apx_mlx_reset_peak_memory() })
 }
+/// Set the process-wide MLX allocator cache limit and return the previous value.
+pub fn set_cache_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_cache_limit(limit, &mut previous) })?;
+    Ok(previous)
+}
+
 /// Release cached allocator buffers process-wide. Active arrays remain valid.
 /// Synchronize first when measuring release, and use an isolated test process.
 pub fn clear_cache() -> Result<()> {
     check(unsafe { ffi::apx_mlx_clear_cache() })
+}
+
+/// Set the process-wide MLX allocation guideline and return the previous value.
+/// MLX can exceed this value for one operation. It is not a physical memory cap.
+pub fn set_memory_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_memory_limit(limit, &mut previous) })?;
+    Ok(previous)
 }
 fn count(shape: &[usize]) -> Result<usize> {
     shape.iter().try_fold(1usize, |n, &d| {
@@ -180,6 +205,14 @@ impl Stream {
         let p = self.inputs(arrays.iter())?;
         self.record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
         check(unsafe { ffi::apx_mlx_eval(self.raw(), p.as_ptr(), p.len()) })
+    }
+    /// Enqueues evaluation of `arrays` and returns without waiting, so host
+    /// work (such as a Neural Engine prediction) overlaps the device. A later
+    /// [`eval`](Self::eval), download or dependent evaluation waits for it.
+    pub fn async_eval(&self, arrays: &[Array]) -> Result<()> {
+        let p = self.inputs(arrays.iter())?;
+        self.record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_async_eval(p.as_ptr(), p.len()) })
     }
     fn raw(&self) -> ffi::Handle {
         self.0.raw.as_ptr()
@@ -366,6 +399,19 @@ impl Array {
         check(unsafe {
             ffi::apx_mlx_array_read(self.stream().raw(), self.raw(), out.as_mut_ptr(), out.len())
         })?;
+        self.stream()
+            .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
+        Ok(out)
+    }
+    /// Like [`to_bytes`](Self::to_bytes), but waits only for this array's
+    /// computation, not for other work queued on its stream, and adds no
+    /// operation: work submitted later with [`Stream::async_eval`] keeps
+    /// running. The array must be row-contiguous (for example a kernel output).
+    pub fn to_bytes_ready(&self) -> Result<Vec<u8>> {
+        let mut out = vec![0; self.numel() * self.dtype().size_in_bytes()];
+        self.stream()
+            .record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_array_read_ready(self.raw(), out.as_mut_ptr(), out.len()) })?;
         self.stream()
             .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
         Ok(out)
@@ -877,6 +923,19 @@ impl Compiled {
         self.call_and_eval(inputs)?;
         let before = self.trace.stream.counters().trace_callbacks;
         let output = self.call_and_eval(inputs)?;
+        if self.trace.stream.counters().trace_callbacks != before {
+            return Err(error("MLX prepared profile retraced on replay; required compiled execution is unavailable"));
+        }
+        Ok(output)
+    }
+
+    /// Compile an exact input profile and verify reuse without evaluating it.
+    /// This prepares the MLX graph, not Metal pipelines or allocator workspaces.
+    /// The first evaluation can still incur device compilation and allocation.
+    pub fn prepare_trace(&self, inputs: &[Array]) -> Result<Vec<Array>> {
+        self.call(inputs)?;
+        let before = self.trace.stream.counters().trace_callbacks;
+        let output = self.call(inputs)?;
         if self.trace.stream.counters().trace_callbacks != before {
             return Err(error("MLX prepared profile retraced on replay; required compiled execution is unavailable"));
         }

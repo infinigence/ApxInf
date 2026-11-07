@@ -238,6 +238,48 @@ pub struct Tokenizer {
     chat_template: Option<String>,
 }
 
+/// Emits stable byte-level segments and checks contextual decoder prefixes.
+pub struct IncrementalDecoder<'a> {
+    tokenizer: &'a Tokenizer,
+    tokens: Vec<u32>,
+    pending: Vec<u32>,
+    emitted: String,
+    skip_special_tokens: bool,
+    byte_level: bool,
+}
+
+impl IncrementalDecoder<'_> {
+    pub fn push(&mut self, token: u32) -> Result<String> {
+        self.tokens.push(token);
+        let text = if self.byte_level {
+            self.pending.push(token);
+            let decoded = self.tokenizer.decode_with_options(&self.pending, self.skip_special_tokens)?;
+            if decoded.ends_with('\u{fffd}') {
+                return Ok(String::new());
+            }
+            self.pending.clear();
+            decoded
+        } else {
+            let decoded = self.tokenizer.decode_with_options(&self.tokens, self.skip_special_tokens)?;
+            if decoded.ends_with('\u{fffd}') {
+                return Ok(String::new());
+            }
+            decoded.strip_prefix(&self.emitted)
+                .ok_or_else(|| Error::Other("tokenizer changed published text".into()))?
+                .to_owned()
+        };
+        self.emitted.push_str(&text);
+        Ok(text)
+    }
+
+    /// Verify the complete output once and return its unpublished suffix.
+    pub fn finish(self) -> Result<String> {
+        let decoded = self.tokenizer.decode_with_options(&self.tokens, self.skip_special_tokens)?;
+        decoded.strip_prefix(&self.emitted).map(str::to_owned)
+            .ok_or_else(|| Error::Other("tokenizer changed published text".into()))
+    }
+}
+
 impl Tokenizer {
     /// Load tokenizer from tokenizer.json, optionally loading tokenizer_config.json
     /// from the same directory for chat template and special tokens.
@@ -286,7 +328,11 @@ impl Tokenizer {
     }
 
     /// Encode text, optionally applying the tokenizer's post-processor.
-    pub fn encode_with_special_tokens(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
+    pub fn encode_with_special_tokens(
+        &self,
+        text: &str,
+        add_special_tokens: bool,
+    ) -> Result<Vec<u32>> {
         let encoding = self
             .inner
             .encode(text, add_special_tokens)
@@ -307,6 +353,17 @@ impl Tokenizer {
     /// Resolve one token to its vocabulary ID.
     pub fn token_to_id(&self, token: &str) -> Option<u32> {
         self.inner.token_to_id(token)
+    }
+
+    pub fn incremental_decoder(&self, skip_special_tokens: bool) -> IncrementalDecoder<'_> {
+        IncrementalDecoder {
+            tokenizer: self,
+            tokens: Vec::new(),
+            pending: Vec::new(),
+            emitted: String::new(),
+            skip_special_tokens,
+            byte_level: matches!(self.inner.get_decoder(), Some(tokenizers::decoders::DecoderWrapper::ByteLevel(_))),
+        }
     }
 
     /// Decode token IDs to text.
@@ -421,9 +478,18 @@ impl Tokenizer {
         self.render_chat_template(messages, options, true)
     }
 
-    fn render_chat_template(
+    /// Render checked structured messages without flattening tool arguments.
+    pub fn apply_rich_chat_template(
         &self,
-        messages: &[ChatMessage],
+        messages: &[serde_json::Value],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String> {
+        self.render_chat_template(messages, options, true)
+    }
+
+    fn render_chat_template<M: Serialize>(
+        &self,
+        messages: &[M],
         options: &serde_json::Map<String, serde_json::Value>,
         hf_whitespace: bool,
     ) -> Result<String> {
@@ -457,31 +523,36 @@ impl Tokenizer {
             .map_err(|e| Error::Other(format!("template error: {e}")))?;
 
         // Build template context
-        let bos = self
-            .config
-            .bos_token
-            .clone()
-            .or_else(|| {
-                self.inner
-                    .get_vocab(true)
-                    .iter()
-                    .find(|(t, _)| *t == "<s>" || *t == "<|begin_of_text|>")
-                    .map(|(t, _)| t.clone())
-            })
-            .unwrap_or_default();
-
-        let eos = self
-            .config
-            .eos_token
-            .clone()
-            .or_else(|| {
-                self.inner
-                    .get_vocab(true)
-                    .iter()
-                    .find(|(t, _)| *t == "</s>" || *t == "<|eot_id|>" || *t == "<|end_of_text|>")
-                    .map(|(t, _)| t.clone())
-            })
-            .unwrap_or_default();
+        let resolve = |configured: Option<&str>, spellings: &[&str]| -> String {
+            if let Some(token) = configured {
+                return token.to_owned();
+            }
+            let mut matches = spellings
+                .iter()
+                .copied()
+                .filter(|token| self.inner.token_to_id(token).is_some());
+            let Some(first) = matches.next() else {
+                return String::new();
+            };
+            if matches.next().is_none() {
+                return first.to_owned();
+            }
+            // Preserve legacy map-iteration selection for ambiguous spellings.
+            self.inner
+                .get_vocab(true)
+                .iter()
+                .find(|(token, _)| spellings.contains(&token.as_str()))
+                .map(|(token, _)| token.clone())
+                .unwrap_or_default()
+        };
+        let bos = resolve(
+            self.config.bos_token.as_deref(),
+            &["<s>", "<|begin_of_text|>"],
+        );
+        let eos = resolve(
+            self.config.eos_token.as_deref(),
+            &["</s>", "<|eot_id|>", "<|end_of_text|>"],
+        );
 
         // Create context as serde Value (map)
         let mut context = serde_json::json!({
@@ -692,6 +763,293 @@ mod tests {
             .is_err());
     }
 
+    fn special_token_template(tokens: &[&str]) -> Tokenizer {
+        let vocab = tokens
+            .iter()
+            .copied()
+            .chain(std::iter::once("[UNK]"))
+            .enumerate()
+            .map(|(id, token)| (token.to_owned(), id as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .unwrap();
+        Tokenizer {
+            inner: HfTokenizer::new(model),
+            config: TokenizerConfig::default(),
+            chat_template: Some("{{ bos_token }}|{{ eos_token }}".to_owned()),
+        }
+    }
+
+    #[test]
+    fn incremental_decoder_preserves_semantic_tokens_and_complete_text() {
+        let mut tokenizer = special_token_template(&["hello", "world", "<function>", "</function>"]);
+        tokenizer.inner.add_special_tokens(&[AddedToken::from("<function>", true), AddedToken::from("</function>", true)]);
+        let ids = [0, 2, 1, 3];
+        let expected = tokenizer.decode_with_options(&ids, false).unwrap();
+        let mut decoder = tokenizer.incremental_decoder(false);
+        let mut actual = String::new();
+        for id in ids { actual.push_str(&decoder.push(id).unwrap()); }
+        actual.push_str(&decoder.finish().unwrap());
+        assert_eq!(actual, expected);
+        assert!(actual.contains("<function>"));
+    }
+
+    #[test]
+    fn incremental_decoder_keeps_partial_utf8_until_it_is_complete() {
+        let mut tokenizer = special_token_template(&["<0xE4>", "<0xB8>", "<0xAD>", "<function>"]);
+        tokenizer.inner.with_decoder(Some(tokenizers::decoders::byte_fallback::ByteFallback::new()));
+        let mut decoder = tokenizer.incremental_decoder(false);
+        assert_eq!(decoder.push(0).unwrap(), "");
+        assert_eq!(decoder.push(1).unwrap(), "");
+        assert_eq!(decoder.push(2).unwrap(), "中");
+        assert_eq!(decoder.finish().unwrap(), "");
+        let mut decoder = tokenizer.incremental_decoder(false);
+        assert_eq!(decoder.push(0).unwrap(), "");
+        assert_eq!(decoder.finish().unwrap(), "�");
+    }
+
+    #[test]
+    fn incremental_byte_level_matches_full_decode_over_long_sequences() {
+        let mut tokenizer = special_token_template(&["A", "Ġcache", "Ġstores", "Ġdata", ".", "<function>", "</function>"]);
+        tokenizer.inner.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+        let ids = [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 6].repeat(20);
+        let mut decoder = tokenizer.incremental_decoder(false);
+        let mut actual = String::new();
+        for (index, &id) in ids.iter().enumerate() {
+            actual.push_str(&decoder.push(id).unwrap());
+            assert_eq!(actual, tokenizer.decode_with_options(&ids[..=index], false).unwrap());
+        }
+        actual.push_str(&decoder.finish().unwrap());
+        assert_eq!(actual, tokenizer.decode_with_options(&ids, false).unwrap());
+        assert!(actual.contains("<function>"));
+    }
+
+    #[test]
+    fn incremental_byte_level_preserves_split_utf8_and_literal_replacement() {
+        let mut tokenizer = special_token_template(&["ä", "¸", "Ń", "<function>", "ï", "¿", "½"]);
+        tokenizer.inner.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+        let mut decoder = tokenizer.incremental_decoder(false);
+        assert_eq!(decoder.push(0).unwrap(), "");
+        assert_eq!(decoder.push(1).unwrap(), "");
+        assert_eq!(decoder.push(2).unwrap(), "中");
+        assert_eq!(decoder.push(3).unwrap(), "<function>");
+        assert_eq!(decoder.push(4).unwrap(), "");
+        assert_eq!(decoder.push(5).unwrap(), "");
+        assert_eq!(decoder.push(6).unwrap(), "");
+        assert_eq!(decoder.finish().unwrap(), "�");
+        assert_eq!(tokenizer.decode_with_options(&[0, 1, 2, 3, 4, 5, 6], false).unwrap(), "中<function>�");
+    }
+
+    fn legacy_fallback_prompt(tokenizer: &Tokenizer) -> String {
+        let snapshot = || {
+            tokenizer
+                .inner
+                .get_vocab(true)
+                .iter()
+                .map(|(token, id)| (token.clone(), *id))
+                .collect::<Vec<_>>()
+        };
+        let order = snapshot();
+        for _ in 0..3 {
+            assert_eq!(
+                snapshot(),
+                order,
+                "legacy oracle requires stable snapshot traversal on this unchanged fixture"
+            );
+        }
+        let bos = tokenizer
+            .inner
+            .get_vocab(true)
+            .iter()
+            .find(|(t, _)| *t == "<s>" || *t == "<|begin_of_text|>")
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        let eos = tokenizer
+            .inner
+            .get_vocab(true)
+            .iter()
+            .find(|(t, _)| *t == "</s>" || *t == "<|eot_id|>" || *t == "<|end_of_text|>")
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        format!("{bos}|{eos}")
+    }
+
+    #[test]
+    fn template_special_tokens_preserve_configured_strings() {
+        for tokens in [
+            &[][..],
+            &["<s>", "</s>"][..],
+            &[
+                "<s>",
+                "<|begin_of_text|>",
+                "</s>",
+                "<|eot_id|>",
+                "<|end_of_text|>",
+            ][..],
+        ] {
+            let mut tokenizer = special_token_template(tokens);
+            tokenizer.config.bos_token = Some("configured-bos".to_owned());
+            tokenizer.config.eos_token = Some("configured-eos".to_owned());
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                "configured-bos|configured-eos"
+            );
+            tokenizer.config.bos_token = Some(String::new());
+            tokenizer.config.eos_token = Some(String::new());
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                "|"
+            );
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_return_empty_without_candidates() {
+        let tokenizer = special_token_template(&[]);
+        assert_eq!(
+            tokenizer
+                .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                .unwrap(),
+            "|"
+        );
+    }
+
+    #[test]
+    fn template_special_tokens_resolve_each_sole_spelling_at_id_zero() {
+        for spelling in ["<s>", "<|begin_of_text|>"] {
+            let mut tokenizer = special_token_template(&[spelling]);
+            tokenizer.config.eos_token = Some("configured-eos".to_owned());
+            assert_eq!(tokenizer.token_to_id(spelling), Some(0));
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                format!("{spelling}|configured-eos")
+            );
+        }
+        for spelling in ["</s>", "<|eot_id|>", "<|end_of_text|>"] {
+            let mut tokenizer = special_token_template(&[spelling]);
+            tokenizer.config.bos_token = Some("configured-bos".to_owned());
+            assert_eq!(tokenizer.token_to_id(spelling), Some(0));
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                format!("configured-bos|{spelling}")
+            );
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_keep_legacy_selection_for_ambiguous_vocabularies() {
+        for tokens in [
+            &["<s>", "<|begin_of_text|>"][..],
+            &["</s>", "<|eot_id|>"][..],
+            &["</s>", "<|end_of_text|>"][..],
+            &["<|eot_id|>", "<|end_of_text|>"][..],
+            &["</s>", "<|eot_id|>", "<|end_of_text|>"][..],
+            &[
+                "<s>",
+                "<|begin_of_text|>",
+                "</s>",
+                "<|eot_id|>",
+                "<|end_of_text|>",
+            ][..],
+        ] {
+            let tokenizer = special_token_template(tokens);
+            let expected = legacy_fallback_prompt(&tokenizer);
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                expected,
+                "{tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_follow_added_token_mutations() {
+        for (first, second, unique_prompt) in [
+            ("<s>", "<|begin_of_text|>", "<s>|"),
+            ("<|begin_of_text|>", "<s>", "<|begin_of_text|>|"),
+            ("</s>", "<|eot_id|>", "|</s>"),
+            ("<|eot_id|>", "<|end_of_text|>", "|<|eot_id|>"),
+            ("<|end_of_text|>", "</s>", "|<|end_of_text|>"),
+        ] {
+            let mut tokenizer = special_token_template(&[]);
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                "|"
+            );
+            assert_eq!(tokenizer.add_tokens(&[first.to_owned()]), 1);
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                unique_prompt
+            );
+            assert_eq!(tokenizer.add_tokens(&[second.to_owned()]), 1);
+            let expected = legacy_fallback_prompt(&tokenizer);
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                expected,
+                "{first}, {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_allow_base_and_added_overlap() {
+        for spelling in [
+            "<s>",
+            "<|begin_of_text|>",
+            "</s>",
+            "<|eot_id|>",
+            "<|end_of_text|>",
+        ] {
+            let mut tokenizer = special_token_template(&[spelling]);
+            tokenizer.chat_template = Some("{{ bos_token }}{{ eos_token }}".to_owned());
+            assert_eq!(tokenizer.add_tokens(&[spelling.to_owned()]), 1);
+            let prompt = tokenizer
+                .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                .unwrap();
+            assert_eq!(prompt, spelling);
+            assert_eq!(tokenizer.token_to_id(&prompt), Some(0));
+            assert_eq!(tokenizer.encode(&prompt).unwrap(), [0]);
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_preserve_legacy_whitespace() {
+        let mut tokenizer = special_token_template(&["<s>", "</s>"]);
+        tokenizer.chat_template = Some(
+            " \n{{ bos_token }}\n\n{{ messages[0].content }}\n\n{{ eos_token }}\n\n ".to_owned(),
+        );
+        let messages = [ChatMessage::user("hello")];
+        assert_eq!(
+            tokenizer
+                .apply_chat_template_with_options(&messages, &serde_json::Map::new())
+                .unwrap(),
+            " \n<s>\n\nhello\n\n</s>\n\n "
+        );
+        assert_eq!(
+            tokenizer.apply_chat_template(&messages).unwrap(),
+            "<s>\nhello\n</s>\n"
+        );
+    }
+
     #[test]
     fn test_chat_message_constructors() {
         let user = ChatMessage::user("Hello");
@@ -703,6 +1061,25 @@ mod tests {
 
         let system = ChatMessage::system("You are helpful");
         assert_eq!(system.role, "system");
+    }
+
+    #[test]
+    fn rich_template_preserves_argument_objects_and_tool_result_identity() {
+        let tokenizer = Tokenizer {
+            inner: HfTokenizer::new(WordLevel::default()),
+            config: TokenizerConfig::default(),
+            chat_template: Some("{{ messages[0].tool_calls[0].function.arguments.path }}|{{ messages[1].role }}|{{ messages[1].tool_call_id }}|{{ messages[1].content }}".into()),
+        };
+        let messages = vec![
+            serde_json::json!({"role":"assistant","content":"","tool_calls":[{"id":"call1","type":"function","function":{"name":"Read","arguments":{"path":"brief.txt"}}}]}),
+            serde_json::json!({"role":"tool","content":"Draw a bicycle.","tool_call_id":"call1"}),
+        ];
+        assert_eq!(
+            tokenizer
+                .apply_rich_chat_template(&messages, &serde_json::Map::new())
+                .unwrap(),
+            "brief.txt|tool|call1|Draw a bicycle."
+        );
     }
 
     #[test]
