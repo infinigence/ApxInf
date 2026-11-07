@@ -83,6 +83,7 @@ pub struct GemmArgs<'a> {
     /// identity: both the tensor address and this version identify a prepared
     /// weight.
     pub weight_version: Option<WeightVersion>,
+    pub repacked_weight: Option<&'a super::RepackedWeight>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -153,6 +154,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            repacked_weight: None,
         }
     }
 
@@ -197,11 +199,14 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy,
             weight_version: None,
+            repacked_weight: None,
         }
     }
 
     /// Assert that `b` is immutable for the lifetime of prepared executions
     /// created from these arguments and attach its caller-managed version.
+    /// This does not permit packing in place; use `with_repacked_weight` to opt
+    /// into implementations requiring a prepared physical weight layout.
     pub fn with_immutable_weight(mut self, version: WeightVersion) -> Self {
         self.weight_version = Some(version);
         self
@@ -210,6 +215,13 @@ impl<'a> GemmArgs<'a> {
     /// Consume a W8A8 checkpoint weight stored physically as `[N, K]`.
     pub fn with_output_major_weight(mut self) -> Self {
         self.weight_layout = GemmWeightLayout::OutputMajor;
+        self
+    }
+
+    /// Use model-owned layout state. All consumers of B must use this state.
+    pub fn with_repacked_weight(mut self, weight: &'a super::RepackedWeight) -> Self {
+        self.repacked_weight = Some(weight);
+        self.weight_version = Some(WeightVersion::new(0));
         self
     }
 
@@ -240,6 +252,7 @@ impl<'a> GemmArgs<'a> {
             output_scale: 1.0,
             policy: GemmPolicy::default(),
             weight_version: None,
+            repacked_weight: None,
         }
     }
 }
@@ -287,6 +300,7 @@ pub(crate) struct Normalized {
     pub policy: GemmPolicy,
     pub bindings: abi::Bindings,
     pub storage: Vec<CudaBuffer>,
+    pub repacked_weight: Option<super::RepackedWeight>,
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
@@ -723,10 +737,16 @@ fn normalize_fused<'a>(
             accumulation_dtype: dtype(args.policy.accumulation_dtype)?,
             output_dtype: dtype(args.out.dtype())?,
             quantization,
-            b_layout: match args.weight_layout {
-                GemmWeightLayout::Kn => 0,
-                GemmWeightLayout::OutputMajor => 1,
-                GemmWeightLayout::GateUpPairs { .. } => 2,
+            b_layout: if args.repacked_weight.is_some() {
+                // Model-owned state starts canonical and is committed in place
+                // during the first preparation.
+                0
+            } else {
+                match args.weight_layout {
+                    GemmWeightLayout::Kn => 0,
+                    GemmWeightLayout::OutputMajor => 1,
+                    GemmWeightLayout::GateUpPairs { .. } => 2,
+                }
             },
             numerics: match args.policy.numerics {
                 GemmNumerics::Default => 0,
@@ -751,6 +771,7 @@ fn normalize_fused<'a>(
             alpha_is_unit: u32::from(args.alpha == 1.0),
             output_scale_is_unit: u32::from(args.output_scale == 1.0),
         },
+        repacked_weight: args.repacked_weight.cloned(),
         policy,
         bindings,
         storage,
