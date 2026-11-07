@@ -1,0 +1,7 @@
+[
+  {"case_id":"smoke-p1-g0-r0","input_tokens":1,"max_tokens":0,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"smoke-p1-g1-r0","input_tokens":1,"max_tokens":1,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"smoke-p32-g1-r0","input_tokens":32,"max_tokens":1,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"smoke-p32-g32-r0","input_tokens":32,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"smoke-p33-g32-r0","input_tokens":33,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0}
+]

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <mlx/linalg.h>
 #include <cstring>
+#include <dlfcn.h>
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
@@ -31,6 +32,11 @@ template<class T>A upload(const uint8_t* bytes,size_t len,mx::Shape sh,mx::Dtype
 }
 extern "C" {
 const char* apx_mlx_error(void){return last_error.c_str();}
+int apx_mlx_loaded_library_path(const char** out){TRY
+ Dl_info image{};
+ if(!dladdr(reinterpret_cast<const void*>(&mx::get_active_memory),&image)||!image.dli_fname)
+   throw std::runtime_error("Cannot identify loaded MLX library");
+ *out=image.dli_fname;CATCH}
 int apx_mlx_stream_new(int32_t gpu,int32_t index,void** out){TRY
  if(std::string(mx::version())!="0.32.3")throw std::runtime_error("linked MLX runtime differs from pinned 0.32.3 SDK");
  mx::Device d(gpu?mx::Device::gpu:mx::Device::cpu,index);
@@ -43,6 +49,7 @@ int apx_mlx_sync(void* p){TRY mx::synchronize(*static_cast<S*>(p));CATCH}
 int apx_mlx_memory_stats(size_t* active,size_t* cache,size_t* peak){TRY *active=mx::get_active_memory();*cache=mx::get_cache_memory();*peak=mx::get_peak_memory();CATCH}
 int apx_mlx_reset_peak_memory(void){TRY mx::reset_peak_memory();CATCH}
 int apx_mlx_clear_cache(void){TRY mx::clear_cache();CATCH}
+int apx_mlx_set_memory_limit(size_t limit,size_t* previous){TRY *previous=mx::set_memory_limit(limit);CATCH}
 // gpu::device_info returns MLX's function-local static map, so both strings
 // live for the process. `architecture` is what MLX's own Metal dispatch reads.
 int apx_mlx_device_info(int32_t index,const char** name,const char** architecture){TRY

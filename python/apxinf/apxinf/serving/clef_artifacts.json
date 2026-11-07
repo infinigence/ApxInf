@@ -1,0 +1,13 @@
+[
+  {"path":"chat_template.jinja","size_bytes":7756,"sha256":"a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"},
+  {"path":"config.json","size_bytes":3722,"sha256":"c323f36eb35fb9349b2bde60b3e16ee3d86316e20a5166c91f4a0585286f0ec1"},
+  {"path":"generation_config.json","size_bytes":116,"sha256":"45707f8467bf4e54e112c6095a1b2d1f2d63651cf86816344cfff21f02dda0d4"},
+  {"path":"joint_head.safetensors","size_bytes":243538016,"sha256":"19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0"},
+  {"path":"joint_head_config.json","size_bytes":119,"sha256":"77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0"},
+  {"path":"model-00001-of-00002.safetensors","size_bytes":5349769710,"sha256":"39894f085d844004c8e5c2394e45b5ab66bce4637ecdf23d92bf7c85cb66238f"},
+  {"path":"model-00002-of-00002.safetensors","size_bytes":600449850,"sha256":"40258d3d4f7225a0acbb45f4d34693465b98c8e2c0a4b0a512e536750379fcf3"},
+  {"path":"model.safetensors.index.json","size_bytes":123592,"sha256":"4518e4d98baed265cb25c5adb45839d5b69e0b9700f4bd573533392097bbb874"},
+  {"path":"processor_config.json","size_bytes":1191,"sha256":"d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1"},
+  {"path":"tokenizer.json","size_bytes":19989339,"sha256":"a5cd9732badce41de57e6efce8302930ded1c1188c5f81feb2bd6c24c4a1941f"},
+  {"path":"tokenizer_config.json","size_bytes":1190,"sha256":"7d884d6eaf8142a3343a933ca5ab6ccc2fa93d52591cdbbe2ea33559bb2b503a"}
+]

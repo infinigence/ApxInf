@@ -1,0 +1,7 @@
+[
+  {"case_id":"late-prefill-p4096-g32-at3840","input_tokens":4096,"max_tokens":32,"stop_after_prefill":3840,"stop_after_output":null,"repetition":0},
+  {"case_id":"late-prefill-p14336-g2048-at14080","input_tokens":14336,"max_tokens":2048,"stop_after_prefill":14080,"stop_after_output":null,"repetition":0},
+  {"case_id":"final-prompt-p14336-g2048-at14336","input_tokens":14336,"max_tokens":2048,"stop_after_prefill":14336,"stop_after_output":null,"repetition":0},
+  {"case_id":"late-output-p512-g2048-at1024","input_tokens":512,"max_tokens":2048,"stop_after_prefill":null,"stop_after_output":1024,"repetition":0},
+  {"case_id":"late-output-p512-g2048-at2047","input_tokens":512,"max_tokens":2048,"stop_after_prefill":null,"stop_after_output":2047,"repetition":0}
+]
