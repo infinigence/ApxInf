@@ -87,7 +87,6 @@ struct Fa2SplitKvState {
   float* softmax_lse = nullptr;
   float* softmax_lse_accum = nullptr;
   float* output_accum = nullptr;
-
 };
 
 size_t checked_multiply(size_t lhs, size_t rhs, const char* label) {

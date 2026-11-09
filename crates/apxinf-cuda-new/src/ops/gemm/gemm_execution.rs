@@ -570,7 +570,9 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
     drop(selected_storage);
     let scratch_bytes = unsafe { abi::apxinf_gemm_scratch_bytes(native.0) } as usize;
     if let Some(scratch) = crate::workspace::provider_scratch(ctx, scratch_bytes)? {
-        // Preparation/tuning has completed and synchronized before rebinding.
+        // Rebind only after native prepare has quiesced its private scratch:
+        // online tuning synchronizes to measure, and a restored recipe never
+        // ran kernels against its scratch. See framework::Scratch::bind.
         unsafe {
             status::check(abi::apxinf_gemm_bind_scratch(
                 native.0,

@@ -131,6 +131,9 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
     };
     let scratch_bytes = unsafe { abi::apxinf_attention_scratch_bytes(raw) } as usize;
     if let Some(scratch) = crate::workspace::provider_scratch(ctx, scratch_bytes)? {
+        // Attention prepare only allocates scratch (it runs no kernels), so
+        // the private buffers are quiesced and rebinding is safe here. See
+        // framework::Scratch::bind for the full contract.
         unsafe {
             status::check(abi::apxinf_attention_bind_scratch(
                 raw,

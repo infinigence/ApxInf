@@ -54,6 +54,11 @@ class Scratch {
 
   size_t bytes() const noexcept { return bytes_; }
 
+  // Rebinds each slice into the runner's `buffer` and frees any private
+  // allocation made during prepare. The caller must ensure no stream work still
+  // references those private buffers: online tuning synchronizes to measure,
+  // and a restored recipe never ran kernels against its scratch. The `cudaFree`
+  // here is therefore not relied upon as a correctness barrier.
   void bind(void* buffer, size_t capacity) {
     if (capacity < bytes_ || (!buffer && bytes_) ||
         reinterpret_cast<uintptr_t>(buffer) % 256) {
