@@ -29,7 +29,17 @@ pub(super) fn load_model_runner(
     backend: Arc<backend::Context>,
     options: &LoadOptions,
 ) -> Result<Pi05ModelRunner> {
-    let policies = cuda_l3_policies(options)?;
+    let mut policies = cuda_l3_policies(options)?;
+    // Clamp the GEMM workspace budget to the free device memory and drop online
+    // tuning entirely when the remaining budget falls below the viable floor,
+    // so autotune never tips a nearly-exhausted device over.
+    let (limit, allow_tune) = backend.memory_aware_tuning_budget();
+    if allow_tune {
+        policies.gemm.workspace_limit = policies.gemm.workspace_limit.min(limit);
+    } else {
+        policies.gemm.online_tune = false;
+        policies.attention.online_tune = false;
+    }
     load_model_runner_with_policies(path, backend, options, policies)
 }
 
