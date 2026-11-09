@@ -113,6 +113,28 @@ impl CudaBuffer {
         }
     }
 
+    /// A null-backed buffer used only by a virtual arena's measurement pass.
+    ///
+    /// The logical offset is tracked by the workspace state, not by this
+    /// pointer, which stays null and must never be dereferenced. `owner` keeps
+    /// the workspace lease alive so the block is returned to the free list on
+    /// drop; `retained_owner` is a no-op because there is no device allocation
+    /// to retain.
+    pub(crate) fn dummy(
+        len: usize,
+        device: usize,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        let noop: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+        Self {
+            ptr: std::ptr::null_mut(),
+            len,
+            device,
+            owner,
+            retained_owner: noop,
+        }
+    }
+
     /// Allocate and zero-fill.
     pub fn alloc_zeros(num_bytes: usize, device: usize) -> Result<Self, String> {
         let buf = Self::alloc(num_bytes, device)?;

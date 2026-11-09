@@ -197,10 +197,8 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             self.ctx().device_id(),
             self.scratch,
         )?;
-        let eager_output = session.prepare_right_sized(
-            self.ctx().device_id(),
-            WORKSPACE_MARGIN,
-            |session| {
+        let eager_output =
+            session.prepare_right_sized(self.ctx().device_id(), WORKSPACE_MARGIN, |session| {
                 ops::prepare_with_session(session, || {
                     self.infer_captured_inputs(
                         &patches,
@@ -212,8 +210,7 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
                         &modulation,
                     )
                 })
-            },
-        )?;
+            })?;
         backend::synchronize(backend)?;
         drop(eager_output);
         eprintln!(

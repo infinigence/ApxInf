@@ -167,8 +167,16 @@ impl DirectPlan {
         let generator = backend.create_normal_generator(inputs.noise.clone())?;
         // One arena is reused sequentially for Vision, Language and Action inside
         // the same graph. Only persistent visual features and shared KV cross phases.
+        // A fixed-tactic prepare never launches kernels against its outputs, so the
+        // measurement traversal runs against a null-backed arena and defers the
+        // device allocation until the peak is known. Online tuning writes into the
+        // arena, so it keeps the real reservation.
         let bytes = 32usize * (1 << 30);
-        let workspace = ops::ExecutionSession::with_capacity(bytes, ctx.device_id())?;
+        let workspace = if ctx.allow_online_tune() {
+            ops::ExecutionSession::with_capacity(bytes, ctx.device_id())?
+        } else {
+            ops::ExecutionSession::with_virtual_capacity(bytes)?
+        };
         let noise_workspace =
             ops::ExecutionSession::with_capacity(inputs.noise.numel() * 4 + 256, ctx.device_id())?;
         let spec = sample.observation.inference_spec();

@@ -208,16 +208,17 @@ impl WallossPreparedInference {
                     request,
                 )?;
                 self.bind(&host, request)?;
-                self.workspace
-                    .prepare_right_sized(self.backend.device_id(), WORKSPACE_MARGIN, |session| {
-                        ops::prepare_with_session(session, forward)
-                    })?
+                self.workspace.prepare_right_sized(
+                    self.backend.device_id(),
+                    WORKSPACE_MARGIN,
+                    |session| ops::prepare_with_session(session, forward),
+                )?
             }
-            None => self
-                .workspace
-                .prepare_right_sized(self.backend.device_id(), WORKSPACE_MARGIN, |session| {
-                    ops::prepare_with_session(session, forward)
-                })?,
+            None => self.workspace.prepare_right_sized(
+                self.backend.device_id(),
+                WORKSPACE_MARGIN,
+                |session| ops::prepare_with_session(session, forward),
+            )?,
         };
         self.backend.synchronize()?;
         drop(output);

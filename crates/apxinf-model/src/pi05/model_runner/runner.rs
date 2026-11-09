@@ -387,19 +387,17 @@ impl Pi05ModelRunner {
         // traversal below inlines `eager_traversal`'s RGB prefix so it can run
         // against `session` without borrowing the whole `EagerInputs` (which
         // owns that session and would otherwise conflict with the resize).
-        let output = session.prepare_right_sized(
-            self.backend.device_id(),
-            WORKSPACE_MARGIN,
-            |session| {
+        let output =
+            session.prepare_right_sized(self.backend.device_id(), WORKSPACE_MARGIN, |session| {
                 ops::prepare_with_session(session, || {
                     if let (Some(raw), Some(layout)) = (&raw_images, spec.image_layout) {
                         self.model
                             .preprocess_rgb(raw, &patches, kernel_image_layout(layout))?;
                     }
-                    self.model.infer(&patches, &token_ids, spec.token_count, &noise, raw_rgb)
+                    self.model
+                        .infer(&patches, &token_ids, spec.token_count, &noise, raw_rgb)
                 })
-            },
-        )?;
+            })?;
         backend::synchronize(&self.backend)?;
         drop(output);
         Ok(EagerInputs {

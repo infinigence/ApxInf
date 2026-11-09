@@ -36,7 +36,7 @@ struct WorkspaceState {
 
 struct WorkspaceLease {
     state: Arc<Mutex<WorkspaceState>>,
-    _storage: CudaBuffer,
+    _storage: Option<CudaBuffer>,
     start: usize,
     extent: usize,
     requested_bytes: usize,
@@ -65,7 +65,8 @@ impl Drop for WorkspaceLease {
 /// Persistent device arena used by a fixed-shape CUDA graph.
 /// Native operator executions are deliberately not stored here.
 pub struct GraphWorkspace {
-    storage: CudaBuffer,
+    storage: Option<CudaBuffer>,
+    capacity: usize,
     state: Arc<Mutex<WorkspaceState>>,
 }
 
@@ -77,7 +78,8 @@ impl GraphWorkspace {
             ));
         }
         Ok(Self {
-            storage: CudaBuffer::alloc(capacity_bytes, device).map_err(Error::Cuda)?,
+            storage: Some(CudaBuffer::alloc(capacity_bytes, device).map_err(Error::Cuda)?),
+            capacity: capacity_bytes,
             state: Arc::new(Mutex::new(WorkspaceState {
                 free_blocks: BTreeMap::from([(0, capacity_bytes)]),
                 ..WorkspaceState::default()
@@ -85,8 +87,33 @@ impl GraphWorkspace {
         })
     }
 
+    /// A virtual arena that records allocations and the free-list high-water
+    /// mark without reserving device memory. `allocate` returns null-backed
+    /// views, so this is only safe for measurement traversals that never launch
+    /// kernels against their outputs (a fixed-tactic prepare). `capacity`
+    /// bounds the logical offset space only.
+    pub fn new_virtual(capacity_bytes: usize) -> Result<Self> {
+        if capacity_bytes == 0 {
+            return Err(Error::Other(
+                "static inference workspace capacity must be non-zero".into(),
+            ));
+        }
+        Ok(Self {
+            storage: None,
+            capacity: capacity_bytes,
+            state: Arc::new(Mutex::new(WorkspaceState {
+                free_blocks: BTreeMap::from([(0, capacity_bytes)]),
+                ..WorkspaceState::default()
+            })),
+        })
+    }
+
+    pub fn is_virtual(&self) -> bool {
+        self.storage.is_none()
+    }
+
     pub fn capacity(&self) -> usize {
-        self.storage.len()
+        self.capacity
     }
 
     pub fn used(&self) -> usize {
@@ -102,7 +129,7 @@ impl GraphWorkspace {
     }
 
     fn reset(&self) -> Result<()> {
-        let capacity = self.storage.len();
+        let capacity = self.capacity;
         let mut state = self.lock_state()?;
         state.generation = state
             .generation
@@ -118,11 +145,13 @@ impl GraphWorkspace {
     }
 
     pub fn allocate(&self, bytes: usize, device: usize) -> Result<CudaBuffer> {
-        if device != self.storage.device() {
-            return Err(Error::Other(format!(
-                "static inference workspace is on CUDA {}, but operation targets CUDA {device}",
-                self.storage.device()
-            )));
+        if let Some(storage) = &self.storage {
+            if device != storage.device() {
+                return Err(Error::Other(format!(
+                    "static inference workspace is on CUDA {}, but operation targets CUDA {device}",
+                    storage.device()
+                )));
+            }
         }
         let extent = align_extent(bytes)?;
         let mut state = self.lock_state()?;
@@ -130,7 +159,7 @@ impl GraphWorkspace {
             Error::Other(format!(
                 "static inference workspace exhausted: need {} contiguous bytes, capacity is {} bytes",
                 extent.max(bytes),
-                self.storage.len()
+                self.capacity
             ))
         })?;
         state.active_allocations = state
@@ -155,10 +184,15 @@ impl GraphWorkspace {
             generation: state.generation,
         });
         drop(state);
-        let retained_owner: Arc<dyn Any + Send + Sync> = Arc::new(self.storage.clone());
-        self.storage
-            .view_with_owner(start, bytes, lease, retained_owner)
-            .map_err(Error::Cuda)
+        match &self.storage {
+            Some(storage) => {
+                let retained_owner: Arc<dyn Any + Send + Sync> = Arc::new(storage.clone());
+                storage
+                    .view_with_owner(start, bytes, lease, retained_owner)
+                    .map_err(Error::Cuda)
+            }
+            None => Ok(CudaBuffer::dummy(bytes, device, lease)),
+        }
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, WorkspaceState>> {
@@ -343,6 +377,15 @@ impl ExecutionSession {
         self
     }
 
+    /// A session whose arena records allocations without reserving device
+    /// memory. Intended for `prepare_right_sized`: the measurement traversal
+    /// runs against the virtual arena, then the arena is rebuilt with real
+    /// storage at the measured peak. Only safe when the traversal never
+    /// launches kernels against its outputs (fixed tactic, no online tuning).
+    pub fn with_virtual_capacity(capacity_bytes: usize) -> Result<Self> {
+        GraphWorkspace::new_virtual(capacity_bytes).map(Self::new)
+    }
+
     pub fn workspace(&self) -> &GraphWorkspace {
         &self.inner.workspace
     }
@@ -398,13 +441,22 @@ impl ExecutionSession {
         operation(self)?;
         let peak = self.used();
         let exact = peak.saturating_add(margin);
-        if exact < self.capacity() {
+        // A virtual (null-backed) arena must be rebuilt with real storage before
+        // capture, even when the measured peak already fits its logical capacity.
+        if self.inner.workspace.is_virtual() || exact < self.capacity() {
             // Rebuild the activation arena only; the provider workspace (native
             // GEMM/Attention scratch) is shared with the caller and survives the
             // resize, so a runner that shares one scratch across profiles keeps
             // that bound intact.
             let scratch = self.inner.scratch.clone();
-            *self = Self::with_provider_workspace(GraphWorkspace::new(exact, device)?, scratch);
+            let retire_stale_bindings = self.inner.retire_stale_bindings;
+            let rebuilt =
+                Self::with_provider_workspace(GraphWorkspace::new(exact, device)?, scratch);
+            *self = if retire_stale_bindings {
+                rebuilt.retire_stale_bindings()
+            } else {
+                rebuilt
+            };
         }
         operation(self)
     }
@@ -678,12 +730,15 @@ pub(crate) fn output_buffer_zeroed(ctx: &crate::CudaContext, bytes: usize) -> Re
         if inner.is_null() {
             CudaBuffer::alloc_zeros_async(bytes, ctx.device_id(), ctx.stream()).map_err(Error::Cuda)
         } else {
-            let buffer = unsafe { &*inner }
-                .workspace
-                .allocate(bytes, ctx.device_id())?;
-            buffer
-                .memset_async(0, bytes, ctx.stream())
-                .map_err(Error::Cuda)?;
+            let workspace = &unsafe { &*inner }.workspace;
+            let buffer = workspace.allocate(bytes, ctx.device_id())?;
+            // A virtual (null-backed) arena records offsets only; the clear is
+            // deferred to the real arena rebuilt after the measurement pass.
+            if !workspace.is_virtual() {
+                buffer
+                    .memset_async(0, bytes, ctx.stream())
+                    .map_err(Error::Cuda)?;
+            }
             Ok(buffer)
         }
     })
@@ -705,16 +760,22 @@ pub(crate) fn output_buffer_tail_zeroed(
         .ok_or_else(|| Error::Other("scratch used bytes exceed group extent".into()))?;
     ACTIVE_SESSION.with(|active| {
         let inner = active.get();
-        let buffer = if inner.is_null() {
+        if inner.is_null() {
             // A fresh driver allocation still has to establish the tail, but
             // it is not a reused arena, so the payload rows need no clearing.
-            CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)?
-        } else {
-            unsafe { &*inner }
-                .workspace
-                .allocate(bytes, ctx.device_id())?
-        };
-        if tail > 0 && groups > 0 {
+            let buffer = CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)?;
+            if tail > 0 && groups > 0 {
+                buffer
+                    .memset_2d_async(0, used_bytes, group_bytes, tail, groups, ctx.stream())
+                    .map_err(Error::Cuda)?;
+            }
+            return Ok(buffer);
+        }
+        let inner = unsafe { &*inner };
+        let buffer = inner.workspace.allocate(bytes, ctx.device_id())?;
+        // A virtual (null-backed) arena records offsets only; the tail clear is
+        // deferred to the real arena rebuilt after the measurement pass.
+        if tail > 0 && groups > 0 && !inner.workspace.is_virtual() {
             buffer
                 .memset_2d_async(0, used_bytes, group_bytes, tail, groups, ctx.stream())
                 .map_err(Error::Cuda)?;
@@ -826,5 +887,39 @@ mod tests {
         let mut bytes = vec![0; small.len()];
         small.copy_to_host(&mut bytes).unwrap();
         assert!(bytes.iter().all(|&x| x == 42));
+    }
+
+    #[test]
+    fn virtual_arena_records_offsets_and_rebuilds_real_storage() {
+        let mut session = ExecutionSession::with_virtual_capacity(1 << 20)
+            .unwrap()
+            .retire_stale_bindings();
+        assert!(session.workspace().is_virtual());
+        // The measurement traversal runs twice: first against the virtual arena
+        // (null-backed), then against the rebuilt real arena. Track the pass so
+        // the null assertion applies only to the measurement pass.
+        let pass = std::cell::Cell::new(0usize);
+        let result = session
+            .prepare_right_sized(0, 256, |sess| {
+                let a = sess.workspace().allocate(1024, 0).unwrap();
+                let b = sess.workspace().allocate(4096, 0).unwrap();
+                if pass.get() == 0 {
+                    assert!(a.ptr().is_null());
+                    assert!(b.ptr().is_null());
+                }
+                pass.set(pass.get() + 1);
+                drop(a);
+                drop(b);
+                Ok(7usize)
+            })
+            .unwrap();
+        assert_eq!(result, 7);
+        // The virtual arena has been replaced by real storage sized to the
+        // measured high-water plus the margin, and the second traversal ran
+        // against that real arena.
+        assert!(!session.workspace().is_virtual());
+        assert!(session.inner.retire_stale_bindings);
+        assert_eq!(session.capacity(), 5120 + 256);
+        assert_eq!(session.used(), 5120);
     }
 }

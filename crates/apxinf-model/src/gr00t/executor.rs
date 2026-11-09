@@ -804,17 +804,28 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         inputs: Gr00tGraphInputs,
         device_observation: Gr00tObservation,
     ) -> Result<Gr00tCapturedGraph> {
-        let mut workspace = ops::ExecutionSession::with_capacity(
-            INITIAL_GRAPH_WORKSPACE_BYTES,
-            self.backend.device_id(),
-        )?;
+        // A fixed-tactic prepare never launches kernels against its outputs, so
+        // the measurement traversal runs against a null-backed arena and defers
+        // the device allocation until the peak is known. Online tuning writes
+        // into the arena, so it keeps the real reservation.
+        let mut workspace = if self.backend.context().allow_online_tune() {
+            ops::ExecutionSession::with_capacity(
+                INITIAL_GRAPH_WORKSPACE_BYTES,
+                self.backend.device_id(),
+            )?
+        } else {
+            ops::ExecutionSession::with_virtual_capacity(INITIAL_GRAPH_WORKSPACE_BYTES)?
+        };
 
         let preflight_start = Instant::now();
-        let eager_output = workspace
-            .prepare_right_sized(self.backend.device_id(), WORKSPACE_MARGIN, |session| {
+        let eager_output = workspace.prepare_right_sized(
+            self.backend.device_id(),
+            WORKSPACE_MARGIN,
+            |session| {
                 ops::prepare_with_session(session, || self.infer_device(&device_observation))
                     .map_err(|error| Error::Other(format!("whole-graph preflight failed: {error}")))
-            })?;
+            },
+        )?;
         self.backend.synchronize()?;
         let preflight_seconds = preflight_start.elapsed().as_secs_f64();
         drop(eager_output);
