@@ -328,6 +328,10 @@ pub(super) fn capture<B: PrepareBlocks>(
 }
 /// Prepare a low-level graph with caller-owned stable patch/token/noise tensors.
 /// Their storage is retained; sizes and addresses cannot change between replays.
+/// These standalone entry points use a fresh [`ProviderWorkspace`], so operator
+/// scratch is not shared across separately captured graphs; use
+/// [`Pi05ModelRunner`](super::Pi05ModelRunner) to share one workspace across
+/// profiles.
 pub fn capture_patches<B: PrepareBlocks>(
     model: &Arc<Pi05Model<B>>,
     patches: &Tensor,

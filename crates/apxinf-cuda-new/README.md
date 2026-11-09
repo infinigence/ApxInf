@@ -256,8 +256,9 @@ but do not allocate a permanent scratch copy per operator. Standalone operators
 without a session keep their own temporary storage.
 
 Vendor GEMM workspace/unpack/dequantization/projection and custom/FA2/CUTLASS
-FMHA attention scratch participate. Constants and the opaque NVFP4 GEMM
-workspace remain private. Candidate tuning uses isolated temporary allocations.
-A new `prepare` traversal reuses matching cached executions and retires unused
-bindings after traversal; old captured graphs retain the executions and buffers
-they actually reference.
+FMHA attention scratch participate. Constants, the opaque NVFP4 GEMM workspace,
+and the segmented FA2 LSE buffer remain private. Candidate tuning uses isolated
+temporary allocations. A new `prepare` traversal reuses matching cached
+executions and retires bindings that have been unused for more than one
+traversal (so a variable-length eager traversal does not evict warm executions);
+old captured graphs retain the executions and buffers they actually reference.

@@ -167,25 +167,29 @@ storage/state and retiring the old graph readers.
 
 Ordinary Tensor/`WeightVersion` arguments stay canonical: they do not authorize
 in-place packing and cannot select kernels requiring packed weights. Callers
-wanting these kernels must attach `RepackedWeight`. Provider computation scratch is managed separately from weights and activations.
+wanting these kernels must attach `RepackedWeight`. Provider computation scratch
+is managed separately from weights and activations.
 PI0.5's runner owns a cuda-new `ProviderWorkspace`, shared by its prepared
 profiles on the same stream. Each session owns its activation `GraphWorkspace`;
 persistent KV/state remains model/request storage. Serial GEMM vendor scratch
 (workspace, unpack/dequantization and projection) and attention temporary
 probabilities/LSE/partials borrow aligned slices of a per-stream block. Different
-streams/devices use distinct blocks. Power-of-two growth preserves previous
-blocks retained by executions and captured graphs; it never rewrites an old
-binding. Constants such as cuBLASLt zero bias and output scale remain private.
-The opaque prepared NVFP4 GEMM workspace remains private until its embedded
-launch state supports external rebinding.
+streams/devices use distinct blocks. Blocks are rounded up to a fixed
+granularity, so growth never rewrites an old binding and per-block overhead stays
+bounded; executions and captured graphs retain the actual block they reference.
+Constants such as cuBLASLt zero bias and output scale remain private. The opaque
+prepared NVFP4 GEMM workspace and the segmented FA2 LSE buffer remain private
+until their embedded launch state supports external rebinding.
 
 Tuning candidates use private scratch. Final prepared executions borrow runner
 storage after selection and retain the actual block for graph lifetime.
 Repeated `ExecutionSession::prepare` reuses matching cached executions and
-retires unused bindings after traversal; captured graphs retain their own
-executions. Changing eager IO addresses cannot
-accumulate obsolete executions in that cache. Stable eager arena bindings remain cache hits across repeated preparation;
-this reuse does not require enabling CUDA Graphs.
+retires bindings that have been unused for more than one traversal, so a
+variable-length eager traversal (an early decode stop) does not evict warm
+executions; captured graphs retain their own executions. Changing eager IO
+addresses cannot accumulate obsolete executions in that cache. Stable eager
+arena bindings remain cache hits across repeated preparation; this reuse does
+not require enabling CUDA Graphs.
 
 Kernel weight layout is an explicit property of each native `Implementation`
 registry entry. Implementation IDs are local to a semantic registry and must

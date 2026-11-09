@@ -13,6 +13,19 @@ use crate::buffer::CudaBuffer;
 
 const WORKSPACE_ALIGNMENT: usize = 256;
 
+/// Provider scratch blocks are rounded up to this granularity, so per-block
+/// overhead stays under one granularity unit instead of up to 2× at each
+/// power-of-two boundary. It is a power of two and a multiple of the 256-byte
+/// alignment the native bind path enforces.
+const PROVIDER_SCRATCH_GRANULARITY: usize = 1 << 20;
+
+/// An execution stays cached until it has been unused for this many prepare
+/// traversals. Tolerating one missed traversal keeps warm executions alive
+/// across a variable-length eager traversal (for example an early decode stop
+/// that skips later steps) while still retiring bindings whose IO addresses no
+/// longer recur within a bounded number of generations.
+pub(crate) const STALE_GENERATIONS: u64 = 2;
+
 #[derive(Default)]
 struct WorkspaceState {
     generation: u64,
@@ -201,6 +214,13 @@ fn merge_adjacent_free_blocks(free_blocks: &mut BTreeMap<usize, usize>) {
 /// Runner-owned temporary storage shared by serial operators and profiles.
 /// Separate streams/devices receive disjoint blocks. Clones share ownership;
 /// executions retain their actual block so growth never invalidates old graphs.
+///
+/// Users of a shared block must be serialized on that block's stream: a
+/// captured graph must be replayed on the stream it was captured from, and two
+/// executions borrowing the same block must not be enqueued concurrently on
+/// different streams. Blocks are keyed by the raw stream handle, so a caller
+/// must not reuse a stream handle after destroying a stream while work from the
+/// old stream is still in flight.
 #[derive(Clone, Default)]
 pub struct ProviderWorkspace {
     buffers: Rc<RefCell<HashMap<(usize, usize), CudaBuffer>>>,
@@ -223,7 +243,8 @@ impl<K: Eq + Hash + 'static, V: Any> ExecutionCache for TypedExecutionCache<K, V
         self
     }
     fn retire_unused(&mut self, generation: u64) {
-        self.0.retain(|_, (_, used)| used.get() == generation);
+        self.0
+            .retain(|_, (_, used)| generation.saturating_sub(used.get()) < STALE_GENERATIONS);
     }
 }
 
@@ -397,7 +418,10 @@ fn with_session_phase<T>(
         // eager generation merely because an older graph is still alive.
         retain_resource(&session.inner.workspace);
         let result = operation();
-        if prepare {
+        // Retire only after a successful traversal. A partial traversal that
+        // errors out has not established a complete set of used bindings, so
+        // retiring then would drop executions the next request still needs.
+        if prepare && result.is_ok() {
             for cache in session.inner.caches.borrow_mut().values_mut() {
                 cache.retire_unused(session.inner.generation.get());
             }
@@ -628,9 +652,11 @@ pub(crate) fn output_buffer_tail_zeroed(
 }
 
 /// Scratch is separate from activation liveness and persistent KV/state. Each
-/// stream uses its own block. Growth preserves old bindings retained by graphs.
-/// Powers of two bound the total retained generations to less than twice the
-/// largest block, rather than the sum of all operator requirements.
+/// stream uses its own block, rounded up to [`PROVIDER_SCRATCH_GRANULARITY`] so
+/// per-block overhead stays bounded instead of doubling at power-of-two
+/// boundaries. A block is replaced only when it is too small; executions retain
+/// their actual block, so growth never invalidates old graphs, and generation
+/// retirement bounds how many replaced blocks stay referenced at once.
 pub(crate) fn provider_scratch(
     ctx: &crate::CudaContext,
     bytes: usize,
@@ -650,9 +676,7 @@ pub(crate) fn provider_scratch(
             .get(&key)
             .is_some_and(|buffer| buffer.len() >= bytes)
         {
-            let capacity = bytes
-                .checked_next_power_of_two()
-                .ok_or_else(|| Error::Other("provider scratch capacity overflow".into()))?;
+            let capacity = round_up_to(bytes, PROVIDER_SCRATCH_GRANULARITY)?;
             scratch.insert(
                 key,
                 CudaBuffer::alloc(capacity, ctx.device_id()).map_err(Error::Cuda)?,
@@ -660,6 +684,15 @@ pub(crate) fn provider_scratch(
         }
         Ok(scratch.get(&key).cloned())
     })
+}
+
+/// Round `value` up to a multiple of `align` (a power of two), returning an
+/// error on overflow.
+fn round_up_to(value: usize, align: usize) -> Result<usize> {
+    value
+        .checked_add(align - 1)
+        .map(|end| end & !(align - 1))
+        .ok_or_else(|| Error::Other("provider scratch capacity overflow".into()))
 }
 
 #[cfg(test)]
@@ -689,8 +722,9 @@ mod tests {
             .unwrap();
         assert_ne!(small.ptr(), separate.ptr());
         small.copy_from_host(&vec![42; small.len()]).unwrap();
+        // Exceed the current block's granularity to force it to grow.
         let large = second
-            .prepare(|| Ok(provider_scratch(&ctx, 1025)?.unwrap()))
+            .prepare(|| Ok(provider_scratch(&ctx, PROVIDER_SCRATCH_GRANULARITY + 1)?.unwrap()))
             .unwrap();
         assert_ne!(small.ptr(), large.ptr());
         drop(first);
