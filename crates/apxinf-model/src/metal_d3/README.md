@@ -77,9 +77,18 @@ the reference `probabilities`, and `arrays.pixel_values.file` and
 `APXINF_D3_REFERENCE_PIXELS` is the processor's raw F32 `pixel_values` for the
 PNG in `APXINF_D3_TEST_IMAGE`.
 
+Two scripts record these inputs from the checkpoint's PyTorch runtime
+(`trust_remote_code`; torch, transformers and Pillow). The images are
+deterministic and the CPU recording reproduces bit for bit:
+
 ```bash
+python3 scripts/d3_metal_reference_images.py /path/to/d3-lite ref/images
+python3 scripts/d3_metal_reference_dump.py /path/to/d3-lite ref/images ref cpu
+
 APXINF_D3_CHECKPOINT=/path/to/d3-lite \
-APXINF_D3_VISION_REF=/path/to/reference/cases.json \
+APXINF_D3_VISION_REF=ref/cases.json \
+APXINF_D3_TEST_IMAGE=ref/images/bars-400x320.png \
+APXINF_D3_REFERENCE_PIXELS=ref/bars-400x320-round-down.pixels.f32 \
 cargo test -p apxinf-model --features mlx --lib metal_d3 -- --ignored --test-threads 1
 ```
 
