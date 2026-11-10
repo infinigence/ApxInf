@@ -434,6 +434,36 @@ live engines, repeated reset/load/unload, retained outputs, cancellation/error
 cleanup and capacity exhaustion. Unified memory does not remove ownership,
 copy, device-residency or synchronization obligations.
 
+## Profiling with Instruments
+
+Build with `--features mlx-signpost` and every `profiling::trace::range` in the
+process becomes an `os_signpost` interval. Each interval has subsystem
+`com.apxinf`, category `PointsOfInterest`, signpost name `range`, and the range
+name as its start message. Metal Qwen3 opens a `prefill` or `decode` range per
+step with an `eval` range inside it, so the time before `eval` is host graph
+construction and `eval` covers evaluation, including the wait for the GPU.
+
+```sh
+cargo build --release --features mlx-signpost
+xcrun xctrace record --template 'Metal System Trace' \
+  --instrument 'Points of Interest' --output run.trace \
+  --env DYLD_LIBRARY_PATH="$MLX_ROOT/lib" \
+  --launch -- target/release/apxinf generate --model /path/to/Qwen3-0.6B \
+  --device metal --dtype bf16 --greedy --max-tokens 8 --prompt 'Hello'
+```
+
+The recording holds the ranges in the Points of Interest instrument, on the
+same timeline as Metal System Trace's GPU intervals. Without Instruments,
+`/usr/bin/log show --signpost --last 5m --predicate 'subsystem == "com.apxinf"'`
+lists the same intervals (zsh has a `log` builtin, hence the full path).
+
+Points of Interest signposts are written to the unified log whether or not a
+recorder is attached, so each range costs an FFI call and a log write: a few
+microseconds (1.5 to 5 µs per begin/end pair in a tight C loop on Apple M2 with
+nothing recording). That is why the backend is a separate feature. Keep ranges
+at step or stage granularity, not per operation. Names are logged as public
+strings and kept in the system log, so a name must not carry request content.
+
 ## Migration sequence and acceptance
 
 Follow the [porting workflow](porting-workflow.md) for source/checkpoint
