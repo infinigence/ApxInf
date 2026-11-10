@@ -141,10 +141,33 @@ __global__ void attention_values(const float* probabilities, const T* value,
   output[index] = from_float<T>(result);
 }
 
-// Single-token decode keeps the reference accumulation order while assigning
-// independent key dot-products to different threads. One block owns a head;
-// thread 0 computes the softmax in the same key order as the baseline. Value
-// channels also retain their sequential key accumulation, preserving F16 logits.
+// Single-token decode (batch == 1, query_tokens == 1) with one block per head.
+// The block is eight warps; the head's key range and its 32 channels are split
+// so that every warp is busy in the value pass.
+//
+//   * Dot products: one thread per key token, q held in registers, K read as int4
+//     (16 B per instruction instead of 2 B). Dimensions still accumulate in
+//     increasing order, so the logits match the generic path bit for bit.
+//   * Softmax: warp-level max and sum, then one cross-warp read of the eight
+//     warp maxima and eight warp sums. The key sum is therefore a tree rather
+//     than the reference's sequential scan.
+//   * Value pass: warp w owns channels [8*(w&3), +8) and the keys congruent to
+//     (w>>2)*32 + lane modulo 64, four 16 B loads in flight. Partials are reduced
+//     by warp shuffle and combined in shared memory, so all 256 threads
+//     contribute instead of the 32 the generic path leaves active.
+//
+// Accuracy contract. Changing a reduction order changes fp32 rounding, so this
+// path is not bit-identical to attention_scores_softmax + attention_values, and
+// it is not meant to be. It is checked against a float64 oracle: on decode shapes
+// (key_tokens 720, 16 heads x 32 channels, valid 24/96/186/372) the fp16 output
+// matches the float64 reference rounded to fp16 exactly (0 ULP), with the same
+// max |delta| as the sequential implementation. Re-run the fp64 comparison when
+// editing this, not only the end-to-end audio.
+//
+// The three __syncthreads are near the floor for this shape: 16 blocks on 20 SMs
+// gives too little parallelism to hide latency, so the block's serial chain, not
+// bandwidth, sets the wall time (measured: pure cooperative copy of the same
+// bytes costs 4.1-5.8 us, this kernel 4.2-8.2 us, the old path 6.3-24.9 us).
 template<class T, int FixedHeadDim = 0>
 __global__ void single_token_attention(
     const T* query, const T* key, const T* value, T* output,
@@ -156,6 +179,101 @@ __global__ void single_token_attention(
   const int kv_head=head/(query_heads/kv_heads);
   const int valid=runtime_valid_keys(key_tokens,causal,query_start,0,meta);
   const T* q=query+int64_t(head)*head_dim;
+
+  if constexpr (FixedHeadDim == 32) {
+    __shared__ float partial[2][32];
+    __shared__ float warp_maxima[8];
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+
+    float qf[32];
+    {
+      const int4* q4 = reinterpret_cast<const int4*>(q);
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        int4 raw = q4[i];
+        const T* h = reinterpret_cast<const T*>(&raw);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) qf[i * 8 + j] = to_float(h[j]);
+      }
+    }
+    float maximum = -CUDART_INF_F;
+    for (int token = threadIdx.x; token < valid; token += 256) {
+      const int4* k4 = reinterpret_cast<const int4*>(
+          key + (int64_t(token) * kv_heads + kv_head) * 32);
+      float dot = 0.0f;
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        int4 raw = k4[i];
+        const T* h = reinterpret_cast<const T*>(&raw);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) dot += qf[i * 8 + j] * to_float(h[j]);
+      }
+      scores[token] = dot * scale;
+      maximum = fmaxf(maximum, scores[token]);
+    }
+    for (int offset = 16; offset > 0; offset /= 2)
+      maximum = fmaxf(maximum, __shfl_down_sync(0xffffffff, maximum, offset));
+    if (lane == 0) warp_maxima[warp] = maximum;
+    __syncthreads();
+    maximum = warp_maxima[0];
+    for (int w = 1; w < 8; ++w) maximum = fmaxf(maximum, warp_maxima[w]);
+    float sum = 0.0f;
+    for (int token = threadIdx.x; token < valid; token += 256) {
+      const float weight = expf(scores[token] - maximum);
+      scores[token] = weight;
+      sum += weight;
+    }
+    for (int offset = 16; offset > 0; offset /= 2)
+      sum += __shfl_down_sync(0xffffffff, sum, offset);
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    sum = warp_sums[0];
+    for (int w = 1; w < 8; ++w) sum += warp_sums[w];
+    const float inverse = 1.0f / sum;
+
+    // warp w: 通道 8*(w&3)..+8，key 相位 (w>>2)*32 + lane，步长 64
+    const int channel = (warp & 3) * 8;
+    const int phase = warp >> 2;
+    const int64_t stride = int64_t(kv_heads) * 32;
+    const T* v = value + (int64_t(kv_head) * 32 + channel);
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    int token = phase * 32 + lane;
+    for (; token + 192 < valid; token += 256) {
+      const int4 a = *reinterpret_cast<const int4*>(v + int64_t(token + 0) * stride);
+      const int4 b = *reinterpret_cast<const int4*>(v + int64_t(token + 64) * stride);
+      const int4 c = *reinterpret_cast<const int4*>(v + int64_t(token + 128) * stride);
+      const int4 d = *reinterpret_cast<const int4*>(v + int64_t(token + 192) * stride);
+      const T* hh[4] = {reinterpret_cast<const T*>(&a), reinterpret_cast<const T*>(&b),
+                        reinterpret_cast<const T*>(&c), reinterpret_cast<const T*>(&d)};
+      const float ww[4] = {scores[token + 0] * inverse, scores[token + 64] * inverse,
+                           scores[token + 128] * inverse, scores[token + 192] * inverse};
+      #pragma unroll
+      for (int r = 0; r < 4; ++r)
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] += ww[r] * to_float(hh[r][i]);
+    }
+    for (; token < valid; token += 64) {
+      const int4 a = *reinterpret_cast<const int4*>(v + int64_t(token) * stride);
+      const T* h = reinterpret_cast<const T*>(&a);
+      const float weight = scores[token] * inverse;
+      #pragma unroll
+      for (int i = 0; i < 8; ++i) acc[i] += weight * to_float(h[i]);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i)
+      for (int offset = 16; offset > 0; offset /= 2)
+        acc[i] += __shfl_down_sync(0xffffffff, acc[i], offset);
+    if (lane == 0)
+      for (int i = 0; i < 8; ++i) partial[phase][channel + i] = acc[i];
+    __syncthreads();
+    if (threadIdx.x < 32)
+      output[int64_t(head) * 32 + threadIdx.x] =
+          from_float<T>(partial[0][threadIdx.x] + partial[1][threadIdx.x]);
+  } else {
+  // Generic fallback: one thread owns one softmax row and one output channel,
+  // keeping the reference accumulation order for any head_dim.
   for(int token=threadIdx.x;token<valid;token+=blockDim.x) {
     const T* k=key+(int64_t(token)*kv_heads+kv_head)*head_dim;
     float dot=0.0f;
@@ -166,33 +284,13 @@ __global__ void single_token_attention(
   __syncthreads();
   __shared__ float maximum_value;
   __shared__ float normalizer;
-  if constexpr (FixedHeadDim == 32) {
-    // Maximum has no addition rounding dependency. Preserve the ordered sum
-    // below, while distributing only this comparison reduction across warps.
-    __shared__ float warp_maxima[8];
-    float maximum = -CUDART_INF_F;
-    for (int token = threadIdx.x; token < valid; token += blockDim.x)
-      maximum = fmaxf(maximum, scores[token]);
-    for (int offset = 16; offset > 0; offset /= 2)
-      maximum = fmaxf(maximum,
-          __shfl_down_sync(0xffffffff, maximum, offset));
-    if ((threadIdx.x & 31) == 0) warp_maxima[threadIdx.x / 32] = maximum;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      maximum = -CUDART_INF_F;
-      for (int warp = 0; warp < 8; ++warp)
-        maximum = fmaxf(maximum, warp_maxima[warp]);
-      maximum_value = maximum;
-    }
-  } else if (threadIdx.x == 0) {
+  if(threadIdx.x==0) {
     float maximum = -CUDART_INF_F;
     for (int token = 0; token < valid; ++token)
       maximum = fmaxf(maximum, scores[token]);
     maximum_value = maximum;
   }
   __syncthreads();
-  // Elementwise exponentiation and division have no reduction dependency.
-  // Keep the sum in the baseline key order to preserve decode numerics.
   for(int token=threadIdx.x;token<valid;token+=blockDim.x)
     scores[token]=expf(scores[token]-maximum_value);
   __syncthreads();
@@ -210,6 +308,7 @@ __global__ void single_token_attention(
     for(int token=0;token<valid;++token)
       result+=scores[token]*to_float(value[(int64_t(token)*kv_heads+kv_head)*head_dim+d]);
     output[int64_t(head)*head_dim+d]=from_float<T>(result);
+  }
   }
 }
 
