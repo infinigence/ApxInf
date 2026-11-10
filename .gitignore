@@ -15,6 +15,12 @@ build/
 # Local model-port worktrees
 experiment/
 
+# `build_support/` is crate source, not build output. A global `**/build*/`
+# exclude is common on developers' machines, and it would swallow new files
+# there without a trace from `git add`. Re-include the directory so the
+# higher-priority rule here wins.
+!**/build_support/
+
 # Local development artifacts (see AGENTS.md)
 /devlocal/
 crates/.gemm-pilot-link.lock

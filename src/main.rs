@@ -114,7 +114,8 @@ enum Commands {
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to run inference on (cpu, cuda[:N], or metal[:N]; mlx is an alias)
+        /// Device to run inference on (cpu, cuda[:N], hip[:N], musa[:N], or
+        /// metal[:N]; mlx is an alias)
         #[arg(short, long, default_value = "cpu")]
         device: String,
 
@@ -147,7 +148,7 @@ enum Commands {
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to run inference on (cuda[:N] or metal[:N])
+        /// Device to run inference on (cuda[:N] or metal[:N]; d3-mini requires CUDA)
         #[arg(short, long, default_value = "cuda:0")]
         device: String,
 
@@ -306,7 +307,7 @@ fn parse_device(spec: &str) -> Result<Device, String> {
     let (kind, index) = match normalized.split_once(':') {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
-                format!("Invalid device index in '{spec}'; use cpu, cuda:N, or metal:N")
+                format!("Invalid device index in '{spec}'; use cpu, cuda:N, hip:N, musa:N, or metal:N")
             })?;
             (kind, index)
         }
@@ -315,9 +316,11 @@ fn parse_device(spec: &str) -> Result<Device, String> {
     match kind {
         "cpu" if index == 0 => Ok(Device::Cpu),
         "cuda" | "gpu" => Ok(Device::Cuda(index)),
+        "hip" => Ok(Device::Hip(index)),
+        "musa" => Ok(Device::Musa(index)),
         "metal" | "mlx" => Ok(Device::Metal(index)),
         _ => Err(format!(
-            "Unknown device '{spec}'; use cpu, cuda:N, or metal:N (mlx:N is an alias)"
+            "Unknown device '{spec}'; use cpu, cuda:N, hip:N, musa:N, or metal:N (mlx:N is an alias)"
         )),
     }
 }
@@ -377,6 +380,9 @@ mod device_tests {
         assert_eq!(parse_device("cpu").unwrap(), Device::Cpu);
         assert_eq!(parse_device("gpu").unwrap(), Device::Cuda(0));
         assert_eq!(parse_device("cuda:2").unwrap(), Device::Cuda(2));
+        assert_eq!(parse_device("hip").unwrap(), Device::Hip(0));
+        assert_eq!(parse_device("musa").unwrap(), Device::Musa(0));
+        assert_eq!(parse_device("MUSA:1").unwrap(), Device::Musa(1));
         assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));
         assert_eq!(parse_device("MLX:1").unwrap(), Device::Metal(1));
     }
