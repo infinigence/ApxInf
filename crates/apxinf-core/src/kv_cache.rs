@@ -9,7 +9,8 @@ use crate::{Result, Tensor};
 pub trait KvCache {
     /// Append new K/V data for a layer.
     /// k, v: [append_len, n_kv_heads, head_dim]
-    fn append(&mut self, layer_idx: usize, k: &Tensor, v: &Tensor, append_len: usize) -> Result<()>;
+    fn append(&mut self, layer_idx: usize, k: &Tensor, v: &Tensor, append_len: usize)
+        -> Result<()>;
 
     /// Advance the sequence position by n tokens.
     fn advance(&mut self, n: usize);
@@ -57,7 +58,14 @@ impl CpuKVCache {
             })
             .collect();
 
-        Self { k_cache, v_cache, seq_len: 0, max_seq_len, n_kv_heads, head_dim }
+        Self {
+            k_cache,
+            v_cache,
+            seq_len: 0,
+            max_seq_len,
+            n_kv_heads,
+            head_dim,
+        }
     }
 
     /// Get K and V for a layer up to current position.
@@ -68,7 +76,13 @@ impl CpuKVCache {
 }
 
 impl KvCache for CpuKVCache {
-    fn append(&mut self, layer_idx: usize, k: &Tensor, v: &Tensor, append_len: usize) -> Result<()> {
+    fn append(
+        &mut self,
+        layer_idx: usize,
+        k: &Tensor,
+        v: &Tensor,
+        append_len: usize,
+    ) -> Result<()> {
         let k_data = k.as_f32()?;
         let v_data = v.as_f32()?;
         for s in 0..append_len {
@@ -98,14 +112,18 @@ impl KvCache for CpuKVCache {
         for layer in &mut self.k_cache {
             for head in layer {
                 for pos in head {
-                    for v in pos { *v = 0.0; }
+                    for v in pos {
+                        *v = 0.0;
+                    }
                 }
             }
         }
         for layer in &mut self.v_cache {
             for head in layer {
                 for pos in head {
-                    for v in pos { *v = 0.0; }
+                    for v in pos {
+                        *v = 0.0;
+                    }
                 }
             }
         }
@@ -116,6 +134,10 @@ impl KvCache for CpuKVCache {
         self.k_cache.len()
     }
 
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }

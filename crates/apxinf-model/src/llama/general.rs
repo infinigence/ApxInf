@@ -11,13 +11,13 @@ use apxinf_core::{Backend, Device, Error, KvCache, Result, Tensor};
 use apxinf_core::{DType, RopeKind};
 use apxinf_loader::ModelConfig;
 
-use super::weights::{LlamaWeights, TransformerLayer};
-use crate::llm_trait::LlmTrait;
-#[cfg(feature = "cuda")]
-use crate::accelerator::cuda::downcast as cuda_backend;
-use crate::accelerator::create_backend;
 #[cfg(feature = "cuda")]
 use super::decode_graph::{DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
+use super::weights::{LlamaWeights, TransformerLayer};
+use crate::accelerator::create_backend;
+#[cfg(feature = "cuda")]
+use crate::accelerator::cuda::downcast as cuda_backend;
+use crate::llm_trait::LlmTrait;
 
 /// Device-agnostic Llama model.
 pub struct GeneralLlama {
@@ -33,7 +33,11 @@ pub struct GeneralLlama {
 
 impl GeneralLlama {
     /// Construct from weights and a backend.
-    pub fn new(config: ModelConfig, weights: LlamaWeights, backend: Arc<dyn Backend>) -> Result<Self> {
+    pub fn new(
+        config: ModelConfig,
+        weights: LlamaWeights,
+        backend: Arc<dyn Backend>,
+    ) -> Result<Self> {
         let kv = backend.create_kv_cache(
             config.n_layers,
             config.n_kv_heads,
@@ -62,7 +66,10 @@ impl GeneralLlama {
         };
 
         Ok(Self {
-            config, weights, backend, kv,
+            config,
+            weights,
+            backend,
+            kv,
             #[cfg(feature = "cuda")]
             decode_graph: decode_graph?,
         })
@@ -83,7 +90,9 @@ impl GeneralLlama {
             rope_theta: config.rope_theta,
             rms_norm_eps: config.rms_norm_eps,
             dtype,
-            rope_kind: RopeKind::OneD { theta: config.rope_theta },
+            rope_kind: RopeKind::OneD {
+                theta: config.rope_theta,
+            },
             qk_norm: false,
             tie_embeddings: false,
         }
@@ -119,11 +128,27 @@ impl GeneralLlama {
         // Attention
         let kv_len = self.kv.seq_len() + seq_len;
         let attn_out = if seq_len == 1 {
-            b.sdpa_decode(&q, &mut *self.kv, layer_idx,
-                          n_heads, n_kv_heads, head_dim, kv_len, self.config.max_seq_len)?
+            b.sdpa_decode(
+                &q,
+                &mut *self.kv,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_len,
+                self.config.max_seq_len,
+            )?
         } else {
-            b.sdpa_prefill(&q, &mut *self.kv, layer_idx,
-                           n_heads, n_kv_heads, head_dim, kv_len, self.config.max_seq_len)?
+            b.sdpa_prefill(
+                &q,
+                &mut *self.kv,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_len,
+                self.config.max_seq_len,
+            )?
         };
 
         // Reshape and project
@@ -167,12 +192,20 @@ impl LlmTrait for GeneralLlama {
             if let Some(dg) = self.decode_graph.as_mut() {
                 let weights = DecodeGraphWeights {
                     token_embedding: &self.weights.token_embedding,
-                    layers: self.weights.layers.iter()
+                    layers: self
+                        .weights
+                        .layers
+                        .iter()
                         .map(|l| DecodeLayerWeights {
                             attn_norm_weight: &l.attn_norm_weight,
-                            wq: &l.wq, wk: &l.wk, wv: &l.wv, wo: &l.wo,
+                            wq: &l.wq,
+                            wk: &l.wk,
+                            wv: &l.wv,
+                            wo: &l.wo,
                             ffn_norm_weight: &l.ffn_norm_weight,
-                            w_gate: &l.w_gate, w_up: &l.w_up, w_down: &l.w_down,
+                            w_gate: &l.w_gate,
+                            w_up: &l.w_up,
+                            w_down: &l.w_down,
                             q_norm_weight: None,
                             k_norm_weight: None,
                             qkv_packed: l.qkv_packed.as_ref(),
@@ -182,8 +215,7 @@ impl LlmTrait for GeneralLlama {
                     output_norm_weight: &self.weights.output_norm_weight,
                     output_weight: &self.weights.output_weight,
                 };
-                let cb = cuda_backend(&*self.backend)
-                    .expect("decode_graph requires CudaBackend");
+                let cb = cuda_backend(&*self.backend).expect("decode_graph requires CudaBackend");
                 let logits = dg.decode(cb, &weights, &mut *self.kv, token_ids[0], start_pos)?;
                 self.kv.advance(1);
                 return Ok(logits);
@@ -191,7 +223,9 @@ impl LlmTrait for GeneralLlama {
         }
 
         // Embedding lookup
-        let mut x = self.backend.embedding(&self.weights.token_embedding, token_ids)?;
+        let mut x = self
+            .backend
+            .embedding(&self.weights.token_embedding, token_ids)?;
 
         // Transformer layers
         for layer_idx in 0..self.config.n_layers {
@@ -202,7 +236,11 @@ impl LlmTrait for GeneralLlama {
         self.kv.advance(seq_len);
 
         // Final norm + output
-        let x = self.backend.rms_norm(&x, &self.weights.output_norm_weight, self.config.rms_norm_eps)?;
+        let x = self.backend.rms_norm(
+            &x,
+            &self.weights.output_norm_weight,
+            self.config.rms_norm_eps,
+        )?;
         let logits = self.backend.matmul(&x, &self.weights.output_weight)?;
 
         // Single sync per forward
@@ -214,7 +252,9 @@ impl LlmTrait for GeneralLlama {
 
     #[cfg(feature = "cuda")]
     fn prewarm_decode(&mut self, prompt_len: usize, max_new_tokens: usize) {
-        let Some(cb) = cuda_backend(&*self.backend) else { return; };
+        let Some(cb) = cuda_backend(&*self.backend) else {
+            return;
+        };
         // Called before prefill: the cache is empty, so the decode loop will
         // write positions prompt_len..prompt_len+max_new_tokens.
         let kv_len = prompt_len as u32;
@@ -223,12 +263,20 @@ impl LlmTrait for GeneralLlama {
         // coexists with the mutable borrows of decode_graph / kv below).
         let weights = DecodeGraphWeights {
             token_embedding: &self.weights.token_embedding,
-            layers: self.weights.layers.iter()
+            layers: self
+                .weights
+                .layers
+                .iter()
                 .map(|l| DecodeLayerWeights {
                     attn_norm_weight: &l.attn_norm_weight,
-                    wq: &l.wq, wk: &l.wk, wv: &l.wv, wo: &l.wo,
+                    wq: &l.wq,
+                    wk: &l.wk,
+                    wv: &l.wv,
+                    wo: &l.wo,
                     ffn_norm_weight: &l.ffn_norm_weight,
-                    w_gate: &l.w_gate, w_up: &l.w_up, w_down: &l.w_down,
+                    w_gate: &l.w_gate,
+                    w_up: &l.w_up,
+                    w_down: &l.w_down,
                     q_norm_weight: None,
                     k_norm_weight: None,
                     qkv_packed: l.qkv_packed.as_ref(),
@@ -292,20 +340,24 @@ fn pack_fused_weights(weights: &mut LlamaWeights, backend: &dyn Backend) {
 
 /// Transfer all weights in `weights` to the backend's device.
 fn transfer_weights(weights: &LlamaWeights, backend: &dyn Backend) -> Result<LlamaWeights> {
-    let layers = weights.layers.iter()
-        .map(|l| Ok::<_, Error>(TransformerLayer {
-            attn_norm_weight: backend.to_device(&l.attn_norm_weight)?,
-            wq: backend.to_device(&l.wq)?,
-            wk: backend.to_device(&l.wk)?,
-            wv: backend.to_device(&l.wv)?,
-            wo: backend.to_device(&l.wo)?,
-            ffn_norm_weight: backend.to_device(&l.ffn_norm_weight)?,
-            w_gate: backend.to_device(&l.w_gate)?,
-            w_up: backend.to_device(&l.w_up)?,
-            w_down: backend.to_device(&l.w_down)?,
-            qkv_packed: None,
-            gate_up_packed: None,
-        }))
+    let layers = weights
+        .layers
+        .iter()
+        .map(|l| {
+            Ok::<_, Error>(TransformerLayer {
+                attn_norm_weight: backend.to_device(&l.attn_norm_weight)?,
+                wq: backend.to_device(&l.wq)?,
+                wk: backend.to_device(&l.wk)?,
+                wv: backend.to_device(&l.wv)?,
+                wo: backend.to_device(&l.wo)?,
+                ffn_norm_weight: backend.to_device(&l.ffn_norm_weight)?,
+                w_gate: backend.to_device(&l.w_gate)?,
+                w_up: backend.to_device(&l.w_up)?,
+                w_down: backend.to_device(&l.w_down)?,
+                qkv_packed: None,
+                gate_up_packed: None,
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
 
     Ok(LlamaWeights {
@@ -319,8 +371,8 @@ fn transfer_weights(weights: &LlamaWeights, backend: &dyn Backend) -> Result<Lla
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llama::LlamaModel;
     use crate::debug::DebugCapture;
+    use crate::llama::LlamaModel;
 
     fn tiny_config() -> ModelConfig {
         ModelConfig {
@@ -350,29 +402,57 @@ mod tests {
         );
         for i in 0..config.n_layers {
             let prefix = format!("model.layers.{i}");
-            tensors.insert(format!("{prefix}.input_layernorm.weight"),
-                make_weight(vec![config.hidden_size]));
-            tensors.insert(format!("{prefix}.self_attn.q_proj.weight"),
-                make_weight(vec![config.hidden_size, config.hidden_size]));
-            tensors.insert(format!("{prefix}.self_attn.k_proj.weight"),
-                make_weight(vec![config.n_kv_heads * config.head_dim(), config.hidden_size]));
-            tensors.insert(format!("{prefix}.self_attn.v_proj.weight"),
-                make_weight(vec![config.n_kv_heads * config.head_dim(), config.hidden_size]));
-            tensors.insert(format!("{prefix}.self_attn.o_proj.weight"),
-                make_weight(vec![config.hidden_size, config.hidden_size]));
-            tensors.insert(format!("{prefix}.post_attention_layernorm.weight"),
-                make_weight(vec![config.hidden_size]));
-            tensors.insert(format!("{prefix}.mlp.gate_proj.weight"),
-                make_weight(vec![config.intermediate_size, config.hidden_size]));
-            tensors.insert(format!("{prefix}.mlp.up_proj.weight"),
-                make_weight(vec![config.intermediate_size, config.hidden_size]));
-            tensors.insert(format!("{prefix}.mlp.down_proj.weight"),
-                make_weight(vec![config.hidden_size, config.intermediate_size]));
+            tensors.insert(
+                format!("{prefix}.input_layernorm.weight"),
+                make_weight(vec![config.hidden_size]),
+            );
+            tensors.insert(
+                format!("{prefix}.self_attn.q_proj.weight"),
+                make_weight(vec![config.hidden_size, config.hidden_size]),
+            );
+            tensors.insert(
+                format!("{prefix}.self_attn.k_proj.weight"),
+                make_weight(vec![
+                    config.n_kv_heads * config.head_dim(),
+                    config.hidden_size,
+                ]),
+            );
+            tensors.insert(
+                format!("{prefix}.self_attn.v_proj.weight"),
+                make_weight(vec![
+                    config.n_kv_heads * config.head_dim(),
+                    config.hidden_size,
+                ]),
+            );
+            tensors.insert(
+                format!("{prefix}.self_attn.o_proj.weight"),
+                make_weight(vec![config.hidden_size, config.hidden_size]),
+            );
+            tensors.insert(
+                format!("{prefix}.post_attention_layernorm.weight"),
+                make_weight(vec![config.hidden_size]),
+            );
+            tensors.insert(
+                format!("{prefix}.mlp.gate_proj.weight"),
+                make_weight(vec![config.intermediate_size, config.hidden_size]),
+            );
+            tensors.insert(
+                format!("{prefix}.mlp.up_proj.weight"),
+                make_weight(vec![config.intermediate_size, config.hidden_size]),
+            );
+            tensors.insert(
+                format!("{prefix}.mlp.down_proj.weight"),
+                make_weight(vec![config.hidden_size, config.intermediate_size]),
+            );
         }
-        tensors.insert("model.norm.weight".to_string(),
-            make_weight(vec![config.hidden_size]));
-        tensors.insert("lm_head.weight".to_string(),
-            make_weight(vec![config.vocab_size, config.hidden_size]));
+        tensors.insert(
+            "model.norm.weight".to_string(),
+            make_weight(vec![config.hidden_size]),
+        );
+        tensors.insert(
+            "lm_head.weight".to_string(),
+            make_weight(vec![config.vocab_size, config.hidden_size]),
+        );
         tensors
     }
 
@@ -404,14 +484,21 @@ mod tests {
         let general_logits = general.forward(&[5], 0).unwrap();
         let general_data = general_logits.as_f32().unwrap().to_vec();
 
-        assert_eq!(legacy_data.len(), general_data.len(),
-                   "logit count mismatch");
+        assert_eq!(
+            legacy_data.len(),
+            general_data.len(),
+            "logit count mismatch"
+        );
 
-        let max_err: f32 = legacy_data.iter().zip(general_data.iter())
+        let max_err: f32 = legacy_data
+            .iter()
+            .zip(general_data.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
-        assert!(max_err < 1e-4,
-                "GeneralLlama logits diverge from legacy: max error {max_err}");
+        assert!(
+            max_err < 1e-4,
+            "GeneralLlama logits diverge from legacy: max error {max_err}"
+        );
     }
 
     #[test]
@@ -429,11 +516,15 @@ mod tests {
         let general_data = general_logits.as_f32().unwrap().to_vec();
 
         assert_eq!(legacy_data.len(), general_data.len());
-        let max_err: f32 = legacy_data.iter().zip(general_data.iter())
+        let max_err: f32 = legacy_data
+            .iter()
+            .zip(general_data.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max);
-        assert!(max_err < 1e-3,
-                "Multi-token: GeneralLlama logits diverge: max error {max_err}");
+        assert!(
+            max_err < 1e-3,
+            "Multi-token: GeneralLlama logits diverge: max error {max_err}"
+        );
     }
 
     /// Multi-step autoregressive decode: prefill once, then decode several
@@ -449,18 +540,25 @@ mod tests {
         let mut legacy = LlamaModel::from_weights(config.clone(), tensors.clone()).unwrap();
         let mut legacy_cache = crate::llama::KVCache::new(&config);
         let mut debug: Option<&mut DebugCapture> = None;
-        let _ = legacy.forward(&[5, 10, 15], 0, Some(&mut legacy_cache), &mut debug).unwrap();
+        let _ = legacy
+            .forward(&[5, 10, 15], 0, Some(&mut legacy_cache), &mut debug)
+            .unwrap();
         legacy_cache.advance(3);
         let mut legacy_tokens: Vec<u32> = Vec::new();
         let mut pos = 3usize;
         let mut current: u32 = 20;
         for _ in 0..3 {
-            let logits = legacy.forward(&[current], pos, Some(&mut legacy_cache), &mut debug).unwrap();
+            let logits = legacy
+                .forward(&[current], pos, Some(&mut legacy_cache), &mut debug)
+                .unwrap();
             legacy_cache.advance(1);
             let data = logits.as_f32().unwrap();
-            let argmax = data.iter().enumerate()
+            let argmax = data
+                .iter()
+                .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i).unwrap_or(0);
+                .map(|(i, _)| i)
+                .unwrap_or(0);
             legacy_tokens.push(argmax as u32);
             current = argmax as u32;
             pos += 1;
@@ -475,15 +573,20 @@ mod tests {
         for _ in 0..3 {
             let logits = general.forward(&[current], pos).unwrap();
             let data = logits.as_f32().unwrap();
-            let argmax = data.iter().enumerate()
+            let argmax = data
+                .iter()
+                .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i).unwrap_or(0);
+                .map(|(i, _)| i)
+                .unwrap_or(0);
             general_tokens.push(argmax as u32);
             current = argmax as u32;
             pos += 1;
         }
 
-        assert_eq!(legacy_tokens, general_tokens,
-                   "Multi-step decode: token sequences diverge");
+        assert_eq!(
+            legacy_tokens, general_tokens,
+            "Multi-step decode: token sequences diverge"
+        );
     }
 }

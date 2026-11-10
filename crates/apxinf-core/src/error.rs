@@ -22,7 +22,12 @@ pub enum Error {
     ReshapeError { src_numel: usize, dst_numel: usize },
 
     #[error("matmul dimension mismatch: [{m}x{k1}] @ [{k2}x{n}]")]
-    MatmulDimMismatch { m: usize, k1: usize, k2: usize, n: usize },
+    MatmulDimMismatch {
+        m: usize,
+        k1: usize,
+        k2: usize,
+        n: usize,
+    },
 
     #[error("data length mismatch: expected {expected} bytes, got {got} bytes")]
     DataLengthMismatch { expected: usize, got: usize },

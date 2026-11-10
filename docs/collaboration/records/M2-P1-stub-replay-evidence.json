@@ -1,0 +1,367 @@
+{
+  "base_url": "http://127.0.0.1:18013",
+  "captured_at": "2026-08-23T11:07:16.623400+00:00",
+  "commit": "f98cb6ff7e96476c244b0e42db13600c2726520c",
+  "ending_health": {
+    "elapsed_ms": 0.401,
+    "finished_at": "2026-08-23T11:07:16.623387+00:00",
+    "request_body": "",
+    "request_body_raw": "",
+    "request_method": "GET",
+    "request_path": "/health",
+    "response": {
+      "capabilities": {
+        "multimodal": false,
+        "pretokenized_input_ids": true,
+        "token_id_output": true
+      },
+      "evaluation_contract": "apxinf.qwen38_27b.inference_interface.v1",
+      "fallback_active": false,
+      "max_model_len": 32768,
+      "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+      "parallel_requests": 1,
+      "status": "ok",
+      "stub": true,
+      "vocab_size": 248320
+    },
+    "response_raw": "{\"capabilities\":{\"multimodal\":false,\"pretokenized_input_ids\":true,\"token_id_output\":true},\"evaluation_contract\":\"apxinf.qwen38_27b.inference_interface.v1\",\"fallback_active\":false,\"max_model_len\":32768,\"model_revision\":\"63768c10df38c0395e12ef49edac1bd539eaeeea\",\"parallel_requests\":1,\"status\":\"ok\",\"stub\":true,\"vocab_size\":248320}",
+    "started_at": "2026-08-23T11:07:16.622972+00:00",
+    "status_code": 200,
+    "timestamp": "2026-08-23T11:07:16.623392+00:00"
+  },
+  "initial_health": {
+    "elapsed_ms": 3.805,
+    "finished_at": "2026-08-23T11:07:16.617397+00:00",
+    "request_body": "",
+    "request_body_raw": "",
+    "request_method": "GET",
+    "request_path": "/health",
+    "response": {
+      "capabilities": {
+        "multimodal": false,
+        "pretokenized_input_ids": true,
+        "token_id_output": true
+      },
+      "evaluation_contract": "apxinf.qwen38_27b.inference_interface.v1",
+      "fallback_active": false,
+      "max_model_len": 32768,
+      "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+      "parallel_requests": 1,
+      "status": "ok",
+      "stub": true,
+      "vocab_size": 248320
+    },
+    "response_raw": "{\"capabilities\":{\"multimodal\":false,\"pretokenized_input_ids\":true,\"token_id_output\":true},\"evaluation_contract\":\"apxinf.qwen38_27b.inference_interface.v1\",\"fallback_active\":false,\"max_model_len\":32768,\"model_revision\":\"63768c10df38c0395e12ef49edac1bd539eaeeea\",\"parallel_requests\":1,\"status\":\"ok\",\"stub\":true,\"vocab_size\":248320}",
+    "started_at": "2026-08-23T11:07:16.613569+00:00",
+    "status_code": 200,
+    "timestamp": "2026-08-23T11:07:16.617404+00:00"
+  },
+  "max_model_len": 32768,
+  "passed": true,
+  "rows": [
+    {
+      "body": "{not-json",
+      "elapsed_ms": 0.538,
+      "finished_at": "2026-08-23T11:07:16.618028+00:00",
+      "id": "malformed_json",
+      "mode": "raw",
+      "passed": true,
+      "request_body": "{not-json",
+      "request_body_raw": "{not-json",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "malformed JSON: key must be a string at line 1 column 2",
+          "type": "invalid_request"
+        }
+      },
+      "response_raw": "{\"error\":{\"message\":\"malformed JSON: key must be a string at line 1 column 2\",\"type\":\"invalid_request\"}}",
+      "started_at": "2026-08-23T11:07:16.617474+00:00",
+      "status_code": 400,
+      "timestamp": "2026-08-23T11:07:16.618034+00:00"
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.684,
+      "finished_at": "2026-08-23T11:07:16.618790+00:00",
+      "id": "empty_input_ids",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_body_raw": "{\"ignore_eos\":true,\"input_ids\":[],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "input_ids must not be empty",
+          "type": "invalid_request"
+        }
+      },
+      "response_raw": "{\"error\":{\"message\":\"input_ids must not be empty\",\"type\":\"invalid_request\"}}",
+      "started_at": "2026-08-23T11:07:16.618090+00:00",
+      "status_code": 400,
+      "timestamp": "2026-08-23T11:07:16.618796+00:00"
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          -1
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.46,
+      "finished_at": "2026-08-23T11:07:16.619328+00:00",
+      "id": "negative_token_id",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[-1],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_body_raw": "{\"ignore_eos\":true,\"input_ids\":[-1],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "token id -1 is outside model vocabulary [0, 248320)",
+          "type": "invalid_request"
+        }
+      },
+      "response_raw": "{\"error\":{\"message\":\"token id -1 is outside model vocabulary [0, 248320)\",\"type\":\"invalid_request\"}}",
+      "started_at": "2026-08-23T11:07:16.618856+00:00",
+      "status_code": 400,
+      "timestamp": "2026-08-23T11:07:16.619333+00:00"
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          4294967295
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.436,
+      "finished_at": "2026-08-23T11:07:16.619831+00:00",
+      "id": "out_of_vocabulary_token_id",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[4294967295],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_body_raw": "{\"ignore_eos\":true,\"input_ids\":[4294967295],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "token id 4294967295 is outside model vocabulary [0, 248320)",
+          "type": "invalid_request"
+        }
+      },
+      "response_raw": "{\"error\":{\"message\":\"token id 4294967295 is outside model vocabulary [0, 248320)\",\"type\":\"invalid_request\"}}",
+      "started_at": "2026-08-23T11:07:16.619383+00:00",
+      "status_code": 400,
+      "timestamp": "2026-08-23T11:07:16.619836+00:00"
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          1
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.1
+      },
+      "elapsed_ms": 0.479,
+      "finished_at": "2026-08-23T11:07:16.620377+00:00",
+      "id": "unsupported_temperature",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[1],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.1}",
+      "request_body_raw": "{\"ignore_eos\":true,\"input_ids\":[1],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.1}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "temperature must be exactly 0 for greedy generation",
+          "type": "invalid_request"
+        }
+      },
+      "response_raw": "{\"error\":{\"message\":\"temperature must be exactly 0 for greedy generation\",\"type\":\"invalid_request\"}}",
+      "started_at": "2026-08-23T11:07:16.619887+00:00",
+      "status_code": 400,
+      "timestamp": "2026-08-23T11:07:16.620383+00:00"
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          1
+        ],
+        "max_new_tokens": 32768,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.441,
+      "finished_at": "2026-08-23T11:07:16.620881+00:00",
+      "id": "over_budget",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[1],\"max_new_tokens\":32768,\"stream\":false,\"temperature\":0.0}",
+      "request_body_raw": "{\"ignore_eos\":true,\"input_ids\":[1],\"max_new_tokens\":32768,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "prompt tokens 1 plus max_new_tokens 32768 exceed max_model_len 32768",
+          "type": "invalid_request"
+        }
+      },
+      "response_raw": "{\"error\":{\"message\":\"prompt tokens 1 plus max_new_tokens 32768 exceed max_model_len 32768\",\"type\":\"invalid_request\"}}",
+      "started_at": "2026-08-23T11:07:16.620429+00:00",
+      "status_code": 400,
+      "timestamp": "2026-08-23T11:07:16.620886+00:00"
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "images": [
+          "x"
+        ],
+        "input_ids": [
+          1
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.49,
+      "finished_at": "2026-08-23T11:07:16.621433+00:00",
+      "id": "unsupported_modality_field",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"images\":[\"x\"],\"input_ids\":[1],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_body_raw": "{\"ignore_eos\":true,\"images\":[\"x\"],\"input_ids\":[1],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "error": {
+          "message": "unsupported field `images`",
+          "type": "invalid_request"
+        }
+      },
+      "response_raw": "{\"error\":{\"message\":\"unsupported field `images`\",\"type\":\"invalid_request\"}}",
+      "started_at": "2026-08-23T11:07:16.620932+00:00",
+      "status_code": 400,
+      "timestamp": "2026-08-23T11:07:16.621438+00:00"
+    },
+    {
+      "body": {
+        "ignore_eos": true,
+        "input_ids": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "max_new_tokens": 1,
+        "stream": false,
+        "temperature": 0.0
+      },
+      "elapsed_ms": 0.468,
+      "finished_at": "2026-08-23T11:07:16.621963+00:00",
+      "id": "valid_short_nostream_request",
+      "passed": true,
+      "request_body": "{\"ignore_eos\":true,\"input_ids\":[1,2,3,4,5,6,7,8],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_body_raw": "{\"ignore_eos\":true,\"input_ids\":[1,2,3,4,5,6,7,8],\"max_new_tokens\":1,\"stream\":false,\"temperature\":0.0}",
+      "request_method": "POST",
+      "request_path": "/v1/evaluations/generate",
+      "response": {
+        "output_ids": [
+          7
+        ],
+        "request_id": "req-1",
+        "type": "result",
+        "usage": {
+          "completion_tokens": 1,
+          "prompt_tokens": 8,
+          "total_tokens": 9
+        }
+      },
+      "response_raw": "{\"output_ids\":[7],\"request_id\":\"req-1\",\"type\":\"result\",\"usage\":{\"completion_tokens\":1,\"prompt_tokens\":8,\"total_tokens\":9}}",
+      "started_at": "2026-08-23T11:07:16.621482+00:00",
+      "status_code": 200,
+      "timestamp": "2026-08-23T11:07:16.621968+00:00"
+    },
+    {
+      "elapsed_ms": 0.421,
+      "finished_at": "2026-08-23T11:07:16.622440+00:00",
+      "id": "health_after_invalid_requests",
+      "method": "GET",
+      "passed": true,
+      "path": "/health",
+      "request_body": "",
+      "request_body_raw": "",
+      "request_method": "GET",
+      "request_path": "/health",
+      "response": {
+        "capabilities": {
+          "multimodal": false,
+          "pretokenized_input_ids": true,
+          "token_id_output": true
+        },
+        "evaluation_contract": "apxinf.qwen38_27b.inference_interface.v1",
+        "fallback_active": false,
+        "max_model_len": 32768,
+        "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+        "parallel_requests": 1,
+        "status": "ok",
+        "stub": true,
+        "vocab_size": 248320
+      },
+      "response_raw": "{\"capabilities\":{\"multimodal\":false,\"pretokenized_input_ids\":true,\"token_id_output\":true},\"evaluation_contract\":\"apxinf.qwen38_27b.inference_interface.v1\",\"fallback_active\":false,\"max_model_len\":32768,\"model_revision\":\"63768c10df38c0395e12ef49edac1bd539eaeeea\",\"parallel_requests\":1,\"status\":\"ok\",\"stub\":true,\"vocab_size\":248320}",
+      "started_at": "2026-08-23T11:07:16.622002+00:00",
+      "status_code": 200,
+      "timestamp": "2026-08-23T11:07:16.622446+00:00"
+    },
+    {
+      "elapsed_ms": 0.442,
+      "finished_at": "2026-08-23T11:07:16.622931+00:00",
+      "id": "health_contract_identity",
+      "method": "GET",
+      "passed": true,
+      "path": "/health",
+      "request_body": "",
+      "request_body_raw": "",
+      "request_method": "GET",
+      "request_path": "/health",
+      "response": {
+        "capabilities": {
+          "multimodal": false,
+          "pretokenized_input_ids": true,
+          "token_id_output": true
+        },
+        "evaluation_contract": "apxinf.qwen38_27b.inference_interface.v1",
+        "fallback_active": false,
+        "max_model_len": 32768,
+        "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+        "parallel_requests": 1,
+        "status": "ok",
+        "stub": true,
+        "vocab_size": 248320
+      },
+      "response_raw": "{\"capabilities\":{\"multimodal\":false,\"pretokenized_input_ids\":true,\"token_id_output\":true},\"evaluation_contract\":\"apxinf.qwen38_27b.inference_interface.v1\",\"fallback_active\":false,\"max_model_len\":32768,\"model_revision\":\"63768c10df38c0395e12ef49edac1bd539eaeeea\",\"parallel_requests\":1,\"status\":\"ok\",\"stub\":true,\"vocab_size\":248320}",
+      "started_at": "2026-08-23T11:07:16.622476+00:00",
+      "status_code": 200,
+      "timestamp": "2026-08-23T11:07:16.622936+00:00"
+    }
+  ],
+  "runtime_kind": "stub_fixture",
+  "schema": "apxinf.protocol-gates.v2",
+  "stub": true
+}

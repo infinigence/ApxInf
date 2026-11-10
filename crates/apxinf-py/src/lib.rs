@@ -157,11 +157,7 @@ impl Model {
         let data = noise.as_slice().map_err(|_| {
             PyValueError::new_err("apxinf_py.infer: noise must be C-contiguous float32")
         })?;
-        Tensor::from_f32(
-            Shape::new(vec![expected[0], expected[1]]),
-            data,
-        )
-        .map_err(runtime_err)
+        Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), data).map_err(runtime_err)
     }
 
     /// Run inference and marshal the flat host action into a `[horizon, dim]`
@@ -171,7 +167,10 @@ impl Model {
         py: Python<'py>,
         observation: Observation,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
-        let flat = self.model.infer_host_f32(&observation).map_err(runtime_err)?;
+        let flat = self
+            .model
+            .infer_host_f32(&observation)
+            .map_err(runtime_err)?;
         let horizon = self.config.action_horizon;
         let dim = self.config.action_dim;
         if flat.len() != horizon * dim {
@@ -326,8 +325,7 @@ impl Model {
             uniform_fp8_scale,
             ..LoadOptions::default()
         };
-        let loaded = AutoModel::load_model(device, Path::new(""), &options)
-            .map_err(runtime_err)?;
+        let loaded = AutoModel::load_model(device, Path::new(""), &options).map_err(runtime_err)?;
         Ok(Self {
             model: loaded,
             config,
@@ -366,17 +364,16 @@ impl Model {
         let tokens = token_ids
             .as_slice()
             .map_err(|_| {
-                PyValueError::new_err("apxinf_py._infer_patches: token_ids must be C-contiguous uint32")
+                PyValueError::new_err(
+                    "apxinf_py._infer_patches: token_ids must be C-contiguous uint32",
+                )
             })?
             .to_vec();
         self.validate_tokens(&tokens)?;
 
         let noise_tensor = self.noise_tensor(noise)?;
-        let patch_tensor = Tensor::from_f32(
-            Shape::new(vec![expected[0], expected[1]]),
-            patch_data,
-        )
-        .map_err(runtime_err)?;
+        let patch_tensor = Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), patch_data)
+            .map_err(runtime_err)?;
 
         let observation = Observation {
             vision: VisionObservation::Patches(patch_tensor),

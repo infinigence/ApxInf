@@ -1,8 +1,8 @@
 //! W8A8 INT8 π0.5 transformer-layer execution.
 
 use super::backend::{kernels, Context};
-use kernels::{activation, attention, embedding, fused, norm, rope};
 use apxinf_core::{Result, Tensor};
+use kernels::{activation, attention, embedding, fused, norm, rope};
 
 use super::{
     GemmaVariantConfig, Int8DeviceActionLayer, Int8DeviceLanguageLayer, Int8DeviceVisionBlock,
@@ -65,7 +65,8 @@ pub fn language_layer_int8(
     let gate_up = weights.gate_up.gemm(ctx, &fused.normalized)?;
     let activated = activation::geglu_bf16(ctx, &gate_up)?;
     let projected = weights.down.gemm(ctx, &activated)?;
-    let hidden = fused::bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
+    let hidden =
+        fused::bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
     Ok(Int8LanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
@@ -179,7 +180,8 @@ pub fn vision_layer_int8(
         layer_norm_eps,
     )?;
     let qkv = weights.qkv.gemm(ctx, &normalized)?;
-    let qkv = attention::split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
+    let qkv =
+        attention::split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
     let attention = attention::mha_bf16(ctx, &qkv.q, &qkv.k, &qkv.v, patches_per_view)?
         .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
     let projection = weights.output.gemm(ctx, &attention)?;

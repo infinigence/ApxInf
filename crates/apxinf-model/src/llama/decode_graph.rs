@@ -12,12 +12,11 @@
 
 #![cfg(feature = "cuda")]
 
-use apxinf_core::{Backend, Device, DType, Error, Graph, KvCache, Result, RopeKind, Shape, Tensor};
+use apxinf_core::{Backend, DType, Device, Error, Graph, KvCache, Result, RopeKind, Shape, Tensor};
 
 use crate::accelerator::cuda::{
-    kernels, Context as CudaContext, CublasTranspose,
-    DeviceBuffer as CudaBuffer, KvCache as CudaKVCache, MappedBuffer as HostMappedBuffer,
-    RuntimeBackend as CudaBackend,
+    kernels, Context as CudaContext, CublasTranspose, DeviceBuffer as CudaBuffer,
+    KvCache as CudaKVCache, MappedBuffer as HostMappedBuffer, RuntimeBackend as CudaBackend,
 };
 
 // ── Config + weight view types (model-level, not backend) ───────────────
@@ -44,16 +43,33 @@ pub struct DecodeGraphConfig {
 
 impl DecodeGraphConfig {
     pub fn llama_like(
-        n_layers: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
-        hidden_size: usize, intermediate_size: usize, vocab_size: usize,
-        max_seq_len: usize, rope_theta: f32, rms_norm_eps: f32, dtype: DType,
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        vocab_size: usize,
+        max_seq_len: usize,
+        rope_theta: f32,
+        rms_norm_eps: f32,
+        dtype: DType,
     ) -> Self {
         Self {
-            n_layers, n_heads, n_kv_heads, head_dim, hidden_size,
-            intermediate_size, vocab_size, max_seq_len, rope_theta,
-            rms_norm_eps, dtype,
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden_size,
+            intermediate_size,
+            vocab_size,
+            max_seq_len,
+            rope_theta,
+            rms_norm_eps,
+            dtype,
             rope_kind: RopeKind::OneD { theta: rope_theta },
-            qk_norm: false, tie_embeddings: false,
+            qk_norm: false,
+            tie_embeddings: false,
         }
     }
 }
@@ -90,9 +106,9 @@ pub struct DecodeLayerWeights<'a> {
 /// Reused across tokens and layers. Zero `cudaMalloc` per token.
 struct DecodeWorkspace {
     dtype: DType,
-    x: CudaBuffer,            // [hidden] flowing residual
-    logits: CudaBuffer,       // [vocab] — device mem (GPU→host mapped write is
-                              // slower on Tegra due to coherency; D2H copy wins)
+    x: CudaBuffer,      // [hidden] flowing residual
+    logits: CudaBuffer, // [vocab] — device mem (GPU→host mapped write is
+    // slower on Tegra due to coherency; D2H copy wins)
     norm_out: CudaBuffer,     // [hidden] pre-attn normed (reused across layers)
     q: CudaBuffer,            // [hidden]
     k: CudaBuffer,            // [n_kv_heads*head_dim]
@@ -111,8 +127,8 @@ struct DecodeWorkspace {
     up: CudaBuffer,           // [intermediate]
     mlp_hidden: CudaBuffer,   // [intermediate]
     mlp_out: CudaBuffer,      // [hidden]
-    token_buf: HostMappedBuffer,    // [1] u32 — zero-copy host-write, device-read
-    pos_buf: HostMappedBuffer,      // [1] u32
+    token_buf: HostMappedBuffer, // [1] u32 — zero-copy host-write, device-read
+    pos_buf: HostMappedBuffer, // [1] u32
 }
 
 impl DecodeWorkspace {
@@ -151,7 +167,9 @@ impl DecodeWorkspace {
         })
     }
 
-    fn dtype(&self) -> DType { self.dtype }
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -193,7 +211,9 @@ fn read_logits(ws: &DecodeWorkspace, vocab: usize) -> Result<Tensor> {
             // conversion + Vec alloc per token.
             Tensor::from_raw(Shape::new(vec![1, vocab]), DType::BF16, Device::Cpu, host)
         }
-        dtype => Err(Error::Other(format!("Llama decode logits do not support {dtype}"))),
+        dtype => Err(Error::Other(format!(
+            "Llama decode logits do not support {dtype}"
+        ))),
     }
 }
 
@@ -222,7 +242,9 @@ fn decode_forward_capturable(
     let dtype = cfg.dtype;
     let is_bf16 = dtype == DType::BF16;
 
-    let cache = kv.as_any_mut().downcast_mut::<CudaKVCache>()
+    let cache = kv
+        .as_any_mut()
+        .downcast_mut::<CudaKVCache>()
         .ok_or_else(|| Error::Other("expected CudaKVCache".into()))?;
 
     // Embedding lookup
@@ -254,11 +276,15 @@ fn decode_forward_capturable(
     for (i, layer) in weights.layers.iter().enumerate() {
         let kv_proj = n_kv_heads * head_dim;
         let (q_view, k_view, v_view) = if let Some(qkv_w) = layer.qkv_packed {
-            let norm_view = ws.norm_out.view(0, ws.norm_out.len()).map_err(Error::Cuda)?;
+            let norm_view = ws
+                .norm_out
+                .view(0, ws.norm_out.len())
+                .map_err(Error::Cuda)?;
             let qkv_wv = weight_view(qkv_w, device_id)?;
             let fused_n = hidden + 2 * kv_proj;
-            kernels::gemm::write(ctx, dtype, 1, fused_n, hidden, 1.0, &norm_view, &qkv_wv, 0.0, &ws.qkv)
-                ?;
+            kernels::gemm::write(
+                ctx, dtype, 1, fused_n, hidden, 1.0, &norm_view, &qkv_wv, 0.0, &ws.qkv,
+            )?;
             (
                 ws.qkv.view(0, hidden * elem).map_err(Error::Cuda)?,
                 ws.qkv
@@ -269,13 +295,22 @@ fn decode_forward_capturable(
                     .map_err(Error::Cuda)?,
             )
         } else {
-            let norm_view = ws.norm_out.view(0, ws.norm_out.len()).map_err(Error::Cuda)?;
+            let norm_view = ws
+                .norm_out
+                .view(0, ws.norm_out.len())
+                .map_err(Error::Cuda)?;
             let wq_v = weight_view(layer.wq, device_id)?;
             let wk_v = weight_view(layer.wk, device_id)?;
             let wv_v = weight_view(layer.wv, device_id)?;
-            kernels::gemm::write(ctx, dtype, 1, hidden, hidden, 1.0, &norm_view, &wq_v, 0.0, &ws.q)?;
-            kernels::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wk_v, 0.0, &ws.k)?;
-            kernels::gemm::write(ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wv_v, 0.0, &ws.v)?;
+            kernels::gemm::write(
+                ctx, dtype, 1, hidden, hidden, 1.0, &norm_view, &wq_v, 0.0, &ws.q,
+            )?;
+            kernels::gemm::write(
+                ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wk_v, 0.0, &ws.k,
+            )?;
+            kernels::gemm::write(
+                ctx, dtype, 1, kv_proj, hidden, 1.0, &norm_view, &wv_v, 0.0, &ws.v,
+            )?;
             (
                 ws.q.view(0, ws.q.len()).map_err(Error::Cuda)?,
                 ws.k.view(0, ws.k.len()).map_err(Error::Cuda)?,
@@ -360,12 +395,35 @@ fn decode_forward_capturable(
                 let q_offset = (kv_h * gqa_ratio) * head_dim;
                 let scores_offset = (kv_h * gqa_ratio) * bucket_kv_len;
                 let k_offset = kv_h * max_seq * head_dim;
-                let q_group = ws.q_rope.view(q_offset * elem, gqa_ratio * head_dim * elem).map_err(Error::Cuda)?;
-                let k_block = cache.k_buffer(i).view(k_offset * elem, bucket_kv_len * head_dim * elem).map_err(Error::Cuda)?;
-                let scores_block = ws.scores.view(scores_offset * elem, gqa_ratio * bucket_kv_len * elem).map_err(Error::Cuda)?;
-                kernels::gemm::write_ex(ctx, dtype, CublasTranspose::None, CublasTranspose::Transpose,
-                    gqa_ratio, bucket_kv_len, head_dim, scale,
-                    &q_group, head_dim as i32, &k_block, head_dim as i32, 0.0, &scores_block, bucket_kv_len as i32)?;
+                let q_group = ws
+                    .q_rope
+                    .view(q_offset * elem, gqa_ratio * head_dim * elem)
+                    .map_err(Error::Cuda)?;
+                let k_block = cache
+                    .k_buffer(i)
+                    .view(k_offset * elem, bucket_kv_len * head_dim * elem)
+                    .map_err(Error::Cuda)?;
+                let scores_block = ws
+                    .scores
+                    .view(scores_offset * elem, gqa_ratio * bucket_kv_len * elem)
+                    .map_err(Error::Cuda)?;
+                kernels::gemm::write_ex(
+                    ctx,
+                    dtype,
+                    CublasTranspose::None,
+                    CublasTranspose::Transpose,
+                    gqa_ratio,
+                    bucket_kv_len,
+                    head_dim,
+                    scale,
+                    &q_group,
+                    head_dim as i32,
+                    &k_block,
+                    head_dim as i32,
+                    0.0,
+                    &scores_block,
+                    bucket_kv_len as i32,
+                )?;
             }
             kernels::attention::softmax_f32_into(
                 ctx,
@@ -379,19 +437,56 @@ fn decode_forward_capturable(
                 let attn_offset = (kv_h * gqa_ratio) * bucket_kv_len;
                 let v_offset = kv_h * max_seq * head_dim;
                 let out_offset = (kv_h * gqa_ratio) * head_dim;
-                let attn_group = ws.attn_weights.view(attn_offset * elem, gqa_ratio * bucket_kv_len * elem).map_err(Error::Cuda)?;
-                let v_block = cache.v_buffer(i).view(v_offset * elem, bucket_kv_len * head_dim * elem).map_err(Error::Cuda)?;
-                let out_block = ws.attn_out.view(out_offset * elem, gqa_ratio * head_dim * elem).map_err(Error::Cuda)?;
-                kernels::gemm::write_ex(ctx, dtype, CublasTranspose::None, CublasTranspose::None,
-                    gqa_ratio, head_dim, bucket_kv_len, 1.0,
-                    &attn_group, bucket_kv_len as i32, &v_block, head_dim as i32, 0.0, &out_block, head_dim as i32)?;
+                let attn_group = ws
+                    .attn_weights
+                    .view(attn_offset * elem, gqa_ratio * bucket_kv_len * elem)
+                    .map_err(Error::Cuda)?;
+                let v_block = cache
+                    .v_buffer(i)
+                    .view(v_offset * elem, bucket_kv_len * head_dim * elem)
+                    .map_err(Error::Cuda)?;
+                let out_block = ws
+                    .attn_out
+                    .view(out_offset * elem, gqa_ratio * head_dim * elem)
+                    .map_err(Error::Cuda)?;
+                kernels::gemm::write_ex(
+                    ctx,
+                    dtype,
+                    CublasTranspose::None,
+                    CublasTranspose::None,
+                    gqa_ratio,
+                    head_dim,
+                    bucket_kv_len,
+                    1.0,
+                    &attn_group,
+                    bucket_kv_len as i32,
+                    &v_block,
+                    head_dim as i32,
+                    0.0,
+                    &out_block,
+                    head_dim as i32,
+                )?;
             }
         }
 
         // wo projection
-        let ao_view = ws.attn_out.view(0, ws.attn_out.len()).map_err(Error::Cuda)?;
+        let ao_view = ws
+            .attn_out
+            .view(0, ws.attn_out.len())
+            .map_err(Error::Cuda)?;
         let wo_v = weight_view(layer.wo, device_id)?;
-        kernels::gemm::write(ctx, dtype, 1, hidden, hidden, 1.0, &ao_view, &wo_v, 0.0, &ws.attn_proj)?;
+        kernels::gemm::write(
+            ctx,
+            dtype,
+            1,
+            hidden,
+            hidden,
+            1.0,
+            &ao_view,
+            &wo_v,
+            0.0,
+            &ws.attn_proj,
+        )?;
 
         // Fused post-attn residual add + pre-FFN norm
         let ffn_norm_weight = weight_view(layer.ffn_norm_weight, device_id)?;
@@ -420,11 +515,24 @@ fn decode_forward_capturable(
             )?;
         }
 
-        let fn_view = ws.ffn_norm_out.view(0, ws.ffn_norm_out.len()).map_err(Error::Cuda)?;
+        let fn_view = ws
+            .ffn_norm_out
+            .view(0, ws.ffn_norm_out.len())
+            .map_err(Error::Cuda)?;
         if let Some(gate_up_w) = layer.gate_up_packed {
             let gu_wv = weight_view(gate_up_w, device_id)?;
-            kernels::gemm::write(ctx, dtype, 1, 2 * inter, hidden, 1.0, &fn_view, &gu_wv, 0.0, &ws.gate_up)
-                ?;
+            kernels::gemm::write(
+                ctx,
+                dtype,
+                1,
+                2 * inter,
+                hidden,
+                1.0,
+                &fn_view,
+                &gu_wv,
+                0.0,
+                &ws.gate_up,
+            )?;
             let up_view = ws
                 .gate_up
                 .view(inter * elem, inter * elem)
@@ -445,8 +553,12 @@ fn decode_forward_capturable(
         } else {
             let wg_v = weight_view(layer.w_gate, device_id)?;
             let wu_v = weight_view(layer.w_up, device_id)?;
-            kernels::gemm::write(ctx, dtype, 1, inter, hidden, 1.0, &fn_view, &wg_v, 0.0, &ws.gate)?;
-            kernels::gemm::write(ctx, dtype, 1, inter, hidden, 1.0, &fn_view, &wu_v, 0.0, &ws.up)?;
+            kernels::gemm::write(
+                ctx, dtype, 1, inter, hidden, 1.0, &fn_view, &wg_v, 0.0, &ws.gate,
+            )?;
+            kernels::gemm::write(
+                ctx, dtype, 1, inter, hidden, 1.0, &fn_view, &wu_v, 0.0, &ws.up,
+            )?;
             kernels::activation::silu_into(ctx, dtype, &ws.gate, &ws.gate_silu, inter)?;
             kernels::elementwise::mul_into(
                 ctx,
@@ -457,9 +569,23 @@ fn decode_forward_capturable(
                 inter,
             )?;
         }
-        let mh_view = ws.mlp_hidden.view(0, ws.mlp_hidden.len()).map_err(Error::Cuda)?;
+        let mh_view = ws
+            .mlp_hidden
+            .view(0, ws.mlp_hidden.len())
+            .map_err(Error::Cuda)?;
         let wd_v = weight_view(layer.w_down, device_id)?;
-        kernels::gemm::write(ctx, dtype, 1, hidden, inter, 1.0, &mh_view, &wd_v, 0.0, &ws.mlp_out)?;
+        kernels::gemm::write(
+            ctx,
+            dtype,
+            1,
+            hidden,
+            inter,
+            1.0,
+            &mh_view,
+            &wd_v,
+            0.0,
+            &ws.mlp_out,
+        )?;
 
         // Fused post-FFN residual add + next layer's pre-attn norm (or final output norm)
         let next_norm_w = if i + 1 < weights.layers.len() {
@@ -496,9 +622,14 @@ fn decode_forward_capturable(
     }
 
     // lm_head matmul (norm_out already holds the final normed output)
-    let no_view = ws.norm_out.view(0, ws.norm_out.len()).map_err(Error::Cuda)?;
+    let no_view = ws
+        .norm_out
+        .view(0, ws.norm_out.len())
+        .map_err(Error::Cuda)?;
     let ow_v = weight_view(weights.output_weight, device_id)?;
-    kernels::gemm::write(ctx, dtype, 1, vocab, hidden, 1.0, &no_view, &ow_v, 0.0, &ws.logits)?;
+    kernels::gemm::write(
+        ctx, dtype, 1, vocab, hidden, 1.0, &no_view, &ow_v, 0.0, &ws.logits,
+    )?;
 
     // NOTE: a single-block GPU argmax over [vocab] was tried here but is
     // net-negative on Thor (14 SMs): one block under-occupies the GPU and
@@ -527,9 +658,12 @@ pub struct DecodeGraph {
 
 impl DecodeGraph {
     pub fn new(backend: &CudaBackend, cfg: DecodeGraphConfig) -> Result<Self> {
-        let ws = DecodeWorkspace::new(backend.device_id(), &cfg)
-            .map_err(Error::Other)?;
-        Ok(Self { config: cfg, workspace: ws, buckets: Vec::new() })
+        let ws = DecodeWorkspace::new(backend.device_id(), &cfg).map_err(Error::Other)?;
+        Ok(Self {
+            config: cfg,
+            workspace: ws,
+            buckets: Vec::new(),
+        })
     }
 
     fn bucket_for(&self, _pos: u32) -> usize {
@@ -563,11 +697,14 @@ impl DecodeGraph {
                 continue;
             }
             backend.begin_capture_relaxed()?;
-            let cap_res = decode_forward_capturable(
-                ctx, &self.workspace, weights, kv, &self.config, bkl);
+            let cap_res =
+                decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bkl);
             let graph = backend.end_capture()?;
             cap_res?;
-            self.buckets.push(BucketGraph { bucket_kv_len: bkl, graph });
+            self.buckets.push(BucketGraph {
+                bucket_kv_len: bkl,
+                graph,
+            });
         }
         Ok(())
     }
@@ -583,20 +720,40 @@ impl DecodeGraph {
         let ctx = backend.context();
         let bucket_kv_len = self.bucket_for(pos);
         let vocab = self.config.vocab_size;
-        let have = self.buckets.iter().any(|b| b.bucket_kv_len == bucket_kv_len);
+        let have = self
+            .buckets
+            .iter()
+            .any(|b| b.bucket_kv_len == bucket_kv_len);
 
         if !have {
             write_u32_mapped(&self.workspace.token_buf, token);
             write_u32_mapped(&self.workspace.pos_buf, pos);
-            decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len)?;
+            decode_forward_capturable(
+                ctx,
+                &self.workspace,
+                weights,
+                kv,
+                &self.config,
+                bucket_kv_len,
+            )?;
             backend.synchronize()?;
             let logits = read_logits(&self.workspace, vocab)?;
 
             backend.begin_capture_relaxed()?;
-            let cap_res = decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len);
+            let cap_res = decode_forward_capturable(
+                ctx,
+                &self.workspace,
+                weights,
+                kv,
+                &self.config,
+                bucket_kv_len,
+            );
             let graph = backend.end_capture()?;
             cap_res?;
-            self.buckets.push(BucketGraph { bucket_kv_len, graph });
+            self.buckets.push(BucketGraph {
+                bucket_kv_len,
+                graph,
+            });
             return Ok(logits);
         }
 
@@ -606,8 +763,18 @@ impl DecodeGraph {
         // Lets nsys see every per-token kernel (graph-replayed kernels are
         // undercounted in the CUPTI activity trace). Profiling-only — do not
         // use in production (loses the launch-overhead amortization).
-        if std::env::var("APXINF_NO_GRAPH").map(|v| !v.is_empty()).unwrap_or(false) {
-            decode_forward_capturable(ctx, &self.workspace, weights, kv, &self.config, bucket_kv_len)?;
+        if std::env::var("APXINF_NO_GRAPH")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            decode_forward_capturable(
+                ctx,
+                &self.workspace,
+                weights,
+                kv,
+                &self.config,
+                bucket_kv_len,
+            )?;
             backend.synchronize()?;
             return read_logits(&self.workspace, vocab);
         }

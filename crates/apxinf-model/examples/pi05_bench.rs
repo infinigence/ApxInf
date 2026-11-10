@@ -35,9 +35,10 @@ use apxinf_core::{Backend, DType, Tensor};
 use apxinf_cuda::{CudaBackend, CudaBuffer};
 use apxinf_model::pi05::{
     upload_time_embeddings, upload_time_embeddings_bf16, upload_time_embeddings_int8,
-    Pi05ActivationScales, Pi05Bf16CapturedGraph, Pi05Bf16CudaRuntime, Pi05CapturedGraph, Pi05Config,
-    Pi05CudaRuntime, Pi05ImageLayout, Pi05Int8CapturedGraph, Pi05Int8CudaRuntime, Pi05Weights,
-    StaticBf16Pi05Weights, StaticFp8Calibration, StaticFp8Pi05Weights, StaticInt8Pi05Weights,
+    Pi05ActivationScales, Pi05Bf16CapturedGraph, Pi05Bf16CudaRuntime, Pi05CapturedGraph,
+    Pi05Config, Pi05CudaRuntime, Pi05ImageLayout, Pi05Int8CapturedGraph, Pi05Int8CudaRuntime,
+    Pi05Weights, StaticBf16Pi05Weights, StaticFp8Calibration, StaticFp8Pi05Weights,
+    StaticInt8Pi05Weights,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,7 +291,8 @@ impl ImageInput {
         let value = match spec {
             Some(value) => value,
             None => {
-                owned = std::env::var("APXINF_PI05_IMAGE_INPUT").unwrap_or_else(|_| "patches".into());
+                owned =
+                    std::env::var("APXINF_PI05_IMAGE_INPUT").unwrap_or_else(|_| "patches".into());
                 owned.as_str()
             }
         };
@@ -333,7 +335,11 @@ impl ErrorMetrics {
             )
             .into());
         }
-        if actual.iter().chain(expected).any(|value| !value.is_finite()) {
+        if actual
+            .iter()
+            .chain(expected)
+            .any(|value| !value.is_finite())
+        {
             return Err("integrity comparison contains a non-finite value".into());
         }
 
@@ -603,21 +609,27 @@ impl Args {
         while index < raw.len() {
             let argument = raw[index].as_str();
             match argument {
-                "--dtype" => dtype = Some(Dtype::parse(&expect_value(raw, &mut index, "--dtype")?)?),
-                "--calibration" => calibration = Some(expect_value(raw, &mut index, "--calibration")?),
+                "--dtype" => {
+                    dtype = Some(Dtype::parse(&expect_value(raw, &mut index, "--dtype")?)?)
+                }
+                "--calibration" => {
+                    calibration = Some(expect_value(raw, &mut index, "--calibration")?)
+                }
                 "--tactics" => tactics = Some(expect_value(raw, &mut index, "--tactics")?),
                 "--views" => views = Some(expect_value(raw, &mut index, "--views")?.parse()?),
                 "--image-size" => {
                     image_size = Some(expect_value(raw, &mut index, "--image-size")?.parse()?)
                 }
                 "--action-horizon" => {
-                    action_horizon = Some(expect_value(raw, &mut index, "--action-horizon")?.parse()?)
+                    action_horizon =
+                        Some(expect_value(raw, &mut index, "--action-horizon")?.parse()?)
                 }
                 "--action-dim" => {
                     action_dim = Some(expect_value(raw, &mut index, "--action-dim")?.parse()?)
                 }
                 "--num-flow-steps" => {
-                    num_flow_steps = Some(expect_value(raw, &mut index, "--num-flow-steps")?.parse()?)
+                    num_flow_steps =
+                        Some(expect_value(raw, &mut index, "--num-flow-steps")?.parse()?)
                 }
                 "--max-token-len" => {
                     max_token_len = Some(expect_value(raw, &mut index, "--max-token-len")?.parse()?)
@@ -722,7 +734,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     if matches!(image_input, ImageInput::Rgb(_)) && args.reference.is_some() {
-        return Err("a raw-image fixture cannot be validated against the zero-input reference".into());
+        return Err(
+            "a raw-image fixture cannot be validated against the zero-input reference".into(),
+        );
     }
     // FP8 tuning knobs (--tactics / --calibration) only apply to fp8; bf16/int8 have
     // no per-tensor activation scales or GEMM tactic DB.
@@ -783,7 +797,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if random {
-        eprintln!("building deterministic random π0.5 weights (seed {})...", args.seed);
+        eprintln!(
+            "building deterministic random π0.5 weights (seed {})...",
+            args.seed
+        );
     } else {
         eprintln!("loading π0.5 checkpoint...");
     }
@@ -796,7 +813,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bench = match dtype {
         Dtype::Bf16 => {
             eprintln!("converting and uploading native BF16 weights...");
-            let device_weights = Arc::new(StaticBf16Pi05Weights::from_host(&host_weights, &*backend)?);
+            let device_weights =
+                Arc::new(StaticBf16Pi05Weights::from_host(&host_weights, &*backend)?);
             Bench::Bf16(Pi05Bf16CudaRuntime::new(
                 backend.clone(),
                 config.clone(),
@@ -804,31 +822,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?)
         }
         Dtype::Fp8 => {
-            let scales = match args.calibration.as_deref() {
-                Some(spec) if spec.starts_with("uniform:") => {
-                    eprintln!("warning: uniform activation scales are for smoke/latency tests only");
-                    Arc::new(Pi05ActivationScales::uniform(
-                        &config,
-                        spec["uniform:".len()..].parse()?,
-                    )?)
-                }
-                Some(path) => {
-                    let calibration = StaticFp8Calibration::from_json_file(Path::new(path))?;
-                    Arc::new(Pi05ActivationScales::from_calibration(&config, &calibration)?)
-                }
-                None if random => {
-                    eprintln!("warning: no --calibration; using uniform activation scale 1.0");
-                    Arc::new(Pi05ActivationScales::uniform(&config, 1.0)?)
-                }
-                None => {
-                    return Err(
+            let scales =
+                match args.calibration.as_deref() {
+                    Some(spec) if spec.starts_with("uniform:") => {
+                        eprintln!(
+                            "warning: uniform activation scales are for smoke/latency tests only"
+                        );
+                        Arc::new(Pi05ActivationScales::uniform(
+                            &config,
+                            spec["uniform:".len()..].parse()?,
+                        )?)
+                    }
+                    Some(path) => {
+                        let calibration = StaticFp8Calibration::from_json_file(Path::new(path))?;
+                        Arc::new(Pi05ActivationScales::from_calibration(
+                            &config,
+                            &calibration,
+                        )?)
+                    }
+                    None if random => {
+                        eprintln!("warning: no --calibration; using uniform activation scale 1.0");
+                        Arc::new(Pi05ActivationScales::uniform(&config, 1.0)?)
+                    }
+                    None => return Err(
                         "--dtype fp8 requires --calibration <json|uniform:SCALE> for a checkpoint"
                             .into(),
-                    )
-                }
-            };
+                    ),
+                };
             eprintln!("quantizing and uploading static FP8 weights...");
-            let device_weights = Arc::new(StaticFp8Pi05Weights::from_host(&host_weights, &*backend)?);
+            let device_weights =
+                Arc::new(StaticFp8Pi05Weights::from_host(&host_weights, &*backend)?);
             Bench::Fp8(Pi05CudaRuntime::new(
                 backend.clone(),
                 config.clone(),
@@ -838,7 +861,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Dtype::Int8 => {
             eprintln!("quantizing and uploading per-channel INT8 weights...");
-            let device_weights = Arc::new(StaticInt8Pi05Weights::from_host(&host_weights, &backend)?);
+            let device_weights =
+                Arc::new(StaticInt8Pi05Weights::from_host(&host_weights, &backend)?);
             Bench::Int8(Pi05Int8CudaRuntime::new(
                 backend.clone(),
                 config.clone(),
@@ -869,7 +893,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Dtype::Int8 => upload_time_embeddings_int8(&config, &*backend)?,
     };
 
-    eprintln!("running eager {} integrity pass...", dtype.precision_label());
+    eprintln!(
+        "running eager {} integrity pass...",
+        dtype.precision_label()
+    );
     let eager_output = bench.infer(&patches, &token_ids, token_count, &noise, &time_embeddings)?;
     let eager = backend.to_cpu(&eager_output)?.to_f32_vec()?;
     drop(eager_output);
@@ -908,8 +935,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     graph.replay_and_synchronize()?;
     let captured = backend.to_cpu(graph.output())?.to_f32_vec()?;
     let eager_graph = ErrorMetrics::measure(&captured, &eager)?;
-    let eager_graph_passed =
-        eager_graph.cosine >= EAGER_GRAPH_MIN_COSINE && eager_graph.max_abs <= thresholds.eager_graph_max_abs;
+    let eager_graph_passed = eager_graph.cosine >= EAGER_GRAPH_MIN_COSINE
+        && eager_graph.max_abs <= thresholds.eager_graph_max_abs;
 
     let reference_min_cosine = args.min_cosine.unwrap_or(thresholds.reference_min_cosine);
     let reference_metrics = args

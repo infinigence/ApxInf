@@ -13,27 +13,36 @@
 //!       "1 20 20" \
 //!       /tmp/vision_out
 
-use std::path::PathBuf;
 use std::io::Read;
+use std::path::PathBuf;
 
 use apxinf_core::{Device, Tensor};
-use apxinf_model::GeneralQwen3VL;
 use apxinf_model::qwen3vl::vision;
+use apxinf_model::GeneralQwen3VL;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 5 {
-        eprintln!("usage: vision_check <model_dir> <pixel_values.npy> <grid_thw 'T H W'> <output_dir>");
+        eprintln!(
+            "usage: vision_check <model_dir> <pixel_values.npy> <grid_thw 'T H W'> <output_dir>"
+        );
         std::process::exit(1);
     }
     let model_dir = PathBuf::from(&args[1]);
     let pv_path = &args[2];
-    let grid: Vec<u32> = args[3].split_whitespace().map(|s| s.parse().unwrap()).collect();
+    let grid: Vec<u32> = args[3]
+        .split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
     let out_dir = PathBuf::from(&args[4]);
 
     // Read the .npy pixel_values file.
     let (pv_shape, pv_data) = read_npy_bf16(pv_path).expect("read pixel_values.npy");
-    eprintln!("pixel_values shape: {:?}, {} bytes", pv_shape, pv_data.len());
+    eprintln!(
+        "pixel_values shape: {:?}, {} bytes",
+        pv_shape,
+        pv_data.len()
+    );
 
     // Load model.
     let mut model = GeneralQwen3VL::from_dir(&model_dir, Device::Cuda(0)).expect("load model");
@@ -41,14 +50,22 @@ fn main() {
 
     // Upload pixel_values to GPU.
     let pixel_values_cpu = Tensor::from_bf16(pv_shape.clone(), &pv_data).expect("build tensor");
-    let pixel_values = model.backend().to_device(&pixel_values_cpu).expect("upload pixel_values");
+    let pixel_values = model
+        .backend()
+        .to_device(&pixel_values_cpu)
+        .expect("upload pixel_values");
 
     // Run vision tower with debug dumps.
     let grid_thw = vec![[grid[0], grid[1], grid[2]]];
     let vis = vision::forward_debug(
-        &model.config_ref(), &model.vision_weights_ref(),
-        model.backend(), &pixel_values, &grid_thw, "/tmp/apxinf",
-    ).expect("vision forward");
+        &model.config_ref(),
+        &model.vision_weights_ref(),
+        model.backend(),
+        &pixel_values,
+        &grid_thw,
+        "/tmp/apxinf",
+    )
+    .expect("vision forward");
     eprintln!("primary shape: {:?}", vis.primary.shape().dims());
 
     // Download outputs to CPU and write as .npy.
@@ -98,7 +115,8 @@ fn read_npy_bf16(path: &str) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
     let total: usize = shape.iter().product();
     let raw = &buf[data_start..];
     if dtype == "bf16" {
-        let data: Vec<half::bf16> = raw.chunks_exact(2)
+        let data: Vec<half::bf16> = raw
+            .chunks_exact(2)
             .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
             .collect();
         if data.len() != total {
@@ -107,7 +125,8 @@ fn read_npy_bf16(path: &str) -> Result<(Vec<usize>, Vec<half::bf16>), String> {
         Ok((shape, data))
     } else {
         // f32 → upcast to bf16
-        let data: Vec<half::bf16> = raw.chunks_exact(4)
+        let data: Vec<half::bf16> = raw
+            .chunks_exact(4)
             .map(|c| half::bf16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
             .collect();
         Ok((shape, data))
@@ -122,18 +141,26 @@ fn parse_npy_shape(header: &str) -> Result<Vec<usize>, String> {
     if inner.trim().is_empty() {
         return Ok(vec![]);
     }
-    inner.split(',')
-        .map(|s| s.trim().parse::<usize>()
-            .map_err(|e| format!("parse shape dim '{s}': {e}")))
+    inner
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<usize>()
+                .map_err(|e| format!("parse shape dim '{s}': {e}"))
+        })
         .collect()
 }
 
 fn write_npy_bf16(path: &PathBuf, t: &Tensor) -> Result<(), String> {
     let f32_data = t.to_f32_vec().map_err(|e| format!("to_f32_vec: {e}"))?;
     let dims = t.shape().dims();
-    let shape_str = dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ");
-    let mut header = format!(
-        "{{'descr': '<f4', 'fortran_order': False, 'shape': ({shape_str}), }}");
+    let shape_str = dims
+        .iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut header =
+        format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({shape_str}), }}");
     // Pad header to multiple of 64 bytes (numpy convention).
     let pad = (64 - ((header.len() + 10) % 64)) % 64;
     header.push_str(&" ".repeat(pad));
@@ -146,9 +173,7 @@ fn write_npy_bf16(path: &PathBuf, t: &Tensor) -> Result<(), String> {
     out.extend_from_slice(&(header.len() as u16).to_le_bytes());
     out.extend_from_slice(header.as_bytes());
     // Data as f32 LE.
-    let f32_bytes: Vec<u8> = f32_data.iter()
-        .flat_map(|&v| v.to_le_bytes())
-        .collect();
+    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
     out.extend_from_slice(&f32_bytes);
 
     std::fs::write(path, &out).map_err(|e| format!("write: {e}"))?;

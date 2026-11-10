@@ -186,9 +186,10 @@ fn main() {
         let kernels_dir = format!("{manifest_dir}/kernels");
         let adapters_dir = format!("{manifest_dir}/adapters");
         if std::path::Path::new(&kernels_dir).exists() {
-            // Track the directory as well as its current members so adding a
-            // new top-level .cu file invalidates an existing Cargo build.
-            println!("cargo:rerun-if-changed={kernels_dir}");
+            // Track every CUDA source/header recursively.  The adapter files
+            // include project-owned .cuh files, so watching only the
+            // directory entry can leave a stale object after a header edit.
+            emit_rerun_if_changed_tree(std::path::Path::new(&kernels_dir));
             println!("cargo:rerun-if-changed={adapters_dir}");
             emit_rerun_if_changed_tree(std::path::Path::new(&adapters_dir));
             // Pick a target arch: explicit override > aarch64→sm_101 (Drive OS

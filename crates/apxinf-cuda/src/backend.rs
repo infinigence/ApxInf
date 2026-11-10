@@ -43,6 +43,19 @@ impl CudaBackend {
         Ok(Self { ctx })
     }
 
+    /// Create a backend whose CUDA ordinal is independently attested against
+    /// the requested physical GPU UUID.
+    pub fn new_attested(device_id: usize, expected_uuid: &str) -> Result<Self> {
+        let ctx = CudaContext::new_attested(device_id, expected_uuid).map_err(Error::Cuda)?;
+        eprintln!(
+            "CUDA {}: {} ({})",
+            device_id,
+            ctx.caps().device_name,
+            ctx.device_uuid(),
+        );
+        Ok(Self { ctx })
+    }
+
     /// Access the CUDA context.
     pub fn context(&self) -> &CudaContext {
         &self.ctx

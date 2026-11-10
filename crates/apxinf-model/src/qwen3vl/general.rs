@@ -8,19 +8,17 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use apxinf_core::{
-    Backend, Device, Error, KvCache, Result, Tensor,
-};
+use apxinf_core::{Backend, Device, Error, KvCache, Result, Tensor};
 use apxinf_loader::safetensors;
 
-use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
+use super::config::Qwen3VLConfig;
+use super::vision::{self, VisionOutput};
+use super::vision_weights::{transfer_vision_weights, Qwen3VLVisionWeights};
+use super::weights::Qwen3VLTextWeights;
+use crate::accelerator::create_backend;
 #[cfg(feature = "cuda")]
 use crate::accelerator::cuda::downcast as cuda_backend;
-use crate::accelerator::create_backend;
-use super::config::Qwen3VLConfig;
-use super::weights::Qwen3VLTextWeights;
-use super::vision_weights::{Qwen3VLVisionWeights, transfer_vision_weights};
-use super::vision::{self, VisionOutput};
+use crate::llm_trait::{LlmCapabilities, LlmInput, LlmTrait};
 
 pub struct GeneralQwen3VL {
     config: Qwen3VLConfig,
@@ -109,7 +107,12 @@ impl GeneralQwen3VL {
         };
 
         Ok(Self {
-            config, weights, vision_weights, lm_head, backend, kv,
+            config,
+            weights,
+            vision_weights,
+            lm_head,
+            backend,
+            kv,
             rope_delta: 0,
             #[cfg(feature = "cuda")]
             decode_graph,
@@ -118,7 +121,8 @@ impl GeneralQwen3VL {
 
     #[cfg(feature = "cuda")]
     fn decode_graph_cfg(
-        config: &Qwen3VLConfig, dtype: apxinf_core::DType,
+        config: &Qwen3VLConfig,
+        dtype: apxinf_core::DType,
     ) -> super::decode_graph::Qwen3VLDecodeGraphConfig {
         let tc = &config.text;
         super::decode_graph::Qwen3VLDecodeGraphConfig {
@@ -138,18 +142,34 @@ impl GeneralQwen3VL {
     }
 
     /// Access the backend (for tests that need to upload tensors).
-    pub fn backend(&self) -> &dyn Backend { &*self.backend }
+    pub fn backend(&self) -> &dyn Backend {
+        &*self.backend
+    }
 
     /// Access the config (for debug tools).
-    pub fn config_ref(&self) -> &Qwen3VLConfig { &self.config }
+    pub fn config_ref(&self) -> &Qwen3VLConfig {
+        &self.config
+    }
 
     /// Access the vision weights (for debug tools).
-    pub fn vision_weights_ref(&self) -> &Qwen3VLVisionWeights { &self.vision_weights }
+    pub fn vision_weights_ref(&self) -> &Qwen3VLVisionWeights {
+        &self.vision_weights
+    }
 
     /// Run the vision tower. `pixel_values` is `[N, 1536]` bf16 on device;
     /// `grid_thw` is `[[T, H, W]]`. Returns primary + 3 deepstack embeddings.
-    pub fn forward_vision(&self, pixel_values: &Tensor, grid_thw: &[[u32; 3]]) -> Result<VisionOutput> {
-        vision::forward(&self.config, &self.vision_weights, &*self.backend, pixel_values, grid_thw)
+    pub fn forward_vision(
+        &self,
+        pixel_values: &Tensor,
+        grid_thw: &[[u32; 3]],
+    ) -> Result<VisionOutput> {
+        vision::forward(
+            &self.config,
+            &self.vision_weights,
+            &*self.backend,
+            pixel_values,
+            grid_thw,
+        )
     }
 
     /// Compute 3D mRoPE position IDs for a text+image prompt.
@@ -164,7 +184,7 @@ impl GeneralQwen3VL {
 
         let mut st = 0usize;
         let mut image_index = 0usize;
-        let mut next_pos: u32 = 0;  // Tracks the next linear position to assign
+        let mut next_pos: u32 = 0; // Tracks the next linear position to assign
 
         loop {
             // Find next image_pad from st.
@@ -272,7 +292,9 @@ impl GeneralQwen3VL {
         drop(_vis_range);
 
         // Embedding lookup.
-        let mut x = self.backend.embedding(&self.weights.token_embedding, token_ids)?;
+        let mut x = self
+            .backend
+            .embedding(&self.weights.token_embedding, token_ids)?;
 
         // Replace image_pad embeddings with vision primary output.
         let image_tok = self.config.image_token_id;
@@ -286,7 +308,9 @@ impl GeneralQwen3VL {
         if img_positions.len() != n_img_tokens {
             return Err(Error::Other(format!(
                 "image_pad count {} != vision primary tokens {}",
-                img_positions.len(), n_img_tokens)));
+                img_positions.len(),
+                n_img_tokens
+            )));
         }
         x = scatter_add(&x, &img_positions, &vis.primary, &*self.backend)?;
 
@@ -295,7 +319,8 @@ impl GeneralQwen3VL {
         // Compute rope_delta = max(mRoPE positions) + 1 - seq_len, matching
         // HF's `mrope_position_deltas`. Used by decode to offset the linear
         // position into mRoPE space.
-        let max_mrope = pos_ids.chunks(3)
+        let max_mrope = pos_ids
+            .chunks(3)
             .map(|c| c[0].max(c[1]).max(c[2]))
             .max()
             .unwrap_or(0) as i64;
@@ -315,8 +340,11 @@ impl GeneralQwen3VL {
         self.kv.advance(seq_len);
 
         // Final norm + tied lm_head.
-        let x = self.backend.rms_norm(&x, &self.weights.output_norm_weight,
-                                      self.config.text.rms_norm_eps)?;
+        let x = self.backend.rms_norm(
+            &x,
+            &self.weights.output_norm_weight,
+            self.config.text.rms_norm_eps,
+        )?;
         let logits = self.backend.matmul(&x, &self.lm_head)?;
         self.backend.synchronize()?;
         self.backend.to_cpu(&logits)
@@ -339,8 +367,13 @@ impl GeneralQwen3VL {
         out
     }
 
-    fn forward_layer(&mut self, x: &Tensor, layer_idx: usize,
-                     pos_ids: &[u32], start_pos: u32) -> Result<Tensor> {
+    fn forward_layer(
+        &mut self,
+        x: &Tensor,
+        layer_idx: usize,
+        pos_ids: &[u32],
+        start_pos: u32,
+    ) -> Result<Tensor> {
         let seq_len = x.shape().dims()[0];
         let tc = &self.config.text;
         let n_heads = tc.n_heads;
@@ -372,8 +405,22 @@ impl GeneralQwen3VL {
         let k = k.reshape(vec![seq_len, n_kv_heads, head_dim])?;
 
         // mRoPE (rotate_half + axis-interleaved). Text-only → all axes = pos.
-        let q = b.rope_mrope(&q, n_heads, head_dim, tc.rope_theta, tc.mrope_section, pos_ids)?;
-        let k = b.rope_mrope(&k, n_kv_heads, head_dim, tc.rope_theta, tc.mrope_section, pos_ids)?;
+        let q = b.rope_mrope(
+            &q,
+            n_heads,
+            head_dim,
+            tc.rope_theta,
+            tc.mrope_section,
+            pos_ids,
+        )?;
+        let k = b.rope_mrope(
+            &k,
+            n_kv_heads,
+            head_dim,
+            tc.rope_theta,
+            tc.mrope_section,
+            pos_ids,
+        )?;
 
         // Append to KV cache.
         b.kv_append(&mut *self.kv, layer_idx, &k, &v, seq_len)?;
@@ -381,13 +428,27 @@ impl GeneralQwen3VL {
         // Attention.
         let kv_len = self.kv.seq_len() + seq_len;
         let attn_out = if seq_len == 1 {
-            b.sdpa_decode(&q, &mut *self.kv, layer_idx,
-                          n_heads, n_kv_heads, head_dim, kv_len,
-                          tc.max_position_embeddings.min(4096))?
+            b.sdpa_decode(
+                &q,
+                &mut *self.kv,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_len,
+                tc.max_position_embeddings.min(4096),
+            )?
         } else {
-            b.sdpa_prefill(&q, &mut *self.kv, layer_idx,
-                           n_heads, n_kv_heads, head_dim, kv_len,
-                           tc.max_position_embeddings.min(4096))?
+            b.sdpa_prefill(
+                &q,
+                &mut *self.kv,
+                layer_idx,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_len,
+                tc.max_position_embeddings.min(4096),
+            )?
         };
 
         // Output projection + residual.
@@ -404,7 +465,7 @@ impl GeneralQwen3VL {
         let mlp_out = b.matmul(&hidden, &layer.w_down)?;
 
         // Residual.
-        let _ = start_pos;  // unused for now; kept for parity with Llama
+        let _ = start_pos; // unused for now; kept for parity with Llama
         b.add(&x, &mlp_out)
     }
 }
@@ -412,8 +473,14 @@ impl GeneralQwen3VL {
 impl LlmTrait for GeneralQwen3VL {
     /// Stub: Qwen3-VL uses its own config schema; call `from_dir` /
     /// `from_weights` directly. `AutoModel` uses its registered loader.
-    fn load(_config: apxinf_loader::ModelConfig, _weights: HashMap<String, Tensor>, _device: Device) -> Result<Self>
-    where Self: Sized {
+    fn load(
+        _config: apxinf_loader::ModelConfig,
+        _weights: HashMap<String, Tensor>,
+        _device: Device,
+    ) -> Result<Self>
+    where
+        Self: Sized,
+    {
         Err(Error::Other(
             "GeneralQwen3VL::load(ModelConfig) not supported; use GeneralQwen3VL::from_dir or from_weights"
                 .into()))
@@ -425,7 +492,8 @@ impl LlmTrait for GeneralQwen3VL {
             return Err(Error::Other("forward: empty token_ids".into()));
         }
 
-        let _decode_range = crate::profiling::trace::range(if seq_len == 1 { "decode" } else { "prefill" });
+        let _decode_range =
+            crate::profiling::trace::range(if seq_len == 1 { "decode" } else { "prefill" });
 
         // Decode fast path: seq_len=1 with the CUDA decode graph.
         #[cfg(feature = "cuda")]
@@ -434,12 +502,20 @@ impl LlmTrait for GeneralQwen3VL {
                 use super::decode_graph::{Qwen3VLDecodeGraphWeights, Qwen3VLDecodeLayerWeights};
                 let weights = Qwen3VLDecodeGraphWeights {
                     token_embedding: &self.weights.token_embedding,
-                    layers: self.weights.layers.iter()
+                    layers: self
+                        .weights
+                        .layers
+                        .iter()
                         .map(|l| Qwen3VLDecodeLayerWeights {
                             attn_norm_weight: &l.attn_norm_weight,
-                            wq: &l.wq, wk: &l.wk, wv: &l.wv, wo: &l.wo,
+                            wq: &l.wq,
+                            wk: &l.wk,
+                            wv: &l.wv,
+                            wo: &l.wo,
                             ffn_norm_weight: &l.ffn_norm_weight,
-                            w_gate: &l.w_gate, w_up: &l.w_up, w_down: &l.w_down,
+                            w_gate: &l.w_gate,
+                            w_up: &l.w_up,
+                            w_down: &l.w_down,
                             q_norm_weight: &l.q_norm_weight,
                             k_norm_weight: &l.k_norm_weight,
                             qkv_packed: l.qkv_packed.as_ref(),
@@ -449,15 +525,20 @@ impl LlmTrait for GeneralQwen3VL {
                     output_norm_weight: &self.weights.output_norm_weight,
                     lm_head: &self.lm_head,
                 };
-                let cb = cuda_backend(&*self.backend)
-                    .expect("decode_graph requires CudaBackend");
+                let cb = cuda_backend(&*self.backend).expect("decode_graph requires CudaBackend");
                 // For decode: mRoPE position = linear + rope_delta (text-only
                 // after multimodal prefill), all three axes equal.
                 // Cache position = linear (unshifted).
                 let mrope_pos = (start_pos as i64 + self.rope_delta) as u32;
                 let cache_pos = start_pos;
-                let logits = dg.decode(cb, &weights, &mut *self.kv, token_ids[0],
-                                       [mrope_pos, mrope_pos, mrope_pos], cache_pos)?;
+                let logits = dg.decode(
+                    cb,
+                    &weights,
+                    &mut *self.kv,
+                    token_ids[0],
+                    [mrope_pos, mrope_pos, mrope_pos],
+                    cache_pos,
+                )?;
                 self.kv.advance(1);
                 return Ok(logits);
             }
@@ -465,7 +546,9 @@ impl LlmTrait for GeneralQwen3VL {
 
         // Fallback: dyn Backend op-by-op path (prefill or non-CUDA).
         // Embedding lookup.
-        let mut x = self.backend.embedding(&self.weights.token_embedding, token_ids)?;
+        let mut x = self
+            .backend
+            .embedding(&self.weights.token_embedding, token_ids)?;
 
         // mRoPE position IDs (text-only for now).
         let pos_ids = self.text_only_pos_ids(seq_len, start_pos);
@@ -480,8 +563,11 @@ impl LlmTrait for GeneralQwen3VL {
         // Final norm + tied lm_head. The output projection is
         // token_embedding^T: cuBLAS row-major GEMM against [vocab, hidden]
         // gives [seq_len, vocab] directly.
-        let x = self.backend.rms_norm(&x, &self.weights.output_norm_weight,
-                                      self.config.text.rms_norm_eps)?;
+        let x = self.backend.rms_norm(
+            &x,
+            &self.weights.output_norm_weight,
+            self.config.text.rms_norm_eps,
+        )?;
         let logits = self.backend.matmul(&x, &self.lm_head)?;
 
         self.backend.synchronize()?;
@@ -494,11 +580,9 @@ impl LlmTrait for GeneralQwen3VL {
 
     fn prefill(&mut self, input: LlmInput<'_>) -> Result<Tensor> {
         match input.image {
-            Some(image) => self.prefill_with_image(
-                input.token_ids,
-                image.pixel_values,
-                image.grid_thw,
-            ),
+            Some(image) => {
+                self.prefill_with_image(input.token_ids, image.pixel_values, image.grid_thw)
+            }
             None => self.forward(input.token_ids, 0),
         }
     }
@@ -515,21 +599,27 @@ impl LlmTrait for GeneralQwen3VL {
 
 /// Transfer text weights to backend's device.
 fn transfer_weights(w: &Qwen3VLTextWeights, backend: &dyn Backend) -> Result<Qwen3VLTextWeights> {
-    let layers = w.layers.iter().map(|l| Ok::<_, Error>(super::weights::Qwen3VLLayer {
-        attn_norm_weight: backend.to_device(&l.attn_norm_weight)?,
-        wq: backend.to_device(&l.wq)?,
-        wk: backend.to_device(&l.wk)?,
-        wv: backend.to_device(&l.wv)?,
-        wo: backend.to_device(&l.wo)?,
-        q_norm_weight: backend.to_device(&l.q_norm_weight)?,
-        k_norm_weight: backend.to_device(&l.k_norm_weight)?,
-        ffn_norm_weight: backend.to_device(&l.ffn_norm_weight)?,
-        w_gate: backend.to_device(&l.w_gate)?,
-        w_up: backend.to_device(&l.w_up)?,
-        w_down: backend.to_device(&l.w_down)?,
-        qkv_packed: None,
-        gate_up_packed: None,
-    })).collect::<Result<Vec<_>>>()?;
+    let layers = w
+        .layers
+        .iter()
+        .map(|l| {
+            Ok::<_, Error>(super::weights::Qwen3VLLayer {
+                attn_norm_weight: backend.to_device(&l.attn_norm_weight)?,
+                wq: backend.to_device(&l.wq)?,
+                wk: backend.to_device(&l.wk)?,
+                wv: backend.to_device(&l.wv)?,
+                wo: backend.to_device(&l.wo)?,
+                q_norm_weight: backend.to_device(&l.q_norm_weight)?,
+                k_norm_weight: backend.to_device(&l.k_norm_weight)?,
+                ffn_norm_weight: backend.to_device(&l.ffn_norm_weight)?,
+                w_gate: backend.to_device(&l.w_gate)?,
+                w_up: backend.to_device(&l.w_up)?,
+                w_down: backend.to_device(&l.w_down)?,
+                qkv_packed: None,
+                gate_up_packed: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(Qwen3VLTextWeights {
         token_embedding: backend.to_device(&w.token_embedding)?,
         layers,
@@ -551,20 +641,28 @@ fn transpose_tensor_bf16_or_f32(t: &Tensor, backend: &dyn Backend) -> Result<Ten
         apxinf_core::DType::F32 => {
             let src = cpu.as_f32()?;
             let mut out = vec![0.0f32; rows * cols];
-            for i in 0..rows { for j in 0..cols {
-                out[j * rows + i] = src[i * cols + j];
-            }}
+            for i in 0..rows {
+                for j in 0..cols {
+                    out[j * rows + i] = src[i * cols + j];
+                }
+            }
             Tensor::from_f32(vec![cols, rows], &out)?
         }
         apxinf_core::DType::BF16 => {
             let src = cpu.as_bf16()?;
             let mut out = vec![half::bf16::from_f32(0.0); rows * cols];
-            for i in 0..rows { for j in 0..cols {
-                out[j * rows + i] = src[i * cols + j];
-            }}
+            for i in 0..rows {
+                for j in 0..cols {
+                    out[j * rows + i] = src[i * cols + j];
+                }
+            }
             Tensor::from_bf16(vec![cols, rows], &out)?
         }
-        dtype => return Err(Error::Other(format!("Qwen3-VL tied embedding transpose does not support {dtype}"))),
+        dtype => {
+            return Err(Error::Other(format!(
+                "Qwen3-VL tied embedding transpose does not support {dtype}"
+            )))
+        }
     };
     backend.to_device(&transposed)
 }
@@ -587,7 +685,10 @@ fn pack_fused_weights(weights: &mut Qwen3VLTextWeights, backend: &dyn Backend) {
 /// (round-trip through to_cpu/to_device) since the Backend trait has no
 /// scatter op. One-time per forward, not on the hot path.
 fn scatter_add(
-    x: &Tensor, positions: &[usize], src: &Tensor, backend: &dyn Backend,
+    x: &Tensor,
+    positions: &[usize],
+    src: &Tensor,
+    backend: &dyn Backend,
 ) -> Result<Tensor> {
     let x_cpu = backend.to_cpu(x)?;
     let src_cpu = backend.to_cpu(src)?;
@@ -618,7 +719,9 @@ fn scatter_add(
             let out = Tensor::from_bf16(dims, &bf16)?;
             backend.to_device(&out)
         }
-        dtype => Err(Error::Other(format!("Qwen3-VL scatter does not support {dtype}"))),
+        dtype => Err(Error::Other(format!(
+            "Qwen3-VL scatter does not support {dtype}"
+        ))),
     }
 }
 

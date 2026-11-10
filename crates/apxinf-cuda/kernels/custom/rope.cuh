@@ -155,6 +155,64 @@ __global__ void rope_batched_bf16_kernel(
     output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
 }
 
+// Qwen3.5 partial RoPE: rotate only the first `rotary_dim` channels using
+// half-split pairs and leave the remaining head channels byte-for-byte
+// unchanged. The frequency denominator is rotary_dim (not head_dim).
+__global__ void rope_partial_batched_bf16_kernel(
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    uint32_t head_dim, uint32_t rotary_dim, uint32_t n_heads,
+    uint32_t seq_len, float rope_theta, uint32_t pos_offset)
+{
+    uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t head_idx = blockIdx.y;
+    uint32_t seq_idx  = blockIdx.z;
+    if (pair_idx >= rotary_dim / 2) return;
+
+    uint32_t pos = seq_idx + pos_offset;
+    float freq = 1.0f / powf(rope_theta, 2.0f * (float)pair_idx / (float)rotary_dim);
+    float angle = (float)pos * freq;
+    float cos_val = cosf(angle);
+    float sin_val = sinf(angle);
+
+    uint32_t base = seq_idx * n_heads * head_dim + head_idx * head_dim;
+    uint32_t idx0 = base + pair_idx;
+    uint32_t idx1 = base + rotary_dim / 2 + pair_idx;
+    float x0 = __bfloat162float(input[idx0]);
+    float x1 = __bfloat162float(input[idx1]);
+    output[idx0] = __float2bfloat16(x0 * cos_val - x1 * sin_val);
+    output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
+}
+
+
+
+// Partial RoPE with one independent position per row: the batched-decode
+// variant of the kernel above, where each of `seq_len` rows is a different
+// request at its own KV position. Math per row is identical.
+__global__ void rope_partial_positions_bf16_kernel(
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    uint32_t head_dim, uint32_t rotary_dim, uint32_t n_heads,
+    uint32_t seq_len, float rope_theta, const uint32_t* positions)
+{
+    uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t head_idx = blockIdx.y;
+    uint32_t seq_idx  = blockIdx.z;
+    if (pair_idx >= rotary_dim / 2) return;
+
+    uint32_t pos = positions[seq_idx];
+    float freq = 1.0f / powf(rope_theta, 2.0f * (float)pair_idx / (float)rotary_dim);
+    float angle = (float)pos * freq;
+    float cos_val = cosf(angle);
+    float sin_val = sinf(angle);
+
+    uint32_t base = seq_idx * n_heads * head_dim + head_idx * head_dim;
+    uint32_t idx0 = base + pair_idx;
+    uint32_t idx1 = base + rotary_dim / 2 + pair_idx;
+    float x0 = __bfloat162float(input[idx0]);
+    float x1 = __bfloat162float(input[idx1]);
+    output[idx0] = __float2bfloat16(x0 * cos_val - x1 * sin_val);
+    output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
+}
+
 
 
 __global__ void rope_decode_bf16_kernel(
@@ -311,7 +369,6 @@ __global__ void rope_vision_2d_bf16_kernel(
     output[idx0] = __float2bfloat16(x0 * cos_val - x1 * sin_val);
     output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
 }
-
 
 
 

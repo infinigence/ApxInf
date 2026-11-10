@@ -29,7 +29,7 @@ mod tests;
 pub use backend::CudaBackend;
 pub use buffer::HostMappedBuffer;
 pub use buffer::{CudaBuffer, CudaDeviceAddress};
-pub use context::{CudaContext, CudaLibraryVersions};
+pub use context::{CudaContext, CudaLibraryVersions, CudaMemoryInfo};
 pub use cublas::{CublasHandle, CublasTranspose};
 pub use device_caps::{CudaArchFamily, CudaDeviceCaps};
 pub use kv_cache::CudaKVCache;

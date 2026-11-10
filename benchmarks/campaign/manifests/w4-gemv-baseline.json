@@ -1,0 +1,74 @@
+{
+  "schema": "apxinf.member3.experiment.v1",
+  "status": "planned",
+  "experiment_id": "M3-E0-W4-GEMV-001",
+  "owner": "member3",
+  "branch": "exp/w4-gemv",
+  "base_good_sha": "",
+  "commit_sha": "",
+  "model_revision": "63768c10df38c0395e12ef49edac1bd539eaeeea",
+  "contract_sha256": "",
+  "input_manifest_sha256": "",
+  "hypothesis": "Packed W4 decode GEMV reduces decode latency while preserving BASE_GOOD correctness and recovery.",
+  "primary_variable": "experimental packed-W4 decode GEMV feature",
+  "baseline": {
+    "feature": "off",
+    "command": "<BASE_GOOD server command with experimental feature off>",
+    "config": "<fixed baseline config>"
+  },
+  "candidate": {
+    "feature": "on",
+    "command": "<same BASE_GOOD server command with exactly one feature enabled>",
+    "config": "<same fixed config>"
+  },
+  "environment": {
+    "gpu_uuid": "<RTX 4090 UUID>",
+    "gpu_model": "<actual GPU model>",
+    "driver_version": "<driver>",
+    "cuda_version": "<CUDA toolkit/runtime>",
+    "apxinf_cuda_arch": "sm_89",
+    "replay_lane": "<GPU0 for official acceptance; GPU2/GPU3 for logical replay>",
+    "evidence_scope": "<official or development>"
+  },
+  "measurement": {
+    "warmup_repeats": 1,
+    "measured_repeats": 5,
+    "timeout_s": 1800,
+    "clock_policy": "<record clocks, temperature and power>"
+  },
+  "evidence": {
+    "correctness": {
+      "baseline_pass": null,
+      "candidate_pass": null,
+      "max_abs_error": null
+    },
+    "reliability": {
+      "no_unexpected_oom": null,
+      "no_nan": null,
+      "no_fallback": null,
+      "no_xid": null
+    },
+    "recovery": {
+      "service_healthy_after_failure": null,
+      "recovery_pass": null
+    },
+    "latency": {
+      "baseline": {"ttft_ms": [], "tpot_ms": []},
+      "candidate": {"ttft_ms": [], "tpot_ms": []}
+    },
+    "memory": {
+      "baseline_peak_vram_mib": null,
+      "candidate_peak_vram_mib": null
+    },
+    "raw_artifact_path": "<shared storage path to canonical JSONL/raw evidence>",
+    "raw_artifact_sha256": ""
+  },
+  "conclusion": {
+    "decision": "<accepted, rejected, or inconclusive>",
+    "reason": "<evidence-backed conclusion; no end-to-end claim before GPU0 replay>"
+  },
+  "rollback": {
+    "sha": "",
+    "command": "<git revert or branch rollback command>"
+  }
+}

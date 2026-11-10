@@ -58,31 +58,55 @@ impl Qwen3VLTextWeights {
         for i in 0..n_layers {
             let p = format!("model.language_model.layers.{i}");
             let take = |name: &str, map: &mut HashMap<String, Tensor>| -> Result<Tensor> {
-                map.remove(name).ok_or_else(|| Error::Other(format!("missing {name}")))
+                map.remove(name)
+                    .ok_or_else(|| Error::Other(format!("missing {name}")))
             };
             layers.push(Qwen3VLLayer {
-                attn_norm_weight:  take(&format!("{p}.input_layernorm.weight"), &mut tensors)?,
-                wq: transpose_2d(&take(&format!("{p}.self_attn.q_proj.weight"), &mut tensors)?)?,
-                wk: transpose_2d(&take(&format!("{p}.self_attn.k_proj.weight"), &mut tensors)?)?,
-                wv: transpose_2d(&take(&format!("{p}.self_attn.v_proj.weight"), &mut tensors)?)?,
-                wo: transpose_2d(&take(&format!("{p}.self_attn.o_proj.weight"), &mut tensors)?)?,
-                q_norm_weight:     take(&format!("{p}.self_attn.q_norm.weight"), &mut tensors)?,
-                k_norm_weight:     take(&format!("{p}.self_attn.k_norm.weight"), &mut tensors)?,
-                ffn_norm_weight:   take(&format!("{p}.post_attention_layernorm.weight"), &mut tensors)?,
+                attn_norm_weight: take(&format!("{p}.input_layernorm.weight"), &mut tensors)?,
+                wq: transpose_2d(&take(
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    &mut tensors,
+                )?)?,
+                wk: transpose_2d(&take(
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    &mut tensors,
+                )?)?,
+                wv: transpose_2d(&take(
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    &mut tensors,
+                )?)?,
+                wo: transpose_2d(&take(
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    &mut tensors,
+                )?)?,
+                q_norm_weight: take(&format!("{p}.self_attn.q_norm.weight"), &mut tensors)?,
+                k_norm_weight: take(&format!("{p}.self_attn.k_norm.weight"), &mut tensors)?,
+                ffn_norm_weight: take(
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    &mut tensors,
+                )?,
                 w_gate: transpose_2d(&take(&format!("{p}.mlp.gate_proj.weight"), &mut tensors)?)?,
-                w_up:   transpose_2d(&take(&format!("{p}.mlp.up_proj.weight"),   &mut tensors)?)?,
+                w_up: transpose_2d(&take(&format!("{p}.mlp.up_proj.weight"), &mut tensors)?)?,
                 w_down: transpose_2d(&take(&format!("{p}.mlp.down_proj.weight"), &mut tensors)?)?,
                 qkv_packed: None,
                 gate_up_packed: None,
             });
         }
 
-        let token_embedding = tensors.remove("model.language_model.embed_tokens.weight")
-            .ok_or_else(|| Error::Other("missing model.language_model.embed_tokens.weight".into()))?;
-        let output_norm_weight = tensors.remove("model.language_model.norm.weight")
+        let token_embedding = tensors
+            .remove("model.language_model.embed_tokens.weight")
+            .ok_or_else(|| {
+                Error::Other("missing model.language_model.embed_tokens.weight".into())
+            })?;
+        let output_norm_weight = tensors
+            .remove("model.language_model.norm.weight")
             .ok_or_else(|| Error::Other("missing model.language_model.norm.weight".into()))?;
 
-        Ok(Self { token_embedding, layers, output_norm_weight })
+        Ok(Self {
+            token_embedding,
+            layers,
+            output_norm_weight,
+        })
     }
 }
 
@@ -94,7 +118,9 @@ fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
     let dims = tensor.shape().dims();
     if dims.len() != 2 {
         return Err(Error::Other(format!(
-            "transpose_2d expected 2D tensor, got {}D", dims.len())));
+            "transpose_2d expected 2D tensor, got {}D",
+            dims.len()
+        )));
     }
     let [rows, cols] = [dims[0], dims[1]];
     match tensor.dtype() {
@@ -118,6 +144,8 @@ fn transpose_2d(tensor: &Tensor) -> Result<Tensor> {
             }
             Tensor::from_bf16(vec![cols, rows], &out)
         }
-        dtype => Err(Error::Other(format!("Qwen3-VL weight transpose does not support {dtype}"))),
+        dtype => Err(Error::Other(format!(
+            "Qwen3-VL weight transpose does not support {dtype}"
+        ))),
     }
 }

@@ -1,5 +1,5 @@
-use half::bf16;
 use apxinf_core::{Backend, Result, Tensor};
+use half::bf16;
 
 use crate::buffer::CudaBuffer;
 use crate::context::CudaContext;

@@ -45,6 +45,18 @@ pub const cudaHostAllocWriteCombined: u32 = 4;
 extern "C" {
     pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> cudaError_t;
     pub fn cudaFree(devPtr: *mut c_void) -> cudaError_t;
+    pub fn cudaMallocAsync(
+        devPtr: *mut *mut c_void,
+        size: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn cudaFreeAsync(devPtr: *mut c_void, stream: cudaStream_t) -> cudaError_t;
+    pub fn cudaDeviceGetDefaultMemPool(pool: *mut *mut c_void, device: i32) -> cudaError_t;
+    pub fn cudaMemPoolSetAttribute(
+        pool: *mut c_void,
+        attr: i32,
+        value: *mut c_void,
+    ) -> cudaError_t;
 
     /// Allocate page-locked (pinned) host memory. With `cudaHostAllocMapped`
     /// the buffer is also directly accessible from the GPU via
@@ -107,6 +119,7 @@ extern "C" {
     ) -> cudaError_t;
 
     pub fn cudaDeviceSynchronize() -> cudaError_t;
+    pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
 
     /// Explicit collection boundaries consumed by tools such as Nsight
     /// Systems when launched with `--capture-range=cudaProfilerApi`.

@@ -37,29 +37,28 @@ impl Fp8LinearWeights {
         }
         let weight = concat_host_2d(&linears.iter().map(|x| &x.weight).collect::<Vec<_>>())?;
         #[cfg(feature = "cuda")]
-        let (weight, weight_scale) = if let Some(cuda_backend) =
-            backend.as_any().downcast_ref::<RuntimeBackend>()
-        {
-            // Quantizing billions of parameters with the scalar CPU E4M3
-            // encoder is prohibitively slow on Jetson. Upload FP16 once and
-            // let the CUDA conversion kernel produce the resident FP8 matrix.
-            let (weight_f16, amax) = fp16_host_and_amax(&weight)?;
-            let weight_scale = if amax == 0.0 {
-                1.0
+        let (weight, weight_scale) =
+            if let Some(cuda_backend) = backend.as_any().downcast_ref::<RuntimeBackend>() {
+                // Quantizing billions of parameters with the scalar CPU E4M3
+                // encoder is prohibitively slow on Jetson. Upload FP16 once and
+                // let the CUDA conversion kernel produce the resident FP8 matrix.
+                let (weight_f16, amax) = fp16_host_and_amax(&weight)?;
+                let weight_scale = if amax == 0.0 {
+                    1.0
+                } else {
+                    amax / super::E4M3_MAX
+                };
+                let weight_f16 = backend.to_device(&weight_f16)?;
+                let weight = kernels::quantization::quantize_f16_e4m3(
+                    cuda_backend.context(),
+                    &weight_f16,
+                    weight_scale,
+                )?;
+                (weight, weight_scale)
             } else {
-                amax / super::E4M3_MAX
+                let quantized = quantize_e4m3_absmax(&weight)?;
+                (backend.to_device(&quantized.values)?, quantized.scale)
             };
-            let weight_f16 = backend.to_device(&weight_f16)?;
-            let weight = kernels::quantization::quantize_f16_e4m3(
-                cuda_backend.context(),
-                &weight_f16,
-                weight_scale,
-            )?;
-            (weight, weight_scale)
-        } else {
-            let quantized = quantize_e4m3_absmax(&weight)?;
-            (backend.to_device(&quantized.values)?, quantized.scale)
-        };
         #[cfg(not(feature = "cuda"))]
         let (weight, weight_scale) = {
             let quantized = quantize_e4m3_absmax(&weight)?;

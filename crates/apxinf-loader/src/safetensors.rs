@@ -10,15 +10,19 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
-use std::path::{Component, Path};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 use memmap2::Mmap;
 use serde::Deserialize;
 
-use bytemuck;
 use apxinf_core::{DType, Device, Shape, Tensor};
+use bytemuck;
 
 use crate::config::ModelConfig;
+use crate::manifest::{ManifestDType, TensorManifest};
+
+const MAX_MANIFEST_HEADER_BYTES: usize = 64 * 1024 * 1024;
 
 /// A raw tensor entry from the SafeTensors JSON header.
 #[derive(Debug, Deserialize)]
@@ -31,6 +35,160 @@ struct TensorInfo {
 #[derive(Debug, Deserialize)]
 struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
+}
+
+fn resolve_shard_path(parent: &Path, shard: &str, index_path: &Path) -> Result<PathBuf, String> {
+    let relative = Path::new(shard);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!(
+            "unsafe shard path `{shard}` in {}",
+            index_path.display()
+        ));
+    }
+    let candidate = parent.join(relative);
+    let metadata = std::fs::symlink_metadata(&candidate)
+        .map_err(|error| format!("failed to inspect shard {}: {error}", candidate.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "SafeTensors shard `{shard}` in {} must not be a symlink",
+            index_path.display()
+        ));
+    }
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve {}: {error}", parent.display()))?;
+    let canonical_candidate = candidate
+        .canonicalize()
+        .map_err(|error| format!("failed to resolve {}: {error}", candidate.display()))?;
+    if !canonical_candidate.starts_with(&canonical_parent) {
+        return Err(format!(
+            "SafeTensors shard `{shard}` resolves outside {}",
+            parent.display()
+        ));
+    }
+    Ok(candidate)
+}
+
+/// Read only the SafeTensors JSON header and return a sorted tensor inventory.
+/// Tensor payload bytes are never mapped or materialized.
+pub fn read_tensor_manifest(path: &Path) -> Result<Vec<TensorManifest>, String> {
+    let mut file =
+        File::open(path).map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    let mut length_bytes = [0u8; 8];
+    file.read_exact(&mut length_bytes).map_err(|error| {
+        format!(
+            "failed to read SafeTensors header length {}: {error}",
+            path.display()
+        )
+    })?;
+    let header_len = usize::try_from(u64::from_le_bytes(length_bytes)).map_err(|_| {
+        format!(
+            "SafeTensors header length does not fit usize in {}",
+            path.display()
+        )
+    })?;
+    if header_len > MAX_MANIFEST_HEADER_BYTES {
+        return Err(format!(
+            "SafeTensors header in {} is too large: {header_len} bytes",
+            path.display()
+        ));
+    }
+    let mut header = vec![0u8; header_len];
+    file.read_exact(&mut header).map_err(|error| {
+        format!(
+            "failed to read SafeTensors header {}: {error}",
+            path.display()
+        )
+    })?;
+    let raw: HashMap<String, serde_json::Value> = serde_json::from_slice(&header)
+        .map_err(|error| format!("invalid SafeTensors header {}: {error}", path.display()))?;
+    let mut tensors = Vec::with_capacity(raw.len());
+    for (name, value) in raw {
+        if name == "__metadata__" {
+            continue;
+        }
+        let info: TensorInfo = serde_json::from_value(value).map_err(|error| {
+            format!(
+                "failed to parse tensor `{name}` in {}: {error}",
+                path.display()
+            )
+        })?;
+        tensors.push(TensorManifest {
+            name,
+            shape: info.shape,
+            dtype: manifest_dtype(&info.dtype),
+            quantization_role: None,
+            pack_axis: None,
+            group_size: None,
+        });
+    }
+    tensors.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(tensors)
+}
+
+/// Read every shard header referenced by a Hugging Face SafeTensors index.
+pub fn read_sharded_tensor_manifest(index_path: &Path) -> Result<Vec<TensorManifest>, String> {
+    let raw = std::fs::read_to_string(index_path)
+        .map_err(|error| format!("failed to read {}: {error}", index_path.display()))?;
+    let index: SafetensorsIndex = serde_json::from_str(&raw).map_err(|error| {
+        format!(
+            "invalid SafeTensors index {}: {error}",
+            index_path.display()
+        )
+    })?;
+    if index.weight_map.is_empty() {
+        return Err(format!(
+            "SafeTensors index {} has an empty weight_map",
+            index_path.display()
+        ));
+    }
+    let parent = index_path.parent().unwrap_or_else(|| Path::new("."));
+    let shards = index.weight_map.values().cloned().collect::<BTreeSet<_>>();
+    let mut found = HashMap::<String, (String, TensorManifest)>::new();
+    for shard in shards {
+        let shard_path = resolve_shard_path(parent, &shard, index_path)?;
+        for tensor in read_tensor_manifest(&shard_path)? {
+            if found
+                .insert(tensor.name.clone(), (shard.clone(), tensor))
+                .is_some()
+            {
+                return Err(format!("duplicate tensor found across SafeTensors shards"));
+            }
+        }
+    }
+    let mut inventory = Vec::with_capacity(index.weight_map.len());
+    for (name, expected_shard) in &index.weight_map {
+        let (actual_shard, tensor) = found.remove(name).ok_or_else(|| {
+            format!("indexed tensor `{name}` is missing from shard `{expected_shard}`")
+        })?;
+        if actual_shard != *expected_shard {
+            return Err(format!(
+                "indexed tensor `{name}` was found in `{actual_shard}`, index assigns it to `{expected_shard}`"
+            ));
+        }
+        inventory.push(tensor);
+    }
+    if let Some((name, (shard, _))) = found.into_iter().next() {
+        return Err(format!(
+            "unindexed tensor `{name}` found in SafeTensors shard `{shard}`"
+        ));
+    }
+    inventory.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(inventory)
+}
+
+fn manifest_dtype(dtype: &str) -> ManifestDType {
+    match dtype {
+        "I32" => ManifestDType::I32,
+        "BF16" => ManifestDType::BF16,
+        "F16" => ManifestDType::F16,
+        "F32" => ManifestDType::F32,
+        other => ManifestDType::Other(other.to_owned()),
+    }
 }
 
 /// Load a SafeTensors file. Returns all tensors on CPU.
@@ -125,23 +283,13 @@ pub fn load_native_sharded(
     let mut metadata = HashMap::new();
 
     for shard in shards {
-        let shard_path = Path::new(&shard);
-        if shard_path.is_absolute()
-            || shard_path
-                .components()
-                .any(|component| matches!(component, Component::ParentDir))
-        {
-            return Err(format!(
-                "unsafe shard path `{shard}` in {}",
-                index_path.display()
-            ));
-        }
-        let (shard_tensors, shard_metadata) = load_native(&parent.join(&shard))?;
+        let shard_path = resolve_shard_path(parent, &shard, index_path)?;
+        let (shard_tensors, shard_metadata) = load_native(&shard_path)?;
         metadata.extend(shard_metadata);
         for (name, tensor) in shard_tensors {
-            let Some(expected_shard) = index.weight_map.get(&name) else {
-                continue;
-            };
+            let expected_shard = index.weight_map.get(&name).ok_or_else(|| {
+                format!("unindexed tensor `{name}` found in SafeTensors shard `{shard}`")
+            })?;
             if expected_shard != &shard {
                 return Err(format!(
                     "tensor `{name}` was found in `{shard}`, index assigns it to `{expected_shard}`"
@@ -482,5 +630,118 @@ mod tests {
         assert_eq!(tensors.len(), 2);
         assert_eq!(tensors["a"].dtype(), DType::F16);
         assert_eq!(tensors["b"].as_f16().unwrap()[0].to_f32(), -2.0);
+    }
+
+    #[test]
+    fn load_native_sharded_rejects_unindexed_tensors() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("model.safetensors"),
+            make_safetensors(&[
+                ("a", DType::F16, &[1], &[0u8; 2]),
+                ("extra", DType::F16, &[1], &[0u8; 2]),
+            ]),
+        )
+        .unwrap();
+        let index_path = directory.path().join("model.safetensors.index.json");
+        std::fs::write(&index_path, r#"{"weight_map":{"a":"model.safetensors"}}"#).unwrap();
+        let error = load_native_sharded(&index_path).unwrap_err();
+        assert!(error.contains("unindexed tensor `extra`"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sharded_readers_reject_symlinked_shards() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = NamedTempFile::new().unwrap();
+        std::fs::write(
+            outside.path(),
+            make_safetensors(&[("a", DType::F16, &[1], &[0u8; 2])]),
+        )
+        .unwrap();
+        symlink(outside.path(), directory.path().join("linked.safetensors")).unwrap();
+        let index_path = directory.path().join("model.safetensors.index.json");
+        std::fs::write(&index_path, r#"{"weight_map":{"a":"linked.safetensors"}}"#).unwrap();
+
+        assert!(read_sharded_tensor_manifest(&index_path)
+            .unwrap_err()
+            .contains("symlink"));
+        assert!(load_native_sharded(&index_path)
+            .unwrap_err()
+            .contains("symlink"));
+    }
+
+    #[test]
+    fn manifest_reads_header_without_payload_and_sorts_names() {
+        let file_bytes = make_safetensors(&[
+            ("z", DType::F32, &[2, 3], &[0u8; 24]),
+            ("a", DType::BF16, &[4], &[0u8; 8]),
+        ]);
+        let header_len =
+            usize::try_from(u64::from_le_bytes(file_bytes[..8].try_into().unwrap())).unwrap();
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&file_bytes[..8 + header_len]).unwrap();
+        let inventory = read_tensor_manifest(tmp.path()).unwrap();
+        assert_eq!(
+            inventory
+                .iter()
+                .map(|tensor| tensor.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "z"]
+        );
+        assert_eq!(inventory[0].dtype, ManifestDType::BF16);
+        assert_eq!(inventory[1].shape, [2, 3]);
+    }
+
+    #[test]
+    fn manifest_sharded_reader_rejects_unsafe_and_missing_index_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let shard = make_safetensors(&[("a", DType::F16, &[1], &[0u8; 2])]);
+        std::fs::write(directory.path().join("a.safetensors"), shard).unwrap();
+        let index_path = directory.path().join("model.safetensors.index.json");
+        std::fs::write(
+            &index_path,
+            r#"{"weight_map":{"a":"a.safetensors","missing":"a.safetensors"}}"#,
+        )
+        .unwrap();
+        let error = read_sharded_tensor_manifest(&index_path).unwrap_err();
+        assert!(error.contains("indexed tensor `missing` is missing"));
+
+        std::fs::write(&index_path, r#"{"weight_map":{"a":"../a.safetensors"}}"#).unwrap();
+        let error = read_sharded_tensor_manifest(&index_path).unwrap_err();
+        assert!(error.contains("unsafe shard path"));
+    }
+
+    #[test]
+    fn manifest_sharded_reader_rejects_wrong_shard_and_unindexed_tensors() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("one.safetensors"),
+            make_safetensors(&[
+                ("a", DType::F16, &[1], &[0u8; 2]),
+                ("extra", DType::F16, &[1], &[0u8; 2]),
+            ]),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("two.safetensors"),
+            make_safetensors(&[("b", DType::F16, &[1], &[0u8; 2])]),
+        )
+        .unwrap();
+        let index_path = directory.path().join("model.safetensors.index.json");
+
+        std::fs::write(
+            &index_path,
+            r#"{"weight_map":{"a":"two.safetensors","b":"two.safetensors","extra":"one.safetensors"}}"#,
+        )
+        .unwrap();
+        let error = read_sharded_tensor_manifest(&index_path).unwrap_err();
+        assert!(error.contains("was found in `one.safetensors`"));
+
+        std::fs::write(&index_path, r#"{"weight_map":{"a":"one.safetensors"}}"#).unwrap();
+        let error = read_sharded_tensor_manifest(&index_path).unwrap_err();
+        assert!(error.contains("unindexed tensor `extra`"));
     }
 }

@@ -188,26 +188,91 @@ pub fn sdpa(
     let seq_len = query_dims[0];
     let gqa_ratio = n_heads / n_kv_heads;
     let dtype = query.dtype();
+    let cache_dtype = cache
+        .dtype()?
+        .ok_or_else(|| Error::Other("CUDA KV cache has no appended dtype".into()))?;
+    if cache_dtype != dtype {
+        return Err(Error::Other(format!(
+            "attention query dtype {dtype} does not match CUDA KV cache dtype {cache_dtype}"
+        )));
+    }
     let element_bytes = dtype.size_in_bytes();
     let scores = CudaBuffer::alloc(seq_len * n_heads * kv_len * element_bytes, ctx.device_id())
         .map_err(Error::Cuda)?;
     let key_cache = cache.k_buffer(layer_idx);
 
-    for kv_head in 0..n_kv_heads {
-        for sequence in 0..seq_len {
-            gqa_scores(
-                ctx,
-                dtype,
-                query,
-                (sequence * n_heads + kv_head * gqa_ratio) * head_dim,
-                key_cache,
-                kv_head * max_seq_len * head_dim,
-                &scores,
-                (sequence * n_heads + kv_head * gqa_ratio) * kv_len,
-                gqa_ratio,
-                kv_len,
-                head_dim,
+    // GEMM shape matters far more than launch count here. Batching the
+    // sequence dimension (one strided-batched call per kv head, batch=seq_len)
+    // leaves M = gqa_ratio = 6, which wastes the tensor core almost entirely:
+    // a measured 16K attention staircase cost 25 s per layer, ~1300x the
+    // arithmetic estimate. Batching over the query heads *within* a GQA group
+    // instead makes M = seq_len (512 at the production block size) while the
+    // key page broadcasts with stride 0, which is a well-shaped GEMM.
+    // `APXINF_Q35_BATCHED_SDPA=0` restores the per-row loop as the A/B control.
+    let batched = seq_len > 1 && batched_sdpa_enabled();
+    if batched {
+        let query_buffer = CudaBuffer::from_tensor(query).map_err(Error::Cuda)?;
+        for kv_head in 0..n_kv_heads {
+            let head_base = kv_head * gqa_ratio;
+            let query_view = buffer_slice(
+                &query_buffer,
+                head_base * head_dim * element_bytes,
+                ((seq_len - 1) * n_heads + gqa_ratio) * head_dim * element_bytes,
             )?;
+            let key = buffer_slice(
+                key_cache,
+                kv_head * max_seq_len * head_dim * element_bytes,
+                kv_len * head_dim * element_bytes,
+            )?;
+            let scores_view = buffer_slice(
+                &scores,
+                head_base * kv_len * element_bytes,
+                ((seq_len - 1) * n_heads + gqa_ratio) * kv_len * element_bytes,
+            )?;
+            // Batch over the gqa_ratio query heads of this group: each batch
+            // element is an [seq_len, head_dim] x [kv_len, head_dim]^T GEMM.
+            // Within one batch element consecutive rows are consecutive
+            // sequence positions, so lda/ldc stride by the full head count.
+            ctx.cublas()
+                .batched_gemm_ex(
+                    dtype,
+                    CublasTranspose::None,
+                    CublasTranspose::Transpose,
+                    seq_len,
+                    kv_len,
+                    head_dim,
+                    1.0,
+                    &query_view,
+                    (n_heads * head_dim) as i32,
+                    head_dim as i64,
+                    &key,
+                    head_dim as i32,
+                    0,
+                    0.0,
+                    &scores_view,
+                    (n_heads * kv_len) as i32,
+                    kv_len as i64,
+                    gqa_ratio as i32,
+                )
+                .map_err(Error::Cuda)?;
+        }
+    } else {
+        for kv_head in 0..n_kv_heads {
+            for sequence in 0..seq_len {
+                gqa_scores(
+                    ctx,
+                    dtype,
+                    query,
+                    (sequence * n_heads + kv_head * gqa_ratio) * head_dim,
+                    key_cache,
+                    kv_head * max_seq_len * head_dim,
+                    &scores,
+                    (sequence * n_heads + kv_head * gqa_ratio) * kv_len,
+                    gqa_ratio,
+                    kv_len,
+                    head_dim,
+                )?;
+            }
         }
     }
 
@@ -221,25 +286,78 @@ pub fn sdpa(
     )
     .map_err(Error::Cuda)?;
     let value_cache = cache.v_buffer(layer_idx);
-    for kv_head in 0..n_kv_heads {
-        for sequence in 0..seq_len {
-            gqa_values(
-                ctx,
-                dtype,
-                &attention,
-                (sequence * n_heads + kv_head * gqa_ratio) * kv_len,
-                value_cache,
-                kv_head * max_seq_len * head_dim,
-                &output,
-                (sequence * n_heads + kv_head * gqa_ratio) * head_dim,
-                gqa_ratio,
-                kv_len,
-                head_dim,
+    if batched {
+        let attention_buffer = CudaBuffer::from_tensor(&attention).map_err(Error::Cuda)?;
+        for kv_head in 0..n_kv_heads {
+            let head_base = kv_head * gqa_ratio;
+            let attention_view = buffer_slice(
+                &attention_buffer,
+                head_base * kv_len * element_bytes,
+                ((seq_len - 1) * n_heads + gqa_ratio) * kv_len * element_bytes,
             )?;
+            let value = buffer_slice(
+                value_cache,
+                kv_head * max_seq_len * head_dim * element_bytes,
+                kv_len * head_dim * element_bytes,
+            )?;
+            let output_view = buffer_slice(
+                &output,
+                head_base * head_dim * element_bytes,
+                ((seq_len - 1) * n_heads + gqa_ratio) * head_dim * element_bytes,
+            )?;
+            // Same reshape as the score GEMM: batch over the group's query
+            // heads so M = seq_len rather than gqa_ratio.
+            ctx.cublas()
+                .batched_gemm_ex(
+                    dtype,
+                    CublasTranspose::None,
+                    CublasTranspose::None,
+                    seq_len,
+                    head_dim,
+                    kv_len,
+                    1.0,
+                    &attention_view,
+                    (n_heads * kv_len) as i32,
+                    kv_len as i64,
+                    &value,
+                    head_dim as i32,
+                    0,
+                    0.0,
+                    &output_view,
+                    (n_heads * head_dim) as i32,
+                    head_dim as i64,
+                    gqa_ratio as i32,
+                )
+                .map_err(Error::Cuda)?;
+        }
+    } else {
+        for kv_head in 0..n_kv_heads {
+            for sequence in 0..seq_len {
+                gqa_values(
+                    ctx,
+                    dtype,
+                    &attention,
+                    (sequence * n_heads + kv_head * gqa_ratio) * kv_len,
+                    value_cache,
+                    kv_head * max_seq_len * head_dim,
+                    &output,
+                    (sequence * n_heads + kv_head * gqa_ratio) * head_dim,
+                    gqa_ratio,
+                    kv_len,
+                    head_dim,
+                )?;
+            }
         }
     }
 
     Ok(output.into_tensor(Shape::new(vec![seq_len, n_heads * head_dim]), dtype))
+}
+
+/// Selects the strided-batched prefill attention path (one cuBLAS call per
+/// kv head instead of one per row per kv head). Default on;
+/// `APXINF_Q35_BATCHED_SDPA=0` is the paired A/B control.
+fn batched_sdpa_enabled() -> bool {
+    !matches!(std::env::var("APXINF_Q35_BATCHED_SDPA").as_deref(), Ok("0"))
 }
 
 /// F32 attention softmax into caller-owned storage using a device position.
@@ -381,15 +499,72 @@ pub fn vision(
     if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
         return Err(Error::Other("vision_sdpa: only BF16 supported".into()));
     }
-    if head_dim != 64 {
-        return Err(Error::Other("vision_sdpa: head_dim must be 64".into()));
+    // head_dim == 64 keeps the original two-element-per-thread kernel
+    // (bit-identical history); other even head_dims up to 128 use the wide
+    // strided variant (Qwen3.5 vision is 72).
+    if head_dim != 64 && (head_dim == 0 || head_dim % 2 != 0 || head_dim > 128) {
+        return Err(Error::Other(format!(
+            "vision_sdpa: head_dim {head_dim} unsupported (need 64, or even <= 128)"
+        )));
     }
     let device_id = ctx.device_id();
     let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
     let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     unsafe {
-        let res = ffi::apxinf_vision_sdpa_bf16(
+        let res = if head_dim == 64 {
+            ffi::apxinf_vision_sdpa_bf16(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                out_buf.ptr(),
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                scale,
+                ctx.stream().handle(),
+            )
+        } else {
+            ffi::apxinf_vision_sdpa_bf16_wide(
+                gpu_ptr(q)?,
+                gpu_ptr(k)?,
+                gpu_ptr(v)?,
+                out_buf.ptr(),
+                seq_len as u32,
+                n_heads as u32,
+                head_dim as u32,
+                scale,
+                ctx.stream().handle(),
+            )
+        };
+        ffi::check_cuda(res).map_err(Error::Cuda)?;
+    }
+    Ok(make_gpu_tensor(
+        Shape::new(vec![seq_len, n_heads * head_dim]),
+        DType::BF16,
+        device_id,
+        out_buf,
+    ))
+}
+
+/// Vision SDPA forced through the wide kernel, for testing bit-equality
+/// against the narrow head_dim=64 kernel.
+#[cfg(test)]
+pub fn vision_wide_for_test(
+    ctx: &CudaContext,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    let device_id = ctx.device_id();
+    let out_bytes = seq_len * n_heads * head_dim * DType::BF16.size_in_bytes();
+    let out_buf = CudaBuffer::alloc_zeros(out_bytes, device_id).map_err(Error::Cuda)?;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    unsafe {
+        let res = ffi::apxinf_vision_sdpa_bf16_wide(
             gpu_ptr(q)?,
             gpu_ptr(k)?,
             gpu_ptr(v)?,
