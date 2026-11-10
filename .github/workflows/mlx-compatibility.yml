@@ -21,6 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # No MLX_ROOT or Apple SDK: unified features must stay inert on Linux.
       - run: cargo check --locked --features mlx
+      - run: cargo check --locked --features mlx-signpost
       - run: cargo test --locked -p apxinf-core --features opaque-storage --test opaque_storage
       - run: cargo test --locked -p apxinf-tokenizer --lib
       - run: cargo test --locked -p apxinf-tokenizer --features minijinja/json --lib

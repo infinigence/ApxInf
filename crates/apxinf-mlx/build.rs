@@ -3,6 +3,15 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MLX_ROOT");
     println!("cargo:rerun-if-changed=native/bridge.cpp");
     println!("cargo:rerun-if-changed=native/bridge.h");
+    println!("cargo:rerun-if-changed=native/signpost.c");
+    if env::var_os("CARGO_FEATURE_SIGNPOST").is_some()
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos")
+    {
+        cc::Build::new()
+            .file("native/signpost.c")
+            .flag("-fvisibility=hidden")
+            .compile("apxinf_mlx_signpost");
+    }
     if env::var_os("CARGO_FEATURE_NATIVE").is_none() {
         return;
     }
