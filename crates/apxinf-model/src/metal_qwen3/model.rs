@@ -519,6 +519,8 @@ impl Qwen3Model {
     ) -> Result<(Option<Tensor>, Vec<KvState>)> {
         let s = self.backend.stream();
         let len = tokens.len();
+        let _step_range =
+            crate::profiling::trace::range(if len == 1 { "decode" } else { "prefill" });
         let ids = Array::from_i32(
             s,
             &[len],
@@ -537,6 +539,9 @@ impl Qwen3Model {
                 .iter()
                 .flat_map(|kv| [kv.keys.clone(), kv.values.clone()]),
         );
+        // MLX builds the graph lazily: the step range up to here is host graph
+        // construction, and evaluation is where the GPU work is waited for.
+        let _eval_range = crate::profiling::trace::range("eval");
         self.backend.stream().eval(&required)?;
         Ok((output, pending))
     }
