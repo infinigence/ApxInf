@@ -73,6 +73,30 @@ impl Drop for BlasHandle {
     }
 }
 
+/// The optional second GEMM provider.
+///
+/// Null when the crate was built against a ROCm without hipBLASLt, or when the
+/// handle could not be created. Both cases are states, not errors:
+/// `native::gemm` keeps using hipBLAS, which is the default provider anyway.
+///
+/// The handle owns the per-shape descriptor and tactic caches on the C++ side,
+/// so it must outlive every GEMM issued through it and is dropped last.
+struct BlasLtHandle {
+    raw: *mut c_void,
+}
+
+// SAFETY: as for `BlasHandle`.
+unsafe impl Send for BlasLtHandle {}
+unsafe impl Sync for BlasLtHandle {}
+
+impl Drop for BlasLtHandle {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { ffi::apxinf_hip_blaslt_destroy(self.raw) };
+        }
+    }
+}
+
 /// A device allocation, owned by the tensor storage that refers to it.
 ///
 /// Holding an `Arc` to the stream keeps the stream alive as long as any tensor
@@ -106,11 +130,12 @@ impl HipBuffer {
     }
 }
 
-/// Everything one HIP device needs: its stream, BLAS handle and properties.
+/// Everything one HIP device needs: its stream, BLAS handles and properties.
 pub struct HipContext {
     device_id: usize,
     stream: Arc<HipStream>,
     blas: BlasHandle,
+    blaslt: BlasLtHandle,
     caps: HipDeviceCaps,
 }
 
@@ -159,7 +184,14 @@ impl HipContext {
         let blas = BlasHandle { raw: raw_blas };
         check("hipblasCreate", status)?;
 
-        Ok(Self { device_id, stream, blas, caps })
+        // Not checked: a ROCm without hipBLASLt, or a handle that will not
+        // create, leaves the provider unavailable rather than failing the
+        // context. hipBLAS alone is a complete backend.
+        let mut raw_blaslt = std::ptr::null_mut();
+        let _ = unsafe { ffi::apxinf_hip_blaslt_create(&mut raw_blaslt, stream.raw()) };
+        let blaslt = BlasLtHandle { raw: raw_blaslt };
+
+        Ok(Self { device_id, stream, blas, blaslt, caps })
     }
 
     pub fn device_id(&self) -> usize {
@@ -180,6 +212,11 @@ impl HipContext {
 
     pub(crate) fn blas(&self) -> *mut c_void {
         self.blas.raw
+    }
+
+    /// The hipBLASLt handle, or null when the provider is unavailable.
+    pub(crate) fn blaslt(&self) -> *mut c_void {
+        self.blaslt.raw
     }
 
     /// Make this device current on the calling thread. HIP's current device is

@@ -40,6 +40,8 @@ pub fn register_builtin_models() {
     crate::pi0fast::register_builtin();
     #[cfg(feature = "cuda")]
     crate::gr00t::register_builtin();
+    #[cfg(feature = "hip")]
+    crate::hip_gr00t::register_builtin();
     #[cfg(feature = "cuda")]
     crate::smolvla::register_builtin();
 }

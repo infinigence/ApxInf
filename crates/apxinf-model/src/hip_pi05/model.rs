@@ -303,6 +303,7 @@ impl HipPi05Model {
                 kv_heads: c.vision_heads,
                 head_dim: c.vision_head_dim,
                 kv_tokens: per_view,
+                causal_query_start: None,
             },
             &attention,
         )?;
@@ -356,6 +357,7 @@ impl HipPi05Model {
             &self.ctx,
             &self.weights.token_embedding,
             token_ids,
+            native::EmbeddingScale::SqrtWidth,
             &language,
         )?;
         let vision_rows = vision.shape().dims()[0];
@@ -445,6 +447,7 @@ impl HipPi05Model {
                 kv_heads: lang.num_kv_heads,
                 head_dim: lang.head_dim,
                 kv_tokens: tokens,
+                causal_query_start: None,
             },
             &attention,
         )?;
@@ -635,6 +638,7 @@ impl HipPi05Model {
                 kv_heads: act.num_kv_heads,
                 head_dim: act.head_dim,
                 kv_tokens: prefix_tokens + tokens,
+                causal_query_start: None,
             },
             &attention,
         )?;

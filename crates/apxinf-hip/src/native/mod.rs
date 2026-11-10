@@ -22,6 +22,7 @@ mod attention;
 mod elementwise;
 mod gemm;
 mod norm;
+mod rope;
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -29,16 +30,28 @@ use std::sync::Arc;
 use apxinf_core::{DType, Error, NormalGenerator, Result, Tensor};
 
 pub use arena::HipArena;
-pub use attention::{attention, AttentionGeometry};
-pub use elementwise::{
-    add_position, bias_activation, copy_rows, embedding, euler_update, geglu, rgb_to_patches,
-    split_qkv_bias, split_qkv_rope, Activation, HipDeviceBytes, ImageLayout, QkvRope,
+pub use attention::{
+    attention, attention_apxinf_for_test, attention_counts, reset_attention_counts,
+    AttentionGeometry,
 };
-pub use gemm::gemm;
+pub use elementwise::{
+    add_position, bias_activation, copy_columns, copy_row_range, copy_rows, embedding,
+    euler_update, gather_rows, geglu, rgb_to_patches, scatter_rows, silu_mul, split_qkv_bias,
+    split_qkv_rope, Activation, EmbeddingScale, HipDeviceBytes, ImageLayout, QkvRope,
+};
+pub use gemm::{
+    gemm_bias_activation,
+    dispatch_counts, gemm, recorded_shapes, reset_dispatch_counts, reset_recorded_shapes,
+    routed_shapes, Provider,
+};
 pub use norm::{
+    bias_residual_ada_layer_norm,
+    ada_layer_norm,
     ada_gate_residual_rms_norm, ada_rms_norm, bias_residual, bias_residual_layer_norm,
     bias_residual_rms_norm, layer_norm, rms_norm,
 };
+pub use rope::{
+apply_mrope, apply_vision_2d};
 
 use crate::runtime::HipContext;
 

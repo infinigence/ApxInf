@@ -39,6 +39,30 @@ __global__ void layer_norm_kernel(const bf16* x, const bf16* weight, const bf16*
   }
 }
 
+// GR00T's DiT conditioning: LayerNorm statistics with the per-call
+// `[scale; shift]` modulation `ada_rms_norm` uses, i.e.
+// `(x - mean) * rsqrt(var + eps) * (1 + scale) + shift`. The `1 +` offset and
+// the single rounding at the store are cuda-new's
+// (`native/kernels/norm/fixed_bf16.cuh: adaptive_layer_norm_bf16_kernel`).
+__global__ void ada_layer_norm_kernel(const bf16* x, const bf16* style, bf16* y, int cols,
+                                      float eps) {
+  __shared__ float scratch[kReduceBlock];
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * cols;
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) sum += ld(x, base + c);
+  const float mean = block_sum(sum, scratch) / cols;
+  float centered_sum = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    const float centered = ld(x, base + c) - mean;
+    centered_sum += centered * centered;
+  }
+  const float inverse_std = rsqrtf(block_sum(centered_sum, scratch) / cols + eps);
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    const float normalized = (ld(x, base + c) - mean) * inverse_std;
+    y[base + c] = f32_to_bf16(normalized * (1.0f + ld(style, c)) + ld(style, cols + c));
+  }
+}
+
 // `style` is [2 * cols]: scale in [0, cols), shift in [cols, 2 * cols).
 __global__ void ada_rms_norm_kernel(const bf16* x, const bf16* style, bf16* y, int cols,
                                     float eps) {
@@ -120,6 +144,47 @@ __global__ void bias_residual_layer_norm_kernel(const bf16* projection, const bf
 // hidden = round(residual + projection * gate), the gate being the third
 // segment of this layer's [3 * cols] `gate_style`; normalized is the adaptive
 // RMS norm of hidden under the next layer's [2 * cols] `norm_style`.
+// hidden = round(projection + residual (+ bias)); normalized is the adaptive
+// LayerNorm of hidden under `style`.
+//
+// The pair this replaces spans a DiT block boundary: a block ends by writing
+// `hidden`, and the next begins by normalizing it under its own modulation.
+// Fusing them removes a launch and a round trip of `hidden` through memory --
+// at 41 rows of 1536 the launch is the larger half, since 126 KB is half a
+// microsecond of traffic against about 1.8 us of dispatch.
+//
+// `hidden` is still written, and written *before* it is read back for the
+// statistics, because the separate path rounds it to BF16 there and the
+// normalization consumes the rounded value. Computing the mean from the
+// unrounded sum would be more accurate and would not match.
+__global__ void bias_residual_ada_layer_norm_kernel(const bf16* projection, const bf16* bias,
+                                                    const bf16* residual, const bf16* style,
+                                                    bf16* hidden, bf16* normalized, int cols,
+                                                    float eps) {
+  __shared__ float scratch[kReduceBlock];
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * cols;
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    float v = ld(projection, base + c) + ld(residual, base + c);
+    if (bias != nullptr) v += ld(bias, c);
+    const bf16 rounded = f32_to_bf16(v);
+    hidden[base + c] = rounded;
+    sum += bf16_to_f32(rounded);
+  }
+  const float mean = block_sum(sum, scratch) / cols;
+  float centered_sum = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    const float centered = ld(hidden, base + c) - mean;
+    centered_sum += centered * centered;
+  }
+  const float inverse_std = rsqrtf(block_sum(centered_sum, scratch) / cols + eps);
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    const float v = (ld(hidden, base + c) - mean) * inverse_std;
+    normalized[base + c] =
+        f32_to_bf16(v * (1.0f + ld(style, c)) + ld(style, cols + c));
+  }
+}
+
 __global__ void ada_gate_residual_rms_norm_kernel(const bf16* projection, const bf16* residual,
                                                   const bf16* gate_style, const bf16* norm_style,
                                                   bf16* hidden, bf16* normalized, int cols,
@@ -155,6 +220,14 @@ extern "C" int apxinf_hip_native_layer_norm(const void* x, const void* weight, c
   if (!valid_rows(rows, cols)) return kInvalidArgument;
   layer_norm_kernel<<<static_cast<unsigned>(rows), kReduceBlock, 0, as_stream(stream)>>>(
       in(x), in(weight), in(bias), out(y), cols, eps);
+  return last_launch_status();
+}
+
+extern "C" int apxinf_hip_native_ada_layer_norm(const void* x, const void* style, void* y,
+                                               int64_t rows, int cols, float eps, void* stream) {
+  if (rows <= 0 || cols <= 0) return kInvalidArgument;
+  ada_layer_norm_kernel<<<static_cast<unsigned>(rows), kReduceBlock, 0, as_stream(stream)>>>(
+      in(x), in(style), out(y), cols, eps);
   return last_launch_status();
 }
 
@@ -199,6 +272,17 @@ extern "C" int apxinf_hip_native_bias_residual_layer_norm(
                                     as_stream(stream)>>>(
       in(projection), in(bias), in(residual), in(norm_weight), in(norm_bias), out(hidden),
       out(normalized), cols, eps);
+  return last_launch_status();
+}
+
+extern "C" int apxinf_hip_native_bias_residual_ada_layer_norm(
+    const void* projection, const void* bias, const void* residual, const void* style,
+    void* hidden, void* normalized, int64_t rows, int cols, float eps, void* stream) {
+  if (rows <= 0 || cols <= 0) return kInvalidArgument;
+  bias_residual_ada_layer_norm_kernel<<<static_cast<unsigned>(rows), kReduceBlock, 0,
+                                        as_stream(stream)>>>(
+      in(projection), in(bias), in(residual), in(style), out(hidden), out(normalized), cols,
+      eps);
   return last_launch_status();
 }
 
