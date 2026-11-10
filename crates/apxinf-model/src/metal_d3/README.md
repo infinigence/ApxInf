@@ -51,6 +51,13 @@ profile drops its callable, so its next request traces again. The first request 
 a new length also pays for tracing and warming, so a benchmark must warm every
 length before timing it.
 
+Retained profiles hold no device memory between requests; the weights do. MLX
+keeps the buffers each new shape frees for reuse, though, and that process-wide
+cache is not bounded here. On an M2, four 8,000-token lengths grew it to 8.4 GB
+while live memory stayed at 1.6 GB. A caller that runs many distinct lengths
+must bound it, as `examples/d3_decision_index.rs` does with
+`apxinf_mlx::clear_cache` once the cache passes 1 GiB.
+
 ## Device tests
 
 The ignored tests run on an Apple Metal GPU with the real package:
@@ -81,3 +88,8 @@ residual stream amplifies BF16 kernel-order differences, and the checkpoint's
 PyTorch runtime moves by itself between MPS and CPU. Each test allows three
 times that movement: 0.06 absolute probability with no changed decision, and
 0.21 relative L2 on the merged image features.
+
+Accuracy on the public text suite is measured with the shared Decision Index
+runner: `examples/d3_decision_index.rs --device metal`, fed by
+`scripts/d3_prepare_decision_index.py` as in
+[the d3-mini guide](../../../../doc/d3-mini-decision-index.md).
