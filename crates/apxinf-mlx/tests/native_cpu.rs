@@ -593,3 +593,189 @@ fn image_operators_follow_mlx_semantics() -> Result<()> {
     assert_eq!(image.to_f32_vec()?, [0., 0.625, 1.]);
     Ok(())
 }
+
+#[test]
+fn audio_operators_and_key_sequence_follow_mlx() -> Result<()> {
+    // Expected values from MLX Python 0.32.3 on the CPU device.
+    let s = Stream::cpu()?;
+    let words = |a: &Array| -> Result<Vec<u32>> {
+        Ok(a.to_bytes()?
+            .chunks(4)
+            .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+            .collect())
+    };
+    // mx.random.seed(42) sets the state to key(42); each global random call
+    // consumes split(state).second and keeps split(state).first.
+    let (next, sub) = Array::random_split(&Array::random_key(&s, 42)?)?;
+    assert_eq!(words(&next)?, [2465931498, 3679230171]);
+    assert_eq!(words(&sub)?, [255383827, 267815257]);
+    let logits = Array::arange(&s, 0., 8., 1., D::F32)?
+        .mul(&Array::scalar(&s, 0.37, D::F32)?)?
+        .sub(&Array::scalar(&s, 1.1, D::F32)?)?
+        .reshape(&[1, 8])?;
+    let first = logits.categorical(-1, &sub)?;
+    assert_eq!((first.dtype(), first.shape()), (D::U32, &[1][..]));
+    assert_eq!(words(&first)?, [7]);
+    // The second global call: mx.random.seed(42); categorical(); categorical().
+    let (_, sub) = Array::random_split(&next)?;
+    assert_eq!(words(&logits.categorical(-1, &sub)?)?, [5]);
+    // Rows of a 2D logits array take the Gumbel-max path.
+    let rows = Array::arange(&s, 0., 10., 1., D::F32)?
+        .mul(&Array::scalar(&s, 0.5, D::F32)?)?
+        .reshape(&[2, 5])?;
+    assert_eq!(
+        words(&rows.categorical(-1, &Array::random_key(&s, 7)?)?)?,
+        [3, 4]
+    );
+    assert!(logits.categorical(-1, &logits).is_err());
+
+    // Top-k masking as mlx-audio applies it: argpartition, then -inf writes.
+    let x = Array::from_f32(&s, &[8], &[3., -1., 7., 7., 0.5, 2., -4., 9.])?;
+    let order = x.neg()?.argpartition(2, -1)?;
+    assert_eq!(words(&order)?, [7, 2, 3, 0, 1, 5, 6, 4]);
+    let masked = x.reshape(&[1, 8])?.top_k_mask(3, -1)?;
+    assert_eq!(
+        masked.to_f32_vec()?,
+        [
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            7.,
+            7.,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            9.
+        ]
+    );
+
+    let z = Array::arange(&s, 0., 6., 1., D::F32)?.reshape(&[1, 3, 2])?;
+    let padded = z.pad(&[0, 2, 0], &[0, 0, 0])?;
+    assert_eq!(padded.shape(), [1, 5, 2]);
+    assert_eq!(
+        padded.to_f32_vec()?,
+        [0., 0., 0., 0., 0., 1., 2., 3., 4., 5.]
+    );
+    assert!(z.pad(&[0, 2], &[0, 0]).is_err());
+
+    // mx.conv_transpose1d(arange(6)/4 - 0.5 as [1, 3, 2], arange(32)/8 - 1 as [4, 4, 2], stride=2).
+    let input = z
+        .div(&Array::scalar(&s, 4., D::F32)?)?
+        .sub(&Array::scalar(&s, 0.5, D::F32)?)?;
+    let weight = Array::arange(&s, 0., 32., 1., D::F32)?
+        .reshape(&[4, 4, 2])?
+        .div(&Array::scalar(&s, 8., D::F32)?)?
+        .sub(&Array::scalar(&s, 1., D::F32)?)?;
+    let up = input.conv_transpose1d(&weight, 2, 0, 1, 0, 1)?;
+    assert_eq!(up.shape(), [1, 8, 4]);
+    assert_eq!(
+        bits(&up)?,
+        [
+            0x3f380000, 0xbd000000, 0xbf480000, 0xbfc40000, 0x3f080000, 0xbe600000, 0xbf780000,
+            0xbfdc0000, 0x3e000000, 0xbec00000, 0xbf600000, 0xbfb00000, 0x0, 0xbf000000,
+            0xbf800000, 0xbfc00000, 0xbfa00000, 0x3e800000, 0x3fe00000, 0x40500000, 0xbf600000,
+            0x3f200000, 0x40080000, 0x40680000, 0xbf080000, 0x3f380000, 0x3ffc0000, 0x404e0000,
+            0xbe600000, 0x3f840000, 0x40120000, 0x40620000
+        ]
+    );
+    assert!(input.conv_transpose1d(&weight, 0, 0, 1, 0, 1).is_err());
+    Ok(())
+}
+
+#[test]
+fn put_along_axis_rejects_cross_row_indices() -> Result<()> {
+    let stream = Stream::cpu()?;
+    let source = Array::from_f32(&stream, &[2, 2], &[1., 2., 3., 4.])?;
+    let values = Array::from_f32(&stream, &[2, 1], &[99., 88.])?;
+    let counters = stream.counters();
+    for indices in [[2, 1], [-3, 1], [i32::MAX, 1], [i32::MIN, 1]] {
+        let message = source
+            .put_along_axis(&indices, &[2, 1], &values, -1)
+            .err()
+            .expect("invalid indices must be rejected")
+            .to_string();
+        assert!(
+            message.contains("outside the indexed dimension"),
+            "{message}"
+        );
+    }
+    assert_eq!(stream.counters(), counters);
+    for axis in [-3, 2, i32::MIN, i32::MAX] {
+        assert!(source
+            .put_along_axis(&[0, 1], &[2, 1], &values, axis)
+            .is_err());
+    }
+    assert!(source.put_along_axis(&[0, 1], &[2], &values, -1).is_err());
+    assert!(source.put_along_axis(&[0], &[2, 1], &values, -1).is_err());
+    let updated = source.put_along_axis(&[-2, -1], &[2, 1], &values, -1)?;
+    assert_eq!(updated.to_f32_vec()?, [99., 2., 3., 88.]);
+    assert_eq!(source.to_f32_vec()?, [1., 2., 3., 4.]);
+    let empty = Array::zeros(&stream, &[1, 0], D::F32)?;
+    assert!(empty.put_along_axis(&[0], &[1, 1], &values, -1).is_err());
+    let foreign_stream = Stream::cpu()?;
+    let foreign_values = Array::scalar(&foreign_stream, 1., D::F32)?;
+    assert!(source
+        .put_along_axis(&[0], &[1, 1], &foreign_values, -1)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn top_k_mask_preserves_rows_axes_and_compiled_inputs() -> Result<()> {
+    let stream = Stream::cpu()?;
+    let source = Array::from_f32(&stream, &[2, 4], &[1., 4., 3., 2., 8., 5., 6., 7.])?;
+    let masked = source.top_k_mask(2, -1)?;
+    assert_eq!(stream.counters().downloads_bytes, 0);
+    assert_eq!(
+        masked.to_f32_vec()?,
+        [
+            f32::NEG_INFINITY,
+            4.,
+            3.,
+            f32::NEG_INFINITY,
+            8.,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            7.
+        ]
+    );
+    assert_eq!(
+        source.top_k_mask(1, 0)?.to_f32_vec()?,
+        [
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            f32::NEG_INFINITY,
+            8.,
+            5.,
+            6.,
+            7.
+        ]
+    );
+    assert_eq!(source.top_k_mask(4, 1)?.to_bytes()?, source.to_bytes()?);
+    for count in [0, 5, usize::MAX] {
+        assert!(source.top_k_mask(count, 1).is_err());
+    }
+    for axis in [-3, 2, i32::MIN, i32::MAX] {
+        assert!(source.top_k_mask(1, axis).is_err());
+    }
+    assert!(source.cast(D::I32)?.top_k_mask(1, 1).is_err());
+    assert!(Array::zeros(&stream, &[1, 0], D::F32)?
+        .top_k_mask(1, 1)
+        .is_err());
+    for dtype in [D::F16, D::BF16] {
+        let output = source.cast(dtype)?.top_k_mask(2, 1)?;
+        assert_eq!(output.dtype(), dtype);
+        assert_eq!(output.to_f32_vec()?, masked.to_f32_vec()?);
+    }
+    let compiled = Compiled::new(&stream, 1, |inputs| Ok(vec![inputs[0].top_k_mask(2, -1)?]))?;
+    compiled.prepare(&[source.clone()])?;
+    let changed = source.neg()?;
+    let before = stream.counters();
+    let output = compiled.call_and_eval(&[changed.clone()])?.remove(0);
+    let after = stream.counters();
+    assert_eq!(after.trace_callbacks, before.trace_callbacks);
+    assert_eq!(after.downloads_bytes, before.downloads_bytes);
+    assert_eq!(output.to_bytes()?, changed.top_k_mask(2, -1)?.to_bytes()?);
+    assert_ne!(output.to_f32_vec()?, masked.to_f32_vec()?);
+    Ok(())
+}

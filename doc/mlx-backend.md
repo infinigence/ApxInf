@@ -174,6 +174,43 @@ cargo run --features mlx -- generate-image --model /path/to/Qwen-Image-2.1-MLX-4
 
 Add `--model-variant reference` to select the quantized-matmul reference path.
 Omitting it or using `--model-variant auto` preserves the optimization target.
+
+### Implemented speech selection
+
+[`metal_qwen3_tts`](../crates/apxinf-model/src/metal_qwen3_tts/README.md) runs
+Qwen3-TTS-12Hz-1.7B-CustomVoice through `SpeechRuntime`: batch one,
+non-streaming, the checkpoint's voices and languages, an optional style
+instruction and a seed. AutoModel detects it from `model_type` `qwen3_tts`.
+It follows the EngineTailor MLX parity path (mlx-audio 70f4add with reference
+cast seams) operation by operation, so a seed reproduces that path's codes and
+waveform. The CLI `speak` command writes 32-bit float WAV. The default
+`auto` variant runs the code predictor MLPs on the EngineTailor `SwigluMlpGemv`
+kernels only on the measured `applegpu_g16g` architecture. Other architectures
+keep the composed reference until their numerical and timing gates pass.
+`--model-variant reference` keeps the composed parity SwiGLU on every device.
+
+- Sampling depends on the pinned MLX version: MLX 0.32.3 samples one row of
+  logits by inverse CDF, where 0.31.2 used Gumbel-max.
+- The [family-scoped EOS decision](../crates/apxinf-model/src/metal_qwen3_tts/README.md#scoped-eos-control-boundary)
+  permits only a stopping Boolean on host. First-code ids and repetition
+  membership remain device arrays. Top-k/categorical vocabulary profiles and
+  local GELU/RoPE prepare explicitly; request-length RoPE prepares before the
+  Talker. The selected predictor fusion evaluates each retained layer on
+  materialized one/two-row scratch inputs at load. The decoder prepares the
+  exact GELU profiles derived from its actual chunk lengths and loaded widths
+  before waveform execution. This is local compilation, not a prepared full
+  speech loop, and does not establish numerical, resource, native-JIT or
+  performance qualification. Warm calls remain in complete load/request timing.
+- As in mlx-audio, the waveform decoder's transformer uses a full causal mask;
+  the checkpoint's `sliding_window` of 72 frames is not applied.
+- The checkpoint ships no `tokenizer.json`; the family builds the tokenizer
+  from `vocab.json` and `merges.txt` as Transformers 5 does.
+
+```sh
+cargo run --features mlx -- speak --model /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --voice Vivian --language English --seed 46 \
+  --text 'Hello, could you close the window for me? Thank you.' --output hello.wav
+```
 ## Clef decision preparation
 
 The `metal_clef` decision family prepares its existing shapeless decay/beta

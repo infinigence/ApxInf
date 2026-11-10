@@ -102,7 +102,7 @@ not a port requirement.
 | --- | --- | --- |
 | Python policy (`<Family>Policy`) | Public observation → canonical native inputs → decoded actions; prompt, tokenizer, state/action normalization and output context | [Pi05Policy](../python/apxinf/apxinf/policies/impls/pi05.py) |
 | Native binding (`ModelRunner`) | NumPy/Rust conversion, public shape validation, default sampling keys, host result conversion; delegates family computation to `VlaRuntime` | [PyO3 ModelRunner](../crates/apxinf-py/src/lib.rs) |
-| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision` or `Image`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
+| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision`, `Image` or `Speech`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
 | `config.rs`, `load.rs` | Validate family config; select a supported implementation, materialize weights and fixed embeddings, construct the runner through its constructor | [load.rs](../crates/apxinf-model/src/pi05/load.rs) |
 | `model_runner/` (`<Family>ModelRunner`) | Implements `VlaRuntime`; validates requests, owns preparation policy, input/RNG binding, bounded cache and invalidation | [runner.rs](../crates/apxinf-model/src/pi05/model_runner/runner.rs) |
 | `model_runner/prepare.rs` and prepared inference | Query requirements, allocate stable inputs/output/workspace, warm up, capture and retain resources; compatible `run` executes without capture/autotune | [prepare.rs](../crates/apxinf-model/src/pi05/model_runner/prepare.rs) |
@@ -128,6 +128,14 @@ text-to-image contract. A request carries the prompt, size, seed and step count;
 the result is caller-owned row-major RGB8. Each family documents the sizes and
 step counts it supports, rejects others before device work, and keeps guidance,
 scheduler and file encoding out of the request.
+
+`SpeechRuntime` ([speech.rs](../crates/apxinf-model/src/speech.rs)) is the shared
+text-to-speech contract. A request carries the text, voice, language, an optional
+style instruction and a seed; the result is caller-owned interleaved `f32` samples
+with their sample rate and channel count, and whether generation reached its end
+token. The family owns its random stream: the seed resets it per request. Each
+family documents its voices and languages and rejects others before device work.
+Streaming output is not part of this contract.
 
 The native binding and the family runner are existing language-boundary and
 execution owners. `apxinf.ModelRunner` re-exports `apxinf_py.ModelRunner`; there
