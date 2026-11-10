@@ -78,8 +78,9 @@ pub struct LoadOptions {
     /// on recipe misses during preparation or first execution. When false,
     /// missing records resolve once to a safe inference fallback.
     pub autotune: bool,
-    /// Maximum number of fixed-length d3 text CUDA Graph profiles retained in
-    /// memory. `None` uses the d3 runtime's safe default.
+    /// Maximum number of fixed-length d3 text profiles retained in memory
+    /// (CUDA Graphs on CUDA, compiled MLX callables on Metal). `None` uses the
+    /// d3 runtime's safe default.
     pub d3_text_profile_limit: Option<usize>,
     /// Sum of token capacities across retained d3 text profiles. `None` uses
     /// the d3 runtime's safe default. A single request may exceed the budget.
@@ -507,7 +508,9 @@ impl AutoModel {
             ));
         }
 
-        if matches!(model_name, "d3" | "d3-cuda") {
+        // On Metal, fall through to the registered `metal_d3` port, which
+        // `metal_registry_name` resolves from the detected `d3` name.
+        if matches!(model_name, "d3" | "d3-cuda") && !matches!(device, Device::Metal(_)) {
             #[cfg(feature = "cuda")]
             return crate::d3::load::load_with_cuda_new(path, device, options);
 

@@ -315,6 +315,7 @@ renamed as part of unrelated work.
 | Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
 | MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
 | Clef Flash / `SchemaDecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 16384 tokens; `reference` (the stock MLX-VLM composition, also `auto`). Its local shapeless decay/beta callable is prepared at load for lengths 1, 2 and 16384; this is not whole-backbone/head preparation. |
+| d3 / `CodeDecisionRuntime`, MLX | Independent `metal_d3/{config,weights,model,profiles,vision,preprocess}.rs`; d3-lite geometry only (18 GatedDeltaNet + 6 non-causal full attention, FP32 255-code readout), no decode or KV cache, plus the `visual.*` tower and multimodal wiring for one still image; `bf16` (also `auto`). Whole-request `Compiled` profiles per prompt length (and image-token count), bounded and evicted under `d3_text_profile_limit`/`d3_text_profile_token_budget`. Registered as `metal_d3`; `capabilities() == VISION`. Video and multi-image requests are not wired. See its [README](../crates/apxinf-model/src/metal_d3/README.md). |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
@@ -327,9 +328,11 @@ The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
 names, and for every Metal request. Metal admission reaches only a registered
 `metal_` factory, and each MLX family parses its variants locally; the common
 loader does not infer quantization from a shared CUDA precision choice. A new
-Metal family needs no central admission edit. Supporting it for a new non-Metal
-family requires updating that admission check and implementing family-local
-parsing/validation; registration alone is not
+Metal family needs no central *variant* admission edit; a name already claimed by
+a device-specific intercept does (the d3 family's CUDA intercept in `AutoModel`
+is gated to non-Metal devices so `metal_d3` can resolve).
+Supporting a new non-Metal family requires updating that admission check and
+implementing family-local parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and
@@ -337,10 +340,14 @@ extend a shared option only for a demonstrated contract, not by copying
 `Pi05Config` or adding unrelated fields to it.
 
 Metal model composition is performance-first and independent of the provisional
-cross-backend design. With the `mlx` feature, Metal selection resolves `metal_qwen3` or `metal_minicpm5`.
+cross-backend design. With the `mlx` feature, Metal selection resolves the
+registered `metal_<family>` factory: `metal_qwen3`, `metal_minicpm5`,
+`metal_clef` and `metal_d3`.
 Qwen3 checkpoint detection uses `model_type=qwen3`; MiniCPM5 requires explicit
-family selection because its official metadata says `llama`. Unsupported
-families fail instead of silently moving work to CPU. See the
+family selection because its official metadata says `llama`; a `d3-code-readout-v1`
+package detects as `d3` and resolves to `metal_d3` on Metal while keeping the
+CUDA loader for non-Metal devices. Unsupported families fail instead of silently
+moving work to CPU. See the
 [implemented MLX selection table](mlx-backend.md#implemented-text-selections)
 for profiles, compilation scopes and CLI options.
 
