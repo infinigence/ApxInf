@@ -73,14 +73,24 @@ fn linear(x: &Array, weight: &Array) -> Result<Array> {
     x.matmul(&weight.transpose(&[1, 0])?)
 }
 
-fn layer(
-    h: &Array,
-    w: &TextLayer,
-    cos: &Array,
-    sin: &Array,
-    mask: &Array,
-    ops: &Ops,
-) -> Result<Array> {
+/// Causal self-attention computed in FP32, as the reference rounds it.
+/// Operands and result are `[1, HEADS, T, HEAD_DIM]` in the input dtype. The
+/// prompt is unpadded, so causality is the whole mask; the flag lets MLX skip
+/// key tiles above the diagonal instead of reading a `[T, T]` `-inf` mask.
+fn causal_attention(q: &Array, k: &Array, v: &Array) -> Result<Array> {
+    let scale = (1.0 / (HEAD_DIM as f64).sqrt()) as f32;
+    q.cast(MlxDType::F32)?
+        .sdpa(
+            &k.cast(MlxDType::F32)?,
+            &v.cast(MlxDType::F32)?,
+            scale,
+            true,
+            None,
+        )?
+        .cast(q.dtype())
+}
+
+fn layer(h: &Array, w: &TextLayer, cos: &Array, sin: &Array, ops: &Ops) -> Result<Array> {
     let length = h.shape()[1];
     let x = rms_norm(h, &w.input_norm, ops)?;
     let heads = |p: &Array, n: usize| p.reshape(&[1, length, n, HEAD_DIM]);
@@ -101,17 +111,7 @@ fn layer(
             .reshape(&[1, HEADS, length, HEAD_DIM])
     };
     let (k, v) = (repeat(&k)?, repeat(&v)?);
-    let scale = (1.0 / (HEAD_DIM as f64).sqrt()) as f32;
-    let attn = q
-        .cast(MlxDType::F32)?
-        .sdpa(
-            &k.cast(MlxDType::F32)?,
-            &v.cast(MlxDType::F32)?,
-            scale,
-            false,
-            Some(mask),
-        )?
-        .cast(q.dtype())?
+    let attn = causal_attention(&q, &k, &v)?
         .transpose(&[0, 2, 1, 3])?
         .reshape(&[1, length, DIM])?;
     let h = h.add(&linear(&attn, &w.o)?)?;
@@ -131,17 +131,6 @@ pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Res
         h.eval()?;
         h
     };
-    // Additive causal mask; the unpadded prompt adds a zero padding mask.
-    let mask: Vec<f32> = (0..length * length)
-        .map(|i| {
-            if i % length > i / length {
-                f32::NEG_INFINITY
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    let mask = Array::from_f32(stream, &[1, 1, length, length], &mask)?;
     // Text positions repeat on all three MRoPE axes, so the interleave is the identity.
     let inv_freq = files.tensor(stream, "rotary_emb.inv_freq")?;
     let positions: Vec<f32> = (0..length).map(|p| p as f32).collect();
@@ -154,7 +143,7 @@ pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Res
     let sin = emb.sin()?.cast(h.dtype())?;
     for i in 0..TEXT_LAYERS {
         let weights = files.layer(stream, i)?;
-        h = layer(&h, &weights, &cos, &sin, &mask, ops)?;
+        h = layer(&h, &weights, &cos, &sin, ops)?;
         // Release this layer's weights before reading the next one.
         h.eval()?;
     }
@@ -167,6 +156,7 @@ pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apxinf_mlx::Stream;
 
     #[test]
     fn embedding_ids_preserve_valid_ids_and_reject_invalid_suffixes() {
@@ -177,5 +167,61 @@ mod tests {
             assert!(error.contains(&format!("token ID {invalid} at position 2")));
             assert!(error.contains(&format!("vocabulary {TEXT_VOCAB}")));
         }
+    }
+
+    /// The masked attention this encoder used before the causal flag: an
+    /// additive `-inf` mask above the diagonal and zeros elsewhere.
+    fn additive_mask_attention(q: &Array, k: &Array, v: &Array) -> Result<Array> {
+        let length = q.shape()[2];
+        let mask: Vec<f32> = (0..length * length)
+            .map(|i| {
+                if i % length > i / length {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let mask = Array::from_f32(q.stream(), &[1, 1, length, length], &mask)?;
+        let scale = (1.0 / (HEAD_DIM as f64).sqrt()) as f32;
+        q.cast(MlxDType::F32)?
+            .sdpa(
+                &k.cast(MlxDType::F32)?,
+                &v.cast(MlxDType::F32)?,
+                scale,
+                false,
+                Some(&mask),
+            )?
+            .cast(q.dtype())
+    }
+
+    fn causal_flag_matches_additive_mask(stream: &Stream, lengths: &[usize]) -> Result<()> {
+        for (seed, &length) in lengths.iter().enumerate() {
+            let operand = |offset: u64| -> Result<Array> {
+                let key = Array::random_key(stream, 3 * seed as u64 + offset)?;
+                Array::random_normal(&[1, HEADS, length, HEAD_DIM], MlxDType::F32, &key)?
+                    .cast(MlxDType::BF16)
+            };
+            let (q, k, v) = (operand(0)?, operand(1)?, operand(2)?);
+            assert_eq!(
+                causal_attention(&q, &k, &v)?.to_bytes()?,
+                additive_mask_attention(&q, &k, &v)?.to_bytes()?,
+                "prompt length {length}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn causal_flag_matches_additive_mask_on_cpu() -> Result<()> {
+        causal_flag_matches_additive_mask(&Stream::cpu()?, &[17, 55])
+    }
+
+    /// Covers lengths that leave partial query and key tiles and the 2048-token
+    /// template cap.
+    #[test]
+    #[ignore = "requires native Apple Metal"]
+    fn causal_flag_matches_additive_mask_on_metal() -> Result<()> {
+        causal_flag_matches_additive_mask(&Stream::metal(0)?, &[17, 55, 917, 2048])
     }
 }
