@@ -58,7 +58,8 @@ pub use gemm::{
     gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, gemm_swiglu, gemv, gemv_bias,
     pack_swiglu_weight_host, BlockQuantizedSwiGluArgs, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs,
     GemmBiasResidualArgs, GemmGegluArgs, GemmNumerics, GemmPolicy, GemmQuantization,
-    GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales, WeightVersion,
+    GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales, RepackedWeight,
+    WeightVersion,
 };
 pub use norm::{
     fused_add_norm, residual_add, Affine, BiasOrder, FusedAddNormArgs, NormArgs, NormKind,

@@ -9,13 +9,13 @@ use crate::d3::backend::read_f32;
 use crate::d3::model::{
     forward_multimodal_device, forward_text_device, write_text_inputs, D3Policies, D3TextScratch,
 };
-use crate::d3::runtime::{DecisionInput, DecisionOutput, DecisionRuntime, DecisionScore};
 use crate::d3::vision::D3VisionScratch;
 use crate::d3::weights::bf16::D3DeviceWeights;
 use crate::d3::{
     D3DecisionConfig, D3PackageConfig, D3_DEFAULT_TEXT_PROFILE_LIMIT,
     D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
+use crate::decision::{CodeDecisionRuntime, DecisionInput, DecisionOutput, DecisionScore};
 use crate::llm_trait::{ImageInput, LlmCapabilities};
 
 struct TextProfile {
@@ -302,7 +302,7 @@ impl D3Runner {
     }
 }
 
-impl DecisionRuntime for D3Runner {
+impl CodeDecisionRuntime for D3Runner {
     fn capabilities(&self) -> LlmCapabilities {
         LlmCapabilities::TEXT_ONLY
     }

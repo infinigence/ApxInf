@@ -7,7 +7,10 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 
 use crate::accelerator::create_backend_with_recipe_options;
 use crate::builtin::register_builtin_models;
-use crate::d3::{DecisionInput, DecisionOutput, DecisionRuntime};
+use crate::decision::{
+    CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionSchema,
+    SchemaDecisionOutput,
+};
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
@@ -17,7 +20,9 @@ use crate::llm_trait::{
 use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
-use crate::vla::{Action, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime};
+use crate::vla::{
+    Action, ExecutionPolicy, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime,
+};
 
 /// User-level precision policy. Hardware/tactic dispatch remains in kernels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -49,6 +54,9 @@ pub struct LoadOptions {
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
+    /// How a VLA runtime that owns implicit plans should build them. `None`
+    /// keeps the family's own default (PI0.5 runs `PreferGraph`).
+    pub execution_policy: Option<ExecutionPolicy>,
     /// Optional text-model weight dtype. `None` preserves checkpoint dtype
     /// (except CPU backends, which currently require f32).
     pub text_weight_dtype: Option<DType>,
@@ -56,6 +64,11 @@ pub struct LoadOptions {
     /// For cuda-new, override the recipe directory. None uses the shared
     /// hardware/toolkit tuning directory; legacy JSON records are not loaded.
     pub tuning_path: Option<PathBuf>,
+    /// CUDA PI0.5 BF16/FP8: maximum extra bytes for language gate/up layout copies.
+    /// None permits one extra live layout per weight for concurrent consumers.
+    /// Copies die with their last execution/graph; retired bases can transition
+    /// in place. Some(0) fixes canonical without additional copies.
+    pub weight_layout_budget_bytes: Option<usize>,
     /// Additional named model artifacts that are not embedded in the primary
     /// checkpoint. Model loaders must reject missing or unknown required
     /// assets instead of discovering them through process-global state.
@@ -94,7 +107,7 @@ pub enum LoadedModel {
         generation_defaults: GenerationOptions,
     },
     Vla(Box<dyn VlaRuntime>),
-    Decision(Box<dyn DecisionRuntime>),
+    Decision(DecisionModel),
 }
 
 impl LoadedModel {
@@ -121,21 +134,41 @@ impl LoadedModel {
         }
     }
 
-    pub fn decision_mut(&mut self) -> Result<&mut dyn DecisionRuntime> {
+    pub fn decision_model_mut(&mut self) -> Result<&mut DecisionModel> {
         match self {
-            Self::Decision(model) => Ok(&mut **model),
+            Self::Decision(model) => Ok(model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
+    }
+
+    /// The encoded-prompt runtime of a code decision model.
+    pub fn decision_mut(&mut self) -> Result<&mut dyn CodeDecisionRuntime> {
+        self.decision_model_mut()?.code_mut()
     }
 
     pub fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
         self.decision_mut()?.decide(input)
     }
 
+    /// Score named schema questions on a schema decision model.
+    pub fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
+        self.decision_model_mut()?
+            .schema_mut()?
+            .decide_schema(request)
+    }
+
     pub fn decision_code_names(&self) -> Result<&[String]> {
         match self {
-            Self::Decision(model) => Ok(model.code_names()),
+            Self::Decision(model) => Ok(model.code()?.code_names()),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+        }
+    }
+
+    pub fn decision_capabilities(&self) -> Result<LlmCapabilities> {
+        match self {
+            Self::Decision(model) => Ok(model.capabilities()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
@@ -143,7 +176,7 @@ impl LoadedModel {
 
     pub fn decision_token_ids(&self) -> Result<&[u32]> {
         match self {
-            Self::Decision(model) => Ok(model.token_ids()),
+            Self::Decision(model) => Ok(model.code()?.token_ids()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
         }
@@ -329,6 +362,10 @@ impl AutoModel {
         // Decision 3.0 deliberately preserves the base Qwen3.5 model_type in
         // config.json. Its package-level format is the discriminator; without
         // this check it is incorrectly routed to the Qwen3.8 NVFP4 loader.
+        // Clef keeps the Qwen3.5 model_type; its joint schema head identifies it.
+        if model_dir.join("joint_head_config.json").is_file() {
+            return Ok("clef".to_owned());
+        }
         let decision_path = model_dir.join("decision_config.json");
         if decision_path.is_file() {
             let raw = std::fs::read_to_string(&decision_path).map_err(|error| {
@@ -388,18 +425,26 @@ impl AutoModel {
             )));
         }
 
-        if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip") {
+        if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip" | "pi05-musa") {
             #[cfg(feature = "hip")]
             if matches!(device, Device::Hip(_)) {
                 let config = options.config.as_ref().map(hip_pi05_config);
                 return crate::hip_pi05::load(path, device, options, config);
             }
 
+            #[cfg(feature = "musa")]
+            if matches!(device, Device::Musa(_)) {
+                let config = options.config.as_ref().map(musa_pi05_config);
+                return crate::musa_pi05::load(path, device, options, config);
+            }
+
             #[cfg(feature = "cuda")]
             return crate::pi05::load_with_cuda_new(path, device, options);
 
             #[cfg(not(feature = "cuda"))]
-            return Err(Error::Other("PI0.5 requires CUDA or HIP support".into()));
+            return Err(Error::Other(
+                "PI0.5 requires CUDA, HIP or MUSA support".into(),
+            ));
         }
 
         if matches!(model_name, "d3" | "d3-cuda") {
@@ -414,6 +459,11 @@ impl AutoModel {
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
             Device::Hip(_) => Some("hip"),
+            // A family that brings a MUSA port registers `<family>-musa`, the
+            // same way a CUDA or HIP family registers its own suffix. None does
+            // yet: PI0.5 resolves through its seam above.
+            Device::Musa(_) => Some("musa"),
+            // Metal owns its own admission below; CPU has no registry suffix.
             Device::Metal(_) | Device::Cpu => None,
         };
 
@@ -576,35 +626,75 @@ fn hip_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::hip_pi05::Confi
     }
 }
 
+/// The same frontend contract as `hip_pi05_config`, for the MUSA port. Both
+/// conversions live here, outside the families, so neither imports the other.
+#[cfg(feature = "musa")]
+fn musa_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::musa_pi05::Pi05Config {
+    let gemma = |g: &crate::pi05::GemmaVariantConfig| crate::musa_pi05::GemmaVariantConfig {
+        width: g.width,
+        depth: g.depth,
+        mlp_dim: g.mlp_dim,
+        num_heads: g.num_heads,
+        num_kv_heads: g.num_kv_heads,
+        head_dim: g.head_dim,
+    };
+    crate::musa_pi05::Pi05Config {
+        action_dim: frontend.action_dim,
+        action_horizon: frontend.action_horizon,
+        max_token_len: frontend.max_token_len,
+        num_flow_steps: frontend.num_flow_steps,
+        flow_start_time: frontend.flow_start_time,
+        num_views: frontend.num_views,
+        image_size: frontend.image_size,
+        patch_size: frontend.patch_size,
+        vision_width: frontend.vision_width,
+        vision_depth: frontend.vision_depth,
+        vision_mlp_dim: frontend.vision_mlp_dim,
+        vision_heads: frontend.vision_heads,
+        vision_head_dim: frontend.vision_head_dim,
+        vocab_size: frontend.vocab_size,
+        rms_norm_eps: frontend.rms_norm_eps,
+        layer_norm_eps: frontend.layer_norm_eps,
+        rope_theta: frontend.rope_theta,
+        time_min_period: frontend.time_min_period,
+        time_max_period: frontend.time_max_period,
+        discrete_state_input: frontend.discrete_state_input,
+        language: gemma(&frontend.language),
+        action_expert: gemma(&frontend.action_expert),
+    }
+}
+
+/// The family a backend-qualified name refers to: `pi05-hip` is `pi05`.
+///
+/// The qualifier says which backend the caller had in mind; `device` is what
+/// decides, and admission is only asked whether the *family* supports variants.
+/// Stripping it here is what lets a family listed once admit `<family>`,
+/// `<family>-cuda`, `<family>-hip`, `<family>-musa` and `<family>-mlx`, so a
+/// family that grows a port on another backend needs no entry — or edit — here.
+fn family_name(model_name: &str) -> &str {
+    ["-cuda", "-hip", "-musa", "-mlx"]
+        .iter()
+        .find_map(|suffix| model_name.strip_suffix(suffix))
+        .unwrap_or(model_name)
+}
+
 // Admission only: supported variant names and precision semantics are owned by
 // each family loader, not a second central implementation registry. A Metal
 // request reaches only a registered `metal_` factory, which parses its variant.
 fn supports_model_variant(model_name: &str, device: Device) -> bool {
     matches!(
-        model_name,
+        family_name(model_name),
         "pi05"
-            | "pi05-cuda"
-            | "pi05-hip"
             | "qwen_drive"
-            | "qwen_drive-cuda"
             | "d3"
-            | "d3-cuda"
             | "walloss"
-            | "walloss-cuda"
             | "wall-oss"
-            | "wall-oss-cuda"
             | "wall_oss_05"
-            | "wall_oss_05-cuda"
             | "gr00t"
-            | "gr00t-cuda"
             | "gr00t_n1_7"
-            | "gr00t_n1_7-cuda"
             | "Gr00tN1d7"
-            | "Gr00tN1d7-cuda"
             | "pi0_fast"
-            | "pi0_fast-cuda"
             | "pi0fast"
-            | "pi0fast-cuda"
             | "smolvla"
             | "smolvla_libero"
     ) || matches!(device, Device::Metal(_))
@@ -727,8 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_variant_admission_is_family_and_device_specific() {
-        // Metal defers to the registered family factory; other devices keep the list.
+    fn metal_admission_defers_to_the_registered_factory() {
         for name in [
             "qwen3",
             "metal_qwen3",
@@ -745,6 +834,7 @@ mod tests {
         }
         assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
         assert!(supports_model_variant("pi05-hip", Device::Hip(0)));
+        assert!(supports_model_variant("pi05-musa", Device::Musa(0)));
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
         assert!(supports_model_variant("smolvla", Device::Cuda(0)));
         assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
@@ -766,27 +856,43 @@ mod tests {
         }
     }
 
-    /// `Pi05Policy.from_pretrained(model_name="pi05-hip")` always sends a
-    /// model_variant (`"auto"` by default). Both must pass admission and reach
-    /// the PI0.5 loader; here that loader then fails for lack of a device or a
-    /// checkpoint, which is fine — only the admission rejection is the bug.
+    /// A backend qualifier names the backend the caller meant, not a different
+    /// family: admission answers for the family, on every device it can name.
     #[test]
-    fn pi05_hip_alias_admits_auto_and_bf16_model_variants() {
-        let path = temporary_directory("pi05-hip-admission");
-        for variant in ["auto", "bf16"] {
-            let options = LoadOptions {
-                model_name: Some("pi05-hip".into()),
-                model_variant: Some(variant.into()),
-                ..LoadOptions::default()
-            };
-            let error = match AutoModel::load_model(Device::Hip(0), &path, &options) {
-                Ok(_) => panic!("an empty directory cannot load as PI0.5"),
-                Err(error) => error.to_string(),
-            };
-            assert!(
-                !error.contains("does not yet support model_variant"),
-                "model_variant={variant} was rejected before the PI0.5 loader: {error}"
-            );
+    fn a_backend_qualifier_does_not_decide_admission() {
+        for name in ["pi05", "pi05-cuda", "pi05-hip", "pi05-musa"] {
+            assert!(supports_model_variant(name, Device::Musa(0)), "{name}");
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
+        // The qualifier does not invent a family that has no variants either.
+        assert!(!supports_model_variant("llama-musa", Device::Musa(0)));
+    }
+
+    /// `Pi05Policy.from_pretrained(model_name="pi05-hip")` — and the same call
+    /// with `pi05-musa` — always sends a model_variant (`"auto"` by default).
+    /// Both must pass admission and reach the PI0.5 loader; here that loader
+    /// then fails for lack of a device or a checkpoint, which is fine — only
+    /// the admission rejection is the bug.
+    #[test]
+    fn pi05_backend_aliases_admit_auto_and_bf16_model_variants() {
+        let path = temporary_directory("pi05-alias-admission");
+        for (alias, device) in [("pi05-hip", Device::Hip(0)), ("pi05-musa", Device::Musa(0))] {
+            for variant in ["auto", "bf16"] {
+                let options = LoadOptions {
+                    model_name: Some(alias.into()),
+                    model_variant: Some(variant.into()),
+                    ..LoadOptions::default()
+                };
+                let error = match AutoModel::load_model(device, &path, &options) {
+                    Ok(_) => panic!("an empty directory cannot load as PI0.5"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    !error.contains("does not yet support model_variant"),
+                    "model_name={alias} model_variant={variant} was rejected before the PI0.5 \
+                     loader: {error}"
+                );
+            }
         }
         std::fs::remove_dir_all(path).unwrap();
     }
