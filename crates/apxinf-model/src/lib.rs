@@ -8,6 +8,8 @@ pub mod debug;
 mod generation_config;
 pub mod gr00t;
 #[cfg(feature = "hip")]
+pub mod hip_gr00t;
+#[cfg(feature = "hip")]
 pub mod hip_pi05;
 pub mod llama;
 pub mod llm_trait;

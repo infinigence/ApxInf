@@ -12,6 +12,16 @@ use apxinf_core::{Error, Result};
 /// Status the stub ABI returns when the crate was built without ROCm.
 pub(crate) const NOT_COMPILED: i32 = -1;
 
+/// Mirrors `kInvalidArgument` in `kernels/common.h`: an argument the shim
+/// rejects, as opposed to a runtime or library failure. A caller that has
+/// another way to do the work can treat it as "not available here".
+pub(crate) const INVALID_ARGUMENT: i32 = 200_000;
+
+/// `apxinf_hip_blaslt_tactic_bytes` returns a size rather than a status, so
+/// Rust never hard-codes the C++ `hipblasLtMatmulAlgo_t` layout. It is the one
+/// entry point here whose return value is not a status code; on a build
+/// without hipBLASLt it returns 0, which reads as "no tactic can be set".
+///
 /// Shim dtype codes. Mirror `kDTypeF32` / `kDTypeBF16` in the device code.
 pub(crate) const DTYPE_F32: i32 = 0;
 pub(crate) const DTYPE_BF16: i32 = 1;
@@ -69,6 +79,55 @@ hip_abi! {
         b: *const c_void,
         c: *mut c_void,
     );
+
+    fn apxinf_hip_blaslt_create(handle: *mut *mut c_void, stream: *mut c_void);
+    fn apxinf_hip_blaslt_destroy(handle: *mut c_void);
+    fn apxinf_hip_blaslt_set_tactic(
+        handle: *mut c_void,
+        dtype: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        epilogue: i32,
+        blob: *const u8,
+        len: i32,
+    );
+    fn apxinf_hip_blaslt_tactic_bytes();
+    fn apxinf_hip_library_versions(rocm: *mut i32, blaslt: *mut i32);
+    fn apxinf_hip_gemm_tune(
+        lt_handle: *mut c_void,
+        blas_handle: *mut c_void,
+        dtype: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const c_void,
+        b: *const c_void,
+        epilogue: i32,
+        bias: *const c_void,
+        blas_ms: *mut f64,
+        lt_ms: *mut f64,
+        blob: *mut u8,
+        blob_len: i32,
+        worst_relative_l2: *mut f64,
+    );
+    fn apxinf_hip_gemm_lt(
+        handle: *mut c_void,
+        dtype: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+        epilogue: i32,
+        bias: *const c_void,
+    );
+
+    fn apxinf_hip_graph_capture_begin(stream: *mut c_void);
+    fn apxinf_hip_graph_capture_end(stream: *mut c_void, exec: *mut *mut c_void, nodes: *mut i32);
+    fn apxinf_hip_graph_launch(exec: *mut c_void, stream: *mut c_void);
+    fn apxinf_hip_graph_destroy(exec: *mut c_void);
 
     fn apxinf_hip_silu(dtype: i32, x: *const c_void, y: *mut c_void, n: i64, stream: *mut c_void);
     fn apxinf_hip_binary(
@@ -146,6 +205,16 @@ hip_abi! {
         eps: f32,
         stream: *mut c_void,
     );
+    fn apxinf_hip_native_ada_layer_norm(
+        x: *const c_void,
+        style: *const c_void,
+        y: *mut c_void,
+        rows: i64,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
+
     fn apxinf_hip_native_ada_rms_norm(
         x: *const c_void,
         style: *const c_void,
@@ -182,6 +251,18 @@ hip_abi! {
         residual: *const c_void,
         norm_weight: *const c_void,
         norm_bias: *const c_void,
+        hidden: *mut c_void,
+        normalized: *mut c_void,
+        rows: i64,
+        cols: i32,
+        eps: f32,
+        stream: *mut c_void,
+    );
+    fn apxinf_hip_native_bias_residual_ada_layer_norm(
+        projection: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        style: *const c_void,
         hidden: *mut c_void,
         normalized: *mut c_void,
         rows: i64,
@@ -232,6 +313,44 @@ hip_abi! {
         tokens: i32,
         width: i32,
         vocab: u32,
+        scale_by_sqrt_width: i32,
+        stream: *mut c_void,
+    );
+
+    fn apxinf_hip_native_gather_rows(
+        input: *const c_void,
+        indices: *const c_void,
+        y: *mut c_void,
+        rows: i32,
+        cols: i32,
+        stream: *mut c_void,
+    );
+
+    fn apxinf_hip_native_scatter_rows(
+        destination: *mut c_void,
+        indices: *const c_void,
+        source: *const c_void,
+        rows: i32,
+        cols: i32,
+        accumulate: i32,
+        stream: *mut c_void,
+    );
+
+    fn apxinf_hip_native_copy_columns(
+        src: *const c_void,
+        dst: *mut c_void,
+        rows: i32,
+        src_cols: i32,
+        dst_cols: i32,
+        dst_col: i32,
+        stream: *mut c_void,
+    );
+
+    fn apxinf_hip_native_silu_mul(
+        gate: *const c_void,
+        up: *const c_void,
+        y: *mut c_void,
+        count: i64,
         stream: *mut c_void,
     );
     fn apxinf_hip_native_add_position(
@@ -278,6 +397,31 @@ hip_abi! {
         width: i32,
         stream: *mut c_void,
     );
+    fn apxinf_hip_ck_attention_supported(
+        dtype: i32,
+        head_dim: i32,
+        query_start: i32,
+        q_tokens: i32,
+        kv_tokens: i32,
+    );
+    fn apxinf_hip_ck_attention(
+        dtype: i32,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        out: *mut c_void,
+        batch: i32,
+        q_tokens: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        kv_tokens: i32,
+        kv_batch_stride: i64,
+        kv_token_stride: i64,
+        scale: f32,
+        query_start: i32,
+        stream: *mut c_void,
+    );
     fn apxinf_hip_native_attention(
         q: *const c_void,
         k: *const c_void,
@@ -292,6 +436,32 @@ hip_abi! {
         kv_batch_stride: i64,
         kv_token_stride: i64,
         scale: f32,
+        query_start: i32,
+        stream: *mut c_void,
+    );
+
+    fn apxinf_hip_native_apply_mrope(
+        input: *const c_void,
+        output: *mut c_void,
+        positions: *const c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        rotary_dim: i32,
+        section_h: i32,
+        section_w: i32,
+        theta: f32,
+        stream: *mut c_void,
+    );
+
+    fn apxinf_hip_native_apply_vision_2d(
+        input: *const c_void,
+        output: *mut c_void,
+        positions: *const c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        theta: f32,
         stream: *mut c_void,
     );
 }

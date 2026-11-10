@@ -20,15 +20,29 @@ __device__ __forceinline__ float ld(const bf16* p, int64_t i) { return bf16_to_f
 constexpr int kActivationNone = 0;
 constexpr int kActivationGeluTanh = 1;
 constexpr int kActivationSilu = 2;
+constexpr int kActivationRelu = 3;
+constexpr int kActivationGeluErf = 4;
+// Keep this at the highest code: the entry points validate against it.
+constexpr int kActivationMax = kActivationGeluErf;
 
 __device__ __forceinline__ float gelu_tanh(float v) {
   constexpr float kAlpha = 0.7978845608028654f;  // sqrt(2 / pi)
   return 0.5f * v * (1.0f + tanhf(kAlpha * (v + 0.044715f * v * v * v)));
 }
 
+// Torch's default `nn.GELU()` -- the exact form, not the tanh approximation.
+// The two differ by up to 3e-4 absolute, which is above BF16 resolution where
+// GELU itself is small, so a model that asks for one must not get the other.
+__device__ __forceinline__ float gelu_erf(float v) {
+  constexpr float kInvSqrt2 = 0.70710678118654752f;
+  return 0.5f * v * (1.0f + erff(v * kInvSqrt2));
+}
+
 __device__ __forceinline__ float activate(float v, int activation) {
   if (activation == kActivationGeluTanh) return gelu_tanh(v);
   if (activation == kActivationSilu) return v / (1.0f + expf(-v));
+  if (activation == kActivationRelu) return fmaxf(v, 0.0f);
+  if (activation == kActivationGeluErf) return gelu_erf(v);
   return v;
 }
 
@@ -53,6 +67,16 @@ __global__ void geglu_kernel(const bf16* gate_up, bf16* y, int64_t rows, int inn
   }
 }
 
+// y = silu(gate) * up over separate operands -- GR00T's SwiGLU MLP, where the
+// two projections are distinct tensors rather than the packed `gate_up` that
+// `geglu` splits.
+__global__ void silu_mul_kernel(const bf16* gate, const bf16* up, bf16* y, int64_t count) {
+  for (int64_t i = global_index(); i < count; i += grid_stride()) {
+    const float g = ld(gate, i);
+    y[i] = f32_to_bf16(g / (1.0f + expf(-g)) * ld(up, i));
+  }
+}
+
 // One explicit-Euler flow step: y = state + dt * velocity.
 __global__ void euler_update_kernel(const bf16* state, const bf16* velocity, bf16* y,
                                     int64_t count, float dt) {
@@ -66,10 +90,13 @@ __global__ void euler_update_kernel(const bf16* state, const bf16* velocity, bf1
 // Token-embedding rows scaled by sqrt(width), Gemma's embedding normalizer,
 // which the backbone folds into the lookup. Out-of-range ids produce zeros
 // rather than reading past the table (the host range-checks them as well).
+// `scale_by_sqrt_width` is pi05's Gemma convention; GR00T's Qwen3-VL table is
+// consumed unscaled (cuda-new's `EmbeddingScale::None`), and the two differ
+// numerically, so the caller states which it wants.
 __global__ void embedding_kernel(const bf16* table, const uint32_t* ids, bf16* y, int tokens,
-                                 int width, uint32_t vocab) {
+                                 int width, uint32_t vocab, int scale_by_sqrt_width) {
   const int64_t count = static_cast<int64_t>(tokens) * width;
-  const float normalizer = sqrtf(static_cast<float>(width));
+  const float normalizer = scale_by_sqrt_width ? sqrtf(static_cast<float>(width)) : 1.0f;
   for (int64_t i = global_index(); i < count; i += grid_stride()) {
     const int64_t token = i / width;
     const int64_t col = i % width;
@@ -193,6 +220,47 @@ __global__ void split_qkv_bias_kernel(const bf16* qkv, const bf16* bias, bf16* q
   }
 }
 
+// ── Row and column movement ─────────────────────────────────────────
+
+// Gather whole rows of `input` named by u32 `indices`.
+__global__ void gather_rows_kernel(const bf16* input, const uint32_t* indices, bf16* y, int rows,
+                                   int cols) {
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  for (int64_t i = global_index(); i < count; i += grid_stride()) {
+    const int64_t row = i / cols;
+    const int64_t col = i % cols;
+    y[i] = input[static_cast<int64_t>(indices[row]) * cols + col];
+  }
+}
+
+// Scatter whole rows of `source` into the rows of `destination` named by u32
+// `indices`, replacing or accumulating. The indices GR00T scatters by are a
+// permutation of distinct rows, so accumulation needs no atomics.
+__global__ void scatter_rows_kernel(bf16* destination, const uint32_t* indices, const bf16* source,
+                                    int rows, int cols, int accumulate) {
+  const int64_t count = static_cast<int64_t>(rows) * cols;
+  for (int64_t i = global_index(); i < count; i += grid_stride()) {
+    const int64_t row = i / cols;
+    const int64_t col = i % cols;
+    const int64_t target = static_cast<int64_t>(indices[row]) * cols + col;
+    destination[target] =
+        accumulate ? f32_to_bf16(ld(destination, target) + ld(source, i)) : source[i];
+  }
+}
+
+// Copy `src` into the column window of `dst` starting at `dst_col`. Column
+// concatenation is one of these per source, the way `copy_rows` composes into
+// row concatenation.
+__global__ void copy_columns_kernel(const bf16* src, bf16* dst, int rows, int src_cols,
+                                    int dst_cols, int dst_col) {
+  const int64_t count = static_cast<int64_t>(rows) * src_cols;
+  for (int64_t i = global_index(); i < count; i += grid_stride()) {
+    const int64_t row = i / src_cols;
+    const int64_t col = i % src_cols;
+    dst[row * dst_cols + dst_col + col] = src[i];
+  }
+}
+
 const bf16* in(const void* p) { return static_cast<const bf16*>(p); }
 bf16* out(void* p) { return static_cast<bf16*>(p); }
 
@@ -203,7 +271,7 @@ unsigned elementwise_grid(int64_t count) { return grid_for(count, kElementwiseBl
 extern "C" int apxinf_hip_native_bias_activation(const void* x, const void* bias, void* y,
                                                  int64_t rows, int cols, int activation,
                                                  void* stream) {
-  if (rows <= 0 || cols <= 0 || activation < kActivationNone || activation > kActivationSilu) {
+  if (rows <= 0 || cols <= 0 || activation < kActivationNone || activation > kActivationMax) {
     return kInvalidArgument;
   }
   const int64_t count = rows * cols;
@@ -220,6 +288,45 @@ extern "C" int apxinf_hip_native_geglu(const void* gate_up, void* y, int64_t row
   return last_launch_status();
 }
 
+extern "C" int apxinf_hip_native_gather_rows(const void* input, const void* indices, void* y,
+                                            int rows, int cols, void* stream) {
+  if (rows <= 0 || cols <= 0) return kInvalidArgument;
+  gather_rows_kernel<<<elementwise_grid(static_cast<int64_t>(rows) * cols), kElementwiseBlock, 0,
+                       as_stream(stream)>>>(in(input), static_cast<const uint32_t*>(indices),
+                                            out(y), rows, cols);
+  return last_launch_status();
+}
+
+extern "C" int apxinf_hip_native_scatter_rows(void* destination, const void* indices,
+                                              const void* source, int rows, int cols,
+                                              int accumulate, void* stream) {
+  if (rows <= 0 || cols <= 0) return kInvalidArgument;
+  scatter_rows_kernel<<<elementwise_grid(static_cast<int64_t>(rows) * cols), kElementwiseBlock, 0,
+                        as_stream(stream)>>>(out(destination),
+                                             static_cast<const uint32_t*>(indices), in(source),
+                                             rows, cols, accumulate);
+  return last_launch_status();
+}
+
+extern "C" int apxinf_hip_native_copy_columns(const void* src, void* dst, int rows, int src_cols,
+                                              int dst_cols, int dst_col, void* stream) {
+  if (rows <= 0 || src_cols <= 0 || dst_cols <= 0 || dst_col < 0 || dst_col + src_cols > dst_cols) {
+    return kInvalidArgument;
+  }
+  copy_columns_kernel<<<elementwise_grid(static_cast<int64_t>(rows) * src_cols), kElementwiseBlock,
+                        0, as_stream(stream)>>>(in(src), out(dst), rows, src_cols, dst_cols,
+                                                dst_col);
+  return last_launch_status();
+}
+
+extern "C" int apxinf_hip_native_silu_mul(const void* gate, const void* up, void* y,
+                                          int64_t count, void* stream) {
+  if (count <= 0) return kInvalidArgument;
+  silu_mul_kernel<<<elementwise_grid(count), kElementwiseBlock, 0, as_stream(stream)>>>(
+      in(gate), in(up), out(y), count);
+  return last_launch_status();
+}
+
 extern "C" int apxinf_hip_native_euler_update(const void* state, const void* velocity, void* y,
                                               int64_t count, float dt, void* stream) {
   if (count <= 0) return kInvalidArgument;
@@ -229,11 +336,13 @@ extern "C" int apxinf_hip_native_euler_update(const void* state, const void* vel
 }
 
 extern "C" int apxinf_hip_native_embedding(const void* table, const void* ids, void* y, int tokens,
-                                           int width, uint32_t vocab, void* stream) {
+                                           int width, uint32_t vocab, int scale_by_sqrt_width,
+                                           void* stream) {
   if (tokens <= 0 || width <= 0 || vocab == 0) return kInvalidArgument;
   const int64_t count = static_cast<int64_t>(tokens) * width;
   embedding_kernel<<<elementwise_grid(count), kElementwiseBlock, 0, as_stream(stream)>>>(
-      in(table), static_cast<const uint32_t*>(ids), out(y), tokens, width, vocab);
+      in(table), static_cast<const uint32_t*>(ids), out(y), tokens, width, vocab,
+      scale_by_sqrt_width);
   return last_launch_status();
 }
 

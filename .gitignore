@@ -17,6 +17,7 @@ crates/.gemm-pilot-link.lock
 target-gemm-pilot/
 target-p92i/
 .claude/
+CLAUDE.md
 
 /configs/tuning/**/*.recipe
 /configs/tuning/**/*.recipe.*.tmp
