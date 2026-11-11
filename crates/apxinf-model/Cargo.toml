@@ -6,9 +6,11 @@ license = "Apache-2.0"
 
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
+apxinf-cpu = { path = "../apxinf-cpu" }
 apxinf-mlx = { path = "../apxinf-mlx", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
 apxinf-hip = { path = "../apxinf-hip", optional = true }
+apxinf-musa = { path = "../apxinf-musa", optional = true, default-features = false }
 apxinf-loader = { path = "../apxinf-loader" }
 apxinf-tokenizer = { path = "../apxinf-tokenizer", optional = true }
 thiserror = "1"
@@ -20,6 +22,7 @@ sha2 = { version = "0.10", optional = true }
 
 [features]
 default = []
+openblas = ["apxinf-cpu/openblas"]
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
 cuda = ["dep:apxinf-cuda-new"]
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
@@ -33,6 +36,10 @@ pi05-only = ["cuda"]
 # AMD ROCm/HIP inference, independent of both CUDA features: either, both or
 # neither can be enabled.
 hip = ["dep:apxinf-hip"]
+# Moore Threads MUSA inference, independent of the CUDA and HIP features.
+# `musa` enables the backend; `musa-mttx` adds its profiling markers.
+musa = ["dep:apxinf-musa"]
+musa-mttx = ["musa", "apxinf-musa/mttx"]
 
 [[example]]
 name = "pi05_bench"
@@ -97,3 +104,6 @@ required-features = ["cuda"]
 [[example]]
 name = "clef_decision_index"
 required-features = ["mlx"]
+
+[dev-dependencies]
+sha2 = "0.10"
