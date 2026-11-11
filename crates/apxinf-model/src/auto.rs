@@ -1,6 +1,7 @@
 //! Unified model loading for text, vision-language, and VLA models.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 use apxinf_core::{DType, Device, Error, Result, Tensor};
@@ -41,6 +42,19 @@ pub enum ModelPrecision {
 #[derive(Clone, Copy, Debug)]
 pub struct SyntheticWeights {
     pub seed: u64,
+}
+
+/// A persistent cache of prompt-derived model state, shared by every process
+/// that names the same directory. Entries hold activations derived from the
+/// prompt text, so the caller chooses where they live and how much disk they use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptCacheOptions {
+    /// Directory the cache owns entries in; created if missing.
+    pub dir: PathBuf,
+    /// Upper bound on the bytes of stored entries. The least recently used
+    /// entries are deleted to stay within it; an entry larger than the bound
+    /// is never stored.
+    pub max_bytes: NonZeroU64,
 }
 
 /// Optional loading policy for models that have calibrated or tuned variants.
@@ -98,6 +112,10 @@ pub struct LoadOptions {
     /// Deployment-level settings applied over model defaults and under each
     /// request's explicit [`GenerationOptions`].
     pub generation_overrides: GenerationOptions,
+    /// Reuse prompt-derived state across requests and processes. `None`
+    /// computes it for every request and writes nothing to disk. Only
+    /// Qwen-Image uses it; other families ignore it.
+    pub prompt_cache: Option<PromptCacheOptions>,
 }
 
 /// A loaded autoregressive language model (text-only or VLM), or a VLA model.

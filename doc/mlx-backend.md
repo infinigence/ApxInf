@@ -175,6 +175,13 @@ cargo run --features mlx -- generate-image --model /path/to/Qwen-Image-2.1-MLX-4
 Add `--model-variant reference` to select the quantized-matmul reference path.
 Omitting it or using `--model-variant auto` preserves the optimization target.
 
+`LoadOptions::prompt_cache` enables a persistent cache of each prompt's DiT
+text K/V, shared by processes that name the same directory. A hit skips the
+text encoder and the text-prefix K/V computation and gives the same image as a
+miss. It is off by default and bounded by an explicit byte budget with
+least-recently-used eviction; the family README lists what the key covers.
+From the CLI, add `--prompt-cache-dir DIR --prompt-cache-max-mib N`.
+
 ### Implemented speech selection
 
 [`metal_qwen3_tts`](../crates/apxinf-model/src/metal_qwen3_tts/README.md) runs

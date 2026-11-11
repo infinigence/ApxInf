@@ -8,6 +8,7 @@
 //! family ships no weights.
 mod dit;
 mod ops;
+mod prompt_cache;
 mod tables;
 mod text;
 mod vae;
@@ -45,6 +46,14 @@ pub struct QwenImage {
     /// `Qwen21Rope` cos/sin tables for the 16- and 56-wide axes.
     rope16: (Vec<f32>, Vec<f32>),
     rope56: (Vec<f32>, Vec<f32>),
+    prompt_cache: Option<prompt_cache::PromptCache>,
+}
+
+/// The prompt as the DiT consumes it: text-encoder states to project, or the
+/// projected per-block K/V from the prompt cache.
+enum Prompt {
+    Encoded(Array),
+    Cached(dit::TextCache),
 }
 
 /// Device-independent option admission, checked before the checkpoint is read.
@@ -103,20 +112,28 @@ pub fn load(
     let text = TextEncoderFiles::open(&path.join("text_encoder"))?;
     let transformer = Transformer::load(&stream, &path.join("transformer"))?;
     let decoder = Decoder::load(&stream, &path.join("vae"))?;
+    let ops = Ops::new(&stream)?;
+    let gemm = if options.model_variant.as_deref() == Some("reference") {
+        None
+    } else {
+        probed_gemm(&stream).map(Rc::new)
+    };
+    let prompt_cache = options
+        .prompt_cache
+        .as_ref()
+        .map(|cache| prompt_cache::PromptCache::open(cache, path, &stream, gemm.is_some()))
+        .transpose()?;
     Ok(LoadedModel::Image(Box::new(QwenImage {
         dir: path.to_path_buf(),
         tokenizer,
         text,
         transformer: Some(transformer),
         decoder,
-        ops: Ops::new(&stream)?,
-        gemm: if options.model_variant.as_deref() == Some("reference") {
-            None
-        } else {
-            probed_gemm(&stream).map(Rc::new)
-        },
+        ops,
+        gemm,
         rope16: tables::rope_axis(16, 10000.0),
         rope56: tables::rope_axis(56, 10000.0),
+        prompt_cache,
     })))
 }
 
@@ -273,15 +290,25 @@ impl ImageRuntime for QwenImage {
         let (width, height) = (request.width, request.height);
         let (lh, lw) = (height / SCALE, width / SCALE);
         let tokens = text::tokenize(&self.tokenizer, request.prompt)?;
-        let prompt = text::encode(&self.text, &tokens, ops)?;
-        // The text encoder layers are freed; release their cached buffers as
-        // mflux --low-ram does after deleting the encoder.
-        apxinf_mlx::clear_cache()?;
+        let cached = self
+            .prompt_cache
+            .as_ref()
+            .and_then(|cache| cache.load(&tokens, stream));
+        let prompt = match cached {
+            Some(cache) => Prompt::Cached(cache),
+            None => {
+                let prompt = text::encode(&self.text, &tokens, ops)?;
+                // The text encoder layers are freed; release their cached buffers as
+                // mflux --low-ram does after deleting the encoder.
+                apxinf_mlx::clear_cache()?;
+                Prompt::Encoded(prompt)
+            }
+        };
         let key = Array::random_key(stream, request.seed)?;
         let mut latents = Array::random_normal(&[1, lh * lw, LATENT], MlxDType::F32, &key)?
             .cast(MlxDType::BF16)?;
         let sigmas = sigmas(ops, width, height, request.steps)?;
-        let text_len = prompt.shape()[1];
+        let text_len = tokens.ids.len() - tokens.drop;
         let (cos, sin) = rope(&self.rope16, &self.rope56, text_len, lh, lw);
         let split = text_len * 64;
         let table = |v: &[f32], rows: usize| Array::from_f32(stream, &[rows, 64], v);
@@ -290,12 +317,21 @@ impl ImageRuntime for QwenImage {
             None => Transformer::load(stream, &self.dir.join("transformer"))?,
         };
         let dit = dit::Dit::new(transformer, ops, self.gemm.clone())?;
-        let cache = dit.text_cache(
-            &prompt,
-            &table(&cos[..split], text_len)?,
-            &table(&sin[..split], text_len)?,
-        )?;
-        drop(prompt);
+        let cache = match prompt {
+            Prompt::Cached(cache) => cache,
+            Prompt::Encoded(prompt) => {
+                let cache = dit.text_cache(
+                    &prompt,
+                    &table(&cos[..split], text_len)?,
+                    &table(&sin[..split], text_len)?,
+                )?;
+                drop(prompt);
+                if let Some(prompt_cache) = &self.prompt_cache {
+                    prompt_cache.store(&tokens, &cache);
+                }
+                cache
+            }
+        };
         let (cos, sin) = (
             table(&cos[split..], lh * lw)?,
             table(&sin[split..], lh * lw)?,
@@ -483,6 +519,64 @@ mod tests {
         let architecture = stream.metal_caps().unwrap().architecture.clone();
         let measured = MPP_MEASURED_ARCHITECTURES.contains(&architecture.as_str());
         assert_eq!(probed_gemm(&stream).is_some(), measured, "{architecture}");
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Qwen-Image checkpoint and an exclusive Apple Silicon Metal slot"]
+    fn prompt_cache_hits_give_the_image_of_the_uncached_path() {
+        let checkpoint = PathBuf::from(
+            std::env::var("APXINF_QWEN_IMAGE_CHECKPOINT")
+                .expect("set APXINF_QWEN_IMAGE_CHECKPOINT"),
+        );
+        let dir =
+            std::env::temp_dir().join(format!("apxinf-qwen-image-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let backend = crate::accelerator::create_backend(Device::Metal(0)).unwrap();
+        let load = |prompt_cache| {
+            let options = LoadOptions {
+                prompt_cache,
+                ..LoadOptions::default()
+            };
+            match super::load(&checkpoint, Device::Metal(0), backend.clone(), &options).unwrap() {
+                LoadedModel::Image(model) => model,
+                _ => unreachable!("Qwen-Image loads an image model"),
+            }
+        };
+        let cached = Some(crate::PromptCacheOptions {
+            dir: dir.clone(),
+            max_bytes: std::num::NonZeroU64::new(1 << 30).unwrap(),
+        });
+        let request = ImageRequest {
+            prompt: "a red bicycle",
+            width: 64,
+            height: 64,
+            seed: 7,
+            steps: STEPS,
+        };
+        let uncached = load(None).generate(&request).unwrap();
+        let entries = || -> Vec<_> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|item| item.unwrap().path())
+                .collect()
+        };
+        let mut model = load(cached.clone());
+        assert_eq!(model.generate(&request).unwrap(), uncached, "miss");
+        let [entry] = entries().try_into().expect("one stored entry");
+        let stored = std::fs::metadata(&entry).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(model.generate(&request).unwrap(), uncached, "hit");
+        assert_eq!(
+            load(cached).generate(&request).unwrap(),
+            uncached,
+            "hit after reload"
+        );
+        assert_eq!(entries(), std::slice::from_ref(&entry));
+        assert!(
+            std::fs::metadata(&entry).unwrap().modified().unwrap() > stored,
+            "hit not recorded"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

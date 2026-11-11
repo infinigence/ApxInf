@@ -29,6 +29,16 @@ pub struct TextCache {
     kv: Vec<(Array, Array)>,
 }
 
+impl TextCache {
+    pub fn from_kv(kv: Vec<(Array, Array)>) -> Self {
+        Self { kv }
+    }
+
+    pub fn kv(&self) -> &[(Array, Array)] {
+        &self.kv
+    }
+}
+
 impl Dit {
     pub fn new(w: Transformer, ops: &Ops, gemm: Option<Rc<MppBf16GemmNt>>) -> Result<Self> {
         let stream = ops.stream();

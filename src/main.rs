@@ -1,12 +1,13 @@
 //! ApxInf LLM inference engine CLI.
 
 use std::io::Write;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
     AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, ImageRequest,
-    LlmInput, LoadOptions, SamplingMode, SpeechRequest,
+    LlmInput, LoadOptions, PromptCacheOptions, SamplingMode, SpeechRequest,
 };
 use apxinf_tokenizer::{ChatMessage, Tokenizer};
 use clap::{Parser, Subcommand};
@@ -206,6 +207,17 @@ enum Commands {
         /// Device to run inference on (metal[:N])
         #[arg(short, long, default_value = "metal")]
         device: String,
+
+        /// Reuse prompt-derived state across runs from this directory
+        /// (Qwen-Image: the DiT text K/V). Entries contain prompt-derived
+        /// activations. Off unless set.
+        #[arg(long, requires = "prompt_cache_max_mib")]
+        prompt_cache_dir: Option<PathBuf>,
+
+        /// Disk bound for --prompt-cache-dir in MiB; least recently used
+        /// entries are deleted to stay within it
+        #[arg(long, requires = "prompt_cache_dir")]
+        prompt_cache_max_mib: Option<NonZeroU64>,
     },
 
     /// Synthesize speech from text and write it as 32-bit float WAV
@@ -383,7 +395,10 @@ fn main() {
             steps,
             output,
             device,
+            prompt_cache_dir,
+            prompt_cache_max_mib,
         } => {
+            let prompt_cache = prompt_cache_options(prompt_cache_dir, prompt_cache_max_mib);
             let request = ImageRequest {
                 prompt: &prompt,
                 width,
@@ -396,6 +411,7 @@ fn main() {
                     &model,
                     model_name.as_deref(),
                     model_variant.as_deref(),
+                    prompt_cache,
                     device,
                     &request,
                     &output,
@@ -525,9 +541,14 @@ mod truncation_tests {
 
 #[cfg(test)]
 mod device_tests {
-    use super::{parse_device, run_generate_image, Cli, Commands, ImageRequest};
+    use super::{
+        parse_device, prompt_cache_options, run_generate_image, Cli, Commands, ImageRequest,
+        PromptCacheOptions,
+    };
     use apxinf_core::Device;
     use clap::Parser;
+    use std::num::NonZeroU64;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_explicit_accelerator_devices() {
@@ -615,6 +636,56 @@ mod device_tests {
     }
 
     #[test]
+    fn image_cli_prompt_cache_is_off_unless_both_flags_are_set() {
+        let base = [
+            "apxinf",
+            "generate-image",
+            "--model",
+            "/checkpoint",
+            "--prompt",
+            "a red bicycle",
+            "--output",
+            "image.ppm",
+        ];
+        let parse = |extra: &[&str]| {
+            Cli::try_parse_from(base.iter().chain(extra)).map(|cli| {
+                let Commands::GenerateImage {
+                    prompt_cache_dir,
+                    prompt_cache_max_mib,
+                    ..
+                } = cli.command
+                else {
+                    panic!("expected generate-image command");
+                };
+                prompt_cache_options(prompt_cache_dir, prompt_cache_max_mib)
+            })
+        };
+        assert_eq!(parse(&[]).unwrap(), None);
+        assert_eq!(
+            parse(&[
+                "--prompt-cache-dir",
+                "/cache",
+                "--prompt-cache-max-mib",
+                "3"
+            ])
+            .unwrap(),
+            Some(PromptCacheOptions {
+                dir: PathBuf::from("/cache"),
+                max_bytes: NonZeroU64::new(3 << 20).unwrap(),
+            })
+        );
+        assert!(parse(&["--prompt-cache-dir", "/cache"]).is_err());
+        assert!(parse(&["--prompt-cache-max-mib", "3"]).is_err());
+        assert!(parse(&[
+            "--prompt-cache-dir",
+            "/cache",
+            "--prompt-cache-max-mib",
+            "0"
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn image_cli_preserves_default_and_auto_variants() {
         for variant in [None, Some("auto")] {
             let mut arguments = vec![
@@ -651,6 +722,7 @@ mod device_tests {
             &"/missing-qwen-image-checkpoint".into(),
             Some("qwen_image"),
             Some("reference"),
+            None,
             Device::Cpu,
             &request,
             &"/unused-image.ppm".into(),
@@ -1191,10 +1263,22 @@ fn run_generate(
     Ok(())
 }
 
+fn prompt_cache_options(
+    dir: Option<PathBuf>,
+    max_mib: Option<NonZeroU64>,
+) -> Option<PromptCacheOptions> {
+    let mib = NonZeroU64::new(1 << 20).unwrap();
+    dir.zip(max_mib).map(|(dir, max_mib)| PromptCacheOptions {
+        dir,
+        max_bytes: max_mib.saturating_mul(mib),
+    })
+}
+
 fn run_generate_image(
     model_dir: &PathBuf,
     model_name_override: Option<&str>,
     model_variant: Option<&str>,
+    prompt_cache: Option<PromptCacheOptions>,
     device: Device,
     request: &ImageRequest<'_>,
     output: &PathBuf,
@@ -1207,6 +1291,7 @@ fn run_generate_image(
     let options = LoadOptions {
         model_name: Some(model_name.clone()),
         model_variant: model_variant.map(str::to_owned),
+        prompt_cache,
         ..LoadOptions::default()
     };
     eprintln!("Loading {model_name} from {:?}...", model_dir);

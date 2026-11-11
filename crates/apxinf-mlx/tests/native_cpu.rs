@@ -779,3 +779,11 @@ fn top_k_mask_preserves_rows_axes_and_compiled_inputs() -> Result<()> {
     assert_ne!(output.to_f32_vec()?, masked.to_f32_vec()?);
     Ok(())
 }
+
+#[test]
+fn reports_the_linked_mlx_version() {
+    assert_eq!(apxinf_mlx::version(), "0.32.3");
+    let library = apxinf_mlx::library_path().expect("loader reports the MLX library");
+    assert_eq!(library.file_name().unwrap(), "libmlx.dylib");
+    assert!(library.is_file(), "{}", library.display());
+}

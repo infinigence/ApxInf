@@ -4,6 +4,7 @@
 #include <mlx/fast.h>
 #include <mlx/version.h>
 #include <mlx/memory.h>
+#include <dlfcn.h>
 #include <algorithm>
 #include <mlx/linalg.h>
 #include <cstring>
@@ -31,6 +32,8 @@ template<class T>A upload(const uint8_t* bytes,size_t len,mx::Shape sh,mx::Dtype
 }
 extern "C" {
 const char* apx_mlx_error(void){return last_error.c_str();}
+const char* apx_mlx_version(void){return mx::version();}
+const char* apx_mlx_library_path(void){Dl_info info;return dladdr(reinterpret_cast<const void*>(&mx::version),&info)?info.dli_fname:nullptr;}
 int apx_mlx_stream_new(int32_t gpu,int32_t index,void** out){TRY
  if(std::string(mx::version())!="0.32.3")throw std::runtime_error("linked MLX runtime differs from pinned 0.32.3 SDK");
  mx::Device d(gpu?mx::Device::gpu:mx::Device::cpu,index);

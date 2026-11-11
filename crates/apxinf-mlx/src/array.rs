@@ -70,6 +70,22 @@ pub fn reset_peak_memory() -> Result<()> {
 pub fn clear_cache() -> Result<()> {
     check(unsafe { ffi::apx_mlx_clear_cache() })
 }
+/// Version string of the linked MLX library, such as `0.32.3`.
+pub fn version() -> &'static str {
+    // MLX returns a static string literal.
+    unsafe { CStr::from_ptr(ffi::apx_mlx_version()) }
+        .to_str()
+        .expect("MLX version is ASCII")
+}
+/// File the linked MLX library was loaded from, when the loader reports it.
+pub fn library_path() -> Option<std::path::PathBuf> {
+    let path = unsafe { ffi::apx_mlx_library_path() };
+    (!path.is_null()).then(|| {
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            unsafe { CStr::from_ptr(path) }.to_bytes(),
+        ))
+    })
+}
 fn count(shape: &[usize]) -> Result<usize> {
     shape.iter().try_fold(1usize, |n, &d| {
         n.checked_mul(d).ok_or_else(|| error("MLX shape overflow"))

@@ -151,6 +151,7 @@ dependencies = [
  "apxinf-musa",
  "apxinf-tokenizer",
  "half",
+ "libc",
  "once_cell",
  "serde",
  "serde_json",
