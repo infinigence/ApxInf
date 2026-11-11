@@ -19,6 +19,7 @@ struct CublasLtState {
   cublasLtMatmulAlgo_t algorithm{};
   bool has_algorithm = false;
   bool native_fp4 = false;
+  bool native_f16_bias = false;
   bool direct_fp8_gelu = false;
   bool split_geglu = false;
   void* c_buffer = nullptr;
@@ -74,13 +75,31 @@ bool supports_native_bf16_bias(const Spec& spec) {
          spec.output_scale_is_unit != 0;
 }
 
+// FP16 bias GEMMs have no cuBLASLt bias epilogue in the generic staged path,
+// so every projection pays an extra elementwise kernel. This predicate marks
+// the specs whose bias can be folded into the matmul epilogue instead; the
+// numerical contract is unchanged (FP32 accumulate, bias added before the
+// single F16 rounding).
+bool supports_native_f16_bias(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+         spec.a_dtype == APXINF_DTYPE_F16 &&
+         spec.b_dtype == APXINF_DTYPE_F16 &&
+         spec.output_dtype == APXINF_DTYPE_F16 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.alpha_is_unit != 0 && spec.output_scale_is_unit != 0;
+}
+
+bool native_bias_epilogue(const Spec& spec) {
+  return supports_native_bf16_bias(spec) || supports_native_f16_bias(spec);
+}
+
 size_t common_requirement(const Spec& spec, bool native_fp8) {
   const bool needs_zero_bias =
       native_fp8 &&
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL &&
       spec.bias_alignment == 0;
   return vendor::common_resource_requirements(
-             spec, native_fp8, supports_native_bf16_bias(spec)) +
+             spec, native_fp8, native_bias_epilogue(spec)) +
          (needs_zero_bias
               ? static_cast<size_t>(spec.n) * dtype_bytes(APXINF_DTYPE_F16)
               : 0);
@@ -88,16 +107,18 @@ size_t common_requirement(const Spec& spec, bool native_fp8) {
 
 void prepare_cublaslt_impl(Execution& state, bool native_fp8,
                            bool direct_fp8_gelu, bool split_geglu = false,
-                           bool native_fp4 = false) {
+                           bool native_fp4 = false,
+                           bool native_f16_bias = false) {
   auto resources = std::make_unique<CublasLtState>();
   const auto& spec = state.spec;
   resources->native_fp4 = native_fp4;
+  resources->native_f16_bias = native_f16_bias;
   const int64_t projection_columns = split_geglu ? spec.n / 2 : spec.n;
   const int64_t projection_stride = spec.n;
   const int heuristic_rank =
       split_geglu ? state.configuration / 3 : state.configuration;
   resources->common.projection_dtype =
-      (native_fp4 || supports_native_bf16_bias(spec))
+      (native_fp4 || native_bias_epilogue(spec))
           ? spec.output_dtype
           : vendor::common_projection_dtype(spec);
   const size_t c_buffer_bytes =
@@ -167,7 +188,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
        spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
        spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
        spec.output_scale_is_unit != 0) ||
-      supports_native_bf16_bias(spec);
+      native_bias_epilogue(spec);
   if (native_bias_residual && state.bindings.bias == nullptr) {
     check_cuda(cudaMalloc(&resources->zero_bias,
                           static_cast<size_t>(spec.n) *
@@ -220,13 +241,40 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
 
   cublasLtMatmulPreference_t preference = nullptr;
   check_cublas(cublasLtMatmulPreferenceCreate(&preference));
-  const size_t workspace_limit = available_workspace;
+  // Torch asks cuBLASLt for a 1 MiB algorithm workspace. That preference,
+  // not the larger allocation the shape would allow, is what selects the
+  // matching split-K recipe for an FP16 bias linear.
+  const size_t torch_workspace_preference = static_cast<size_t>(1024) * 1024;
+  const size_t workspace_limit =
+      resources->native_f16_bias &&
+              available_workspace > torch_workspace_preference
+          ? torch_workspace_preference
+          : available_workspace;
   cublasStatus_t status = cublasLtMatmulPreferenceSetAttribute(
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
       &workspace_limit, sizeof(workspace_limit));
   if (status != CUBLAS_STATUS_SUCCESS) {
     cublasLtMatmulPreferenceDestroy(preference);
     check_cublas(status);
+  }
+  if (resources->native_f16_bias) {
+    // The heuristic sees no operand pointers, so advertise the fixed 256-byte
+    // contract the recipe is defined on instead of deriving it from an address.
+    // A/B are reversed for the column-major vendor view of row-major GEMM.
+    const uint32_t alignment = 256U;
+    const cublasLtMatmulPreferenceAttributes_t attributes[] = {
+        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
+        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES,
+        CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES};
+    for (const auto attribute : attributes) {
+      status = cublasLtMatmulPreferenceSetAttribute(
+          preference, attribute, &alignment, sizeof(alignment));
+      if (status != CUBLAS_STATUS_SUCCESS) {
+        cublasLtMatmulPreferenceDestroy(preference);
+        check_cublas(status);
+      }
+    }
   }
   cublasLtMatmulHeuristicResult_t candidates[8]{};
   int candidate_count = 0;
@@ -270,7 +318,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     resources->common.resource_bytes = fixed_bytes;
   } else if (!native_fp4) {
     vendor::allocate_common_resources(spec, resources->common, native_fp8,
-                                      supports_native_bf16_bias(spec));
+                                      native_bias_epilogue(spec));
   }
   if (resources->workspace_bytes != 0) {
     check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
@@ -299,6 +347,16 @@ size_t cublaslt_native_fp8_gelu_resource_requirements(const Spec& spec) {
 
 void prepare_cublaslt(Execution& state) {
   prepare_cublaslt_impl(state, false, false);
+}
+
+size_t cublaslt_f16_bias_resource_requirements(const Spec& spec) {
+  return common_requirement(spec, false);
+}
+
+void prepare_cublaslt_f16_bias(Execution& state) {
+  // Fused epilogue needs no projection buffer: the matmul writes the caller's
+  // F16 output directly.
+  prepare_cublaslt_impl(state, false, false, false, false, true);
 }
 
 void prepare_cublaslt_native_fp8(Execution& state) {
@@ -390,7 +448,10 @@ cudaError_t launch_cublaslt(Execution& state) {
       resources.c_layout, output,
       resources.d_layout, &resources.algorithm, resources.workspace,
       resources.workspace_bytes, stream));
-  if (resources.direct_fp8_gelu || resources.split_geglu) return cudaSuccess;
+  if (resources.direct_fp8_gelu || resources.split_geglu ||
+      resources.native_f16_bias) {
+    return cudaSuccess;
+  }
   return vendor::launch_postprocess(spec, resources.common, bindings,
                                     projection);
 }

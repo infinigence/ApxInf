@@ -586,6 +586,58 @@ fn gemm_bias_all_candidates_match_torch() {
 }
 
 #[test]
+fn gemm_bias_f16_all_candidates_match_reference() {
+    // F16 bias 投影在候选集里只有 r1 加回的原生 epilogue 一个非回退候选，
+    // 所以这条测试是它唯一的精度门。参考值是 f64 累加再取 f32，等价于
+    // 「F32 投影 + bias-before-cast」，容差由 compare_reference 统一给定。
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (64usize, 256usize, 256usize);
+    // 1/8、1/16、1/4 的粒度在 F16 里都精确可表示，参考值可以直接复用同一批
+    // f32 输入，不会掺进输入量化误差。
+    let a_values: Vec<f32> = (0..m * k)
+        .map(|index| ((index * 7 % 33) as f32 - 16.0) / 8.0)
+        .collect();
+    let b_values: Vec<f32> = (0..k * n)
+        .map(|index| ((index * 5 % 31) as f32 - 15.0) / 16.0)
+        .collect();
+    let bias_values: Vec<f32> = (0..n)
+        .map(|index| ((index * 3 % 17) as f32 - 8.0) / 4.0)
+        .collect();
+
+    let a = f16_tensor(0, vec![m, k], &a_values);
+    let b = f16_tensor(0, vec![k, n], &b_values);
+    // bias 按 contracts::normalize 的投影 dtype 规则跟 A 走：F16 输入 ⇒ F16 bias。
+    let bias = f16_tensor(0, vec![n], &bias_values);
+    let mut out = zeros_tensor(0, vec![m, n], DType::F16);
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.alpha = 1.0;
+    args.output_scale = 1.0;
+    args.policy.allow_fallback = false;
+    args.policy.graph_safe = true;
+
+    let mut expected = vec![0f32; m * n];
+    for row in 0..m {
+        for column in 0..n {
+            let mut accumulator = 0f64;
+            for inner in 0..k {
+                accumulator +=
+                    a_values[row * k + inner] as f64 * b_values[inner * n + column] as f64;
+            }
+            expected[row * n + column] = (accumulator + bias_values[column] as f64) as f32;
+        }
+    }
+
+    let normalized = super::contracts::normalize(
+        &ctx,
+        args,
+        super::contracts::Semantic::GemmBias,
+        Some(&bias),
+    )
+    .unwrap();
+    super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
+}
+
+#[test]
 fn gemm_bias_gelu_all_candidates_match_torch() {
     use torch_fixture as f;
 
