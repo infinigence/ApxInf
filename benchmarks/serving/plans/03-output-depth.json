@@ -1,0 +1,6 @@
+[
+  {"case_id":"depth-p32-g256-r0","input_tokens":32,"max_tokens":256,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"depth-p512-g256-r0","input_tokens":512,"max_tokens":256,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"depth-p32-g2048-r0","input_tokens":32,"max_tokens":2048,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"depth-p512-g2048-r0","input_tokens":512,"max_tokens":2048,"stop_after_prefill":null,"stop_after_output":null,"repetition":0}
+]

@@ -40,6 +40,16 @@ pub fn tables(stream: &Stream, capacity: usize) -> Result<(Array, Array)> {
     Ok((cos, sin))
 }
 
+pub fn causal_mask(positions: &Array, index: &Array, rows: usize) -> Result<Array> {
+    let width = positions.shape()[0];
+    let row_ids = Array::arange(positions.stream(), 0., rows as f32, 1., MlxDType::I32)?
+        .reshape(&[rows, 1])?;
+    positions
+        .reshape(&[1, width])?
+        .less_equal(&index.add(&row_ids)?)?
+        .reshape(&[1, 1, rows, width])
+}
+
 pub fn swiglu(gate: &Array, up: &Array) -> Result<Array> {
     // Same operation order as mlx_lm.models.activations.swiglu.
     gate.mul(&gate.sigmoid()?)?.mul(up)
@@ -60,4 +70,43 @@ pub fn project(x: &Array, weight: &Array, preserve_m1: bool) -> Result<Array> {
     vectors
         .matmul(&weight.reshape(&[1, k, weight.shape()[1]])?)?
         .reshape(&[1, rows, weight.shape()[1]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_mask_excludes_future_rows_and_unused_capacity() {
+        let stream = Stream::cpu().unwrap();
+        for (position, rows, width) in [(0, 1, 256), (255, 8, 512), (65791, 1, 65792)] {
+            let positions = Array::arange(&stream, 0., width as f32, 1., MlxDType::I32).unwrap();
+            let index = Array::from_i32(&stream, &[1], &[position]).unwrap();
+            let mask = causal_mask(&positions, &index, rows)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+            for row in 0..rows {
+                for column in 0..width {
+                    assert_eq!(
+                        mask[row * width + column],
+                        u8::from(column <= position as usize + row)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_extended_rope_preserves_the_original_prefix() {
+        let stream = Stream::cpu().unwrap();
+        let (small_cos, small_sin) = tables(&stream, 4096).unwrap();
+        let (large_cos, large_sin) = tables(&stream, 65792).unwrap();
+        for (small, large) in [(small_cos, large_cos), (small_sin, large_sin)] {
+            assert_eq!(
+                small.to_bytes().unwrap(),
+                large.slice_axis(2, 0, 4096).unwrap().to_bytes().unwrap()
+            );
+        }
+    }
 }

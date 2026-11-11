@@ -1,0 +1,88 @@
+# Native MiniCPM5 context profile
+
+Status: implementation profile 0.1. Historical observations have their original source and runtime scope.
+Drawing quality and general long-context quality remain unverified.
+The [serving contract](contracts-v0.1.md) controls admission, cancellation, and resource settlement.
+This profile introduces no runtime dependency and changes no v1 protocol.
+The model tests call the existing `apxinf-tokenizer` crate to encode original prompt fixtures.
+
+## Controlled prefill interface
+
+`LlmTrait::prefill_controlled` receives one complete `LlmInput` and a mutable callback.
+The callback receives `GenerationBoundary` and returns `Result<bool>`.
+A true result permits continued execution.
+A false result stops execution and returns `Ok(None)`.
+A callback error propagates to the caller.
+Successful prefill returns `Ok(Some(logits))` for the shared sampler.
+
+`PrefillStart` is a control boundary before prompt execution.
+It claims no consumed positions and produces no progress frame.
+`PrefillProgress { consumed_tokens }` reports evaluated prompt positions.
+`Token` retains its existing meaning.
+The default hook calls the existing whole-prompt `prefill` and reports one completed progress boundary.
+The shared generation loop calls this hook without another prefill progress notification.
+
+MiniCPM checks the complete prompt before the first control callback or KV mutation.
+Validation includes image exclusion, token range, prepared prompt length, current offset, and capacity.
+An invalid token in a later chunk rejects the complete prompt before execution.
+The hook returns no logits after cancellation, including cancellation after the final chunk.
+The caller retains responsibility for request cleanup with device synchronization after cancellation or failure.
+
+## Model execution
+
+The model family selects the prepared prefill plan.
+Prompts of at most 4096 tokens use one complete-prompt chunk.
+Standalone compiled generation uses 1024-token long chunks by default; public mode uses 512-token long chunks.
+Construction-time chunk overrides remain part of the family plan.
+The native worker selects the 256-token override before loading the model.
+This override changes long-prompt chunks; prompts of at most 4096 tokens still use one complete-prompt chunk.
+Ordinary MiniCPM prefill executes the selected chunks in order.
+Each chunk uses absolute RoPE positions and a causal mask over prior and current positions.
+Each chunk evaluates its outputs before it publishes KV state, advances the offset, and reports progress.
+The model checks control before the first chunk and after each completed chunk.
+The final chunk returns one logit row for sampling.
+
+The model admits each chunk at its exact prepared offset and row count.
+A one-row tail uses the family's admitted prefill path.
+Preparation warms admitted chunk lengths and the supported decode profiles.
+`prepared_sequence_lengths` reports those admitted lengths in ascending order.
+The full `forward` operation retains all input logit rows and its complete-prompt admission rule.
+The shared sampler and EOS behavior remain unchanged.
+
+DSpark retains whole-prompt prefill and all prompt taps.
+Its context limit remains 4096 positions.
+Chunked prefill does not establish DSpark support at larger lengths.
+
+## Context limits
+
+The native serving deployment permits at most 16384 consumed positions.
+The ordinary BF16 family has a separate source capacity of 65792 positions, subject to checkpoint limits.
+That family capacity does not widen the serving deployment or establish quality at those lengths.
+Variant limits control RoPE table size, preparation, and token admission together.
+The [support overview](support-status.md) separates historical observations from current qualification.
+These gates do not establish equivalent quality for every task or variant.
+A serving profile above 16384 positions remains outside this deployment.
+
+Admission includes the complete prepared input and maximum output allowance.
+The effective limit is the smaller model limit and deployment limit.
+No path truncates a prompt, shifts context, or reuses a previous request prefix.
+A chunk bounds query rows but does not bound total request memory.
+
+## Verification gate
+
+The real-checkpoint test loads the pinned BF16 weights once in one GPU process.
+Its original prompt fixtures use the existing checkpoint tokenizer.
+It compares chunked final logits with the final row from full `forward` at 255, 256, 257, and 513 tokens.
+Both results must have finite values and the same greedy next token.
+The declared comparison tolerance is absolute error 0.5 plus relative error 0.02 per logit.
+This BF16 tolerance permits changes in reduction order without permitting a changed greedy choice.
+
+The test also rejects an invalid token after the first chunk before any KV mutation.
+Cancellation before prefill must consume zero tokens.
+Cancellation after the first chunk must stop at its prepared end and return no logits.
+The actual consumed count follows the selected family plan, not a fixed 256-token interval.
+Release after device synchronization must permit a successful subsequent request on the same instance.
+CPU checks cover shape admission, context boundaries, overflow, and shared control behavior.
+
+Larger context acceptance additionally requires production HTTP quality, memory, cancellation, and recovery evidence.
+Retain the exact candidate and complete result with each execution.

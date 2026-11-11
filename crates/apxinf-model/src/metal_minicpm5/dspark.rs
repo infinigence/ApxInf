@@ -4,7 +4,7 @@
 //! Adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin, and mlx-dspark
 //! revision d6042f38f0aa7dd3e03a2a406111d725056d45a3 (MIT), Copyright 2026 erahim3.
 //! The full notices are retained in the repository's third-party notices.
-use super::{model::MiniCpm5, weights::Weights, CONTEXT_CAPACITY};
+use super::{config::DSPARK_CONTEXT_CAPACITY, model::MiniCpm5, weights::Weights};
 use crate::generation_config::ResolvedGenerationOptions;
 use crate::{
     GeneratedToken, GenerationOutput, GenerationProfile, GenerationRequest, LlmInput, LlmTrait,
@@ -428,7 +428,7 @@ impl DSpark {
         let total = prompt
             .checked_add(output)
             .ok_or(Error::Contract("DSpark context overflow"))?;
-        if prompt == 0 || output == 0 || output > 256 || total > CONTEXT_CAPACITY {
+        if prompt == 0 || output == 0 || output > 256 || total > DSPARK_CONTEXT_CAPACITY {
             return Err(Error::Contract(
                 "DSpark supports B1, 1..256 output tokens and at most 4096 positions",
             ));
@@ -441,8 +441,10 @@ impl DSpark {
         }
         // A verification block can consume seven more rows than its output
         // budget. These speculative rows must fit even at a capacity boundary.
-        self.target
-            .prepare(prompt, (output + BLOCK).min(CONTEXT_CAPACITY - prompt))?;
+        self.target.prepare(
+            prompt,
+            (output + BLOCK).min(DSPARK_CONTEXT_CAPACITY - prompt),
+        )?;
         let capacity = (total + BLOCK).div_ceil(256) * 256;
         if self.prepared == Some((prompt, capacity)) {
             return Ok(());
@@ -576,7 +578,7 @@ impl DSpark {
             || ids
                 .len()
                 .checked_add(options.max_new_tokens)
-                .is_none_or(|n| n > CONTEXT_CAPACITY)
+                .is_none_or(|n| n > DSPARK_CONTEXT_CAPACITY)
         {
             return Err(Error::Contract(
                 "unsupported DSpark B1 token/context/output bounds",
@@ -637,7 +639,7 @@ impl DSpark {
             self.last_stats.proposal_calls += 1;
             self.last_stats.proposed_tokens += BLOCK;
             let before = self.target.offset;
-            let width = (BLOCK + 1).min(CONTEXT_CAPACITY - before);
+            let width = (BLOCK + 1).min(DSPARK_CONTEXT_CAPACITY - before);
             if width == 0 {
                 return Err(Error::Contract("DSpark target context exhausted"));
             }
@@ -797,6 +799,14 @@ impl LlmTrait for DSpark {
             return Err(Error::Contract("DSpark is text-only"));
         }
         self.forward(input.token_ids, 0)
+    }
+    fn generate_streaming_cancellable_dyn(
+        &mut self,
+        _request: GenerationRequest<'_>,
+        _cancel: &crate::GenerationCancellation,
+        _on_token: &mut dyn FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        Err(Error::UnsupportedOp("DSpark cancellation"))
     }
     fn generate_streaming_with_options_dyn(
         &mut self,
@@ -1071,7 +1081,7 @@ mod tests {
             // No reset by the caller: this is the reported long-lived API path.
             assert_eq!(model.generate(request, &mut |_| {})?.token_ids(), expected);
         }
-        for bad_ids in [vec![], vec![VOCAB as u32], vec![1; CONTEXT_CAPACITY]] {
+        for bad_ids in [vec![], vec![VOCAB as u32], vec![1; DSPARK_CONTEXT_CAPACITY]] {
             assert!(model
                 .generate(
                     GenerationRequest {

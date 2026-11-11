@@ -1,0 +1,5 @@
+[
+  {"case_id":"fresh-long-p8192-g32-r0","input_tokens":8192,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":0},
+  {"case_id":"fresh-long-p8192-g32-r1","input_tokens":8192,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":1},
+  {"case_id":"fresh-long-p8192-g32-r2","input_tokens":8192,"max_tokens":32,"stop_after_prefill":null,"stop_after_output":null,"repetition":2}
+]

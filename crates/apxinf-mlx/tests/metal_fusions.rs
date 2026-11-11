@@ -1,6 +1,6 @@
 #![cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 use apxinf_core::Result;
-use apxinf_mlx::fusions::{PackedResidualRmsNorm, QkNormRope};
+use apxinf_mlx::fusions::{NormRounding, QkNormRope, ResidualRmsNorm};
 use apxinf_mlx::{Array, MlxDType as D, Stream};
 
 #[test]
@@ -37,9 +37,9 @@ fn qk_norm_rope_respects_heads_rotation_and_rejects_bad_geometry() -> Result<()>
 
 #[test]
 #[ignore = "requires shared Metal qualification lock"]
-fn packed_residual_norm_returns_both_owned_bf16_consumers() -> Result<()> {
+fn residual_norm_returns_both_owned_bf16_consumers() -> Result<()> {
     let s = Stream::metal(0)?;
-    let kernel = PackedResidualRmsNorm::new(&s, 1e-6)?;
+    let kernel = ResidualRmsNorm::new(&s, 2048, 1e-6, NormRounding::BeforeWeight)?;
     let x = Array::from_f32(&s, &[1, 1, 2048], &vec![1.; 2048])?.cast(D::BF16)?;
     let weight = Array::from_f32(&s, &[2048], &vec![2.; 2048])?.cast(D::BF16)?;
     let (sum, norm) = kernel.call(&x, &x, &weight)?;
@@ -49,23 +49,137 @@ fn packed_residual_norm_returns_both_owned_bf16_consumers() -> Result<()> {
     assert_eq!(sum.to_f32_vec()?, vec![2.; 2048]);
     assert_eq!(norm.to_f32_vec()?, vec![2.; 2048]);
     assert_eq!(x.to_f32_vec()?, vec![1.; 2048]);
-    assert!(PackedResidualRmsNorm::new(&s, f32::NAN).is_err());
+    assert!(ResidualRmsNorm::new(&s, 2048, f32::NAN, NormRounding::BeforeWeight).is_err());
     Ok(())
 }
 
 #[test]
 #[ignore = "requires shared Metal qualification lock"]
-fn packed_residual_norm_keeps_epsilon_per_kernel_instance() -> Result<()> {
+fn residual_norm_keeps_epsilon_per_kernel_instance() -> Result<()> {
     let s = Stream::metal(0)?;
     let x = Array::from_f32(&s, &[1, 1, 2048], &vec![0.5; 2048])?.cast(D::BF16)?;
     let weight = Array::from_f32(&s, &[2048], &vec![1.; 2048])?.cast(D::BF16)?;
-    let small = PackedResidualRmsNorm::new(&s, 1e-6)?;
-    let large = PackedResidualRmsNorm::new(&s, 3.)?;
+    let small = ResidualRmsNorm::new(&s, 2048, 1e-6, NormRounding::BeforeWeight)?;
+    let large = ResidualRmsNorm::new(&s, 2048, 3., NormRounding::BeforeWeight)?;
     for (kernel, expected) in [(&small, 1.), (&large, 0.5), (&small, 1.)] {
         let (sum, norm) = kernel.call(&x, &x, &weight)?;
         assert_eq!(sum.to_f32_vec()?, vec![1.; 2048]);
         assert_eq!(norm.to_f32_vec()?, vec![expected; 2048]);
     }
+    Ok(())
+}
+
+fn residual_inputs(s: &Stream, rows: usize, width: usize) -> Result<(Array, Array)> {
+    let n = rows * width;
+    let x = Array::from_f32(s, &[1, rows, width], &data(n, 37, 0.21))?.cast(D::BF16)?;
+    let delta = Array::from_f32(s, &[1, rows, width], &data(n, 23, 0.093))?.cast(D::BF16)?;
+    Ok((x, delta))
+}
+
+fn norm_weight(s: &Stream, width: usize, dtype: D) -> Result<Array> {
+    let values: Vec<f32> = (0..width)
+        .map(|i| 0.75 + ((i * 13 + 5) % 41) as f32 / 37.)
+        .collect();
+    Array::from_f32(s, &[width], &values)?.cast(dtype)
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn residual_norm_before_weight_equals_native_weighted_rms_norm() -> Result<()> {
+    let s = Stream::metal(0)?;
+    for width in [8, 1024, 2048] {
+        let kernel = ResidualRmsNorm::new(&s, width, 1e-6, NormRounding::BeforeWeight)?;
+        let after = ResidualRmsNorm::new(&s, width, 1e-6, NormRounding::AfterWeight)?;
+        let weight = norm_weight(&s, width, D::BF16)?;
+        for rows in [1, 3] {
+            let (x, delta) = residual_inputs(&s, rows, width)?;
+            let (sum, norm) = kernel.call(&x, &delta, &weight)?;
+            let expected_sum = x.add(&delta)?;
+            assert_eq!(sum.to_f32_vec()?, expected_sum.to_f32_vec()?);
+            let native = expected_sum.fast_rms_norm(&weight, 1e-6)?.to_f32_vec()?;
+            assert_eq!(norm.to_f32_vec()?, native, "width {width} rows {rows}");
+            // These inputs separate the two contracts: rounding once after
+            // the weight multiply does not reproduce the native result.
+            let once = after.call(&x, &delta, &weight)?.1.to_f32_vec()?;
+            assert_ne!(once, native, "width {width} rows {rows}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn residual_norm_after_weight_equals_ordered_f32_norm() -> Result<()> {
+    let s = Stream::metal(0)?;
+    let epsilon = 1e-6;
+    for width in [8, 1024] {
+        let kernel = ResidualRmsNorm::new(&s, width, epsilon, NormRounding::AfterWeight)?;
+        // One instance serves both weight dtypes.
+        for (dtype, rows) in [(D::BF16, 1), (D::F32, 1), (D::F32, 3)] {
+            let weight = norm_weight(&s, width, dtype)?;
+            let (x, delta) = residual_inputs(&s, rows, width)?;
+            let (sum, norm) = kernel.call(&x, &delta, &weight)?;
+            let expected_sum = x.add(&delta)?;
+            assert_eq!(sum.to_f32_vec()?, expected_sum.to_f32_vec()?);
+            let f = expected_sum.cast(D::F32)?;
+            let reciprocal = f
+                .mul(&f)?
+                .mean(&[-1], true)?
+                .add(&Array::scalar(&s, epsilon, D::F32)?)?
+                .rsqrt()?;
+            let ordered = f.mul(&reciprocal)?.mul(&weight)?.cast(D::BF16)?;
+            assert_eq!(
+                norm.to_f32_vec()?,
+                ordered.to_f32_vec()?,
+                "width {width} rows {rows} {dtype:?} weight"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn residual_norm_rows_match_single_row_calls_and_reject_bad_geometry() -> Result<()> {
+    let s = Stream::metal(0)?;
+    let width = 2048;
+    let kernel = ResidualRmsNorm::new(&s, width, 1e-6, NormRounding::BeforeWeight)?;
+    let weight = norm_weight(&s, width, D::BF16)?;
+    let (x, delta) = residual_inputs(&s, 5, width)?;
+    let (sum, norm) = kernel.call(&x, &delta, &weight)?;
+    assert_eq!(
+        (sum.shape(), norm.shape()),
+        (&[1, 5, width][..], &[1, 5, width][..])
+    );
+    let (sums, norms) = (sum.to_f32_vec()?, norm.to_f32_vec()?);
+    for row in 0..5 {
+        let (one_sum, one_norm) = kernel.call(
+            &x.slice_axis(1, row, row + 1)?,
+            &delta.slice_axis(1, row, row + 1)?,
+            &weight,
+        )?;
+        let columns = row * width..(row + 1) * width;
+        assert_eq!(one_sum.to_f32_vec()?, sums[columns.clone()]);
+        assert_eq!(one_norm.to_f32_vec()?, norms[columns]);
+    }
+    assert!(kernel
+        .call(&x, &delta.slice_axis(1, 0, 4)?, &weight)
+        .is_err());
+    assert!(kernel.call(&x, &delta, &weight.cast(D::F16)?).is_err());
+    assert!(kernel.call(&x.cast(D::F32)?, &delta, &weight).is_err());
+    assert!(kernel
+        .call(&x.reshape(&[5, width])?, &delta, &weight)
+        .is_err());
+    let narrow = ResidualRmsNorm::new(&s, 1024, 1e-6, NormRounding::BeforeWeight)?;
+    assert!(narrow.call(&x, &delta, &weight).is_err());
+    assert!(ResidualRmsNorm::new(&s, 0, 1e-6, NormRounding::AfterWeight).is_err());
+    assert!(ResidualRmsNorm::new(
+        &s,
+        ResidualRmsNorm::MAX_WIDTH + 1,
+        1e-6,
+        NormRounding::AfterWeight
+    )
+    .is_err());
     Ok(())
 }
 
