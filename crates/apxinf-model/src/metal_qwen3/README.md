@@ -1,29 +1,49 @@
 # Native Qwen3 on MLX
 
-This Metal-specific module owns checkpoint interpretation, ordered forward computation and
+This Metal-specific module owns checkpoint interpretation, forward computation and
 request KV state. It calls safe `apxinf-mlx` array operations, without Python or
 an external model provider. Initial target: Qwen/Qwen3-0.6B revision
 `c1899de289a04d12100db370d81485cdf75e47ca`, original BF16 weights, batch one,
 Apple Silicon macOS.
 
-Checkpoint loading admits only the 0.6B geometry above and caps the request
-profile at 2048 tokens, even though the checkpoint advertises 40960. Other
-geometry and larger contexts require a separately verified migration profile.
+Checkpoint loading admits only the 0.6B geometry above. The request limit is
+40960 total tokens, including the prompt and reserved output. Other geometry,
+RoPE scaling and contexts beyond the checkpoint limit are rejected.
 
 `config.rs` reads the explicit `head_dim` (128 for this checkpoint), independently
 of `hidden_size / num_attention_heads` (64). Sliding-window attention, RoPE
 scaling, projection biases and alternative activations are rejected. `weights.rs`
 checks every key, dtype and shape; maps HF `[out,in]` matrices to canonical
-`[in,out]` private views; preserves tied embedding storage; and caches FP32 norm
-weights. Unrecognized checkpoint tensors fail loading.
+`[in,out]` private views; preserves tied embedding storage; and prepares norm
+weights once. `bf16-compiled` retains checkpoint BF16 norm weights.
+`bf16-public` and `mixed-w8` materialize FP32 norm weights.
+Unrecognized checkpoint tensors fail loading.
 
 The BF16 selections are `bf16-public` and `bf16-compiled` (default).
-Both preserve FP32 norm statistics and weight multiplication before the BF16
-cast, BF16 cos/sin tables, and the two separate BF16 RoPE multiplication results.
-The compiled selection additionally prepares local norm/RoPE functions and the
-complete B1/L1 decoder block with explicit input/output KV arrays. Prefill uses
-the same ordered layer composition with compiled local seams. Whole decode-step
-compilation is not implemented or claimed by this selection.
+`bf16-public` computes norm statistics and weight multiplication in FP32 before
+the BF16 cast. `bf16-compiled` uses native weighted RMSNorm with BF16 activations
+and prepared BF16 weights for input, post-attention, Q, K, and final norms,
+including prefill. This changes normalization rounding. The text-fixed check
+differs at 222 of 1024 tokens from b2d58ea; external-teacher agreement is 221/222,
+with neither language below its reference. Five clean 1K blocks improve total
+time against the ordered implementation. The full MLX matrix remains pending.
+Both selections retain BF16 cos/sin tables and the two separate BF16 RoPE
+multiplication results. The compiled selection prepares local norm/RoPE functions
+and the complete B1/L1 decoder block with explicit input/output KV arrays.
+After prefix state exists, that block uses `Bf16QkTableRope` to rotate Q and K
+in one Metal call. The backend owns shape validation and separately rounded
+BF16 products and sums. The block captures the immutable kernel, while Q, K,
+and table rows remain explicit array operands. Its 18-input/3-output ABI is
+unchanged. Prefill and the fresh first-token path retain local compiled RoPE.
+Prefill uses the same layer composition with compiled local seams. Whole
+decode-step compilation is not implemented or claimed by this selection.
+
+The private norm weight dtype selects the arithmetic. BF16 weights require BF16
+activations and select native weighted RMSNorm. FP32 weights select the ordered
+FP32 expression. The loader prepares one representation for every norm site,
+including the final norm, with no inference-time weight cast or alternate copy.
+The existing tiny public/compiled trajectory assertions remain unchanged.
+Historical qualification below predates this arithmetic change.
 
 `mixed-w8` uses affine 8-bit quantization with group size 64: W8 Q/K/V/O,
 fused gate/up and down projections only
@@ -40,8 +60,12 @@ compilation boundary and valid-length attention remain explicit.
 
 `Qwen3Model::prepare(prompt_len, max_new_tokens)` allocates a bounded KV profile
 and warms its sequence shapes before inference. Capacity rounds up to 256 tokens
-within the smaller checkpoint/2048-token profile limit. Growing capacity
-requires a fresh request.
+within the smaller checkpoint/40960-token limit. A new request can grow or
+shrink this allocation after reset. RoPE tables use the same capacity.
+Compiled decode slices attention to the next 256-token boundary of the active
+prefix and masks unwritten positions. Requests with capacity at most 2048 keep
+their original attention shape. Preparation warms every admitted one-row
+attention bucket, including bucket crossings in direct `forward` calls.
 `LlmTrait::prewarm_decode` invokes this preparation for the shared generation
 driver; failures invalidate the next fallible operation. Direct callers must
 prepare every sequence length they use. `reset` returns to
@@ -54,10 +78,29 @@ session until reset. Outputs own immutable array handles; a later forward/reset
 does not overwrite earlier results.
 
 Generation `prefill` follows the source schedule: consume all but the last token
-in chunks of at most 512, evaluating only updated KV; then consume the last
+in chunks of at most 2048 for `bf16-compiled`, evaluating only updated KV;
+then consume the last
 token and return `[1,vocab_size]`. The chunk head is never evaluated. The shared
 generation driver uses this hook, while `forward` continues
 to return every row. All prompt chunk shapes are warmed by `prepare`.
+The experimental `APXINF_QWEN3_PREFILL_CHUNK` override accepts 512, 1024 or
+2048 and is captured at construction. Public and MixedW8 default to 512;
+compiled BF16 defaults to 2048. A family-local
+plan supplies the same prefix ranges to preparation and execution. Existing
+prepared-row admission for public `forward` remains unchanged.
+
+Long generation prepares the selected chunks, tail and final row. It does not prepare
+a full prompt-sized `forward` above 2048 rows; that call fails explicitly.
+This avoids allocating a large `[prompt,vocabulary]` result during generation.
+
+On a 16 GiB host, the BF16 KV budget is
+`2 * 28 layers * 8 KV heads * 128 channels * 2 bytes = 112 KiB/token`.
+At 40960 tokens the live cache is 4.375 GiB, both RoPE tables total 20 MiB,
+and one shared immutable reset buffer is 80 MiB. These are tensor sizes,
+excluding weights, allocator cache and temporary arrays. Request execution
+releases old state handles before evaluation so native buffer reuse is possible.
+The qualification runs enforce a 12 GiB physical process limit, leaving room
+for macOS and the other jobs; the context limit is not a reservation of that RAM.
 
 Load through `AutoModel` with `model_name=metal_qwen3` (or checkpoint detection),
 `Device::Metal(0)`, BF16, and the desired `model_variant`. The native CLI uses:
@@ -71,6 +114,10 @@ apxinf generate --model /path/to/Qwen3-0.6B --device metal --dtype bf16 \
 Sampling capability is supplied by the MLX backend. Currently only greedy
 selection without penalties/logprob is implemented; Qwen's random-sampling
 generation defaults must be overridden explicitly. Unsupported options fail.
+The compiled BF16 variant uses device greedy IDs with one-step async lookahead.
+Set `APXINF_MLX_SYNC_DECODE=1` to use the synchronous generation path. Public
+`forward` remains synchronous. EOS and cancellation drain the extra step and
+restore the position of the published prefix; async failures invalidate state.
 First preparation/compilation must be reported separately from warmed latency.
 Preparation uses `Compiled::prepare` to evaluate each supported callable twice
 and require no tracing on the second invocation. The presence of
