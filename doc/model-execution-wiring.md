@@ -28,6 +28,12 @@ All placement, transfer, numerical, performance, preparation, resource and
 lifetime evidence there remains required. This does not relax GPU-only or
 CUDA acceptance, authorize other host operators or qualify either composition.
 
+For native Qwen3-TTS CustomVoice only, the requesting Metal maintainer accepted
+a one-Boolean EOS stopping boundary on 2026-10-19. Its exact scope and unchanged
+gates are defined in the [family decision](../crates/apxinf-model/src/metal_qwen3_tts/README.md#scoped-eos-control-boundary).
+This permits no codec-id/history readback, CPU tensor computation, arbitrary
+control exception or change to GPU/CUDA requirements for other families.
+
 For CUDA targets, fixed profiles must support CUDA Graph acceleration. Prefer one graph from
 canonical device inputs to outputs. For a VLA where concrete blockers prevent
 one graph, the accepted fallback partition covers Vision, Language and Action
