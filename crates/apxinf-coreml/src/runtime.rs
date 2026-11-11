@@ -3,9 +3,15 @@ use crate::program::Package;
 use apxinf_core::{Error, Result};
 use half::f16;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
+use std::fs::File;
+use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 mod ffi {
     use std::ffi::{c_char, c_void};
@@ -179,12 +185,46 @@ impl Model {
     }
 }
 
+fn cache_error(error: std::io::Error) -> Error {
+    Error::Other(format!("Core ML cache: {error}"))
+}
+
+/// Opens the published entry at `compiled`, holds a shared lock on it and
+/// refreshes its last-use time. `None` when no entry is there, including one
+/// evicted while this waited for the lock.
+fn use_entry(compiled: &Path) -> std::io::Result<Option<File>> {
+    loop {
+        let entry = match File::open(compiled) {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        entry.lock_shared()?;
+        let current = match std::fs::metadata(compiled) {
+            Ok(current) => current,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let locked = entry.metadata()?;
+        if (locked.dev(), locked.ino()) == (current.dev(), current.ino()) {
+            entry.set_modified(SystemTime::now())?;
+            return Ok(Some(entry));
+        }
+        // Evicted and published again while this waited; lock the new one.
+    }
+}
+
 /// A content-addressed directory of compiled programs. After [`seal`](Self::seal),
 /// a program that is not yet compiled is an error, so no compilation happens
 /// while requests run.
+///
+/// Every program a cache resolves stays in use until the cache is dropped:
+/// it holds a shared lock on the entry. Each hit also refreshes the entry's
+/// last-use time.
 pub struct ProgramCache {
     dir: PathBuf,
     sealed: bool,
+    in_use: Mutex<HashMap<String, File>>,
 }
 
 impl ProgramCache {
@@ -192,6 +232,7 @@ impl ProgramCache {
         Self {
             dir: dir.into(),
             sealed: false,
+            in_use: Mutex::default(),
         }
     }
 
@@ -210,7 +251,6 @@ impl ProgramCache {
         package: &Package,
         compiler: impl FnOnce(&Path, &Path) -> Result<()>,
     ) -> Result<PathBuf> {
-        let io = |e: std::io::Error| Error::Other(format!("Core ML cache: {e}"));
         let mut hash = Sha256::new();
         hash.update(package.model_bytes());
         hash.update(&package.weights);
@@ -222,7 +262,8 @@ impl ProgramCache {
             .map(|b| format!("{b:02x}"))
             .collect();
         let compiled = self.dir.join(format!("{key}.mlmodelc"));
-        if compiled.is_dir() {
+        if let Some(entry) = use_entry(&compiled).map_err(cache_error)? {
+            self.hold(key, entry);
             return Ok(compiled);
         }
         if self.sealed {
@@ -230,22 +271,38 @@ impl ProgramCache {
                 "Core ML programs are compiled before the cache is sealed",
             ));
         }
-        std::fs::create_dir_all(&self.dir).map_err(io)?;
+        std::fs::create_dir_all(&self.dir).map_err(cache_error)?;
         let staging = tempfile::Builder::new()
             .prefix(&format!(".{key}-"))
             .tempdir_in(&self.dir)
-            .map_err(io)?;
+            .map_err(cache_error)?;
         let source = staging.path().join("program.mlpackage");
         let target = staging.path().join("program.mlmodelc");
         package.write(&source)?;
         compiler(&source, &target)?;
-        // A concurrent loader may have renamed the same key first; keep either.
-        if std::fs::rename(&target, &compiled).is_err() && !compiled.is_dir() {
-            return Err(Error::Other(
-                "cannot place the compiled Core ML program".into(),
-            ));
-        }
+        // Locked before it is published, so no eviction can take it first.
+        let entry = File::open(&target).map_err(cache_error)?;
+        entry.lock_shared().map_err(cache_error)?;
+        let entry = match std::fs::rename(&target, &compiled) {
+            Ok(()) => {
+                entry.set_modified(SystemTime::now()).map_err(cache_error)?;
+                entry
+            }
+            // A concurrent loader may have renamed the same key first; use theirs.
+            Err(_) => use_entry(&compiled)
+                .map_err(cache_error)?
+                .ok_or_else(|| Error::Other("cannot place the compiled Core ML program".into()))?,
+        };
+        self.hold(key, entry);
         Ok(compiled)
+    }
+
+    fn hold(&self, key: String, entry: File) {
+        self.in_use
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(key)
+            .or_insert(entry);
     }
 
     pub fn load(&self, package: &Package, units: ComputeUnits) -> Result<Model> {
@@ -375,6 +432,63 @@ mod tests {
             .compiled_with(&package, |_, _| panic!("sealed miss compiled"))
             .is_err());
         assert_eq!(std::fs::read_dir(missing.path()).unwrap().count(), 0);
+    }
+
+    fn program(width: usize) -> Package {
+        let mut builder = ProgramBuilder::new();
+        let input = builder.input("x", &[width]).unwrap();
+        builder.finish(&[&input]).unwrap()
+    }
+
+    /// Publishes a 4 KiB stand-in program and dates its last use `age_secs` ago.
+    fn publish(dir: &Path, width: usize, age_secs: u64) -> PathBuf {
+        let compiled = ProgramCache::new(dir)
+            .compiled_with(&program(width), |_, target| {
+                std::fs::create_dir(target).unwrap();
+                std::fs::write(target.join("weight.bin"), vec![0u8; 4096]).unwrap();
+                std::fs::write(target.join("model.mil"), b"program").unwrap();
+                Ok(())
+            })
+            .unwrap();
+        File::open(&compiled)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(age_secs))
+            .unwrap();
+        compiled
+    }
+
+    #[test]
+    fn a_lookup_that_waited_on_an_eviction_holds_what_is_published_after_it() {
+        let root = tempfile::tempdir().unwrap();
+        let compiled = publish(root.path(), 1, 100);
+        let lookup = |evict: &dyn Fn()| {
+            let evicting = File::open(&compiled).unwrap();
+            evicting.lock().unwrap();
+            std::thread::scope(|scope| {
+                let lookup = scope.spawn(|| use_entry(&compiled).unwrap());
+                std::thread::sleep(Duration::from_millis(200));
+                evict();
+                drop(evicting);
+                lookup.join().unwrap()
+            })
+        };
+        let trash = root.path().join(".evicted-test");
+        let moved = lookup(&|| std::fs::rename(&compiled, &trash).unwrap());
+        assert!(moved.is_none(), "a moved entry counted as a hit");
+        std::fs::remove_dir_all(&trash).unwrap();
+        publish(root.path(), 1, 100);
+        let republished = lookup(&|| {
+            std::fs::rename(&compiled, &trash).unwrap();
+            std::fs::create_dir(&compiled).unwrap();
+        })
+        .expect("the program published again was missed");
+        let held = republished.metadata().unwrap();
+        let current = std::fs::metadata(&compiled).unwrap();
+        assert_eq!(
+            (held.dev(), held.ino()),
+            (current.dev(), current.ino()),
+            "the lock is on the evicted copy, not the published one"
+        );
     }
 
     #[test]
