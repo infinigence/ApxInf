@@ -14,6 +14,15 @@
 //! (FP32 angles, one rounding to the input dtype) are the apxinf-mlx kernels
 //! for those primitives. The causal convolution is MLX `conv1d` over an
 //! explicit zero history.
+//!
+//! The readout reads only the last position, and the final layer is a
+//! full-attention layer, so its query, output projection and MLP run on that
+//! one row against the whole prompt's keys and values ([`FinalLayerRows`]).
+//! This is the same function of the inputs, but not the same rounding: MLX
+//! sends one query row at head dimension 256 to its fused single-query
+//! attention kernel, which keeps scores and softmax weights in FP32, where a
+//! longer query takes the unfused path that rounds both to BF16; and one-row
+//! projections run as GEMV, which sums the same FP32 products in another order.
 
 use std::rc::Rc;
 
@@ -41,6 +50,16 @@ struct Parts {
     rope: HalfSplitRope,
     inv_freq: Array,
     stream: Stream,
+}
+
+/// Which rows the final layer computes. `Readout` is the served shape: only
+/// the last position, the one the readout pools. `All` is the reference shape
+/// that computes every row and discards all but the last; it exists so the
+/// eager path can measure what the pruning changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalLayerRows {
+    All,
+    Readout,
 }
 
 /// Image profiles are keyed by prompt length and merged image-token count.
@@ -184,7 +203,7 @@ impl Model {
                         "d3-lite compiled forward takes ids and candidate count",
                     ));
                 };
-                forward(&trace_parts, ids, count)
+                forward(&trace_parts, ids, count, FinalLayerRows::Readout)
             })?;
             // The traced graph depends on shapes, not values, so zeros keep
             // the warm-up independent of any request.
@@ -205,10 +224,22 @@ impl Model {
     }
 
     /// Eager lazy-graph execution of the same `forward`, used to compare the
-    /// compiled path against its own body and to diagnose a divergence.
-    pub fn eager_probabilities(&self, token_ids: &[u32], count: usize) -> Result<Vec<f32>> {
+    /// compiled path (`FinalLayerRows::Readout`) against its own body, or the
+    /// final-layer pruning against the full layer, and to diagnose a
+    /// divergence.
+    pub fn eager_probabilities(
+        &self,
+        token_ids: &[u32],
+        count: usize,
+        rows: FinalLayerRows,
+    ) -> Result<Vec<f32>> {
         self.validate(token_ids, count)?;
-        let outputs = forward(&self.parts, &self.ids(token_ids)?, &self.count(count)?)?;
+        let outputs = forward(
+            &self.parts,
+            &self.ids(token_ids)?,
+            &self.count(count)?,
+            rows,
+        )?;
         self.stream().eval(&outputs)?;
         read_probabilities(&outputs[0], count)
     }
@@ -233,7 +264,15 @@ impl Model {
                                  run start",
                         ));
                     };
-                    image_forward(&trace_parts, ids, positions, count, features, run_start)
+                    image_forward(
+                        &trace_parts,
+                        ids,
+                        positions,
+                        count,
+                        features,
+                        run_start,
+                        FinalLayerRows::Readout,
+                    )
                 })?;
                 let stream = &parts.stream;
                 let ids = Array::zeros(stream, &[1, length], MlxDType::I32)?;
@@ -453,7 +492,12 @@ enum RopeMode<'a> {
 /// `[1]` I32; the returned vector is `[probabilities [1, 255]]` in F32, with
 /// every code at or past `candidate_count` set to `-inf` before the softmax so
 /// the result is exactly the masked softmax the reference produces.
-fn forward(parts: &Parts, ids: &Array, candidate_count: &Array) -> Result<Vec<Array>> {
+fn forward(
+    parts: &Parts,
+    ids: &Array,
+    candidate_count: &Array,
+    rows: FinalLayerRows,
+) -> Result<Vec<Array>> {
     let [1, length] = *ids.shape() else {
         return Err(Error::Contract("d3-lite ids must be [1, L]"));
     };
@@ -463,7 +507,7 @@ fn forward(parts: &Parts, ids: &Array, candidate_count: &Array) -> Result<Vec<Ar
     let hidden = parts.weights.embed.take(ids, 0)?;
     let positions = Array::arange(&parts.stream, 0.0, length as f32, 1.0, MlxDType::I32)?
         .reshape(&[1, length])?;
-    let hidden = stack(parts, hidden, &RopeMode::HalfSplit(&positions))?;
+    let hidden = stack(parts, hidden, &RopeMode::HalfSplit(&positions), rows)?;
     readout_tail(parts, &hidden, candidate_count)
 }
 
@@ -481,6 +525,7 @@ fn image_forward(
     candidate_count: &Array,
     features: &Array,
     run_start: &Array,
+    rows: FinalLayerRows,
 ) -> Result<Vec<Array>> {
     let [1, length] = *ids.shape() else {
         return Err(Error::Contract("d3-lite ids must be [1, L]"));
@@ -521,35 +566,70 @@ fn image_forward(
             cos: &cos,
             sin: &sin,
         },
+        rows,
     )?;
     readout_tail(parts, &hidden, candidate_count)
 }
 
 /// The 24-layer stack under one rotary contract, ending at the final RMSNorm.
 /// The op order is shared by the text and image callables; only the rotary
-/// arguments differ.
-fn stack(parts: &Parts, mut hidden: Array, rope: &RopeMode<'_>) -> Result<Array> {
+/// arguments differ. With `FinalLayerRows::Readout` a full-attention final
+/// layer returns only the last row, and the residual, MLP and final norm
+/// follow it; a final Gated DeltaNet layer would need every row, so it keeps
+/// them.
+fn stack(
+    parts: &Parts,
+    mut hidden: Array,
+    rope: &RopeMode<'_>,
+    rows: FinalLayerRows,
+) -> Result<Array> {
     let geometry = parts.geometry;
     let length = hidden.shape()[1];
-    for (index, layer) in parts.weights.layers.iter().enumerate() {
-        let normalized = hidden.fast_rms_norm(&layer.input_norm, geometry.eps)?;
-        let mixed = if geometry.is_attention(index) {
-            let Mixer::Attention(attention) = &layer.mixer else {
-                unreachable!("the validated schedule selects attention here")
-            };
-            attention_forward(parts, &normalized, attention, rope)?
+    let final_layer = parts.weights.layers.len() - 1;
+    for index in 0..parts.weights.layers.len() {
+        let first_row = if index == final_layer
+            && rows == FinalLayerRows::Readout
+            && geometry.is_attention(index)
+        {
+            length - 1
         } else {
-            let Mixer::GatedDelta(gated_delta) = &layer.mixer else {
-                unreachable!("the validated schedule selects gated delta here")
-            };
-            gated_delta_forward(parts, &normalized, gated_delta, length)?
+            0
         };
-        let residual = hidden.add(&mixed)?;
-        let mlp_input = residual.fast_rms_norm(&layer.post_norm, geometry.eps)?;
-        let mlp_output = mlp_forward(&mlp_input, &layer.mlp)?;
-        hidden = residual.add(&mlp_output)?;
+        hidden = layer_forward(parts, index, &hidden, rope, first_row)?;
     }
     hidden.fast_rms_norm(&parts.weights.norm, geometry.eps)
+}
+
+/// Decoder layer `index` for the output rows `first_row..L` of `hidden`
+/// `[1, L, H]`. Every row still contributes attention keys and values; a
+/// Gated DeltaNet layer needs every row, so it takes only `first_row == 0`.
+fn layer_forward(
+    parts: &Parts,
+    index: usize,
+    hidden: &Array,
+    rope: &RopeMode<'_>,
+    first_row: usize,
+) -> Result<Array> {
+    let geometry = parts.geometry;
+    let layer = &parts.weights.layers[index];
+    let length = hidden.shape()[1];
+    let normalized = hidden.fast_rms_norm(&layer.input_norm, geometry.eps)?;
+    let mixed = if geometry.is_attention(index) {
+        let Mixer::Attention(attention) = &layer.mixer else {
+            unreachable!("the validated schedule selects attention here")
+        };
+        attention_forward(parts, &normalized, attention, rope, first_row)?
+    } else {
+        let Mixer::GatedDelta(gated_delta) = &layer.mixer else {
+            unreachable!("the validated schedule selects gated delta here")
+        };
+        debug_assert_eq!(first_row, 0, "a recurrent layer computes every row");
+        gated_delta_forward(parts, &normalized, gated_delta, length)?
+    };
+    let residual = hidden.slice_axis(1, first_row, length)?.add(&mixed)?;
+    let mlp_input = residual.fast_rms_norm(&layer.post_norm, geometry.eps)?;
+    let mlp_output = mlp_forward(&mlp_input, &layer.mlp)?;
+    residual.add(&mlp_output)
 }
 
 /// Last position → FP32 → the 255-code readout → masked FP32 softmax.
@@ -727,27 +807,31 @@ fn gated_delta_forward(
     )
 }
 
+/// Full attention for the query rows `first_row..L` against keys and values
+/// from all `L` rows. Every query keeps its own position: the rotary inputs
+/// are sliced, never rebuilt from zero, so the last row rotates as `L - 1`.
 fn attention_forward(
     parts: &Parts,
     input: &Array,
     attention: &Attention,
     rope: &RopeMode<'_>,
+    first_row: usize,
 ) -> Result<Array> {
     let geometry = parts.geometry;
     let [1, length, _] = *input.shape() else {
         return Err(Error::Contract("d3-lite attention input must be [1, L, H]"));
     };
-    // One packed projection yields queries and the output gate: `[B, L, 2*heads*head_dim]`.
-    let projected = project(input, &attention.q.weight)?.reshape(&[
-        1,
-        length,
-        geometry.q_heads,
-        2 * geometry.head_dim,
-    ])?;
+    let query_rows = length - first_row;
+    // One packed projection yields queries and the output gate: `[B, T, 2*heads*head_dim]`.
+    let projected = project(
+        &input.slice_axis(1, first_row, length)?,
+        &attention.q.weight,
+    )?
+    .reshape(&[1, query_rows, geometry.q_heads, 2 * geometry.head_dim])?;
     let queries = projected.slice_axis(3, 0, geometry.head_dim)?;
     let gate = projected
         .slice_axis(3, geometry.head_dim, 2 * geometry.head_dim)?
-        .reshape(&[1, length, geometry.q_heads * geometry.head_dim])?;
+        .reshape(&[1, query_rows, geometry.q_heads * geometry.head_dim])?;
     let keys = project(input, &attention.k.weight)?;
     let values = project(input, &attention.v.weight)?;
     let queries = queries
@@ -762,11 +846,20 @@ fn attention_forward(
         .transpose(&[0, 2, 1, 3])?;
     let (queries, keys) = match rope {
         RopeMode::HalfSplit(positions) => (
-            parts.rope.call(&queries, positions, &parts.inv_freq)?,
+            parts.rope.call(
+                &queries,
+                &positions.slice_axis(1, first_row, length)?,
+                &parts.inv_freq,
+            )?,
             parts.rope.call(&keys, positions, &parts.inv_freq)?,
         ),
         RopeMode::Mrope { cos, sin } => (
-            mrope_apply(&queries, cos, sin, geometry.rope_dims)?,
+            mrope_apply(
+                &queries,
+                &cos.slice_axis(0, first_row, length)?,
+                &sin.slice_axis(0, first_row, length)?,
+                geometry.rope_dims,
+            )?,
             mrope_apply(&keys, cos, sin, geometry.rope_dims)?,
         ),
     };
@@ -780,7 +873,7 @@ fn attention_forward(
     )?;
     let output = output.transpose(&[0, 2, 1, 3])?.reshape(&[
         1,
-        length,
+        query_rows,
         geometry.q_heads * geometry.head_dim,
     ])?;
     project(&output.mul(&gate.sigmoid()?)?, &attention.o.weight)
@@ -913,7 +1006,7 @@ mod tests {
         let count = config.codes.len();
         let tokens = 37usize;
         let first = vec![1u32; tokens];
-        let eager = model.eager_probabilities(&first, count)?;
+        let eager = model.eager_probabilities(&first, count, FinalLayerRows::Readout)?;
         let compiled = model.probabilities(&first, count)?;
         let max = eager
             .iter()
@@ -951,7 +1044,7 @@ mod tests {
             stream.counters().trace_callbacks,
             "a new candidate count retraced the profile"
         );
-        let eager_two = model.eager_probabilities(&first, 2)?;
+        let eager_two = model.eager_probabilities(&first, 2, FinalLayerRows::Readout)?;
         let two_delta = two
             .iter()
             .zip(&eager_two)
@@ -971,6 +1064,101 @@ mod tests {
         model.probabilities(&longer, count)?;
         assert_eq!(before.trace_callbacks, stream.counters().trace_callbacks);
         assert_eq!(model.text_profiles(), [tokens, 64]);
+        Ok(())
+    }
+
+    /// The readout-row final layer is the full final layer's last row, not
+    /// an approximation of it. Layers before the last run once in BF16; the
+    /// final layer then runs on that same input promoted to F32, once for all
+    /// rows and once for the readout row. In F32 the two shapes differ only in
+    /// summation order, so the rows agree to about 1e-6. The BF16 rounding the
+    /// served path sees is about 4e-3, which would hide a query rotated at the
+    /// wrong position; in F32 that defect measures 5e-4 at two tokens.
+    #[test]
+    #[ignore = "requires APXINF_D3_CHECKPOINT and an Apple Metal GPU"]
+    fn readout_row_final_layer_is_the_full_layers_last_row_in_f32() -> Result<()> {
+        const MAX_RELATIVE_L2: f32 = 1e-4;
+        let (_, stream, model) = load_device_model(ProfileLimits::default())?;
+        let parts = &model.parts;
+        let final_layer = parts.weights.layers.len() - 1;
+        assert!(parts.geometry.is_attention(final_layer));
+        for length in [1usize, 2, 8, 9, 37, 300] {
+            let tokens = (0..length)
+                .map(|index| 1_000 + (index as u32 * 7_919) % 50_000)
+                .collect::<Vec<_>>();
+            let positions = Array::arange(&stream, 0.0, length as f32, 1.0, MlxDType::I32)?
+                .reshape(&[1, length])?;
+            let rope = RopeMode::HalfSplit(&positions);
+            let mut hidden = parts.weights.embed.take(&model.ids(&tokens)?, 0)?;
+            for index in 0..final_layer {
+                hidden = layer_forward(parts, index, &hidden, &rope, 0)?;
+            }
+            let hidden = hidden.cast(MlxDType::F32)?;
+            let full = layer_forward(parts, final_layer, &hidden, &rope, 0)?.slice_axis(
+                1,
+                length - 1,
+                length,
+            )?;
+            let readout = layer_forward(parts, final_layer, &hidden, &rope, length - 1)?;
+            assert_eq!(readout.shape(), [1, 1, parts.geometry.hidden]);
+            stream.eval(&[full.clone(), readout.clone()])?;
+            let (full, readout) = (full.to_f32_vec()?, readout.to_f32_vec()?);
+            let difference = full
+                .iter()
+                .zip(&readout)
+                .map(|(left, right)| (left - right).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let relative = difference / full.iter().map(|value| value * value).sum::<f32>().sqrt();
+            println!("length {length}: F32 relative L2 = {relative:.2e}");
+            assert!(
+                relative <= MAX_RELATIVE_L2,
+                "length {length}: readout row vs full layer relative L2 = {relative}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The served final layer computes only the readout row. It must be the
+    /// full layer's last row up to rounding: the probabilities stay within
+    /// `MAX_ROW_PRUNE_DELTA` of the full layer's and the decision does not
+    /// change. Lengths cover one token, the last length MLX's fused
+    /// single-query attention also serves in the full layer (8), the first it
+    /// does not (9), and a few longer prompts. Token IDs vary so every row
+    /// differs.
+    #[test]
+    #[ignore = "requires APXINF_D3_CHECKPOINT and an Apple Metal GPU"]
+    fn readout_row_final_layer_matches_the_full_final_layer() -> Result<()> {
+        const MAX_ROW_PRUNE_DELTA: f32 = 0.01;
+        let (config, _, model) = load_device_model(ProfileLimits::default())?;
+        let count = config.codes.len();
+        for length in [1usize, 2, 8, 9, 37, 300] {
+            let tokens = (0..length)
+                .map(|index| 1_000 + (index as u32 * 7_919) % 50_000)
+                .collect::<Vec<_>>();
+            let full = model.eager_probabilities(&tokens, count, FinalLayerRows::All)?;
+            let readout = model.eager_probabilities(&tokens, count, FinalLayerRows::Readout)?;
+            let delta = full
+                .iter()
+                .zip(&readout)
+                .map(|(left, right)| (left - right).abs())
+                .fold(0.0f32, f32::max);
+            let decision = |values: &[f32]| {
+                (0..values.len())
+                    .max_by(|&left, &right| values[left].total_cmp(&values[right]))
+                    .unwrap()
+            };
+            println!("length {length}: max|Δp| = {delta:.6}");
+            assert!(
+                delta <= MAX_ROW_PRUNE_DELTA,
+                "length {length}: readout-row vs full-layer max|Δp| = {delta}"
+            );
+            assert_eq!(
+                decision(&readout),
+                decision(&full),
+                "length {length}: the readout row changed the decision"
+            );
+        }
         Ok(())
     }
 

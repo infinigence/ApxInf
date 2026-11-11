@@ -22,7 +22,12 @@ The runtime implements `CodeDecisionRuntime`: the caller renders and tokenizes
 the prompt (the package's `d3_format.py`) and passes token IDs and the
 candidate count. The runtime scores the first `candidate_count` package codes
 with a masked FP32 softmax at the last position. There is no decode and no KV
-cache.
+cache. Because only the last position is read, the final layer (full
+attention) computes its query, output projection and MLP for that row alone,
+against keys and values from the whole prompt. MLX rounds that one-row shape
+differently from the full layer (see `model.rs`), so probabilities move by
+rounding only. Device tests check that the row equals the full layer's last
+row in F32 and bound the BF16 probability movement against the full layer.
 
 An image request passes one still image through `DecisionInput::with_vision`
 (`pixel_values [N, 1536]`, `grid_thw [[1, h, w]]`). `preprocess.rs` reproduces
@@ -66,6 +71,8 @@ The ignored tests run on an Apple Metal GPU with the real package:
 | --- | --- |
 | `model::tests::compiled_forward_matches_eager_replays_and_binds_changed_inputs` | `APXINF_D3_CHECKPOINT` |
 | `model::tests::text_profiles_stay_within_the_limit_and_evicted_lengths_retrace` | `APXINF_D3_CHECKPOINT` |
+| `model::tests::readout_row_final_layer_is_the_full_layers_last_row_in_f32` | `APXINF_D3_CHECKPOINT` |
+| `model::tests::readout_row_final_layer_matches_the_full_final_layer` | `APXINF_D3_CHECKPOINT` |
 | `model::tests::vision_tower_matches_pytorch_reference` | `APXINF_D3_CHECKPOINT`, `APXINF_D3_VISION_REF`, optional `APXINF_D3_VISION_STAGES` |
 | `model::tests::image_decision_matches_pytorch_reference_through_the_public_path` | `APXINF_D3_CHECKPOINT`, `APXINF_D3_VISION_REF` |
 | `preprocess::tests::preprocessing_reproduces_the_reference_pixel_values` | `APXINF_D3_TEST_IMAGE`, `APXINF_D3_REFERENCE_PIXELS` |
