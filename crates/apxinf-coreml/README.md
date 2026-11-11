@@ -45,6 +45,16 @@ not byte-reproducible. The writer instead matches it in three ways:
   directory is created under a temporary name and renamed into place.
 - `ProgramCache::seal` makes a later cache miss an error, so nothing compiles
   while requests run.
+- `ProgramCache::with_byte_budget` bounds the directory. `seal` then evicts
+  the least recently used programs until the rest fit; every hit refreshes a
+  program's last-use time. A program that any live `ProgramCache`, in any
+  process, has resolved is never evicted, so a working set larger than the
+  budget is kept whole. Eviction moves a program aside before deleting it, so
+  an interrupted eviction never leaves a partial program under its key, and
+  the next `seal` deletes the leftovers. Without a budget the directory is
+  unbounded. Core ML's own per-executable bundle cache
+  (`~/Library/Caches/<executable>/com.apple.e5rt.e5bundlecache`) is not
+  counted or touched.
 - `Model::load` takes the compute units (for the ANE,
   `ComputeUnits::CpuAndNeuralEngine`).
 - `ProgramCache::load_with_placement` resolves a compiled artifact once, inspects
