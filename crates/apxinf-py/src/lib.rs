@@ -42,7 +42,7 @@ use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::{
-    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ImageLayout, LoadOptions,
+    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout, LoadOptions,
     LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer, SyntheticWeights,
     VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
@@ -127,7 +127,7 @@ fn parse_device(spec: &str) -> PyResult<Device> {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
                 PyValueError::new_err(format!(
-                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0` or `metal:0`)"
+                    "apxinf_py.load: invalid device index in `{spec}` (expected e.g. `cuda:0`, `musa:0` or `metal:0`)"
                 ))
             })?;
             (kind, index)
@@ -137,10 +137,11 @@ fn parse_device(spec: &str) -> PyResult<Device> {
     match kind {
         "cuda" => Ok(Device::Cuda(index)),
         "hip" => Ok(Device::Hip(index)),
+        "musa" => Ok(Device::Musa(index)),
         "metal" | "mlx" => Ok(Device::Metal(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|metal|mlx|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|musa|metal|mlx|cpu)"
         ))),
     }
 }
@@ -153,6 +154,17 @@ fn parse_precision(spec: &str) -> PyResult<ModelPrecision> {
         "int8" | "w8a8" => Ok(ModelPrecision::W8A8),
         other => Err(PyValueError::new_err(format!(
             "apxinf_py.load: unknown precision `{other}` (expected auto|fp8|bf16|int8)"
+        ))),
+    }
+}
+
+fn parse_execution_policy(spec: &str) -> PyResult<ExecutionPolicy> {
+    match spec {
+        "eager" => Ok(ExecutionPolicy::Eager),
+        "prefer-graph" => Ok(ExecutionPolicy::PreferGraph),
+        "require-graph" => Ok(ExecutionPolicy::RequireGraph),
+        other => Err(PyValueError::new_err(format!(
+            "apxinf_py.load: unknown execution `{other}` (expected eager|prefer-graph|require-graph)"
         ))),
     }
 }
@@ -1053,8 +1065,8 @@ impl ModelRunner {
     /// * `path` — checkpoint directory or index file.
     /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
     ///   The selected family and compiled features must support that backend.
-    /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
-    /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
+    /// * `model_variant` — family-owned implementation selection for every VLA policy.
+    /// * `precision` — legacy runtime compatibility; leave auto when using model_variant.
     /// * `calibration` — optional FP8 calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
     /// * `autotune` — tune missing exact GEMM keys from the first real request.
@@ -1068,6 +1080,12 @@ impl ModelRunner {
     ///   the same weights load and run at the requested chunk length.
     /// * `num_views` - serve fewer cameras than the checkpoint declares.
     ///
+    /// `execution` selects how the MUSA PI0.5 runtime builds the plans it
+    /// caches for repeated inference: `"eager"` never captures, `"prefer-graph"`
+    /// (the default when omitted) captures and falls back to eager, and
+    /// `"require-graph"` turns a capture failure into an error. The mode a run
+    /// actually took is reported by [`Self::execution_mode`].
+    ///
     /// `num_views` exists because a deployment often has fewer cameras than the
     /// checkpoint was trained with. Dropping the trailing views is numerically
     /// equivalent to openpi zero-padding and masking them - a masked view is
@@ -1076,7 +1094,7 @@ impl ModelRunner {
     /// tokens per step. Nothing weight-shaped depends on the count; it only sizes
     /// the prefix, so this is a load-time constant, not a per-request one.
     #[staticmethod]
-    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None, weight_layout_budget_bytes=None))]
+    #[pyo3(signature = (model, path, device="cuda:0", precision="auto", calibration=None, tactics=None, autotune=false, config_json=None, action_horizon=None, num_views=None, num_flow_steps=None, flow_start_time=None, sampling_seed=0, assets=None, model_variant=None, weight_layout_budget_bytes=None, execution=None))]
     fn load(
         model: &str,
         path: PathBuf,
@@ -1094,6 +1112,7 @@ impl ModelRunner {
         assets: Option<BTreeMap<String, PathBuf>>,
         model_variant: Option<String>,
         weight_layout_budget_bytes: Option<usize>,
+        execution: Option<&str>,
     ) -> PyResult<Self> {
         let device = parse_device(device)?;
         // Only explicit PI0.5 overrides bypass AutoModel's config loading.
@@ -1143,6 +1162,7 @@ impl ModelRunner {
             autotune,
             num_views,
             config,
+            execution_policy: execution.map(parse_execution_policy).transpose()?,
             ..LoadOptions::default()
         };
         let loaded = AutoModel::load_model(device, &path, &options).map_err(runtime_err)?;
@@ -1717,9 +1737,13 @@ impl ModelRunner {
     ///   and stops, returning a shorter array. Pass the FAST `|` terminator to
     ///   skip the ~90% of `max_action_tokens` that the detokenizer discards.
     ///
+    /// * `max_new_tokens` — optional per-call limit in `1..=max_action_tokens`.
+    ///   With `stop_token=None`, emit exactly this many ids (including any `|`).
+    ///   This bounds the actual decode loop, not a slice of a longer result.
+    ///
     /// Returns `uint32` `[1..=max_action_tokens]`, including `stop_token` when
     /// it was hit.
-    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None, *, max_new_tokens=None))]
     fn infer_action_tokens_rgb<'py>(
         &self,
         py: Python<'py>,
@@ -1727,6 +1751,7 @@ impl ModelRunner {
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
         stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
         let token_shape = self.action_tokens.ok_or_else(|| {
             PyValueError::new_err(
@@ -1734,6 +1759,13 @@ impl ModelRunner {
                  discrete action tokens (it is a continuous-action runtime)",
             )
         })?;
+        if let Some(limit) = max_new_tokens {
+            if limit == 0 || limit > token_shape[1] {
+                return Err(PyValueError::new_err(format!(
+                    "max_new_tokens must be in 1..={}, got {limit}", token_shape[1]
+                )));
+            }
+        }
         let (observation, _) =
             self.rgb_observation("infer_action_tokens_rgb", rgb_u8, layout, token_ids, None)?;
         // Token VLAs condition on the observation alone; the request still
@@ -1742,7 +1774,7 @@ impl ModelRunner {
         let request = VlaRequest::provided(&observation, &unused_latent);
         let decoded = self
             .model
-            .infer_action_tokens(&request, stop_token)
+            .infer_action_tokens_with_limit(&request, stop_token, max_new_tokens)
             .map_err(runtime_err)?;
         let values = decoded.to_f32_vec().map_err(runtime_err)?;
         if values.is_empty() || values.len() > token_shape[1] {
@@ -1850,6 +1882,18 @@ impl ModelRunner {
     #[getter]
     fn model_variant(&self) -> PyResult<Option<&'static str>> {
         Ok(self.model.vla().map_err(runtime_err)?.model_variant())
+    }
+
+    /// Execution path the runtime is actually on: `"unprepared"`, `"eager"`,
+    /// `"graph"`, `"invalidated"` or `"runtime-managed"`.
+    ///
+    /// Ask after a run, not after loading: the plan is built on first use. A
+    /// `"eager"` here after asking for `"require-graph"` cannot happen - that
+    /// combination fails the run - while after `"prefer-graph"` it means the
+    /// capture fell back.
+    #[getter]
+    fn execution_mode(&self) -> PyResult<&'static str> {
+        Ok(self.model.vla().map_err(runtime_err)?.execution_mode())
     }
 
     #[getter]
@@ -2158,6 +2202,8 @@ mod tests {
         assert!(matches!(parse_device("cuda").unwrap(), Device::Cuda(0)));
         assert!(matches!(parse_device("hip").unwrap(), Device::Hip(0)));
         assert!(matches!(parse_device("hip:2").unwrap(), Device::Hip(2)));
+        assert!(matches!(parse_device("musa").unwrap(), Device::Musa(0)));
+        assert!(matches!(parse_device("musa:1").unwrap(), Device::Musa(1)));
         assert!(matches!(parse_device("cuda:1").unwrap(), Device::Cuda(1)));
         assert!(matches!(parse_device("cpu").unwrap(), Device::Cpu));
         assert_eq!(parse_device("metal").unwrap(), Device::Metal(0));

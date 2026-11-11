@@ -39,16 +39,23 @@ pub(crate) fn create_backend_with_recipe_options(
         Device::Hip(id) => hip::create(id),
         #[cfg(not(feature = "hip"))]
         Device::Hip(_) => Err(Error::Other("HIP support not compiled in".into())),
+        // No `dyn Backend` family is ported to MUSA: PI0.5 reaches it through
+        // its own concrete seam in `musa_pi05/`. Both arms spell `Error` out in
+        // full because the import above is gone exactly when every other
+        // backend feature is on, and one of these two arms always compiles.
+        #[cfg(feature = "musa")]
+        Device::Musa(_) => Err(apxinf_core::Error::UnsupportedDevice(device)),
+        #[cfg(not(feature = "musa"))]
+        Device::Musa(_) => Err(apxinf_core::Error::Other(
+            "MUSA support not compiled in".into(),
+        )),
     }
 }
 
 /// AMD ROCm/HIP seam.
 ///
-/// Deliberately thin compared to [`cuda`]: models reach this backend only
-/// through `dyn Backend`, so there is no downcast helper. A family that needs
-/// HIP-specific fused kernels would add one here, the same way PI0.5 does for
-/// CUDA — but nothing needs that yet, and adding it before something does would
-/// invite the coupling this backend was built to avoid.
+/// Portable models reach HIP through `dyn Backend`. Native ports such as
+/// `hip_pi05` own their concrete backend imports separately.
 #[cfg(feature = "hip")]
 pub(crate) mod hip {
     use std::sync::Arc;
@@ -58,6 +65,19 @@ pub(crate) mod hip {
     pub(crate) fn create(device_id: usize) -> Result<Arc<dyn Backend>> {
         Ok(Arc::new(apxinf_hip::HipBackend::new(device_id)?))
     }
+}
+
+/// Moore Threads seam.
+///
+/// No `dyn Backend` family is ported to MUSA — PI0.5 reaches the device through
+/// its own concrete port in `musa_pi05/`, which owns every device import. What
+/// the model layer needs from this backend is the profiling marker, so it is
+/// re-exported here and `profiling::trace` reaches it the same way it reaches
+/// `apxinf_cuda_new::nvtx`. That module picks one backend for the whole process,
+/// so this is compiled exactly when MUSA is the one it picks.
+#[cfg(all(feature = "musa", not(feature = "cuda")))]
+pub(crate) mod musa {
+    pub(crate) use apxinf_musa::mttx;
 }
 
 /// Create a backend on the `apxinf-cuda-new` runtime.
@@ -88,8 +108,8 @@ pub(crate) fn create_cuda_new_backend_with_recipe_options(
 
 /// Recover the concrete cuda-new backend from an `Arc<dyn Backend>`.
 ///
-/// Mirrors `cuda::downcast_arc` for families whose executors call the
-/// cuda-new kernel seam directly (π0-FAST).
+/// Used by families whose executors call the cuda-new kernel seam directly
+/// (π0-FAST).
 #[cfg(feature = "cuda")]
 pub(crate) fn downcast_cuda_new_arc(
     backend: Arc<dyn Backend>,
