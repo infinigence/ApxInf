@@ -810,14 +810,17 @@ impl Gpt {
             input: decode_input,
             mut cache,
         } = resources;
+        let _gpt_prefill_range = crate::profiling::trace::range("tts.gpt.prefill");
         let mut logits = self
             .prefill_cached(ctx, text, audio, &mut cache)
             .map_err(|error| Error::Other(format!("GPT cached prefill: {error}")))?;
+        drop(_gpt_prefill_range);
         let mut audio_tokens = prompt.to_vec();
         #[cfg(test)]
         let sampling_alignment = SamplingAlignment::from_env()?;
 
         for index in 0..max_new_tokens {
+            let _gpt_step_range = crate::profiling::trace::range("tts.gpt.step");
             let active_vocab = if index < MIN_GENERATED_BEFORE_EOS {
                 GPT_AUDIO_VOCAB - 1
             } else {
@@ -825,6 +828,7 @@ impl Gpt {
             };
             let active_logits = logits_prefix(&logits, active_vocab)
                 .map_err(|error| Error::Other(format!("GPT logits view step {index}: {error}")))?;
+            let _gpt_sample_range = crate::profiling::trace::range("tts.gpt.sample");
             let (sample, argmax) = sample_fp16_exponential_race(
                 &active_logits,
                 &audio_tokens,
@@ -838,6 +842,7 @@ impl Gpt {
                 sampling_alignment.as_ref(),
             )
             .map_err(|error| Error::Other(format!("GPT sample step {index}: {error}")))?;
+            drop(_gpt_sample_range);
             #[cfg(test)]
             let teacher = sampling_alignment
                 .as_ref()
@@ -864,9 +869,11 @@ impl Gpt {
                 let embedded = self.embed_audio(ctx, &[next_token], cache.audio_len)?;
                 transfers::copy_cuda_to_cuda(ctx, &embedded, &decode_input)?;
                 if let Some(graph) = &decode_graph {
+                    let _gpt_replay_range = crate::profiling::trace::range("tts.gpt.replay");
                     graph.replay().map_err(|error| {
                         Error::Other(format!("GPT decode replay step {index}: {error}"))
                     })?;
+                    drop(_gpt_replay_range);
                     cache.audio_len += 1;
                     logits = graph_logits.as_ref().expect("prepared GPT logits").clone();
                 } else {

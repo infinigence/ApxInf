@@ -845,9 +845,14 @@ impl PreparedGptSovitsSpeech {
 
     fn run_prepared(&self, request: &SpeechRequest<'_>) -> Result<PcmAudio> {
         self.validate_request(request)?;
+        // NVTX 分段时间线（nsys）。这一层是整图 replay 的黑箱，四个 stage 必须在
+        // host 侧埋点才拆得开；不带 `nvtx` feature 时是零成本 no-op。
+        let _tts_reference_range = crate::profiling::trace::range("tts.reference");
         let reference = self.reference_features(request)?;
+        drop(_tts_reference_range);
         let reference_mel = reference.mel.clone();
         let reference_bert = reference.bert.clone();
+        let _tts_bert_range = crate::profiling::trace::range("tts.bert");
         let target_bert = self.cached_bert(
             &self.target_bert,
             request.bert_token_ids,
@@ -855,10 +860,12 @@ impl PreparedGptSovitsSpeech {
             request.phone_ids.len(),
             true,
         )?;
+        drop(_tts_bert_range);
         let bert = ops::concat_rows(&self.ctx, &reference_bert, &target_bert)?;
         let mut phones = request.reference_phone_ids.to_vec();
         phones.extend_from_slice(request.phone_ids);
         let prompt = &reference.prompt;
+        let _tts_gpt_range = crate::profiling::trace::range("tts.gpt");
         let generated = self
             .gpt
             .generate(
@@ -874,6 +881,7 @@ impl PreparedGptSovitsSpeech {
                 ((request.max_seconds.max(1.0) * 25.0) as usize).min(1500),
             )
             .map_err(|error| Error::Other(format!("prepared gpt: {error}")))?;
+        drop(_tts_gpt_range);
         if generated.is_empty() {
             return Err(Error::Other("semantic decoder produced no tokens".into()));
         }
@@ -897,9 +905,11 @@ impl PreparedGptSovitsSpeech {
         )?;
         let ge = reference.style.clone();
         let reference_features = reference.features.clone();
+        let _tts_sovits_range = crate::profiling::trace::range("tts.sovits");
         let target_features =
             self.target_sovits
                 .replay(&self.ctx, &target_codes, request.phone_ids, &ge)?;
+        drop(_tts_sovits_range);
         if target_features.shape().dims() != [self.spec.target_frames, 512] {
             return Err(Error::Other(format!(
                 "prepared target frame mismatch: graph expects {}, GPT produced {} frames from {} semantic tokens",
@@ -982,6 +992,7 @@ impl PreparedGptSovitsSpeech {
             let graph = self.cfm_graphs.get(&length).ok_or_else(|| {
                 Error::Other(format!("missing prepared CFM chunk profile {length}"))
             })?;
+            let _tts_cfm_range = crate::profiling::trace::range("tts.cfm.chunk");
             let generated = graph.replay(
                 &self.ctx,
                 &prompt_features,
@@ -989,6 +1000,7 @@ impl PreparedGptSovitsSpeech {
                 &prompt_mel,
                 request.seed + chunk_index as u64,
             )?;
+            drop(_tts_cfm_range);
             rolling_mel = ops::slice_rows(
                 &self.ctx,
                 &generated,
@@ -1017,7 +1029,9 @@ impl PreparedGptSovitsSpeech {
             &self.mel_zero,
             &self.mel_shift,
         )?;
+        let _tts_vocoder_range = crate::profiling::trace::range("tts.vocoder");
         let samples = self.vocoder_graph.replay(&self.ctx, &mel)?;
+        drop(_tts_vocoder_range);
         // The public pipeline adds `fragment_interval` silence; the acoustic
         // graph itself must not append an implicit pause.
         let valid_length = samples.len();
