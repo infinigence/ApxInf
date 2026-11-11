@@ -267,9 +267,12 @@ Complete these steps in the new family's own code and the existing registries:
    `builtin::register_builtin_models`, with the correct feature gate and names.
    `AutoModel::load_model` resolves `LoadOptions.model_name` or checkpoint
    metadata; test both explicit selection and the supported detection path.
-   For Metal, the current `mlx` feature registers `metal_qwen3` and
-   `metal_minicpm5`; `AutoModel` resolves the Metal prefix. MiniCPM5 must be
-   explicitly named because its official checkpoint identifies as `llama`.
+   For Metal, the current `mlx` feature registers `metal_qwen3`,
+   `metal_minicpm5`, `metal_clef` and `metal_d3`; `AutoModel` resolves the
+   Metal prefix. MiniCPM5 must be explicitly named because its official
+   checkpoint identifies as `llama`; a `d3-code-readout-v1` package detects as
+   `d3` and resolves to `metal_d3` on Metal (its CUDA-only intercept is gated
+   to non-Metal devices).
 2. For LLM/VLM, return `LoadedModel::text(Box<dyn LlmTrait>)` and exercise shared
    generation. For VLA, implement `VlaRuntime` on the family runner and return
    `LoadedModel::Vla(Box::new(runner))`. Required methods include `contract`,
