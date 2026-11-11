@@ -1,0 +1,27 @@
+# ApxInf serving
+
+The interface contract owns serving terms, states and resource semantics.
+Each explicit profile defines its supported subset. The system design includes future stages.
+
+| Maintained guide |
+| --- |
+| [Interface semantics](contracts-v0.1.md) |
+| [Module ownership and implementation stages](implementation-plan.md) |
+| [Serial worker protocol and conformance](serial-profile-v0.1.md) |
+| [Service startup and supported public requests](local-service-v0.1.md) |
+| [Provider dependencies and execution boundaries](dependencies.md) |
+| [Native MiniCPM5 profile](native-minicpm-v0.1.md) |
+| [Explicit sampling profile](native-sampling-v0.1.md) |
+| [Thinking output profile](native-thinking-v0.1.md) |
+| [Bounded initial thinking profile](native-bounded-thinking-v0.1.md) |
+| [Deployment context and cancellation boundaries](minicpm-context-v0.1.md) |
+| [Model output and public projection](minicpm-output-v0.1.md) |
+| [Owned media input contract](owned-media-v0.1.md) |
+| [Explicit external vision provider](minicpm-vision-v0.1.md) |
+| [Explicit external decision provider](clef-text-v0.1.md) |
+| [Diagnostic memory observations](memory-calibration-v0.1.md) |
+| [Planned and executed memory coverage](memory-coverage-v0.1.md) |
+| [Production memory validation](production-memory-validation-v0.1.md) |
+| [Support and verification boundaries](support-status.md) |
+
+Historical experiments and personal authoring preferences remain local.
