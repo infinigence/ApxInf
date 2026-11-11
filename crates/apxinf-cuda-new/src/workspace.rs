@@ -328,6 +328,12 @@ impl ExecutionSession {
         &self.inner.workspace
     }
 
+    /// Number of shared provider scratch blocks currently held by the pool.
+    #[cfg(test)]
+    pub(crate) fn provider_scratch_blocks(&self) -> usize {
+        self.inner.scratch.buffers.borrow().len()
+    }
+
     pub fn capacity(&self) -> usize {
         self.inner.workspace.capacity()
     }
@@ -657,6 +663,12 @@ pub(crate) fn output_buffer_tail_zeroed(
 /// boundaries. A block is replaced only when it is too small; executions retain
 /// their actual block, so growth never invalidates old graphs, and generation
 /// retirement bounds how many replaced blocks stay referenced at once.
+///
+/// Callers reach this after native prepare already allocated working private
+/// scratch, so sharing is an optimization rather than a requirement. If the
+/// shared block itself cannot be allocated for lack of device memory, this
+/// returns `None` and the execution keeps its private scratch instead of
+/// failing prepare; any other allocation error still propagates.
 pub(crate) fn provider_scratch(
     ctx: &crate::CudaContext,
     bytes: usize,
@@ -677,13 +689,29 @@ pub(crate) fn provider_scratch(
             .is_some_and(|buffer| buffer.len() >= bytes)
         {
             let capacity = round_up_to(bytes, PROVIDER_SCRATCH_GRANULARITY)?;
-            scratch.insert(
-                key,
-                CudaBuffer::alloc(capacity, ctx.device_id()).map_err(Error::Cuda)?,
-            );
+            #[cfg(test)]
+            let capacity = SCRATCH_ALLOC_OVERRIDE.with(Cell::get).unwrap_or(capacity);
+            let Some(buffer) =
+                CudaBuffer::try_alloc(capacity, ctx.device_id()).map_err(Error::Cuda)?
+            else {
+                return Ok(None);
+            };
+            scratch.insert(key, buffer);
         }
         Ok(scratch.get(&key).cloned())
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCRATCH_ALLOC_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Test hook: replace the byte count of new provider scratch blocks, e.g. with
+/// an impossible size to inject a real device out-of-memory failure.
+#[cfg(test)]
+pub(crate) fn override_provider_scratch_alloc(bytes: Option<usize>) {
+    SCRATCH_ALLOC_OVERRIDE.with(|value| value.set(bytes));
 }
 
 /// Round `value` up to a multiple of `align` (a power of two), returning an
