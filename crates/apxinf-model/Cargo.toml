@@ -18,12 +18,13 @@ half = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", optional = true }
+libc = { version = "0.2", optional = true }
 
 [features]
 default = []
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
 cuda = ["dep:apxinf-cuda-new"]
-mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
+mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer", "dep:libc"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # It no longer gates anything: `cuda` already pulls in `apxinf-cuda-new`, and
 # the model code that used to hide behind this flag now follows `cuda`.

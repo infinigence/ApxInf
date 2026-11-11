@@ -39,7 +39,9 @@ pub mod speech;
 pub mod vla;
 mod walloss;
 
-pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWeights};
+pub use auto::{
+    AutoModel, LoadOptions, LoadedModel, ModelPrecision, PromptCacheOptions, SyntheticWeights,
+};
 pub use builtin::register_builtin_models;
 pub use d3::{
     D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig,

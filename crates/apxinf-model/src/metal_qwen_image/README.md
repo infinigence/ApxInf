@@ -74,6 +74,39 @@ Select it from the CLI with `generate-image --model-variant reference`.
 - `tables.rs` reproduces the NumPy float32 sin/cos used for the RoPE tables and
   the blending ramp; tests check recorded NumPy digests.
 
+Prompt cache: `LoadOptions::prompt_cache` (CLI `--prompt-cache-dir` with
+`--prompt-cache-max-mib`) stores each prompt's DiT text K/V in a directory and
+reuses them when a later request, in any process, has the same prompt tokens.
+A hit skips the text encoder and the text-prefix K/V computation; the image is
+the same as on a miss. It is off by default. `prompt_cache.rs` owns it:
+
+- The key hashes the prompt token ids and system-prefix length with the entry
+  format version, the crate version, the size and modification time of the
+  executable or library containing this code and of the loaded MLX library and
+  `mlx.metallib`, the MLX version, the OS release record, the GPU architecture,
+  the MPP selection, and a fingerprint of each of the text-encoder and DiT
+  shard sets. A shard fingerprint covers the file name, size, modification
+  time, SafeTensors header and eight 64 KiB payload windows, but not the path.
+  It does not read every byte, so replacing a shard with different values of
+  the same size, header and modification time between those windows is not
+  detected.
+- An entry is one SafeTensors file, `<key>.safetensors`, of 64 BF16
+  `[1, 32, T, 128]` tensors: 512 KiB per prompt token, about 1 GB for a
+  2000-token prompt. It is written to a uniquely named temporary file with
+  mode 0600, synced and renamed, so processes can share the directory.
+- `max_bytes` bounds the stored entries. Before and after each store, the
+  least recently used entries are deleted until the rest fit; a hit sets the
+  entry's modification time, which is its last use. While other processes
+  write, the directory can briefly exceed the bound by their entries in
+  progress. An entry larger than the bound is not stored. Eviction deletes
+  only files named like entries, and temporary files older than an hour.
+- An entry with the wrong size, header, dtype or shape is deleted and counts
+  as a miss. Payload bytes are not checksummed. Cache I/O errors print one
+  line and never fail the request.
+
+Entries are activations derived from the prompt text. Choose a directory with
+the same access control as the prompts.
+
 Lifecycle: the DiT is loaded with the model, released before each VAE decode
 and read again by the next request; the VAE decoder stays loaded. The MLX
 buffer cache is cleared after text encoding and after the DiT is released, as
