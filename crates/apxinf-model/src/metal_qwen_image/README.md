@@ -24,9 +24,10 @@ checks the dimensions and checked token product before any request device work.
 sides 8192, 16384 or 32768 are rejected. Empty prompts, other step counts,
 negative prompts, true CFG, editing, ControlNet and LoRA are rejected or not exposed.
 
-`model_variant=auto`, also the default when omitted, retains the existing MPP
-selection and optimization target. `model_variant=reference` skips the MPP
-probe and uses MLX quantized matmul for all Q4 projections. It changes neither
+`model_variant=auto`, also the default when omitted, selects per MLX
+architecture: on `applegpu_g16g` (M4) the fused image blocks below, elsewhere
+the MPP selection described below. `model_variant=reference` skips both and
+uses MLX quantized matmul for all Q4 projections. It changes neither
 checkpoint interpretation nor the schedule, text encoder, compilation or VAE.
 Select it from the CLI with `generate-image --model-variant reference`.
 
@@ -65,6 +66,22 @@ Select it from the CLI with `generate-image --model-variant reference`.
   optimization still needs device and workload qualification. In `reference`,
   on other architectures, when the probe fails, below 1024 or for unaligned image
   token counts, and for the text prefix, projections use quantized matmul.
+- Fused image blocks (`auto` on `applegpu_g16g`, image-token counts that are
+  multiples of 64 in 1024..=4096; other counts use the path above). Each image
+  block runs seven kernels from `apxinf-mlx`: `LayerNormModulate`; Q and K
+  through `MppGemmHeadRmsRope` (BF16-rounded GEMM, head RMSNorm and RoPE in the
+  epilogue, K with the cached text keys copied in front); V through
+  `MppGemmHeadsWithPrefix`; SDPA; the output projection through
+  `MppGemmDecodeQ4Rows`, which also decodes the MLP gate/up weight;
+  `GatedResidualLayerNormModulate`; `MppGemmSwigluPairs`; and the MLP down
+  projection through `MppGemmGatedResidual`. The broadcast modulation rows are
+  read through their strides. After the text prefix, the only other reader of
+  the image MLP's gate and up Q4 weights, each block's pair is interleaved in
+  32-row pairs and replaces the originals, one block at a time, so the DiT keeps
+  one copy. Requests outside the fused token range keep them separate. These
+  kernels round differently from mflux: images are not bit-identical to
+  `reference`, so qualification compares them with the reference
+  implementation they reproduce and reports PSNR against mflux.
 - `vae.rs` decodes in mflux's NCHW layout, tiled with 512 px tiles and 128 px
   overlap. FP32 tiles, weighted products and ordered overlap sums/counts remain
   on device. Each product is materialized before addition, and each replacement
@@ -75,10 +92,13 @@ Select it from the CLI with `generate-image --model-variant reference`.
   the blending ramp; tests check recorded NumPy digests.
 
 Lifecycle: the DiT is loaded with the model, released before each VAE decode
-and read again by the next request; the VAE decoder stays loaded. The MLX
-buffer cache is cleared after text encoding and after the DiT is released, as
-mflux `--low-ram` does; its 1 GB cache limit is not applied. This matches
-the reference's weight-release boundaries. Device accumulation and integer
+and read again by the next request; the VAE decoder stays loaded. The image CLI
+sets its process-wide MLX allocator cache limit to 1 GB before loading.
+Library callers own this process policy and can configure it through
+`apxinf_mlx::set_cache_limit` before loading a model. The family loader leaves
+the caller's limit unchanged. The cache is cleared after text encoding and
+after the DiT is released.
+This matches the reference's weight-release boundaries. Device accumulation and integer
 pixel finalization add bounded request-local arrays; their measured peak and
 complete-request cost require source-bound qualification, not a claim of
 identical memory usage.

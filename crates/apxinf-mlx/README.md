@@ -62,8 +62,8 @@ the bridge does not clear other functions' compiler caches.
 `Stream::counters()` snapshots cumulative trace callbacks, explicit upload and
 download bytes, and evaluation boundaries (including downloads). Cloned streams
 share counters; separate logical streams do not. Byte counters report bridge
-host IO, not driver transfers. `memory_stats`, `reset_peak_memory` and
-`clear_cache` observe or change the process-wide MLX allocator. Synchronize before
+host IO, not driver transfers. `memory_stats`, `reset_peak_memory`, `set_cache_limit`
+and `clear_cache` observe or change the process-wide MLX allocator. Synchronize before
 comparing release observations and run memory qualification in an isolated
 process. The ignored `metal_memory` integration executable checks repeated
 compiled-instance release and pool reuse when run under the shared Metal lock.
@@ -136,6 +136,16 @@ The Clef-derived fusions are `Q4TransposeDecode`, `PadRowsF16`,
 weights to FP16 for one call only; they keep no decoded weight resident.
 Their tests compare each kernel with MLX operators or a host reference on
 small shapes. They do not qualify the Clef model.
+
+`MppGemmDecodeQ4Rows`, `MppGemmGatedResidual`, `MppGemmSwigluPairs`,
+`MppGemmHeadsWithPrefix` and `MppGemmHeadRmsRope` extend the MPP BF16 GEMM with
+epilogues that consume its tile (Q4 row decode, gated residual, paired SwiGLU,
+head-major layout with a copied prefix, head RMSNorm with RoPE).
+`LayerNormModulate` and `GatedResidualLayerNormModulate` fuse a width-4096
+LayerNorm with modulation. Their modulation inputs are read through their
+strides (`MetalKernel::new_strided`), so broadcast views are not copied.
+Layout-only epilogues are tested bit for bit against the plain GEMM; the others
+are bounded against composed MLX operators. They do not qualify a model.
 
 `InterleavedQkNormRope` adapts the mflux Qwen-Image attention prologue:
 per-head RMSNorm, interleaved-pair RoPE from FP32 tables and the

@@ -10,6 +10,7 @@ extern "C" {
     pub fn apx_mlx_memory_stats(active: *mut usize, cache: *mut usize, peak: *mut usize) -> i32;
     pub fn apx_mlx_reset_peak_memory() -> i32;
     pub fn apx_mlx_clear_cache() -> i32;
+    pub fn apx_mlx_set_cache_limit(limit: usize, previous: *mut usize) -> i32;
     pub fn apx_mlx_device_info(
         index: i32,
         name: *mut *const c_char,
@@ -93,6 +94,7 @@ extern "C" {
         input_count: usize,
         outputs: *const *const c_char,
         output_count: usize,
+        row_contiguous: i32,
         out: *mut Handle,
     ) -> i32;
     pub fn apx_mlx_metal_free(kernel: Handle);
