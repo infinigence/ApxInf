@@ -315,7 +315,6 @@ impl LayerWeights {
             ));
         };
         Ok(vec![
-            self.input_norm.clone(),
             self.q_norm.clone(),
             self.k_norm.clone(),
             self.post_norm.clone(),

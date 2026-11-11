@@ -32,11 +32,24 @@ multiplication results. The compiled selection prepares local norm/RoPE function
 and the complete B1/L1 decoder block with explicit input/output KV arrays.
 After prefix state exists, that block uses `Bf16QkTableRope` to rotate Q and K
 in one Metal call. The backend owns shape validation and separately rounded
-BF16 products and sums. The block captures the immutable kernel, while Q, K,
-and table rows remain explicit array operands. Its 18-input/3-output ABI is
-unchanged. Prefill and the fresh first-token path retain local compiled RoPE.
+BF16 products and sums. The block captures the immutable kernels, while Q, K,
+and table rows remain explicit array operands. Its 19-input/4-output ABI takes
+the residual row and its input-normalized form, and returns the next residual
+with its next norm already applied, so every weight multiply between the two
+residual adds sits inside one compiled block. Prefill and the fresh first-token
+path retain local compiled RoPE.
 Prefill uses the same layer composition with compiled local seams. Whole
 decode-step compilation is not implemented or claimed by this selection.
+
+Every selection except `bf16-public` fuses each residual add with the
+RMSNorm that consumes it (`ResidualRmsNorm`): the post-attention add with the
+post-attention norm, and the MLP add with the next layer's input norm, or with
+the final norm after the last layer. `bf16-compiled` uses the `BeforeWeight`
+rounding of its native weighted RMSNorm; `bf16-public` and `mixed-w8` use
+`AfterWeight`, rounding once after the FP32 weight multiply. That is the
+arithmetic their prepared FP32 norm weights already selected, so fused and
+unfused logits differ only by the reduction order of the row sum. `bf16-public`
+keeps the separate `add` and norm as the ordered reference.
 
 The private norm weight dtype selects the arithmetic. BF16 weights require BF16
 activations and select native weighted RMSNorm. FP32 weights select the ordered
