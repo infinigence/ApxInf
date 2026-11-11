@@ -406,6 +406,9 @@ fn main() {
     generic_sources.push(native.join("kernels/custom/attention_gates.cu"));
     generic_sources.push(native.join("kernels/custom/gather_embedding.cu"));
     generic_sources.push(native.join("kernels/custom/sampling_argmax.cu"));
+    generic_sources.push(native.join("adapters/conv1d.cu"));
+    generic_sources.push(native.join("adapters/relative_attention.cu"));
+    generic_sources.push(native.join("adapters/tts.cu"));
     generic_sources.push(native.join("tests/framework_backend.cu"));
     let cutlass_root = native.join("kernels/cutlass");
     let fa2_root = native.join("kernels/fa2");
@@ -653,6 +656,16 @@ fn main() {
             .args(["--compiler-options", "-fPIC", "-O3", "-std=c++17"])
             .arg(format!("-I{}", native.join("include").display()))
             .arg(format!("-I{}", out.display()));
+        // The conv1d adapter carries an optional cuDNN provider. Orin ships
+        // cuDNN headers under the multiarch include directory, so the
+        // provider stays available without an explicit APXINF_CUDNN_ROOT.
+        if source
+            .file_name()
+            .is_some_and(|name| name == "conv1d.cu")
+        {
+            command.arg("-DAPXINF_CONV1D_CUDNN=1");
+            command.arg("-I/usr/include/aarch64-linux-gnu");
+        }
         // The build IDs fold a whole-tree fingerprint, so they change on any
         // kernel edit. Only the two tuning-key translation units read them;
         // putting them on every command line would invalidate the whole object
@@ -861,6 +874,7 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=apxinf_gemm_native");
+    println!("cargo:rustc-link-lib=cudnn");
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");

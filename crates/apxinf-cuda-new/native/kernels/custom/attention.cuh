@@ -141,6 +141,78 @@ __global__ void attention_values(const float* probabilities, const T* value,
   output[index] = from_float<T>(result);
 }
 
+// Single-token decode keeps the reference accumulation order while assigning
+// independent key dot-products to different threads. One block owns a head;
+// thread 0 computes the softmax in the same key order as the baseline. Value
+// channels also retain their sequential key accumulation, preserving F16 logits.
+template<class T, int FixedHeadDim = 0>
+__global__ void single_token_attention(
+    const T* query, const T* key, const T* value, T* output,
+    int key_tokens, int key_stride, int query_heads, int kv_heads,
+    int runtime_head_dim, bool causal, int query_start, const uint32_t* meta, float scale) {
+  const int head_dim = FixedHeadDim == 0 ? runtime_head_dim : FixedHeadDim;
+  extern __shared__ float scores[];
+  const int head=blockIdx.x;
+  const int kv_head=head/(query_heads/kv_heads);
+  const int valid=runtime_valid_keys(key_tokens,causal,query_start,0,meta);
+  const T* q=query+int64_t(head)*head_dim;
+  for(int token=threadIdx.x;token<valid;token+=blockDim.x) {
+    const T* k=key+(int64_t(token)*kv_heads+kv_head)*head_dim;
+    float dot=0.0f;
+    #pragma unroll
+    for(int d=0;d<head_dim;++d)dot+=to_float(q[d])*to_float(k[d]);
+    scores[token]=dot*scale;
+  }
+  __syncthreads();
+  __shared__ float maximum_value;
+  __shared__ float normalizer;
+  if constexpr (FixedHeadDim == 32) {
+    // Maximum has no addition rounding dependency. Preserve the ordered sum
+    // below, while distributing only this comparison reduction across warps.
+    __shared__ float warp_maxima[8];
+    float maximum = -CUDART_INF_F;
+    for (int token = threadIdx.x; token < valid; token += blockDim.x)
+      maximum = fmaxf(maximum, scores[token]);
+    for (int offset = 16; offset > 0; offset /= 2)
+      maximum = fmaxf(maximum,
+          __shfl_down_sync(0xffffffff, maximum, offset));
+    if ((threadIdx.x & 31) == 0) warp_maxima[threadIdx.x / 32] = maximum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      maximum = -CUDART_INF_F;
+      for (int warp = 0; warp < 8; ++warp)
+        maximum = fmaxf(maximum, warp_maxima[warp]);
+      maximum_value = maximum;
+    }
+  } else if (threadIdx.x == 0) {
+    float maximum = -CUDART_INF_F;
+    for (int token = 0; token < valid; ++token)
+      maximum = fmaxf(maximum, scores[token]);
+    maximum_value = maximum;
+  }
+  __syncthreads();
+  // Elementwise exponentiation and division have no reduction dependency.
+  // Keep the sum in the baseline key order to preserve decode numerics.
+  for(int token=threadIdx.x;token<valid;token+=blockDim.x)
+    scores[token]=expf(scores[token]-maximum_value);
+  __syncthreads();
+  if(threadIdx.x==0) {
+    float sum=0.0f;
+    for(int token=0;token<valid;++token)sum+=scores[token];
+    normalizer=sum;
+  }
+  __syncthreads();
+  for(int token=threadIdx.x;token<valid;token+=blockDim.x)
+    scores[token]/=normalizer;
+  __syncthreads();
+  for(int d=threadIdx.x;d<head_dim;d+=blockDim.x) {
+    float result=0.0f;
+    for(int token=0;token<valid;++token)
+      result+=scores[token]*to_float(value[(int64_t(token)*kv_heads+kv_head)*head_dim+d]);
+    output[int64_t(head)*head_dim+d]=from_float<T>(result);
+  }
+}
+
 template <class T>
 cudaError_t launch_attention(const void* query, const void* key,
                              const void* value, void* output,
@@ -150,6 +222,20 @@ cudaError_t launch_attention(const void* query, const void* key,
                              bool causal, int query_start,
                              const uint32_t* decode_meta, float scale,
                              cudaStream_t stream) {
+  if (batch == 1 && query_tokens == 1 && decode_meta != nullptr && key_tokens <= 4096) {
+    if (head_dim == 32) {
+      single_token_attention<T, 32><<<query_heads,256,key_tokens*sizeof(float),stream>>>(
+          static_cast<const T*>(query),static_cast<const T*>(key),static_cast<const T*>(value),
+          static_cast<T*>(output),key_tokens,key_stride,query_heads,kv_heads,head_dim,
+          causal,query_start,decode_meta,scale);
+    } else {
+      single_token_attention<T><<<query_heads,256,key_tokens*sizeof(float),stream>>>(
+          static_cast<const T*>(query),static_cast<const T*>(key),static_cast<const T*>(value),
+          static_cast<T*>(output),key_tokens,key_stride,query_heads,kv_heads,head_dim,
+          causal,query_start,decode_meta,scale);
+    }
+    return cudaGetLastError();
+  }
   constexpr int threads = 128;
   const int64_t rows =
       static_cast<int64_t>(batch) * query_tokens * query_heads;

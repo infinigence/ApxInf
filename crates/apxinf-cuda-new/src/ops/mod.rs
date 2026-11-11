@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod cache;
+mod conv1d;
 pub mod elementwise;
 pub mod embedding;
 pub mod gather;
@@ -12,8 +13,10 @@ pub mod pillow_bicubic;
 pub mod pointwise;
 pub mod preprocess;
 pub mod quantization;
+mod relative_attention;
 pub mod rope;
 pub mod sampling;
+pub mod tts;
 pub(crate) mod validation;
 
 // Keep these crate-private aliases while graph/workspace and unit tests still
@@ -38,6 +41,7 @@ pub use attention::{
     AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta, SegmentedAttentionArgs,
 };
 pub use cache::core::{append as cache_append, concat_rows, copy_tensor, reserve_prefix};
+pub use conv1d::{conv1d, Conv1dAccumulation, Conv1dArgs, Conv1dSemantic};
 pub use elementwise::add_into;
 pub use elementwise::core::{
     activation as elementwise_activation, add as elementwise_add, add_bias as elementwise_add_bias,
@@ -69,6 +73,7 @@ pub use pointwise::{
     pointwise, swiglu_into, PointwiseActivation, PointwiseArgs, PointwiseSemantic,
 };
 pub use preprocess::{vision_position, VisionPositionArgs};
+pub use relative_attention::{relative_attention, RelativeAttentionArgs};
 pub use quantization::{
     block_quantize, block_scale_buffer_bytes, pack_block_scales, quantization, quantize_per_tensor,
     BlockQuantizationArgs, BlockQuantizationSemantic, PackBlockScalesArgs, QuantizationArgs,
@@ -84,6 +89,7 @@ pub use rope::{
     RopeSemantic,
 };
 pub use sampling::{argmax, ArgmaxArgs};
+pub use tts::{argmax_rows, sinusoidal_embedding, write_kv_cache_token};
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(

@@ -36,6 +36,7 @@ pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
 pub mod speech;
+pub mod tts_trait;
 pub mod vla;
 mod walloss;
 

@@ -42,6 +42,7 @@ from .registry import available_policies, get_policy, register_policy
 from .impls import (
     Pi05Policy,
     Pi0FastPolicy,
+    GptSovitsPolicy,
     Gr00tPolicy,
     QwenDrivePolicy,
     SmolVlaPolicy,
@@ -60,6 +61,7 @@ __all__ = [
     "register_policy",
     "get_policy",
     "available_policies",
+    "GptSovitsPolicy",
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",

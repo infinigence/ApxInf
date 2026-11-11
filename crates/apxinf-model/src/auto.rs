@@ -22,6 +22,7 @@ use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
 use crate::speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
+use crate::tts_trait::TtsTrait;
 use crate::vla::{
     Action, ExecutionPolicy, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime,
 };
@@ -112,6 +113,9 @@ pub enum LoadedModel {
     Decision(DecisionModel),
     Image(Box<dyn ImageRuntime>),
     Speech(Box<dyn SpeechRuntime>),
+    /// Canonical-input TTS runtime: the policy layer owns the text front-end
+    /// and hands over phone/BERT ids, reference features and sampling knobs.
+    Tts(Box<dyn TtsTrait>),
 }
 
 impl LoadedModel {
@@ -129,6 +133,7 @@ impl LoadedModel {
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not text".into())),
         }
     }
 
@@ -139,6 +144,7 @@ impl LoadedModel {
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not VLA".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not VLA".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not VLA".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not VLA".into())),
         }
     }
 
@@ -149,6 +155,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
         }
     }
 
@@ -175,6 +182,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
         }
     }
 
@@ -185,6 +193,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
         }
     }
 
@@ -195,6 +204,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
         }
     }
 
@@ -209,6 +219,7 @@ impl LoadedModel {
             Self::Decision(model) => Ok(model.capabilities()),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not text".into())),
         }
     }
 
@@ -230,6 +241,9 @@ impl LoadedModel {
             )),
             Self::Speech(_) => Err(Error::Other(
                 "speech models do not use autoregressive generation defaults".into(),
+            )),
+            Self::Tts(_) => Err(Error::Other(
+                "tts models do not use autoregressive generation defaults".into(),
             )),
         }
     }
@@ -275,6 +289,7 @@ impl LoadedModel {
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not text".into())),
         }
     }
 
@@ -285,6 +300,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not image".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not image".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not image".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not image".into())),
         }
     }
 
@@ -299,6 +315,17 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not speech".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not speech".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not speech".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not speech".into())),
+        }
+    }
+
+    /// Borrow the canonical-input TTS runtime (phone/BERT ids already built).
+    pub fn tts_mut(&mut self) -> Result<&mut dyn TtsTrait> {
+        match self {
+            Self::Tts(model) => Ok(&mut **model),
+            _ => Err(Error::Other(
+                "loaded model does not implement TtsTrait".into(),
+            )),
         }
     }
 
