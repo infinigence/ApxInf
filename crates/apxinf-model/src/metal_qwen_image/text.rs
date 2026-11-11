@@ -2,7 +2,7 @@
 //! stack (mflux `Qwen21TextEncoder`), read from disk one layer at a time.
 use super::ops::Ops;
 use super::weights::{
-    TextEncoderFiles, TextLayer, DIM, HEADS, HEAD_DIM, TEXT_KV_HEADS, TEXT_LAYERS,
+    TextEncoderFiles, TextLayer, DIM, HEADS, HEAD_DIM, TEXT_KV_HEADS, TEXT_LAYERS, TEXT_VOCAB,
 };
 use apxinf_core::{Error, Result};
 use apxinf_mlx::{Array, MlxDType};
@@ -18,6 +18,20 @@ pub struct PromptTokens {
     pub ids: Vec<u32>,
     /// Leading system-prefix tokens whose states the DiT does not read.
     pub drop: usize,
+}
+
+fn embedding_ids(ids: &[u32]) -> Result<Vec<i32>> {
+    ids.iter()
+        .enumerate()
+        .map(|(position, &id)| {
+            if id as usize >= TEXT_VOCAB {
+                return Err(Error::Other(format!(
+                    "Qwen-Image token ID {id} at position {position} is outside text vocabulary {TEXT_VOCAB}"
+                )));
+            }
+            Ok(id as i32)
+        })
+        .collect()
 }
 
 pub fn tokenize(tokenizer: &Tokenizer, prompt: &str) -> Result<PromptTokens> {
@@ -110,7 +124,7 @@ fn layer(
 pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Result<Array> {
     let stream = ops.stream();
     let length = tokens.ids.len();
-    let ids: Vec<i32> = tokens.ids.iter().map(|&id| id as i32).collect();
+    let ids = embedding_ids(&tokens.ids)?;
     let mut h = {
         let embedding = files.tensor(stream, "embed_tokens.weight")?;
         let h = embedding.take(&Array::from_i32(stream, &[1, length], &ids)?, 0)?;
@@ -148,4 +162,20 @@ pub fn encode(files: &TextEncoderFiles, tokens: &PromptTokens, ops: &Ops) -> Res
     let h = rms_norm(&h, &norm, ops)?.slice_axis(1, tokens.drop, length)?;
     h.eval()?;
     Ok(h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_ids_preserve_valid_ids_and_reject_invalid_suffixes() {
+        let last = (TEXT_VOCAB - 1) as u32;
+        assert_eq!(embedding_ids(&[0, last]).unwrap(), [0, last as i32]);
+        for invalid in [TEXT_VOCAB as u32, i32::MAX as u32 + 1, u32::MAX] {
+            let error = embedding_ids(&[0, last, invalid]).unwrap_err().to_string();
+            assert!(error.contains(&format!("token ID {invalid} at position 2")));
+            assert!(error.contains(&format!("vocabulary {TEXT_VOCAB}")));
+        }
+    }
 }
