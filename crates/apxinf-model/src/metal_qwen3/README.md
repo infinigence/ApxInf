@@ -36,7 +36,8 @@ BF16 prefill projections remain resident alongside their W8 decode copies.
 This is a decode-performance selection, not a guaranteed memory-saving mode;
 its resident weight memory can exceed BF16.
 This variant does not select the BF16 decoder-block callable: its inherited
-compilation boundary and valid-length attention remain explicit.
+compilation boundary and valid-length attention remain explicit. It shares the
+device greedy decode path with `bf16-compiled`.
 
 `Qwen3Model::prepare(prompt_len, max_new_tokens)` allocates a bounded KV profile
 and warms its sequence shapes before inference. Capacity rounds up to 256 tokens
@@ -88,7 +89,8 @@ apxinf generate --model /path/to/Qwen3-0.6B --device metal --dtype bf16 \
 Sampling capability is supplied by the MLX backend. Currently only greedy
 selection without penalties/logprob is implemented; Qwen's random-sampling
 generation defaults must be overridden explicitly. Unsupported options fail.
-The compiled BF16 variant uses device greedy IDs with one-step async lookahead.
+The `bf16-compiled` and `mixed-w8` variants use device greedy IDs with one-step
+async lookahead.
 Set `APXINF_MLX_SYNC_DECODE=1` to use the synchronous generation path. Public
 `forward` remains synchronous. EOS and cancellation drain the extra step and
 restore the position of the published prefix; async failures invalidate state.

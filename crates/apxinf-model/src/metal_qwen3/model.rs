@@ -49,6 +49,18 @@ fn swiglu(gate: &Array, up: &Array) -> Result<Array> {
     gate.mul(&gate.sigmoid()?)?.mul(up)
 }
 
+/// Selections that prepare compiled local norm/RoPE functions and evaluate
+/// every decode step, so the device loop can feed the next token without a
+/// host round trip. `bf16-public` stays on the synchronous loop as the
+/// ordered reference.
+fn device_greedy_variant(variant: Variant) -> bool {
+    matches!(variant, Variant::Bf16Compiled | Variant::MixedW8)
+}
+
+fn device_greedy(variant: Variant, params: &apxinf_core::TokenSamplingParams) -> bool {
+    device_greedy_variant(variant) && crate::mlx_decode::enabled(params)
+}
+
 fn decode_mask(positions: &Array, index: &Array) -> Result<Array> {
     positions
         .less_equal(index)?
@@ -704,7 +716,7 @@ impl LlmTrait for Qwen3Model {
         params: &apxinf_core::TokenSamplingParams,
         prompt_end: u32,
     ) -> Result<Box<dyn crate::llm_trait::TokenSequence + 'a>> {
-        if self.variant == Variant::Bf16Compiled && crate::mlx_decode::enabled(params) {
+        if device_greedy(self.variant, params) {
             let first = self.backend.array(&first)?;
             Ok(Box::new(crate::mlx_decode::GreedySequence::new(
                 self, first, prompt_end,
@@ -824,6 +836,22 @@ mod tests {
     use super::super::config::MAX_CONTEXT;
     use super::*;
     use half::bf16;
+
+    #[test]
+    fn device_greedy_admits_every_variant_with_prepared_local_norm() {
+        for (variant, admitted) in [
+            (Variant::Bf16Compiled, true),
+            (Variant::MixedW8, true),
+            (Variant::Bf16Public, false),
+        ] {
+            assert_eq!(device_greedy_variant(variant), admitted, "{variant:?}");
+        }
+        let mut penalized = apxinf_core::TokenSamplingParams::greedy();
+        penalized.penalties.repetition = 1.1;
+        for variant in [Variant::Bf16Compiled, Variant::MixedW8] {
+            assert!(!device_greedy(variant, &penalized), "{variant:?}");
+        }
+    }
 
     #[test]
     fn cpu_decode_mask_includes_current_position_and_excludes_padding() {
