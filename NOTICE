@@ -45,8 +45,9 @@ MiniCPM5 tapped verification, padded independent M1 projections and DSpark
 integration derive from target df20140e26ea1ef0951747fa192a3891afa24845.
 These revisions describe provenance, not qualification of the ApxInf port.
 
-The Clef Q4 decode, row padding, FP16 GEMM and gated delta recurrence kernels
-are adapted from EngineTailor (MIT), Copyright 2026 Haiyan Qin.
+The Clef Q4 decode, row padding, FP16 GEMM, causal depthwise convolution and
+gated delta recurrence kernels are adapted from EngineTailor (MIT), Copyright
+2026 Haiyan Qin.
 
 The Qwen-Image MetalPerformancePrimitives BF16 GEMM kernel is adapted from
 EngineTailor (MIT), Copyright 2026 Haiyan Qin.
@@ -58,7 +59,8 @@ The gated delta recurrence and the half-split rotary embedding kernel adapt
 MLX-VLM 0.7.4, revision 00093678a1f6bd513212d94778ffc381d6d731bf.
 Copyright (c) 2025 Prince Canuma. MIT License.
 
-The split GEMM fragment layout follows MLX 0.32.3 Steel mma.h.
+The split GEMM fragment layout follows MLX 0.32.3 Steel mma.h, and the causal
+convolution follows MLX 0.32.3 depthwise_conv_1d.
 Copyright (c) 2024 Apple Inc. MIT License.
 
 The interleaved Q/K normalization and rotary embedding kernel and the
