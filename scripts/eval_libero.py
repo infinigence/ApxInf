@@ -119,9 +119,7 @@ def _two_image_keys(value: str) -> Tuple[str, str]:
     """
     keys = tuple(part.strip() for part in value.split(",") if part.strip())
     if len(keys) != 2:
-        raise argparse.ArgumentTypeError(
-            f"expected two comma-separated keys (base,wrist), got {len(keys)}: {value!r}"
-        )
+        raise argparse.ArgumentTypeError(f"expected two comma-separated keys (base,wrist), got {len(keys)}: {value!r}")
     return keys
 
 
@@ -167,8 +165,7 @@ def completed_runs(
         item_precision = item.get("precision", "fp8")
         if item_precision != precision:
             raise ValueError(
-                f"ledger precision is {item_precision!r}, requested {precision!r} "
-                f"at line {line_number}"
+                f"ledger precision is {item_precision!r}, requested {precision!r} " f"at line {line_number}"
             )
         if item.get("status") == "completed":
             # Rows written before rollout-protocol fields were added used the
@@ -179,8 +176,7 @@ def completed_runs(
             item_replan_steps = item.get("replan_steps", REPLAN_STEPS)
             if max_steps is not None and item_max_steps != max_steps:
                 raise ValueError(
-                    f"ledger max_steps is {item_max_steps!r}, requested "
-                    f"{max_steps!r} at line {line_number}"
+                    f"ledger max_steps is {item_max_steps!r}, requested " f"{max_steps!r} at line {line_number}"
                 )
             if replan_steps is not None and item_replan_steps != replan_steps:
                 raise ValueError(
@@ -221,11 +217,7 @@ def write_summary(
     for suite in sorted({key[0] for key in expected_keys}):
         per_task = {}
         for task_id in sorted({t for (s, t, _) in expected_keys if s == suite}):
-            rows = [
-                row
-                for (s, t, _), row in ledger.items()
-                if s == suite and t == task_id
-            ]
+            rows = [row for (s, t, _), row in ledger.items() if s == suite and t == task_id]
             successes = sum(bool(row["success"]) for row in rows)
             per_task[str(task_id)] = {
                 "completed": len(rows),
@@ -237,9 +229,7 @@ def write_summary(
         per_suite[suite] = {
             "completed": len(suite_rows),
             "successes": suite_successes,
-            "success_rate": (
-                suite_successes / len(suite_rows) if suite_rows else None
-            ),
+            "success_rate": (suite_successes / len(suite_rows) if suite_rows else None),
             "per_task": per_task,
         }
     rows = list(ledger.values())
@@ -260,9 +250,7 @@ def write_summary(
             for suite, task, trial in sorted(expected_keys - set(ledger))
         ],
         "successes": sum(bool(row["success"]) for row in rows),
-        "success_rate": (
-            sum(bool(row["success"]) for row in rows) / len(rows) if rows else None
-        ),
+        "success_rate": (sum(bool(row["success"]) for row in rows) / len(rows) if rows else None),
         "per_suite": per_suite,
         "timing": _aggregate_timing(rows),
         "updated_unix_seconds": time.time(),
@@ -294,23 +282,16 @@ def _aggregate_timing(rows: list[dict]) -> dict:
         "websocket_transport_seconds",
         "inference_seconds",
     )
-    totals = {
-        name: sum(float(row.get(name, 0.0)) for row in completed) for name in segments
-    }
+    totals = {name: sum(float(row.get(name, 0.0)) for row in completed) for name in segments}
     per_call_ms = {
-        name.replace("_seconds", "_ms"): (
-            (value / total_replans * 1000.0) if total_replans else None
-        )
+        name.replace("_seconds", "_ms"): ((value / total_replans * 1000.0) if total_replans else None)
         for name, value in totals.items()
     }
     return {
         "episodes": len(completed),
         "total_inference_calls": total_replans,
         "total_seconds": {name: round(value, 6) for name, value in totals.items()},
-        "per_call_ms": {
-            name: (round(value, 4) if value is not None else None)
-            for name, value in per_call_ms.items()
-        },
+        "per_call_ms": {name: (round(value, 4) if value is not None else None) for name, value in per_call_ms.items()},
     }
 
 
@@ -344,8 +325,7 @@ class Backend(Protocol):
         """Return ``(actions, normalized_actions, timing)``."""
         ...
 
-    def close(self) -> None:
-        ...
+    def close(self) -> None: ...
 
 
 def state_finger_joints(metadata: Mapping) -> int:
@@ -387,9 +367,7 @@ def _observation(base, wrist, state: Any, prompt, keys: WireKeys) -> dict:
 class WebsocketBackend:
     """Reach an OpenPI-compatible server through the unmodified ``openpi_client``."""
 
-    def __init__(
-        self, host: str, port: int, expected_precision: str, keys: WireKeys
-    ) -> None:
+    def __init__(self, host: str, port: int, expected_precision: str, keys: WireKeys) -> None:
         from openpi_client import websocket_client_policy
 
         # WebsocketClientPolicy honours the ambient proxy; exempt the target host
@@ -405,13 +383,13 @@ class WebsocketBackend:
         self._keys = keys
         actual_precision = self.metadata.get("precision")
         if "model_variant" in self.metadata:
-            actual_precision = {"bf16": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}.get(self.metadata["model_variant"])
+            actual_precision = {"bf16": "bf16", "bf16_ref": "bf16", "fp8_static": "fp8", "int8_dynamic": "int8"}.get(
+                self.metadata["model_variant"]
+            )
 
         if actual_precision != expected_precision:
             self.close()
-            raise RuntimeError(
-                f"server precision is {actual_precision!r}, expected {expected_precision!r}"
-            )
+            raise RuntimeError(f"server precision is {actual_precision!r}, expected {expected_precision!r}")
         self._assert_server_speaks_the_same_dialect()
 
     def _assert_server_speaks_the_same_dialect(self) -> None:
@@ -438,14 +416,10 @@ class WebsocketBackend:
                     f"{self._keys.state_key!r}; pass --state-key to match it"
                 )
 
-    def infer(
-        self, base, wrist, state, prompt, noise=None
-    ) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
+    def infer(self, base, wrist, state, prompt, noise=None) -> Tuple[np.ndarray, Optional[np.ndarray], dict]:
         if noise is not None:
             raise RuntimeError("warm-start noise requires --backend in-process")
-        response = self._client.infer(
-            _observation(base, wrist, state, prompt, self._keys)
-        )
+        response = self._client.infer(_observation(base, wrist, state, prompt, self._keys))
         actions = np.asarray(response["actions"], dtype=np.float32)
         # Only OpenPI-contract keys ride the wire; ``policy_timing`` /
         # ``server_timing`` are the server's tolerated diagnostic namespaces.
@@ -458,12 +432,16 @@ class WebsocketBackend:
         model_ms = float(policy_timing.get("infer_ms", 0.0))
         server_total_ms = float(policy_timing.get("policy_ms", model_ms))
         server_compute_ms = float(server_timing.get("infer_ms", server_total_ms))
-        return actions, None, {
-            "model_seconds": model_ms / 1000.0,
-            # Server compute the client can see beyond the pure model = the
-            # server-side processor pipeline (event-loop wall clock minus model).
-            "server_processor_seconds": max(0.0, server_compute_ms - model_ms) / 1000.0,
-        }
+        return (
+            actions,
+            None,
+            {
+                "model_seconds": model_ms / 1000.0,
+                # Server compute the client can see beyond the pure model = the
+                # server-side processor pipeline (event-loop wall clock minus model).
+                "server_processor_seconds": max(0.0, server_compute_ms - model_ms) / 1000.0,
+            },
+        )
 
     def state_from_observation(self, observation) -> np.ndarray:
         # Preserve the established OpenPI wire contract. A GR00T websocket
@@ -507,12 +485,18 @@ class InProcessBackend:
             "seed": args.model_seed if args.model_seed is not None else args.seed,
         }
         from apxinf.policies.auto import _read_model_type
+
         model_type = args.model_type or _read_model_type(pathlib.Path(args.model_dir))
         # Campaign precision is a numerical comparison category in the ledger.
         # PI0.5 loading uses a model-local implementation ID instead.
         selector = (
-            {"model_variant": {"bf16": "bf16", "fp8": "fp8_static", "int8": "int8_dynamic"}[args.precision]}
-            if model_type == "pi05" else {"precision": args.precision}
+            {
+                "model_variant": {"bf16": "bf16", "bf16_ref": "bf16_ref", "fp8": "fp8_static", "int8": "int8_dynamic"}[
+                    args.precision
+                ]
+            }
+            if model_type == "pi05"
+            else {"precision": args.precision}
         )
         self._policy = AutoPolicy.from_pretrained(
             args.model_dir,
@@ -538,12 +522,8 @@ class InProcessBackend:
             return libero_gr00t_state(observation)
         return libero_state(observation)
 
-    def infer(
-        self, base, wrist, state, prompt, noise=None
-    ) -> Tuple[np.ndarray, np.ndarray, dict]:
-        result = self._policy.infer(
-            _observation(base, wrist, state, prompt, self._keys), noise=noise
-        )
+    def infer(self, base, wrist, state, prompt, noise=None) -> Tuple[np.ndarray, np.ndarray, dict]:
+        result = self._policy.infer(_observation(base, wrist, state, prompt, self._keys), noise=noise)
         actions = np.asarray(result["actions"], dtype=np.float32)
         if self._is_gr00t:
             actions = libero_gr00t_action(actions)
@@ -551,10 +531,14 @@ class InProcessBackend:
         timing = result.get("timing", {}) or {}
         model_ms = float(timing.get("model_ms", 0.0))
         total_ms = float(timing.get("total_ms", model_ms))
-        return actions, normalized, {
-            "model_seconds": model_ms / 1000.0,
-            "server_processor_seconds": max(0.0, total_ms - model_ms) / 1000.0,
-        }
+        return (
+            actions,
+            normalized,
+            {
+                "model_seconds": model_ms / 1000.0,
+                "server_processor_seconds": max(0.0, total_ms - model_ms) / 1000.0,
+            },
+        )
 
     def close(self) -> None:
         close = getattr(self._policy, "close", None)
@@ -588,6 +572,7 @@ def run_episode(
     settle_gripper: float = -1.0,
     finger_joints: int = 1,
     max_steps: int = MAX_STEPS,
+    flip_180: bool = True,
 ) -> dict:
     episode_started = time.perf_counter()
     env.reset()
@@ -625,6 +610,7 @@ def run_episode(
             images = libero_images(
                 observation["agentview_image"],
                 observation["robot0_eye_in_hand_image"],
+                flip_180=flip_180,
             )
             state = libero_state(observation, finger_joints=finger_joints)
             preprocess_seconds += time.perf_counter() - preprocess_started
@@ -646,9 +632,7 @@ def run_episode(
                     warm_noise_checksum = float(np.abs(noise).sum())
 
             request_started = time.perf_counter()
-            actions, normalized_actions, timing = backend.infer(
-                images[0], images[1], state, prompt, noise=noise
-            )
+            actions, normalized_actions, timing = backend.infer(images[0], images[1], state, prompt, noise=noise)
             round_trip_seconds = time.perf_counter() - request_started
             inference_seconds += round_trip_seconds
             # The action horizon is a checkpoint property (metadata ``action_horizon``),
@@ -656,37 +640,24 @@ def run_episode(
             # native ``pi05_libero_base`` checkpoints emit H=50. The rollout only
             # consumes ``REPLAN_STEPS`` actions per chunk, so any horizon >=
             # REPLAN_STEPS is valid; we only require the correct action width.
-            if (
-                actions.ndim != 2
-                or actions.shape[1] != LIBERO_ACTION_DIM
-                or actions.shape[0] < replan_steps
-            ):
-                raise ValueError(
-                    f"expected actions (>= {replan_steps}, {LIBERO_ACTION_DIM}), "
-                    f"got {actions.shape}"
-                )
+            if actions.ndim != 2 or actions.shape[1] != LIBERO_ACTION_DIM or actions.shape[0] < replan_steps:
+                raise ValueError(f"expected actions (>= {replan_steps}, {LIBERO_ACTION_DIM}), " f"got {actions.shape}")
             if not np.isfinite(actions).all():
                 raise FloatingPointError("backend returned non-finite actions")
             if warm_start:
                 if normalized_actions is None:
                     raise RuntimeError("warm-start requires backend normalized_actions")
                 if normalized_actions.ndim != 2:
-                    raise ValueError(
-                        f"expected normalized actions [H, D], got {normalized_actions.shape}"
-                    )
+                    raise ValueError(f"expected normalized actions [H, D], got {normalized_actions.shape}")
                 if not np.isfinite(normalized_actions).all():
                     raise FloatingPointError("backend returned non-finite normalized actions")
-                previous_normalized_chunk = np.ascontiguousarray(
-                    normalized_actions, dtype=np.float32
-                )
+                previous_normalized_chunk = np.ascontiguousarray(normalized_actions, dtype=np.float32)
 
             segment_model = float(timing.get("model_seconds", 0.0))
             segment_processor = float(timing.get("server_processor_seconds", 0.0))
             model_seconds += segment_model
             server_processor_seconds += segment_processor
-            transport_seconds += max(
-                0.0, round_trip_seconds - segment_model - segment_processor
-            )
+            transport_seconds += max(0.0, round_trip_seconds - segment_model - segment_processor)
             if first_action_checksum is None:
                 first_action_checksum = float(np.abs(actions).sum())
             action_plan.extend(actions[:replan_steps])
@@ -733,13 +704,16 @@ def run_episode(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--backend", choices=("websocket", "in-process"), required=True,
+        "--backend",
+        choices=("websocket", "in-process"),
+        required=True,
         help="reach the model through a running server, or build it in-process",
     )
-    parser.add_argument("--precision", choices=("fp8", "bf16", "int8"), required=True)
+    parser.add_argument("--precision", choices=("fp8", "bf16", "bf16_ref", "int8"), required=True)
     parser.add_argument("--suite", default="libero_10", choices=(*ALL_SUITES, "all"))
     parser.add_argument(
-        "--tasks", default="all",
+        "--tasks",
+        default="all",
         help="'all' (default) or a comma list of task ids, applied within each selected suite",
     )
     parser.add_argument("--trials-per-task", type=int, default=10)
@@ -768,6 +742,11 @@ def parse_args() -> argparse.Namespace:
         help="seventh action used during the initial settle steps (default: -1)",
     )
     parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument(
+        "--no-flip",
+        action="store_true",
+        help="disable the 180-degree LIBERO image rotation (A/B comparison)",
+    )
     parser.add_argument("--results-jsonl", required=True, type=pathlib.Path)
     parser.add_argument("--summary-json", required=True, type=pathlib.Path)
 
@@ -804,7 +783,8 @@ def parse_args() -> argparse.Namespace:
     in_process.add_argument("--tactics", type=pathlib.Path, help=argparse.SUPPRESS)
     in_process.add_argument("--tokenizer", type=pathlib.Path)
     in_process.add_argument(
-        "--norm-stats", type=pathlib.Path,
+        "--norm-stats",
+        type=pathlib.Path,
         help="explicit OpenPI-style norm_stats.json; overrides checkpoint normalization",
     )
     in_process.add_argument("--norm-key")
@@ -850,10 +830,7 @@ def parse_args() -> argparse.Namespace:
         "--warm-start-alpha",
         type=float,
         default=0.5,
-        help=(
-            "cache/noise blend coefficient used only with --warm-start; partial "
-            "flow starts at 1-alpha"
-        ),
+        help=("cache/noise blend coefficient used only with --warm-start; partial " "flow starts at 1-alpha"),
     )
 
     args = parser.parse_args()
@@ -885,8 +862,7 @@ def parse_args() -> argparse.Namespace:
             parser.error("--flow-start-time must be in (0, 1]")
     elif args.flow_start_time is not None and args.flow_start_time < 1.0:
         print(
-            "warning: --flow-start-time < 1.0 without --warm-start runs partial "
-            "flow from pure noise",
+            "warning: --flow-start-time < 1.0 without --warm-start runs partial " "flow from pure noise",
             file=sys.stderr,
             flush=True,
         )
@@ -925,9 +901,7 @@ def resolve_task_ids(spec: str, n_tasks: int, suite: str) -> list[int]:
         raise ValueError(f"--tasks has duplicate ids: {task_ids}")
     out_of_range = [t for t in task_ids if not 0 <= t < n_tasks]
     if out_of_range:
-        raise ValueError(
-            f"--tasks {out_of_range} out of range for suite {suite!r} (0..{n_tasks - 1})"
-        )
+        raise ValueError(f"--tasks {out_of_range} out of range for suite {suite!r} (0..{n_tasks - 1})")
     return task_ids
 
 
@@ -964,9 +938,7 @@ def main() -> None:
     )
     unexpected = set(ledger) - expected_keys
     if unexpected:
-        raise ValueError(
-            f"ledger contains runs outside requested scope: {sorted(unexpected)}"
-        )
+        raise ValueError(f"ledger contains runs outside requested scope: {sorted(unexpected)}")
     write_summary(
         args.summary_json,
         ledger,
@@ -986,9 +958,7 @@ def main() -> None:
                 task = suite.get_task(task_id)
                 prompt = str(task.language)
                 pending = [
-                    trial_id
-                    for trial_id in range(args.trials_per_task)
-                    if (name, task_id, trial_id) not in ledger
+                    trial_id for trial_id in range(args.trials_per_task) if (name, task_id, trial_id) not in ledger
                 ]
                 if not pending:
                     print(f"{name} task {task_id}: already complete", flush=True)
@@ -1016,14 +986,18 @@ def main() -> None:
                                     args.settle_gripper,
                                     finger_joints,
                                     args.max_steps,
+                                    flip_180=not args.no_flip,
                                 )
                                 record["attempt"] = attempt
                                 record["precision"] = args.precision
                                 append_record(args.results_jsonl, record)
                                 ledger[(name, task_id, trial_id)] = record
                                 write_summary(
-                                    args.summary_json, ledger, expected_keys,
-                                    args.precision, transport,
+                                    args.summary_json,
+                                    ledger,
+                                    expected_keys,
+                                    args.precision,
+                                    transport,
                                     max_steps=args.max_steps,
                                     replan_steps=args.replan_steps,
                                 )
@@ -1050,8 +1024,7 @@ def main() -> None:
                                 }
                                 append_record(args.results_jsonl, failure)
                                 print(
-                                    f"{name} task={task_id} trial={trial_id} attempt={attempt} "
-                                    f"ERROR: {error}",
+                                    f"{name} task={task_id} trial={trial_id} attempt={attempt} " f"ERROR: {error}",
                                     file=sys.stderr,
                                     flush=True,
                                 )

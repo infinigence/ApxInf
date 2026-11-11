@@ -2,27 +2,27 @@
 //!
 //! Declares the aclnn types (aclTensor, aclScalar, aclOpExecutor) and the
 //! two-phase operator functions needed by PI0.5. Each operator has:
-//! - `aclnnXxxGetWorkspaceSize` — planning phase, returns workspace + executor
-//! - `aclnnXxx` — execution phase, runs the executor on a stream
+//! - `aclnnXxxGetWorkspaceSize` —planning phase, returns workspace + executor
+//! - `aclnnXxx` —execution phase, runs the executor on a stream
 
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 
 use super::acl::aclrtStream;
 
-// ── aclnn status ──────────────────────────────────────────────────────
+// ---- aclnn status ----
 
 /// aclnn error code. 0 = OK.
 pub type aclnnStatus = c_int;
 
-// ── aclnn init / finalize ─────────────────────────────────────────────
+// ---- aclnn init / finalize ----
 
 extern "C" {
     pub fn aclnnInit(config_path: *const c_char) -> aclnnStatus;
     pub fn aclnnFinalize() -> aclnnStatus;
 }
 
-// ── Opaque types (from acl_meta.h) ────────────────────────────────────
+// ---- Opaque types (from acl_meta.h) ----
 
 #[repr(C)]
 pub struct aclOpExecutor {
@@ -49,7 +49,7 @@ pub struct aclTensorList {
     _private: [u8; 0],
 }
 
-// ── ACL data types and formats (from acl_base_rt.h) ───────────────────
+// ---- ACL data types and formats (from acl_base_rt.h) ----
 
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +75,7 @@ pub enum aclFormat {
     ACL_FORMAT_ND = 2,
 }
 
-// ── aclTensor / aclScalar lifecycle (from acl_meta.h) ─────────────────
+// ---- aclTensor / aclScalar lifecycle (from acl_meta.h) ----
 
 extern "C" {
     pub fn aclCreateTensor(
@@ -107,7 +107,7 @@ extern "C" {
     pub fn aclDestroyTensorList(array: *const aclTensorList) -> aclnnStatus;
 }
 
-// ── Operator: aclnnSilu ───────────────────────────────────────────────
+// ---- Operator: aclnnSilu ----
 
 extern "C" {
     pub fn aclnnSiluGetWorkspaceSize(
@@ -125,7 +125,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnAdd ────────────────────────────────────────────────
+// ---- Operator: aclnnAdd ----
 
 extern "C" {
     pub fn aclnnAddGetWorkspaceSize(
@@ -161,7 +161,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnMul ────────────────────────────────────────────────
+// ---- Operator: aclnnMul ----
 
 extern "C" {
     pub fn aclnnMulGetWorkspaceSize(
@@ -180,7 +180,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnMuls (scalar multiplication) ───────────────────────
+// ---- Operator: aclnnMuls (scalar multiplication) ----
 
 extern "C" {
     pub fn aclnnMulsGetWorkspaceSize(
@@ -199,7 +199,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnRmsNorm ────────────────────────────────────────────
+// ---- Operator: aclnnRmsNorm ----
 
 extern "C" {
     pub fn aclnnRmsNormGetWorkspaceSize(
@@ -220,7 +220,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnMatmul ─────────────────────────────────────────────
+// ---- Operator: aclnnMatmul ----
 
 extern "C" {
     pub fn aclnnMatmulGetWorkspaceSize(
@@ -240,7 +240,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnEmbedding ──────────────────────────────────────────
+// ---- Operator: aclnnEmbedding ----
 
 extern "C" {
     pub fn aclnnEmbeddingGetWorkspaceSize(
@@ -259,7 +259,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnApplyRotaryPosEmb (RoPE) ───────────────────────────
+// ---- Operator: aclnnApplyRotaryPosEmb (RoPE) ----
 
 extern "C" {
     pub fn aclnnApplyRotaryPosEmbGetWorkspaceSize(
@@ -280,8 +280,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnRotaryPositionEmbedding (RoPE, simpler op) ─────────
-// On 950PR: requires cos/sin same shape as x (no broadcasting in practice).
+// ---- Operator: aclnnRotaryPositionEmbedding (RoPE, simpler op) ----
+// Note: requires cos/sin same shape as x (no broadcasting in use here).
 // mode=0 (half): out[i] = x[i]*cos[i] - x[i+d/2]*sin[i]; out[i+d/2] = x[i+d/2]*cos[i+d/2] + x[i]*sin[i+d/2]
 // cos/sin must be full head_dim (half_dim values repeated).
 
@@ -304,7 +304,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnIncreFlashAttentionV4 (decode attention) ───────────
+// ---- Operator: aclnnIncreFlashAttentionV4 (decode attention) ----
 
 extern "C" {
     pub fn aclnnIncreFlashAttentionV4GetWorkspaceSize(
@@ -342,7 +342,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnPromptFlashAttentionV3 (prefill attention) ─────────
+// ---- Operator: aclnnPromptFlashAttentionV3 (prefill attention) ----
 
 extern "C" {
     pub fn aclnnPromptFlashAttentionV3GetWorkspaceSize(
@@ -379,8 +379,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnFlashAttentionScore (training-domain flash attention) ─
-// On 950PR, PFA has no compiled kernels, but FAS does.
+// ---- Operator: aclnnFlashAttentionScore (training-domain flash attention) ----
+// PFA may lack compiled kernels on some CANN builds; FAS is preferred.
 // softmaxMaxOut/softmaxSumOut must be [batch, heads, seq, 8] FP32.
 
 extern "C" {
@@ -417,7 +417,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnLayerNorm ──────────────────────────────────────────
+// ---- Operator: aclnnLayerNorm ----
 
 extern "C" {
     pub fn aclnnLayerNormGetWorkspaceSize(
@@ -441,7 +441,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnGelu ───────────────────────────────────────────────
+// ---- Operator: aclnnGelu ----
 
 extern "C" {
     pub fn aclnnGeluGetWorkspaceSize(
@@ -459,7 +459,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnGeGlu ──────────────────────────────────────────────
+// ---- Operator: aclnnGeGlu ----
 // GeGLU: split input along dim, out = A * Gelu(B)
 // approximate: 0 = tanh, 1 = none
 
@@ -482,7 +482,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnAddRmsNorm ─────────────────────────────────────────
+// ---- Operator: aclnnAddRmsNorm ----
 // Fused: x = x1 + x2; y = (x / RMS(x)) * gamma; rstd = 1 / RMS(x)
 // Note: rstd_out must be 2D [rows, 1], not 1D [rows]
 
@@ -507,7 +507,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnSplitWithSize ──────────────────────────────────────
+// ---- Operator: aclnnSplitWithSize ----
 // Split tensor into variable-size chunks along a dimension
 
 extern "C" {
@@ -528,8 +528,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnPermute (Transpose) ────────────────────────────────
-// Permute dimensions. P0: VLM 180次 + AE 720次, attention 布局变换.
+// ---- Operator: aclnnPermute (Transpose) ----
+// Permute dimensions. P0: VLM 180M + AE 720M, attention weight reshape.
 
 extern "C" {
     pub fn aclnnPermuteGetWorkspaceSize(
@@ -548,8 +548,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnCast ───────────────────────────────────────────────
-// Type conversion. P0: VLM 171次 + AE 1110次, BF16↔FP32 精度转换.
+// ---- Operator: aclnnCast ----
+// Type conversion. P0: VLM 171M + AE 1110M, BF16->FP32 cast.
 
 extern "C" {
     pub fn aclnnCastGetWorkspaceSize(
@@ -568,8 +568,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnCat (Concat) ───────────────────────────────────────
-// Concatenate tensors along a dimension. P0: VLM 3次 + AE 364次, KV cache concat.
+// ---- Operator: aclnnCat (Concat) ----
+// Concatenate tensors along a dimension. P0: VLM 3M + AE 364M, KV cache concat.
 
 extern "C" {
     pub fn aclnnCatGetWorkspaceSize(
@@ -588,8 +588,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnExpand (BroadcastTo) ───────────────────────────────
-// Broadcast tensor to expanded shape. P0: VLM 35次 + AE 361次, attention mask 广播.
+// ---- Operator: aclnnExpand (BroadcastTo) ----
+// Broadcast tensor to expanded shape. P0: VLM 35M + AE 361M, attention mask
 
 extern "C" {
     pub fn aclnnExpandGetWorkspaceSize(
@@ -608,8 +608,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnSub ────────────────────────────────────────────────
-// self - alpha * other. P1: VLM 4次 + AE 1次.
+// ---- Operator: aclnnSub ----
+// self - alpha * other. P1: VLM 4M + AE 1M
 
 extern "C" {
     pub fn aclnnSubGetWorkspaceSize(
@@ -629,8 +629,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnDiv ────────────────────────────────────────────────
-// Element-wise division. P1: VLM 1次 + AE 1次.
+// ---- Operator: aclnnDiv ----
+// Element-wise division. P1: VLM 1M + AE 1M
 
 extern "C" {
     pub fn aclnnDivGetWorkspaceSize(
@@ -649,8 +649,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnClamp (ClipByValue) ────────────────────────────────
-// Clamp tensor to [min, max]. P1: VLM 2次, attention mask clip.
+// ---- Operator: aclnnClamp (ClipByValue) ----
+// Clamp tensor to [min, max]. P1: VLM 2M attention mask clip.
 
 extern "C" {
     pub fn aclnnClampGetWorkspaceSize(
@@ -670,8 +670,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnConvolution ────────────────────────────────────────
-// N-d convolution. P1: VLM 1次, ViT patch embedding (当前 STUB).
+// ---- Operator: aclnnConvolution ----
+// N-d convolution. P1: VLM 1M ViT patch embedding (STUB).
 
 extern "C" {
     pub fn aclnnConvolutionGetWorkspaceSize(
@@ -697,8 +697,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnSoftmax ────────────────────────────────────────────
-// Softmax along a dimension. P3: independent softmax (当前用 FAS 融合).
+// ---- Operator: aclnnSoftmax ----
+// Softmax along a dimension. P3: independent softmax ( ?FAS ?.
 
 extern "C" {
     pub fn aclnnSoftmaxGetWorkspaceSize(
@@ -717,7 +717,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnBatchMatMul ────────────────────────────────────────
+// ---- Operator: aclnnBatchMatMul ----
 // Explicit batched matrix multiply. P3: autotune candidate for batched GEMM.
 
 extern "C" {
@@ -737,7 +737,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnFusedMatmul ────────────────────────────────────────
+// ---- Operator: aclnnFusedMatmul ----
 // Fused GEMM (bias + fusedOp). P3: autotune candidate for GEMM+bias+activation.
 
 extern "C" {
@@ -761,7 +761,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnGemmaRmsNorm ───────────────────────────────────────
+// ---- Operator: aclnnGemmaRmsNorm ----
 // Gemma-specific RMSNorm. P3: PI0.5 uses Gemma2B + Gemma300M.
 
 extern "C" {
@@ -783,8 +783,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnRange ──────────────────────────────────────────────
-// Generate range [start, end) with step. P1: VLM 1次 + AE 1次, sequence generation.
+// ---- Operator: aclnnRange ----
+// Generate range [start, end) with step. P1: VLM 1M + AE 1M sequence generation.
 
 extern "C" {
     pub fn aclnnRangeGetWorkspaceSize(
@@ -804,8 +804,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnCumsum ─────────────────────────────────────────────
-// Cumulative sum along a dimension. P1: VLM 1次 + AE 1次.
+// ---- Operator: aclnnCumsum ----
+// Cumulative sum along a dimension. P1: VLM 1M + AE 1M
 
 extern "C" {
     pub fn aclnnCumsumGetWorkspaceSize(
@@ -824,8 +824,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnStack ──────────────────────────────────────────────
-// Stack tensors along a new dimension. P2: VLM 2次.
+// ---- Operator: aclnnStack ----
+// Stack tensors along a new dimension. P2: VLM 2M
 
 extern "C" {
     pub fn aclnnStackGetWorkspaceSize(
@@ -844,7 +844,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnInplaceCopy ────────────────────────────────────────
+// ---- Operator: aclnnInplaceCopy ----
 // In-place copy. P2: KV cache updates.
 
 extern "C" {
@@ -863,7 +863,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnSlice ──────────────────────────────────────────────
+// ---- Operator: aclnnSlice ----
 // Extract a sub-tensor along a dimension. Used for QKV split (3 calls
 // replace 3*seq_len per-token D2D copies).
 
@@ -887,8 +887,8 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Operator: aclnnFillScalar ─────────────────────────────────────────
-// Fill tensor with a scalar value. P2: AE 2次.
+// ---- Operator: aclnnFillScalar ----
+// Fill tensor with a scalar value. P2: AE 2M
 
 extern "C" {
     pub fn aclnnFillScalarGetWorkspaceSize(
@@ -907,7 +907,7 @@ extern "C" {
     ) -> aclnnStatus;
 }
 
-// ── Helper: check aclnn status ────────────────────────────────────────
+// ---- Helper: check aclnn status ----
 
 pub fn check(ret: aclnnStatus, ctx: &str) -> Result<(), String> {
     if ret == 0 {
@@ -915,4 +915,87 @@ pub fn check(ret: aclnnStatus, ctx: &str) -> Result<(), String> {
     } else {
         Err(format!("aclnn error {ret} in {ctx}"))
     }
+}
+
+// ━ Operator: aclnnInplaceAddRmsNorm (fused add+rmsnorm) ━
+extern "C" {
+    pub fn aclnnInplaceAddRmsNormGetWorkspaceSize(
+        x1_ref: *const aclTensor,
+        x2_ref: *const aclTensor,
+        gamma: *const aclTensor,
+        epsilon: f64,
+        rstd_out: *const aclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+
+    pub fn aclnnInplaceAddRmsNorm(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut aclOpExecutor,
+        stream: aclrtStream,
+    ) -> aclnnStatus;
+}
+
+// ━ Operator: aclnnAddLayerNorm (fused add+layernorm) ━
+extern "C" {
+    pub fn aclnnAddLayerNormGetWorkspaceSize(
+        x1: *const aclTensor,
+        x2: *const aclTensor,
+        gamma: *const aclTensor,
+        beta: *const aclTensor,
+        bias: *const aclTensor,
+        epsilon: f64,
+        additional_output: bool,
+        y_out: *const aclTensor,
+        mean_out: *const aclTensor,
+        rstd_out: *const aclTensor,
+        x_out: *const aclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+
+    pub fn aclnnAddLayerNorm(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut aclOpExecutor,
+        stream: aclrtStream,
+    ) -> aclnnStatus;
+}
+
+// ── Operator: aclnnAdds (scalar add) ───────────────────────────────────
+extern "C" {
+    pub fn aclnnAddsGetWorkspaceSize(
+        x: *const aclTensor,
+        y: *const aclScalar,
+        alpha: *const aclScalar,
+        out: *const aclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+
+    pub fn aclnnAdds(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut aclOpExecutor,
+        stream: aclrtStream,
+    ) -> aclnnStatus;
+}
+
+// ── Operator: aclnnGeluV2 (gelu with approximate) ──────────────────────
+extern "C" {
+    pub fn aclnnGeluV2GetWorkspaceSize(
+        x: *const aclTensor,
+        approximate: i64,
+        y: *const aclTensor,
+        workspace_size: *mut u64,
+        executor: *mut *mut aclOpExecutor,
+    ) -> aclnnStatus;
+
+    pub fn aclnnGeluV2(
+        workspace: *mut c_void,
+        workspace_size: u64,
+        executor: *mut aclOpExecutor,
+        stream: aclrtStream,
+    ) -> aclnnStatus;
 }

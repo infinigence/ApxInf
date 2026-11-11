@@ -1,6 +1,8 @@
 //! Load PI0.5 assets and assemble the Ascend model runner (BF16 only).
 
-use super::model::{build_bf16_model_with_policies, L3Policies, ModelVariant};
+use super::model::{
+    build_bf16_model_with_policies, build_bf16_ref_model_with_policies, L3Policies, ModelVariant,
+};
 use super::*;
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Device, Error};
@@ -27,7 +29,20 @@ pub(super) fn load_model_runner(
     backend: Arc<backend::Context>,
     options: &LoadOptions,
 ) -> Result<Pi05ModelRunner> {
-    let policies = L3Policies::default();
+    // Pick policies based on model_variant. We need to parse it here to decide
+    // before load_model_runner_with_policies does its own parse (which also
+    // validates the choice). A parse error here is propagated so the user
+    // sees the same error regardless of which parse runs first.
+    let model_variant = options
+        .model_variant
+        .as_deref()
+        .unwrap_or("bf16")
+        .parse::<ModelVariantChoice>()?;
+    let policies = if model_variant == ModelVariantChoice::Bf16Ref {
+        L3Policies::for_ref()
+    } else {
+        L3Policies::default()
+    };
     load_model_runner_with_policies(path, backend, options, policies)
 }
 
@@ -70,18 +85,21 @@ fn load_model_runner_with_policies(
         ));
     }
 
-    // BF16 only for Ascend
+    // BF16 (or bf16_ref) for Ascend
     let model_variant = options
         .model_variant
         .as_deref()
         .unwrap_or("bf16")
         .parse::<ModelVariantChoice>()?;
-    if model_variant != ModelVariantChoice::Bf16 {
+    if !matches!(model_variant, ModelVariantChoice::Bf16 | ModelVariantChoice::Bf16Ref) {
         return Err(Error::Other(format!(
-            "PI0.5 Ascend currently supports bf16 only, got {model_variant:?}"
+            "PI0.5 Ascend currently supports bf16 / bf16_ref only, got {model_variant:?}"
         )));
     }
-    eprintln!("[apxinf] PI0.5 Ascend model_variant=bf16");
+    eprintln!(
+        "[apxinf] PI0.5 Ascend model_variant={}",
+        model_variant.as_str()
+    );
 
     apxinf_ascend::l3::reset_h2d_diagnostics();
     let weights_start = std::time::Instant::now();
@@ -113,17 +131,30 @@ fn load_model_runner_with_policies(
     );
     apxinf_ascend::l3::print_h2d_diagnostics();
     let model_start = std::time::Instant::now();
-    let model = ModelVariant::Bf16 {
-        model: build_bf16_model_with_policies(
-            Arc::clone(&backend),
-            Arc::clone(&config),
-            weights,
-            policies,
-        )?,
-        time_embeddings,
+    let model = match model_variant {
+        ModelVariantChoice::Bf16Ref => ModelVariant::Bf16Ref {
+            model: build_bf16_ref_model_with_policies(
+                Arc::clone(&backend),
+                Arc::clone(&config),
+                weights,
+                policies,
+            )?,
+            time_embeddings,
+        },
+        // Only Bf16 / Bf16Ref reach here (validated above).
+        _ => ModelVariant::Bf16 {
+            model: build_bf16_model_with_policies(
+                Arc::clone(&backend),
+                Arc::clone(&config),
+                weights,
+                policies,
+            )?,
+            time_embeddings,
+        },
     };
     eprintln!(
-        "[apxinf] build_bf16_model: {:.3}s",
+        "[apxinf] build_model ({}) {:.3}s",
+        model_variant.as_str(),
         model_start.elapsed().as_secs_f64()
     );
 

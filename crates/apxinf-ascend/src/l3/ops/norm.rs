@@ -1,4 +1,4 @@
-//! Normalization operations — RMSNorm, LayerNorm, and fused residual+norm variants.
+//! Normalization operations —RMSNorm, LayerNorm, and fused residual+norm variants.
 //!
 //! Uses `aclnnRmsNorm`, `aclnnLayerNorm`, `aclnnAddRmsNorm`, and compositions
 //! of `aclnnAdd` / `aclnnMul` for the adaptive variants.
@@ -9,7 +9,7 @@ use apxinf_core::{DType, Device, Error, Result, Shape, Storage, Tensor};
 
 use crate::l3::context::AscendNewContext;
 
-// ── Args structs ──────────────────────────────────────────────────────
+// ━ Args structs ━
 
 pub struct RmsNormArgs<'a> {
     pub input: &'a Tensor,
@@ -103,7 +103,7 @@ impl<'a> BiasResidualRmsNormArgs<'a> {
     }
 }
 
-// ── All-ones weight cache (RI-capture compatible) ────────────────────
+// ━ All-ones weight cache (RI-capture compatible) ━
 
 struct OnesWeightCache {
     key: (usize, u8),
@@ -235,7 +235,7 @@ impl<'a> BiasThenResidualArgs<'a> {
     }
 }
 
-// ── Implementations ───────────────────────────────────────────────────
+// ━ Implementations ━
 
 /// RMS normalization via `aclnnRmsNorm`.
 pub fn rms_norm(ctx: &AscendNewContext, args: RmsNormArgs<'_>) -> Result<()> {
@@ -244,7 +244,7 @@ pub fn rms_norm(ctx: &AscendNewContext, args: RmsNormArgs<'_>) -> Result<()> {
     let shape = args.input.shape().clone();
 
     // rstd output: same shape as input, but MUST be FP32 (not BF16)
-    // aclnnRmsNorm on 950PR rejects BF16 rstd with 161002 (PARAM_INVALID)
+    // aclnnRmsNorm rejects BF16 rstd with 161002 (PARAM_INVALID) on this CANN stack
     let rstd = ctx.allocate_output(shape.clone(), DType::F32)?;
 
     let acl_input = acl_tensor(args.input, dtype);
@@ -323,7 +323,7 @@ pub fn adaptive_rms_norm(ctx: &AscendNewContext, args: AdaptiveRmsNormArgs<'_>) 
     let dtype = args.input.dtype();
     let shape = args.input.shape().clone();
 
-    // norm_style is [1, 2*cols] → split into scale [cols] and shift [cols]
+    // norm_style is [1, 2*cols] ->split into scale [cols] and shift [cols]
     let cols = shape.dims()[shape.dims().len() - 1];
     let norm_style_dims = args.norm_style.shape().dims();
     let style_cols = norm_style_dims[norm_style_dims.len() - 1];
@@ -331,7 +331,7 @@ pub fn adaptive_rms_norm(ctx: &AscendNewContext, args: AdaptiveRmsNormArgs<'_>) 
 
     // Step 1: RMS norm
     // Use a dummy weight of ones for the rms_norm call.
-    // Cached on device — warmup pass computes + H2D, capture pass reuses
+    // Cached on device —warmup pass computes + H2D, capture pass reuses
     // cached device pointer (no H2D during RI capture).
     let weight_shape = Shape::new(vec![cols]);
     let weight = get_or_create_ones_weight(ctx, cols, dtype)?;
@@ -449,8 +449,8 @@ pub fn adaptive_rms_norm(ctx: &AscendNewContext, args: AdaptiveRmsNormArgs<'_>) 
 
 /// Bias + residual: `hidden = (input + bias) + residual`.
 /// Uses `aclnnAdd` twice (or once if bias is None).
-/// NOTE: aclnnAdd does not support in-place (self == out → 161002).
-/// When bias is present, the second add (hidden + residual → hidden) needs
+/// NOTE: aclnnAdd does not support in-place (self == out ->161002).
+/// When bias is present, the second add (hidden + residual ->hidden) needs
 /// a temp buffer because `hidden` is both input and output.
 pub fn bias_residual(ctx: &AscendNewContext, args: BiasResidualArgs<'_>) -> Result<()> {
     let stream = ctx.raw_stream();
@@ -492,7 +492,7 @@ pub fn bias_residual(ctx: &AscendNewContext, args: BiasResidualArgs<'_>) -> Resu
         )
         .map_err(|e| Error::Other(format!("bias_residual inplace add: {e}")))
     } else {
-        // hidden = input + residual (input ≠ hidden, safe)
+        // hidden = input + residual (input 鈮?hidden, safe)
         let acl_res = acl_tensor(args.residual, dtype);
         run_op(
             |ws, exec| unsafe {
@@ -530,7 +530,7 @@ pub fn bias_residual_rms_norm(ctx: &AscendNewContext, args: BiasResidualRmsNormA
     if let Some(bias) = args.bias {
         // Step 1: input += bias in-place (avoids tmp buffer allocation + D2D write/read).
         // Safe because `args.input` is a fresh GEMM output (projection), not reused
-        // after this call — verified at the bf16.rs:587-595 call site.
+        // after this call —verified at the bf16.rs:587-595 call site.
         super::aclnn_inplace_add(
             device_ptr(args.input)?,
             device_ptr(bias)?,
@@ -541,7 +541,7 @@ pub fn bias_residual_rms_norm(ctx: &AscendNewContext, args: BiasResidualRmsNormA
         )
         .map_err(|e| Error::Other(format!("bias_residual_rms_norm inplace bias: {e}")))?;
 
-        // Step 2: AddRmsNorm(input, residual, weight) → hidden, normalized, rstd
+        // Step 2: AddRmsNorm(input, residual, weight) ->hidden, normalized, rstd
         let acl_input = acl_tensor(args.input, dtype);
         let acl_res = acl_tensor(args.residual, dtype);
         let acl_weight = acl_tensor(args.weight, dtype);
@@ -569,7 +569,7 @@ pub fn bias_residual_rms_norm(ctx: &AscendNewContext, args: BiasResidualRmsNormA
         )
         .map_err(|e| Error::Other(format!("bias_residual_rms_norm: {e}")))
     } else {
-        // No bias: AddRmsNorm(input, residual, weight) → hidden, normalized, rstd
+        // No bias: AddRmsNorm(input, residual, weight) ->hidden, normalized, rstd
         let acl_input = acl_tensor(args.input, dtype);
         let acl_res = acl_tensor(args.residual, dtype);
         let acl_weight = acl_tensor(args.weight, dtype);
@@ -604,7 +604,7 @@ pub fn bias_residual_layer_norm(ctx: &AscendNewContext, args: BiasResidualLayerN
     // Step 1: hidden = (input + bias) + residual (reuse bias_residual)
     bias_residual(ctx, BiasResidualArgs::new(args.input, args.bias, args.residual, args.hidden))?;
 
-    // Step 2: layer_norm(hidden, weight, norm_bias) → normalized
+    // Step 2: layer_norm(hidden, weight, norm_bias) ->normalized
     layer_norm(ctx, LayerNormArgs::new(args.hidden, args.weight, args.norm_bias, args.normalized, args.eps))
 }
 
@@ -672,10 +672,10 @@ pub fn ada_gate_residual_rms_norm(
     ctx: &AscendNewContext,
     args: AdaGateResidualRmsNormArgs<'_>,
 ) -> Result<()> {
-    // Step 1: ada_gate_residual → hidden
+    // Step 1: ada_gate_residual ->hidden
     ada_gate_residual(ctx, AdaGateResidualArgs::new(args.input, args.residual, args.gate_style, args.hidden))?;
 
-    // Step 2: adaptive_rms_norm(hidden, norm_style) → normalized
+    // Step 2: adaptive_rms_norm(hidden, norm_style) ->normalized
     adaptive_rms_norm(ctx, AdaptiveRmsNormArgs::new(args.hidden, args.norm_style, args.normalized, args.eps))
 }
 
@@ -684,7 +684,7 @@ pub fn bias_then_residual(ctx: &AscendNewContext, args: BiasThenResidualArgs<'_>
     bias_residual(ctx, BiasResidualArgs::new(args.input, args.bias, args.residual, args.hidden))
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────
+// ━ Helpers ━
 
 use crate::ffi::aclnn as ffi;
 use crate::acl_tensor::{run_op, AclTensor, AclScalar, AclIntArray};
@@ -701,4 +701,144 @@ fn device_ptr(tensor: &Tensor) -> Result<usize> {
 
 fn acl_tensor(tensor: &Tensor, dtype: DType) -> AclTensor {
     AclTensor::from_device(device_ptr(tensor).unwrap_or(0), tensor.shape(), dtype)
+}
+
+/// Zero-copy variant of [`inplace_add_rms_norm`].
+///
+/// Returns `(normalized, residual)` directly instead of writing into
+/// pre-allocated buffers. The caller MUST NOT read `x1` or `x2` after this
+/// call — both are overwritten in place by the operator:
+///   * `x1` is overwritten with the normalized output `rms_norm(x1+x2, weight)`
+///   * `x2` is overwritten with the residual sum `(x1 + x2)`
+///
+/// Because `Tensor::clone()` is a zero-copy Arc reference count, `x2` only
+/// needs a clone to obtain an owned handle — no device-to-device copy occurs.
+/// This eliminates the 2 `aclnnInplaceCopy` (d2d) ops per call that the
+/// legacy [`inplace_add_rms_norm`] wrapper performs (~754 ops for PI0.5).
+///
+/// # Safety (logical)
+///
+/// The caller must ensure no other code reads the original `x1`/`x2` values
+/// after this function returns. In the PI0.5 graph this is always true:
+/// `inplace_add_rms_bf16` consumes `projection_with_bias` (owned) and
+/// `residual` (whose last use is this call).
+pub fn inplace_add_rms_norm_zero_copy(
+    ctx: &AscendNewContext,
+    mut x1: Tensor,
+    x2: Tensor,
+    weight: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    let stream = ctx.raw_stream();
+    let dtype = x1.dtype();
+    let shape = x1.shape().clone();
+
+    let cols = shape.dims()[shape.dims().len() - 1];
+    let rows = shape.numel() / cols;
+    let rstd = ctx.allocate_output(Shape::new(vec![rows, 1]), DType::F32)?;
+
+    // x2.clone() is zero-copy (Arc refcount on the GpuStorageHandle).
+    // The operator will overwrite the shared device memory with the residual
+    // sum — safe because the caller guarantees no further reads of x2's
+    // original value.
+    let x2_owned = x2.clone();
+
+    let acl_x1 = acl_tensor(&x1, dtype);
+    let acl_x2 = acl_tensor(&x2_owned, dtype);
+    let acl_weight = acl_tensor(weight, dtype);
+    let acl_rstd = acl_tensor(&rstd, DType::F32);
+
+    run_op(
+        |ws, exec| unsafe {
+            ffi::aclnnInplaceAddRmsNormGetWorkspaceSize(
+                acl_x1.raw(),
+                acl_x2.raw(),
+                acl_weight.raw(),
+                eps as f64,
+                acl_rstd.raw(),
+                ws,
+                exec,
+            )
+        },
+        |ws, ws_size, exec, s| unsafe { ffi::aclnnInplaceAddRmsNorm(ws, ws_size, exec, s) },
+        stream,
+        "aclnnInplaceAddRmsNorm",
+    )
+    .map_err(|e| Error::Other(format!("inplace_add_rms_norm_zero_copy: {e}")))?;
+
+    // After the op: x1 holds normalized, x2_owned holds residual sum.
+    // Return them directly — no d2d copy needed.
+    // Drop acl_x1/acl_x2 (they only hold raw ptr views, not ownership).
+    drop(acl_x1);
+    drop(acl_x2);
+    Ok((x1, x2_owned))
+}
+
+/// Args for fused add + layer norm.
+pub struct AddLayerNormArgs<'a> {
+    pub x1: &'a Tensor,
+    pub x2: &'a Tensor,
+    pub weight: &'a Tensor,
+    pub bias: &'a Tensor,
+    /// Optional bias added to the normalized output (may be NULL).
+    pub norm_bias: Option<&'a Tensor>,
+    pub normalized: &'a mut Tensor,
+    /// Optional output for the residual sum `x1 + x2` (may be None → NULL).
+    /// When provided, the caller can reuse the residual without a separate
+    /// `aclnnAdd` op. Required for the vision encoder post-attention path.
+    pub hidden: Option<&'a mut Tensor>,
+    pub eps: f32,
+}
+
+/// Fused `x = x1 + x2; normalized = layer_norm(x, weight, bias)` via `aclnnAddLayerNorm`.
+///
+/// Replaces the 2-step `aclnnAdd + aclnnLayerNorm` used in the vision encoder
+/// path. norm_bias (biasOptional) may be None (NULL pointer).
+pub fn add_layer_norm(ctx: &AscendNewContext, mut args: AddLayerNormArgs<'_>) -> Result<()> {
+    let stream = ctx.raw_stream();
+    let dtype = args.x1.dtype();
+    let shape = args.x1.shape().clone();
+
+    let norm_dims = shape.dims();
+    let norm_shape_dim = norm_dims[norm_dims.len() - 1];
+    let rows = shape.numel() / norm_shape_dim;
+    let mean = ctx.allocate_output(Shape::new(vec![rows, 1]), DType::F32)?;
+    let rstd = ctx.allocate_output(Shape::new(vec![rows, 1]), DType::F32)?;
+
+    let acl_x1 = acl_tensor(args.x1, dtype);
+    let acl_x2 = acl_tensor(args.x2, dtype);
+    let acl_weight = acl_tensor(args.weight, dtype);
+    let acl_bias = acl_tensor(args.bias, dtype);
+    let acl_norm_bias = args.norm_bias.map(|t| acl_tensor(t, dtype));
+    let acl_out = acl_tensor(args.normalized, dtype);
+    let acl_mean = acl_tensor(&mean, DType::F32);
+    let acl_rstd = acl_tensor(&rstd, DType::F32);
+    let acl_hidden = args.hidden.as_deref_mut().map(|t| acl_tensor(t, dtype));
+
+    let norm_shape_arr: Vec<i64> = vec![norm_shape_dim as i64];
+    let norm_shape = AclIntArray::new(&norm_shape_arr);
+
+    run_op(
+        |ws, exec| unsafe {
+            ffi::aclnnAddLayerNormGetWorkspaceSize(
+                acl_x1.raw(),
+                acl_x2.raw(),
+                acl_weight.raw(),
+                acl_bias.raw(),
+                acl_norm_bias.as_ref().map_or(std::ptr::null(), |t| t.raw()),
+                args.eps as f64,
+                false, // additional_output — not used, we want y/rstd/x only
+                acl_out.raw(),
+                acl_mean.raw(),
+                acl_rstd.raw(),
+                acl_hidden.as_ref().map_or(std::ptr::null(), |t| t.raw()),
+                ws,
+                exec,
+            )
+        },
+        |ws, ws_size, exec, s| unsafe { ffi::aclnnAddLayerNorm(ws, ws_size, exec, s) },
+        stream,
+        "aclnnAddLayerNorm",
+    )
+    .map_err(|e| Error::Other(format!("add_layer_norm: {e}")))
 }

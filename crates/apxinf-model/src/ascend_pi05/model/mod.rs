@@ -14,7 +14,7 @@ mod model;
 pub(in crate::ascend_pi05) use blocks::L3Policies;
 pub use calibration::Pi05CalibrationObserver;
 pub use model::{build_bf16_model, upload_time_embeddings_bf16};
-pub(in crate::ascend_pi05) use model::{build_bf16_model_with_policies, ModelVariant};
+pub(in crate::ascend_pi05) use model::{build_bf16_model_with_policies, build_bf16_ref_model_with_policies, ModelVariant};
 
 use crate::ascend_pi05::backend::{Context, DeviceBuffer as _DeviceBuffer};
 use crate::ascend_pi05::AscendPi05ImageLayout;

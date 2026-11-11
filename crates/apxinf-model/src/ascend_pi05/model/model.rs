@@ -1,5 +1,5 @@
 //! Construction and typed dispatch of loaded PI0.5 computation (Ascend, BF16).
-use super::blocks::{Bf16Blocks, L3Policies};
+use super::blocks::{Bf16Blocks, Bf16RefBlocks, L3Policies};
 use super::Pi05Model;
 use super::Bf16Model;
 use crate::ascend_pi05::backend::{self, Context};
@@ -23,6 +23,28 @@ pub(in crate::ascend_pi05) fn build_bf16_model_with_policies(
     policies: L3Policies,
 ) -> Result<Arc<Pi05Model<Bf16Blocks>>> {
     Ok(Arc::new(Pi05Model::from_blocks(Bf16Blocks::new(
+        backend, config, weights, policies,
+    )?)))
+}
+
+/// Type alias for the fused-op reference BF16 model variant.
+pub type Bf16RefModel = Arc<Pi05Model<Bf16RefBlocks>>;
+
+pub fn build_bf16_ref_model(
+    backend: Arc<Context>,
+    config: Arc<Pi05Config>,
+    weights: Arc<Bf16Weights>,
+) -> Result<Bf16RefModel> {
+    build_bf16_ref_model_with_policies(backend, config, weights, L3Policies::default())
+}
+
+pub(in crate::ascend_pi05) fn build_bf16_ref_model_with_policies(
+    backend: Arc<Context>,
+    config: Arc<Pi05Config>,
+    weights: Arc<Bf16Weights>,
+    policies: L3Policies,
+) -> Result<Bf16RefModel> {
+    Ok(Arc::new(Pi05Model::from_blocks(Bf16RefBlocks::new(
         backend, config, weights, policies,
     )?)))
 }
@@ -60,18 +82,23 @@ pub(in crate::ascend_pi05) enum ModelVariant {
         model: Bf16Model,
         time_embeddings: Arc<Vec<Tensor>>,
     },
+    Bf16Ref {
+        model: Bf16RefModel,
+        time_embeddings: Arc<Vec<Tensor>>,
+    },
 }
 
 impl ModelVariant {
     pub(in crate::ascend_pi05) fn name(&self) -> &'static str {
         match self {
             Self::Bf16 { .. } => "bf16",
+            Self::Bf16Ref { .. } => "bf16_ref",
         }
     }
 
     pub(in crate::ascend_pi05) fn input_dtype(&self) -> DType {
         match self {
-            Self::Bf16 { .. } => DType::BF16,
+            Self::Bf16 { .. } | Self::Bf16Ref { .. } => DType::BF16,
         }
     }
 
@@ -85,6 +112,7 @@ impl ModelVariant {
     ) -> Result<super::WorkspaceRequirements> {
         match self {
             Self::Bf16 { model, .. } => model.workspace_requirements(token_count),
+            Self::Bf16Ref { model, .. } => model.workspace_requirements(token_count),
         }
     }
 
@@ -99,6 +127,10 @@ impl ModelVariant {
     ) -> Result<Tensor> {
         match self {
             Self::Bf16 {
+                model,
+                time_embeddings,
+            } => model.infer(patches, token_ids, token_count, noise, time_embeddings, position_offset),
+            Self::Bf16Ref {
                 model,
                 time_embeddings,
             } => model.infer(patches, token_ids, token_count, noise, time_embeddings, position_offset),
@@ -117,6 +149,9 @@ impl ModelVariant {
                 model,
                 time_embeddings,
             } => model.infer_with_dump(patches, token_ids, token_count, noise, time_embeddings, position_offset),
+            Self::Bf16Ref { .. } => Err(Error::Other(
+                "PI0.5 infer_with_dump requires model_variant=bf16 (not bf16_ref)".into(),
+            )),
         }
     }
 
@@ -126,6 +161,10 @@ impl ModelVariant {
     ) -> Result<O::Output> {
         match self {
             Self::Bf16 {
+                model,
+                time_embeddings,
+            } => operation.run(model, time_embeddings),
+            Self::Bf16Ref {
                 model,
                 time_embeddings,
             } => operation.run(model, time_embeddings),
@@ -143,6 +182,7 @@ impl ModelVariant {
         use super::PrepareBlocks;
         match self {
             Self::Bf16 { model, .. } => model.blocks.preprocess(images, patches, layout),
+            Self::Bf16Ref { model, .. } => model.blocks.preprocess(images, patches, layout),
         }
     }
     pub(in crate::ascend_pi05) fn calibrate(
@@ -157,8 +197,8 @@ impl ModelVariant {
                 model,
                 time_embeddings,
             } => model.calibrate(patches, tokens, count, noise, time_embeddings),
-            _ => Err(Error::Other(
-                "PI0.5 calibration requires model_variant=bf16".into(),
+            Self::Bf16Ref { .. } => Err(Error::Other(
+                "PI0.5 calibration requires model_variant=bf16 (not bf16_ref)".into(),
             )),
         }
     }

@@ -142,6 +142,8 @@ pub struct Bf16DeviceActionLayer {
     pub output: Bf16LinearWeights,
     pub post_attention_modulation: Bf16LinearWeights,
     pub gate_up: Bf16LinearWeights,
+    pub gate: Bf16LinearWeights,
+    pub up: Bf16LinearWeights,
     pub down: Bf16LinearWeights,
 }
 
@@ -272,6 +274,8 @@ impl Bf16DeviceActionLayer {
                 &[&weights.mlp.up, &weights.mlp.gate],
                 backend,
             )?,
+            gate: Bf16LinearWeights::from_host(&weights.mlp.gate, backend)?,
+            up: Bf16LinearWeights::from_host(&weights.mlp.up, backend)?,
             down: Bf16LinearWeights::from_host(&weights.mlp.down, backend)?,
         })
     }

@@ -1,9 +1,13 @@
 //! PI0.5 Ascend semantic backbones and layers (BF16 only).
 
 pub(super) mod bf16;
+pub(super) mod bf16_950pr_ref;
 
 pub(super) use bf16::backbone::Bf16Blocks;
 pub use bf16::backbone::Bf16PrefixKvCache;
+
+pub(super) use bf16_950pr_ref::backbone::Bf16RefBlocks;
+pub use bf16_950pr_ref::backbone::Bf16RefPrefixKvCache;
 
 use crate::ascend_pi05::{backend, backend::DeviceBuffer, Pi05Config};
 use apxinf_core::{Result, Tensor};
@@ -21,6 +25,17 @@ impl L3Policies {
     ) -> Self {
         // Ascend has no autotuning — always use defaults
         Self::default()
+    }
+
+    /// Policies for the fused-op reference BF16 path.
+    ///
+    /// Sets `GemmImpl::AclnnFusedMatmul` so `gemm_bias` fuses bias into the
+    /// matmul kernel (1 launch instead of matmul + aclnnAdd), matching the
+    /// torch_npu FULL_FUSION 31ms op distribution.
+    pub(in crate::ascend_pi05) fn for_ref() -> Self {
+        let mut policies = Self::default();
+        policies.gemm.impl_preference = backend::ops::GemmImpl::AclnnFusedMatmul;
+        policies
     }
 }
 

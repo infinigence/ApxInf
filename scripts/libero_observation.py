@@ -33,14 +33,21 @@ def quat_to_axis_angle(quat: np.ndarray) -> np.ndarray:
     return (quat[:3] * 2.0 * math.acos(quat[3]) / denominator).astype(np.float32)
 
 
-def libero_images(base: np.ndarray, wrist: np.ndarray) -> np.ndarray:
+def libero_images(base: np.ndarray, wrist: np.ndarray, *, flip_180: bool = True) -> np.ndarray:
     """Orient raw LIBERO frames; the selected policy owns model-specific resize.
 
-    LeRobot's ``LiberoEnv._format_raw_obs`` does NOT flip images — the 180°
-    rotation in ``render()`` is for visualization only. The checkpoint was
-    trained on unflipped frames, so we pass them through as-is.
+    The 180-degree rotation is applied to the frames that reach the model,
+    matching LeRobot's LIBERO processor (``torch.flip(img, dims=[2, 3])``),
+    which the HuggingFaceVLA/libero training and the LeRobot eval chain use.
+    The flip in ``render()`` is for visualization only; this one affects model
+    input. ``flip_180=False`` disables it for A/B comparison.
     """
-    return np.stack([np.ascontiguousarray(base), np.ascontiguousarray(wrist)])
+
+    def _orient(img: np.ndarray) -> np.ndarray:
+        img = np.ascontiguousarray(img)
+        return img[::-1, ::-1] if flip_180 else img
+
+    return np.stack([_orient(base), _orient(wrist)])
 
 
 def libero_state(observation, *, finger_joints: int = 1) -> np.ndarray:

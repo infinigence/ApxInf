@@ -646,6 +646,7 @@ pub enum ModelVariantChoice {
     #[default]
     Auto,
     Bf16,
+    Bf16Ref,
     Fp8Static,
     Int8Dynamic,
 }
@@ -654,6 +655,7 @@ impl ModelVariantChoice {
         match self {
             Self::Auto => "auto",
             Self::Bf16 => "bf16",
+            Self::Bf16Ref => "bf16_ref",
             Self::Fp8Static => "fp8_static",
             Self::Int8Dynamic => "int8_dynamic",
         }
@@ -682,9 +684,9 @@ impl std::str::FromStr for ModelVariantChoice {
     type Err = apxinf_core::Error;
     fn from_str(value: &str) -> apxinf_core::Result<Self> {
         match value {
-            "auto" => Ok(Self::Auto), "bf16" => Ok(Self::Bf16),
+            "auto" => Ok(Self::Auto), "bf16" => Ok(Self::Bf16), "bf16_ref" => Ok(Self::Bf16Ref),
             "fp8_static" => Ok(Self::Fp8Static), "int8_dynamic" => Ok(Self::Int8Dynamic),
-            _ => Err(apxinf_core::Error::Other(format!("unknown PI0.5 model_variant {value:?}; expected auto, bf16, fp8_static or int8_dynamic"))),
+            _ => Err(apxinf_core::Error::Other(format!("unknown PI0.5 model_variant {value:?}; expected auto, bf16, bf16_ref, fp8_static or int8_dynamic"))),
         }
     }
 }
@@ -696,6 +698,7 @@ mod model_variant_tests {
         for v in [
             ModelVariantChoice::Auto,
             ModelVariantChoice::Bf16,
+            ModelVariantChoice::Bf16Ref,
             ModelVariantChoice::Fp8Static,
             ModelVariantChoice::Int8Dynamic,
         ] {

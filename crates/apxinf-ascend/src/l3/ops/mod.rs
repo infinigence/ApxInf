@@ -187,16 +187,178 @@ pub use attention::{attention, AttentionArgs, AttentionMask, AttentionPolicy};
 pub use cache::{concat_rows, reserve_prefix};
 pub use gather::{gather, GatherArgs, GatherPatchGeometry, GatherSemantic};
 pub use gemm::{
-    gemm, gemm_geglu, GemmArgs, GemmGegluArgs, GemmPolicy, GemmQuantization, WeightVersion,
+    gemm, gemm_bias, gemm_geglu, GemmArgs, GemmBiasArgs, GemmGegluArgs, GemmImpl, GemmPolicy,
+    GemmQuantization, WeightVersion,
 };
 pub use norm::{
     ada_gate_residual, ada_gate_residual_rms_norm, adaptive_rms_norm,
-    bias_residual, bias_residual_layer_norm, bias_residual_rms_norm, bias_then_residual,
-    layer_norm, rms_norm,
+    add_layer_norm, bias_residual, bias_residual_layer_norm, bias_residual_rms_norm,
+    bias_then_residual, inplace_add_rms_norm_zero_copy, layer_norm, rms_norm,
     AdaGateResidualArgs, AdaGateResidualRmsNormArgs, AdaptiveRmsNormArgs,
-    BiasResidualArgs, BiasResidualLayerNormArgs, BiasResidualRmsNormArgs,
+    AddLayerNormArgs, BiasResidualArgs, BiasResidualLayerNormArgs, BiasResidualRmsNormArgs,
     BiasThenResidualArgs, LayerNormArgs, RmsNormArgs,
 };
 pub use pointwise::{pointwise, PointwiseActivation, PointwiseArgs, PointwiseSemantic};
 pub use rope::{rope, RopeArgs, RopeSemantic};
 pub use shape_ops::{transpose, cast, cat, expand, sub, div, clamp};
+
+// ── Legacy raw helpers (torch_npu graph alignment) ─────────────────────
+// Bare device-pointer / stream helpers used by the fused-op BF16 reference model to match
+// the same op sequence as the torch_npu FULL_FUSION path (1 op per aclnn call).
+
+/// Scalar add: `out = input + scalar` via `aclnnAdds`.
+pub fn aclnn_adds(
+    input_ptr: usize,
+    out_ptr: usize,
+    shape: &apxinf_core::Shape,
+    scalar: f32,
+    dtype: apxinf_core::DType,
+    stream: crate::ffi::acl::aclrtStream,
+) -> apxinf_core::Result<()> {
+    if shape.numel() == 0 {
+        return Ok(());
+    }
+    let acl_in = crate::acl_tensor::AclTensor::from_device(input_ptr, shape, dtype);
+    let acl_out = crate::acl_tensor::AclTensor::from_device(out_ptr, shape, dtype);
+    let acl_scalar = crate::acl_tensor::AclScalar::f32(scalar);
+    let acl_alpha = crate::acl_tensor::AclScalar::f32(1.0);
+    crate::acl_tensor::run_op(
+        |ws, exec| unsafe {
+            crate::ffi::aclnn::aclnnAddsGetWorkspaceSize(
+                acl_in.raw(),
+                acl_scalar.raw(),
+                acl_alpha.raw(),
+                acl_out.raw(),
+                ws,
+                exec,
+            )
+        },
+        |ws, ws_size, exec, s| unsafe { crate::ffi::aclnn::aclnnAdds(ws, ws_size, exec, s) },
+        stream,
+        "aclnnAdds",
+    )
+    .map_err(|e| apxinf_core::Error::Other(format!("aclnn_adds: {e}")))
+}
+
+/// Scalar mul: `out = input * scalar` via `aclnnMuls`.
+pub fn aclnn_muls(
+    input_ptr: usize,
+    out_ptr: usize,
+    shape: &apxinf_core::Shape,
+    scalar: f32,
+    dtype: apxinf_core::DType,
+    stream: crate::ffi::acl::aclrtStream,
+) -> apxinf_core::Result<()> {
+    if shape.numel() == 0 {
+        return Ok(());
+    }
+    let acl_in = crate::acl_tensor::AclTensor::from_device(input_ptr, shape, dtype);
+    let acl_out = crate::acl_tensor::AclTensor::from_device(out_ptr, shape, dtype);
+    let acl_scalar = crate::acl_tensor::AclScalar::f32(scalar);
+    crate::acl_tensor::run_op(
+        |ws, exec| unsafe {
+            crate::ffi::aclnn::aclnnMulsGetWorkspaceSize(
+                acl_in.raw(),
+                acl_scalar.raw(),
+                acl_out.raw(),
+                ws,
+                exec,
+            )
+        },
+        |ws, ws_size, exec, s| unsafe { crate::ffi::aclnn::aclnnMuls(ws, ws_size, exec, s) },
+        stream,
+        "aclnnMuls",
+    )
+    .map_err(|e| apxinf_core::Error::Other(format!("aclnn_muls: {e}")))
+}
+
+/// Element-wise mul: `out = a * b` via `aclnnMul`.
+pub fn aclnn_mul(
+    a_ptr: usize,
+    b_ptr: usize,
+    out_ptr: usize,
+    a_shape: &apxinf_core::Shape,
+    b_shape: &apxinf_core::Shape,
+    dtype: apxinf_core::DType,
+    stream: crate::ffi::acl::aclrtStream,
+) -> apxinf_core::Result<()> {
+    let acl_a = crate::acl_tensor::AclTensor::from_device(a_ptr, a_shape, dtype);
+    let acl_b = crate::acl_tensor::AclTensor::from_device(b_ptr, b_shape, dtype);
+    let acl_out = crate::acl_tensor::AclTensor::from_device(out_ptr, a_shape, dtype);
+    crate::acl_tensor::run_op(
+        |ws, exec| unsafe {
+            crate::ffi::aclnn::aclnnMulGetWorkspaceSize(
+                acl_a.raw(),
+                acl_b.raw(),
+                acl_out.raw(),
+                ws,
+                exec,
+            )
+        },
+        |ws, ws_size, exec, s| unsafe { crate::ffi::aclnn::aclnnMul(ws, ws_size, exec, s) },
+        stream,
+        "aclnnMul",
+    )
+    .map_err(|e| apxinf_core::Error::Other(format!("aclnn_mul: {e}")))
+}
+
+/// Gelu (tanh approximation): `out = gelu(input)` via `aclnnGeluV2` with
+/// approximate=1 to match torch_npu gelu_pytorch_tanh.
+pub fn aclnn_gelu(
+    input_ptr: usize,
+    out_ptr: usize,
+    shape: &apxinf_core::Shape,
+    dtype: apxinf_core::DType,
+    stream: crate::ffi::acl::aclrtStream,
+) -> apxinf_core::Result<()> {
+    let acl_in = crate::acl_tensor::AclTensor::from_device(input_ptr, shape, dtype);
+    let acl_out = crate::acl_tensor::AclTensor::from_device(out_ptr, shape, dtype);
+    crate::acl_tensor::run_op(
+        |ws, exec| unsafe {
+            crate::ffi::aclnn::aclnnGeluV2GetWorkspaceSize(
+                acl_in.raw(),
+                1, // approximate=1 → tanh
+                acl_out.raw(),
+                ws,
+                exec,
+            )
+        },
+        |ws, ws_size, exec, s| unsafe { crate::ffi::aclnn::aclnnGeluV2(ws, ws_size, exec, s) },
+        stream,
+        "aclnnGeluV2",
+    )
+    .map_err(|e| apxinf_core::Error::Other(format!("aclnn_gelu: {e}")))
+}
+
+/// Element-wise add: `out = a + alpha * b` via `aclnnAdd`.
+pub fn aclnn_add(
+    a_ptr: usize,
+    b_ptr: usize,
+    out_ptr: usize,
+    a_shape: &apxinf_core::Shape,
+    b_shape: &apxinf_core::Shape,
+    alpha: f32,
+    dtype: apxinf_core::DType,
+    stream: crate::ffi::acl::aclrtStream,
+) -> apxinf_core::Result<()> {
+    let acl_a = crate::acl_tensor::AclTensor::from_device(a_ptr, a_shape, dtype);
+    let acl_b = crate::acl_tensor::AclTensor::from_device(b_ptr, b_shape, dtype);
+    let acl_out = crate::acl_tensor::AclTensor::from_device(out_ptr, a_shape, dtype);
+    let acl_alpha = crate::acl_tensor::AclScalar::f32(alpha);
+    crate::acl_tensor::run_op(
+        |ws, exec| unsafe {
+            crate::ffi::aclnn::aclnnAddGetWorkspaceSize(
+                acl_a.raw(),
+                acl_b.raw(),
+                acl_alpha.raw(),
+                acl_out.raw(),
+                ws,
+                exec,
+            )
+        },
+        |ws, ws_size, exec, s| unsafe { crate::ffi::aclnn::aclnnAdd(ws, ws_size, exec, s) },
+        stream,
+        "aclnnAdd",
+    )
+    .map_err(|e| apxinf_core::Error::Other(format!("aclnn_add: {e}")))
+}
