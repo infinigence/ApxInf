@@ -28,11 +28,11 @@ impl Inputs {
         })
     }
 }
-fn upload_f32(t: &Tensor, values: &[f32]) -> Result<()> {
+fn upload_f32(ctx: &CudaContext, t: &Tensor, values: &[f32]) -> Result<()> {
     let bytes: Vec<_> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
     CudaBuffer::from_tensor(t)
         .map_err(Error::Cuda)?
-        .copy_from_host(&bytes)
+        .copy_from_host_on(&bytes, ctx.stream())
         .map_err(Error::Cuda)
 }
 struct PlanState {
@@ -49,20 +49,30 @@ struct PlanState {
 impl PlanState {
     fn bind(&mut self, request: &VlaRequest<'_>) -> Result<()> {
         validate_request(request)?;
-        self.ctx.synchronize().map_err(Error::Cuda)?;
+        // Upload on the same non-blocking stream as eager execution and Graph
+        // replay. The safe transfer also waits before releasing host slices.
         if let VisionObservation::RgbU8 { bytes, .. } = &request.observation.vision {
-            self.inputs.rgb.copy_from_host(bytes).map_err(Error::Cuda)?;
+            self.inputs
+                .rgb
+                .copy_from_host_on(bytes, self.ctx.stream())
+                .map_err(Error::Cuda)?;
         }
         upload_f32(
+            &self.ctx,
             &self.inputs.proprio,
             request.observation.state.as_ref().unwrap().as_f32()?,
         )?;
         CudaBuffer::from_tensor(&self.inputs.task)
             .map_err(Error::Cuda)?
-            .copy_from_host(&(request.observation.token_ids[0] as i32).to_ne_bytes())
+            .copy_from_host_on(
+                &(request.observation.token_ids[0] as i32).to_ne_bytes(),
+                self.ctx.stream(),
+            )
             .map_err(Error::Cuda)?;
         match request.initial_latent {
-            InitialLatent::Provided(noise) => upload_f32(&self.inputs.noise, noise.as_f32()?)?,
+            InitialLatent::Provided(noise) => {
+                upload_f32(&self.ctx, &self.inputs.noise, noise.as_f32()?)?
+            }
             InitialLatent::Generate { rng } => {
                 self.generator.generate(rng)?;
             }
@@ -115,9 +125,11 @@ impl PreparedInference for Plan {
         // buffer cannot be reclaimed while an `Action` still holds it, so reuse
         // would either alias a live result or reintroduce the scratch exposure
         // this copy exists to prevent. 448 bytes from the driver's cache.
-        let buffer =
-            CudaBuffer::alloc(ACTION_SHAPE.iter().product::<usize>() * 4, state.ctx.device_id())
-                .map_err(Error::Cuda)?;
+        let buffer = CudaBuffer::alloc(
+            ACTION_SHAPE.iter().product::<usize>() * 4,
+            state.ctx.device_id(),
+        )
+        .map_err(Error::Cuda)?;
         let output = buffer
             .as_tensor(state.model.actions().shape().clone(), DType::F32)
             .map_err(Error::Cuda)?;
@@ -186,13 +198,13 @@ impl ModelRunner {
             state
                 .inputs
                 .rgb
-                .copy_from_host(&vec![0; 2 * 224 * 224 * 3])
+                .copy_from_host_on(&vec![0; 2 * 224 * 224 * 3], state.ctx.stream())
                 .map_err(Error::Cuda)?;
-            upload_f32(&state.inputs.proprio, &[0.; 9])?;
-            upload_f32(&state.inputs.noise, &vec![0.; 16 * 9 * 28 * 28])?;
+            upload_f32(&state.ctx, &state.inputs.proprio, &[0.; 9])?;
+            upload_f32(&state.ctx, &state.inputs.noise, &vec![0.; 16 * 9 * 28 * 28])?;
             CudaBuffer::from_tensor(&state.inputs.task)
                 .map_err(Error::Cuda)?
-                .copy_from_host(&0i32.to_ne_bytes())
+                .copy_from_host_on(&0i32.to_ne_bytes(), state.ctx.stream())
                 .map_err(Error::Cuda)?;
         }
         {
@@ -402,6 +414,28 @@ mod tests {
         )?;
         assert_ne!(changed_task_eager, eager_action);
         assert_eq!(host(eager.run(&request)?.tensor())?, eager_action);
+        // Change every uploaded field together. Preserve independently run
+        // eager references before dropping that plan, then alternate the two
+        // inputs on one captured Graph to detect stale request bindings.
+        let mut alternate = changed_task.clone();
+        alternate.state = Some(Tensor::from_f32(vec![9], &[0.125; 9])?);
+        if let VisionObservation::RgbU8 { bytes, .. } = &mut alternate.vision {
+            for pixel in bytes {
+                *pixel = 255 - *pixel;
+            }
+        }
+        let alternate_noise = Tensor::from_f32(
+            vec![1, 16, 9, 28, 28],
+            &fixture["noise"]
+                .as_f32()?
+                .iter()
+                .map(|value| -*value)
+                .collect::<Vec<_>>(),
+        )?;
+        let alternate_request = VlaRequest::provided(&alternate, &alternate_noise);
+        let alternate_eager = host(eager.run(&alternate_request)?.tensor())?;
+        assert_ne!(alternate_eager, eager_action);
+        assert_eq!(host(eager.run(&request)?.tensor())?, eager_action);
         drop(eager);
         eprintln!("Preparing full model graph");
         let graph = runner.plan(
@@ -419,6 +453,18 @@ mod tests {
         eprintln!("Full model graph prepared; checking replay and lifecycle");
         for _ in 0..3 {
             assert_eq!(host(graph.run(&request)?.tensor())?, eager_action);
+        }
+        for round in 0..8 {
+            assert_eq!(
+                host(graph.run(&alternate_request)?.tensor())?,
+                alternate_eager,
+                "alternate input differs from eager reference in round {round}"
+            );
+            assert_eq!(
+                host(graph.run(&request)?.tensor())?,
+                eager_action,
+                "original input differs from eager reference in round {round}"
+            );
         }
         assert_eq!(host(retained.tensor())?, eager_action);
         let mut changed = o.clone();

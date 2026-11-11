@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 from types import SimpleNamespace
@@ -31,6 +32,29 @@ def stats():
         "actions_min": [-2.] * 7, "actions_max": [4.] * 7,
         "proprio_min": [-1.] * 9, "proprio_max": [3.] * 9,
     }
+
+
+@pytest.fixture
+def prepared_assets(tmp_path, stats):
+    tasks = ["move the cup", "open the drawer"]
+    (tmp_path / "config.json").write_text(json.dumps(
+        {"model_type": "cosmos-policy", "profile": "libero-2b-direct-v1", "num_tasks": len(tasks)}))
+    (tmp_path / "tasks.json").write_text(json.dumps({"tasks": tasks}))
+    # The injected/mocked runner owns tensor validation. These bytes let the
+    # policy's load-time integrity contract be tested without GPU weights.
+    (tmp_path / "text.safetensors").write_bytes(b"cached embeddings in task order")
+    (tmp_path / "libero_dataset_statistics.json").write_text(json.dumps(stats))
+    _write_output_manifest(tmp_path)
+    return tmp_path
+
+
+def _write_output_manifest(root):
+    manifest = {"output_sha256": {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in ("tasks.json", "text.safetensors", "libero_dataset_statistics.json")
+    }}
+    (root / "conversion.json").write_text(json.dumps(manifest))
+    return manifest
 
 
 @pytest.fixture
@@ -118,15 +142,12 @@ def test_retained_results_and_close(stats, observation):
         model.infer(observation)
 
 
-def test_auto_policy_loads_prepared_assets_with_injected_runner(tmp_path, stats):
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "cosmos-policy", "profile": "libero-2b-direct-v1"}))
-    (tmp_path / "tasks.json").write_text(json.dumps({"tasks": ["move the cup"]}))
-    (tmp_path / "libero_dataset_statistics.json").write_text(json.dumps(stats))
+def test_auto_policy_loads_prepared_assets_with_injected_runner(prepared_assets):
     runner = Runner()
-    model = AutoPolicy.from_pretrained(tmp_path, model_runner=runner, state_key="state")
+    model = AutoPolicy.from_pretrained(prepared_assets, model_runner=runner, state_key="state")
     assert isinstance(model, CosmosPolicy) and model.model_runner is runner
     with pytest.raises(ValueError, match="load options"):
-        AutoPolicy.from_pretrained(tmp_path, model_runner=runner, state_key="state", precision="fp8")
+        AutoPolicy.from_pretrained(prepared_assets, model_runner=runner, state_key="state", precision="fp8")
 
 
 def test_wrong_runtime_profile_and_stats_rejected(stats):
@@ -168,10 +189,7 @@ def test_invalid_image_transform_output_is_rejected_before_runner(stats, observa
     assert not runner.calls
 
 
-def test_from_pretrained_keeps_image_transform_out_of_native_load_options(tmp_path, stats, monkeypatch):
-    (tmp_path / "config.json").write_text(json.dumps({"model_type": "cosmos-policy", "profile": "libero-2b-direct-v1"}))
-    (tmp_path / "tasks.json").write_text(json.dumps({"tasks": ["move the cup"]}))
-    (tmp_path / "libero_dataset_statistics.json").write_text(json.dumps(stats))
+def test_from_pretrained_keeps_image_transform_out_of_native_load_options(prepared_assets, monkeypatch):
     runner = Runner()
     calls = []
 
@@ -181,11 +199,11 @@ def test_from_pretrained_keeps_image_transform_out_of_native_load_options(tmp_pa
 
     monkeypatch.setitem(sys.modules, "apxinf_py", SimpleNamespace(ModelRunner=SimpleNamespace(load=load)))
     transform = lambda image: image
-    model = CosmosPolicy.from_pretrained(tmp_path, state_key="state", image_transform=transform,
+    model = CosmosPolicy.from_pretrained(prepared_assets, state_key="state", image_transform=transform,
                                          autotune=True)
     assert model.image_transform is transform
     assert calls[0][1] == {"device": "cuda:0", "autotune": True}
-    injected = CosmosPolicy.from_pretrained(tmp_path, state_key="state", model_runner=runner,
+    injected = CosmosPolicy.from_pretrained(prepared_assets, state_key="state", model_runner=runner,
                                             image_transform=transform)
     assert injected.image_transform is transform
     assert len(calls) == 1
@@ -312,19 +330,68 @@ def test_rejects_task_table_that_does_not_match_cached_embeddings(tmp_path, stat
         AutoPolicy.from_pretrained(tmp_path, model_runner=runner, state_key="state")
 
 
-def test_prepared_assets_verify_declared_hashes(tmp_path, stats):
-    import hashlib
-
-    (tmp_path / "config.json").write_text(json.dumps(
-        {"model_type": "cosmos-policy", "profile": "libero-2b-direct-v1", "num_tasks": 1}))
-    (tmp_path / "tasks.json").write_text(json.dumps({"tasks": ["move the cup"]}))
-    (tmp_path / "libero_dataset_statistics.json").write_text(json.dumps(stats))
-    good = hashlib.sha256((tmp_path / "tasks.json").read_bytes()).hexdigest()
-    manifest = {"output_sha256": {"tasks.json": good}}
-    (tmp_path / "conversion.json").write_text(json.dumps(manifest))
+def test_prepared_assets_verify_declared_hashes(prepared_assets):
+    manifest = json.loads((prepared_assets / "conversion.json").read_text())
     runner = Runner()
-    AutoPolicy.from_pretrained(tmp_path, model_runner=runner, state_key="state")
+    AutoPolicy.from_pretrained(prepared_assets, model_runner=runner, state_key="state")
     manifest["output_sha256"]["tasks.json"] = "0" * 64
-    (tmp_path / "conversion.json").write_text(json.dumps(manifest))
+    (prepared_assets / "conversion.json").write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="SHA256"):
-        AutoPolicy.from_pretrained(tmp_path, model_runner=Runner(), state_key="state")
+        AutoPolicy.from_pretrained(prepared_assets, model_runner=Runner(), state_key="state")
+
+
+@pytest.mark.parametrize("manifest", [None, {}, [], {"output_sha256": None},
+                                      {"output_sha256": {}}, {"output_sha256": []}])
+def test_prepared_assets_require_integrity_manifest_before_native_load(prepared_assets, monkeypatch, manifest):
+    def unexpected_load(*args, **kwargs):
+        raise AssertionError("native loading must not happen for unverified assets")
+
+    monkeypatch.setitem(sys.modules, "apxinf_py", SimpleNamespace(ModelRunner=SimpleNamespace(load=unexpected_load)))
+    path = prepared_assets / "conversion.json"
+    if manifest is None:
+        path.unlink()
+    else:
+        path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="conversion.json"):
+        AutoPolicy.from_pretrained(prepared_assets, state_key="state")
+
+
+@pytest.mark.parametrize("name", ["tasks.json", "text.safetensors"])
+@pytest.mark.parametrize("digest", [None, "", "0" * 63, "g" * 64, 1])
+def test_prepared_assets_require_valid_table_hashes(prepared_assets, name, digest):
+    manifest = json.loads((prepared_assets / "conversion.json").read_text())
+    if digest is None:
+        del manifest["output_sha256"][name]
+    else:
+        manifest["output_sha256"][name] = digest
+    (prepared_assets / "conversion.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match=rf"SHA256.*{name}"):
+        AutoPolicy.from_pretrained(prepared_assets, model_runner=Runner(), state_key="state")
+
+
+def test_prepared_assets_reject_reordered_40_task_table(prepared_assets):
+    tasks = [f"task {index}" for index in range(40)]
+    (prepared_assets / "tasks.json").write_text(json.dumps({"tasks": tasks}))
+    config = json.loads((prepared_assets / "config.json").read_text())
+    config["num_tasks"] = 40
+    (prepared_assets / "config.json").write_text(json.dumps(config))
+    _write_output_manifest(prepared_assets)
+    AutoPolicy.from_pretrained(prepared_assets, model_runner=Runner(), state_key="state")
+
+    tasks[0], tasks[1] = tasks[1], tasks[0]
+    (prepared_assets / "tasks.json").write_text(json.dumps({"tasks": tasks}))
+    with pytest.raises(ValueError, match="SHA256 mismatch: tasks.json"):
+        AutoPolicy.from_pretrained(prepared_assets, model_runner=Runner(), state_key="state")
+
+
+@pytest.mark.parametrize("name", ["text.safetensors", "libero_dataset_statistics.json"])
+def test_prepared_assets_reject_replaced_declared_output(prepared_assets, name):
+    (prepared_assets / name).write_bytes(b"replacement")
+    with pytest.raises(ValueError, match=rf"SHA256 mismatch: {name}"):
+        AutoPolicy.from_pretrained(prepared_assets, model_runner=Runner(), state_key="state")
+
+
+def test_prepared_assets_reject_missing_cached_embeddings(prepared_assets):
+    (prepared_assets / "text.safetensors").unlink()
+    with pytest.raises(ValueError, match="missing: text.safetensors"):
+        AutoPolicy.from_pretrained(prepared_assets, model_runner=Runner(), state_key="state")

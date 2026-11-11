@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -80,8 +81,8 @@ def _verify_prepared_assets(root: Path, config: Mapping[str, Any], tasks: Sequen
 
     The native text table is indexed by task position, so a reordered or
     resized ``tasks.json`` selects the wrong cached embedding without any shape
-    error. ``conversion.json`` records the hashes the converter wrote; when it
-    is present it is authoritative for every file it lists.
+    error. ``conversion.json`` must record both tables' hashes and is
+    authoritative for every file it lists.
     """
     declared = config.get("num_tasks")
     if declared is not None and declared != len(tasks):
@@ -89,16 +90,27 @@ def _verify_prepared_assets(root: Path, config: Mapping[str, Any], tasks: Sequen
             f"Cosmos Policy tasks.json has {len(tasks)} tasks but config num_tasks is {declared}")
     manifest_path = root / "conversion.json"
     if not manifest_path.is_file():
-        return
-    expected = json.loads(manifest_path.read_text()).get("output_sha256") or {}
+        raise ValueError("Cosmos Policy prepared assets require conversion.json")
+    manifest = json.loads(manifest_path.read_text())
+    if not isinstance(manifest, Mapping):
+        raise ValueError("Cosmos Policy conversion.json must be an object")
+    expected = manifest.get("output_sha256")
     if not isinstance(expected, Mapping):
         raise ValueError("Cosmos Policy conversion.json output_sha256 must be an object")
+    for name in ("tasks.json", "text.safetensors"):
+        if name not in expected:
+            raise ValueError(f"Cosmos Policy conversion.json requires a SHA256 for {name}")
     for name, digest in expected.items():
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+            raise ValueError(f"Cosmos Policy prepared asset SHA256 is invalid: {name}")
         path = root / name
         if not path.is_file():
             raise ValueError(f"Cosmos Policy prepared asset is missing: {name}")
-        actual = hashlib.sha256(path.read_bytes()).hexdigest()
-        if actual != digest:
+        actual = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                actual.update(block)
+        if actual.hexdigest() != digest.lower():
             raise ValueError(f"Cosmos Policy prepared asset SHA256 mismatch: {name}")
 
 

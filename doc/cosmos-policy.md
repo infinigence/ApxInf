@@ -31,6 +31,12 @@ The VAE identity is
 `38071ab59bd94681c686fa51d75a1968f64e470262043be31f7a094e442fd981`.
 Source assets are read in place. An existing output directory is rejected;
 `config.json` is written last as the completion marker.
+Python `from_pretrained` requires `conversion.json` with valid SHA256 entries
+for both `tasks.json` and `text.safetensors`, verifies every listed output,
+and checks the task count against `config.json`. Missing manifests, omitted
+table hashes, reordered tasks or replaced embeddings are rejected before
+native loading. Direct construction with an injected runner remains available
+for callers that own the runner and its matching task table.
 
 ```bash
 python -m apxinf.checkpoints.cosmos_policy \
@@ -217,6 +223,20 @@ median / 1198.45 ms p95. Functional acceptance passes; performance remains
 **best effort with performance debt** (roughly twice reference latency).
 Existing GEMM and attention candidate tuning was exercised; the convolution
 lowering and repeated text projections remain optimization opportunities.
+
+The same initial port passed the full joint/action, eager/Graph and lifecycle
+checks before the later DiT/VAE session-arena migrations. Single-plan process
+GPU accounting sampled every three seconds reached **14,044 MiB**; this is a
+sampled process high-water mark, not an exact allocator peak. The arena changes
+are subsequent ownership/performance work, not prerequisites for avoiding OOM
+or enabling capture in the basic implementation. The earlier unbounded
+per-convolution-tile vendor-binding growth was fixed before this baseline passed.
+The functional VAE now requires its matching Conv3d session cache and pooled
+output lease handling during prepare/capture, so these changes are retained
+as one implementation. No same-method whole-plan allocator-peak comparison
+before/after the arena migrations is available; summed convolution scratch
+budgets and the optimized implementation with autotuning disabled do not
+substitute for that comparison.
 
 A 2026-10-30 release-build rerun on Thor MAXN compared the post-merge baseline
 with vectorized, bounds-checked causal volume lowering. With five warmups and
