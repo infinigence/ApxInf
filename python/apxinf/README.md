@@ -129,8 +129,9 @@ PI0.5 selects its implementation with `model_variant`: `auto`, `bf16`,
 dynamic INT8 uses per-row activation scales and fixed per-channel weight scales.
 `ModelRunner.model_variant` and PI0.5 policy metadata report the resolved
 implementation, including when loading with `auto`.
-The previous PI0.5 `precision` keyword is no longer accepted. Other model families
-retain their own loading options until migrated.
+All six built-in VLA policies use `model_variant`; the public `precision` keyword
+is not accepted. WallOSS passes the variant directly to its Rust loader. GR00T
+and PI0-FAST adapt it to their legacy precision executors only inside Rust loading.
 
 Two entry points, both returning something that satisfies the `Policy` contract:
 
@@ -188,7 +189,7 @@ copy Cosmos weights. Then load with the model directory alone:
 ```python
 policy = AutoPolicy.from_pretrained(
     "/models/GR00T-N1.7-LIBERO/libero_10",
-    precision="bf16",
+    model_variant="bf16",
 )
 ```
 
@@ -200,7 +201,7 @@ paths or checkpoint export paths, or download missing resources. See the
 and an FP8 calibration bound to the selected model/processor metadata. Profiles
 without the versioned GR00T processor identity require recalibration for both
 prepared resources and explicit `backbone=` snapshots.
-GR00T uses `precision=`, rather than PI0.5's `model_variant=`.
+GR00T uses `model_variant="bf16"`, `"fp8_static"` or `"int8_dynamic"`.
 
 ## Policy contract
 
