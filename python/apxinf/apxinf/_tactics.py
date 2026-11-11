@@ -55,6 +55,10 @@ def resolve_pi05_tactics(
     allow_missing: bool = False,
 ) -> Path | None:
     """Resolve explicit, checkpoint-local, then source-tree PI0.5 tactics."""
+    if device == "cpu":
+        if override is not None:
+            raise ValueError("PI0.5 CPU reference does not use CUDA tactics")
+        return None
     if override is not None:
         return Path(override)
     if model_dir is not None:
