@@ -125,6 +125,19 @@ def _resolve_asset(spec: str, filename: str, *, env: str, what: str) -> pathlib.
     )
 
 
+def _checkpoint_tokenizer(model_dir, explicit, name, subdir):
+    """Prefer explicitly selected or checkpoint-local assets before hub lookup."""
+    if explicit is not None:
+        return str(explicit)
+    local = pathlib.Path(model_dir) / "assets" / subdir
+    if (local / "tokenizer.json").is_file():
+        return str(local)
+    relative = pathlib.Path(model_dir) / str(name)
+    if relative.is_file() or (relative / "tokenizer.json").is_file():
+        return str(relative)
+    return str(name)
+
+
 def _read_safetensors_f32(path: pathlib.Path, names: Sequence[str]) -> dict:
     """Read named ``float32`` tensors straight out of a ``safetensors`` file.
 
@@ -454,7 +467,7 @@ class Pi0FastPolicy:
         model=None,
         checkpoint=None,
         device: str = "cuda:0",
-        precision: str = "auto",
+        model_variant: str = "auto",
         action_dim: Optional[int] = None,
         action_horizon: Optional[int] = None,
         num_views: Optional[int] = None,
@@ -484,14 +497,11 @@ class Pi0FastPolicy:
         dropped calibration file or normalization override would look like an
         accuracy result.
         """
+        if model_variant not in ("auto", "bf16", "fp8_static"):
+            raise ValueError("Pi0FastPolicy model_variant must be auto, bf16 or fp8_static")
         if kwargs:
             raise TypeError(
                 f"Pi0FastPolicy.from_pretrained: unsupported options {sorted(kwargs)}"
-            )
-        if tactics is not None:
-            raise NotImplementedError(
-                "Pi0FastPolicy.from_pretrained: π0-FAST token decoding is not a "
-                "GEMM-tactic search target; pass calibration= for FP8 instead"
             )
         if norm_stats is not None or norm_key is not None:
             raise NotImplementedError(
@@ -537,8 +547,9 @@ class Pi0FastPolicy:
 
             path = str(checkpoint) if checkpoint is not None else str(model_dir / "model.safetensors")
             model = apxinf_py.ModelRunner.load(
-                "pi0_fast-cuda", path, device=device, precision=precision,
+                "pi0_fast-cuda", path, device=device, model_variant=model_variant,
                 sampling_seed=int(seed), autotune=bool(autotune),
+                **({"tactics": str(tactics)} if tactics is not None else {}),
                 # FP8 needs measured activation scales; the native loader reads
                 # the checkpoint's own calibration.json when this is omitted and
                 # refuses to run on a guessed uniform scale.
@@ -603,7 +614,7 @@ class Pi0FastPolicy:
 
         tokenizer = _PaligemmaTokenizer(
             _resolve_asset(
-                str(tokenizer_path) if tokenizer_path is not None else str(text_tokenizer),
+                _checkpoint_tokenizer(model_dir, tokenizer_path, text_tokenizer, "paligemma-tokenizer"),
                 "tokenizer.json",
                 env="APXINF_PALIGEMMA_TOKENIZER",
                 what="(text) tokenizer",
@@ -612,7 +623,7 @@ class Pi0FastPolicy:
         )
         fast_tokenizer = _FastActionTokenizer(
             _resolve_asset(
-                str(fast_tokenizer_path) if fast_tokenizer_path is not None else str(action_tokenizer),
+                _checkpoint_tokenizer(model_dir, fast_tokenizer_path, action_tokenizer, "fast-tokenizer"),
                 "tokenizer.json",
                 env="APXINF_FAST_TOKENIZER",
                 what="FAST action tokenizer",
@@ -657,7 +668,7 @@ class Pi0FastPolicy:
             fast_skip_tokens=int(config.get("fast_skip_tokens", _DEFAULT_FAST_SKIP_TOKENS)),
             max_state_dim=int(config.get("max_state_dim", _DEFAULT_MAX_STATE_DIM)),
             max_action_tokens=int(config.get("max_action_tokens", _DEFAULT_MAX_ACTION_TOKENS)),
-            metadata=metadata,
+            metadata={"model_variant": getattr(model, "model_variant", None) or ("bf16" if model_variant == "auto" else model_variant), **(dict(metadata) if metadata else {})},
         )
 
     # --- inference ---------------------------------------------------------

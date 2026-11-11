@@ -84,7 +84,7 @@ def test_common_policy_options_keep_model_knobs_and_protect_generic_flags():
             "metadata": {"deployment": "lab", "protocol": "wrong"},
         },
         device="cuda:1",
-        precision="fp8",
+        model_variant="fp8_static",
         action_dim=7,
         metadata={"protocol": "openpi.websocket_policy"},
     )
@@ -92,7 +92,7 @@ def test_common_policy_options_keep_model_knobs_and_protect_generic_flags():
     assert options == {
         "norm_key": "x2_normal",
         "device": "cuda:1",
-        "precision": "fp8",
+        "model_variant": "fp8_static",
         "action_dim": 7,
         "metadata": {"deployment": "lab", "protocol": "openpi.websocket_policy"},
     }
@@ -132,7 +132,7 @@ def test_websocket_example_passes_caller_named_wire_keys_through(monkeypatch, tm
         "parse_args",
         lambda: argparse.Namespace(
             model_dir=tmp_path,
-            precision="bf16",
+            model_variant="bf16",
             device="cuda:0",
             action_dim=0,
             policy_options={"norm_key": "libero_all"},
@@ -151,12 +151,12 @@ def test_websocket_example_passes_caller_named_wire_keys_through(monkeypatch, tm
     assert captured["kwargs"] == {
         "norm_key": "libero_all",
         "device": "cuda:0",
-        "precision": "bf16",
+        "model_variant": "bf16",
         "image_keys": ("observation/image", "observation/wrist_image"),
         "state_key": "observation/state",
         "metadata": {
             "protocol": "openpi.websocket_policy",
-            "precision": "bf16",
+            "model_variant": "bf16",
         },
     }
     assert captured["host"] == "127.0.0.1"
@@ -191,7 +191,7 @@ def test_websocket_example_leaves_unnamed_keys_to_the_policy(monkeypatch, tmp_pa
         "parse_args",
         lambda: argparse.Namespace(
             model_dir=tmp_path,
-            precision="bf16",
+            model_variant="bf16",
             device="cuda:0",
             action_dim=0,
             policy_options={},
