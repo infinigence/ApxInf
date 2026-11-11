@@ -139,6 +139,12 @@ Kernel templates take dtype, integer and boolean arguments (`TemplateArg`).
 An integer template is a specialization fact: each distinct value builds and
 caches a separate Metal pipeline the first time it is used.
 
+`ResidualRmsNorm` computes `bf16(x + delta)` and its weighted RMSNorm for
+`[1, rows, width]` BF16 rows up to width 8192, with a BF16 or F32 weight. Its
+`NormRounding` argument selects the contract that exists in MLX and in the
+ordered FP32 expression: round the normalized row before the weight multiply,
+or once after it.
+
 The Clef-derived fusions are `Q4TransposeDecode`, `PadRowsF16`,
 `SplitF16Gemm`, `GatedDeltaRecurrence` and `HalfSplitRope`. They decode affine Q4 group-64
 weights to FP16 for one call only; they keep no decoded weight resident.

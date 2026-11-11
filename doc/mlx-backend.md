@@ -290,7 +290,7 @@ against ordered normalization; the full MLX matrix remains pending.
 MiniCPM5 compiled prefill uses native weighted RMSNorm with its existing BF16
 weights. The pinned MLX 0.32.3 Metal kernel casts the normalized value to BF16
 before multiplying the weight. Public and DSpark retain ordered normalization,
-and compiled decode retains packed residual/RMSNorm. Short-token, teacher and
+and compiled decode retains fused residual/RMSNorm. Short-token, teacher and
 eight long logits/state checks match the unweighted path. Five clean 1K blocks
 give a median total-time ratio of 0.9961 against that path; the full matrix
 remains pending.

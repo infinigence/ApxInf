@@ -10,7 +10,7 @@ use crate::{
 };
 use apxinf_core::{Backend, Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
-use apxinf_mlx::fusions::PackedResidualRmsNorm;
+use apxinf_mlx::fusions::{NormRounding, ResidualRmsNorm};
 use apxinf_mlx::{Array, Compiled, MlxBackend, MlxDType};
 use std::{collections::HashMap, rc::Rc};
 
@@ -381,9 +381,11 @@ impl MiniCpm5 {
 
     fn compile_step(&self, attention: DecodeAttention) -> Result<Compiled> {
         let stream = self.backend.stream();
-        let packed = Rc::new(PackedResidualRmsNorm::new(
+        let packed = Rc::new(ResidualRmsNorm::new(
             stream,
+            self.config.hidden_size,
             self.config.rms_norm_eps,
+            NormRounding::BeforeWeight,
         )?);
         let weights = self.weights.clone();
         let eps = self.epsilon.clone();
@@ -401,26 +403,9 @@ impl MiniCpm5 {
             let mut delta: Option<Array> = None;
             let mut states = Vec::with_capacity(84);
             let mut taps = Vec::new();
-            let pack_rows = |x: &Array, delta: &Array, weight: &Array| -> Result<(Array, Array)> {
-                let mut residuals = Vec::with_capacity(rows);
-                let mut norms = Vec::with_capacity(rows);
-                for row in 0..rows {
-                    let (r, n) = packed.call(
-                        &x.slice_axis(1, row, row + 1)?,
-                        &delta.slice_axis(1, row, row + 1)?,
-                        weight,
-                    )?;
-                    residuals.push(r);
-                    norms.push(n);
-                }
-                Ok((
-                    Array::concat(&residuals.iter().collect::<Vec<_>>(), 1)?,
-                    Array::concat(&norms.iter().collect::<Vec<_>>(), 1)?,
-                ))
-            };
             for (i, w) in weights.layers.iter().enumerate() {
                 let n = if let Some(d) = &delta {
-                    let (residual, normalized) = pack_rows(&x, d, &w.input_norm)?;
+                    let (residual, normalized) = packed.call(&x, d, &w.input_norm)?;
                     x = residual;
                     normalized
                 } else {
@@ -451,7 +436,7 @@ impl MiniCpm5 {
                     .transpose(&[0, 2, 1, 3])?
                     .reshape(&[1, rows, 2048])?;
                 let attention_delta = project(&attention, &w.o)?;
-                let (h, n) = pack_rows(&x, &attention_delta, &w.post_norm)?;
+                let (h, n) = packed.call(&x, &attention_delta, &w.post_norm)?;
                 x = h;
                 delta = Some(project(
                     &math::swiglu(&project(&n, &w.gate)?, &project(&n, &w.up)?)?,
@@ -459,10 +444,10 @@ impl MiniCpm5 {
                 )?);
                 states.extend([keys, values]);
                 if tapped && [1, 10, 20, 30, 39].contains(&i) {
-                    taps.push(pack_rows(&x, delta.as_ref().unwrap(), &w.input_norm)?.0);
+                    taps.push(packed.call(&x, delta.as_ref().unwrap(), &w.input_norm)?.0);
                 }
             }
-            let (_, normalized) = pack_rows(&x, delta.as_ref().unwrap(), &weights.norm)?;
+            let (_, normalized) = packed.call(&x, delta.as_ref().unwrap(), &weights.norm)?;
             let logits = math::project(&normalized, &weights.head, tapped)?;
             let mut output = vec![logits];
             output.extend(states);
