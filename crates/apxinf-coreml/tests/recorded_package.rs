@@ -163,7 +163,7 @@ fn written_and_recorded_programs_predict_identical_bits() -> Result<()> {
         &int8_mlp_program(&model, &weights)?,
         ComputeUnits::CpuAndNeuralEngine,
     )?;
-    cache.seal();
+    cache.seal()?;
     let mut other = ProgramBuilder::new();
     let x = other.input("x", &[1, 4, 1, 1])?;
     let id = other.identity(&x, Some("y"))?;

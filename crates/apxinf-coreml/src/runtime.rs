@@ -5,7 +5,7 @@ use half::f16;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::fs::File;
+use std::fs::{File, TryLockError};
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -189,6 +189,10 @@ fn cache_error(error: std::io::Error) -> Error {
     Error::Other(format!("Core ML cache: {error}"))
 }
 
+/// Eviction moves an entry under this prefix before deleting it, so an
+/// interrupted deletion never leaves a partial program under its own name.
+const EVICTED_PREFIX: &str = ".evicted-";
+
 /// Opens the published entry at `compiled`, holds a shared lock on it and
 /// refreshes its last-use time. `None` when no entry is there, including one
 /// evicted while this waited for the lock.
@@ -214,15 +218,116 @@ fn use_entry(compiled: &Path) -> std::io::Result<Option<File>> {
     }
 }
 
+fn remove_tree(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+fn tree_bytes(path: &Path) -> std::io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Ok(metadata.len());
+    }
+    let mut bytes = 0;
+    for child in std::fs::read_dir(path)? {
+        bytes += tree_bytes(&child?.path())?;
+    }
+    Ok(bytes)
+}
+
+/// Evicts compiled programs in `dir`, least recently used first, until the
+/// rest take at most `budget` bytes. Programs that a live cache holds are
+/// skipped. Leftovers of an interrupted eviction are deleted first, so
+/// running this again after a crash converges on the same state.
+fn evict_to_budget(
+    dir: &Path,
+    budget: u64,
+    remove: impl Fn(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    let children = match std::fs::read_dir(dir) {
+        Ok(children) => children,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(cache_error(error)),
+    };
+    let mut programs = Vec::new();
+    for child in children {
+        let path = child.map_err(cache_error)?.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with(EVICTED_PREFIX) {
+            remove(&path).map_err(cache_error)?;
+            continue;
+        }
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "mlmodelc")
+        {
+            continue;
+        }
+        let sized = std::fs::metadata(&path)
+            .and_then(|metadata| Ok((metadata.modified()?, tree_bytes(&path)?)));
+        match sized {
+            Ok((used, bytes)) => programs.push((used, bytes, path)),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(cache_error(error)),
+        }
+    }
+    let mut total: u64 = programs.iter().map(|(_, bytes, _)| bytes).sum();
+    programs.sort_by_key(|(used, _, _)| *used);
+    for (_, bytes, path) in programs {
+        if total <= budget {
+            break;
+        }
+        if evict(dir, &path, &remove).map_err(cache_error)? {
+            total -= bytes;
+        }
+    }
+    Ok(())
+}
+
+/// Moves `compiled` out of the cache and deletes it, unless a live cache
+/// holds it. Returns whether it was evicted.
+fn evict(
+    dir: &Path,
+    compiled: &Path,
+    remove: impl Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
+    let entry = match File::open(compiled) {
+        Ok(entry) => entry,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match entry.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(false),
+        Err(TryLockError::Error(error)) => return Err(error),
+    }
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = compiled.file_name().unwrap_or_default().to_string_lossy();
+    let trash = dir.join(format!(
+        "{EVICTED_PREFIX}{name}-{}-{stamp}",
+        std::process::id()
+    ));
+    std::fs::rename(compiled, &trash)?;
+    drop(entry);
+    remove(&trash)?;
+    Ok(true)
+}
+
 /// A content-addressed directory of compiled programs. After [`seal`](Self::seal),
 /// a program that is not yet compiled is an error, so no compilation happens
 /// while requests run.
 ///
 /// Every program a cache resolves stays in use until the cache is dropped:
-/// it holds a shared lock on the entry. Each hit also refreshes the entry's
-/// last-use time.
+/// it holds a shared lock on the entry, which eviction from any process
+/// respects. Each hit also refreshes the entry's last-use time.
 pub struct ProgramCache {
     dir: PathBuf,
+    byte_budget: Option<u64>,
     sealed: bool,
     in_use: Mutex<HashMap<String, File>>,
 }
@@ -231,13 +336,31 @@ impl ProgramCache {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
+            byte_budget: None,
             sealed: false,
             in_use: Mutex::default(),
         }
     }
 
-    pub fn seal(&mut self) {
+    /// Bounds the directory to `bytes` of compiled programs. Without a
+    /// budget the directory grows with every program and macOS build it has
+    /// seen.
+    pub fn with_byte_budget(mut self, bytes: u64) -> Self {
+        self.byte_budget = Some(bytes);
+        self
+    }
+
+    /// Seals the cache. With a byte budget, it then evicts the least recently
+    /// used programs until the rest fit, skipping any program a live cache in
+    /// any process is using. That includes every program this cache resolved,
+    /// so a working set larger than the budget is kept whole. The cache is
+    /// sealed even if eviction fails.
+    pub fn seal(&mut self) -> Result<()> {
         self.sealed = true;
+        match self.byte_budget {
+            Some(budget) => evict_to_budget(&self.dir, budget, remove_tree),
+            None => Ok(()),
+        }
     }
 
     /// The compiled directory for `package`, compiling it on a miss. The key
@@ -423,11 +546,11 @@ mod tests {
         let compiled = cache
             .compiled_with(&package, |_, target| write_compiled(target))
             .unwrap();
-        cache.seal();
+        cache.seal().unwrap();
         assert_eq!(cache.compiled(&package).unwrap(), compiled);
         let missing = tempfile::tempdir().unwrap();
         let mut cache = ProgramCache::new(missing.path());
-        cache.seal();
+        cache.seal().unwrap();
         assert!(cache
             .compiled_with(&package, |_, _| panic!("sealed miss compiled"))
             .is_err());
@@ -455,6 +578,75 @@ mod tests {
             .set_modified(SystemTime::now() - Duration::from_secs(age_secs))
             .unwrap();
         compiled
+    }
+
+    fn sealed_with_budget(dir: &Path, bytes: u64) {
+        ProgramCache::new(dir)
+            .with_byte_budget(bytes)
+            .seal()
+            .unwrap();
+    }
+
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|child| child.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn seal_evicts_least_recently_used_programs_until_the_budget_fits() {
+        let root = tempfile::tempdir().unwrap();
+        let oldest = publish(root.path(), 1, 300);
+        let middle = publish(root.path(), 2, 200);
+        let newest = publish(root.path(), 3, 100);
+        let budget = tree_bytes(&middle).unwrap() + tree_bytes(&newest).unwrap();
+        let mut unbounded = ProgramCache::new(root.path());
+        unbounded.seal().unwrap();
+        assert!(oldest.is_dir(), "a cache without a budget evicted");
+        sealed_with_budget(root.path(), budget);
+        assert!(!oldest.exists(), "the least recently used program stayed");
+        assert!(
+            middle.is_dir() && newest.is_dir(),
+            "evicted past the budget"
+        );
+        assert!(tree_bytes(root.path()).unwrap() <= budget);
+    }
+
+    #[test]
+    fn a_hit_makes_a_program_most_recently_used() {
+        let root = tempfile::tempdir().unwrap();
+        let first = publish(root.path(), 1, 200);
+        let second = publish(root.path(), 2, 100);
+        let mut hit = ProgramCache::new(root.path());
+        hit.seal().unwrap();
+        assert_eq!(hit.compiled(&program(1)).unwrap(), first);
+        drop(hit);
+        sealed_with_budget(root.path(), tree_bytes(&first).unwrap());
+        assert!(first.is_dir(), "the program just hit was evicted");
+        assert!(!second.exists(), "the program not used since stayed");
+    }
+
+    #[test]
+    fn programs_held_by_a_live_cache_are_never_evicted() {
+        let root = tempfile::tempdir().unwrap();
+        let held = publish(root.path(), 1, 200);
+        let idle = publish(root.path(), 2, 100);
+        let mut loading = ProgramCache::new(root.path());
+        loading.seal().unwrap();
+        assert_eq!(loading.compiled(&program(1)).unwrap(), held);
+        File::open(&held)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(300))
+            .unwrap();
+        sealed_with_budget(root.path(), 0);
+        assert!(held.is_dir(), "a program another cache holds was evicted");
+        assert!(!idle.exists());
+        drop(loading);
+        sealed_with_budget(root.path(), 0);
+        assert!(!held.exists(), "a released program was kept over budget");
     }
 
     #[test]
@@ -489,6 +681,31 @@ mod tests {
             (current.dev(), current.ino()),
             "the lock is on the evicted copy, not the published one"
         );
+    }
+
+    #[test]
+    fn an_interrupted_eviction_leaves_no_partial_program_and_a_rerun_converges() {
+        let root = tempfile::tempdir().unwrap();
+        let evicted = publish(root.path(), 1, 200);
+        let kept = publish(root.path(), 2, 100);
+        let budget = tree_bytes(&kept).unwrap();
+        let crash = |trash: &Path| {
+            std::fs::remove_file(trash.join("weight.bin"))?;
+            Err(std::io::Error::other("killed mid-deletion"))
+        };
+        assert!(evict_to_budget(root.path(), budget, crash).is_err());
+        assert!(!evicted.exists(), "a partial program kept its name");
+        for _ in 0..2 {
+            evict_to_budget(root.path(), budget, remove_tree).unwrap();
+            assert_eq!(listing(root.path()), listing_of(&kept));
+        }
+        let mut sealed = ProgramCache::new(root.path());
+        sealed.seal().unwrap();
+        assert_eq!(sealed.compiled(&program(2)).unwrap(), kept);
+    }
+
+    fn listing_of(compiled: &Path) -> Vec<String> {
+        vec![compiled.file_name().unwrap().to_string_lossy().into_owned()]
     }
 
     #[test]

@@ -133,7 +133,8 @@ committed, because they contain checkpoint-derived weights.
   The compiled `.mlmodelc` is stored in a cache directory. The key is the
   program and weight digests plus the macOS build. The writer creates the
   entry in a temporary directory and renames it into place, so concurrent
-  loads never read a partial entry.
+  loads never read a partial entry. With a byte budget, sealing evicts the
+  least recently used entries that no live cache holds until the rest fit.
 - **Load.** The model is loaded with the compute units the family requests
   (the GPU+ANE composition uses `MLComputeUnitsCPUAndNeuralEngine`). After loading, the runtime is
   sealed: a later application compile request is an error. Loaded and sealed
