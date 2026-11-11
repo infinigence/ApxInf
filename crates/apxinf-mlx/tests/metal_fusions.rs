@@ -400,3 +400,159 @@ fn half_split_rope_rotates_leading_pairs_and_copies_the_rest() -> Result<()> {
     assert!(HalfSplitRope::new(&s, 3).is_err());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn interleaved_qk_norm_rope_matches_composed_operators() -> Result<()> {
+    use apxinf_mlx::fusions::InterleavedQkNormRope;
+    let s = Stream::metal(0)?;
+    let (len, heads, dim) = (6, 2, 128);
+    let width = heads * dim;
+    let q = Array::from_f32(&s, &[1, len, width], &data(len * width, 37, 0.07))?.cast(D::BF16)?;
+    let k = Array::from_f32(&s, &[1, len, width], &data(len * width, 41, 0.05))?.cast(D::BF16)?;
+    let wq = Array::from_f32(
+        &s,
+        &[dim],
+        &data(dim, 7, 0.25)
+            .iter()
+            .map(|v| v + 1.)
+            .collect::<Vec<_>>(),
+    )?
+    .cast(D::BF16)?;
+    let wk = Array::from_f32(
+        &s,
+        &[dim],
+        &data(dim, 5, 0.2).iter().map(|v| v + 1.).collect::<Vec<_>>(),
+    )?
+    .cast(D::BF16)?;
+    let angles: Vec<f32> = (0..len * dim / 2)
+        .map(|i| (i / (dim / 2)) as f32 * 0.3f32.powi((i % (dim / 2)) as i32 % 9))
+        .collect();
+    let cos = Array::from_f32(
+        &s,
+        &[len, dim / 2],
+        &angles.iter().map(|a| a.cos()).collect::<Vec<_>>(),
+    )?;
+    let sin = Array::from_f32(
+        &s,
+        &[len, dim / 2],
+        &angles.iter().map(|a| a.sin()).collect::<Vec<_>>(),
+    )?;
+    let (fq, fk) = InterleavedQkNormRope::new(&s)?.call(&q, &k, &wq, &wk, &cos, &sin, heads)?;
+    assert_eq!(
+        (fq.shape(), fq.dtype()),
+        (&[1, heads, len, dim][..], D::BF16)
+    );
+
+    // Composed path of mflux Qwen21Attention._project (norm, FP32 rope, transpose).
+    let composed = |x: &Array, w: &Array| -> Result<Vec<f32>> {
+        let x = x.reshape(&[1, len, heads, dim])?.fast_rms_norm(w, 1e-6)?;
+        let pairs = x.cast(D::F32)?.reshape(&[1, len, heads, dim / 2, 2])?;
+        let (re, im) = (
+            pairs
+                .slice_axis(4, 0, 1)?
+                .reshape(&[1, len, heads, dim / 2])?,
+            pairs
+                .slice_axis(4, 1, 2)?
+                .reshape(&[1, len, heads, dim / 2])?,
+        );
+        let c = cos.reshape(&[1, len, 1, dim / 2])?;
+        let sn = sin.reshape(&[1, len, 1, dim / 2])?;
+        let out_re = re.mul(&c)?.sub(&im.mul(&sn)?)?;
+        let out_im = re.mul(&sn)?.add(&im.mul(&c)?)?;
+        let shape = [1, len, heads, dim / 2, 1];
+        Array::concat(&[&out_re.reshape(&shape)?, &out_im.reshape(&shape)?], 4)?
+            .reshape(&[1, len, heads, dim])?
+            .cast(D::BF16)?
+            .transpose(&[0, 2, 1, 3])?
+            .to_f32_vec()
+    };
+    let (rq, rk) = (composed(&q, &wq)?, composed(&k, &wk)?);
+    let (aq, ak) = (fq.to_f32_vec()?, fk.to_f32_vec()?);
+    let exact = aq
+        .iter()
+        .zip(&rq)
+        .chain(ak.iter().zip(&rk))
+        .filter(|(a, b)| a == b)
+        .count();
+    println!(
+        "interleaved Q/K norm-RoPE: {exact} / {} bitwise equal",
+        aq.len() * 2
+    );
+    assert_within(&aq, &rq, 1. / 128., 1e-3);
+    assert_within(&ak, &rk, 1. / 128., 1e-3);
+    let fused = InterleavedQkNormRope::new(&s)?;
+    assert!(fused.call(&q, &k, &wq, &wk, &cos, &sin, 3).is_err());
+    assert!(fused
+        .call(&q, &k, &wq.cast(D::F32)?, &wk, &cos, &sin, heads)
+        .is_err());
+    assert!(fused
+        .call(&q, &k, &wq, &wk, &cos.cast(D::BF16)?, &sin, heads)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn mpp_bf16_gemm_reproduces_mlx_quantized_matmul_bitwise() -> Result<()> {
+    use apxinf_mlx::fusions::MppBf16GemmNt;
+    let s = Stream::metal(0)?;
+    let gemm = MppBf16GemmNt::new(&s)?;
+    // The three Qwen-Image block projection shapes (K, N) at the 512x512 and
+    // 1024x576 image token counts. Below about 64 rows MLX quantized matmul
+    // takes another reduction, which the kernel does not reproduce.
+    for (k, n) in [(4096, 4096), (4096, 12288), (12288, 4096)] {
+        let w = Array::from_f32(&s, &[n, k], &data(n * k, 61, 0.003))?.cast(D::BF16)?;
+        let [qw, scales, biases] = w.quantize(64, 4)?;
+        let dense = qw.dequantize(&scales, &biases, 64, 4)?;
+        for m in [1024, 2304] {
+            let x = Array::from_f32(&s, &[1, m, k], &data(m * k, 53, 0.02))?.cast(D::BF16)?;
+            let out = gemm.call(&x, &dense)?;
+            assert_eq!((out.shape(), out.dtype()), (&[1, m, n][..], D::BF16));
+            let reference = x.quantized_matmul(&qw, &scales, &biases, true, 64, 4)?;
+            assert_eq!(out.to_bytes()?, reference.to_bytes()?, "K {k} N {n} M {m}");
+        }
+    }
+    let x = Array::zeros(&s, &[1, 96, 4096], D::BF16)?;
+    let w = Array::zeros(&s, &[64, 4096], D::BF16)?;
+    assert!(gemm.call(&x, &w).is_err());
+    assert!(gemm
+        .call(&x.slice_axis(1, 0, 64)?, &w.cast(D::F32)?)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn swiglu_gemv_matches_composed_parity_swiglu() -> Result<()> {
+    use apxinf_mlx::fusions::SwigluMlpGemv;
+    let s = Stream::metal(0)?;
+    let weight = |rows: usize, k: usize, period: usize| -> Result<Array> {
+        Array::from_f32(&s, &[rows, k], &data(rows * k, period, 0.002))?.cast(D::BF16)
+    };
+    let (gate, up, down) = (
+        weight(3072, 1024, 61)?,
+        weight(3072, 1024, 53)?,
+        weight(1024, 3072, 47)?,
+    );
+    let mlp = SwigluMlpGemv::new(&s)?;
+    let w = mlp.prepare(&gate, &up, &down)?;
+    for rows in [1, 2] {
+        let x =
+            Array::from_f32(&s, &[1, rows, 1024], &data(rows * 1024, 37, 0.05))?.cast(D::BF16)?;
+        let out = mlp.call(&x, &w)?;
+        assert_eq!((out.shape(), out.dtype()), (&[1, rows, 1024][..], D::BF16));
+        // FP32 SiLU of the BF16 gate, rounded, times up; then down.
+        let g = x.matmul(&gate.transpose(&[1, 0])?)?.cast(D::F32)?;
+        let one = Array::scalar(&s, 1., D::F32)?;
+        let silu = g.div(&one.add(&g.neg()?.exp()?)?)?.cast(D::BF16)?;
+        let act = silu.mul(&x.matmul(&up.transpose(&[1, 0])?)?)?;
+        let expected = act.matmul(&down.transpose(&[1, 0])?)?.to_f32_vec()?;
+        assert_within(&out.to_f32_vec()?, &expected, 0.02, 0.02);
+    }
+    assert!(mlp
+        .call(&Array::zeros(&s, &[1, 3, 1024], D::BF16)?, &w)
+        .is_err());
+    assert!(mlp.prepare(&gate.cast(D::F32)?, &up, &down).is_err());
+    Ok(())
+}

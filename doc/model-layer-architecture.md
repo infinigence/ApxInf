@@ -111,7 +111,7 @@ not a port requirement.
 | --- | --- | --- |
 | Python policy (`<Family>Policy`) | Public observation → canonical native inputs → decoded actions; prompt, tokenizer, state/action normalization and output context | [Pi05Policy](../python/apxinf/apxinf/policies/impls/pi05.py) |
 | Native binding (`ModelRunner`) | NumPy/Rust conversion, public shape validation, default sampling keys, host result conversion; delegates family computation to `VlaRuntime` | [PyO3 ModelRunner](../crates/apxinf-py/src/lib.rs) |
-| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text` or `Vla`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
+| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision`, `Image` or `Speech`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
 | `config.rs`, `load.rs` | Validate family config; select a supported implementation, materialize weights and fixed embeddings, construct the runner through its constructor | [load.rs](../crates/apxinf-model/src/pi05/load.rs) |
 | `model_runner/` (`<Family>ModelRunner`) | Implements `VlaRuntime`; validates requests, owns preparation policy, input/RNG binding, bounded cache and invalidation | [runner.rs](../crates/apxinf-model/src/pi05/model_runner/runner.rs) |
 | `model_runner/prepare.rs` and prepared inference | Query requirements, allocate stable inputs/output/workspace, warm up, capture and retain resources; compatible `run` executes without capture/autotune | [prepare.rs](../crates/apxinf-model/src/pi05/model_runner/prepare.rs) |
@@ -131,6 +131,20 @@ lifetimes and are not three names for a model. A single-implementation family
 does not need a precision-dispatch enum. `StepModulation` is computed per-step
 scale/shift/gate data, distinct from learned modulation weights. Keep model
 semantics such as `prefix` and `denoise`; flow steps are not token decode steps.
+
+`ImageRuntime` ([image.rs](../crates/apxinf-model/src/image.rs)) is the shared
+text-to-image contract. A request carries the prompt, size, seed and step count;
+the result is caller-owned row-major RGB8. Each family documents the sizes and
+step counts it supports, rejects others before device work, and keeps guidance,
+scheduler and file encoding out of the request.
+
+`SpeechRuntime` ([speech.rs](../crates/apxinf-model/src/speech.rs)) is the shared
+text-to-speech contract. A request carries the text, voice, language, an optional
+style instruction and a seed; the result is caller-owned interleaved `f32` samples
+with their sample rate and channel count, and whether generation reached its end
+token. The family owns its random stream: the seed resets it per request. Each
+family documents its voices and languages and rejects others before device work.
+Streaming output is not part of this contract.
 
 The native binding and the family runner are existing language-boundary and
 execution owners. `apxinf.ModelRunner` re-exports `apxinf_py.ModelRunner`; there
@@ -337,13 +351,13 @@ separately migrated; do not rename or import them as part of an unrelated port.
 `PreparedInference::status` is `RuntimeManaged`. A successful legacy `prepare`
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
-The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
-names, and for every Metal request. Metal admission reaches only a registered
-`metal_` factory, and each MLX family parses its variants locally; the common
-loader does not infer quantization from a shared CUDA precision choice. A new
-Metal family needs no central admission edit. Supporting it for a new non-Metal
-family requires updating that admission check and implementing family-local
-parsing/validation; registration alone is not
+The common loader accepts `model_variant` for all six built-in Python VLA
+families and D3, and for every Metal request. Metal admission reaches only a
+registered `metal_` factory, and each MLX family parses its variants locally;
+the common loader does not infer quantization from a shared CUDA precision
+choice. A new Metal family needs no central admission edit. Supporting it for a
+new non-Metal family requires updating that admission check and implementing
+family-local parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and
@@ -566,3 +580,26 @@ See the [implemented component view](model-lifecycle/architecture.md#implemented
 and [migration tracker](model-lifecycle/migration.md) for qualification and scope.
 WallOSS follows the same model/, model_runner/ and weights/ split ([WallOSS](walloss.md)).
 GR00T retains its previous implementation pending its own stage.
+
+## Public VLA variant selection
+
+All six Python VLA policies accept `model_variant` and pass it unchanged to
+`ModelRunner.load` / `LoadOptions.model_variant`. Python policy `precision`
+is rejected. PI0.5, SmolVLA, Qwen-Drive and WallOSS select their implementations
+in their model-local loaders. WallOSS selects BF16 or dynamic FP8 directly;
+it does not convert through `ModelPrecision`. GR00T and PI0-FAST keep a single
+family-local `config::load_precision` adapter for their legacy executors.
+The generic loader only admits model names; it does not interpret variant names.
+
+| Family | Public variants |
+| --- | --- |
+| PI0.5 | auto, bf16, fp8_static, int8_dynamic |
+| WallOSS | auto, bf16, fp8_dynamic |
+| SmolVLA | bf16, fp16 |
+| Qwen-Drive | auto, bf16 |
+| GR00T | auto, bf16, fp8_static, int8_dynamic (hardware restrictions still apply) |
+| PI0-FAST | auto, bf16, fp8_static |
+
+CPU CI exercises each policy through AutoPolicy up to the actual native load
+signature and tests the Rust selection/adaptation rules. It does not establish
+GPU numerical or performance parity.
