@@ -17,6 +17,9 @@ use super::weights::{fp16_tensor, ids_tensor, Linear, Weights};
 const MAX_POSITIONS: usize = 4000;
 const MIN_GENERATED_BEFORE_EOS: usize = 11;
 const DECODE_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
+// Prefill keeps one whole eager traversal of intermediates in the session
+// arena. Measured peak is ~51 MB; the rest is headroom for longer prompts.
+const PREFILL_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
 // PyTorch 2.11 launches its CUDA universal kernel with 256 threads per block.
 // On Orin's current scheduler this kernel receives five blocks for the GPT
 // 1024/1025-element tensors, so every element is assigned in one launch step.
@@ -59,8 +62,24 @@ struct DecodeResources {
     cache: DecodeCache,
 }
 
+// Prepared prefill operators are keyed by operand address, so the two
+// embedded inputs are staged into fixed storage and the whole traversal runs
+// inside one session: the first pass prepares and caches native resources,
+// every later pass with the same lengths replays the prepared sequence
+// without allocating or synchronizing per operator.
+struct PrefillResources {
+    session: cuda_ops::ExecutionSession,
+    text: Tensor,
+    audio: Tensor,
+    text_len: usize,
+    audio_len: usize,
+    capacity: usize,
+    prepared: bool,
+}
+
 pub struct Gpt {
     decode_resources: RefCell<Option<DecodeResources>>,
+    prefill_resources: RefCell<Option<PrefillResources>>,
     text_emb: Tensor,
     audio_emb: Tensor,
     bert_proj: Linear,
@@ -472,6 +491,7 @@ impl Gpt {
             layers,
             out,
             decode_resources: RefCell::new(None),
+            prefill_resources: RefCell::new(None),
         })
     }
 
@@ -655,6 +675,76 @@ impl Gpt {
         })
     }
 
+    /// Prefill inside a reusable execution session. Native operator resources
+    /// are prepared once per (text_len, audio_len, cache capacity) instead of
+    /// once per operator per request; a replay pass allocates from the session
+    /// arena and launches the prepared executions directly.
+    fn prefill_session_cached(
+        &self,
+        ctx: &Context,
+        text: &Tensor,
+        audio: &Tensor,
+        cache: &mut DecodeCache,
+    ) -> Result<Tensor> {
+        let text_len = text.shape().dims()[0];
+        let audio_len = audio.shape().dims()[0];
+        let mut slot = self.prefill_resources.borrow_mut();
+        let reusable = matches!(slot.as_ref(), Some(resources)
+            if resources.capacity == cache.capacity
+                && resources.text_len == text_len
+                && resources.audio_len == audio_len);
+        if !reusable {
+            *slot = Some(PrefillResources {
+                session: cuda_ops::ExecutionSession::with_capacity_pinning_prepared_buffers(
+                    PREFILL_WORKSPACE_BYTES,
+                    ctx.device_id(),
+                )?,
+                text: ops::alloc(ctx, &[text_len, GPT_HIDDEN])?,
+                audio: ops::alloc(ctx, &[audio_len, GPT_HIDDEN])?,
+                text_len,
+                audio_len,
+                capacity: cache.capacity,
+                prepared: false,
+            });
+        }
+        let resources = slot.as_mut().expect("prefill resources");
+        transfers::copy_cuda_to_cuda(ctx, text, &resources.text)?;
+        transfers::copy_cuda_to_cuda(ctx, audio, &resources.audio)?;
+        let staged_text = resources.text.clone();
+        let staged_audio = resources.audio.clone();
+        let session = resources.session.clone();
+        let prepared = resources.prepared;
+        let saved = (cache.text_len, cache.audio_len);
+        let mut replay_error: Option<Error> = None;
+        if prepared {
+            match cuda_ops::with_session(&session, || {
+                self.prefill_cached(ctx, staged_text.clone(), staged_audio.clone(), cache)
+            }) {
+                Ok(logits) => return Ok(logits),
+                Err(error) => {
+                    // The address-keyed cache no longer matches this operand
+                    // set; fall back to a full prepare pass instead of failing.
+                    replay_error = Some(error);
+                    cache.text_len = saved.0;
+                    cache.audio_len = saved.1;
+                }
+            }
+        }
+        let logits = cuda_ops::prepare_with_session(&session, || {
+            self.prefill_cached(ctx, staged_text.clone(), staged_audio.clone(), cache)
+        })
+        .map_err(|error| match replay_error {
+            Some(previous) => Error::Other(format!(
+                "GPT prefill replay failed ({previous}) and re-prepare failed ({error})"
+            )),
+            None => error,
+        })?;
+        if let Some(resources) = slot.as_mut() {
+            resources.prepared = true;
+        }
+        Ok(logits)
+    }
+
     fn prefill_cached(
         &self,
         ctx: &Context,
@@ -812,7 +902,7 @@ impl Gpt {
         } = resources;
         let _gpt_prefill_range = crate::profiling::trace::range("tts.gpt.prefill");
         let mut logits = self
-            .prefill_cached(ctx, text, audio, &mut cache)
+            .prefill_session_cached(ctx, &text, &audio, &mut cache)
             .map_err(|error| Error::Other(format!("GPT cached prefill: {error}")))?;
         drop(_gpt_prefill_range);
         let mut audio_tokens = prompt.to_vec();
