@@ -10,11 +10,23 @@ use std::path::Path;
 pub struct Linear {
     pub weight: Array,
     pub bias: Option<Array>,
+    /// W8 decode copy (`APXINF_TTS_W8_PREDICTOR`), used for one-row lanes only.
+    pub w8: Option<apxinf_mlx::Quantized>,
 }
 
 impl Linear {
-    /// `nn.Linear`: `addmm(bias, x, W.T)` or `x @ W.T`.
+    /// `nn.Linear`: `addmm(bias, x, W.T)` or `x @ W.T`, with the W8 lane for a
+    /// single decode row when the copy exists.
     pub fn apply(&self, x: &Array) -> Result<Array> {
+        if let Some(copy) = &self.w8 {
+            if x.shape().get(1) == Some(&1) {
+                let projected = copy.project(x)?;
+                return match &self.bias {
+                    Some(b) => projected.add(b),
+                    None => Ok(projected),
+                };
+            }
+        }
         let w = self.weight.transpose(&[1, 0])?;
         match &self.bias {
             Some(b) => b.addmm(x, &w, 1.0, 1.0),
@@ -176,6 +188,7 @@ impl Take {
             } else {
                 None
             },
+            w8: None,
         })
     }
 
