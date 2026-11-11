@@ -81,14 +81,36 @@ impl CudaBuffer {
         unsafe {
             ffi::check_cuda(ffi::cudaMalloc(&mut ptr, num_bytes))?;
         }
+        Ok(Self::from_allocation(ptr, num_bytes, device))
+    }
+
+    /// Like [`alloc`](Self::alloc), but reports device out-of-memory as
+    /// `Ok(None)` for callers that have a working fallback. The runtime records
+    /// the failed `cudaMalloc` as the last error; it is cleared so a later
+    /// launch check does not misattribute it. Other failures are returned.
+    pub(crate) fn try_alloc(num_bytes: usize, device: usize) -> Result<Option<Self>, String> {
+        unsafe {
+            ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
+        }
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let status = unsafe { ffi::cudaMalloc(&mut ptr, num_bytes) };
+        if status == ffi::CUDA_ERROR_MEMORY_ALLOCATION {
+            let _ = unsafe { ffi::cudaGetLastError() };
+            return Ok(None);
+        }
+        ffi::check_cuda(status)?;
+        Ok(Some(Self::from_allocation(ptr, num_bytes, device)))
+    }
+
+    fn from_allocation(ptr: *mut c_void, num_bytes: usize, device: usize) -> Self {
         let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation { ptr });
-        Ok(Self {
+        Self {
             ptr,
             len: num_bytes,
             device,
             owner: Arc::clone(&owner),
             retained_owner: owner,
-        })
+        }
     }
 
     /// Allocate and zero-fill.

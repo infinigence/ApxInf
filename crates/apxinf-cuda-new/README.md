@@ -258,7 +258,9 @@ without a session keep their own temporary storage.
 Vendor GEMM workspace/unpack/dequantization/projection and custom/FA2/CUTLASS
 FMHA attention scratch participate. Constants, the opaque NVFP4 GEMM workspace,
 and the segmented FA2 LSE buffer remain private. Candidate tuning uses isolated
-temporary allocations. A new `prepare` traversal reuses matching cached
-executions and retires bindings that have been unused for more than one
+temporary allocations. If the shared block cannot be allocated for lack of
+device memory, the execution keeps the private scratch its native prepare
+already allocated instead of failing. A new `prepare` traversal reuses matching
+cached executions and retires bindings that have been unused for more than one
 traversal (so a variable-length eager traversal does not evict warm executions);
 old captured graphs retain the executions and buffers they actually reference.

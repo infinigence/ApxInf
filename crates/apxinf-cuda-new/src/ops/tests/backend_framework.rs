@@ -2662,7 +2662,11 @@ fn failed_prepare_traversal_keeps_untouched_executions() {
     let a2 = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
     let b2 = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
     let a3 = tensor(0, vec![3, 3], &[1.0; 9]);
-    let b3 = tensor(0, vec![3, 3], &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    let b3 = tensor(
+        0,
+        vec![3, 3],
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    );
     let mut out2 = tensor(0, vec![2, 2], &[0.0; 4]);
     let mut out3 = tensor(0, vec![3, 3], &[0.0; 9]);
     let run2 = |out: &mut Tensor| {
@@ -2716,7 +2720,11 @@ fn temporarily_unused_execution_survives_one_generation() {
     let a2 = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
     let b2 = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
     let a3 = tensor(0, vec![3, 3], &[1.0; 9]);
-    let b3 = tensor(0, vec![3, 3], &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    let b3 = tensor(
+        0,
+        vec![3, 3],
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    );
     let mut out2 = tensor(0, vec![2, 2], &[0.0; 4]);
     let mut out3 = tensor(0, vec![3, 3], &[0.0; 9]);
     let run2 = |out: &mut Tensor| {
@@ -2754,4 +2762,56 @@ fn temporarily_unused_execution_survives_one_generation() {
         0,
         "execution was recreated after a single unused generation"
     );
+}
+
+#[test]
+fn shared_scratch_oom_keeps_private_scratch_and_enqueues() {
+    let ctx = CudaContext::new(0).unwrap();
+    let a = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    let mut output = tensor(0, vec![2, 2], &[0.0; 4]);
+    let enqueue = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a, &b, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+
+    // Without injection the GEMM borrows a shared block, so it does request
+    // provider scratch and the injected failure below is on the real path.
+    let sharing = ExecutionSession::with_capacity(4096, 0).unwrap();
+    sharing.prepare(|| enqueue(&mut output)).unwrap();
+    assert_eq!(sharing.provider_scratch_blocks(), 1);
+    drop(sharing);
+
+    // An impossible block size makes the shared cudaMalloc fail with a real
+    // out-of-memory error after native prepare already allocated the GEMM's
+    // private scratch. Prepare must keep that private scratch, not fail.
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    crate::workspace::override_provider_scratch_alloc(Some(1 << 50));
+    let prepared = session.prepare(|| enqueue(&mut output));
+    crate::workspace::override_provider_scratch_alloc(None);
+    prepared.unwrap();
+    assert_eq!(session.provider_scratch_blocks(), 0);
+    assert_eq!(
+        unsafe { crate::ffi::cudaPeekAtLastError() },
+        crate::ffi::CUDA_SUCCESS,
+        "the failed shared allocation leaked into the CUDA last-error state"
+    );
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&output), vec![1.0, 2.0, 3.0, 4.0]);
+
+    // The execution was cached with its private scratch: a captured run reuses
+    // it and the graph replays correctly.
+    super::execution::reset_execution_create_count();
+    let graph = crate::capture(&ctx, || session.run(|| enqueue(&mut output))).unwrap();
+    assert_eq!(super::execution::execution_create_count(), 0);
+    let zeros = vec![0; CudaBuffer::from_tensor(&output).unwrap().len()];
+    CudaBuffer::from_tensor(&output)
+        .unwrap()
+        .copy_from_host(&zeros)
+        .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(values(&output), vec![1.0, 2.0, 3.0, 4.0]);
 }
