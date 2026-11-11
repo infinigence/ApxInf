@@ -315,6 +315,40 @@ pub(crate) fn residual_add(ctx: &Context, input: &Tensor, residual: &Tensor) -> 
     hidden.reshape(apxinf_core::Shape::new(dims))
 }
 
+pub(crate) fn residual_add_into(
+    ctx: &Context,
+    input: &Tensor,
+    residual: &Tensor,
+    output: &Tensor,
+) -> Result<()> {
+    let dims = input.shape().dims().to_vec();
+    let cols = *dims
+        .last()
+        .ok_or_else(|| Error::Other("residual needs a rank".into()))?;
+    let rows = input.numel() / cols;
+    if residual.numel() != input.numel() {
+        return Err(Error::Other(format!(
+            "residual shape mismatch: {:?} vs {:?}",
+            residual.shape().dims(),
+            input.shape().dims()
+        )));
+    }
+    if output.numel() != input.numel() {
+        return Err(Error::Other(format!(
+            "residual output size mismatch: {:?} vs {:?}",
+            output.shape().dims(),
+            dims
+        )));
+    }
+    let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
+    let residual = residual.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
+    let mut hidden = output.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
+    ops::bias_residual(
+        ctx,
+        ops::BiasResidualArgs::new(&flat, None, &residual, &mut hidden),
+    )
+}
+
 pub(crate) fn affine(
     ctx: &Context,
     input: &Tensor,

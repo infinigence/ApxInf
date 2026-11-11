@@ -60,6 +60,33 @@ struct DecodeResources {
     meta: KvCacheDecodeMeta,
     input: Tensor,
     cache: DecodeCache,
+    embed: DecodeEmbedScratch,
+}
+
+/// Fixed buffers for the one-token decode embedding.
+///
+/// `embed_audio` allocates five tensors per call: two 4-byte id vectors, two
+/// 2 KB gathered rows and the 2 KB sum, and the decode loop dropped all five
+/// as soon as they had been copied into `decode_input`. Each free synchronizes
+/// the device, so the step paid five allocator round trips and five drains for
+/// 6 KB of scratch. Keeping them for the life of the decode resources removes
+/// the allocation entirely and writes the sum straight into the graph input.
+struct DecodeEmbedScratch {
+    ids: Tensor,
+    positions: Tensor,
+    table_row: Tensor,
+    position_row: Tensor,
+}
+
+impl DecodeEmbedScratch {
+    fn new(ctx: &Context) -> Result<Self> {
+        Ok(Self {
+            ids: transfers::to_cuda(&Tensor::from_i32(vec![1], &[0])?, ctx.device_id())?,
+            positions: transfers::to_cuda(&Tensor::from_i32(vec![1], &[0])?, ctx.device_id())?,
+            table_row: ops::alloc(ctx, &[1, GPT_HIDDEN])?,
+            position_row: ops::alloc(ctx, &[1, GPT_HIDDEN])?,
+        })
+    }
 }
 
 // Prepared prefill operators are keyed by operand address, so the two
@@ -536,6 +563,38 @@ impl Gpt {
         ops::residual_add(ctx, &audio, &position)
     }
 
+    /// One-token embedding for the decode loop, written into `destination`.
+    fn embed_audio_step(
+        &self,
+        ctx: &Context,
+        token: u32,
+        position_start: usize,
+        destination: &Tensor,
+        scratch: &mut DecodeEmbedScratch,
+    ) -> Result<()> {
+        let position = i32::try_from(position_start)
+            .map_err(|_| Error::Other("GPT audio position overflow".into()))?;
+        let ids = Tensor::from_i32(vec![1], &[token as i32])?;
+        transfers::copy_cpu_to_cuda(&ids, &scratch.ids)?;
+        let positions = Tensor::from_i32(vec![1], &[position])?;
+        transfers::copy_cpu_to_cuda(&positions, &scratch.positions)?;
+        cuda_ops::embedding_gather(ctx, &self.audio_emb, &scratch.ids, &scratch.table_row)
+            .map_err(|error| Error::Other(format!("GPT audio embedding: {error}")))?;
+        cuda_ops::embedding_gather(
+            ctx,
+            &self.audio_pe,
+            &scratch.positions,
+            &scratch.position_row,
+        )
+        .map_err(|error| Error::Other(format!("GPT audio position embedding: {error}")))?;
+        ops::residual_add_into(
+            ctx,
+            &scratch.table_row,
+            &scratch.position_row,
+            destination,
+        )
+    }
+
     fn allocate_cache(&self, ctx: &Context, capacity: usize) -> Result<Vec<LayerCache>> {
         let head_dim = GPT_HIDDEN / GPT_HEADS;
         (0..self.layers.len())
@@ -884,6 +943,7 @@ impl Gpt {
                 )?,
                 meta: KvCacheDecodeMeta::new(ctx.device_id(), capacity)?,
                 input: ops::alloc(ctx, &[1, GPT_HIDDEN])?,
+                embed: DecodeEmbedScratch::new(ctx)?,
                 cache: DecodeCache {
                     layers: self.allocate_cache(ctx, capacity)?,
                     text_len: 0,
@@ -899,6 +959,7 @@ impl Gpt {
             meta: decode_meta,
             input: decode_input,
             mut cache,
+            embed: mut embed_scratch,
         } = resources;
         let _gpt_prefill_range = crate::profiling::trace::range("tts.gpt.prefill");
         let mut logits = self
@@ -956,8 +1017,13 @@ impl Gpt {
                     .checked_add(cache.audio_len)
                     .ok_or_else(|| Error::Other("GPT cache position overflow".into()))?;
                 decode_meta.update(cache_position + 1, cache_position)?;
-                let embedded = self.embed_audio(ctx, &[next_token], cache.audio_len)?;
-                transfers::copy_cuda_to_cuda(ctx, &embedded, &decode_input)?;
+                self.embed_audio_step(
+                    ctx,
+                    next_token,
+                    cache.audio_len,
+                    &decode_input,
+                    &mut embed_scratch,
+                )?;
                 if let Some(graph) = &decode_graph {
                     let _gpt_replay_range = crate::profiling::trace::range("tts.gpt.replay");
                     graph.replay().map_err(|error| {
@@ -1001,6 +1067,7 @@ impl Gpt {
             meta: decode_meta,
             input: decode_input,
             cache,
+            embed: embed_scratch,
         });
         Ok(generated)
     }
