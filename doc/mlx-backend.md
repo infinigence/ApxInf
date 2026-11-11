@@ -163,6 +163,13 @@ codec dependency is added.
   rollout. Local activations are prepared separately. VAE overlap accumulation,
   normalization and final channel rounding use safe device arrays; the final
   download contains completed integer channels for RGB8 serialization.
+- Step reuse is off by default. A request with `step_reuse_fraction` (CLI
+  `--step-reuse-fraction`) skips the DiT on `round(fraction * 40)` steps,
+  ties to even, and reuses the previous step's velocity there. Admission
+  requires that count to be between 1 and 32; the first and last four steps
+  always run the DiT. The reused steps depend only on the sigma schedule, not
+  on the prompt or the image. This changes the output image. How much it
+  degrades image quality has not been measured for this implementation.
 - The checkpoint weights are under the Qwen Research License, which permits
   non-commercial use only. APXinf ships no weights.
 
@@ -174,6 +181,8 @@ cargo run --features mlx -- generate-image --model /path/to/Qwen-Image-2.1-MLX-4
 
 Add `--model-variant reference` to select the quantized-matmul reference path.
 Omitting it or using `--model-variant auto` preserves the optimization target.
+Add `--step-reuse-fraction 0.25` to skip the DiT on 10 of the 40 steps; the
+image differs from the default output.
 
 ### Implemented speech selection
 

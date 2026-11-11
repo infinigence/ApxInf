@@ -50,9 +50,11 @@ Select it from the CLI with `generate-image --model-variant reference`.
   first solver update; steps 1 through 39 call it once each. There are exactly
   40 original BF16 solver updates and one initial noise realization. Preparation
   belongs to the request because the low-RAM path releases the transformer.
-  Neither the scheduler nor the rollout is compiled. `ops.rs` keeps MLX
-  `nn.silu` and `nn.gelu_approx` as shapeless compiled functions, preparing their
-  BF16 rank-2/3 and FP32 rank-4 singleton/nonsingleton classes before first use.
+  Neither the scheduler nor the rollout is compiled. With step reuse requested
+  (below), some updates use the previous step's velocity instead. `ops.rs`
+  keeps MLX `nn.silu` and `nn.gelu_approx` as shapeless compiled functions,
+  preparing their BF16 rank-2/3 and FP32 rank-4 singleton/nonsingleton classes
+  before first use.
 - Image-token block projections decode Q4 to BF16 per call and use the
   MetalPerformancePrimitives GEMM when the token count is a multiple of 64 and
   at least 1024. Loading enables it only
@@ -74,6 +76,18 @@ Select it from the CLI with `generate-image --model-variant reference`.
 - `tables.rs` reproduces the NumPy float32 sin/cos used for the RoPE tables and
   the blending ramp; tests check recorded NumPy digests.
 
+Step reuse is off by default and lossy when enabled. With
+`ImageRequest::step_reuse_fraction` (CLI `--step-reuse-fraction`), the request
+skips the DiT forward on `round(fraction * 40)` steps, ties to even, and gives
+the solver the previous step's velocity there. The first and last four steps
+always run the DiT. Admission rejects a fraction whose count is not between 1
+and 32, including NaN, before any device work. The reused steps are those whose
+timestep embedding changes least from the previous step. They are a fixed
+function of the image size's sigma schedule and do not depend on the prompt,
+the seed or the latents. The output image differs from the default path. Its
+quality cost has not been measured for this implementation, so the option
+carries no quality claim.
+
 Lifecycle: the DiT is loaded with the model, released before each VAE decode
 and read again by the next request; the VAE decoder stays loaded. The MLX
 buffer cache is cleared after text encoding and after the DiT is released, as
@@ -84,6 +98,7 @@ complete-request cost require source-bound qualification, not a claim of
 identical memory usage.
 
 Verification status: CPU tests cover the tables, admission, RoPE positions,
-text-encoder tensor names and checkpoint detection. Image output against the
-reference, memory and latency are measured on Apple M4 and reported in the PR;
-other devices are listed as supported only after the same checks pass there.
+text-encoder tensor names, checkpoint detection and the step-reuse selection.
+Image output against the reference, memory and latency are measured on Apple M4
+and reported in the PR; other devices are listed as supported only after the
+same checks pass there.
