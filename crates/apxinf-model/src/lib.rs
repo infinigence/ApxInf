@@ -4,6 +4,8 @@ mod accelerator;
 pub mod auto;
 pub mod builtin;
 pub mod cuda_cosmos_policy;
+#[cfg(feature = "cuda")]
+pub mod cuda_gpt_sovits;
 pub mod d3;
 pub mod decision;
 pub mod debug;
@@ -37,6 +39,7 @@ pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
 pub mod speech;
+pub mod tts_trait;
 pub mod vla;
 mod walloss;
 

@@ -50,6 +50,11 @@ pub fn register_builtin_models() {
     crate::smolvla::register_builtin();
     #[cfg(feature = "cuda")]
     crate::cuda_cosmos_policy::register_builtin();
+    #[cfg(feature = "cuda")]
+    {
+        registry::register("gpt_sovits", crate::cuda_gpt_sovits::load::load);
+        registry::register("gpt_sovits-cuda", crate::cuda_gpt_sovits::load::load);
+    }
 }
 fn load_llama(
     path: &Path,
