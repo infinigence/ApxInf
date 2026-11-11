@@ -10,15 +10,15 @@
 //! non-causal SDPA over the full prompt, the output gate on the attention
 //! path, and the FP32 255-code readout at the last position.
 //!
-//! `GatedDeltaRecurrence` (four value rows per SIMD group) and `HalfSplitRope`
-//! (FP32 angles, one rounding to the input dtype) are the apxinf-mlx kernels
-//! for those primitives. The causal convolution is MLX `conv1d` over an
-//! explicit zero history.
+//! `GatedDeltaRecurrence` (four value rows per SIMD group),
+//! `CausalDepthwiseConv` (FP32 tap order, its own zero history, one launch)
+//! and `HalfSplitRope` (FP32 angles, one rounding to the input dtype) are the
+//! apxinf-mlx kernels for those primitives.
 
 use std::rc::Rc;
 
 use apxinf_core::{Error, Result};
-use apxinf_mlx::fusions::{GatedDeltaRecurrence, HalfSplitRope};
+use apxinf_mlx::fusions::{CausalDepthwiseConv, GatedDeltaRecurrence, HalfSplitRope};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 use super::config::{Config, Geometry, MAX_INPUT_TOKENS};
@@ -38,6 +38,7 @@ struct Parts {
     video_token_id: u32,
     vision_merge: usize,
     recurrence: GatedDeltaRecurrence,
+    causal_conv: CausalDepthwiseConv,
     rope: HalfSplitRope,
     inv_freq: Array,
     stream: Stream,
@@ -106,6 +107,7 @@ impl Model {
             video_token_id: config.video_token_id,
             vision_merge: config.vision.spatial_merge,
             recurrence: GatedDeltaRecurrence::new(&stream)?,
+            causal_conv: CausalDepthwiseConv::new(&stream)?,
             rope: HalfSplitRope::new(&stream, geometry.rope_dims)?,
             inv_freq: inverse_frequencies(&stream, geometry)?,
             stream,
@@ -668,15 +670,10 @@ fn gated_delta_forward(
     ])?;
     let b = project(input, &gated_delta.b.weight)?;
     let a = project(input, &gated_delta.a.weight)?;
-    // Stock reference: a depthwise causal convolution over `S - 1` zero rows.
-    let history = Array::zeros(
-        &parts.stream,
-        &[1, geometry.conv_kernel - 1, conv_dim],
-        qkv.dtype(),
-    )?;
-    let convolved =
-        Array::concat(&[&history, &qkv], 1)?.conv1d(&gated_delta.conv, 1, 0, 1, conv_dim)?;
-    let convolved = silu(&convolved)?;
+    // Causal depthwise convolution with zero history: the same arithmetic as
+    // a depthwise `conv1d` over `S - 1` zero rows, in one launch and without
+    // materializing that history.
+    let convolved = silu(&parts.causal_conv.call(&qkv, &gated_delta.conv)?)?;
     let queries = convolved.slice_axis(2, 0, key_dim)?.reshape(&[
         1,
         length,

@@ -1,6 +1,6 @@
 #![cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 use apxinf_core::Result;
-use apxinf_mlx::fusions::{PackedResidualRmsNorm, QkNormRope};
+use apxinf_mlx::fusions::{CausalDepthwiseConv, PackedResidualRmsNorm, QkNormRope};
 use apxinf_mlx::{Array, MlxDType as D, Stream};
 
 #[test]
@@ -440,5 +440,59 @@ fn swiglu_gemv_matches_composed_parity_swiglu() -> Result<()> {
         .call(&Array::zeros(&s, &[1, 3, 1024], D::BF16)?, &w)
         .is_err());
     assert!(mlp.prepare(&gate.cast(D::F32)?, &up, &down).is_err());
+    Ok(())
+}
+
+/// `CausalDepthwiseConv` must equal a depthwise `conv1d` over `S - 1` zero
+/// rows bit for bit: the model swaps one for the other, so any rounding
+/// difference would move its probabilities. Lengths cover a prompt shorter
+/// than, equal to and longer than the tap count.
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn causal_depthwise_conv_matches_the_composed_zero_history_conv1d() -> Result<()> {
+    let s = Stream::metal(0)?;
+    let kernel = CausalDepthwiseConv::new(&s)?;
+    for (length, channels, taps) in [
+        (1, 32, 4),
+        (2, 32, 4),
+        (3, 32, 4),
+        (4, 32, 4),
+        (9, 64, 3),
+        (5, 1, 4),
+    ] {
+        let x = Array::from_f32(
+            &s,
+            &[1, length, channels],
+            &data(length * channels, 29, 0.3),
+        )?
+        .cast(D::BF16)?;
+        let weight = Array::from_f32(&s, &[channels, taps, 1], &data(channels * taps, 13, 0.2))?
+            .cast(D::BF16)?;
+        let expected = {
+            let history = Array::zeros(&s, &[1, taps - 1, channels], D::BF16)?;
+            Array::concat(&[&history, &x], 1)?.conv1d(&weight, 1, 0, 1, channels)?
+        };
+        let actual = kernel.call(&x, &weight)?;
+        let (actual, expected) = (actual.to_f32_vec()?, expected.to_f32_vec()?);
+        assert_eq!(
+            actual, expected,
+            "length {length}, channels {channels}, taps {taps}"
+        );
+    }
+    let x = Array::from_f32(&s, &[1, 4, 8], &[0.5; 32])?;
+    let weight = Array::zeros(&s, &[8, 4, 1], D::BF16)?;
+    assert!(kernel.call(&x, &weight).is_err(), "accepted an F32 input");
+    assert!(
+        kernel
+            .call(&x.cast(D::BF16)?, &Array::zeros(&s, &[8, 4], D::BF16)?)
+            .is_err(),
+        "accepted a weight without the group axis"
+    );
+    assert!(
+        kernel
+            .call(&x.cast(D::BF16)?, &Array::zeros(&s, &[9, 4, 1], D::BF16)?)
+            .is_err(),
+        "accepted a weight whose channel count differs from the input"
+    );
     Ok(())
 }

@@ -4,6 +4,8 @@ mod array;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod backend;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod causal_conv;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod device_caps;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod ffi;

@@ -1,4 +1,5 @@
 //! Safe, shape-bound device fusions with explicit rounding contracts.
+pub use crate::causal_conv::CausalDepthwiseConv;
 pub use crate::gated_delta::GatedDeltaRecurrence;
 pub use crate::half_split_rope::HalfSplitRope;
 pub use crate::interleaved_qk_norm_rope::InterleavedQkNormRope;

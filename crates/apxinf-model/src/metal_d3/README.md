@@ -16,6 +16,15 @@ counts. Other geometry, including d3-mini, is rejected with the offending field.
 `auto` and `bf16` select the same composition. CUDA tuning, calibration,
 synthetic weights and auxiliary assets are rejected.
 
+## Causal convolution kernel
+
+The Gated DeltaNet block's qkv projection is convolved with a four-tap causal
+filter (`linear_conv_kernel_dim` 4). `CausalDepthwiseConv` runs that convolution
+in one launch, with its own zero history: one thread per output, FP32
+accumulation in tap order and one rounding to BF16. It matches a composed MLX
+`conv1d` over an explicit zero history bit for bit, and the device test pins
+that.
+
 ## Requests
 
 The runtime implements `CodeDecisionRuntime`: the caller renders and tokenizes
