@@ -9,7 +9,10 @@ below for these Clef compositions. Quality, performance, resource, lifetime and
 warm-readiness requirements are unchanged.
 
 These fork decisions do not establish upstream maintainer approval.
-The upstream host-handoff proposal remains under review.
+The upstream host-handoff proposal remains under review. Except for explicitly
+identified historical observations, the writer, runtime and qualification tests
+below are proposed requirements, not implemented capabilities or passing tests
+in this documentation-only change.
 
 ## Motivation
 
@@ -20,27 +23,32 @@ the ANE requires the placement evidence defined below.
 
 The first candidate is Clef Flash on the M1 Pro. A GPU+ANE composition keeps
 the optimized GPU kernels and moves 5632 of each MLP's 12288 intermediate
-columns to the ANE, as per-layer int8 programs. Owner evidence (M1 Pro,
-2026-10-17, same session after a reboot):
+columns to the ANE, as per-layer int8 programs. Historical owner-reported
+reference measurements (M1 Pro, 2026-10-17, same session after a reboot):
 
 | Implementation | 32-layer complete request, weighted |
 | --- | --- |
 | GPU only | 3603 ms |
 | GPU + ANE | 2790 ms (1.29x) |
 
-The GPU+ANE composition passed the owner's qualification with two recorded
-accepted decision changes. Its MLX peak memory is 8.68 GB, against 7.22 GB for
-the GPU-only composition.
+The owner reported that reference composition as qualified with two accepted
+decision changes, and MLX peak memory of 8.68 GB versus 7.22 GB for GPU-only.
+These historical observations motivate the proposal; they do not qualify the
+current ApxInf source or either proposed composition. This document does not
+supply the source-bound artifacts or workload definition needed to reproduce
+those figures; acceptance requires the complete qualification record below.
 
 The reference implementation generates the ANE programs with Python
-coremltools. ApxInf does not execute Python, so a port needs its own program
-writer.
+coremltools. The maintained native execution path must not depend on Python
+model execution, so a port needs its own program writer.
 
 ## Requirements
 
 - No Python and no coremltools at build time or run time.
-- Native execution on Apple Silicon macOS only. On other targets the feature
-  is inert, as the `mlx` feature is.
+- Native execution on Apple Silicon macOS 15 or newer for the proposed
+  specification-version-9 / `CoreML8` profile. Reject native preparation on
+  older macOS; availability of compute-plan inspection alone is insufficient.
+  On other targets the native feature is inert, as the `mlx` feature is.
 - No silent acceptance of an unqualified path. Compilation or loading errors
   fail preparation. Successful loading alone does not qualify ANE execution.
   An explicitly requested GPU+ANE path must fail preparation or request admission
@@ -78,9 +86,9 @@ Out of scope:
 The family composes MLX arrays and Core ML programs. Neither crate depends on
 the other.
 
-The scoped owner decision covers these two existing Clef compositions, not
-arbitrary program splits. Both retain hidden width 4096, intermediate width
-12288 and 32 layers. The target column identifies the intended qualification
+The scoped owner decision covers these two experimental Clef compositions
+from implementation PRs #147 and #148, not arbitrary program splits. Both
+retain hidden width 4096, intermediate width 12288 and 32 layers. The target column identifies the intended qualification
 device, not a claim that every gate has passed.
 
 | Composition | Target | GPU intermediate share | Core ML intermediate share | Token tile |
@@ -97,8 +105,9 @@ counts, byte budgets and observations.
 
 The protobuf messages are a hand-written subset of coremltools 9.0
 `Model.proto`, `FeatureTypes.proto` and `MIL.proto` (BSD-3-Clause). They use
-`prost` derive macros, which the workspace already locks, so no `protoc`, build
-script code generation or new dependency is needed.
+`prost` derive macros, reusing the version already in `Cargo.lock`. The new
+crate must declare its direct dependency, but needs no `protoc` or build-script
+code generation.
 
 Operations: `const`, `constexpr_blockwise_shift_scale`, `conv`, `mul`, `add`,
 `tanh`, `real_div`, `maximum`, `abs`, `reduce_max`, `split` and `identity`.
@@ -124,8 +133,13 @@ matches it in three ways:
 - the weight file, byte for byte;
 - prediction outputs, bit for bit, on the same device.
 
-The tests use recorded coremltools packages. The packages themselves are not
-committed, because they contain checkpoint-derived weights.
+The proposed equivalence tests use recorded coremltools packages. The
+checkpoint-derived packages are not committed. Before implementation acceptance,
+record immutable fixture digests, authorized access and replay instructions;
+missing private fixtures must be reported as skipped coverage, not a passing
+equivalence gate. Include redistributable synthetic fixtures for the supported
+writer operations so portable CI can check the format without checkpoints or
+Python. Device prediction equivalence remains a separate native test.
 
 ## Runtime
 
@@ -188,7 +202,11 @@ reports `supportedComputeDevices` and `preferredComputeDevice`. For each
 ANE-required operation, the proposed gate requires ANE support and ANE
 preference. A missing plan, unknown usage, unavailable API or unacceptable
 CPU assignment leaves the path unqualified. `MLComputePlan` is available
-from macOS 14.4; the program format may require a newer deployment target.
+from macOS 14.4, but this proposal's version-9 / `CoreML8` programs require
+macOS 15 or newer. In the pinned
+[coremltools 9.0 deployment targets](https://github.com/apple/coremltools/blob/428d4b2658dfc44194f27f4f36870751be402ff7/coremltools/converters/mil/_deployment_compatibility.py),
+the reference conversion's `iOS18` minimum target and `macOS15` are aliases
+for the same specification version.
 
 A compute plan describes anticipated placement, not an execution certificate.
 On 2026-10-19 the fork operator accepted the following combined,
@@ -242,10 +260,11 @@ or unbounded intermediate transfers. GPU-only and CUDA requirements remain
 unchanged, including device residency and CUDA Graph capture. MLX stages
 outside the listed boundaries retain their existing preparation requirements.
 
-The maintainer's instruction was to accept the documented handoff boundary
-and continue completing the evidence, not to remove Draft early. The
-[canonical acceptance contract](model-execution-wiring.md#accelerator-port-acceptance)
-links this limited decision. Qualification remains conditional on the exact
+The fork operator's instruction was to accept the documented experimental
+handoff boundary and continue completing the evidence, not to remove Draft
+early. The [canonical acceptance contract](model-execution-wiring.md#accelerator-port-acceptance)
+links this proposal without adopting the exception. Upstream maintainer
+approval is still required. Qualification remains conditional on the exact
 profile, placement, warm preparation, complete-request numerical/performance,
 resource, lifetime and transfer evidence below. Missing evidence still blocks
 port completion. This record is not upstream PR approval, implementation,
@@ -309,6 +328,7 @@ bit-equal to the GPU and can differ between ANE generations.
   load takes seconds per layer.
 - Should first-load compilation be an explicit preparation step rather than
   part of loading?
-- CI builds the crate on Linux, where it is inert. Who owns the versioned
-  macOS placement and complete-request qualification evidence until a macOS
-  runner exists? A manual smoke test alone cannot qualify it.
+- The implementation must add Linux writer tests and native-feature isolation
+  checks; this documentation-only PR adds no crate or CI coverage. Who owns the
+  versioned macOS placement and complete-request qualification evidence until a
+  macOS runner exists? A manual smoke test alone cannot qualify it.
