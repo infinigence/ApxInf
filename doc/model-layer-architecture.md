@@ -152,6 +152,14 @@ wrapper merely to reproduce the names in this table.
 
 ### Repacked GEMM weight ownership
 
+PI0.5 BF16 host preparation borrows an already-BF16 CPU tensor for a single
+projection or direct upload. Fused QKV and gate/up projections concatenate their
+output columns directly in BF16, after the same elementwise rounding for F32 or
+F16 inputs. These conversions read typed host slices directly instead of cloning
+an F32 staging vector. This avoids an intermediate F32 concatenation and redundant
+native BF16 conversion. The CUDA upload still creates and owns its device allocation;
+host borrowing does not extend into prepared executions or graph lifetimes.
+
 PI0.5 device linear weights retain cuda-new `RepackedWeight` layout state next
 to their allocation. INT8 row/channel W8A8 loading uses
 `RepackedWeight::upload_row_channel`: the backend checks compiled device capabilities and

@@ -5,7 +5,7 @@ mod linear {
     use apxinf_core::{DType, Error, Result, Tensor};
 
     use crate::pi05::backend::{self, Context};
-    use crate::pi05::weights::packing::concat_host_2d;
+    use crate::pi05::weights::packing::{concat_bf16_host, to_bf16_host};
     use crate::pi05::LinearWeights;
 
     #[derive(Debug)]
@@ -37,7 +37,7 @@ mod linear {
                     "cannot pack an empty BF16 linear group".into(),
                 ));
             }
-            let plain_weight = concat_host_2d(
+            let plain_weight = concat_bf16_host(
                 &linears
                     .iter()
                     .map(|linear| &linear.weight)
@@ -74,20 +74,6 @@ mod linear {
         }
     }
 
-    fn to_bf16_host(tensor: &Tensor) -> Result<Tensor> {
-        if tensor.dtype() == DType::F8E4M3 {
-            return Err(Error::Other(
-                "cannot convert scale-less E4M3 data to BF16".into(),
-            ));
-        }
-        let values = tensor
-            .to_f32_vec()?
-            .into_iter()
-            .map(half::bf16::from_f32)
-            .collect::<Vec<_>>();
-        Tensor::from_bf16(tensor.shape().dims().to_vec(), &values)
-    }
-
     pub fn bf16_to_device(tensor: &Tensor, context: &Context) -> Result<Tensor> {
         backend::to_device(context, &to_bf16_host(tensor)?)
     }
@@ -108,6 +94,7 @@ mod linear {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::pi05::weights::packing::concat_host_2d;
         #[test]
         fn packs_qkv_as_native_bf16() {
             let linear = |weight: &[f32], shape: [usize; 2], bias: &[f32]| LinearWeights {
