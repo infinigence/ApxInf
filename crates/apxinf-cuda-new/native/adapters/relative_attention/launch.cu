@@ -1,6 +1,6 @@
-#include "../include/apxinf_cuda/relative_attention.h"
-#include "../framework/runtime_internal.h"
-#include "../kernels/custom/relative_attention.cuh"
+#include "../../include/apxinf_cuda/relative_attention.h"
+#include "../../framework/runtime_internal.h"
+#include "../../kernels/custom/relative_attention.cuh"
 
 #include <climits>
 #include <cmath>
@@ -28,6 +28,13 @@ void validate_spec(const apxinf_relative_attention_spec_t& spec) {
   if (spec.heads_share_relative > 1) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid RelativeAttention head sharing");
+  }
+  // One FP32 score per key position lives in dynamic shared memory and the
+  // kernel never opts into the larger per-block limit.
+  constexpr int64_t kMaxLength = 48 * 1024 / static_cast<int64_t>(sizeof(float));
+  if (spec.length > kMaxLength) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "RelativeAttention length exceeds the shared score window");
   }
 }
 

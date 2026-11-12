@@ -51,7 +51,7 @@ pub(super) fn execute(ctx: &CudaContext, normalized: Normalized) -> Result<()> {
             // arena allocation diverges from the prepared address sequence.
             if crate::workspace::is_capturing() {
                 for buffer in &normalized.storage {
-                    crate::workspace::retain_resource(&std::rc::Rc::new(buffer.clone()));
+                    crate::workspace::retain_buffer(buffer);
                 }
             }
             execution

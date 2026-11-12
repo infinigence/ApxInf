@@ -1,8 +1,42 @@
 # GPT-SoVITS V5
 
-ApxInf provides a CUDA-native GPT-SoVITS V5 Turbo speech runtime for NVIDIA
-devices. The public input is target text, reference text, and a 3–10 second
+ApxInf provides a CUDA-native GPT-SoVITS V5 speech runtime for NVIDIA
+devices, loaded from a checkpoint directory in the `apxinf-gpt-sovits-v5`
+format. The public input is target text, reference text, and a 3–10 second
 reference audio file. The output is mono `float32` PCM at 48 kHz.
+
+## Checkpoint format
+
+A converted directory is identified by the `format` field of `manifest.json`,
+which is `apxinf-gpt-sovits-v5`. The complete manifest for the V5 release:
+
+```json
+{
+  "format": "apxinf-gpt-sovits-v5",
+  "source_sha256": {
+    "gpt": "87133414860ea14ff6620c483a3db5ed07b44be42e2c3fcdad65523a729a745a",
+    "sovits": "287b32a06b7d486f5303ec520468b0728fb01aac8b0f5d86fd5455c9a1d3e022",
+    "vocoder": "b7543c83222aa2105bb4efb56845086bc5f2eeba61243d723ffa062052b3221f",
+    "hubert": "24164f129c66499d1346e2aa55f183250c223161ec2770c0da3d3b08cf432d3c",
+    "roberta": "e53a693acc59ace251d143d068096ae0d7b79e4b1b503fa84c9dcf576448c1d8"
+  },
+  "dtype": "float16",
+  "version": "v5turbo"
+}
+```
+
+- `format` names the checkpoint layout. `apxinf-gpt-sovits-v5` is the only
+  layout this runtime loads; it covers the five-component V5 model.
+- `version` records the upstream release tag, `v5turbo`; the model itself is
+  **GPT-SoVITS V5**. The upstream GPT file is still called `s1v3.ckpt` for
+  historical reasons; that `v3` is a file name and not a model generation.
+- `dtype` is `float16`, the only precision the runtime accepts.
+- `source_sha256` records the five official inputs the directory was converted
+  from, so a checkpoint is traceable to exact upstream files across machines.
+
+The directory also holds `config.json` (model geometry, inference defaults and
+the `assets` map) and the five safetensors files named there: `gpt`, `sovits`,
+`vocoder`, `hubert` and `roberta`.
 
 ## Checkpoint conversion
 
@@ -33,8 +67,8 @@ spectrogram branch uses torchaudio.
 
 The Rust model contract is `apxinf_model::TtsTrait`, defined in
 `tts_trait.rs`, alongside the separate `LlmTrait` language-model contract.
-`LoadedModel::Speech` owns the implementation, and `LoadedModel::tts()`
-returns the trait object. `SpeechRequest`, `SpeechSpec`, `PreparedSpeech`,
+`LoadedModel::Tts` owns the implementation, and `LoadedModel::tts()`
+returns the trait object. `TtsRequest`, `TtsSpec`, `PreparedTts`,
 and `PcmAudio` describe synthesis input, fixed profiles, prepared plans, and
 output. The Python binding remains `SpeechRunner`.
 
@@ -183,11 +217,11 @@ operations use four-element loads and stores with the same FP32 arithmetic.
 
 ## Supported scope
 
-- GPT-SoVITS V5 Turbo with Chinese-first frontend semantics.
+- GPT-SoVITS V5 with Chinese-first frontend semantics.
 - FP16 converted weights on CUDA.
 - 48 kHz mono PCM.
 - Four CFM steps by default.
-- `cfg_rate` must be zero; V5 Turbo classifier-free guidance is unsupported.
+- `cfg_rate` must be zero; V5 classifier-free guidance is unsupported.
 - Reference audio must be 3–10 seconds through the Python policy.
 - GPT caches the joint text/audio prefix and processes one audio token per
   decode step. Compatible requests reuse the graph and buffers, recomputing
@@ -249,12 +283,12 @@ different host trigonometric implementation.
 
 ## End-to-end quality acceptance (2026-11-06)
 
-Run: `devlocal/gpt-sovits-v5/results/e2e-quality-20261106/` (testset.json,
-gen_official.py, gen_apxinf.py, eval_metrics.py, report.py; logs in pipeline.log).
-5 reference speakers x 3 texts (long/short/medium), seed 1234, top_k 5,
-repetition_penalty 1.35, sample_steps 4, max_seconds 22. Judges on orin:
+Run: a harness that generates the same testset through the official pipeline
+and through ApxInf, then scores both. 5 reference speakers x 3 texts
+(long/short/medium), seed 1234, top_k 5,
+repetition_penalty 1.35, sample_steps 4, max_seconds 22. Judges:
 funasr seaco-paraformer-large (CER), microsoft/wavlm-base-plus-sv (speaker
-cosine), wav duration. HF access via HF_ENDPOINT=https://hf-mirror.com.
+cosine), wav duration.
 
 Result: 12/15 pairs (F02, F07, S01701, Y03) are at parity with official eager —
 mean CER 0.050 vs 0.051, mean speaker similarity 0.965 vs 0.964, duration
@@ -268,14 +302,10 @@ luck), and CER on the short text reaches 0.29-0.52 vs official 0.0-0.15.
 The suspected conditioning/HuBERT-to-code source was later ruled out: the
 actual cause was the reference-window offset, fixed on 2026-11-10 below.
 
-The formal "within official eager-vs-graph spread" gate degenerates on this
-host: official graph and eager runs are near bit-identical (spread ~0), so the
-strict pass counts (cer 11/15, speaker 1/15, duration 3/15) measure bit-exact
-reproduction rather than quality. The 4-reference parity summary above is the
-meaningful reading. Cross-seed controls live in wav-f09-seeds/ and
-wav-f09-official-seeds/ with corrected sims in f09-seed-metrics.json (the
-helper scripts initially fed 48k/32k audio to WavLM labelled 16k; funasr CER
-was never affected).
+A strict "within official eager-vs-graph spread" gate is not meaningful here:
+official eager and graph outputs are near bit-identical, so that gate would
+measure bit-exact reproduction rather than quality. The 4-reference parity
+summary above is the meaningful reading.
 
 E2E verdict (2026-11-06): PASS for 4/5 references, FAIL for F09. The F09
 regression was later traced to reference-window slicing, not HuBERT codes; see
@@ -283,7 +313,7 @@ the 2026-11-10 follow-up below.
 
 ## Native speed/segmentation A/B (2026-11-10)
 
-Run: `tmp/apxinf-e04-compare/` on orin; three E04 texts, Y03 reference,
+Run: three E04 texts, Y03 reference,
 `seed=1234`, `top_k=15`, `sample_steps=4`, `repetition_penalty=1.35`,
 `speed_factor=1.05`, `text_split_method=cut5`, `fragment_interval=0.15`.
 Both backends were judged with funasr seaco-paraformer-large and
@@ -295,12 +325,10 @@ microsoft/wavlm-base-plus-sv.
 | E04-s08 | 0.042 | 0.021 | 0.969 | 0.977 | 8.78 s | 8.74 s |
 | E04-s13 | 0.017 | 0.000 | 0.972 | 0.977 | 10.20 s | 9.68 s |
 
-The earlier apxinf inbox batches simulated the official speed by polyphase
-resampling and trimmed fragment edges before inserting fixed gaps. That
-external processing shifted pitch/formants ("气虚") and removed natural
-pauses ("断句不对"). With speed and segmentation handled inside the engine,
-the three texts are at or above official CER and speaker similarity, and
-duration is within ~0.5 s.
+Speed and segmentation are applied inside the engine rather than by resampling
+the finished audio, so pitch, formants and pauses are preserved; the three
+texts are at or above official CER and speaker similarity, and duration is
+within ~0.5 s.
 
 
 ## F09 root cause and re-acceptance (2026-11-10)
@@ -331,5 +359,4 @@ prompt. Re-running the full 5-reference x 3-text set with `cut0`,
 All 15 texts now match official CER; speaker similarity is within 0.9 points
 of official for every reference, and F09 improves from 0.70-0.79 to
 0.948-0.984. Prepared CUDA Graph and eager output are bit-identical for the
-same request. Raw wavs and metrics are under `tmp/e2e-new/` and
-`tmp/f09-e2e/` on orin.
+same request.

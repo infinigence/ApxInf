@@ -587,13 +587,16 @@ fn gemm_bias_all_candidates_match_torch() {
 
 #[test]
 fn gemm_bias_f16_all_candidates_match_reference() {
-    // F16 bias 投影在候选集里只有 r1 加回的原生 epilogue 一个非回退候选，
-    // 所以这条测试是它唯一的精度门。参考值是 f64 累加再取 f32，等价于
-    // 「F32 投影 + bias-before-cast」，容差由 compare_reference 统一给定。
+    // The native epilogue is the only non-fallback candidate this bias
+    // projection has, so this test is its single precision gate. The reference
+    // accumulates in f64 and rounds to f32, which is the same contract as an
+    // F32 projection with the bias added before the cast; compare_reference
+    // supplies the tolerance.
     let ctx = CudaContext::new(0).unwrap();
     let (m, k, n) = (64usize, 256usize, 256usize);
-    // 1/8、1/16、1/4 的粒度在 F16 里都精确可表示，参考值可以直接复用同一批
-    // f32 输入，不会掺进输入量化误差。
+    // Eighths, sixteenths and quarters are exact in F16, so the reference can
+    // read the same f32 inputs without carrying an extra input-quantization
+    // error.
     let a_values: Vec<f32> = (0..m * k)
         .map(|index| ((index * 7 % 33) as f32 - 16.0) / 8.0)
         .collect();
@@ -606,7 +609,8 @@ fn gemm_bias_f16_all_candidates_match_reference() {
 
     let a = f16_tensor(0, vec![m, k], &a_values);
     let b = f16_tensor(0, vec![k, n], &b_values);
-    // bias 按 contracts::normalize 的投影 dtype 规则跟 A 走：F16 输入 ⇒ F16 bias。
+    // contracts::normalize ties the bias dtype to the projection: F16 A means an
+    // F16 bias.
     let bias = f16_tensor(0, vec![n], &bias_values);
     let mut out = zeros_tensor(0, vec![m, n], DType::F16);
     let mut args = GemmArgs::new(&a, &b, &mut out);
@@ -757,4 +761,234 @@ fn gemm_geglu_three_view_all_candidates_match_torch() {
             .unwrap();
         }
     }
+}
+
+/// Host reference for `conv1d`: PyTorch's temporal cross-correlation,
+/// accumulated in F32 from the channel-last operands.
+#[allow(clippy::too_many_arguments)]
+fn conv1d_reference(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    batch: usize,
+    in_length: usize,
+    in_channels: usize,
+    out_channels: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    groups: usize,
+) -> Vec<f32> {
+    let out_length = (in_length + 2 * padding - dilation * (kernel - 1) - 1) / stride + 1;
+    let in_per_group = in_channels / groups;
+    let out_per_group = out_channels / groups;
+    let mut output = vec![0.0f32; batch * out_length * out_channels];
+    for item in 0..batch {
+        for out_channel in 0..out_channels {
+            let group = out_channel / out_per_group;
+            for position in 0..out_length {
+                let mut sum = 0.0f32;
+                for tap in 0..kernel {
+                    let offset = position * stride + tap * dilation;
+                    if offset < padding {
+                        continue;
+                    }
+                    let source = offset - padding;
+                    if source >= in_length {
+                        continue;
+                    }
+                    for channel in 0..in_per_group {
+                        let input_index = (item * in_length + source) * in_channels
+                            + group * in_per_group
+                            + channel;
+                        let weight_index = (out_channel * in_per_group + channel) * kernel + tap;
+                        sum += input[input_index] * weight[weight_index];
+                    }
+                }
+                output[(item * out_length + position) * out_channels + out_channel] =
+                    sum + bias[out_channel];
+            }
+        }
+    }
+    output
+}
+
+/// Host reference for `conv-transpose1d`: the adjoint scatter of `conv1d`.
+#[allow(clippy::too_many_arguments)]
+fn conv_transpose1d_reference(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    batch: usize,
+    in_length: usize,
+    in_channels: usize,
+    out_channels: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    output_padding: usize,
+    groups: usize,
+) -> Vec<f32> {
+    let out_length = (in_length - 1) * stride - 2 * padding + (kernel - 1) + output_padding + 1;
+    let in_per_group = in_channels / groups;
+    let out_per_group = out_channels / groups;
+    let mut output = vec![0.0f32; batch * out_length * out_channels];
+    for item in 0..batch {
+        for position in 0..in_length {
+            for in_channel in 0..in_channels {
+                let group = in_channel / in_per_group;
+                for tap in 0..kernel {
+                    let scatter = position * stride + tap;
+                    if scatter < padding {
+                        continue;
+                    }
+                    let target = scatter - padding;
+                    if target >= out_length {
+                        continue;
+                    }
+                    for channel in 0..out_per_group {
+                        let out_channel = group * out_per_group + channel;
+                        output[(item * out_length + target) * out_channels + out_channel] += input
+                            [(item * in_length + position) * in_channels + in_channel]
+                            * weight[(in_channel * out_per_group + channel) * kernel + tap];
+                    }
+                }
+            }
+        }
+    }
+    for position in 0..batch * out_length {
+        for out_channel in 0..out_channels {
+            output[position * out_channels + out_channel] += bias[out_channel];
+        }
+    }
+    output
+}
+
+fn f32_tensor_values(tensor: &Tensor) -> Vec<f32> {
+    let buffer = crate::CudaBuffer::from_tensor(tensor).unwrap();
+    let mut bytes = vec![0; buffer.len()];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_ne_bytes(value.try_into().unwrap()))
+        .collect()
+}
+
+fn assert_matches_reference(actual: &[f32], expected: &[f32], label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label} length");
+    let error: f32 = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected) * (actual - expected))
+        .sum();
+    let signal: f32 = expected.iter().map(|value| value * value).sum();
+    let relative_l2 = (error / signal.max(f32::MIN_POSITIVE)).sqrt();
+    assert!(
+        relative_l2 < 1e-5,
+        "{label} drifted from the reference by relative L2 {relative_l2}"
+    );
+}
+
+#[test]
+fn conv1d_matches_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (batch, in_length, in_channels, out_channels, kernel) = (2, 5, 4, 6, 3);
+    let (stride, padding, dilation, groups) = (2, 1, 2, 2);
+    let out_length = (in_length + 2 * padding - dilation * (kernel - 1) - 1) / stride + 1;
+    let input_values: Vec<_> = (0..batch * in_length * in_channels)
+        .map(|index| ((index * 7 % 23) as f32 - 11.0) / 32.0)
+        .collect();
+    let weight_values: Vec<_> = (0..out_channels * (in_channels / groups) * kernel)
+        .map(|index| ((index * 5 % 19) as f32 - 9.0) / 16.0)
+        .collect();
+    let bias_values: Vec<_> = (0..out_channels)
+        .map(|index| (index as f32 - 2.0) / 8.0)
+        .collect();
+    let expected = conv1d_reference(
+        &input_values,
+        &weight_values,
+        &bias_values,
+        batch,
+        in_length,
+        in_channels,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+        dilation,
+        groups,
+    );
+
+    let input = f32_tensor(0, vec![batch, in_length, in_channels], &input_values);
+    let weight = f32_tensor(
+        0,
+        vec![out_channels, in_channels / groups, kernel],
+        &weight_values,
+    );
+    let bias = f32_tensor(0, vec![out_channels], &bias_values);
+    let mut output = zeros_tensor(0, vec![batch, out_length, out_channels], DType::F32);
+    let mut args =
+        Conv1dArgs::new(Conv1dSemantic::Conv1d, &input, &weight, &mut output).with_bias(&bias);
+    args.stride = stride;
+    args.padding = padding;
+    args.dilation = dilation;
+    args.groups = groups;
+    conv1d(&ctx, args).unwrap();
+    ctx.synchronize().unwrap();
+    assert_matches_reference(&f32_tensor_values(&output), &expected, "conv1d");
+}
+
+#[test]
+fn conv_transpose1d_matches_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (batch, in_length, in_channels, out_channels, kernel) = (2, 4, 4, 6, 3);
+    let (stride, padding, output_padding, groups) = (2, 1, 1, 2);
+    let out_length = (in_length - 1) * stride - 2 * padding + (kernel - 1) + output_padding + 1;
+    let input_values: Vec<_> = (0..batch * in_length * in_channels)
+        .map(|index| ((index * 11 % 17) as f32 - 8.0) / 16.0)
+        .collect();
+    let weight_values: Vec<_> = (0..in_channels * (out_channels / groups) * kernel)
+        .map(|index| ((index * 3 % 13) as f32 - 6.0) / 16.0)
+        .collect();
+    let bias_values: Vec<_> = (0..out_channels)
+        .map(|index| (index as f32 - 2.0) / 16.0)
+        .collect();
+    let expected = conv_transpose1d_reference(
+        &input_values,
+        &weight_values,
+        &bias_values,
+        batch,
+        in_length,
+        in_channels,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+        output_padding,
+        groups,
+    );
+
+    let input = f32_tensor(0, vec![batch, in_length, in_channels], &input_values);
+    let weight = f32_tensor(
+        0,
+        vec![in_channels, out_channels / groups, kernel],
+        &weight_values,
+    );
+    let bias = f32_tensor(0, vec![out_channels], &bias_values);
+    let mut output = zeros_tensor(0, vec![batch, out_length, out_channels], DType::F32);
+    let mut args = Conv1dArgs::new(
+        Conv1dSemantic::ConvTranspose1d,
+        &input,
+        &weight,
+        &mut output,
+    )
+    .with_bias(&bias);
+    args.stride = stride;
+    args.padding = padding;
+    args.output_padding = output_padding;
+    args.groups = groups;
+    conv1d(&ctx, args).unwrap();
+    ctx.synchronize().unwrap();
+    assert_matches_reference(&f32_tensor_values(&output), &expected, "conv-transpose1d");
 }

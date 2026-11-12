@@ -24,9 +24,11 @@ pub fn embedding_gather(
         return Err(invalid("embedding output width must match the table"));
     }
     let tokens = output_dims[0];
-    if !matches!(table.dtype(), DType::F32 | DType::BF16) || output.dtype() != table.dtype() {
+    if !matches!(table.dtype(), DType::F32 | DType::F16 | DType::BF16)
+        || output.dtype() != table.dtype()
+    {
         return Err(invalid(
-            "embedding gather currently requires matching F32 or BF16 table/output",
+            "embedding gather requires matching F32, F16 or BF16 table/output",
         ));
     }
     tensor_storage(ctx, table, table.dtype(), &table_dims)?;

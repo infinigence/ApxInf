@@ -49,10 +49,7 @@ pub fn register_builtin_models() {
     #[cfg(feature = "cuda")]
     crate::smolvla::register_builtin();
     #[cfg(feature = "cuda")]
-    {
-        registry::register("gpt_sovits", crate::gpt_sovits::load::load);
-        registry::register("gpt_sovits-cuda", crate::gpt_sovits::load::load);
-    }
+    registry::register("gpt_sovits", crate::gpt_sovits::load::load);
 }
 fn load_llama(
     path: &Path,

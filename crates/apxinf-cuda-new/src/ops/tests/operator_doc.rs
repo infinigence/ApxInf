@@ -6,6 +6,9 @@
 
 use std::collections::BTreeSet;
 
+use crate::ops::conv1d::contracts as conv1d_contracts;
+use crate::ops::relative_attention::contracts as relative_attention_contracts;
+use crate::ops::tts::TtsSemantic;
 use crate::ops::{attention_contracts, contracts as gemm_contracts};
 
 const CATALOG: &str = include_str!("../../../cuda-operator.md");
@@ -40,6 +43,19 @@ fn every_l3_operator_appears_once_in_cuda_operator_doc() {
                 .copied()
                 .map(attention_contracts::Semantic::doc_id),
         )
+        .chain(
+            conv1d_contracts::Conv1dSemantic::ALL
+                .iter()
+                .copied()
+                .map(conv1d_contracts::Conv1dSemantic::doc_id),
+        )
+        .chain(
+            relative_attention_contracts::Semantic::ALL
+                .iter()
+                .copied()
+                .map(relative_attention_contracts::Semantic::doc_id),
+        )
+        .chain(TtsSemantic::ALL.iter().copied().map(TtsSemantic::doc_id))
         .collect();
     let expected: BTreeSet<_> = expected_ids.iter().copied().collect();
 

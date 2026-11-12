@@ -7,6 +7,8 @@ pub mod d3;
 pub mod decision;
 pub mod debug;
 mod generation_config;
+#[cfg(feature = "cuda")]
+pub mod gpt_sovits;
 pub mod gr00t;
 #[cfg(feature = "hip")]
 pub mod hip_pi05;

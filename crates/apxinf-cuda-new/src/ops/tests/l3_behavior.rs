@@ -2979,3 +2979,93 @@ fn attention_semantics_use_distinct_native_registries() {
     assert_ne!(dense_summary, segmented_summary);
     assert_ne!(cache_summary, segmented_summary);
 }
+
+#[test]
+fn conv1d_geometry_and_deferred_bias_follow_the_channel_last_contract() {
+    let ctx = CudaContext::new(0).unwrap();
+    // One input channel, two output channels, kernel 2 over four positions: each
+    // output is a pair-weighted sum of two adjacent inputs. Two output channels
+    // keep the geometry servable; the provider has no single-output engine.
+    let input = f32_tensor(0, vec![1, 4, 1], &[1.0, 2.0, 3.0, 4.0]);
+    let weight = f32_tensor(0, vec![2, 1, 2], &[1.0, 1.0, 1.0, 2.0]);
+    let bias = f32_tensor(0, vec![2], &[0.5, 0.25]);
+    let mut output = zeros_tensor(0, vec![1, 3, 2], DType::F32);
+    conv1d(
+        &ctx,
+        Conv1dArgs::new(Conv1dSemantic::Conv1d, &input, &weight, &mut output).with_bias(&bias),
+    )
+    .unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(f32_values(&output), [3.5, 5.25, 5.5, 8.25, 7.5, 11.25]);
+
+    // `direct_channel_last` applies no bias; the caller adds it afterwards, so
+    // its output is the biased result minus the broadcast bias.
+    let mut deferred = zeros_tensor(0, vec![1, 3, 2], DType::F32);
+    conv1d(
+        &ctx,
+        Conv1dArgs::new(Conv1dSemantic::Conv1d, &input, &weight, &mut deferred)
+            .with_direct_channel_last(),
+    )
+    .unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(f32_values(&deferred), [3.0, 5.0, 5.0, 8.0, 7.0, 11.0]);
+}
+
+#[test]
+fn conv_transpose1d_scatters_the_adjoint_over_the_dilated_axis() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = f32_tensor(0, vec![1, 3, 1], &[3.0, 5.0, 7.0]);
+    let weight = f32_tensor(0, vec![1, 1, 2], &[1.0, 1.0]);
+    let bias = f32_tensor(0, vec![1], &[0.0]);
+    let mut output = zeros_tensor(0, vec![1, 4, 1], DType::F32);
+    conv1d(
+        &ctx,
+        Conv1dArgs::new(
+            Conv1dSemantic::ConvTranspose1d,
+            &input,
+            &weight,
+            &mut output,
+        )
+        .with_bias(&bias),
+    )
+    .unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(f32_values(&output), [3.0, 8.0, 12.0, 7.0]);
+}
+
+#[test]
+fn conv1d_rejects_geometry_dtype_and_deferred_bias_violations() {
+    let ctx = CudaContext::new(0).unwrap();
+    let input = f32_tensor(0, vec![1, 4, 1], &[1.0, 2.0, 3.0, 4.0]);
+    let weight = f32_tensor(0, vec![1, 1, 2], &[1.0, 1.0]);
+    let bias = f32_tensor(0, vec![1], &[0.5]);
+
+    // The output length is implied by the geometry.
+    let mut wrong_length = zeros_tensor(0, vec![1, 2, 1], DType::F32);
+    let error = conv1d(
+        &ctx,
+        Conv1dArgs::new(Conv1dSemantic::Conv1d, &input, &weight, &mut wrong_length),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("output length"), "{error}");
+
+    // The deferred-bias path owns no bias.
+    let mut deferred = zeros_tensor(0, vec![1, 3, 1], DType::F32);
+    let error = conv1d(
+        &ctx,
+        Conv1dArgs::new(Conv1dSemantic::Conv1d, &input, &weight, &mut deferred)
+            .with_direct_channel_last()
+            .with_bias(&bias),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("defers the bias"), "{error}");
+
+    // Input, weight, bias, and output share one dtype.
+    let mut half_output = f16_tensor(0, vec![1, 3, 1], &[0.0; 3]);
+    let error = conv1d(
+        &ctx,
+        Conv1dArgs::new(Conv1dSemantic::Conv1d, &input, &weight, &mut half_output).with_bias(&bias),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("dtypes must match"), "{error}");
+}

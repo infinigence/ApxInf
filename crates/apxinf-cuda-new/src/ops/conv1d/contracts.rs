@@ -54,6 +54,11 @@ pub struct Conv1dArgs<'a> {
     pub groups: usize,
     pub output_padding: usize,
     pub accumulation: Conv1dAccumulation,
+    /// Bind channel-last buffers directly, skipping both layout transforms, and
+    /// leave the bias to a downstream kernel. The caller must then add the bias
+    /// with the same rounding the ordinary path performs when it writes the
+    /// result: `round(dtype_value(x + bias))` after a float add.
+    pub direct_channel_last: bool,
 }
 
 impl<'a> Conv1dArgs<'a> {
@@ -75,11 +80,18 @@ impl<'a> Conv1dArgs<'a> {
             groups: 1,
             output_padding: 0,
             accumulation: Conv1dAccumulation::Default,
+            direct_channel_last: false,
         }
     }
 
     pub fn with_bias(mut self, bias: &'a Tensor) -> Self {
         self.bias = Some(bias);
+        self
+    }
+
+    /// Bind the caller's channel-last buffers in place and defer the bias.
+    pub fn with_direct_channel_last(mut self) -> Self {
+        self.direct_channel_last = true;
         self
     }
 }
@@ -170,6 +182,11 @@ fn transpose_output_length(
 pub(crate) fn normalize(ctx: &CudaContext, args: Conv1dArgs<'_>) -> Result<Normalized> {
     if args.semantic == Conv1dSemantic::Conv1d && args.output_padding != 0 {
         return Err(invalid("Conv1d output_padding must be zero"));
+    }
+    if args.direct_channel_last && args.bias.is_some() {
+        return Err(invalid(
+            "direct channel-last Conv1d defers the bias to a downstream kernel and takes none",
+        ));
     }
     if args.stride == 0 || args.dilation == 0 || args.groups == 0 {
         return Err(invalid(
@@ -296,6 +313,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: Conv1dArgs<'_>) -> Result<Norma
         semantic: args.semantic.code(),
         dtype: dtype_code(dtype)?,
         has_bias: u32::from(!bias.is_null()),
+        direct_channel_last: u32::from(args.direct_channel_last),
         input_alignment,
         weight_alignment,
         bias_alignment,

@@ -2,7 +2,7 @@
 
 pub mod attention;
 pub mod cache;
-mod conv1d;
+pub mod conv1d;
 pub mod elementwise;
 pub mod embedding;
 pub mod gather;
@@ -13,7 +13,7 @@ pub mod pillow_bicubic;
 pub mod pointwise;
 pub mod preprocess;
 pub mod quantization;
-mod relative_attention;
+pub mod relative_attention;
 pub mod rope;
 pub mod sampling;
 pub mod tts;
@@ -73,12 +73,12 @@ pub use pointwise::{
     pointwise, swiglu_into, PointwiseActivation, PointwiseArgs, PointwiseSemantic,
 };
 pub use preprocess::{vision_position, VisionPositionArgs};
-pub use relative_attention::{relative_attention, RelativeAttentionArgs};
 pub use quantization::{
     block_quantize, block_scale_buffer_bytes, pack_block_scales, quantization, quantize_per_tensor,
     BlockQuantizationArgs, BlockQuantizationSemantic, PackBlockScalesArgs, QuantizationArgs,
     QuantizationSemantic, ScaleLayout,
 };
+pub use relative_attention::{relative_attention, RelativeAttentionArgs};
 pub use rope::apply_vision_2d as rope_apply_vision_2d;
 pub use rope::{
     decode_rope, decode_rotation, execute_batched as rope_apply_batched,

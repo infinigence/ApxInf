@@ -12,14 +12,6 @@ struct ResBlock {
     convs2: Vec<Conv>,
 }
 
-pub(crate) struct VocoderDebug {
-    pub conv_pre: Tensor,
-    pub first_upsample: Tensor,
-    pub first_upsample_resblock: Tensor,
-    pub first_resblocks: Vec<Tensor>,
-    pub first_resblock_pairs: Vec<Tensor>,
-}
-
 pub struct Vocoder {
     conv_pre: Conv,
     ups: Vec<Conv>,
@@ -76,27 +68,14 @@ impl Vocoder {
     }
 
     pub fn forward(&self, ctx: &Context, mel: &Tensor) -> Result<Tensor> {
-        self.forward_impl(ctx, mel, false).map(|(output, _)| output)
-    }
-
-    pub(crate) fn forward_with_debug(
-        &self,
-        ctx: &Context,
-        mel: &Tensor,
-    ) -> Result<(Tensor, VocoderDebug)> {
-        let (output, debug) = self.forward_impl(ctx, mel, true)?;
-        let debug = debug.ok_or_else(|| Error::Other("vocoder debug trace missing".into()))?;
-        Ok((output, debug))
-    }
-
-    fn forward_impl(
-        &self,
-        ctx: &Context,
-        mel: &Tensor,
-        trace_debug: bool,
-    ) -> Result<(Tensor, Option<VocoderDebug>)> {
         let len = mel.shape().dims()[0];
-        let mut x = self.conv_pre.apply(
+        // Every convolution below binds the channel-last buffers directly.
+        // A stage input is read twice — once by the activation feeding the
+        // convolutions, once as the residual a resblock adds back — so its bias
+        // cannot stay deferred. Materialize it where the ordinary path rounded
+        // it: `round_f16(x + bias)`.
+        let conv_pre_bias = self.conv_pre.deferred_bias()?;
+        let x = self.conv_pre.apply_direct(
             ctx,
             &mel.reshape(apxinf_core::Shape::new(vec![1, len, 100]))?,
             1,
@@ -104,23 +83,18 @@ impl Vocoder {
             1,
             1,
         )?;
-        let mut conv_pre_debug = trace_debug.then(|| x.clone());
-        let mut first_upsample_debug = None;
-        let mut first_resblocks_debug = Vec::new();
-        let mut first_resblock_pairs_debug = Vec::new();
-        let mut first_upsample_resblock_debug = None;
+        let mut x = ops::add_bias_rounded(ctx, &x, conv_pre_bias)?;
         for (index, up) in self.ups.iter().enumerate() {
             x = ops::leaky_relu(ctx, &x)?;
             let kernel = VOC_UPSAMPLE_KERNELS[index];
-            x = up.transpose(
+            x = up.transpose_direct(
                 ctx,
                 &x,
                 VOC_UPSAMPLE_RATES[index],
                 (kernel - VOC_UPSAMPLE_RATES[index]) / 2,
             )?;
-            if index == 0 && trace_debug {
-                first_upsample_debug = Some(x.clone());
-            }
+            let up_bias = up.deferred_bias()?;
+            x = ops::add_bias_rounded(ctx, &x, up_bias)?;
             let channels = x.shape().dims()[2];
             let length = x.shape().dims()[1];
             let mut sum = ops::alloc(ctx, &[1, length, channels])?;
@@ -132,23 +106,17 @@ impl Vocoder {
                 for pair in 0..3 {
                     let dilation = [1usize, 3, 5][pair];
                     let padded = dilation * (kernel - 1) / 2;
+                    let convs1 = &block.convs1[pair];
+                    let convs2 = &block.convs2[pair];
+                    let first_bias = convs1.deferred_bias()?;
+                    let second_bias = convs2.deferred_bias()?;
                     let first = ops::leaky_relu(ctx, &hidden)?;
-                    let first = block.convs1[pair].apply(ctx, &first, 1, padded, dilation, 1)?;
-                    if index == 0 && kernel_index == 2 && trace_debug {
-                        first_resblock_pairs_debug.push(first.clone());
-                    }
-                    let second = ops::leaky_relu(ctx, &first)?;
-                    let second =
-                        block.convs2[pair].apply(ctx, &second, 1, (kernel - 1) / 2, 1, 1)?;
-                    if index == 0 && kernel_index == 2 && trace_debug {
-                        first_resblock_pairs_debug.push(second.clone());
-                    }
-                    hidden = ops::residual_add(ctx, &second, &hidden)?;
+                    let first = convs1.apply_direct(ctx, &first, 1, padded, dilation, 1)?;
+                    let second = ops::leaky_relu_bias(ctx, &first, first_bias)?;
+                    let second = convs2.apply_direct(ctx, &second, 1, (kernel - 1) / 2, 1, 1)?;
+                    hidden = ops::residual_add_bias(ctx, &second, second_bias, &hidden)?;
                 }
                 sum = ops::residual_add(ctx, &sum, &hidden)?;
-                if index == 0 && trace_debug {
-                    first_resblocks_debug.push(hidden.clone());
-                }
             }
             x = ops::affine(
                 ctx,
@@ -156,9 +124,7 @@ impl Vocoder {
                 &self.resblock_scales[index],
                 &self.resblock_zeros[index],
             )?;
-            if index == 0 && trace_debug {
-                first_upsample_resblock_debug = Some(x.clone());
-            }
+            // The affine carries no bias, so the next stage activates plainly.
         }
         // PyTorch calls F.leaky_relu(x) without an explicit slope here,
         // so this final activation uses the framework default 0.01. The
@@ -166,24 +132,7 @@ impl Vocoder {
         x = ops::leaky_relu_one_percent(ctx, &x)?;
         x = self.conv_post.apply(ctx, &x, 1, 3, 1, 1)?;
         let output = ops::tanh(ctx, &x)?;
-        let debug = if trace_debug {
-            Some(VocoderDebug {
-                conv_pre: conv_pre_debug
-                    .take()
-                    .ok_or_else(|| Error::Other("vocoder conv_pre debug trace missing".into()))?,
-                first_upsample: first_upsample_debug.take().ok_or_else(|| {
-                    Error::Other("vocoder first upsample debug trace missing".into())
-                })?,
-                first_resblocks: first_resblocks_debug,
-                first_resblock_pairs: first_resblock_pairs_debug,
-                first_upsample_resblock: first_upsample_resblock_debug.take().ok_or_else(|| {
-                    Error::Other("vocoder first upsample debug trace missing".into())
-                })?,
-            })
-        } else {
-            None
-        };
-        Ok((output, debug))
+        Ok(output)
     }
 
     /// Returns mono PCM at 48 kHz.

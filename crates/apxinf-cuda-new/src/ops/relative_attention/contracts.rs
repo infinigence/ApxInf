@@ -3,6 +3,23 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 use crate::ffi::abi::{relative_attention as abi, status};
 use crate::{CudaBuffer, CudaContext};
 
+/// Catalog identifier of the single semantic in this family. The doc test
+/// compares `ALL` with the markers in `cuda-operator.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Semantic {
+    RelativeAttention,
+}
+
+impl Semantic {
+    pub(crate) const ALL: [Self; 1] = [Self::RelativeAttention];
+
+    pub(crate) fn doc_id(self) -> &'static str {
+        match self {
+            Self::RelativeAttention => "relative-attention",
+        }
+    }
+}
+
 /// Relative-position self-attention over `[batch, length, heads, head_dim]`
 /// tensors with a head-shared `[2 * window + 1, head_dim]` table.
 pub struct RelativeAttentionArgs<'a> {
@@ -40,6 +57,10 @@ impl<'a> RelativeAttentionArgs<'a> {
     }
 }
 
+/// One FP32 score per key position has to fit the 48 KiB dynamic
+/// shared-memory window a launch may request.
+const MAX_LENGTH: usize = 48 * 1024 / std::mem::size_of::<f32>();
+
 pub(crate) struct Normalized {
     pub spec: abi::Spec,
     pub bindings: abi::Bindings,
@@ -61,13 +82,6 @@ fn dtype_code(dtype: DType) -> Result<u32> {
     }
 }
 
-fn alignment_of(pointer: usize) -> u32 {
-    if pointer == 0 {
-        return 256;
-    }
-    (1usize << pointer.trailing_zeros().min(8)) as u32
-}
-
 fn tensor_storage(
     ctx: &CudaContext,
     tensor: &Tensor,
@@ -86,7 +100,10 @@ fn tensor_storage(
         )));
     }
     let buffer = CudaBuffer::from_tensor(tensor).map_err(Error::Cuda)?;
-    if buffer.len() < elements * dtype.size_in_bytes() {
+    let expected = elements
+        .checked_mul(dtype.size_in_bytes())
+        .ok_or_else(|| invalid("RelativeAttention size overflow"))?;
+    if buffer.len() < expected {
         return Err(invalid(format!(
             "RelativeAttention {label} storage is too small"
         )));
@@ -107,6 +124,11 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RelativeAttentionArgs<'_>) -> R
     let (batch, length, heads, head_dim) = (q_dims[0], q_dims[1], q_dims[2], q_dims[3]);
     if batch == 0 || length == 0 || heads == 0 || head_dim == 0 {
         return Err(invalid("RelativeAttention geometry must be non-empty"));
+    }
+    if length > MAX_LENGTH {
+        return Err(invalid(
+            "RelativeAttention length exceeds the 48 KiB score window",
+        ));
     }
     if k_dims != q_dims || v_dims != q_dims || out_dims != q_dims {
         return Err(invalid(
@@ -155,9 +177,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RelativeAttentionArgs<'_>) -> R
     let relative_value = push(args.relative_value, table_count, "relative_value")?;
     let output_buffer = tensor_storage(ctx, args.out, dtype, q_count, "output")?;
     let output = output_buffer.ptr() as *mut std::ffi::c_void;
-    let output_alignment = alignment_of(output_buffer.ptr() as usize);
     storage.push(output_buffer);
-    let _ = output_alignment;
 
     let spec = abi::Spec {
         version: abi::SPEC_VERSION,
@@ -188,6 +208,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RelativeAttentionArgs<'_>) -> R
 }
 
 pub(crate) fn execute(ctx: &CudaContext, normalized: Normalized) -> Result<()> {
+    // The bindings point into these buffers; hold them until the launch returns.
     let _storage = &normalized.storage;
     crate::workspace::validate_capture_target(
         ctx.device_id(),

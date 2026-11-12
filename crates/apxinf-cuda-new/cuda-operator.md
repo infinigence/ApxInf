@@ -120,6 +120,41 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Constraints | `2N` is divisible by 512; scales are unit; provider padding is private and never changes the output shape |
 | Candidates | cuBLAS fallback, cuBLASLt, and fixed SM110 CUTLASS at M3387/N9216/K2560 |
 
+## Shared Convolution Contract
+
+Both convolution semantics take a channel-last input and return a channel-last
+output, accumulate the projection in FP32, and write the result in the tensor
+dtype. The build serves them through cuDNN when it is compiled in and the shape
+is supported, otherwise through the direct temporal kernel; the choice is
+private, is made per prepared execution, and never changes the result.
+
+<!-- l3-operator:conv1d -->
+### `conv1d`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::conv1d(ctx, Conv1dArgs)` |
+| Inputs | `input=[B,Lin,Cin]`, `weight=[Cout,Cin/groups,K]`, optional `bias=[Cout]`; input, weight, bias, and output share F32, F16, or BF16 |
+| Output | caller-owned `out=[B,Lout,Cout]` with `Lout=(Lin+2*padding-dilation*(K-1)-1)/stride+1`; any other length is rejected |
+| Mathematical semantic | temporal cross-correlation, with `groups` splitting the channels into independent groups |
+| Constraints | `stride`, `dilation`, and `groups` are nonzero; `Cin` and `Cout` are divisible by `groups`; `output_padding` is zero |
+| Numerical policy | `Conv1dAccumulation::Default` lets the provider choose its FP32 accumulation order; `OrderedF32` keeps the direct kernel's sequential order for a result that feeds a discrete decision |
+| Deferred bias | `with_direct_channel_last` binds the caller's channel-last buffers in place, takes no bias, and skips both layout transforms; the caller must then add it with this path's rounding, `round_dtype(x+bias)`. It needs a build with the cuDNN provider and a geometry that provider serves (an output channel count above one), and it rejects ordered accumulation; a shape the provider serves with a single deterministic engine keeps its NCHW path and reports `.channel_last_fallback` in the prepared summary |
+| Reference test | `conv1d_matches_reference` |
+
+<!-- l3-operator:conv-transpose1d -->
+### `conv-transpose1d`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::conv1d(ctx, Conv1dArgs)` with `Conv1dSemantic::ConvTranspose1d` |
+| Inputs | `input=[B,Lin,Cin]`, `weight=[Cin,Cout/groups,K]`, optional `bias=[Cout]`; same dtype rule as `conv1d` |
+| Output | caller-owned `out=[B,Lout,Cout]` with `Lout=(Lin-1)*stride-2*padding+dilation*(K-1)+output_padding+1` |
+| Mathematical semantic | adjoint of `conv1d`: each input position scatters its weight along the dilated, strided time axis |
+| Constraints | `dilation` is 1 and `0<=output_padding<stride`; every other constraint is that of `conv1d` |
+| Numerical policy | the same `Conv1dAccumulation` choice, except that `direct_channel_last` has no ordered-accumulation path and is rejected together with `OrderedF32` |
+| Reference test | `conv_transpose1d_matches_reference` |
+
 ## Shared Attention Contract
 
 Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same dtype, and `scale` is finite and positive with a default of `1/sqrt(head_dim)`. Dense and KV-cache support MHA, GQA, and MQA and require `query_heads % kv_heads == 0`.
@@ -161,11 +196,189 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Constraints | offsets contain at least two elements, are monotonically nondecreasing, begin at 0, and end at `total_tokens`; empty segments are allowed; causal and differing Q/KV head counts are unsupported |
 | Reference test | `segmented_attention_all_candidates_match_reference` |
 
+## Shared Speech Pipeline Contract
+
+The speech pipeline needs relative attention plus elementwise, statistics, and
+layout semantics that the language-model Pointwise ABI does not expose. Every
+operator in the family below accepts F32, F16, or BF16 tensors, requires all
+tensors of one call to share the dtype and CUDA device, and writes FP32
+accumulation back in the tensor dtype at the rounding points its table names.
+The speech models run one batch at a time, so these kernels are sized for that
+geometry and are not tuned for large batches.
+
+<!-- l3-operator:relative-attention -->
+### `relative_attention`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::relative_attention(ctx, RelativeAttentionArgs)` |
+| Inputs | `Q/K/V=[batch,length,heads,head_dim]`; head-shared `relative_key`, `relative_value` are `[2*window+1,head_dim]` |
+| Output | caller-owned `out=[batch,length,heads,head_dim]`, the shape of `Q` |
+| Mathematical semantic | `softmax(scale*(Q@K^T + Q@rk[j-pos+window])) @ (V + rv[j-pos+window])`; a relative row outside `[0,2*window]` contributes nothing and the attention is unmasked |
+| Constraints | all five tensors and the output share dtype and device; `scale` is finite; `length<=12288`, the number of FP32 scores that fit the 48 KiB shared window |
+| Numerical policy | scores and the weighted sum accumulate in FP32; each relative term is added in FP32 before the scale |
+| Reference test | model-level: the official-capture SoVITS encoder comparison covers this path; no crate-level candidate test yet |
+
+<!-- l3-operator:bias-activation -->
+### `bias_activation`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::bias_activation(ctx, input, bias, out, activation, round_bias)` |
+| Inputs | `input` of any nonempty rank with last-axis width `cols`; optional `bias=[cols]` |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | `out = activation(input + bias)` with the bias broadcast over every row; `activation` is a `TtsActivation` variant |
+| Constraints | `cols` divides the element count; with `round_bias` the sum is rounded to the tensor dtype before the activation |
+| Reference test | `leaky_relu_bias_reproduces_the_ordinary_paths_rounding` (model-level) |
+
+<!-- l3-operator:residual-add-bias -->
+### `residual_add_bias`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::residual_add_bias(ctx, input, bias, residual, out)` |
+| Inputs | `input` and `residual` with the same shape; `bias=[cols]` |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | `out = round(round(input + bias) + residual)` |
+| Constraints | the intermediate sum is rounded to the tensor dtype, so this matches a deferred producer bias followed by an ordinary residual add |
+| Reference test | `residual_add_bias_reproduces_the_ordinary_paths_rounding` (model-level) |
+
+<!-- l3-operator:affine -->
+### `affine`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::affine(ctx, input, style, out)` |
+| Inputs | `input` with last-axis width `cols`; `style=[2*cols]` holding gamma then beta |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | `out = input * style[col] + style[cols+col]` |
+| Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
+
+<!-- l3-operator:glu-separate -->
+### `glu_separate`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::glu_separate(ctx, input, gate, out)` |
+| Inputs | `input` and `gate` with the same shape |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | `out = input * sigmoid(gate)` |
+| Reference test | model-level: `official_ffn_operator_isolation` compares the CFM FFN intermediates |
+
+<!-- l3-operator:tanh-sigmoid-gate -->
+### `tanh_sigmoid_gate`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::tanh_sigmoid_gate(ctx, input, secondary, out)` |
+| Inputs | `input=[rows,2*cols]`, whose last axis holds the `a` half then the `b` half; optional same-shaped `secondary` |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | `out = tanh(a + secondary_a) * sigmoid(b + secondary_b)` |
+| Reference test | model-level: `official_ffn_operator_isolation` compares the CFM FFN intermediates |
+
+<!-- l3-operator:grn -->
+### `grn`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::grn(ctx, input, style, out)` |
+| Inputs | `input=[rows,cols]`; `style=[2*cols]` holding gamma then beta |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | with `n_c = sqrt(sum_r input[r,c]^2)` and `m = mean_c(n_c) + 1e-6`, `out = gamma_c * (input * n_c/m) + beta_c`, every intermediate rounded to the tensor dtype |
+| Constraints | `cols<=12288`, the FP32 normalizers that fit the 48 KiB shared window |
+| Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
+
+<!-- l3-operator:column-norm -->
+### `column_norm`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::column_norm(ctx, input, style, out, eps)` |
+| Inputs | `input=[rows,cols]`; `style=[2*cols]` holding gamma then beta |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | per-column LayerNorm over rows, `out = gamma_c * (x - mean_c) * rsqrt(var_c + eps) + beta_c` |
+| Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
+
+<!-- l3-operator:rope-apply -->
+### `rope_apply`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::rope_apply(ctx, input, cos, sin, out)` |
+| Inputs | `input=[batch,time,heads,head_dim]`; `cos`/`sin=[time,head_dim]` |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | interleaved rotary embedding over adjacent `(2p, 2p+1)` pairs using the pair's own `cos`/`sin` entry |
+| Constraints | every product is rounded to the tensor dtype before the final add or subtract, so the result never depends on FP16/BF16 fused-contract behavior |
+| Reference test | `layer_norm_linear_rope_attention_match_reference` |
+
+<!-- l3-operator:sinusoidal-embedding -->
+### `sinusoidal_embedding`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::sinusoidal_embedding(ctx, times, output, scale, max_period)` |
+| Inputs | `times=[rows]`; `out=[rows,width]` with `width>=4` and even |
+| Output | caller-owned `out` |
+| Mathematical semantic | `angle = (scale*times[row]) * exp(-(col % (width/2)) * ln(max_period)/(width/2-1))`; the first half of each row is `sin(angle)` and the second half `cos(angle)` |
+| Constraints | `scale` is finite and `max_period>1` |
+| Reference test | model-level: the official-capture CFM time embedding comparison |
+
+<!-- l3-operator:mean-rows -->
+### `mean_rows`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::mean_rows(ctx, input, out)` |
+| Inputs | `input=[rows,cols]` |
+| Output | `out=[1,cols]` |
+| Mathematical semantic | per-column mean over rows |
+| Reference test | model-level: the official-capture SoVITS encoder comparison |
+
+<!-- l3-operator:argmax-rows -->
+### `argmax_rows`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::argmax_rows(ctx, logits, index)` |
+| Inputs | `logits=[rows,cols]` |
+| Output | I32 `index=[rows]` |
+| Mathematical semantic | per-row argmax with first-index tie breaking |
+| Reference test | model-level: `hubert` codebook assignment inside the official capture replay |
+
+<!-- l3-operator:write-kv-cache-token -->
+### `write_kv_cache_token`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::write_kv_cache_token(ctx, input, cache, meta)` |
+| Inputs | `input=[1,1,heads,head_dim]`; `cache=[1,capacity,heads,head_dim]`; a `KvCacheDecodeMeta` whose second word is the write row |
+| Output | `cache` updated in place |
+| Mathematical semantic | copy the token into cache row `meta[1]` |
+| Constraints | F16 or BF16 with both tensors agreeing; the write row is device state, and a row at or past `capacity` writes nothing, mirroring the clamp `kv_cache_attention` applies to the same metadata |
+| Reference test | model-level: the dynamic decode-graph replay tests write and then attend over the same cache |
+
+<!-- l3-operator:fill-zero -->
+### `fill_zero`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::tts::fill_zero(ctx, tensor)` |
+| Inputs | any nonempty supported tensor |
+| Output | the same tensor zeroed in place |
+| Mathematical semantic | write zero to every element |
+| Reference test | model-level: exercised by every decode and capture-replay test that starts from a zeroed buffer |
+
 ## Testing Responsibilities
 
 The catalog test ensures only that semantics are neither missing nor duplicated; it cannot validate the written contracts. A new L3 semantic must also add a semantic test to `src/ops/tests/l3_behavior.rs` and an independent-reference all-candidate numerical test to `src/ops/tests/precision/precision.rs`.
 
 Tests must run through `crates/apxinf-cuda-new/test-new.sh`; a normal `cargo test` from the repository root does not automatically test this crate.
+
+The speech-pipeline family is currently validated through the model-level
+official-capture comparisons listed in its tables: those tests compare every
+intermediate the reference implementation materializes, one operator at a time,
+but they run only with captured fixtures present. A crate-level reference test
+still has to be added before a second model depends on these semantics.
 
 The translated fixed-shape implementations are not separate model APIs.
 D256 attention and the 624/2200 vision schedule are candidates in the existing

@@ -31,21 +31,27 @@ typedef enum {
   APXINF_TTS_ACTIVATION_LEAKY_RELU_ONE_PERCENT = 9,
 } apxinf_tts_activation_t;
 
-/* output[i] = activation(input[i] + bias[i % cols]); `bias` may be null. */
+/* output[i] = activation(input[i] + bias[i % cols]); `bias` may be null.
+ * With `round_bias`, the sum is rounded to the tensor dtype before the
+ * activation. Use it when the bias a producer deferred has to reproduce the
+ * value that producer would have written itself. */
 apxinf_status_t apxinf_tts_bias_activation(
     apxinf_runtime_t runtime, const void* input, const void* bias, void* output,
     int64_t count, int64_t cols, uint32_t dtype, uint32_t activation,
-    apxinf_cuda_stream_t stream);
+    uint32_t round_bias, apxinf_cuda_stream_t stream);
+
+/* output[i] = round_dtype(round_dtype(input[i] + bias[i % cols]) + residual[i]).
+ * `bias` and `residual` are required; this is the deferred-bias form of the
+ * ordinary residual add, in one launch. */
+apxinf_status_t apxinf_tts_residual_add_bias(
+    apxinf_runtime_t runtime, const void* input, const void* bias,
+    const void* residual, void* output, int64_t count, int64_t cols,
+    uint32_t dtype, apxinf_cuda_stream_t stream);
 
 /* style is [2 * cols]: output = input * style[col] + style[cols + col]. */
 apxinf_status_t apxinf_tts_affine(
     apxinf_runtime_t runtime, const void* input, const void* style, void* output,
     int64_t count, int64_t cols, uint32_t dtype, apxinf_cuda_stream_t stream);
-
-/* input [rows, 2 * cols] -> output [rows, cols]. */
-apxinf_status_t apxinf_tts_glu(
-    apxinf_runtime_t runtime, const void* input, void* output, int64_t count,
-    int64_t cols, uint32_t dtype, apxinf_cuda_stream_t stream);
 
 /* output = input * sigmoid(gate), same width. */
 apxinf_status_t apxinf_tts_glu_separate(
@@ -94,39 +100,14 @@ apxinf_status_t apxinf_tts_argmax_rows(
     int64_t cols, uint32_t dtype, apxinf_cuda_stream_t stream);
 
 /* Append one token row into a flat cache at meta[1]. */
-apxinf_status_t apxinf_tts_cache_write_token(
+apxinf_status_t apxinf_tts_write_kv_cache_token(
     apxinf_runtime_t runtime, const void* input, void* cache,
     const uint32_t* meta, int64_t capacity, int64_t row_elements,
     uint32_t dtype, apxinf_cuda_stream_t stream);
 
-/* output[row, :] = table[ids[row], :]; ids is int32. */
-apxinf_status_t apxinf_tts_gather_rows(
-    apxinf_runtime_t runtime, const void* table, const void* ids, void* output,
-    int64_t rows, int64_t cols, uint32_t dtype, apxinf_cuda_stream_t stream);
-
-/* Row and column layout copies, expressed as CUDA 2D copies. */
-apxinf_status_t apxinf_tts_copy_rows(
-    apxinf_runtime_t runtime, const void* input, void* output, int64_t offset,
-    int64_t rows, int64_t cols, uint32_t dtype, apxinf_cuda_stream_t stream);
-
-apxinf_status_t apxinf_tts_concat_columns(
-    apxinf_runtime_t runtime, const void* first, const void* second,
-    void* output, int64_t rows, int64_t first_cols, int64_t second_cols,
-    uint32_t dtype, apxinf_cuda_stream_t stream);
-
-apxinf_status_t apxinf_tts_slice_columns(
-    apxinf_runtime_t runtime, const void* input, void* output, int64_t rows,
-    int64_t total_cols, int64_t column_offset, int64_t cols, uint32_t dtype,
-    apxinf_cuda_stream_t stream);
-
 apxinf_status_t apxinf_tts_fill_zero(
     apxinf_runtime_t runtime, void* tensor, int64_t elements, uint32_t dtype,
     apxinf_cuda_stream_t stream);
-
-/* output = F16(projection_f32 + bias_f16): bias-before-cast GEMM epilogue. */
-apxinf_status_t apxinf_tts_project_bias_f32_to_f16(
-    apxinf_runtime_t runtime, const void* projection, const void* bias,
-    void* output, int64_t count, int64_t cols, apxinf_cuda_stream_t stream);
 
 #ifdef __cplusplus
 }

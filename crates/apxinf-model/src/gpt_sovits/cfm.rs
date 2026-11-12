@@ -458,14 +458,6 @@ impl Cfm {
         Ok((output, trace))
     }
 
-    pub(crate) fn text_embed_debug(
-        &self,
-        ctx: &Context,
-        text: &Tensor,
-    ) -> Result<(Tensor, CfmTextStageTrace)> {
-        self.text_embed_with_trace(ctx, text)
-    }
-
     fn text_embed_impl(
         &self,
         ctx: &Context,
@@ -1125,29 +1117,6 @@ impl Cfm {
         )
     }
 
-    /// Deterministic captured-noise path without diagnostic tensor retention.
-    pub(crate) fn synthesize_with_captured_noise_untraced(
-        &self,
-        ctx: &Context,
-        reference_features: &Tensor,
-        target_features: &Tensor,
-        reference_mel: &Tensor,
-        steps: usize,
-        cfg_rate: f32,
-        noise_chunks: &[&[f32]],
-    ) -> Result<Tensor> {
-        self.synthesize_impl(
-            ctx,
-            reference_features,
-            target_features,
-            reference_mel,
-            steps,
-            cfg_rate,
-            CfmNoiseSource::CapturedUntraced(noise_chunks),
-        )
-        .map(|(mel, _, _)| mel)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn synthesize_impl(
         &self,
@@ -1181,8 +1150,8 @@ impl Cfm {
         )?;
         let target_len = target_features.shape().dims()[0];
         let chunk = (TOTAL_CHUNK - reference_frames).min(MAX_TARGET_CHUNK);
-        let mut original_mel = prompt_mel;
-        let mut original_features = prompt_features;
+        let original_mel = prompt_mel;
+        let original_features = prompt_features;
         let mut rolling_mel = original_mel.clone();
         let mut rolling_features = original_features.clone();
         let mut results: Vec<Tensor> = Vec::new();
@@ -1236,7 +1205,7 @@ impl Cfm {
                     Vec::new(),
                     Vec::new(),
                 ),
-                CfmNoiseSource::Captured(chunks) | CfmNoiseSource::CapturedUntraced(chunks) => {
+                CfmNoiseSource::Captured(chunks) => {
                     let values = chunks.get(chunk_index).ok_or_else(|| {
                         Error::Other(format!(
                             "missing captured cfm noise chunk {chunk_index}; got {} chunks",
@@ -1277,9 +1246,7 @@ impl Cfm {
             chunk_index += 1;
         }
         let captured_chunks = match noise_source {
-            CfmNoiseSource::Captured(chunks) | CfmNoiseSource::CapturedUntraced(chunks) => {
-                Some(chunks)
-            }
+            CfmNoiseSource::Captured(chunks) => Some(chunks),
             CfmNoiseSource::Seed(_) => None,
         };
         if let Some(chunks) = captured_chunks {
@@ -1290,11 +1257,13 @@ impl Cfm {
                 )));
             }
         }
-        let mut combined = results.remove(0);
-        for tensor in results {
+        let mut chunks = results.into_iter();
+        let mut combined = chunks.next().ok_or_else(|| {
+            Error::Other("cfm synthesis requires at least one target frame".into())
+        })?;
+        for tensor in chunks {
             combined = ops::concat_rows(ctx, &combined, &tensor)?;
         }
-        let _ = (original_mel, original_features);
         Ok((combined, step_trace, text_trace))
     }
 }
@@ -1303,7 +1272,6 @@ impl Cfm {
 enum CfmNoiseSource<'a> {
     Seed(u64),
     Captured(&'a [&'a [f32]]),
-    CapturedUntraced(&'a [&'a [f32]]),
 }
 
 #[cfg(test)]

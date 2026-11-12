@@ -1,3 +1,5 @@
+//! GPT-SoVITS V5 model geometry and checkpoint defaults.
+
 use std::path::Path;
 
 use apxinf_core::{Error, Result};
@@ -59,6 +61,9 @@ pub const BERT_OUTPUT_LAYER: usize = 21;
 
 pub const SOVITS_INTER: usize = 192;
 pub const SOVITS_HIDDEN: usize = 192;
+// Width of the decoder stack (WaveNet and the MRTE style block), which is the
+// same 512 the checkpoint's `dec.*` and `mrte.*` tensors use.
+pub const SOVITS_DECODER: usize = 512;
 pub const SOVITS_HEADS: usize = 2;
 pub const SOVITS_FF: usize = 768;
 pub const SOVITS_WINDOW: usize = 4;

@@ -1,6 +1,6 @@
-#include "../include/apxinf_cuda/tts.h"
-#include "../framework/runtime_internal.h"
-#include "../kernels/custom/tts.cuh"
+#include "../../include/apxinf_cuda/tts.h"
+#include "../../framework/runtime_internal.h"
+#include "../../kernels/custom/tts.cuh"
 
 #include <climits>
 #include <cmath>
@@ -53,14 +53,29 @@ void validate_pointers(const void* input, const void* output, const char* what) 
 template <class T>
 cudaError_t launch_bias_activation(const void* input, const void* bias,
                                    void* output, int64_t count, int64_t cols,
-                                   uint32_t activation, cudaStream_t stream) {
-  if (activation > APXINF_TTS_ACTIVATION_LEAKY_RELU_ONE_PERCENT) {
+                                   uint32_t activation, uint32_t round_bias,
+                                   cudaStream_t stream) {
+  if (activation > APXINF_TTS_ACTIVATION_LEAKY_RELU_ONE_PERCENT ||
+      round_bias > 1) {
     return cudaErrorInvalidValue;
   }
   kernels::bias_activation<T><<<blocks_for(count), kDirectThreads, 0, stream>>>(
       static_cast<const T*>(input), static_cast<const T*>(bias),
       static_cast<T*>(output), count, static_cast<int>(cols),
-      static_cast<int>(activation));
+      static_cast<int>(activation), static_cast<int>(round_bias));
+  return cudaGetLastError();
+}
+
+template <class T>
+cudaError_t launch_residual_add_bias(const void* input, const void* bias,
+                                     const void* residual, void* output,
+                                     int64_t count, int64_t cols,
+                                     cudaStream_t stream) {
+  kernels::residual_add_bias<T>
+      <<<blocks_for(count), kDirectThreads, 0, stream>>>(
+          static_cast<const T*>(input), static_cast<const T*>(bias),
+          static_cast<const T*>(residual), static_cast<T*>(output), count,
+          static_cast<int>(cols));
   return cudaGetLastError();
 }
 
@@ -70,15 +85,6 @@ cudaError_t launch_affine(const void* input, const void* style, void* output,
   kernels::affine<T><<<blocks_for(count), kDirectThreads, 0, stream>>>(
       static_cast<const T*>(input), static_cast<const T*>(style),
       static_cast<T*>(output), count, static_cast<int>(cols));
-  return cudaGetLastError();
-}
-
-template <class T>
-cudaError_t launch_glu(const void* input, void* output, int64_t count,
-                       int64_t cols, cudaStream_t stream) {
-  kernels::glu<T><<<blocks_for(count), kDirectThreads, 0, stream>>>(
-      static_cast<const T*>(input), static_cast<T*>(output), count,
-      static_cast<int>(cols));
   return cudaGetLastError();
 }
 
@@ -106,7 +112,11 @@ cudaError_t launch_tanh_sigmoid_gate(const void* input, const void* secondary,
 template <class T>
 cudaError_t launch_grn(const void* input, const void* style, void* output,
                        int64_t rows, int64_t cols, cudaStream_t stream) {
-  if (cols > 32768) return cudaErrorInvalidValue;
+  // One FP32 normalizer per column lives in dynamic shared memory. The kernel
+  // never opts into the larger per-block limit, so the launch is bounded by
+  // the 48 KiB default a kernel may request.
+  constexpr int64_t kMaxColumns = 48 * 1024 / sizeof(float);
+  if (cols > kMaxColumns) return cudaErrorInvalidValue;
   kernels::grn<T><<<1, kDirectThreads, static_cast<size_t>(cols) * sizeof(float),
                     stream>>>(static_cast<const T*>(input),
                               static_cast<const T*>(style),
@@ -149,17 +159,6 @@ cudaError_t launch_mean_rows(const void* input, void* output, int64_t rows,
   kernels::mean_rows_kernel<T><<<1, kDirectThreads, 0, stream>>>(
       static_cast<const T*>(input), static_cast<T*>(output),
       static_cast<int>(rows), static_cast<int>(cols));
-  return cudaGetLastError();
-}
-
-template <class T>
-cudaError_t launch_gather_rows(const void* table, const void* ids, void* output,
-                               int64_t rows, int64_t cols,
-                               cudaStream_t stream) {
-  kernels::gather_rows_kernel<T><<<blocks_for(rows * cols), kDirectThreads, 0,
-                                     stream>>>(
-      static_cast<const T*>(table), static_cast<const int32_t*>(ids),
-      static_cast<T*>(output), rows, static_cast<int>(cols));
   return cudaGetLastError();
 }
 
@@ -207,7 +206,7 @@ cudaError_t launch_sinusoidal(const void* times, void* output, int64_t rows,
 extern "C" apxinf_status_t apxinf_tts_bias_activation(
     apxinf_runtime_t runtime, const void* input, const void* bias, void* output,
     int64_t count, int64_t cols, uint32_t dtype, uint32_t activation,
-    apxinf_cuda_stream_t raw_stream) {
+    uint32_t round_bias, apxinf_cuda_stream_t raw_stream) {
   return apxinf::framework::abi_boundary([&] {
     if (!runtime) throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null runtime");
     validate_pointers(input, output, "bias activation");
@@ -216,8 +215,29 @@ extern "C" apxinf_status_t apxinf_tts_bias_activation(
     validate_dtype(dtype, "bias activation");
     apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
     const cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
-    APXINF_TTS_DISPATCH(dtype, launch_bias_activation,
-                        input, bias, output, count, cols, activation, stream);
+    APXINF_TTS_DISPATCH(dtype, launch_bias_activation, input, bias, output,
+                        count, cols, activation, round_bias, stream);
+  });
+}
+
+extern "C" apxinf_status_t apxinf_tts_residual_add_bias(
+    apxinf_runtime_t runtime, const void* input, const void* bias,
+    const void* residual, void* output, int64_t count, int64_t cols,
+    uint32_t dtype, apxinf_cuda_stream_t raw_stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (!runtime) throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null runtime");
+    validate_pointers(input, output, "residual add bias");
+    if (bias == nullptr || residual == nullptr) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "null tts binding for residual add bias");
+    }
+    validate_positive(count, "residual add bias count");
+    validate_positive(cols, "residual add bias cols");
+    validate_dtype(dtype, "residual add bias");
+    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
+    const cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
+    APXINF_TTS_DISPATCH(dtype, launch_residual_add_bias, input, bias, residual,
+                        output, count, cols, stream);
   });
 }
 
@@ -237,25 +257,6 @@ extern "C" apxinf_status_t apxinf_tts_affine(
     const cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
     APXINF_TTS_DISPATCH(dtype, launch_affine, input, style, output, count,
                         cols, stream);
-  });
-}
-
-extern "C" apxinf_status_t apxinf_tts_glu(
-    apxinf_runtime_t runtime, const void* input, void* output, int64_t count,
-    int64_t cols, uint32_t dtype, apxinf_cuda_stream_t raw_stream) {
-  return apxinf::framework::abi_boundary([&] {
-    if (!runtime) throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null runtime");
-    validate_pointers(input, output, "glu");
-    validate_positive(count, "glu count");
-    validate_positive(cols, "glu cols");
-    if (count % cols != 0) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "glu count is not a row multiple");
-    }
-    validate_dtype(dtype, "glu");
-    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
-    const cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
-    APXINF_TTS_DISPATCH(dtype, launch_glu, input, output, count, cols,
-                        stream);
   });
 }
 
@@ -429,7 +430,7 @@ extern "C" apxinf_status_t apxinf_tts_argmax_rows(
   });
 }
 
-extern "C" apxinf_status_t apxinf_tts_cache_write_token(
+extern "C" apxinf_status_t apxinf_tts_write_kv_cache_token(
     apxinf_runtime_t runtime, const void* input, void* cache,
     const uint32_t* meta, int64_t capacity, int64_t row_elements,
     uint32_t dtype, apxinf_cuda_stream_t raw_stream) {
@@ -454,124 +455,6 @@ extern "C" apxinf_status_t apxinf_tts_cache_write_token(
                                         kDirectThreads, 0, stream>>>(
         static_cast<const uint16_t*>(input), static_cast<uint16_t*>(cache),
         meta, capacity, row_elements);
-    apxinf::framework::check_cuda(cudaGetLastError());
-  });
-}
-
-extern "C" apxinf_status_t apxinf_tts_gather_rows(
-    apxinf_runtime_t runtime, const void* table, const void* ids, void* output,
-    int64_t rows, int64_t cols, uint32_t dtype, apxinf_cuda_stream_t raw_stream) {
-  return apxinf::framework::abi_boundary([&] {
-    if (!runtime) throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null runtime");
-    validate_pointers(table, output, "gather rows");
-    if (ids == nullptr) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null gather ids");
-    }
-    validate_positive(rows, "gather rows rows");
-    validate_positive(cols, "gather rows cols");
-    validate_dtype(dtype, "gather rows");
-    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
-    const cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
-    APXINF_TTS_DISPATCH(dtype, launch_gather_rows, table, ids, output, rows,
-                        cols, stream);
-  });
-}
-
-extern "C" apxinf_status_t apxinf_tts_copy_rows(
-    apxinf_runtime_t runtime, const void* input, void* output, int64_t offset,
-    int64_t rows, int64_t cols, uint32_t dtype, apxinf_cuda_stream_t raw_stream) {
-  return apxinf::framework::abi_boundary([&] {
-    if (!runtime) throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null runtime");
-    validate_pointers(input, output, "copy rows");
-    if (offset < 0) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "negative row offset");
-    }
-    validate_positive(rows, "copy rows rows");
-    validate_positive(cols, "copy rows cols");
-    validate_dtype(dtype, "copy rows");
-    const int64_t bytes = rows * cols * element_bytes(dtype);
-    const int64_t offset_bytes = offset * cols * element_bytes(dtype);
-    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
-    const cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
-    apxinf::framework::check_cuda(cudaMemcpyAsync(
-        output, static_cast<const uint8_t*>(input) + offset_bytes, bytes,
-        cudaMemcpyDeviceToDevice, stream));
-  });
-}
-
-extern "C" apxinf_status_t apxinf_tts_concat_columns(
-    apxinf_runtime_t runtime, const void* first, const void* second,
-    void* output, int64_t rows, int64_t first_cols, int64_t second_cols,
-    uint32_t dtype, apxinf_cuda_stream_t raw_stream) {
-  return apxinf::framework::abi_boundary([&] {
-    if (!runtime) throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null runtime");
-    if (first == nullptr || second == nullptr || output == nullptr) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null column concat binding");
-    }
-    validate_positive(rows, "column concat rows");
-    validate_positive(first_cols, "column concat first cols");
-    validate_positive(second_cols, "column concat second cols");
-    validate_dtype(dtype, "column concat");
-    const int bytes = element_bytes(dtype);
-    const size_t first_pitch = static_cast<size_t>(first_cols) * bytes;
-    const size_t second_pitch = static_cast<size_t>(second_cols) * bytes;
-    const size_t output_pitch = first_pitch + second_pitch;
-    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
-    const cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
-    apxinf::framework::check_cuda(cudaMemcpy2DAsync(
-        output, output_pitch, first, first_pitch, first_pitch, rows,
-        cudaMemcpyDeviceToDevice, stream));
-    apxinf::framework::check_cuda(cudaMemcpy2DAsync(
-        static_cast<uint8_t*>(output) + first_pitch, output_pitch, second,
-        second_pitch, second_pitch, rows, cudaMemcpyDeviceToDevice, stream));
-  });
-}
-
-extern "C" apxinf_status_t apxinf_tts_slice_columns(
-    apxinf_runtime_t runtime, const void* input, void* output, int64_t rows,
-    int64_t total_cols, int64_t column_offset, int64_t cols, uint32_t dtype,
-    apxinf_cuda_stream_t raw_stream) {
-  return apxinf::framework::abi_boundary([&] {
-    if (!runtime) throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null runtime");
-    validate_pointers(input, output, "slice columns");
-    validate_positive(rows, "slice columns rows");
-    validate_positive(total_cols, "slice columns total cols");
-    validate_positive(cols, "slice columns cols");
-    if (column_offset < 0 || column_offset + cols > total_cols) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
-                    "slice columns range is invalid");
-    }
-    validate_dtype(dtype, "slice columns");
-    const int bytes = element_bytes(dtype);
-    const size_t source_pitch = static_cast<size_t>(total_cols) * bytes;
-    const size_t width = static_cast<size_t>(cols) * bytes;
-    const size_t source_offset = static_cast<size_t>(column_offset) * bytes;
-    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
-    const cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
-    apxinf::framework::check_cuda(cudaMemcpy2DAsync(
-        output, width, static_cast<const uint8_t*>(input) + source_offset,
-        source_pitch, width, rows, cudaMemcpyDeviceToDevice, stream));
-  });
-}
-
-extern "C" apxinf_status_t apxinf_tts_project_bias_f32_to_f16(
-    apxinf_runtime_t runtime, const void* projection, const void* bias,
-    void* output, int64_t count, int64_t cols, apxinf_cuda_stream_t raw_stream) {
-  return apxinf::framework::abi_boundary([&] {
-    if (!runtime) throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "null runtime");
-    if (projection == nullptr || bias == nullptr || output == nullptr) {
-      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
-                    "null projection-bias binding");
-    }
-    validate_positive(count, "projection bias count");
-    validate_positive(cols, "projection bias cols");
-    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
-    const cudaStream_t stream = static_cast<cudaStream_t>(raw_stream);
-    kernels::project_bias_f32_to_f16_kernel<<<blocks_for(count),
-                                              kDirectThreads, 0, stream>>>(
-        static_cast<const float*>(projection),
-        static_cast<const __half*>(bias), static_cast<__half*>(output), count,
-        static_cast<int>(cols));
     apxinf::framework::check_cuda(cudaGetLastError());
   });
 }

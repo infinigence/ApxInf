@@ -41,10 +41,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
-use apxinf_model::tts_trait::{PreparedSpeech, SpeechSpec, TtsCacheConfig};
+use apxinf_model::tts_trait::{PreparedTts, TtsCacheConfig, TtsRequest, TtsSpec};
 use apxinf_model::{
-    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout, LoadOptions,
-    LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer, SpeechRequest,
+    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout,
+    LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer,
     SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
@@ -295,10 +295,14 @@ fn schema_answer_to_python<'py>(
     Ok(result)
 }
 /// Python binding for a loaded text-to-speech runtime.
+///
+/// The Rust contract is `apxinf_model::tts_trait::TtsTrait`; the exported name
+/// stays `SpeechRunner` because the policy layer and the published Python API
+/// already use it.
 #[pyclass(unsendable)]
 pub struct SpeechRunner {
     model: LoadedModel,
-    prepared: RefCell<Option<Box<dyn PreparedSpeech>>>,
+    prepared: RefCell<Option<Box<dyn PreparedTts>>>,
     device: Device,
     model_path: PathBuf,
 }
@@ -368,7 +372,7 @@ impl SpeechRunner {
         target_frames: usize,
         sample_steps: usize,
     ) -> PyResult<()> {
-        let spec = SpeechSpec {
+        let spec = TtsSpec {
             phone_count,
             bert_token_count,
             reference_phone_count,
@@ -595,7 +599,7 @@ impl SpeechRunner {
             ));
         }
 
-        let request = SpeechRequest {
+        let request = TtsRequest {
             phone_ids,
             bert_token_ids,
             word2ph,

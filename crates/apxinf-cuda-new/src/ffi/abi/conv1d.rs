@@ -3,7 +3,7 @@ use std::ffi::c_void;
 pub(crate) use super::types::CudaStream;
 use super::types::Runtime;
 
-pub(crate) const SPEC_VERSION: u32 = 1;
+pub(crate) const SPEC_VERSION: u32 = 2;
 
 pub(crate) const SEMANTIC_CONV1D: u32 = 0;
 pub(crate) const SEMANTIC_CONV_TRANSPOSE1D: u32 = 1;
@@ -15,6 +15,7 @@ pub(crate) struct Spec {
     pub semantic: u32,
     pub dtype: u32,
     pub has_bias: u32,
+    pub direct_channel_last: u32,
     pub input_alignment: u32,
     pub weight_alignment: u32,
     pub bias_alignment: u32,

@@ -389,6 +389,17 @@ impl Hubert {
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+    /// Teacher-forcing captures live next to the capture root; set
+    /// `APXINF_GPT_TEACHER_FORCING` when they are somewhere else.
+    fn teacher_forcing_dir(root: &std::path::Path) -> std::path::PathBuf {
+        std::env::var_os("APXINF_GPT_TEACHER_FORCING")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                root.parent()
+                    .unwrap()
+                    .join("results/gpt-teacher-forcing-20261029")
+            })
+    }
     #[test]
     #[ignore = "requires APXINF_GPT_CAPTURE_ROOT and APXINF_GPT_CHECKPOINT"]
     fn quantizer_on_captured_features_matches_codes() {
@@ -422,16 +433,12 @@ mod capture_tests {
             let features = fp16_tensor(&ctx, &dims, &values).unwrap();
             let actual = hubert.quantize(&ctx, &features).unwrap();
             let actual = apxinf_cuda_new::transfers::to_cpu(&actual).unwrap();
-            let expected = std::fs::read(
-                root.parent()
+            let expected =
+                std::fs::read(teacher_forcing_dir(&root).join(format!("{pair}-prompt.i32")))
                     .unwrap()
-                    .join("results/gpt-teacher-forcing-20261029")
-                    .join(format!("{pair}-prompt.i32")),
-            )
-            .unwrap()
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
-            .collect::<Vec<_>>();
+                    .chunks_exact(4)
+                    .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                    .collect::<Vec<_>>();
             let mismatches = actual
                 .as_i32()
                 .unwrap()
@@ -513,16 +520,12 @@ mod capture_tests {
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .collect::<Vec<_>>();
-            let expected = std::fs::read(
-                root.parent()
+            let expected =
+                std::fs::read(teacher_forcing_dir(&root).join(format!("{pair}-prompt.i32")))
                     .unwrap()
-                    .join("results/gpt-teacher-forcing-20261029")
-                    .join(format!("{pair}-prompt.i32")),
-            )
-            .unwrap()
-            .chunks_exact(4)
-            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
-            .collect::<Vec<_>>();
+                    .chunks_exact(4)
+                    .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+                    .collect::<Vec<_>>();
             let features = hubert.encode_features(&ctx, &audio).unwrap();
             if let Ok(directory) = std::env::var("APXINF_HUBERT_FEATURE_CAPTURE") {
                 let directory = std::path::PathBuf::from(directory);

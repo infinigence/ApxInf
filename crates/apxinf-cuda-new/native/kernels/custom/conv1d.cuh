@@ -225,4 +225,64 @@ __global__ void conv_transpose1d_forward(
   }
 }
 
+/* Swap the last two axes of a `[batch, rows, cols]` buffer in place-equivalent
+ * fashion, optionally adding a per-`row` bias on the way out. The cuDNN
+ * provider needs temporal-major operands while the model stores channel-last,
+ * so both the input staging and the result copy run through this tile
+ * transpose. */
+template <class T, bool AddBias>
+__global__ void transpose_layout(const T* input, const T* bias, T* output,
+                                 int64_t rows, int64_t cols, int64_t batch) {
+  __shared__ T tile[32][33];
+  const int64_t row_tiles = (rows + 31) / 32;
+  const int64_t col_tiles = (cols + 31) / 32;
+  const int64_t tiles_per_batch = row_tiles * col_tiles;
+  for (int64_t tile_id = blockIdx.x; tile_id < batch * tiles_per_batch;
+       tile_id += gridDim.x) {
+    const int64_t batch_id = tile_id / tiles_per_batch;
+    const int64_t local = tile_id % tiles_per_batch;
+    const int64_t row_base = local / col_tiles * 32;
+    const int64_t col_base = local % col_tiles * 32;
+    for (int j = 0; j < 32; j += 8) {
+      const int64_t row = row_base + threadIdx.y + j;
+      const int64_t col = col_base + threadIdx.x;
+      if (row < rows && col < cols)
+        tile[threadIdx.y + j][threadIdx.x] =
+            input[(batch_id * rows + row) * cols + col];
+    }
+    __syncthreads();
+    for (int j = 0; j < 32; j += 8) {
+      const int64_t row = row_base + threadIdx.x;
+      const int64_t col = col_base + threadIdx.y + j;
+      if (row < rows && col < cols) {
+        T value = tile[threadIdx.x][threadIdx.y + j];
+        if constexpr (AddBias) {
+          if (bias) value = from_float<T>(to_float<T>(value) + to_float<T>(bias[row]));
+        }
+        output[(batch_id * cols + col) * rows + row] = value;
+      }
+    }
+    __syncthreads();
+  }
+}
+
+/* A channel-last filter descriptor indexes `[K, 1, kernel, C]` while the model
+ * stores `[K, C, 1, kernel]`; only the storage order changes, so the same
+ * permutation serves both semantics. Run once per prepared execution. */
+template <class T>
+__global__ void permute_filter_krsc(const T* source, T* destination,
+                                    int64_t out_channels, int64_t in_channels,
+                                    int64_t kernel) {
+  const int64_t filter = in_channels * kernel;
+  const int64_t total = out_channels * filter;
+  for (int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < total; index += int64_t(blockDim.x) * gridDim.x) {
+    const int64_t filter_index = index / filter;
+    const int64_t rest = index % filter;
+    const int64_t tap = rest / in_channels;
+    const int64_t channel = rest % in_channels;
+    destination[index] = source[filter_index * filter + channel * kernel + tap];
+  }
+}
+
 }  // namespace apxinf::conv1d::kernels

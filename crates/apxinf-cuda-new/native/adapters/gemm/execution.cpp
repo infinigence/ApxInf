@@ -358,17 +358,13 @@ std::unique_ptr<Execution> fallback(
     }
   }
 
-  // FP16 bias GEMMs: the baseline cuBLAS path stages an F32 projection and
-  // then runs a second elementwise kernel per projection. GPT-SoVITS issues
-  // ~302 such projections per token, so the staged epilogue is ~0.54 s of pure
-  // launch cost. The native cuBLASLt bias epilogue has the same numerical
-  // contract (FP32 accumulate, bias added before the single F16 rounding) and
-  // removes the second kernel. Opt-in until a correctness gate has signed off
-  // on the numerics change for models other than GPT-SoVITS.
-  static const bool prefer_native_f16_bias =
-      std::getenv("APXINF_GEMM_F16_BIAS_EPILOGUE") != nullptr;
-  if (prefer_native_f16_bias &&
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+  // FP16 bias GEMMs: the staged baseline path materializes an F32 projection
+  // and then runs a second elementwise kernel per projection. Decode-shaped
+  // projections pay that launch cost per layer, per step. The native cuBLASLt
+  // bias epilogue has the same numerical contract (FP32 accumulate, bias added
+  // before the single F16 rounding) and removes the second kernel; the F16
+  // operator-level precision gate covers the numerics.
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
       spec.a_dtype == APXINF_DTYPE_F16 && spec.b_dtype == APXINF_DTYPE_F16 &&
       spec.output_dtype == APXINF_DTYPE_F16 &&
       spec.quantization == APXINF_GEMM_QUANT_NONE) {

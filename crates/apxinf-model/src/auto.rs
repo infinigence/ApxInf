@@ -320,6 +320,17 @@ impl LoadedModel {
     }
 
     /// Borrow the canonical-input TTS runtime (phone/BERT ids already built).
+    pub fn tts(&self) -> Result<&dyn TtsTrait> {
+        match self {
+            Self::Tts(model) => Ok(&**model),
+            _ => Err(Error::Other(
+                "loaded model does not implement TtsTrait".into(),
+            )),
+        }
+    }
+
+    /// Mutably borrow the canonical-input TTS runtime, for path changes that
+    /// invalidate its conditioning caches.
     pub fn tts_mut(&mut self) -> Result<&mut dyn TtsTrait> {
         match self {
             Self::Tts(model) => Ok(&mut **model),

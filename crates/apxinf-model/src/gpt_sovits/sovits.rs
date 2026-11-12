@@ -4,10 +4,16 @@ use apxinf_core::{Error, Result, Tensor};
 use apxinf_cuda_new::CudaContext as Context;
 
 use super::config::{
-    SOVITS_FF, SOVITS_HEADS, SOVITS_HIDDEN, SOVITS_INTER, SOVITS_WINDOW, SOVITS_WN_LAYERS,
+    SOVITS_DECODER, SOVITS_FF, SOVITS_HEADS, SOVITS_HIDDEN, SOVITS_INTER, SOVITS_WINDOW,
+    SOVITS_WN_LAYERS,
 };
 use super::ops;
 use super::weights::{ids_tensor, Linear, Weights};
+
+// The MRTE cross-attention lives in the decoder-width style space, not in the
+// 192-wide `SOVITS_INTER` space of the surrounding convolutions.
+const MRTE_HIDDEN: usize = SOVITS_DECODER;
+const MRTE_HEADS: usize = 4;
 
 struct AttnLayer {
     q: Linear,
@@ -28,11 +34,6 @@ struct AttnLayer {
 
 struct EncoderStack {
     layers: Vec<AttnLayer>,
-}
-
-pub(crate) struct EncoderStackTrace {
-    pub attn: Vec<Tensor>,
-    pub ffn: Vec<Tensor>,
 }
 
 impl EncoderStack {
@@ -71,30 +72,9 @@ impl EncoderStack {
     }
 
     fn forward(&self, ctx: &Context, input: &Tensor) -> Result<Tensor> {
-        self.forward_impl(ctx, input, false)
-            .map(|(output, _)| output)
-    }
-
-    fn forward_with_trace(
-        &self,
-        ctx: &Context,
-        input: &Tensor,
-    ) -> Result<(Tensor, EncoderStackTrace)> {
-        let (output, trace) = self.forward_impl(ctx, input, true)?;
-        Ok((output, trace.expect("trace requested")))
-    }
-
-    fn forward_impl(
-        &self,
-        ctx: &Context,
-        input: &Tensor,
-        trace: bool,
-    ) -> Result<(Tensor, Option<EncoderStackTrace>)> {
         let dims = input.shape().dims().to_vec();
         let len = dims[0];
         let mut x = input.clone();
-        let mut attn_trace = Vec::with_capacity(self.layers.len());
-        let mut ffn_trace = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             let q = layer.q.apply(ctx, &x)?;
             let k = layer.k.apply(ctx, &x)?;
@@ -131,9 +111,6 @@ impl EncoderStack {
             let projected = layer.o.apply(ctx, &attended)?;
             let summed = ops::residual_add(ctx, &projected, &x)?;
             let normed = ops::layer_norm(ctx, &summed, &layer.ln1_w, &layer.ln1_b, 1e-5)?;
-            if trace {
-                attn_trace.push(normed.clone());
-            }
 
             let ff = ops::conv1d(
                 ctx,
@@ -150,17 +127,8 @@ impl EncoderStack {
             let ff = ff.reshape(apxinf_core::Shape::new(vec![len, SOVITS_HIDDEN]))?;
             let summed = ops::residual_add(ctx, &ff, &normed)?;
             x = ops::layer_norm(ctx, &summed, &layer.ln2_w, &layer.ln2_b, 1e-5)?;
-            if trace {
-                ffn_trace.push(x.clone());
-            }
         }
-        Ok((
-            x,
-            trace.then_some(EncoderStackTrace {
-                attn: attn_trace,
-                ffn: ffn_trace,
-            }),
-        ))
+        Ok(x)
     }
 }
 
@@ -224,34 +192,38 @@ impl Mrte {
             1,
             1,
         )?;
-        let heads = 4;
-        let head_dim = 512 / heads;
-        let q = self
-            .q
-            .apply(ctx, &c.reshape(apxinf_core::Shape::new(vec![len, 512]))?)?;
+        let head_dim = MRTE_HIDDEN / MRTE_HEADS;
+        let q = self.q.apply(
+            ctx,
+            &c.reshape(apxinf_core::Shape::new(vec![len, MRTE_HIDDEN]))?,
+        )?;
         let k = self.k.apply(
             ctx,
-            &t.reshape(apxinf_core::Shape::new(vec![text_len, 512]))?,
+            &t.reshape(apxinf_core::Shape::new(vec![text_len, MRTE_HIDDEN]))?,
         )?;
         let v = self.v.apply(
             ctx,
-            &t.reshape(apxinf_core::Shape::new(vec![text_len, 512]))?,
+            &t.reshape(apxinf_core::Shape::new(vec![text_len, MRTE_HIDDEN]))?,
         )?;
-        let q = q.reshape(apxinf_core::Shape::new(vec![1, len, heads, head_dim]))?;
-        let k = k.reshape(apxinf_core::Shape::new(vec![1, text_len, heads, head_dim]))?;
-        let v = v.reshape(apxinf_core::Shape::new(vec![1, text_len, heads, head_dim]))?;
-        let attended = ops::attention(ctx, &q, &k, &v, heads)?;
-        let attended = attended.reshape(apxinf_core::Shape::new(vec![len, 512]))?;
+        let q = q.reshape(apxinf_core::Shape::new(vec![1, len, MRTE_HEADS, head_dim]))?;
+        let k = k.reshape(apxinf_core::Shape::new(vec![
+            1, text_len, MRTE_HEADS, head_dim,
+        ]))?;
+        let v = v.reshape(apxinf_core::Shape::new(vec![
+            1, text_len, MRTE_HEADS, head_dim,
+        ]))?;
+        let attended = ops::attention(ctx, &q, &k, &v, MRTE_HEADS)?;
+        let attended = attended.reshape(apxinf_core::Shape::new(vec![len, MRTE_HIDDEN]))?;
         let projected = self.o.apply(ctx, &attended)?;
         let summed = ops::residual_add(
             ctx,
             &projected,
-            &c.reshape(apxinf_core::Shape::new(vec![len, 512]))?,
+            &c.reshape(apxinf_core::Shape::new(vec![len, MRTE_HIDDEN]))?,
         )?;
         let with_style = ops::add_bias(ctx, &summed, ge)?;
         let post = ops::conv1d(
             ctx,
-            &with_style.reshape(apxinf_core::Shape::new(vec![1, len, 512]))?,
+            &with_style.reshape(apxinf_core::Shape::new(vec![1, len, MRTE_HIDDEN]))?,
             &self.c_post_w,
             self.c_post_b.as_ref(),
             1,
@@ -271,16 +243,6 @@ pub struct TextEncoder {
     encoder_tail: EncoderStack,
     text_emb: Tensor,
     mrte: Mrte,
-}
-
-pub(crate) struct TextEncoderTrace {
-    pub ssl_proj: Tensor,
-    pub ssl: EncoderStackTrace,
-    pub text_embedding: Tensor,
-    pub text: EncoderStackTrace,
-    pub mrte: Tensor,
-    pub tail: EncoderStackTrace,
-    pub encoder_out: Tensor,
 }
 
 impl TextEncoder {
@@ -322,46 +284,6 @@ impl TextEncoder {
         let mut y = self.mrte.forward(ctx, &y, &text, ge)?;
         y = self.encoder_tail.forward(ctx, &y)?;
         Ok(y)
-    }
-
-    fn forward_with_trace(
-        &self,
-        ctx: &Context,
-        quantized: &Tensor,
-        text_ids: &[u32],
-        ge: &Tensor,
-    ) -> Result<(Tensor, TextEncoderTrace)> {
-        let len = quantized.shape().dims()[0];
-        let y = ops::conv1d(
-            ctx,
-            &quantized.reshape(apxinf_core::Shape::new(vec![1, len, 768]))?,
-            &self.ssl_proj_w,
-            self.ssl_proj_b.as_ref(),
-            1,
-            0,
-            1,
-            1,
-        )?;
-        let ssl_proj = y.reshape(apxinf_core::Shape::new(vec![len, SOVITS_HIDDEN]))?;
-        let (y, ssl) = self.encoder_ssl.forward_with_trace(ctx, &ssl_proj)?;
-
-        let ids = ids_tensor(ctx, text_ids)?;
-        let text_embedding = ops::embedding(ctx, &self.text_emb, &ids)?;
-        let (text, text_trace) = self.encoder_text.forward_with_trace(ctx, &text_embedding)?;
-        let mrte = self.mrte.forward(ctx, &y, &text, ge)?;
-        let (encoder_out, tail) = self.encoder_tail.forward_with_trace(ctx, &mrte)?;
-        Ok((
-            encoder_out.clone(),
-            TextEncoderTrace {
-                ssl_proj,
-                ssl,
-                text_embedding,
-                text: text_trace,
-                mrte,
-                tail,
-                encoder_out,
-            },
-        ))
     }
 }
 
@@ -441,13 +363,6 @@ impl RefEncoder {
     }
 }
 
-pub(crate) struct WnTrace {
-    pub pre: Tensor,
-    pub x: Vec<Tensor>,
-    pub output: Vec<Tensor>,
-    pub final_output: Tensor,
-}
-
 struct Wn {
     pre_w: Tensor,
     pre_b: Option<Tensor>,
@@ -502,31 +417,10 @@ impl Wn {
     }
 
     fn forward(&self, ctx: &Context, input: &Tensor, ge: &Tensor) -> Result<Tensor> {
-        self.forward_impl(ctx, input, ge, false)
-            .map(|(output, _)| output)
-    }
-
-    fn forward_with_trace(
-        &self,
-        ctx: &Context,
-        input: &Tensor,
-        ge: &Tensor,
-    ) -> Result<(Tensor, WnTrace)> {
-        let (output, trace) = self.forward_impl(ctx, input, ge, true)?;
-        Ok((output, trace.expect("trace requested")))
-    }
-
-    fn forward_impl(
-        &self,
-        ctx: &Context,
-        input: &Tensor,
-        ge: &Tensor,
-        trace: bool,
-    ) -> Result<(Tensor, Option<WnTrace>)> {
         let len = input.shape().dims()[0];
         let mut x = ops::conv1d(
             ctx,
-            &input.reshape(apxinf_core::Shape::new(vec![1, len, 512]))?,
+            &input.reshape(apxinf_core::Shape::new(vec![1, len, SOVITS_DECODER]))?,
             &self.pre_w,
             self.pre_b.as_ref(),
             1,
@@ -534,14 +428,11 @@ impl Wn {
             1,
             1,
         )?;
-        x = x.reshape(apxinf_core::Shape::new(vec![len, 512]))?;
-        let pre = x.clone();
+        x = x.reshape(apxinf_core::Shape::new(vec![len, SOVITS_DECODER]))?;
         let mut output = ops::zeros_like(ctx, &x)?;
-        let mut x_trace = Vec::with_capacity(SOVITS_WN_LAYERS);
-        let mut output_trace = Vec::with_capacity(SOVITS_WN_LAYERS);
-        let ge_3d = ge.reshape(apxinf_core::Shape::new(vec![1, 1, 512]))?;
+        let ge_3d = ge.reshape(apxinf_core::Shape::new(vec![1, 1, SOVITS_DECODER]))?;
         for index in 0..SOVITS_WN_LAYERS {
-            let x3 = x.reshape(apxinf_core::Shape::new(vec![1, len, 512]))?;
+            let x3 = x.reshape(apxinf_core::Shape::new(vec![1, len, SOVITS_DECODER]))?;
             let x_in = ops::conv1d(
                 ctx,
                 &x3,
@@ -566,7 +457,7 @@ impl Wn {
             let g = g.reshape(apxinf_core::Shape::new(vec![1024]))?;
             let gated_input = ops::add_bias(ctx, &x_in, &g)?;
             let acts = ops::tanh_gate(ctx, &gated_input, None)?;
-            let acts3 = acts.reshape(apxinf_core::Shape::new(vec![1, len, 512]))?;
+            let acts3 = acts.reshape(apxinf_core::Shape::new(vec![1, len, SOVITS_DECODER]))?;
             if index + 1 < SOVITS_WN_LAYERS {
                 let res = ops::conv1d(
                     ctx,
@@ -578,7 +469,7 @@ impl Wn {
                     1,
                     1,
                 )?;
-                let res = res.reshape(apxinf_core::Shape::new(vec![len, 512]))?;
+                let res = res.reshape(apxinf_core::Shape::new(vec![len, SOVITS_DECODER]))?;
                 x = ops::residual_add(ctx, &res, &x)?;
             }
             let skip = ops::conv1d(
@@ -591,35 +482,14 @@ impl Wn {
                 1,
                 1,
             )?;
-            let skip = skip.reshape(apxinf_core::Shape::new(vec![len, 512]))?;
+            let skip = skip.reshape(apxinf_core::Shape::new(vec![len, SOVITS_DECODER]))?;
             output = ops::residual_add(ctx, &skip, &output)?;
-            if trace {
-                x_trace.push(x.clone());
-                output_trace.push(output.clone());
-            }
         }
-        let out3 = output.reshape(apxinf_core::Shape::new(vec![1, len, 512]))?;
+        let out3 = output.reshape(apxinf_core::Shape::new(vec![1, len, SOVITS_DECODER]))?;
         let projected = ops::conv1d(ctx, &out3, &self.proj_w, self.proj_b.as_ref(), 1, 0, 1, 1)?;
-        let final_output = projected.reshape(apxinf_core::Shape::new(vec![len, 512]))?;
-        Ok((
-            final_output.clone(),
-            trace.then_some(WnTrace {
-                pre,
-                x: x_trace,
-                output: output_trace,
-                final_output,
-            }),
-        ))
+        let final_output = projected.reshape(apxinf_core::Shape::new(vec![len, SOVITS_DECODER]))?;
+        Ok(final_output)
     }
-}
-
-pub(crate) struct SovitsDecodeTrace {
-    pub quantized: Tensor,
-    pub quantized_upsample: Tensor,
-    pub encoder: TextEncoderTrace,
-    pub bridge: Tensor,
-    pub bridge_upsample: Tensor,
-    pub wn: WnTrace,
 }
 
 pub struct Sovits {
@@ -686,7 +556,6 @@ impl Sovits {
                 "SoVITS speed_factor must be finite and positive, got {speed_factor}"
             )));
         }
-        let frames = codes.shape().dims()[0];
         let quantized = ops::embedding(ctx, &self.codebook, codes)?;
         let quantized = ops::embedding(ctx, &quantized, upsample_codes)?;
         let encoded = self.text_encoder.forward(ctx, &quantized, text_ids, ge)?;
@@ -713,7 +582,7 @@ impl Sovits {
             1,
         )?;
         let bridged = ops::leaky_relu_one_percent(ctx, &bridged)?;
-        let bridged = bridged.reshape(apxinf_core::Shape::new(vec![len, 512]))?;
+        let bridged = bridged.reshape(apxinf_core::Shape::new(vec![len, SOVITS_DECODER]))?;
         let bridged = if (speed_factor - 1.0).abs() > 1e-6 {
             // The prepared row map is sized for native speed. Rebuild the
             // nearest-neighbour 2x expansion for the speed-adjusted length.
@@ -721,54 +590,8 @@ impl Sovits {
         } else {
             ops::embedding(ctx, &bridged, upsample_bridge)?
         };
-        let _ = frames;
         self.wn.forward(ctx, &bridged, ge)
     }
-
-    pub(crate) fn decode_features_with_trace(
-        &self,
-        ctx: &Context,
-        codes: &Tensor,
-        text_ids: &[u32],
-        ge: &Tensor,
-    ) -> Result<(Tensor, SovitsDecodeTrace)> {
-        let quantized = ops::embedding(ctx, &self.codebook, codes)?;
-        let quantized_upsample = ops::upsample2(ctx, &quantized)?;
-        let (encoded, encoder) =
-            self.text_encoder
-                .forward_with_trace(ctx, &quantized_upsample, text_ids, ge)?;
-        let len = encoded.shape().dims()[0];
-        let encoded = encoded.reshape(apxinf_core::Shape::new(vec![1, len, SOVITS_INTER]))?;
-        let bridge = ops::conv1d(
-            ctx,
-            &encoded,
-            &self.bridge_w,
-            self.bridge_b.as_ref(),
-            1,
-            0,
-            1,
-            1,
-        )?;
-        let bridge = ops::leaky_relu_one_percent(ctx, &bridge)?
-            .reshape(apxinf_core::Shape::new(vec![len, 512]))?;
-        let bridge_upsample = ops::upsample2(ctx, &bridge)?;
-        let (output, wn) = self.wn.forward_with_trace(ctx, &bridge_upsample, ge)?;
-        Ok((
-            output,
-            SovitsDecodeTrace {
-                quantized,
-                quantized_upsample,
-                encoder,
-                bridge,
-                bridge_upsample,
-                wn,
-            },
-        ))
-    }
-}
-
-pub fn shape_error(message: &str) -> Error {
-    Error::Other(message.to_owned())
 }
 
 pub fn hidden() -> usize {
