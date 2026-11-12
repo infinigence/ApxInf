@@ -102,55 +102,21 @@ impl Bert {
         {
             return Err(Error::Other("invalid prepared BERT input length".into()));
         }
-        #[cfg(test)]
-        macro_rules! dump {
-            ($label:expr, $tensor:expr) => {
-                if let Some(directory) = std::env::var_os("APXINF_BERT_STAGE_CAPTURE") {
-                    let directory =
-                        std::path::PathBuf::from(directory).join(format!("tokens-{len}"));
-                    std::fs::create_dir_all(&directory).unwrap();
-                    let values = apxinf_cuda_new::transfers::to_cpu($tensor)
-                        .unwrap()
-                        .to_f32_vec()
-                        .unwrap();
-                    std::fs::write(
-                        directory.join(format!("{}.f32", $label)),
-                        values
-                            .iter()
-                            .flat_map(|v| v.to_le_bytes())
-                            .collect::<Vec<_>>(),
-                    )
-                    .unwrap();
-                }
-            };
-        }
         let word = ops::embedding(ctx, &self.word_emb, &ids)
             .map_err(|e| Error::Other(format!("bert word: {e}")))?;
         let position = ops::embedding(ctx, &self.pos_emb, &position_ids)
             .map_err(|e| Error::Other(format!("bert position: {e}")))?;
         let type_embedding = ops::embedding(ctx, &self.type_emb, &type_ids)
             .map_err(|e| Error::Other(format!("bert type: {e}")))?;
-        #[cfg(test)]
-        dump!("word", &word);
-        #[cfg(test)]
-        dump!("type", &type_embedding);
-        #[cfg(test)]
-        dump!("position", &position);
         // Match BertEmbeddings: word + token_type, then + position.
         // Each addition rounds to FP16, so their order affects conditioning.
         let mut hidden = ops::residual_add(ctx, &word, &type_embedding)
             .map_err(|e| Error::Other(format!("bert word+type: {e}")))?;
-        #[cfg(test)]
-        dump!("word_type", &hidden);
         hidden = ops::residual_add(ctx, &hidden, &position)
             .map_err(|e| Error::Other(format!("bert +pos: {e}")))?;
-        #[cfg(test)]
-        dump!("embedding_sum", &hidden);
         hidden = ops::layer_norm(ctx, &hidden, &self.emb_ln_w, &self.emb_ln_b, 1e-12)
             .map_err(|e| Error::Other(format!("bert emb norm: {e}")))?;
 
-        #[cfg(test)]
-        dump!("embedding_norm", &hidden);
         for (layer_index, layer) in self.layers.iter().take(BERT_OUTPUT_LAYER + 1).enumerate() {
             let stage = move |name: &str, error: apxinf_core::Error| {
                 apxinf_core::Error::Other(format!("bert layer {layer_index} {name}: {error}"))
@@ -167,12 +133,6 @@ impl Bert {
                 .v
                 .apply_accumulator(ctx, &hidden)
                 .map_err(|e| stage("v", e))?;
-            #[cfg(test)]
-            if layer_index == 0 {
-                dump!("layer0.q", &q);
-                dump!("layer0.k", &k);
-                dump!("layer0.v", &v);
-            }
             let q = q.reshape(apxinf_core::Shape::new(vec![
                 1,
                 len,
@@ -194,54 +154,28 @@ impl Bert {
             let attended =
                 ops::attention(ctx, &q, &k, &v, BERT_HEADS).map_err(|e| stage("attention", e))?;
             let attended = attended.reshape(apxinf_core::Shape::new(vec![len, BERT_HIDDEN]))?;
-            #[cfg(test)]
-            if layer_index == 0 {
-                dump!("layer0.context", &attended);
-            }
             let projected = layer
                 .o
                 .apply_accumulator(ctx, &attended)
                 .map_err(|e| stage("o", e))?;
-            #[cfg(test)]
-            if layer_index == 0 {
-                dump!("layer0.projected", &projected);
-            }
             let summed = ops::residual_add(ctx, &projected, &hidden)
                 .map_err(|e| stage("attn residual", e))?;
             hidden = ops::layer_norm(ctx, &summed, &layer.ln_w, &layer.ln_b, 1e-12)
                 .map_err(|e| stage("attn norm", e))?;
 
-            #[cfg(test)]
-            if layer_index == 0 {
-                dump!("layer0.attention_norm", &hidden);
-            }
             let ff = layer
                 .ff1
                 .apply_accumulator(ctx, &hidden)
                 .map_err(|e| stage("ff1", e))?;
-            #[cfg(test)]
-            if layer_index == 0 {
-                dump!("layer0.ff1", &ff);
-            }
             let ff = ops::gelu_exact(ctx, &ff).map_err(|e| stage("gelu", e))?;
-            #[cfg(test)]
-            if layer_index == 0 {
-                dump!("layer0.gelu", &ff);
-            }
             let ff = layer
                 .ff2
                 .apply_accumulator(ctx, &ff)
                 .map_err(|e| stage("ff2", e))?;
-            #[cfg(test)]
-            if layer_index == 0 {
-                dump!("layer0.ff2", &ff);
-            }
             let summed =
                 ops::residual_add(ctx, &ff, &hidden).map_err(|e| stage("ff residual", e))?;
             hidden = ops::layer_norm(ctx, &summed, &layer.out_ln_w, &layer.out_ln_b, 1e-12)
                 .map_err(|e| stage("ff norm", e))?;
-            #[cfg(test)]
-            dump!(format!("layer{layer_index}.output"), &hidden);
         }
         ops::slice_rows(ctx, &hidden, 1, len - 2)
     }

@@ -30,6 +30,15 @@ def _immutable_inputs(values):
                  for value in values)
 
 
+def _sha256_file(path):
+    # hashlib.file_digest needs Python 3.11; the package supports 3.9.
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _file_identity(path):
     stat = path.stat()
     return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
@@ -345,8 +354,7 @@ class GptSovitsPolicy:
         if self._prompt_cache_enabled:
             # Some filesystems retain identical timestamps for rapid same-size
             # overwrites. Verify contents on hits, too; stat alone is insufficient.
-            with path.open("rb") as source:
-                digest = hashlib.file_digest(source, "sha256").hexdigest()
+            digest = _sha256_file(path)
         entry = self._reference_audio_cache
         if (self._prompt_cache_enabled and entry is not None
                 and entry[0] == key and entry[2] == digest):
@@ -359,8 +367,7 @@ class GptSovitsPolicy:
         if self._prompt_cache_enabled:
             size = sum(value.nbytes for value in values)
             if size <= _REFERENCE_CACHE_BYTES:
-                with path.open("rb") as source:
-                    final_digest = hashlib.file_digest(source, "sha256").hexdigest()
+                final_digest = _sha256_file(path)
                 if _file_identity(path) == identity and final_digest == digest:
                     values = _immutable_inputs(values)
                     self._reference_audio_cache = (key, values, digest, size)
@@ -485,7 +492,17 @@ class GptSovitsPolicy:
         if steps <= 0:
             raise ValueError("sample_steps must be positive")
 
-        phone_ids, bert_ids, _word2ph = self._text_inputs(text)
+        # The captured profile is fixed to one fragment's phone count, so it
+        # must be prepared on exactly what infer() will synthesize.
+        split_method = str(observation.get("text_split_method", "cut5"))
+        fragments = self._split_text(text, split_method)
+        if len(fragments) != 1:
+            raise ValueError(
+                f"prepare() captures a single fragment, but text_split_method "
+                f"{split_method!r} splits this text into {len(fragments)}; "
+                "use 'cut0' or prepare each fragment separately"
+            )
+        phone_ids, bert_ids, _word2ph = self._text_inputs(fragments[0])
         ref_phone_ids, ref_bert_ids, _ref_word2ph = self._text_inputs(
             reference_text, reference=True
         )
@@ -564,13 +581,15 @@ class GptSovitsPolicy:
         if not np.isfinite(fragment_interval) or fragment_interval < 0.0:
             raise ValueError("fragment_interval must be finite and non-negative")
         fragments = self._split_text(text, split_method)
+        base_seed = int(observation.get("seed", 0))
+        if base_seed < 0 or base_seed + len(fragments) - 1 >= 1 << 64:
+            raise ValueError("seed must be a non-negative 64-bit integer")
         ref_phone_ids, ref_bert_ids, ref_word2ph = self._text_inputs(
             reference_text, reference=True
         )
         ref_audio, ref_mel, ref_spec = self._reference_inputs(reference_audio)
         prepared = time.perf_counter()
 
-        base_seed = int(observation.get("seed", 0))
         common = {
             "top_k": int(observation.get("top_k", 5)),
             "top_p": float(observation.get("top_p", 1.0)),
@@ -587,6 +606,8 @@ class GptSovitsPolicy:
         # it synthesizes fragments. The native runner seeds each call, so use a
         # deterministic continuation instead of restarting every fragment from
         # the same noise.
+        # Like the official pipeline, the gap is sized at the 32 kHz acoustic
+        # rate even though the vocoder emits 48 kHz, so it plays 2/3 as long.
         gap = int(32000 * fragment_interval)
         pieces = []
         detail = []

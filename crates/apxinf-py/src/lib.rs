@@ -294,11 +294,8 @@ fn schema_answer_to_python<'py>(
     result.set_item("scores", scores)?;
     Ok(result)
 }
-/// Python binding for a loaded text-to-speech runtime.
-///
-/// The Rust contract is `apxinf_model::tts_trait::TtsTrait`; the exported name
-/// stays `SpeechRunner` because the policy layer and the published Python API
-/// already use it.
+/// Python binding for a loaded text-to-speech runtime
+/// (`apxinf_model::tts_trait::TtsTrait`).
 #[pyclass(unsendable)]
 pub struct SpeechRunner {
     model: LoadedModel,
@@ -543,14 +540,14 @@ impl SpeechRunner {
                 "phone IDs and reference_audio_16k must be non-empty",
             ));
         }
-        if bert_token_ids.len() < 2 || word2ph.len() + 2 != bert_token_ids.len() {
+        if bert_token_ids.len() < 3 || word2ph.len() + 2 != bert_token_ids.len() {
             return Err(PyValueError::new_err(format!(
                 "word2ph length {} must match BERT tokens without specials ({})",
                 word2ph.len(),
                 bert_token_ids.len().saturating_sub(2)
             )));
         }
-        if reference_bert_token_ids.len() < 2
+        if reference_bert_token_ids.len() < 3
             || reference_word2ph.len() + 2 != reference_bert_token_ids.len()
         {
             return Err(PyValueError::new_err(format!(

@@ -250,6 +250,7 @@ pub(crate) fn linear(
     gemm(ctx, input, weight, bias)
 }
 
+#[cfg(test)]
 /// Linear over the last dimension of `[batch, time, channels]`.
 pub(crate) fn linear_seq(
     ctx: &Context,
@@ -280,7 +281,7 @@ pub(crate) fn layer_norm(
         .ok_or_else(|| Error::Other("layer norm needs a rank".into()))?;
     let rows = input.numel() / cols;
     let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
-    let mut out = alloc(ctx, &[rows, cols])?;
+    let out = alloc(ctx, &[rows, cols])?;
     ops::norm::norm(ctx, NormArgs::layer(&flat, weight, bias, &out, eps))?;
     out.reshape(apxinf_core::Shape::new(dims))
 }
@@ -709,34 +710,6 @@ pub(crate) fn conv1d_impl(
     if direct_channel_last {
         args = args.with_direct_channel_last();
     }
-    ops::conv1d(ctx, args)?;
-    Ok(out)
-}
-
-pub(crate) fn conv_transpose1d(
-    ctx: &Context,
-    input: &Tensor,
-    weight: &Tensor,
-    bias: Option<&Tensor>,
-    stride: usize,
-    padding: usize,
-    output_padding: usize,
-) -> Result<Tensor> {
-    let dims = input.shape().dims().to_vec();
-    if dims.len() != 3 {
-        return Err(Error::Other("conv_transpose1d expects [B,T,C]".into()));
-    }
-    let out_channels = weight.shape().dims()[1];
-    let kernel = weight.shape().dims()[2];
-    let out_length = (dims[1] - 1) * stride - 2 * padding + (kernel - 1) + output_padding + 1;
-    let mut out = alloc(ctx, &[dims[0], out_length, out_channels])?;
-    let mut args = Conv1dArgs::new(Conv1dSemantic::ConvTranspose1d, input, weight, &mut out);
-    if let Some(bias) = bias {
-        args = args.with_bias(bias);
-    }
-    args.stride = stride;
-    args.padding = padding;
-    args.output_padding = output_padding;
     ops::conv1d(ctx, args)?;
     Ok(out)
 }

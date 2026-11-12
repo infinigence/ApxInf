@@ -150,12 +150,6 @@ impl Vocoder {
             .as_cpu()
             .ok_or_else(|| Error::Other("vocoder output is not host storage".into()))?;
         let samples: Vec<f32> = match output.dtype() {
-            apxinf_core::DType::BF16 => bytes
-                .chunks_exact(2)
-                .map(|chunk| {
-                    half::bf16::from_bits(u16::from_ne_bytes([chunk[0], chunk[1]])).to_f32()
-                })
-                .collect(),
             apxinf_core::DType::F16 => bytes
                 .chunks_exact(2)
                 .map(|chunk| {
@@ -173,94 +167,5 @@ impl Vocoder {
             }
         };
         Ok(samples)
-    }
-}
-
-#[cfg(test)]
-mod capture_tests {
-    use super::*;
-    #[test]
-    #[ignore = "requires APXINF_GPT_CAPTURE_ROOT and APXINF_GPT_CHECKPOINT"]
-    fn real_mel_eager_graph_benchmark() {
-        let root = std::path::PathBuf::from(std::env::var("APXINF_GPT_CAPTURE_ROOT").unwrap());
-        let checkpoint = std::path::PathBuf::from(std::env::var("APXINF_GPT_CHECKPOINT").unwrap());
-        let ctx = Context::new(0).unwrap();
-        let mut weights = Weights::load(&checkpoint).unwrap();
-        let vocoder = Vocoder::load(&mut weights, &ctx).unwrap();
-        for pair in ["pair1", "pair2"] {
-            let manifest: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(root.join(pair).join("raw/manifest.json")).unwrap(),
-            )
-            .unwrap();
-            let entries = manifest["entries"].as_array().unwrap();
-            let load = |name: &str| {
-                let entry = entries.iter().find(|e| e["name"] == name).unwrap();
-                let bytes = std::fs::read(
-                    root.join(pair)
-                        .join("raw")
-                        .join(entry["path"].as_str().unwrap()),
-                )
-                .unwrap();
-                bytes
-                    .chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                    .collect::<Vec<_>>()
-            };
-            let nchw_mel = load("vocoder.0.mel_in");
-            let frames = nchw_mel.len() / 100;
-            let mut nlc_mel = vec![0f32; nchw_mel.len()];
-            for t in 0..frames {
-                for c in 0..100 {
-                    nlc_mel[t * 100 + c] = nchw_mel[c * frames + t];
-                }
-            }
-            let mel = super::super::weights::fp16_tensor(&ctx, &[frames, 100], &nlc_mel).unwrap();
-            let reference = load("vocoder.0.wav_out");
-            let start = std::time::Instant::now();
-            let eager = vocoder.forward(&ctx, &mel).unwrap();
-            ctx.synchronize().unwrap();
-            println!("{pair} eager_seconds={:.6}", start.elapsed().as_secs_f64());
-            let eager_pcm = Vocoder::pcm_from_output(&ctx, &eager).unwrap();
-            let session = apxinf_cuda_new::ops::ExecutionSession::with_capacity(
-                (2usize * 1024 * 1024 * 1024 * frames + 499) / 500,
-                0,
-            )
-            .unwrap();
-            let output = ops::alloc(&ctx, &[1, frames * 480, 1]).unwrap();
-            let forward = || {
-                let generated = vocoder.forward(&ctx, &mel)?;
-                apxinf_cuda_new::transfers::copy_cuda_to_cuda(&ctx, &generated, &output)
-            };
-            apxinf_cuda_new::ops::prepare_with_session(&session, forward).unwrap();
-            ctx.synchronize().unwrap();
-            let graph = apxinf_cuda_new::capture(&ctx, || {
-                apxinf_cuda_new::ops::with_session(&session, forward)
-            })
-            .unwrap();
-            graph.replay().unwrap();
-            ctx.synchronize().unwrap();
-            let start = std::time::Instant::now();
-            for _ in 0..3 {
-                graph.replay().unwrap();
-            }
-            ctx.synchronize().unwrap();
-            let seconds = start.elapsed().as_secs_f64() / 3.0;
-            let pcm = Vocoder::pcm_from_output(&ctx, &output).unwrap();
-            let mut error = 0f64;
-            let mut signal = 0f64;
-            let mut max_abs = 0f32;
-            let mut graph_error = 0f32;
-            for ((&a, &r), &e) in pcm.iter().zip(&reference).zip(&eager_pcm) {
-                error += f64::from(a - r).powi(2);
-                signal += f64::from(r).powi(2);
-                max_abs = max_abs.max((a - r).abs());
-                graph_error = graph_error.max((a - e).abs());
-            }
-            let snr = 10.0 * (signal / error).log10();
-            println!("{pair} graph_seconds={seconds:.6} samples={} audio_seconds={} snr={snr:.4} max_abs={max_abs:.6} eager_graph_max={graph_error:.8}",pcm.len(),pcm.len() as f64/48000.0);
-            assert_eq!(pcm.len(), reference.len());
-            assert_eq!(graph_error, 0.0);
-            assert!(snr >= 25.0);
-        }
     }
 }
