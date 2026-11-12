@@ -542,3 +542,59 @@ mod tests {
         assert!(WallossConfig::from_json_str(&bad).is_err());
     }
 }
+
+/// Load-time implementation choice; independent of legacy precision selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Variant {
+    Bf16,
+    DynamicFp8,
+}
+
+impl Variant {
+    pub(super) fn from_options(options: &crate::auto::LoadOptions) -> Result<Self> {
+        if options.precision != crate::auto::ModelPrecision::Auto {
+            return Err(Error::Other(
+                "WallOSS uses model_variant; leave legacy precision at auto".into(),
+            ));
+        }
+        match options.model_variant.as_deref().unwrap_or("auto") {
+            "auto" | "bf16" => Ok(Self::Bf16),
+            "fp8_dynamic" => Ok(Self::DynamicFp8),
+            value => Err(Error::Other(format!(
+                "unsupported WallOSS model_variant {value:?}; expected auto, bf16 or fp8_dynamic"
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::Variant;
+    use crate::auto::{LoadOptions, ModelPrecision};
+    #[test]
+    fn model_variant_selects_implementation_without_precision_conversion() {
+        for (name, expected) in [
+            ("auto", Variant::Bf16),
+            ("bf16", Variant::Bf16),
+            ("fp8_dynamic", Variant::DynamicFp8),
+        ] {
+            let options = LoadOptions {
+                model_variant: Some(name.into()),
+                ..Default::default()
+            };
+            assert_eq!(Variant::from_options(&options).unwrap(), expected);
+        }
+        for name in ["fp8", "fp8_static", "int8_dynamic"] {
+            assert!(Variant::from_options(&LoadOptions {
+                model_variant: Some(name.into()),
+                ..Default::default()
+            })
+            .is_err());
+        }
+        assert!(Variant::from_options(&LoadOptions {
+            precision: ModelPrecision::Bf16,
+            ..Default::default()
+        })
+        .is_err());
+    }
+}
