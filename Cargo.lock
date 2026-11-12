@@ -147,6 +147,7 @@ dependencies = [
  "apxinf-core",
  "cc",
  "half",
+ "serde_json",
 ]
 
 [[package]]

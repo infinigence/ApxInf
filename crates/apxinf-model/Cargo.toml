@@ -26,6 +26,8 @@ openblas = ["apxinf-cpu/openblas"]
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
 cuda = ["dep:apxinf-cuda-new"]
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
+# `mlx-signpost` adds os_signpost trace ranges for Instruments.
+mlx-signpost = ["mlx", "apxinf-mlx/signpost"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # It no longer gates anything: `cuda` already pulls in `apxinf-cuda-new`, and
 # the model code that used to hide behind this flag now follows `cuda`.

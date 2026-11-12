@@ -32,6 +32,9 @@ cuda = [
 cuda-no-nvtx = ["dep:apxinf-cuda-new", "apxinf-model/cuda"]
 # Native Apple Metal execution through an explicitly configured MLX C++ SDK.
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "apxinf-model/mlx"]
+# Adds os_signpost trace ranges for Instruments, kept a separate feature for
+# the same reason as `musa-mttx`.
+mlx-signpost = ["mlx", "apxinf-model/mlx-signpost"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # `cuda` already links cuda-new and enables every CUDA model family, Qwen3.8
 # included — see crates/apxinf-model/Cargo.toml.
