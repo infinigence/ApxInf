@@ -1,0 +1,34 @@
+name: Audio serving CPU contracts
+
+on:
+  pull_request:
+    paths:
+      - crates/apxinf-audio-serving/**
+      - python/apxinf/apxinf/serving/audio_*.py
+      - tests/audio_serving/**
+      - tests/fixtures/audio-serving/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/audio-serving.yml
+  workflow_dispatch:
+
+jobs:
+  audio-cpu:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check Rust audio contracts and media ownership
+        run: cargo test -p apxinf-audio-serving --locked
+      - name: Build the actual audio CLI
+        run: cargo build -p apxinf-audio-serving --bin apxinf-audio-serve --locked
+      - name: Check Python contracts, adapters, and actual TCP service
+        env:
+          APXINF_AUDIO_BIN: ${{ github.workspace }}/target/debug/apxinf-audio-serve
+        run: python -m unittest discover -s tests/audio_serving -p 'test_*.py' -v

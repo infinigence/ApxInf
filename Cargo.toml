@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/apxinf-audio-serving",
     "crates/apxinf-core",
     "crates/apxinf-cpu",
     "crates/apxinf-cuda-new",
