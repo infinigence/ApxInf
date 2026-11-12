@@ -1,3 +1,5 @@
+//! Device weight access, linear layers, and convolution weight wrappers.
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -174,6 +176,39 @@ impl Conv {
         padding: usize,
     ) -> Result<Tensor> {
         ops::conv_transpose1d(ctx, input, &self.w, self.b.as_ref(), stride, padding, 0)
+    }
+
+    /// The bias a direct convolution leaves for its consumer to fold in.
+    pub fn deferred_bias(&self) -> Result<&Tensor> {
+        self.b.as_ref().ok_or_else(|| {
+            Error::Other("convolution weights are missing the bias a direct call defers".into())
+        })
+    }
+
+    /// Bias-free form: binds the caller's channel-last buffers in place, with no
+    /// layout transform, and leaves [`Conv::deferred_bias`] to the kernel that
+    /// reads the result.
+    pub fn apply_direct(
+        &self,
+        ctx: &Context,
+        input: &Tensor,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<Tensor> {
+        ops::conv1d_direct(ctx, input, &self.w, stride, padding, dilation, groups)
+    }
+
+    /// Bias-free [`Conv::transpose`]; see [`Conv::apply_direct`].
+    pub fn transpose_direct(
+        &self,
+        ctx: &Context,
+        input: &Tensor,
+        stride: usize,
+        padding: usize,
+    ) -> Result<Tensor> {
+        ops::conv_transpose1d_direct(ctx, input, &self.w, stride, padding)
     }
 }
 

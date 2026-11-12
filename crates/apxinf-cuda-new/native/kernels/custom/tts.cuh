@@ -96,15 +96,37 @@ __device__ __forceinline__ float apply_activation(float value, int activation) {
   return value;
 }
 
+/* `round_bias` rounds `input + bias` to the tensor dtype before the activation.
+   A producer that defers its bias and is read again by an activation needs that
+   intermediate rounding to match the value it would have written itself. */
 template <class T>
 __global__ void bias_activation(const T* input, const T* bias, T* output,
-                                int64_t count, int cols, int activation) {
+                                int64_t count, int cols, int activation,
+                                int round_bias) {
   int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
   for (; index < count; index += stride) {
     float value = to_float(input[index]);
     if (bias != nullptr) value += to_float(bias[index % cols]);
+    if (round_bias != 0) value = to_float(from_float<T>(value));
     output[index] = from_float<T>(apply_activation(value, activation));
+  }
+}
+
+/* Rounds `input + bias` to the tensor dtype, then adds `residual` and rounds
+   again. This is the two-launch arithmetic of a deferred bias followed by the
+   ordinary residual add, in a single pass. */
+template <class T>
+__global__ void residual_add_bias(const T* input, const T* bias,
+                                  const T* residual, T* output, int64_t count,
+                                  int cols) {
+  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
+  for (; index < count; index += stride) {
+    const T biased = from_float<T>(to_float(input[index]) +
+                                   to_float(bias[index % cols]));
+    output[index] =
+        from_float<T>(to_float(biased) + to_float(residual[index]));
   }
 }
 
@@ -119,21 +141,6 @@ __global__ void affine(const T* input, const T* bias, T* output, int64_t count,
     output[index] = from_float<T>(to_float(input[index]) *
                                       to_float(bias[col]) +
                                   to_float(bias[cols + col]));
-  }
-}
-
-/* input [rows, 2 * cols] -> output [rows, cols]. */
-template <class T>
-__global__ void glu(const T* input, T* output, int64_t count, int cols) {
-  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  for (; index < count; index += stride) {
-    const int64_t row = index / cols;
-    const int col = static_cast<int>(index % cols);
-    const T* row_input = input + row * 2 * cols;
-    const float first = to_float(row_input[col]);
-    const float second = to_float(row_input[cols + col]);
-    output[index] = from_float<T>(first / (1.0f + expf(-second)));
   }
 }
 
@@ -408,20 +415,6 @@ __global__ void argmax_rows_kernel(const T* __restrict__ logits,
   }
 }
 
-/* Bias-before-cast projection epilogue: the GEMM writes an F32 projection and
- * the bias is added before the single F16 rounding, matching Torch's
- * F.linear -> aten::addmm accumulation contract. */
-__global__ void project_bias_f32_to_f16_kernel(
-    const float* __restrict__ projection, const __half* __restrict__ bias,
-    __half* __restrict__ output, int64_t count, int cols) {
-  int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
-  for (; index < count; index += stride) {
-    output[index] = __float2half(
-        projection[index] + __half2float(bias[index % cols]));
-  }
-}
-
 __global__ void cache_write_token_kernel(const uint16_t* input, uint16_t* cache,
     const uint32_t* meta, int64_t capacity, int64_t elements) {
   const uint32_t row = meta[1];
@@ -429,21 +422,6 @@ __global__ void cache_write_token_kernel(const uint16_t* input, uint16_t* cache,
   for (int64_t i = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
        i < elements; i += int64_t(blockDim.x) * gridDim.x)
     cache[int64_t(row) * elements + i] = input[i];
-}
-
-/* output[row, col] = table[ids[row], col]. */
-template <class T>
-__global__ void gather_rows_kernel(const T* __restrict__ table,
-                                   const int32_t* __restrict__ ids,
-                                   T* __restrict__ output, int64_t rows,
-                                   int cols) {
-  const int64_t count = rows * int64_t(cols);
-  for (int64_t index = blockIdx.x * int64_t(blockDim.x) + threadIdx.x;
-       index < count; index += int64_t(blockDim.x) * gridDim.x) {
-    const int64_t row = index / cols;
-    const int64_t column = index % cols;
-    output[index] = table[int64_t(ids[row]) * cols + column];
-  }
 }
 
 template <class T>

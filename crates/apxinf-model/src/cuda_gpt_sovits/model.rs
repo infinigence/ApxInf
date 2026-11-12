@@ -20,8 +20,7 @@ use super::sovits::Sovits;
 use super::vocoder::Vocoder;
 use super::weights::Weights;
 use crate::tts_trait::{
-    PcmAudio, PreparedSpeech, SpeechContract, SpeechRequest, SpeechSpec, TtsCacheConfig,
-    TtsCacheInfo, TtsTrait,
+    PcmAudio, PreparedTts, TtsCacheConfig, TtsCacheInfo, TtsContract, TtsRequest, TtsSpec, TtsTrait,
 };
 
 const SPEC_MIN: f32 = -12.0;
@@ -460,7 +459,7 @@ pub struct PreparedGptSovitsSpeech {
     _bert: Arc<Bert>,
     _hubert: Arc<Hubert>,
     _sovits: Arc<Sovits>,
-    spec: SpeechSpec,
+    spec: TtsSpec,
     cache: Rc<RefCell<ConditioningCache>>,
     ctx: Arc<Context>,
     reference_bert: BertGraph,
@@ -573,7 +572,7 @@ impl GptSovitsModel {
         transfers::to_cuda(&host, self.ctx.device_id())
     }
 
-    fn reference_features(&self, request: &SpeechRequest<'_>) -> Result<Rc<ReferenceFeatures>> {
+    fn reference_features(&self, request: &TtsRequest<'_>) -> Result<Rc<ReferenceFeatures>> {
         let key = ReferenceKey::new(request, false);
         if let Some(value) = self.cache.borrow_mut().reference(&key) {
             return Ok(value);
@@ -612,7 +611,7 @@ impl GptSovitsModel {
         Ok(value)
     }
 
-    pub fn synthesize(&self, request: &SpeechRequest<'_>) -> Result<PcmAudio> {
+    pub fn synthesize(&self, request: &TtsRequest<'_>) -> Result<PcmAudio> {
         if !request.speed_factor.is_finite() || request.speed_factor <= 0.0 {
             return Err(Error::Other(format!(
                 "speed_factor must be finite and positive, got {}",
@@ -733,8 +732,8 @@ impl GptSovitsModel {
 }
 
 impl PreparedGptSovitsSpeech {
-    fn validate_request(&self, request: &SpeechRequest<'_>) -> Result<()> {
-        let actual = SpeechSpec {
+    fn validate_request(&self, request: &TtsRequest<'_>) -> Result<()> {
+        let actual = TtsSpec {
             phone_count: request.phone_ids.len(),
             bert_token_count: request.bert_token_ids.len(),
             reference_phone_count: request.reference_phone_ids.len(),
@@ -797,7 +796,7 @@ impl PreparedGptSovitsSpeech {
         Ok(value)
     }
 
-    fn reference_features(&self, request: &SpeechRequest<'_>) -> Result<Rc<ReferenceFeatures>> {
+    fn reference_features(&self, request: &TtsRequest<'_>) -> Result<Rc<ReferenceFeatures>> {
         let key = ReferenceKey::new(request, true);
         if let Some(value) = self.cache.borrow_mut().reference(&key) {
             return Ok(value);
@@ -843,10 +842,11 @@ impl PreparedGptSovitsSpeech {
         Ok(value)
     }
 
-    fn run_prepared(&self, request: &SpeechRequest<'_>) -> Result<PcmAudio> {
+    fn run_prepared(&self, request: &TtsRequest<'_>) -> Result<PcmAudio> {
         self.validate_request(request)?;
-        // NVTX 分段时间线（nsys）。这一层是整图 replay 的黑箱，四个 stage 必须在
-        // host 侧埋点才拆得开；不带 `nvtx` feature 时是零成本 no-op。
+        // NVTX segment timeline for nsys. This layer is a black box of graph
+        // replays, so the four stages are only separable with host-side marks;
+        // without the `nvtx` feature each range is a zero-cost no-op.
         let _tts_reference_range = crate::profiling::trace::range("tts.reference");
         let reference = self.reference_features(request)?;
         drop(_tts_reference_range);
@@ -1043,26 +1043,26 @@ impl PreparedGptSovitsSpeech {
     }
 }
 
-impl PreparedSpeech for PreparedGptSovitsSpeech {
-    fn spec(&self) -> &SpeechSpec {
+impl PreparedTts for PreparedGptSovitsSpeech {
+    fn spec(&self) -> &TtsSpec {
         &self.spec
     }
 
-    fn run(&self, request: &SpeechRequest<'_>) -> Result<PcmAudio> {
+    fn run(&self, request: &TtsRequest<'_>) -> Result<PcmAudio> {
         self.run_prepared(request)
     }
 }
 
 impl TtsTrait for GptSovitsModel {
-    fn contract(&self) -> SpeechContract {
-        SpeechContract {
+    fn contract(&self) -> TtsContract {
+        TtsContract {
             sample_rate: OUTPUT_SAMPLE_RATE,
             mel_frames_per_second: self.config.mel_frames_per_second,
             semantic_frames_per_second: self.config.semantic_frames_per_second,
         }
     }
 
-    fn synthesize(&self, request: &SpeechRequest<'_>) -> Result<PcmAudio> {
+    fn synthesize(&self, request: &TtsRequest<'_>) -> Result<PcmAudio> {
         GptSovitsModel::synthesize(self, request)
     }
 
@@ -1077,7 +1077,7 @@ impl TtsTrait for GptSovitsModel {
         self.cache.borrow().info()
     }
 
-    fn prepare(&self, spec: &SpeechSpec) -> Result<Box<dyn PreparedSpeech>> {
+    fn prepare(&self, spec: &TtsSpec) -> Result<Box<dyn PreparedTts>> {
         if spec.phone_count == 0
             || spec.bert_token_count < 2
             || spec.reference_phone_count == 0
@@ -1177,6 +1177,17 @@ impl TtsTrait for GptSovitsModel {
 mod capture_tests {
     use super::*;
     use std::{fs, path::PathBuf};
+    /// Teacher-forcing captures live next to the capture root; set
+    /// `APXINF_GPT_TEACHER_FORCING` when they are somewhere else.
+    fn teacher_forcing_dir(root: &std::path::Path) -> std::path::PathBuf {
+        std::env::var_os("APXINF_GPT_TEACHER_FORCING")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                root.parent()
+                    .unwrap()
+                    .join("results/gpt-teacher-forcing-20261029")
+            })
+    }
 
     #[test]
     #[ignore = "requires APXINF_GPT_CAPTURE_ROOT and APXINF_GPT_CHECKPOINT"]
@@ -1267,13 +1278,8 @@ mod capture_tests {
                 super::super::weights::fp16_tensor(ctx, &[spec.len() / 704, 704], &spec).unwrap();
             let style = model.sovits.style(ctx, &spec).unwrap();
             drop(graph);
-            let mut codes = read_u32(
-                &root
-                    .parent()
-                    .unwrap()
-                    .join("results/gpt-teacher-forcing-20261029")
-                    .join(format!("{pair}-target-tokens.i32")),
-            );
+            let mut codes =
+                read_u32(&teacher_forcing_dir(&root).join(format!("{pair}-target-tokens.i32")));
             let graph =
                 SovitsGraph::prepare(ctx, &model.sovits, codes.len(), phones.len()).unwrap();
             for changed in [false, true] {
@@ -1332,10 +1338,7 @@ mod capture_tests {
                 .collect::<Vec<_>>();
             let codes = model.hubert.encode(&model.ctx, &audio).unwrap();
             let prompt = model.codes_to_vec(&codes).unwrap();
-            let reference = root
-                .parent()
-                .unwrap()
-                .join("results/gpt-teacher-forcing-20261029");
+            let reference = teacher_forcing_dir(&root);
             let expected_prompt = read_ids(&reference.join(format!("{pair}-prompt.i32")));
             let prompt_mismatches = prompt
                 .iter()
@@ -1392,10 +1395,7 @@ mod capture_tests {
             std::env::var_os("APXINF_ALIGNMENT_AUTOTUNE").is_some(),
         )
         .unwrap();
-        let fixture = root
-            .parent()
-            .unwrap()
-            .join("results/gpt-teacher-forcing-20261029");
+        let fixture = teacher_forcing_dir(&root);
         let read_ids = |p: &Path| {
             fs::read(p)
                 .unwrap()

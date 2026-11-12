@@ -26,13 +26,19 @@ typedef enum {
   APXINF_CONV1D_SEMANTIC_CONV_TRANSPOSE1D = 1,
 } apxinf_conv1d_semantic_t;
 
-#define APXINF_CONV1D_SPEC_VERSION 1u
+#define APXINF_CONV1D_SPEC_VERSION 2u
 
 typedef struct {
   uint32_t version;
   uint32_t semantic;
   uint32_t dtype;
   uint32_t has_bias;
+  /* 1 = the caller already supplies and receives the provider's channel-last
+   * buffer order, so the adapter performs no layout transform, and bias is not
+   * applied here: the caller adds it to a *downstream* kernel using exactly
+   * round(dtype(x) + bias), which is what the ordinary path's output transform
+   * writes. Requires has_bias == 0 and the cuDNN provider. */
+  uint32_t direct_channel_last;
   uint32_t input_alignment;
   uint32_t weight_alignment;
   uint32_t bias_alignment;

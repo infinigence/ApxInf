@@ -315,6 +315,34 @@ pub(crate) fn residual_add(ctx: &Context, input: &Tensor, residual: &Tensor) -> 
     hidden.reshape(apxinf_core::Shape::new(dims))
 }
 
+/// Adds `bias` to `input`, rounds that sum to the activation dtype, then adds
+/// `residual` and rounds again. One launch reproduces the value a producer that
+/// applies its own bias would have written before an ordinary residual add.
+pub(crate) fn residual_add_bias(
+    ctx: &Context,
+    input: &Tensor,
+    bias: &Tensor,
+    residual: &Tensor,
+) -> Result<Tensor> {
+    let dims = input.shape().dims().to_vec();
+    let cols = *dims
+        .last()
+        .ok_or_else(|| Error::Other("residual needs a rank".into()))?;
+    let rows = input.numel() / cols;
+    if residual.numel() != input.numel() {
+        return Err(Error::Other(format!(
+            "residual shape mismatch: {:?} vs {:?}",
+            input.shape().dims(),
+            residual.shape().dims()
+        )));
+    }
+    let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
+    let residual = residual.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
+    let hidden = alloc(ctx, &[rows, cols])?;
+    tts::residual_add_bias(ctx, &flat, bias, &residual, &hidden)?;
+    hidden.reshape(apxinf_core::Shape::new(dims))
+}
+
 pub(crate) fn residual_add_into(
     ctx: &Context,
     input: &Tensor,
@@ -342,10 +370,19 @@ pub(crate) fn residual_add_into(
     }
     let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
     let residual = residual.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
-    let mut hidden = output.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
-    ops::bias_residual(
+    let hidden = output.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
+    // `output` is fresh scratch, so the residual add can write it directly
+    // instead of allocating: one launch, in the tensor's own dtype.
+    ops::residual_add(
         ctx,
-        ops::BiasResidualArgs::new(&flat, None, &residual, &mut hidden),
+        ResidualAddArgs {
+            input: &flat,
+            bias: None,
+            residual: &residual,
+            gate: None,
+            hidden: &hidden,
+            bias_order: BiasOrder::SingleRound,
+        },
     )
 }
 
@@ -378,53 +415,12 @@ pub(crate) fn affine(
     out.reshape(apxinf_core::Shape::new(dims))
 }
 
-pub(crate) fn gate_residual(
-    ctx: &Context,
-    input: &Tensor,
-    residual: &Tensor,
-    gate: &Tensor,
-) -> Result<Tensor> {
-    let dims = input.shape().dims().to_vec();
-    let cols = *dims
-        .last()
-        .ok_or_else(|| Error::Other("gate needs a rank".into()))?;
-    if gate.shape().dims() != [cols] {
-        return Err(Error::Other("gate width mismatch".into()));
-    }
-    let zeros = alloc(ctx, &[cols])?;
-    let ones = alloc(ctx, &[cols])?;
-    // gate_style = [scale, shift, gate]; only the third segment is read.
-    let first = ops::concat_rows(
-        ctx,
-        &zeros.reshape(apxinf_core::Shape::new(vec![1, cols]))?,
-        &ones.reshape(apxinf_core::Shape::new(vec![1, cols]))?,
-    )?;
-    let second = gate.reshape(apxinf_core::Shape::new(vec![1, cols]))?;
-    let style = ops::concat_rows(ctx, &first, &second)?;
-    let style = style.reshape(apxinf_core::Shape::new(vec![3 * cols]))?;
-    let rows = input.numel() / cols;
-    let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
-    let residual_flat = residual.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
-    let hidden = alloc(ctx, &[rows, cols])?;
-    ops::residual_add(
-        ctx,
-        ResidualAddArgs {
-            input: &flat,
-            bias: None,
-            residual: &residual_flat,
-            gate: Some(ops::ResidualGate::PackedStyle(&style)),
-            hidden: &hidden,
-            bias_order: BiasOrder::SingleRound,
-        },
-    )?;
-    hidden.reshape(apxinf_core::Shape::new(dims))
-}
-
 fn activation(
     ctx: &Context,
     input: &Tensor,
     bias: Option<&Tensor>,
     activation: tts::TtsActivation,
+    round_bias: bool,
 ) -> Result<Tensor> {
     let dims = input.shape().dims().to_vec();
     let cols = *dims
@@ -433,24 +429,44 @@ fn activation(
     let rows = input.numel() / cols;
     let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
     let out = alloc(ctx, &[rows, cols])?;
-    tts::bias_activation(ctx, &flat, bias, &out, activation)?;
+    tts::bias_activation(ctx, &flat, bias, &out, activation, round_bias)?;
     out.reshape(apxinf_core::Shape::new(dims))
 }
 
 pub(crate) fn gelu_exact(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::GeluExact)
+    activation(ctx, input, None, tts::TtsActivation::GeluExact, false)
 }
 
 pub(crate) fn mish(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Mish)
+    activation(ctx, input, None, tts::TtsActivation::Mish, false)
 }
 
 pub(crate) fn leaky_relu(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::LeakyRelu)
+    activation(ctx, input, None, tts::TtsActivation::LeakyRelu, false)
+}
+
+/// Adds `bias`, rounds the sum to the activation dtype, then applies
+/// leaky-relu (slope 0.1). One launch reproduces the value a bias-applying
+/// producer writes and the following activation reads.
+pub(crate) fn leaky_relu_bias(ctx: &Context, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    activation(ctx, input, Some(bias), tts::TtsActivation::LeakyRelu, true)
+}
+
+/// Adds `bias` to `input` and rounds the sum to the activation dtype. A direct
+/// convolution defers its bias, so a trace point sitting right after one has to
+/// reconstruct the value the ordinary path would have written into that buffer.
+pub(crate) fn add_bias_rounded(ctx: &Context, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
+    activation(ctx, input, Some(bias), tts::TtsActivation::None, true)
 }
 
 pub(crate) fn leaky_relu_one_percent(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::LeakyReluOnePercent)
+    activation(
+        ctx,
+        input,
+        None,
+        tts::TtsActivation::LeakyReluOnePercent,
+        false,
+    )
 }
 
 pub(crate) fn tanh_gate(
@@ -474,13 +490,17 @@ pub(crate) fn tanh_gate(
     let out = alloc(ctx, &[rows, cols / 2])?;
     tts::tanh_sigmoid_gate(ctx, &flat, secondary_flat.as_ref(), &out)?;
     let mut out_dims = dims.clone();
-    *out_dims.last_mut().unwrap() /= 2;
+    *out_dims
+        .last_mut()
+        .ok_or_else(|| Error::Other("gate needs a rank".into()))? /= 2;
     out.reshape(apxinf_core::Shape::new(out_dims))
 }
 
 pub(crate) fn glu_separate(ctx: &Context, first: &Tensor, second: &Tensor) -> Result<Tensor> {
     let dims = first.shape().dims().to_vec();
-    let cols = *dims.last().unwrap();
+    let cols = *dims
+        .last()
+        .ok_or_else(|| Error::Other("glu needs a rank".into()))?;
     let rows = first.numel() / cols;
     let flat_first = first.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
     let flat_second = second.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
@@ -532,11 +552,12 @@ pub(crate) fn grn(ctx: &Context, input: &Tensor, gamma: &Tensor, beta: &Tensor) 
 
 pub(crate) fn embedding(ctx: &Context, table: &Tensor, ids: &Tensor) -> Result<Tensor> {
     let table_dims = table.shape().dims();
+    let hidden = *table_dims
+        .get(1)
+        .ok_or_else(|| Error::Other("embedding table needs a rank-2 shape".into()))?;
     let tokens = ids.shape().dims().first().copied().unwrap_or(0);
-    let out = alloc(ctx, &[tokens, table_dims[1]])?;
-    // The general CUDA embedding operator is F32/BF16 only. The speech models
-    // keep every checkpoint tensor in F16, so gather through the tts adapter.
-    tts::embedding_gather(ctx, table, ids, &out)?;
+    let out = alloc(ctx, &[tokens, hidden])?;
+    ops::embedding_gather(ctx, table, ids, &out)?;
     Ok(out)
 }
 
@@ -598,6 +619,7 @@ pub(crate) fn conv1d(
         dilation,
         groups,
         Conv1dAccumulation::Default,
+        false,
     )
 }
 
@@ -621,6 +643,32 @@ pub(crate) fn conv1d_ordered(
         dilation,
         groups,
         Conv1dAccumulation::OrderedF32,
+        false,
+    )
+}
+
+/// Bias-free convolution over channel-last buffers: no layout transform, and the
+/// bias is left for a downstream kernel to add as `round(dtype(x + bias))`.
+pub(crate) fn conv1d_direct(
+    ctx: &Context,
+    input: &Tensor,
+    weight: &Tensor,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    groups: usize,
+) -> Result<Tensor> {
+    conv1d_impl(
+        ctx,
+        input,
+        weight,
+        None,
+        stride,
+        padding,
+        dilation,
+        groups,
+        Conv1dAccumulation::Default,
+        true,
     )
 }
 
@@ -634,6 +682,7 @@ pub(crate) fn conv1d_impl(
     dilation: usize,
     groups: usize,
     accumulation: Conv1dAccumulation,
+    direct_channel_last: bool,
 ) -> Result<Tensor> {
     let dims = input.shape().dims().to_vec();
     if dims.len() != 3 {
@@ -657,6 +706,9 @@ pub(crate) fn conv1d_impl(
     args.dilation = dilation;
     args.groups = groups;
     args.accumulation = accumulation;
+    if direct_channel_last {
+        args = args.with_direct_channel_last();
+    }
     ops::conv1d(ctx, args)?;
     Ok(out)
 }
@@ -689,6 +741,31 @@ pub(crate) fn conv_transpose1d(
     Ok(out)
 }
 
+/// Bias-free transposed convolution over channel-last buffers; see
+/// [`conv1d_direct`].
+pub(crate) fn conv_transpose1d_direct(
+    ctx: &Context,
+    input: &Tensor,
+    weight: &Tensor,
+    stride: usize,
+    padding: usize,
+) -> Result<Tensor> {
+    let dims = input.shape().dims().to_vec();
+    if dims.len() != 3 {
+        return Err(Error::Other("conv_transpose1d expects [B,T,C]".into()));
+    }
+    let out_channels = weight.shape().dims()[1];
+    let kernel = weight.shape().dims()[2];
+    let out_length = (dims[1] - 1) * stride - 2 * padding + (kernel - 1) + 1;
+    let mut out = alloc(ctx, &[dims[0], out_length, out_channels])?;
+    let mut args = Conv1dArgs::new(Conv1dSemantic::ConvTranspose1d, input, weight, &mut out)
+        .with_direct_channel_last();
+    args.stride = stride;
+    args.padding = padding;
+    ops::conv1d(ctx, args)?;
+    Ok(out)
+}
+
 pub(crate) fn slice_rows(
     ctx: &Context,
     input: &Tensor,
@@ -699,9 +776,7 @@ pub(crate) fn slice_rows(
     if dims.len() != 2 || offset + rows > dims[0] {
         return Err(Error::Other("slice_rows range is invalid".into()));
     }
-    let out = alloc(ctx, &[rows, dims[1]])?;
-    tts::copy_rows(ctx, input, offset, rows, &out)?;
-    Ok(out)
+    ops::elementwise::contiguous_rows(ctx, input, offset, rows)
 }
 
 pub(crate) fn concat_rows(ctx: &Context, first: &Tensor, second: &Tensor) -> Result<Tensor> {
@@ -716,24 +791,7 @@ pub(crate) fn concat_columns(ctx: &Context, first: &Tensor, second: &Tensor) -> 
             "concat_columns expects equal-row rank-2 inputs".into(),
         ));
     }
-    let out = alloc(ctx, &[first_dims[0], first_dims[1] + second_dims[1]])?;
-    tts::concat_columns(ctx, first, second, &out)?;
-    Ok(out)
-}
-
-pub(crate) fn slice_columns(
-    ctx: &Context,
-    input: &Tensor,
-    column_offset: usize,
-    columns: usize,
-) -> Result<Tensor> {
-    let dims = input.shape().dims().to_vec();
-    if dims.len() != 2 || column_offset + columns > dims[1] {
-        return Err(Error::Other("slice_columns range is invalid".into()));
-    }
-    let out = alloc(ctx, &[dims[0], columns])?;
-    tts::slice_columns(ctx, input, column_offset, columns, &out)?;
-    Ok(out)
+    ops::elementwise::concat_columns(ctx, &[first, second])
 }
 
 pub(crate) fn upsample2(ctx: &Context, input: &Tensor) -> Result<Tensor> {
@@ -764,24 +822,25 @@ pub(crate) fn rope_apply(
 }
 
 pub(crate) fn add_bias(ctx: &Context, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, Some(bias), tts::TtsActivation::None)
+    activation(ctx, input, Some(bias), tts::TtsActivation::None, false)
 }
 
 pub(crate) fn relu(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Relu)
+    activation(ctx, input, None, tts::TtsActivation::Relu, false)
 }
 
 pub(crate) fn silu(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Silu)
+    activation(ctx, input, None, tts::TtsActivation::Silu, false)
 }
 
+/// Zeroed storage with `input`'s shape.
+///
+/// `alloc` reuses an execution session's arena, which keeps whatever the
+/// previous graph left there, so the accumulator has to be cleared explicitly.
 pub(crate) fn zeros_like(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    alloc(ctx, input.shape().dims())
-}
-
-pub(crate) fn ones_vector(ctx: &Context, cols: usize) -> Result<Tensor> {
-    let values = vec![1.0f32; cols];
-    super::weights::fp16_tensor(ctx, &[cols], &values)
+    let out = alloc(ctx, input.shape().dims())?;
+    tts::fill_zero(ctx, &out)?;
+    Ok(out)
 }
 
 pub(crate) fn mean_rows(ctx: &Context, input: &Tensor) -> Result<Tensor> {
@@ -801,7 +860,7 @@ pub(crate) fn fill_zero(ctx: &Context, tensor: &Tensor) -> Result<()> {
 }
 
 pub(crate) fn gelu_tanh(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Gelu)
+    activation(ctx, input, None, tts::TtsActivation::Gelu, false)
 }
 
 pub(crate) fn euler_update(
@@ -826,13 +885,12 @@ pub(crate) fn euler_update(
 }
 
 pub(crate) fn tanh(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Tanh)
+    activation(ctx, input, None, tts::TtsActivation::Tanh, false)
 }
 
 pub(crate) fn sync(ctx: &Context) -> Result<()> {
     ctx.synchronize().map_err(Error::Cuda)
 }
-
 
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_reference_tests {
@@ -1018,5 +1076,143 @@ mod logic_tests {
         assert_eq!(speed_output_frames(100, 1.5), 67); // floor(66.666) + 1
         assert_eq!(speed_output_frames(100, 0.5), 201);
         assert_eq!(speed_output_frames(1, 2.0), 1);
+    }
+}
+
+/// The vocoder's direct convolutions leave their bias to the next kernel, so
+/// these two folds have to reproduce, bit for bit, what the ordinary path
+/// wrote: `round(dtype(x + bias))` and `round(round(dtype(x + bias)) + residual)`.
+/// These tests hold the kernels to that arithmetic as computed on the host,
+/// independently of the convolution provider.
+#[cfg(all(test, feature = "cuda"))]
+mod deferred_bias_fold_tests {
+    use super::*;
+    use apxinf_core::{Device, Shape};
+    use apxinf_cuda_new::{transfers, CudaBuffer};
+
+    /// Deterministic f16 samples covering both signs and a range of exponents,
+    /// so the rounding boundary is actually exercised.
+    fn samples(count: usize, seed: u32) -> Vec<u16> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
+                let magnitude = ((state >> 29) as f32 + 1.0) * 0.25;
+                f16::from_f32((unit * 2.0 - 1.0) * magnitude * 16.0).to_bits()
+            })
+            .collect()
+    }
+
+    fn upload(ctx: &Context, dims: &[usize], values: &[u16]) -> Tensor {
+        let mut bytes = Vec::with_capacity(values.len() * 2);
+        for value in values {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+        let host = Tensor::from_raw(Shape::new(dims.to_vec()), DType::F16, Device::Cpu, bytes)
+            .expect("host tensor");
+        transfers::to_cuda(&host, ctx.device_id()).expect("upload")
+    }
+
+    fn download(tensor: &Tensor) -> Vec<u16> {
+        let buffer = CudaBuffer::from_tensor(tensor).expect("device buffer");
+        let mut bytes = vec![0u8; buffer.len()];
+        buffer.copy_to_host(&mut bytes).expect("download");
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+            .collect()
+    }
+
+    fn widen(bits: u16) -> f32 {
+        f16::from_bits(bits).to_f32()
+    }
+
+    fn narrow(value: f32) -> f32 {
+        f16::from_f32(value).to_f32()
+    }
+
+    /// The deferred-bias producer's value followed by leaky-relu (slope 0.1).
+    fn reference_leaky_relu_bias(input: &[u16], bias: &[u16], cols: usize) -> Vec<u16> {
+        input
+            .iter()
+            .enumerate()
+            .map(|(index, &bits)| {
+                let value = narrow(widen(bits) + widen(bias[index % cols]));
+                let activated = if value >= 0.0 { value } else { 0.1 * value };
+                f16::from_f32(activated).to_bits()
+            })
+            .collect()
+    }
+
+    /// The deferred-bias producer's value followed by the ordinary residual add.
+    fn reference_bias_then_residual(
+        input: &[u16],
+        bias: &[u16],
+        residual: &[u16],
+        cols: usize,
+    ) -> Vec<u16> {
+        input
+            .iter()
+            .enumerate()
+            .map(|(index, &bits)| {
+                let biased = narrow(widen(bits) + widen(bias[index % cols]));
+                f16::from_f32(biased + widen(residual[index])).to_bits()
+            })
+            .collect()
+    }
+
+    /// `(rows, cols)` pairs covering a wide aligned width, an odd width, a
+    /// width below the vectorized threshold, and a vocoder-sized batch.
+    const CASES: [(usize, usize); 4] = [(8, 256), (3, 257), (1, 100), (512, 512)];
+
+    #[test]
+    fn leaky_relu_bias_reproduces_the_ordinary_paths_rounding() {
+        let ctx = Context::new(0).expect("cuda context");
+        for (case, &(rows, cols)) in CASES.iter().enumerate() {
+            let count = rows * cols;
+            let input = samples(count, 7 + case as u32);
+            let bias = samples(cols, 101 + case as u32);
+            let device = leaky_relu_bias(
+                &ctx,
+                &upload(&ctx, &[1, rows, cols], &input),
+                &upload(&ctx, &[cols], &bias),
+            )
+            .expect("leaky_relu_bias");
+            let got = download(&device);
+            let expected = reference_leaky_relu_bias(&input, &bias, cols);
+            let mismatches = got.iter().zip(&expected).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches, 0,
+                "rows={rows} cols={cols}: {mismatches}/{count} elements differ from the \
+                 deferred-bias producer's rounding"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_add_bias_reproduces_the_ordinary_paths_rounding() {
+        let ctx = Context::new(0).expect("cuda context");
+        for (case, &(rows, cols)) in CASES.iter().enumerate() {
+            let count = rows * cols;
+            let input = samples(count, 211 + case as u32);
+            let bias = samples(cols, 307 + case as u32);
+            let residual = samples(count, 401 + case as u32);
+            let device = residual_add_bias(
+                &ctx,
+                &upload(&ctx, &[1, rows, cols], &input),
+                &upload(&ctx, &[cols], &bias),
+                &upload(&ctx, &[1, rows, cols], &residual),
+            )
+            .expect("residual_add_bias");
+            let got = download(&device);
+            let expected = reference_bias_then_residual(&input, &bias, &residual, cols);
+            let mismatches = got.iter().zip(&expected).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                mismatches, 0,
+                "rows={rows} cols={cols}: {mismatches}/{count} elements differ from the \
+                 deferred-bias producer's rounding"
+            );
+        }
     }
 }

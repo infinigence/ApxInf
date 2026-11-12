@@ -23,10 +23,12 @@ const PREFILL_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
 // PyTorch 2.11 launches its CUDA universal kernel with 256 threads per block.
 // On Orin's current scheduler this kernel receives five blocks for the GPT
 // 1024/1025-element tensors, so every element is assigned in one launch step.
+// The alignment test uses this to prove a captured stream never crosses a
+// grid-stride step boundary.
+#[cfg(test)]
 const TORCH_CUDA_EXPONENTIAL_ACTIVE_THREADS: usize = 5 * 256;
 
 struct Layer {
-    #[allow(dead_code)]
     q: Linear,
     k: Linear,
     v: Linear,
@@ -164,7 +166,9 @@ fn fp16(value: f32) -> f32 {
     half::f16::from_f32(value).to_f32()
 }
 
-fn torch_cuda_exponential_counter_offset(step: usize) -> u64 {
+/// The reference sampler advances the Philox counter once per decode step, so
+/// step `n` draws from counter offset `n`.
+fn philox_counter_offset(step: usize) -> u64 {
     step as u64
 }
 
@@ -457,16 +461,12 @@ fn sample_fp16_exponential_race(
     let exponentials = match alignment {
         Some(alignment) => alignment.exponential_draw(step, probabilities.len())?,
         None => (0..probabilities.len())
-            .map(|index| {
-                counter_exponential_fp16(seed, torch_cuda_exponential_counter_offset(step), index)
-            })
+            .map(|index| counter_exponential_fp16(seed, philox_counter_offset(step), index))
             .collect(),
     };
     #[cfg(not(test))]
     let exponentials = (0..probabilities.len())
-        .map(|index| {
-            counter_exponential_fp16(seed, torch_cuda_exponential_counter_offset(step), index)
-        })
+        .map(|index| counter_exponential_fp16(seed, philox_counter_offset(step), index))
         .collect::<Vec<_>>();
     let sampled = exponential_race_argmax(&probabilities, &exponentials)?;
     Ok((sampled, adjusted_argmax))
@@ -587,12 +587,7 @@ impl Gpt {
             &scratch.position_row,
         )
         .map_err(|error| Error::Other(format!("GPT audio position embedding: {error}")))?;
-        ops::residual_add_into(
-            ctx,
-            &scratch.table_row,
-            &scratch.position_row,
-            destination,
-        )
+        ops::residual_add_into(ctx, &scratch.table_row, &scratch.position_row, destination)
     }
 
     fn allocate_cache(&self, ctx: &Context, capacity: usize) -> Result<Vec<LayerCache>> {
@@ -766,6 +761,8 @@ impl Gpt {
                 prepared: false,
             });
         }
+        // Either the slot was reusable (so already `Some`) or it was just
+        // filled above, so this borrow cannot fail.
         let resources = slot.as_mut().expect("prefill resources");
         transfers::copy_cuda_to_cuda(ctx, text, &resources.text)?;
         transfers::copy_cuda_to_cuda(ctx, audio, &resources.audio)?;
@@ -1031,6 +1028,8 @@ impl Gpt {
                     })?;
                     drop(_gpt_replay_range);
                     cache.audio_len += 1;
+                    // `graph` and `graph_logits` are only ever assigned
+                    // together, so holding the graph implies its output tensor.
                     logits = graph_logits.as_ref().expect("prepared GPT logits").clone();
                 } else {
                     let original_audio_len = cache.audio_len;
@@ -1299,11 +1298,7 @@ mod sampling_tests {
             for (element, encoded) in bytes.chunks_exact(2).enumerate() {
                 let expected_bits = u16::from_le_bytes([encoded[0], encoded[1]]);
                 let expected = half::f16::from_bits(expected_bits).to_f32();
-                let actual = counter_exponential_fp16(
-                    1234,
-                    torch_cuda_exponential_counter_offset(steps),
-                    element,
-                );
+                let actual = counter_exponential_fp16(1234, philox_counter_offset(steps), element);
                 let actual_bits = half::f16::from_f32(actual).to_bits();
                 let distance = u16::abs_diff(actual_bits, expected_bits);
                 if distance == 0 {

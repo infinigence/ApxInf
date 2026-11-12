@@ -61,6 +61,7 @@ fn kind(model: &LoadedModel) -> &'static str {
         LoadedModel::Decision(_) => "decision",
         LoadedModel::Image(_) => "image",
         LoadedModel::Speech(_) => "speech",
+        LoadedModel::Tts(_) => "tts",
     }
 }
 

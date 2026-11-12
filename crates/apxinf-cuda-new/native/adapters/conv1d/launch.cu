@@ -1,8 +1,7 @@
-#include "../include/apxinf_cuda/conv1d.h"
-#include "../framework/runtime_internal.h"
-#include "../kernels/custom/conv1d.cuh"
+#include "../../include/apxinf_cuda/conv1d.h"
+#include "../../framework/runtime_internal.h"
+#include "../../kernels/custom/conv1d.cuh"
 
-#include <climits>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -13,7 +12,7 @@
 #endif
 
 namespace {
-#include "../kernels/primitives/math.cuh"
+#include "../../kernels/primitives/math.cuh"
 
 using apxinf::framework::Failure;
 namespace kernels = apxinf::conv1d::kernels;
@@ -47,6 +46,8 @@ void validate_spec(const apxinf_conv1d_spec_t& spec) {
       spec.semantic == APXINF_CONV1D_SEMANTIC_CONV_TRANSPOSE1D;
   if (spec.version != APXINF_CONV1D_SPEC_VERSION || !supported_semantic ||
       !supported_dtype || spec.has_bias > 1 || spec.batch <= 0 ||
+      spec.direct_channel_last > 1 ||
+      (spec.direct_channel_last != 0 && spec.has_bias != 0) ||
       spec.in_length <= 0 || spec.in_channels <= 0 || spec.out_channels <= 0 ||
       spec.kernel <= 0 || spec.stride <= 0 || spec.dilation <= 0 ||
       spec.groups <= 0 || spec.padding < 0 || spec.output_padding < 0 ||
@@ -216,6 +217,10 @@ extern "C" apxinf_status_t apxinf_conv1d_launch(
     }
     validate_spec(*spec);
     validate_bindings(*spec, *bindings);
+    if (spec->direct_channel_last != 0) {
+      throw Failure(APXINF_STATUS_UNSUPPORTED,
+                    "direct channel-last layout requires a prepared execution");
+    }
     apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
     apxinf::framework::check_cuda(launch(*spec, *bindings));
   });
@@ -233,6 +238,11 @@ struct apxinf_conv1d_execution {
   void* output_temporal = nullptr;
 #ifdef APXINF_CONV1D_CUDNN
   bool use_cudnn = false;
+  /* Whether this execution really runs in the direct channel-last layout. A
+   * requested layout is a preference: a shape the provider serves with a single
+   * deterministic channel-last engine keeps the NCHW path instead (see
+   * prepare_cudnn), so enqueue dispatches on this and not on the spec. */
+  bool channel_last = false;
   std::unique_ptr<CudnnBackendState> backend;
   cudnnHandle_t handle = nullptr;
   cudnnTensorDescriptor_t input_desc = nullptr;
@@ -243,6 +253,11 @@ struct apxinf_conv1d_execution {
   cudnnConvolutionBwdDataAlgo_t backward_algo{};
   void* input_ncl = nullptr;
   void* output_ncl = nullptr;
+  /* Direct channel-last mode only: the model's [K, C, 1, kernel] weights in the
+   * provider's [K, 1, kernel, C] order. Owned here because the permutation is a
+   * property of the prepared execution, not of each call; it is written once in
+   * prepare, on the same stream enqueue later uses. */
+  void* weight_krsc = nullptr;
   void* workspace = nullptr;
   size_t workspace_bytes = 0;
 #endif
@@ -255,6 +270,7 @@ struct apxinf_conv1d_execution {
     if (workspace) cudaFree(workspace);
     if (input_ncl) cudaFree(input_ncl);
     if (output_ncl) cudaFree(output_ncl);
+    if (weight_krsc) cudaFree(weight_krsc);
     if (conv_desc) cudnnDestroyConvolutionDescriptor(conv_desc);
     if (filter_desc) cudnnDestroyFilterDescriptor(filter_desc);
     if (output_desc) cudnnDestroyTensorDescriptor(output_desc);
@@ -265,43 +281,6 @@ struct apxinf_conv1d_execution {
 };
 
 namespace {
-template<class T, bool AddBias>
-__global__ void transpose_layout(const T* input, const T* bias, T* output,
-                                 int64_t rows, int64_t cols, int64_t batch) {
-  __shared__ T tile[32][33];
-  const int64_t row_tiles = (rows + 31) / 32;
-  const int64_t col_tiles = (cols + 31) / 32;
-  const int64_t tiles_per_batch = row_tiles * col_tiles;
-  for (int64_t tile_id = blockIdx.x; tile_id < batch * tiles_per_batch;
-       tile_id += gridDim.x) {
-    const int64_t batch_id = tile_id / tiles_per_batch;
-    const int64_t local = tile_id % tiles_per_batch;
-    const int64_t row_base = local / col_tiles * 32;
-    const int64_t col_base = local % col_tiles * 32;
-    for (int j = 0; j < 32; j += 8) {
-      const int64_t row = row_base + threadIdx.y + j;
-      const int64_t col = col_base + threadIdx.x;
-      if (row < rows && col < cols)
-        tile[threadIdx.y + j][threadIdx.x] =
-            input[(batch_id * rows + row) * cols + col];
-    }
-    __syncthreads();
-    for (int j = 0; j < 32; j += 8) {
-      const int64_t row = row_base + threadIdx.x;
-      const int64_t col = col_base + threadIdx.y + j;
-      if (row < rows && col < cols) {
-        T value = tile[threadIdx.x][threadIdx.y + j];
-        if constexpr (AddBias) {
-          if (bias) value = kernels::from_float<T>(
-              kernels::to_float(value) + kernels::to_float(bias[row]));
-        }
-        output[(batch_id * cols + col) * rows + row] = value;
-      }
-    }
-    __syncthreads();
-  }
-}
-
 int layout_blocks(int64_t batch, int64_t rows, int64_t cols) {
   const int64_t count = batch * ((rows + 31) / 32) * ((cols + 31) / 32);
   return static_cast<int>(count < kMaxBlocks ? count : kMaxBlocks);
@@ -330,7 +309,7 @@ void enqueue_temporal(apxinf_conv1d_execution& e) {
   const auto& s = e.spec;
   const auto& b = e.bindings;
   const auto stream = static_cast<cudaStream_t>(b.stream);
-  transpose_layout<T, false><<<layout_blocks(s.batch, s.in_length, s.in_channels), dim3(32, 8), 0, stream>>>(
+  kernels::transpose_layout<T, false><<<layout_blocks(s.batch, s.in_length, s.in_channels), dim3(32, 8), 0, stream>>>(
       static_cast<const T*>(b.input), nullptr, static_cast<T*>(e.input_temporal),
       s.in_length, s.in_channels, s.batch);
   apxinf::framework::check_cuda(cudaGetLastError());
@@ -361,7 +340,7 @@ void enqueue_temporal(apxinf_conv1d_execution& e) {
   }
   apxinf::framework::check_cuda(cudaGetLastError());
   // Bias was accumulated before the dot product by the direct kernel.
-  transpose_layout<T, false><<<layout_blocks(s.batch, s.out_channels, s.out_length), dim3(32, 8), 0, stream>>>(
+  kernels::transpose_layout<T, false><<<layout_blocks(s.batch, s.out_channels, s.out_length), dim3(32, 8), 0, stream>>>(
       static_cast<const T*>(e.output_temporal), nullptr, static_cast<T*>(b.output),
       s.out_channels, s.out_length, s.batch);
   apxinf::framework::check_cuda(cudaGetLastError());
@@ -401,13 +380,17 @@ cudnnBackendDescriptor_t backend_tensor(CudnnBackendState& state,
   return descriptor;
 }
 
-bool prepare_cudnn_backend(apxinf_conv1d_execution& e, uint64_t workspace_limit) {
+bool prepare_cudnn_backend(apxinf_conv1d_execution& e, uint64_t workspace_limit,
+                           bool channel_last) {
   const auto& s = e.spec;
   // The backend's depthwise engine preserves a different FP32 reduction tree
   // from the legacy convolution algorithms. Admit this geometry independently
   // of the caller; other convolutions retain the established legacy path.
   if (s.semantic != APXINF_CONV1D_SEMANTIC_CONV1D ||
       s.in_channels != s.groups || s.out_channels != s.in_channels) return false;
+  // This backend describes its tensors in the NCHW scratch layout, so it cannot
+  // serve a caller that binds channel-last buffers directly.
+  if (channel_last) return false;
   auto state = std::make_unique<CudnnBackendState>();
   const auto dtype = s.dtype == APXINF_DTYPE_F32 ? CUDNN_DATA_FLOAT :
                      s.dtype == APXINF_DTYPE_F16 ? CUDNN_DATA_HALF : CUDNN_DATA_BFLOAT16;
@@ -520,11 +503,141 @@ void bind_cudnn_backend(apxinf_conv1d_execution& e) {
   check_cudnn(cudnnBackendFinalize(state.pack));
 }
 
+void permute_filter(apxinf_conv1d_execution& e, uint64_t filter_elements) {
+  const auto& s = e.spec;
+  const bool transpose = s.semantic == APXINF_CONV1D_SEMANTIC_CONV_TRANSPOSE1D;
+  const int64_t out_channels = transpose ? s.in_channels : s.out_channels;
+  const int64_t in_channels = (transpose ? s.out_channels : s.in_channels) / s.groups;
+  const auto stream = static_cast<cudaStream_t>(e.bindings.stream);
+  const int blocks = blocks_for(int64_t(filter_elements));
+  const void* source = e.bindings.weight;
+  switch (s.dtype) {
+    case APXINF_DTYPE_F32:
+      kernels::permute_filter_krsc<float><<<blocks, kConvThreads, 0, stream>>>(
+          static_cast<const float*>(source), static_cast<float*>(e.weight_krsc),
+          out_channels, in_channels, s.kernel);
+      break;
+    case APXINF_DTYPE_F16:
+      kernels::permute_filter_krsc<__half><<<blocks, kConvThreads, 0, stream>>>(
+          static_cast<const __half*>(source), static_cast<__half*>(e.weight_krsc),
+          out_channels, in_channels, s.kernel);
+      break;
+    default:
+      kernels::permute_filter_krsc<__nv_bfloat16><<<blocks, kConvThreads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(source),
+          static_cast<__nv_bfloat16*>(e.weight_krsc),
+          out_channels, in_channels, s.kernel);
+      break;
+  }
+  apxinf::framework::check_cuda(cudaGetLastError());
+}
+
 // Preserve the public NLC tensors and native PyTorch OIK/IOK filter layout.
 // A coalesced transform permits the same NCHW Tensor-Core convolution algorithms
 // as the reference instead of imposing a new persistent model weight format.
 // Shared-memory transpose coalesces both reads and writes. Flatten tile and
 // batch indices so large batches do not depend on CUDA's grid-y/z limits.
+struct ConvCandidate {
+  bool transpose;
+  int algo;
+  cudnnMathType_t math;
+  size_t bytes;
+};
+
+// The SIMT entries the v7 list also returns are one to two orders of magnitude
+// slower than the tensor-core engines on this hardware: the legacy direct
+// engine costs 537 ms per call on the stage-4 16->16 geometry and 8.6 ms on the
+// 128->128 k=11 dilation=5 one, against ~0.2 ms and ~0.6 ms. cuDNN reports those
+// engines as CUDNN_DEFAULT_MATH, not as CUDNN_FMA_MATH -- the list here is
+// (algo=1, math=1) for the tensor-op engine, (algo=1, math=0) and
+// (algo=0, math=0) for the two SIMT ones -- so the test is "tensor-op math",
+// not "not FMA". Whenever a tensor-op candidate exists the SIMT ones are
+// dropped before choosing and before timing -- which is also the universe the
+// plain NCHW path always used, so nothing that worked before is lost. A shape
+// whose every admissible candidate is SIMT keeps them.
+std::vector<ConvCandidate> prefer_tensor_op(std::vector<ConvCandidate> in) {
+  const auto is_tensor_op = [](const ConvCandidate& c) {
+    return c.math == CUDNN_TENSOR_OP_MATH || c.math == CUDNN_TENSOR_OP_MATH_ALLOW_CONVERSION;
+  };
+  if (!std::any_of(in.begin(), in.end(), is_tensor_op)) return in;
+  in.erase(std::remove_if(in.begin(), in.end(),
+      [&](const ConvCandidate& c) { return !is_tensor_op(c); }), in.end());
+  return in;
+}
+
+// The v7 ranking is an estimate. On long channel-last sequences it puts the
+// legacy direct engine first (measured 537 ms per call on the stage-4 16->16
+// geometry, against ~2 ms for the tensor-core engines), so an admissible set is
+// timed on the real bindings and the fastest is kept. Prepare is not capture
+// safe, the launch uses beta = 0 and no bias, and every execution overwrites the
+// output buffer, so this probe does not change any observable result.
+void measure_candidates(apxinf_conv1d_execution& e,
+                        const std::vector<ConvCandidate>& candidates,
+                        void* workspace) {
+  const float alpha = 1.0f, beta = 0.0f;
+  const auto stream = static_cast<cudaStream_t>(e.bindings.stream);
+  const auto launch = [&](const ConvCandidate& candidate) {
+    check_cudnn(cudnnSetConvolutionMathType(e.conv_desc, candidate.math));
+    if (candidate.transpose) {
+      check_cudnn(cudnnConvolutionBackwardData(e.handle, &alpha, e.filter_desc,
+          e.weight_krsc, e.input_desc, e.bindings.input, e.conv_desc,
+          static_cast<cudnnConvolutionBwdDataAlgo_t>(candidate.algo),
+          workspace, candidate.bytes, &beta, e.output_desc, e.bindings.output));
+    } else {
+      check_cudnn(cudnnConvolutionForward(e.handle, &alpha, e.input_desc, e.bindings.input,
+          e.filter_desc, e.weight_krsc, e.conv_desc,
+          static_cast<cudnnConvolutionFwdAlgo_t>(candidate.algo),
+          workspace, candidate.bytes, &beta, e.output_desc, e.bindings.output));
+    }
+  };
+  cudaEvent_t begin{}, end{};
+  apxinf::framework::check_cuda(cudaEventCreate(&begin));
+  apxinf::framework::check_cuda(cudaEventCreate(&end));
+  const ConvCandidate* best = nullptr;
+  float best_ms = 0.0f;
+  try {
+    for (const auto& candidate : candidates) {
+      // The v7 list advertises algorithms this device can compile a plan for but
+      // not execute; an unusable candidate is dropped instead of failing prepare.
+      try {
+        launch(candidate);  // engine compilation and lazy workspace happen here
+        apxinf::framework::check_cuda(cudaEventRecord(begin, stream));
+        launch(candidate);
+        apxinf::framework::check_cuda(cudaEventRecord(end, stream));
+        apxinf::framework::check_cuda(cudaEventSynchronize(end));
+      } catch (const Failure& error) {
+        if (error.status != APXINF_STATUS_PROVIDER_ERROR) throw;
+        apxinf::framework::check_cuda(cudaGetLastError());
+        continue;
+      }
+      float elapsed = 0.0f;
+      apxinf::framework::check_cuda(cudaEventElapsedTime(&elapsed, begin, end));
+      if (best == nullptr || elapsed < best_ms) {
+        best = &candidate;
+        best_ms = elapsed;
+      }
+    }
+  } catch (...) {
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    throw;
+  }
+  apxinf::framework::check_cuda(cudaEventDestroy(begin));
+  apxinf::framework::check_cuda(cudaEventDestroy(end));
+  if (best == nullptr) {
+    throw Failure(APXINF_STATUS_PROVIDER_ERROR,
+                  "no admissible convolution algorithm executes on this device");
+  }
+  check_cudnn(cudnnSetConvolutionMathType(e.conv_desc, best->math));
+  if (best->transpose) {
+    e.backward_algo = static_cast<cudnnConvolutionBwdDataAlgo_t>(best->algo);
+  } else {
+    e.forward_algo = static_cast<cudnnConvolutionFwdAlgo_t>(best->algo);
+  }
+  e.workspace_bytes = best->bytes;
+  e.summary += ".measured";
+}
+
 bool prepare_cudnn(apxinf_conv1d_execution& e, uint64_t workspace_limit) {
   const auto& s = e.spec;
   // A single output channel is bandwidth-bound: layout conversion costs
@@ -540,76 +653,146 @@ bool prepare_cudnn(apxinf_conv1d_execution& e, uint64_t workspace_limit) {
   check_cudnn(cudnnCreateConvolutionDescriptor(&e.conv_desc));
   const auto dtype = s.dtype == APXINF_DTYPE_F32 ? CUDNN_DATA_FLOAT :
                      s.dtype == APXINF_DTYPE_F16 ? CUDNN_DATA_HALF : CUDNN_DATA_BFLOAT16;
-  check_cudnn(cudnnSetTensor4dDescriptor(e.input_desc, CUDNN_TENSOR_NCHW, dtype,
-      int(s.batch), int(s.in_channels), 1, int(s.in_length)));
-  check_cudnn(cudnnSetTensor4dDescriptor(e.output_desc, CUDNN_TENSOR_NCHW, dtype,
-      int(s.batch), int(s.out_channels), 1, int(s.out_length)));
+  // Channel-last descriptors over [N, C, 1, L] describe exactly the caller's
+  // [batch, length, channels] buffers, so the provider reads and writes them in
+  // place instead of the NCHW scratch copies. The layout is a preference, not a
+  // requirement; see the single-candidate fallback below.
   const bool transpose = s.semantic == APXINF_CONV1D_SEMANTIC_CONV_TRANSPOSE1D;
-  check_cudnn(cudnnSetFilter4dDescriptor(e.filter_desc, dtype, CUDNN_TENSOR_NCHW,
-      int(transpose ? s.in_channels : s.out_channels),
-      int((transpose ? s.out_channels : s.in_channels) / s.groups), 1, int(s.kernel)));
   check_cudnn(cudnnSetConvolution2dDescriptor(e.conv_desc, 0, int(s.padding),
       1, int(s.stride), 1, int(s.dilation), CUDNN_CROSS_CORRELATION, CUDNN_DATA_FLOAT));
   check_cudnn(cudnnSetConvolutionGroupCount(e.conv_desc, int(s.groups)));
   check_cudnn(cudnnSetConvolutionMathType(e.conv_desc,
       s.dtype == APXINF_DTYPE_F32 ? CUDNN_FMA_MATH : CUDNN_TENSOR_OP_MATH));
+  bool channel_last = s.direct_channel_last != 0;
   bool found = false;
-  try {
-    found = prepare_cudnn_backend(e, workspace_limit);
-  } catch (const Failure& error) {
-    if (error.status != APXINF_STATUS_PROVIDER_ERROR) throw;
-  }
   int returned = 0;
-  if (!found && !transpose) {
-    cudnnConvolutionFwdAlgoPerf_t perf[CUDNN_CONVOLUTION_FWD_ALGO_COUNT]{};
-    const auto status = cudnnGetConvolutionForwardAlgorithm_v7(e.handle,
-        e.input_desc, e.filter_desc, e.conv_desc, e.output_desc,
-        CUDNN_CONVOLUTION_FWD_ALGO_COUNT, &returned, perf);
-    if (status != CUDNN_STATUS_SUCCESS) return false;
-    for (int i = 0; i < returned; ++i) {
-      if (perf[i].status != CUDNN_STATUS_SUCCESS || perf[i].determinism != CUDNN_DETERMINISTIC ||
-          perf[i].memory > workspace_limit) continue;
-      size_t bytes = 0;
-      if (cudnnGetConvolutionForwardWorkspaceSize(e.handle, e.input_desc, e.filter_desc,
-          e.conv_desc, e.output_desc, perf[i].algo, &bytes) != CUDNN_STATUS_SUCCESS ||
-          bytes > workspace_limit) continue;
-      e.forward_algo = perf[i].algo;
-      e.workspace_bytes = bytes;
-      check_cudnn(cudnnSetConvolutionMathType(e.conv_desc, perf[i].mathType));
-      e.summary = "cudnn.conv1d.v1.algo=" + std::to_string(int(perf[i].algo));
-      found = true;
-      break;
+  std::vector<ConvCandidate> candidates;
+  for (;;) {
+    const auto tensor_format = channel_last ? CUDNN_TENSOR_NHWC : CUDNN_TENSOR_NCHW;
+    // The math type steers the ranking of the enumeration query below, so it
+    // must be the default one at the start of every attempt: the retry after a
+    // single-candidate channel-last attempt would otherwise inherit that
+    // candidate's math type. With FMA left over, the NCHW query ranks the
+    // legacy FMA engines first and picks one 50x slower than the tensor-core
+    // engine the untouched NCHW path gets (128-channel k=11 dilation=5: 8.56 ms
+    // against 0.17 ms per call).
+    check_cudnn(cudnnSetConvolutionMathType(e.conv_desc,
+        s.dtype == APXINF_DTYPE_F32 ? CUDNN_FMA_MATH : CUDNN_TENSOR_OP_MATH));
+    check_cudnn(cudnnSetTensor4dDescriptor(e.input_desc, tensor_format, dtype,
+        int(s.batch), int(s.in_channels), 1, int(s.in_length)));
+    check_cudnn(cudnnSetTensor4dDescriptor(e.output_desc, tensor_format, dtype,
+        int(s.batch), int(s.out_channels), 1, int(s.out_length)));
+    check_cudnn(cudnnSetFilter4dDescriptor(e.filter_desc, dtype, tensor_format,
+        int(transpose ? s.in_channels : s.out_channels),
+        int((transpose ? s.out_channels : s.in_channels) / s.groups), 1, int(s.kernel)));
+    found = false;
+    candidates.clear();
+    try {
+      found = prepare_cudnn_backend(e, workspace_limit, channel_last);
+    } catch (const Failure& error) {
+      if (error.status != APXINF_STATUS_PROVIDER_ERROR) throw;
     }
-  } else if (!found) {
-    cudnnConvolutionBwdDataAlgoPerf_t perf[CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT]{};
-    const auto status = cudnnGetConvolutionBackwardDataAlgorithm_v7(e.handle,
-        e.filter_desc, e.input_desc, e.conv_desc, e.output_desc,
-        CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT, &returned, perf);
-    if (status != CUDNN_STATUS_SUCCESS) return false;
-    for (int i = 0; i < returned; ++i) {
-      if (perf[i].status != CUDNN_STATUS_SUCCESS || perf[i].determinism != CUDNN_DETERMINISTIC ||
-          perf[i].memory > workspace_limit) continue;
-      size_t bytes = 0;
-      if (cudnnGetConvolutionBackwardDataWorkspaceSize(e.handle, e.filter_desc, e.input_desc,
-          e.conv_desc, e.output_desc, perf[i].algo, &bytes) != CUDNN_STATUS_SUCCESS ||
-          bytes > workspace_limit) continue;
-      e.backward_algo = perf[i].algo;
-      e.workspace_bytes = bytes;
-      check_cudnn(cudnnSetConvolutionMathType(e.conv_desc, perf[i].mathType));
-      e.summary = "cudnn.conv_transpose1d.v1.algo=" + std::to_string(int(perf[i].algo));
-      found = true;
-      break;
+    // Whether the provider offered a real choice before the tensor-core
+    // preference was applied; the channel-last fallback below keys on it.
+    bool enough = false;
+    if (!found && !transpose) {
+      cudnnConvolutionFwdAlgoPerf_t perf[CUDNN_CONVOLUTION_FWD_ALGO_COUNT]{};
+      const auto status = cudnnGetConvolutionForwardAlgorithm_v7(e.handle,
+          e.input_desc, e.filter_desc, e.conv_desc, e.output_desc,
+          CUDNN_CONVOLUTION_FWD_ALGO_COUNT, &returned, perf);
+      if (status != CUDNN_STATUS_SUCCESS) return false;
+      for (int i = 0; i < returned; ++i) {
+        if (perf[i].status != CUDNN_STATUS_SUCCESS || perf[i].determinism != CUDNN_DETERMINISTIC ||
+            perf[i].memory > workspace_limit) continue;
+        size_t bytes = 0;
+        if (cudnnGetConvolutionForwardWorkspaceSize(e.handle, e.input_desc, e.filter_desc,
+            e.conv_desc, e.output_desc, perf[i].algo, &bytes) != CUDNN_STATUS_SUCCESS ||
+            bytes > workspace_limit) continue;
+        candidates.push_back({false, int(perf[i].algo), perf[i].mathType, bytes});
+      }
+      enough = candidates.size() > 1;
+      candidates = prefer_tensor_op(std::move(candidates));
+      if (!candidates.empty()) {
+        e.forward_algo = static_cast<cudnnConvolutionFwdAlgo_t>(candidates.front().algo);
+        e.workspace_bytes = candidates.front().bytes;
+        check_cudnn(cudnnSetConvolutionMathType(e.conv_desc, candidates.front().math));
+        e.summary = "cudnn.conv1d.v1.algo=" + std::to_string(candidates.front().algo);
+        found = true;
+      }
+    } else if (!found) {
+      cudnnConvolutionBwdDataAlgoPerf_t perf[CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT]{};
+      const auto status = cudnnGetConvolutionBackwardDataAlgorithm_v7(e.handle,
+          e.filter_desc, e.input_desc, e.conv_desc, e.output_desc,
+          CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT, &returned, perf);
+      if (status != CUDNN_STATUS_SUCCESS) return false;
+      for (int i = 0; i < returned; ++i) {
+        if (perf[i].status != CUDNN_STATUS_SUCCESS || perf[i].determinism != CUDNN_DETERMINISTIC ||
+            perf[i].memory > workspace_limit) continue;
+        size_t bytes = 0;
+        if (cudnnGetConvolutionBackwardDataWorkspaceSize(e.handle, e.filter_desc, e.input_desc,
+            e.conv_desc, e.output_desc, perf[i].algo, &bytes) != CUDNN_STATUS_SUCCESS ||
+            bytes > workspace_limit) continue;
+        candidates.push_back({true, int(perf[i].algo), perf[i].mathType, bytes});
+      }
+      enough = candidates.size() > 1;
+      candidates = prefer_tensor_op(std::move(candidates));
+      if (!candidates.empty()) {
+        e.backward_algo = static_cast<cudnnConvolutionBwdDataAlgo_t>(candidates.front().algo);
+        e.workspace_bytes = candidates.front().bytes;
+        check_cudnn(cudnnSetConvolutionMathType(e.conv_desc, candidates.front().math));
+        e.summary = "cudnn.conv_transpose1d.v1.algo=" + std::to_string(candidates.front().algo);
+        found = true;
+      }
     }
+    if (!found) return false;
+    // A channel-last shape the provider serves with a single deterministic
+    // engine leaves nothing to choose or measure -- and that one engine is the
+    // legacy direct kernel, which the v7 estimate ranks first: 537 ms per call
+    // on the 128-channel k=11 dilation=5 geometry, against ~0.3 ms for the
+    // tensor-core engines. Such a shape keeps the NCHW path instead: two
+    // transposes (~0.3 ms) over an engine set already tuned before this layout
+    // existed. The NCHW enumeration is a different one, so retry without it.
+    if (!channel_last || enough) break;
+    channel_last = false;
+    e.forward_algo = static_cast<cudnnConvolutionFwdAlgo_t>(0);
+    e.backward_algo = static_cast<cudnnConvolutionBwdDataAlgo_t>(0);
+    e.summary = "direct.conv1d.v1";
   }
-  if (!found) return false;
+  e.channel_last = channel_last;
   const size_t element_bytes = s.dtype == APXINF_DTYPE_F32 ? 4 : 2;
   const uint64_t input_bytes = uint64_t(s.batch) * s.in_length * s.in_channels * element_bytes;
   const uint64_t output_bytes = uint64_t(s.batch) * s.out_length * s.out_channels * element_bytes;
   if (input_bytes > SIZE_MAX || output_bytes > SIZE_MAX) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "Conv1d transform size overflow");
   }
-  apxinf::framework::check_cuda(cudaMalloc(&e.input_ncl, input_bytes));
-  apxinf::framework::check_cuda(cudaMalloc(&e.output_ncl, output_bytes));
+  if (channel_last) {
+    // No layout scratch is needed; the one prepare-time transform left is the
+    // filter permutation into the channel-last order.
+    const uint64_t filter_elements = uint64_t(transpose ? s.in_channels : s.out_channels) *
+        ((transpose ? s.out_channels : s.in_channels) / s.groups) * s.kernel;
+    if (filter_elements > SIZE_MAX / element_bytes) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "Conv1d filter size overflow");
+    }
+    apxinf::framework::check_cuda(cudaMalloc(&e.weight_krsc, filter_elements * element_bytes));
+    permute_filter(e, filter_elements);
+    // A single admissible candidate needs no probe; several are timed.
+    if (candidates.size() > 1) {
+      size_t widest = 0;
+      for (const auto& candidate : candidates) widest = std::max(widest, candidate.bytes);
+      void* probe = nullptr;
+      if (widest) apxinf::framework::check_cuda(cudaMalloc(&probe, widest));
+      try {
+        measure_candidates(e, candidates, probe);
+      } catch (...) {
+        if (probe) cudaFree(probe);
+        throw;
+      }
+      if (probe) apxinf::framework::check_cuda(cudaFree(probe));
+    }
+  } else {
+    apxinf::framework::check_cuda(cudaMalloc(&e.input_ncl, input_bytes));
+    apxinf::framework::check_cuda(cudaMalloc(&e.output_ncl, output_bytes));
+  }
   if (e.workspace_bytes) apxinf::framework::check_cuda(cudaMalloc(&e.workspace, e.workspace_bytes));
   if (e.backend) {
     bind_cudnn_backend(e);
@@ -621,6 +804,11 @@ bool prepare_cudnn(apxinf_conv1d_execution& e, uint64_t workspace_limit) {
     check_cudnn(cudnnBackendExecute(e.handle, e.backend->plan, e.backend->pack));
     apxinf::framework::check_cuda(cudaStreamSynchronize(stream));
   }
+  if (channel_last) {
+    e.summary += ".channel_last_direct";
+  } else if (s.direct_channel_last) {
+    e.summary += ".channel_last_fallback";
+  }
   e.summary += ".workspace=" + std::to_string(e.workspace_bytes);
   e.use_cudnn = true;
   return true;
@@ -631,11 +819,25 @@ void enqueue_cudnn(apxinf_conv1d_execution& e) {
   const auto& s = e.spec;
   const auto& b = e.bindings;
   const auto stream = static_cast<cudaStream_t>(b.stream);
-  transpose_layout<T, false><<<layout_blocks(s.batch, s.in_length, s.in_channels), dim3(32, 8), 0, stream>>>(
+  const float alpha = 1.0f, beta = 0.0f;
+  if (e.channel_last) {
+    // The provider reads and writes the caller's buffers in place; the filter is
+    // the prepare-time permutation, and the bias-free result is final.
+    if (s.semantic == APXINF_CONV1D_SEMANTIC_CONV1D) {
+      check_cudnn(cudnnConvolutionForward(e.handle, &alpha, e.input_desc, b.input,
+          e.filter_desc, e.weight_krsc, e.conv_desc, e.forward_algo, e.workspace,
+          e.workspace_bytes, &beta, e.output_desc, b.output));
+    } else {
+      check_cudnn(cudnnConvolutionBackwardData(e.handle, &alpha, e.filter_desc,
+          e.weight_krsc, e.input_desc, b.input, e.conv_desc, e.backward_algo,
+          e.workspace, e.workspace_bytes, &beta, e.output_desc, b.output));
+    }
+    return;
+  }
+  kernels::transpose_layout<T, false><<<layout_blocks(s.batch, s.in_length, s.in_channels), dim3(32, 8), 0, stream>>>(
       static_cast<const T*>(b.input), nullptr, static_cast<T*>(e.input_ncl),
       s.in_length, s.in_channels, s.batch);
   apxinf::framework::check_cuda(cudaGetLastError());
-  const float alpha = 1.0f, beta = 0.0f;
   if (e.backend) {
     check_cudnn(cudnnBackendExecute(e.handle, e.backend->plan, e.backend->pack));
   } else if (s.semantic == APXINF_CONV1D_SEMANTIC_CONV1D) {
@@ -647,7 +849,7 @@ void enqueue_cudnn(apxinf_conv1d_execution& e) {
         e.input_desc, e.input_ncl, e.conv_desc, e.backward_algo, e.workspace,
         e.workspace_bytes, &beta, e.output_desc, e.output_ncl));
   }
-  transpose_layout<T, true><<<layout_blocks(s.batch, s.out_channels, s.out_length), dim3(32, 8), 0, stream>>>(
+  kernels::transpose_layout<T, true><<<layout_blocks(s.batch, s.out_channels, s.out_length), dim3(32, 8), 0, stream>>>(
       static_cast<const T*>(e.output_ncl), static_cast<const T*>(b.bias),
       static_cast<T*>(b.output), s.out_channels, s.out_length, s.batch);
   apxinf::framework::check_cuda(cudaGetLastError());
@@ -681,6 +883,10 @@ extern "C" apxinf_status_t apxinf_conv1d_prepare(
     result->spec = *spec;
     result->bindings = *bindings;
     result->device = runtime->device;
+    if (spec->direct_channel_last != 0 && ordered_accumulation != 0) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                    "direct channel-last layout has no ordered-accumulation path");
+    }
     if (ordered_accumulation) prepare_temporal(*result, workspace_limit);
 #ifdef APXINF_CONV1D_CUDNN
     if (!ordered_accumulation) {
@@ -691,6 +897,12 @@ extern "C" apxinf_status_t apxinf_conv1d_prepare(
         if (error.status != APXINF_STATUS_PROVIDER_ERROR) throw;
       }
       if (!prepared) {
+        // The direct layout has no baseline to fall back to: the channel-last
+        // kernel applies the bias itself and expects the provider's geometry.
+        if (spec->direct_channel_last != 0) {
+          throw Failure(APXINF_STATUS_UNSUPPORTED,
+                        "direct channel-last layout requires the convolution provider");
+        }
         // Provider rejection leaves the validated baseline available. Destroy
         // partially constructed handles/layouts before installing the fallback.
         result = std::make_unique<apxinf_conv1d_execution>();
@@ -698,6 +910,11 @@ extern "C" apxinf_status_t apxinf_conv1d_prepare(
         result->bindings = *bindings;
         result->device = runtime->device;
       }
+    }
+#else
+    if (spec->direct_channel_last != 0) {
+      throw Failure(APXINF_STATUS_UNSUPPORTED,
+                    "direct channel-last layout requires the convolution provider");
     }
 #endif
     *execution = result.release();

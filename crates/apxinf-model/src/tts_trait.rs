@@ -9,7 +9,7 @@ use apxinf_core::Result;
 
 /// Fixed capabilities of a loaded speech runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SpeechContract {
+pub struct TtsContract {
     pub sample_rate: u32,
     pub mel_frames_per_second: usize,
     pub semantic_frames_per_second: usize,
@@ -17,7 +17,7 @@ pub struct SpeechContract {
 
 /// One synthesis request in the family's canonical input representation.
 #[derive(Clone, Copy, Debug)]
-pub struct SpeechRequest<'a> {
+pub struct TtsRequest<'a> {
     /// Target text phone IDs.
     pub phone_ids: &'a [u32],
     /// Target BERT token IDs, including `[CLS]` and `[SEP]`.
@@ -65,7 +65,7 @@ pub struct PcmAudio {
 /// part of the profile. Runtime values such as token IDs, audio samples, seed,
 /// and sampling temperature may change between replays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SpeechSpec {
+pub struct TtsSpec {
     pub phone_count: usize,
     pub bert_token_count: usize,
     pub reference_phone_count: usize,
@@ -80,9 +80,9 @@ pub struct SpeechSpec {
 }
 
 /// A prepared, fixed-shape speech plan.
-pub trait PreparedSpeech {
-    fn spec(&self) -> &SpeechSpec;
-    fn run(&self, request: &SpeechRequest<'_>) -> Result<PcmAudio>;
+pub trait PreparedTts {
+    fn spec(&self) -> &TtsSpec;
+    fn run(&self, request: &TtsRequest<'_>) -> Result<PcmAudio>;
 }
 
 /// Instance-local conditioning cache policy. Generation tokens and PCM are never cached.
@@ -122,15 +122,15 @@ pub struct TtsCacheInfo {
     pub text_device_budget_bytes: usize,
 }
 
-/// Common interface for TTS implementations, owned by `LoadedModel::Speech`.
+/// Common interface for TTS implementations, owned by `LoadedModel::Tts`.
 ///
 /// Like `LlmTrait`, this contract exposes model capabilities and inference.
 /// The implementation owns request state, caches, and prepared resources;
 /// text normalization and G2P remain in the policy layer.
 pub trait TtsTrait {
-    fn contract(&self) -> SpeechContract;
+    fn contract(&self) -> TtsContract;
 
-    fn synthesize(&self, request: &SpeechRequest<'_>) -> Result<PcmAudio>;
+    fn synthesize(&self, request: &TtsRequest<'_>) -> Result<PcmAudio>;
 
     /// Configure instance-local conditioning reuse. Unsupported families reject
     /// this explicitly rather than implying that a cache is active.
@@ -148,7 +148,7 @@ pub trait TtsTrait {
 
     /// Prepare a fixed profile. Implementations that have not adopted explicit
     /// preparation fail clearly instead of pretending readiness.
-    fn prepare(&self, _spec: &SpeechSpec) -> Result<Box<dyn PreparedSpeech>> {
+    fn prepare(&self, _spec: &TtsSpec) -> Result<Box<dyn PreparedTts>> {
         Err(apxinf_core::Error::Other(
             "explicit speech preparation is not supported by this runtime".into(),
         ))

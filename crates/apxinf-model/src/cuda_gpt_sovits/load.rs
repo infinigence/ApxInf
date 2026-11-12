@@ -1,3 +1,5 @@
+//! Checkpoint discovery, validation, and the loading entry point.
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -24,5 +26,5 @@ pub fn load(
         other => return Err(Error::UnsupportedDevice(other)),
     };
     let model = GptSovitsModel::load_with_autotune(path, device_id, options.autotune)?;
-    Ok(LoadedModel::Speech(Box::new(model)))
+    Ok(LoadedModel::Tts(Box::new(model)))
 }

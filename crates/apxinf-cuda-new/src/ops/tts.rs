@@ -2,13 +2,17 @@
 //!
 //! These are the semantics GPT-SoVITS needs that the language-model Pointwise
 //! ABI does not expose: extended activations, GRN, per-column normalization,
-//! reference RoPE tables, and row/column layout copies. They live in a separate
-//! adapter so the stable Pointwise encoding is untouched.
+//! reference RoPE tables, row statistics, and the KV-cache token append. They
+//! live in a separate adapter so the stable Pointwise encoding is untouched.
 
 use apxinf_core::{DType, Device, Error, Result, Tensor};
 
 use crate::ffi::abi::{status, tts as abi};
 use crate::{CudaBuffer, CudaContext};
+
+/// One FP32 normalizer per column has to fit the 48 KiB dynamic shared-memory
+/// window a `grn` launch may request.
+const GRN_MAX_COLUMNS: usize = 48 * 1024 / std::mem::size_of::<f32>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TtsActivation {
@@ -37,6 +41,61 @@ impl TtsActivation {
             Self::Sigmoid => abi::ACTIVATION_SIGMOID,
             Self::Relu => abi::ACTIVATION_RELU,
             Self::LeakyReluOnePercent => abi::ACTIVATION_LEAKY_RELU_ONE_PERCENT,
+        }
+    }
+}
+
+/// Catalog identifier of every public semantic in this family. The doc test
+/// compares `ALL` with the markers in `cuda-operator.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TtsSemantic {
+    BiasActivation,
+    ResidualAddBias,
+    Affine,
+    GluSeparate,
+    TanhSigmoidGate,
+    Grn,
+    ColumnNorm,
+    RopeApply,
+    SinusoidalEmbedding,
+    MeanRows,
+    ArgmaxRows,
+    WriteKvCacheToken,
+    FillZero,
+}
+
+impl TtsSemantic {
+    pub(crate) const ALL: [Self; 13] = [
+        Self::BiasActivation,
+        Self::ResidualAddBias,
+        Self::Affine,
+        Self::GluSeparate,
+        Self::TanhSigmoidGate,
+        Self::Grn,
+        Self::ColumnNorm,
+        Self::RopeApply,
+        Self::SinusoidalEmbedding,
+        Self::MeanRows,
+        Self::ArgmaxRows,
+        Self::WriteKvCacheToken,
+        Self::FillZero,
+    ];
+
+    pub(crate) fn doc_id(self) -> &'static str {
+        match self {
+            Self::BiasActivation => "bias-activation",
+            Self::ResidualAddBias => "residual-add-bias",
+            Self::Affine => "affine",
+            Self::GluSeparate => "glu-separate",
+            Self::TanhSigmoidGate => "tanh-sigmoid-gate",
+            Self::Grn => "grn",
+            Self::ColumnNorm => "column-norm",
+            Self::RopeApply => "rope-apply",
+            Self::SinusoidalEmbedding => "sinusoidal-embedding",
+            Self::MeanRows => "mean-rows",
+            Self::ArgmaxRows => "argmax-rows",
+            Self::WriteKvCacheToken => "write-kv-cache-token",
+            Self::FillZero => "fill-zero",
         }
     }
 }
@@ -109,12 +168,7 @@ fn tensor_storage_at_least(
     Ok(buffer)
 }
 
-fn same_layout(
-    ctx: &CudaContext,
-    input: &Tensor,
-    out: &Tensor,
-    label: &str,
-) -> Result<usize> {
+fn same_layout(ctx: &CudaContext, input: &Tensor, out: &Tensor, label: &str) -> Result<usize> {
     if input.dtype() != out.dtype() {
         return Err(invalid(format!("tts {label} dtype mismatch")));
     }
@@ -131,12 +185,17 @@ fn same_layout(
 
 /// `output = activation(input + bias)`, where `bias` repeats every `cols`
 /// elements. `out` has the same shape as `input`.
+///
+/// With `round_bias`, the sum is rounded to the tensor dtype before the
+/// activation. Use it when the bias a producer deferred has to reproduce the
+/// value that producer would have written itself.
 pub fn bias_activation(
     ctx: &CudaContext,
     input: &Tensor,
     bias: Option<&Tensor>,
     out: &Tensor,
     activation: TtsActivation,
+    round_bias: bool,
 ) -> Result<()> {
     let count = same_layout(ctx, input, out, "bias activation")?;
     let dtype = input.dtype();
@@ -166,18 +225,60 @@ pub fn bias_activation(
             cols as i64,
             code,
             activation.code(),
+            u32::from(round_bias),
+            ctx.stream().handle(),
+        ))
+    }
+}
+
+/// `output = round_dtype(round_dtype(input + bias) + residual)`.
+///
+/// This is the arithmetic of a deferred bias followed by the ordinary residual
+/// add, in one launch: the intermediate sum is rounded to the tensor dtype
+/// before the residual is added.
+pub fn residual_add_bias(
+    ctx: &CudaContext,
+    input: &Tensor,
+    bias: &Tensor,
+    residual: &Tensor,
+    out: &Tensor,
+) -> Result<()> {
+    let count = same_layout(ctx, input, out, "residual add bias")?;
+    if residual.shape() != input.shape() {
+        return Err(invalid("tts residual add bias residual shape mismatch"));
+    }
+    let dtype = input.dtype();
+    let code = dtype_code(dtype)?;
+    let cols = *input
+        .shape()
+        .dims()
+        .last()
+        .ok_or_else(|| invalid("tts residual add bias needs a rank"))?;
+    if cols == 0 || count % cols != 0 {
+        return Err(invalid("tts residual add bias geometry is invalid"));
+    }
+    let input_buffer = tensor_storage(ctx, input, dtype, count, "residual add bias input")?;
+    let bias_buffer = tensor_storage(ctx, bias, dtype, cols, "residual add bias bias")?;
+    let residual_buffer =
+        tensor_storage(ctx, residual, dtype, count, "residual add bias residual")?;
+    let out_buffer = tensor_storage(ctx, out, dtype, count, "residual add bias output")?;
+    unsafe {
+        status::check(abi::apxinf_tts_residual_add_bias(
+            ctx.runtime(),
+            input_buffer.ptr(),
+            bias_buffer.ptr(),
+            residual_buffer.ptr(),
+            out_buffer.ptr(),
+            count as i64,
+            cols as i64,
+            code,
             ctx.stream().handle(),
         ))
     }
 }
 
 /// `output = input * style[col] + style[cols + col]`.
-pub fn affine(
-    ctx: &CudaContext,
-    input: &Tensor,
-    style: &Tensor,
-    out: &Tensor,
-) -> Result<()> {
+pub fn affine(ctx: &CudaContext, input: &Tensor, style: &Tensor, out: &Tensor) -> Result<()> {
     let count = same_layout(ctx, input, out, "affine")?;
     let dtype = input.dtype();
     let code = dtype_code(dtype)?;
@@ -206,44 +307,8 @@ pub fn affine(
     }
 }
 
-/// GLU over the last axis: `[rows, 2 * cols] -> [rows, cols]`.
-pub fn glu(ctx: &CudaContext, input: &Tensor, out: &Tensor) -> Result<()> {
-    if input.dtype() != out.dtype() {
-        return Err(invalid("tts glu dtype mismatch"));
-    }
-    let dtype = input.dtype();
-    let code = dtype_code(dtype)?;
-    let cols = *out
-        .shape()
-        .dims()
-        .last()
-        .ok_or_else(|| invalid("tts glu needs a rank"))?;
-    let count = out.numel();
-    if cols == 0 || input.numel() != count * 2 {
-        return Err(invalid("tts glu geometry is invalid"));
-    }
-    let input_buffer = tensor_storage(ctx, input, dtype, count * 2, "glu input")?;
-    let out_buffer = tensor_storage(ctx, out, dtype, count, "glu output")?;
-    unsafe {
-        status::check(abi::apxinf_tts_glu(
-            ctx.runtime(),
-            input_buffer.ptr(),
-            out_buffer.ptr(),
-            count as i64,
-            cols as i64,
-            code,
-            ctx.stream().handle(),
-        ))
-    }
-}
-
 /// `output = input * sigmoid(gate)`.
-pub fn glu_separate(
-    ctx: &CudaContext,
-    input: &Tensor,
-    gate: &Tensor,
-    out: &Tensor,
-) -> Result<()> {
+pub fn glu_separate(ctx: &CudaContext, input: &Tensor, gate: &Tensor, out: &Tensor) -> Result<()> {
     let count = same_layout(ctx, input, out, "glu separate")?;
     let dtype = input.dtype();
     let code = dtype_code(dtype)?;
@@ -287,9 +352,7 @@ pub fn tanh_sigmoid_gate(
     let input_count = input.numel();
     let input_buffer = tensor_storage(ctx, input, dtype, input_count, "tanh-sigmoid input")?;
     let secondary_buffer = secondary
-        .map(|tensor| {
-            tensor_storage(ctx, tensor, dtype, input_count, "tanh-sigmoid secondary")
-        })
+        .map(|tensor| tensor_storage(ctx, tensor, dtype, input_count, "tanh-sigmoid secondary"))
         .transpose()?;
     let out_buffer = tensor_storage(ctx, out, dtype, out.numel(), "tanh-sigmoid output")?;
     unsafe {
@@ -310,12 +373,7 @@ pub fn tanh_sigmoid_gate(
 }
 
 /// Global response normalization over `[rows, cols]`.
-pub fn grn(
-    ctx: &CudaContext,
-    input: &Tensor,
-    style: &Tensor,
-    out: &Tensor,
-) -> Result<()> {
+pub fn grn(ctx: &CudaContext, input: &Tensor, style: &Tensor, out: &Tensor) -> Result<()> {
     let count = same_layout(ctx, input, out, "grn")?;
     let dtype = input.dtype();
     let code = dtype_code(dtype)?;
@@ -326,6 +384,13 @@ pub fn grn(
     let (rows, cols) = (dims[0], dims[1]);
     if rows == 0 || cols == 0 {
         return Err(invalid("tts grn geometry is invalid"));
+    }
+    // The kernel stages one FP32 normalizer per column in dynamic shared
+    // memory and does not opt into the larger per-block limit.
+    if cols > GRN_MAX_COLUMNS {
+        return Err(invalid(
+            "tts grn columns exceed the 48 KiB shared-memory window",
+        ));
     }
     let input_buffer = tensor_storage(ctx, input, dtype, count, "grn input")?;
     let style_buffer = tensor_storage(ctx, style, dtype, 2 * cols, "grn style")?;
@@ -423,7 +488,8 @@ pub fn rope_apply(
 }
 
 /// Sin/cos features from scalar `times`, matching the reference table formula.
-pub fn sinusoidal(
+/// [`sinusoidal_embedding`] wraps this with the reference frequency sweep.
+fn sinusoidal(
     ctx: &CudaContext,
     times: &Tensor,
     out: &Tensor,
@@ -549,6 +615,10 @@ pub fn argmax_rows(ctx: &CudaContext, logits: &Tensor, index: &Tensor) -> Result
 }
 
 /// Copy one input token into the cache row named by `meta[1]`.
+///
+/// A row index at or past the cache capacity writes nothing, which mirrors the
+/// clamp `kv_cache_attention` applies to the same metadata: the write position
+/// is device-side state, so enforcing it on the host would require a sync.
 pub fn write_kv_cache_token(
     ctx: &CudaContext,
     input: &Tensor,
@@ -563,7 +633,9 @@ pub fn write_kv_cache_token(
         ));
     }
     if input_dims != [1, 1, dims[2], dims[3]] {
-        return Err(invalid("dynamic KV token write requires a single token row"));
+        return Err(invalid(
+            "dynamic KV token write requires a single token row",
+        ));
     }
     let dtype = cache.dtype();
     if !matches!(dtype, DType::F16 | DType::BF16) || input.dtype() != dtype {
@@ -580,15 +652,12 @@ pub fn write_kv_cache_token(
     let cache_buffer =
         tensor_storage(ctx, cache, dtype, capacity * row_elements, "kv token cache")?;
     meta.retain();
-    crate::workspace::retain_resource(&std::rc::Rc::new(input_buffer.clone()));
-    crate::workspace::retain_resource(&std::rc::Rc::new(cache_buffer.clone()));
-    crate::workspace::validate_capture_target(
-        ctx.device_id(),
-        ctx.stream().handle() as usize,
-    )?;
+    crate::workspace::retain_buffer(&input_buffer);
+    crate::workspace::retain_buffer(&cache_buffer);
+    crate::workspace::validate_capture_target(ctx.device_id(), ctx.stream().handle() as usize)?;
     let code = dtype_code(dtype)?;
     unsafe {
-        status::check(abi::apxinf_tts_cache_write_token(
+        status::check(abi::apxinf_tts_write_kv_cache_token(
             ctx.runtime(),
             input_buffer.ptr(),
             cache_buffer.ptr(),
@@ -601,198 +670,7 @@ pub fn write_kv_cache_token(
     }
 }
 
-pub fn embedding_gather(
-    ctx: &CudaContext,
-    table: &Tensor,
-    ids: &Tensor,
-    out: &Tensor,
-) -> Result<()> {
-    let table_dims = table.shape().dims().to_vec();
-    let out_dims = out.shape().dims().to_vec();
-    if table_dims.len() != 2 || out_dims.len() != 2 {
-        return Err(invalid("tts embedding gather expects rank-2 table/output"));
-    }
-    let (vocab, width) = (table_dims[0], table_dims[1]);
-    let rows = out_dims[0];
-    if vocab == 0 || width == 0 || rows == 0 || out_dims[1] != width {
-        return Err(invalid("tts embedding gather geometry is invalid"));
-    }
-    let dtype = table.dtype();
-    let code = dtype_code(dtype)?;
-    if out.dtype() != dtype {
-        return Err(invalid("tts embedding gather dtype mismatch"));
-    }
-    if ids.dtype() != DType::I32 || ids.numel() != rows {
-        return Err(invalid(
-            "tts embedding gather ids must be I32 with one entry per row",
-        ));
-    }
-    let table_buffer = tensor_storage(ctx, table, dtype, vocab * width, "embedding table")?;
-    let ids_buffer = tensor_storage(ctx, ids, DType::I32, rows, "embedding ids")?;
-    let out_buffer = tensor_storage(ctx, out, dtype, rows * width, "embedding output")?;
-    unsafe {
-        status::check(abi::apxinf_tts_gather_rows(
-            ctx.runtime(),
-            table_buffer.ptr(),
-            ids_buffer.ptr(),
-            out_buffer.ptr(),
-            rows as i64,
-            width as i64,
-            code,
-            ctx.stream().handle(),
-        ))
-    }
-}
-
-pub fn copy_rows(
-    ctx: &CudaContext,
-    input: &Tensor,
-    offset: usize,
-    rows: usize,
-    out: &Tensor,
-) -> Result<()> {
-    let dtype = input.dtype();
-    let code = dtype_code(dtype)?;
-    let dims = input.shape().dims().to_vec();
-    if dims.len() != 2 || dims[1] == 0 || rows == 0 || offset + rows > dims[0] {
-        return Err(invalid("tts copy rows range is invalid"));
-    }
-    if out.dtype() != dtype || out.numel() != rows * dims[1] {
-        return Err(invalid("tts copy rows output mismatch"));
-    }
-    let input_buffer = tensor_storage(ctx, input, dtype, dims[0] * dims[1], "copy rows input")?;
-    let out_buffer = tensor_storage(ctx, out, dtype, rows * dims[1], "copy rows output")?;
-    unsafe {
-        status::check(abi::apxinf_tts_copy_rows(
-            ctx.runtime(),
-            input_buffer.ptr(),
-            out_buffer.ptr(),
-            offset as i64,
-            rows as i64,
-            dims[1] as i64,
-            code,
-            ctx.stream().handle(),
-        ))
-    }
-}
-
-pub fn concat_columns(
-    ctx: &CudaContext,
-    first: &Tensor,
-    second: &Tensor,
-    out: &Tensor,
-) -> Result<()> {
-    let first_dims = first.shape().dims().to_vec();
-    let second_dims = second.shape().dims().to_vec();
-    if first_dims.len() != 2 || second_dims.len() != 2 || first_dims[0] != second_dims[0] {
-        return Err(invalid("tts column concat expects equal-row rank-2 inputs"));
-    }
-    let dtype = first.dtype();
-    let code = dtype_code(dtype)?;
-    if second.dtype() != dtype || out.dtype() != dtype {
-        return Err(invalid("tts column concat dtype mismatch"));
-    }
-    let rows = first_dims[0];
-    let first_cols = first_dims[1];
-    let second_cols = second_dims[1];
-    if rows == 0 || first_cols == 0 || second_cols == 0 {
-        return Err(invalid("tts column concat geometry is invalid"));
-    }
-    let out_dims = out.shape().dims();
-    if out_dims != [rows, first_cols + second_cols] {
-        return Err(invalid("tts column concat output shape mismatch"));
-    }
-    let first_buffer = tensor_storage(ctx, first, dtype, rows * first_cols, "concat first")?;
-    let second_buffer = tensor_storage(ctx, second, dtype, rows * second_cols, "concat second")?;
-    let out_buffer = tensor_storage(ctx, out, dtype, rows * (first_cols + second_cols), "concat output")?;
-    unsafe {
-        status::check(abi::apxinf_tts_concat_columns(
-            ctx.runtime(),
-            first_buffer.ptr(),
-            second_buffer.ptr(),
-            out_buffer.ptr(),
-            rows as i64,
-            first_cols as i64,
-            second_cols as i64,
-            code,
-            ctx.stream().handle(),
-        ))
-    }
-}
-
-pub fn slice_columns(
-    ctx: &CudaContext,
-    input: &Tensor,
-    column_offset: usize,
-    columns: usize,
-    out: &Tensor,
-) -> Result<()> {
-    let dims = input.shape().dims().to_vec();
-    if dims.len() != 2 || columns == 0 || column_offset + columns > dims[1] {
-        return Err(invalid("tts slice columns range is invalid"));
-    }
-    let dtype = input.dtype();
-    let code = dtype_code(dtype)?;
-    if out.dtype() != dtype || out.numel() != dims[0] * columns {
-        return Err(invalid("tts slice columns output mismatch"));
-    }
-    let input_buffer = tensor_storage(ctx, input, dtype, dims[0] * dims[1], "slice columns input")?;
-    let out_buffer = tensor_storage(ctx, out, dtype, dims[0] * columns, "slice columns output")?;
-    unsafe {
-        status::check(abi::apxinf_tts_slice_columns(
-            ctx.runtime(),
-            input_buffer.ptr(),
-            out_buffer.ptr(),
-            dims[0] as i64,
-            dims[1] as i64,
-            column_offset as i64,
-            columns as i64,
-            code,
-            ctx.stream().handle(),
-        ))
-    }
-}
-
-/// Bias-before-cast projection epilogue: `out_f16 = F16(projection_f32 + bias)`.
-pub fn project_bias_f32_to_f16(
-    ctx: &CudaContext,
-    projection: &Tensor,
-    bias: &Tensor,
-    out: &Tensor,
-) -> Result<()> {
-    let dims = projection.shape().dims().to_vec();
-    if dims.len() != 2 || dims[0] == 0 || dims[1] == 0 {
-        return Err(invalid("tts projection bias expects a non-empty matrix"));
-    }
-    let (rows, cols) = (dims[0], dims[1]);
-    if projection.dtype() != DType::F32
-        || projection.device() != Device::Cuda(ctx.device_id())
-        || bias.dtype() != DType::F16
-        || bias.device() != Device::Cuda(ctx.device_id())
-        || bias.numel() != cols
-        || out.dtype() != DType::F16
-        || out.device() != Device::Cuda(ctx.device_id())
-        || out.shape().dims() != [rows, cols]
-    {
-        return Err(invalid("tts projection bias geometry or dtype mismatch"));
-    }
-    let projection_buffer =
-        tensor_storage(ctx, projection, DType::F32, rows * cols, "projection")?;
-    let bias_buffer = tensor_storage(ctx, bias, DType::F16, cols, "projection bias")?;
-    let out_buffer = tensor_storage(ctx, out, DType::F16, rows * cols, "projection output")?;
-    unsafe {
-        status::check(abi::apxinf_tts_project_bias_f32_to_f16(
-            ctx.runtime(),
-            projection_buffer.ptr(),
-            bias_buffer.ptr(),
-            out_buffer.ptr(),
-            (rows * cols) as i64,
-            cols as i64,
-            ctx.stream().handle(),
-        ))
-    }
-}
-
+/// Set every element of `tensor` to zero.
 pub fn fill_zero(ctx: &CudaContext, tensor: &Tensor) -> Result<()> {
     let dtype = tensor.dtype();
     let code = dtype_code(dtype)?;
