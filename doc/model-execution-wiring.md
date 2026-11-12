@@ -27,6 +27,14 @@ gates are defined in the [family decision](../crates/apxinf-model/src/metal_qwen
 This permits no codec-id/history readback, CPU tensor computation, arbitrary
 control exception or change to GPU/CUDA requirements for other families.
 
+A limited fixed-profile Clef GPU+ANE host-handoff exception is
+[proposed separately](coreml-ane.md#scoped-host-handoff-decision).
+The fork operator accepted that experimental scope on 2026-10-19; upstream
+maintainer approval remains pending. Until approval and all placement, transfer,
+numerical, performance, preparation, resource and lifetime gates are satisfied,
+the proposal does not change this acceptance contract or qualify either
+composition. GPU-only, CUDA and other families' requirements remain unchanged.
+
 For CUDA targets, fixed profiles must support CUDA Graph acceleration. Prefer one graph from
 canonical device inputs to outputs. For a VLA where concrete blockers prevent
 one graph, the accepted fallback partition covers Vision, Language and Action
