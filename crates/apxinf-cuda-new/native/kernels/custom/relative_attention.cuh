@@ -91,6 +91,9 @@ __global__ void relative_attention_kernel(
   }
   __syncthreads();
   const float maximum = reduction[0];
+  // Every warp must read the maximum before warp leaders reuse `reduction`
+  // for the partial sums below.
+  __syncthreads();
 
   float local_sum = 0.0f;
   for (int64_t j = threadIdx.x; j < length; j += blockDim.x) {

@@ -288,7 +288,12 @@ cudaError_t launch_attention(const void* query, const void* key,
   // The single-token kernel sums the softmax weights as a tree, so it changes
   // FP32 rounding relative to the reference scan. Callers set
   // `fast_single_token` only for Flexible numerics; Stable keeps this path off.
-  if (fast_single_token && batch == 1 && query_tokens == 1 &&
+  // It reads q/k/v rows as 16-byte vectors, so a view that is not 16-byte
+  // aligned keeps the reference path.
+  const bool vector_aligned =
+      ((reinterpret_cast<uintptr_t>(query) | reinterpret_cast<uintptr_t>(key) |
+        reinterpret_cast<uintptr_t>(value)) & 15u) == 0;
+  if (fast_single_token && vector_aligned && batch == 1 && query_tokens == 1 &&
       decode_meta != nullptr && head_dim == 32 && key_tokens <= 4096) {
     single_token_attention_hd32<T><<<query_heads,256,key_tokens*sizeof(float),stream>>>(
         static_cast<const T*>(query),static_cast<const T*>(key),static_cast<const T*>(value),
