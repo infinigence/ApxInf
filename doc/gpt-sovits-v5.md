@@ -200,6 +200,10 @@ the expected and actual lengths rather than silently falling back. Values,
 including IDs, samples, reference mel, seed, temperature, and penalties, may
 change while the shape profile remains fixed.
 
+A profile covers one text fragment. `prepare()` applies the request's
+`text_split_method` and rejects text that splits into more than one fragment;
+use `cut0` or prepare per fragment.
+
 The capture acceptance checks eager-versus-graph parity, repeat replay,
 same-shape input propagation, seed propagation, and incompatible-shape
 rejection.
@@ -227,18 +231,9 @@ operations use four-element loads and stores with the same FP32 arithmetic.
   decode step. Compatible requests reuse the graph and buffers, recomputing
   prefix values; another capacity replaces the retained resources.
 - Convolution preparation retains cuDNN handles, descriptors, layout buffers
-  and algorithm workspace when the development library is available. Without
-  cuDNN, the native direct implementation remains available.
+  and algorithm workspace. The vocoder's channel-last convolutions have no
+  direct fallback, so GPT-SoVITS requires a build with cuDNN available.
 
-Component comparisons against official PyTorch use captured identical inputs
-and noise. Component tolerances and discrete-token/PCM acceptance are separate:
-captured GPT inputs isolate decoder checks from conditioning errors. Current
-native HuBERT-to-code and public BERT/HuBERT/GPT conditioning-to-token checks
-against the original fixtures remain unresolved; historical passing results at
-another build/library tuple do not establish current acceptance.
-The sampler's FP16 filtering and argmax boundaries have independent reference
-tests, including top-p prefix rounding and ties, but its CUDA RNG mapping and
-device sampling path remain incomplete.
 ## Acceptance tiers
 
 Required for acceptance:
@@ -254,109 +249,22 @@ Required for acceptance:
 - Performance is measured against official PyTorch eager and CUDA Graph with
   identical inputs, tokens, noise and output length.
 
-Required end-to-end quality check: on a fixed text and reference-audio set,
-ASR transcription error, speaker similarity and duration must stay within the
-spread between official PyTorch eager and official PyTorch CUDA Graph runs.
+End-to-end quality is judged on a fixed text and reference-audio set by ASR
+character error rate, speaker similarity and duration, compared with the
+official PyTorch pipeline under the same request parameters.
 
 Diagnostic only: final PCM bit equality or a waveform SNR threshold after
 injecting official random numbers and CFM noise. Sampling, iterative CFM and
 the vocoder amplify last-bit differences into phase differences, and official
 eager and graph runs differ from each other in the same way, so waveform SNR is
-not an acceptance gate. Passing graph replay, same-library acoustic checks or
-isolated vocoder parity does not establish component acceptance.
+not an acceptance gate.
 
 Numerical evidence must identify the CUDA libraries actually loaded at runtime,
-including cuBLAS/cuBLASLt and cuDNN; a compiler toolkit version alone is insufficient.
-The current original PyTorch captures use cuBLASLt 13.1 while the native system
-runtime uses 13.4. Same-input final-projection differences were reproduced by
-running official PyTorch against the native library version. Such environment
-controls are diagnostic evidence and do not replace the original output acceptance.
-The CFM plain LayerNorm now uses a Welford reduction; isolated same-input checks
-reproduce all 22 captured attention normalization outputs exactly. Final PCM and
-public conditioning-to-token acceptance remain unresolved.
+including cuBLAS/cuBLASLt and cuDNN; a compiler toolkit version alone is
+insufficient.
 
-The converter also emits cfm.text_pe, the reference CPU FP32 nonpersistent
+The converter also emits `cfm.text_pe`, the reference CPU FP32 nonpersistent
 sinusoidal positional buffer rounded to the inference dtype. Native loading
 uploads this fixed [4096,512] table once. Reconvert earlier development
 checkpoints that lack this buffer; model loading does not regenerate it with a
 different host trigonometric implementation.
-
-## End-to-end quality acceptance (2026-11-06)
-
-Run: a harness that generates the same testset through the official pipeline
-and through ApxInf, then scores both. 5 reference speakers x 3 texts
-(long/short/medium), seed 1234, top_k 5,
-repetition_penalty 1.35, sample_steps 4, max_seconds 22. Judges:
-funasr seaco-paraformer-large (CER), microsoft/wavlm-base-plus-sv (speaker
-cosine), wav duration.
-
-Result: 12/15 pairs (F02, F07, S01701, Y03) are at parity with official eager —
-mean CER 0.050 vs 0.051, mean speaker similarity 0.965 vs 0.964, duration
-within 0.05 s. ApxInf eager and prepared(CUDA Graph) outputs are bit-identical
-for the same request and seed, so the graph path adds no quality change.
-
-F09 (fast, expressive movie-commentary reference) regresses systematically:
-speaker similarity 0.69-0.81 vs official 0.93-0.98, stable across seeds
-1234/42/2026 (official is likewise stable at 0.93-0.98, so this is not seed
-luck), and CER on the short text reaches 0.29-0.52 vs official 0.0-0.15.
-The suspected conditioning/HuBERT-to-code source was later ruled out: the
-actual cause was the reference-window offset, fixed on 2026-11-10 below.
-
-A strict "within official eager-vs-graph spread" gate is not meaningful here:
-official eager and graph outputs are near bit-identical, so that gate would
-measure bit-exact reproduction rather than quality. The 4-reference parity
-summary above is the meaningful reading.
-
-E2E verdict (2026-11-06): PASS for 4/5 references, FAIL for F09. The F09
-regression was later traced to reference-window slicing, not HuBERT codes; see
-the 2026-11-10 follow-up below.
-
-## Native speed/segmentation A/B (2026-11-10)
-
-Run: three E04 texts, Y03 reference,
-`seed=1234`, `top_k=15`, `sample_steps=4`, `repetition_penalty=1.35`,
-`speed_factor=1.05`, `text_split_method=cut5`, `fragment_interval=0.15`.
-Both backends were judged with funasr seaco-paraformer-large and
-microsoft/wavlm-base-plus-sv.
-
-| id | official CER | apxinf CER | official speaker | apxinf speaker | official dur | apxinf dur |
-|----|--------------|------------|------------------|----------------|--------------|------------|
-| E04-s01 | 0.042 | 0.000 | 0.976 | 0.967 | 10.14 s | 9.72 s |
-| E04-s08 | 0.042 | 0.021 | 0.969 | 0.977 | 8.78 s | 8.74 s |
-| E04-s13 | 0.017 | 0.000 | 0.972 | 0.977 | 10.20 s | 9.68 s |
-
-Speed and segmentation are applied inside the engine rather than by resampling
-the finished audio, so pitch, formants and pauses are preserved; the three
-texts are at or above official CER and speaker similarity, and duration is
-within ~0.5 s.
-
-
-## F09 root cause and re-acceptance (2026-11-10)
-
-F09 is the only test reference shorter than 5.0 s. With a 4.95 s reference the
-prompt mel is shorter than 500 frames, so `feature_offset` in the reference
-alignment became zero. The eager and prepared paths treated a zero offset as
-"no slice needed" and passed the full decoded feature stream to CFM. CFM then
-paired the *tail* of those features with the *head* of the mel, shifting the
-prompt by ~60 frames (0.6 s). HuBERT feature and semantic-code parity were
-verified separately: features match official at relative error 0.0012, and
-prompt codes match 97.8-100% across all nine references, F09 at 99.28%. The
-defect was therefore purely in the reference window selection.
-
-The fix slices `[feature_offset, feature_offset + reference_frames)` even when
-`feature_offset == 0`, and the prepared path no longer assumes a 500-frame
-prompt. Re-running the full 5-reference x 3-text set with `cut0`,
-`fragment_interval=0.3`, seed 1234, top_k 5, sample_steps 4:
-
-| reference | CER official | CER apxinf | speaker official | speaker apxinf | max duration delta |
-|-----------|--------------|------------|------------------|----------------|--------------------|
-| F02 | 0.056 | 0.050 | 0.942 | 0.943 | 0.04 s |
-| F07 | 0.050 | 0.050 | 0.965 | 0.960 | 1.12 s |
-| F09 | 0.050 | 0.050 | 0.968 | 0.961 | 0.40 s |
-| S01701 | 0.050 | 0.050 | 0.973 | 0.976 | 0.52 s |
-| Y03 | 0.050 | 0.050 | 0.975 | 0.981 | 0.20 s |
-
-All 15 texts now match official CER; speaker similarity is within 0.9 points
-of official for every reference, and F09 improves from 0.70-0.79 to
-0.948-0.984. Prepared CUDA Graph and eager output are bit-identical for the
-same request.

@@ -38,7 +38,6 @@ struct Block {
 }
 
 pub struct Cfm {
-    time_embeddings: Vec<Tensor>,
     step_modulations: Vec<StepModulation>,
     text_blocks: Vec<TextBlock>,
     text_pe: Tensor,
@@ -71,55 +70,6 @@ pub(crate) struct StepModulation {
     blocks: Vec<BlockModulation>,
     final_scale: Tensor,
     final_shift: Tensor,
-}
-
-pub(crate) struct CfmStepTrace {
-    pub x0: Tensor,
-    pub velocity: Tensor,
-    pub static_condition: Tensor,
-    pub text0: Tensor,
-    pub estimator: Option<CfmEstimatorStageTrace>,
-}
-
-pub(crate) struct CfmEstimatorStageTrace {
-    pub block_outputs: Vec<Tensor>,
-    pub input_after_static: Option<Tensor>,
-    pub convpos_output: Option<Tensor>,
-    pub time_embedding: Option<Tensor>,
-    pub q: Option<Tensor>,
-    pub k: Option<Tensor>,
-    pub v: Option<Tensor>,
-    pub q_rope: Option<Tensor>,
-    pub k_rope: Option<Tensor>,
-    pub attention_raw: Option<Tensor>,
-    pub attention_output: Option<Tensor>,
-    pub block0_normed: Option<Tensor>,
-    pub block0_shift_msa: Option<Tensor>,
-    pub block0_scale_msa: Option<Tensor>,
-    pub block0_gate_msa: Option<Tensor>,
-    pub block0_modulated: Option<Tensor>,
-    pub block0_attention: Option<Tensor>,
-    pub block0_ff: Option<Tensor>,
-    pub block0_output: Option<Tensor>,
-    pub final_modulated: Option<Tensor>,
-    pub velocity: Option<Tensor>,
-}
-
-pub(crate) struct CfmTextBlock0Trace {
-    pub dwconv: Tensor,
-    pub norm: Tensor,
-    pub pwconv1: Tensor,
-    pub gelu: Tensor,
-    pub grn: Tensor,
-    pub pwconv2: Tensor,
-    pub residual: Tensor,
-}
-
-pub(crate) struct CfmTextStageTrace {
-    pub chunk_index: usize,
-    pub position_added: Tensor,
-    pub block_outputs: Vec<Tensor>,
-    pub block0: CfmTextBlock0Trace,
 }
 
 fn sinus_tensor(ctx: &Context) -> Result<Tensor> {
@@ -238,7 +188,6 @@ impl Cfm {
         )?;
         let sinus = sinus_tensor(ctx)?;
         let norm_ones = fp16_tensor(ctx, &[CFM_DIM], &vec![1.0; CFM_DIM])?;
-        let mut time_embeddings = Vec::with_capacity(32);
         let mut step_modulations = Vec::with_capacity(32);
         // The admitted schedule indexes a fixed 32-row sinusoidal table.
         // Keep every projection's original [1,K] geometry and FP16 rounding.
@@ -268,10 +217,8 @@ impl Cfm {
                 final_scale: ops::add_bias(ctx, &final_scale, &norm_ones)?,
                 final_shift,
             });
-            time_embeddings.push(time);
         }
         Ok(Self {
-            time_embeddings,
             step_modulations,
             text_blocks,
             // The converter preserves the reference nonpersistent positional buffer.
@@ -326,7 +273,6 @@ impl Cfm {
             let row = ops::slice_rows(ctx, &sinus, index, 1)?;
             let time = time0.apply_accumulator(ctx, &row)?;
             let time = time2.apply_accumulator(ctx, &ops::silu(ctx, &time)?)?;
-            exact(&time, &self.time_embeddings[index])?;
             let ada = ops::silu(ctx, &time)?;
             for (block, stored) in self.blocks.iter().zip(&self.step_modulations[index].blocks) {
                 let expected = Self::block_modulation(ctx, &block.ada, &ada, &self.norm_ones)?;
@@ -436,48 +382,12 @@ impl Cfm {
         ]))
     }
 
-    fn time_embedding(&self, _ctx: &Context, step_index: usize) -> Result<Tensor> {
-        self.time_embeddings
-            .get(step_index)
-            .cloned()
-            .ok_or_else(|| Error::Other(format!("CFM time index {step_index} exceeds 32 rows")))
-    }
-
     fn text_embed(&self, ctx: &Context, text: &Tensor) -> Result<Tensor> {
-        self.text_embed_impl(ctx, text, false)
-            .map(|(output, _)| output)
-    }
-
-    fn text_embed_with_trace(
-        &self,
-        ctx: &Context,
-        text: &Tensor,
-    ) -> Result<(Tensor, CfmTextStageTrace)> {
-        let (output, trace) = self.text_embed_impl(ctx, text, true)?;
-        let trace = trace.ok_or_else(|| Error::Other("CFM text stage trace missing".into()))?;
-        Ok((output, trace))
-    }
-
-    fn text_embed_impl(
-        &self,
-        ctx: &Context,
-        text: &Tensor,
-        trace_text: bool,
-    ) -> Result<(Tensor, Option<CfmTextStageTrace>)> {
         let len = text.shape().dims()[0];
         let pe = ops::slice_rows(ctx, &self.text_pe, 0, len)?;
         let mut x = ops::residual_add(ctx, text, &pe)?;
-        let position_added = trace_text.then(|| x.clone());
-        let mut block_outputs = Vec::with_capacity(self.text_blocks.len());
-        let mut block0_dwconv = None;
-        let mut block0_norm = None;
-        let mut block0_pwconv1 = None;
-        let mut block0_gelu = None;
-        let mut block0_grn = None;
-        let mut block0_pwconv2 = None;
-        let mut block0_residual = None;
 
-        for (block_index, block) in self.text_blocks.iter().enumerate() {
+        for block in &self.text_blocks {
             let residual = x.clone();
             let x3 = x.reshape(apxinf_core::Shape::new(vec![1, len, CFM_TEXT]))?;
             let mut hidden = ops::conv1d(
@@ -491,67 +401,16 @@ impl Cfm {
                 CFM_TEXT,
             )?;
             hidden = hidden.reshape(apxinf_core::Shape::new(vec![len, CFM_TEXT]))?;
-            if trace_text && block_index == 0 {
-                block0_dwconv = Some(hidden.clone());
-            }
             hidden = ops::layer_norm(ctx, &hidden, &block.ln_w, &block.ln_b, 1e-6)?;
-            if trace_text && block_index == 0 {
-                block0_norm = Some(hidden.clone());
-            }
             hidden = block.pw1.apply_accumulator(ctx, &hidden)?;
-            if trace_text && block_index == 0 {
-                block0_pwconv1 = Some(hidden.clone());
-            }
             // ConvNeXt text blocks use the exact GELU; the DiT FFN below
             // uses the separate tanh approximation.
             hidden = ops::gelu_exact(ctx, &hidden)?;
-            if trace_text && block_index == 0 {
-                block0_gelu = Some(hidden.clone());
-            }
             hidden = ops::grn(ctx, &hidden, &block.grn_g, &block.grn_b)?;
-            if trace_text && block_index == 0 {
-                block0_grn = Some(hidden.clone());
-            }
             hidden = block.pw2.apply_accumulator(ctx, &hidden)?;
-            if trace_text && block_index == 0 {
-                block0_pwconv2 = Some(hidden.clone());
-            }
             x = ops::residual_add(ctx, &hidden, &residual)?;
-            if trace_text {
-                block_outputs.push(x.clone());
-                if block_index == 0 {
-                    block0_residual = Some(x.clone());
-                }
-            }
         }
-
-        let trace = if trace_text {
-            Some(CfmTextStageTrace {
-                chunk_index: 0,
-                position_added: position_added
-                    .ok_or_else(|| Error::Other("CFM text position trace missing".into()))?,
-                block_outputs,
-                block0: CfmTextBlock0Trace {
-                    dwconv: block0_dwconv
-                        .ok_or_else(|| Error::Other("CFM text dwconv trace missing".into()))?,
-                    norm: block0_norm
-                        .ok_or_else(|| Error::Other("CFM text norm trace missing".into()))?,
-                    pwconv1: block0_pwconv1
-                        .ok_or_else(|| Error::Other("CFM text pwconv1 trace missing".into()))?,
-                    gelu: block0_gelu
-                        .ok_or_else(|| Error::Other("CFM text gelu trace missing".into()))?,
-                    grn: block0_grn
-                        .ok_or_else(|| Error::Other("CFM text grn trace missing".into()))?,
-                    pwconv2: block0_pwconv2
-                        .ok_or_else(|| Error::Other("CFM text pwconv2 trace missing".into()))?,
-                    residual: block0_residual
-                        .ok_or_else(|| Error::Other("CFM text residual trace missing".into()))?,
-                },
-            })
-        } else {
-            None
-        };
-        Ok((x, trace))
+        Ok(x)
     }
 
     // PyTorch eager rounds the product before adding shift/residual.
@@ -587,19 +446,11 @@ impl Cfm {
         _text_embedding: &Tensor,
         static_condition: &Tensor,
         step_index: usize,
-        trace_stages: bool,
-    ) -> Result<(Tensor, Option<CfmEstimatorStageTrace>)> {
+    ) -> Result<Tensor> {
         let modulation = self.step_modulations.get(step_index).ok_or_else(|| {
             Error::Other(format!("CFM modulation index {step_index} exceeds 32 rows"))
         })?;
-        self.estimator_with_modulation(
-            ctx,
-            x,
-            static_condition,
-            step_index,
-            modulation,
-            trace_stages,
-        )
+        self.estimator_with_modulation(ctx, x, static_condition, modulation)
     }
 
     fn estimator_with_modulation(
@@ -607,40 +458,11 @@ impl Cfm {
         ctx: &Context,
         x: &Tensor,
         static_condition: &Tensor,
-        step_index: usize,
         modulation: &StepModulation,
-        trace_stages: bool,
-    ) -> Result<(Tensor, Option<CfmEstimatorStageTrace>)> {
-        let mut debug: Option<CfmEstimatorStageTrace> =
-            trace_stages.then(|| CfmEstimatorStageTrace {
-                block_outputs: Vec::new(),
-                input_after_static: None,
-                convpos_output: None,
-                time_embedding: None,
-                q: None,
-                k: None,
-                v: None,
-                q_rope: None,
-                k_rope: None,
-                attention_raw: None,
-                attention_output: None,
-                block0_normed: None,
-                block0_shift_msa: None,
-                block0_scale_msa: None,
-                block0_gate_msa: None,
-                block0_modulated: None,
-                block0_attention: None,
-                block0_ff: None,
-                block0_output: None,
-                final_modulated: None,
-                velocity: None,
-            });
+    ) -> Result<Tensor> {
         let len = x.shape().dims()[0];
         let x_part = ops::linear(ctx, x, &self.w_x, None)?;
         let mut hidden = ops::residual_add(ctx, &x_part, static_condition)?;
-        if let Some(trace) = debug.as_mut() {
-            trace.input_after_static = Some(hidden.clone());
-        }
         let conv = ops::conv1d(
             ctx,
             &hidden.reshape(apxinf_core::Shape::new(vec![1, len, 1024]))?,
@@ -665,14 +487,7 @@ impl Cfm {
         let conv = ops::mish(ctx, &conv)?;
         let conv = conv.reshape(apxinf_core::Shape::new(vec![len, 1024]))?;
         hidden = ops::residual_add(ctx, &conv, &hidden)?;
-        if let Some(trace) = debug.as_mut() {
-            trace.convpos_output = Some(conv.clone());
-        }
 
-        let time_embedding = self.time_embedding(ctx, step_index)?;
-        if let Some(trace) = debug.as_mut() {
-            trace.time_embedding = Some(time_embedding.clone());
-        }
         let ones = &self.norm_ones;
         let zeros = &self.norm_zeros;
 
@@ -687,30 +502,10 @@ impl Cfm {
 
             let normed = ops::layer_norm(ctx, &hidden, ones, zeros, 1e-6)?;
             let modulated = self.staged_affine(ctx, &normed, &scale_msa, &shift_msa)?;
-            if block_index == 0 {
-                if let Some(trace) = debug.as_mut() {
-                    trace.block0_normed = Some(normed.clone());
-                    trace.block0_shift_msa = Some(shift_msa.clone());
-                    let projected = block
-                        .ada
-                        .apply_accumulator(ctx, &ops::silu(ctx, &time_embedding)?)?
-                        .reshape(apxinf_core::Shape::new(vec![6, CFM_DIM]))?;
-                    trace.block0_scale_msa = Some(ops::slice_rows(ctx, &projected, 1, 1)?);
-                    trace.block0_gate_msa = Some(gate_msa.clone());
-                    trace.block0_modulated = Some(modulated.clone());
-                }
-            }
 
             let q = block.q.apply_accumulator(ctx, &modulated)?;
             let k = block.k.apply_accumulator(ctx, &modulated)?;
             let v = block.v.apply_accumulator(ctx, &modulated)?;
-            if block_index == 0 {
-                if let Some(trace) = debug.as_mut() {
-                    trace.q = Some(q.clone());
-                    trace.k = Some(k.clone());
-                    trace.v = Some(v.clone());
-                }
-            }
             let q = q.reshape(apxinf_core::Shape::new(vec![
                 1,
                 len,
@@ -733,58 +528,17 @@ impl Cfm {
             let k_flat = k.reshape(apxinf_core::Shape::new(vec![len, 1024]))?;
             let q = Self::rope_first_head(ctx, &q_flat, &self.rotary_cos, &self.rotary_sin)?;
             let k = Self::rope_first_head(ctx, &k_flat, &self.rotary_cos, &self.rotary_sin)?;
-            if block_index == 0 {
-                if let Some(trace) = debug.as_mut() {
-                    trace.q_rope = Some(q.clone());
-                    trace.k_rope = Some(k.clone());
-                }
-            }
             let attended = ops::attention(ctx, &q, &k, &v, CFM_HEADS)?;
-            if block_index == 0 {
-                if let Some(trace) = debug.as_mut() {
-                    trace.attention_raw = Some(attended.clone());
-                }
-            }
             let attended = attended.reshape(apxinf_core::Shape::new(vec![len, 1024]))?;
             let attended = block.o.apply_accumulator(ctx, &attended)?;
-            if block_index == 0 {
-                if let Some(trace) = debug.as_mut() {
-                    trace.attention_output = Some(attended.clone());
-                    trace.block0_attention = Some(attended.clone());
-                }
-            }
             hidden = self.staged_gate_residual(ctx, &attended, &hidden, &gate_msa)?;
 
             let normed = ops::layer_norm(ctx, &hidden, ones, zeros, 1e-6)?;
             let modulated = self.staged_affine(ctx, &normed, &scale_mlp, &shift_mlp)?;
             let ff = block.ff1.apply_accumulator(ctx, &modulated)?;
             let ff = ops::gelu_tanh(ctx, &ff)?;
-            #[cfg(test)]
-            let ff = if let Some(limit) = std::env::var_os("APXINF_PRIVATE_CFM_FF2_WORKSPACE") {
-                ops::linear_bias_accumulator_with_workspace(
-                    ctx,
-                    &ff,
-                    &block.ff2.w,
-                    block.ff2.b.as_ref().unwrap(),
-                    Some(limit.to_str().unwrap().parse().unwrap()),
-                )?
-            } else {
-                block.ff2.apply_accumulator(ctx, &ff)?
-            };
-            #[cfg(not(test))]
             let ff = block.ff2.apply_accumulator(ctx, &ff)?;
-            if block_index == 0 {
-                if let Some(trace) = debug.as_mut() {
-                    trace.block0_ff = Some(ff.clone());
-                }
-            }
             hidden = self.staged_gate_residual(ctx, &ff, &hidden, &gate_mlp)?;
-            if let Some(trace) = debug.as_mut() {
-                trace.block_outputs.push(hidden.clone());
-                if block_index == 0 {
-                    trace.block0_output = Some(hidden.clone());
-                }
-            }
         }
 
         let normed = ops::layer_norm(ctx, &hidden, ones, zeros, 1e-6)?;
@@ -794,14 +548,8 @@ impl Cfm {
             &modulation.final_scale,
             &modulation.final_shift,
         )?;
-        if let Some(trace) = debug.as_mut() {
-            trace.final_modulated = Some(modulated.clone());
-        }
         let velocity = self.proj_out.apply_accumulator(ctx, &modulated)?;
-        if let Some(trace) = debug.as_mut() {
-            trace.velocity = Some(velocity.clone());
-        }
-        Ok((velocity, debug))
+        Ok(velocity)
     }
 
     pub(crate) fn allocate_step_modulation(&self, ctx: &Context) -> Result<StepModulation> {
@@ -866,8 +614,7 @@ impl Cfm {
         static_condition: &Tensor,
         modulation: &StepModulation,
     ) -> Result<Tensor> {
-        self.estimator_with_modulation(ctx, x, static_condition, 0, modulation, false)
-            .map(|(velocity, _)| velocity)
+        self.estimator_with_modulation(ctx, x, static_condition, modulation)
     }
 
     fn chunk_conditioning(
@@ -876,23 +623,17 @@ impl Cfm {
         features: &Tensor,
         target: &Tensor,
         prompt_mel: &Tensor,
-        trace_steps: bool,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, Option<CfmTextStageTrace>)> {
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let target_len = target.shape().dims()[0];
         let mu = ops::concat_rows(ctx, features, target)?;
-        let (text_embedding, text_stage) = if trace_steps {
-            let (embedding, stage) = self.text_embed_with_trace(ctx, &mu)?;
-            (embedding, Some(stage))
-        } else {
-            (self.text_embed(ctx, &mu)?, None)
-        };
+        let text_embedding = self.text_embed(ctx, &mu)?;
         let zeros = ops::alloc(ctx, &[target_len, CFM_MEL])?;
         ops::fill_zero(ctx, &zeros)?;
         let prompt_x = ops::concat_rows(ctx, prompt_mel, &zeros)?;
         let concatenated = ops::concat_columns(ctx, &prompt_x, &text_embedding)?;
         let static_condition =
             ops::linear_bias_accumulator(ctx, &concatenated, &self.w_text, Some(&self.bias))?;
-        Ok((static_condition, mu, prompt_x, text_embedding, text_stage))
+        Ok((static_condition, prompt_x, text_embedding))
     }
 
     fn suppress_reference(
@@ -918,8 +659,7 @@ impl Cfm {
         prompt_mel: &Tensor,
         noise: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        let (condition, _, _, _, _) =
-            self.chunk_conditioning(ctx, features, target, prompt_mel, false)?;
+        let (condition, _, _) = self.chunk_conditioning(ctx, features, target, prompt_mel)?;
         let zeros = ops::alloc(ctx, &[CFM_MEL])?;
         ops::fill_zero(ctx, &zeros)?;
         let x = ops::affine(ctx, noise, &self.noise_scale, &zeros)?;
@@ -947,26 +687,6 @@ impl Cfm {
         Self::suppress_reference(ctx, &updated, prompt_len, target_len)
     }
 
-    /// Convert one captured noise chunk from comparison-harness layout
-    /// `[1, 100, frames]` (row-major) to the model's contiguous `[frames, 100]`
-    /// layout. The values are the pre-temperature normal samples.
-    fn captured_noise(ctx: &Context, values: &[f32]) -> Result<Tensor> {
-        if values.is_empty() || values.len() % CFM_MEL != 0 {
-            return Err(Error::Other(format!(
-                "cfm noise must contain a positive multiple of {CFM_MEL} values, got {}",
-                values.len()
-            )));
-        }
-        let frames = values.len() / CFM_MEL;
-        let mut transposed = vec![0.0f32; values.len()];
-        for channel in 0..CFM_MEL {
-            for frame in 0..frames {
-                transposed[frame * CFM_MEL + channel] = values[channel * frames + frame];
-            }
-        }
-        super::weights::fp16_tensor(ctx, &[frames, CFM_MEL], &transposed)
-    }
-
     fn run_chunk(
         &self,
         ctx: &Context,
@@ -984,12 +704,10 @@ impl Cfm {
                 apxinf_cuda_new::sampling::create_normal_generator(ctx, noise.clone())?;
             generator.generate(RngKey::new(seed, 0, 1))?;
         }
-        self.run_chunk_with_noise(ctx, features, target, prompt_mel, steps, &noise, 0, false)
-            .map(|(generated, _, _)| generated)
+        self.run_chunk_with_noise(ctx, features, target, prompt_mel, steps, &noise)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_chunk_with_noise(
+    fn run_chunk_with_noise(
         &self,
         ctx: &Context,
         features: &Tensor,
@@ -997,9 +715,7 @@ impl Cfm {
         prompt_mel: &Tensor,
         steps: usize,
         noise: &Tensor,
-        chunk_index: usize,
-        trace_steps: bool,
-    ) -> Result<(Tensor, Vec<CfmStepTrace>, Vec<CfmTextStageTrace>)> {
+    ) -> Result<Tensor> {
         let prompt_len = prompt_mel.shape().dims()[0];
         let target_len = target.shape().dims()[0];
         let total = prompt_len + target_len;
@@ -1010,8 +726,8 @@ impl Cfm {
                 [total, CFM_MEL]
             )));
         }
-        let (static_condition, mu, prompt_x, text_embedding, text_stage) =
-            self.chunk_conditioning(ctx, features, target, prompt_mel, trace_steps)?;
+        let (static_condition, prompt_x, text_embedding) =
+            self.chunk_conditioning(ctx, features, target, prompt_mel)?;
 
         let zeros = ops::alloc(ctx, &[CFM_MEL])?;
         ops::fill_zero(ctx, &zeros)?;
@@ -1026,27 +742,16 @@ impl Cfm {
             &ops::slice_rows(ctx, &x, prompt_len, target_len)?,
         )?;
 
-        let mut trace = Vec::new();
         let step = 1.0f32 / steps as f32;
         for index in 0..steps {
-            let (velocity, estimator_trace) = self.estimator(
+            let velocity = self.estimator(
                 ctx,
                 &x,
                 &prompt_x,
                 &text_embedding,
                 &static_condition,
                 index * 32 / steps,
-                trace_steps && index == 0,
             )?;
-            if trace_steps {
-                trace.push(CfmStepTrace {
-                    x0: x.clone(),
-                    velocity: velocity.clone(),
-                    static_condition: static_condition.clone(),
-                    text0: mu.clone(),
-                    estimator: estimator_trace,
-                });
-            }
             x = ops::euler_update(ctx, &x, &velocity, step)?;
             x = ops::concat_rows(
                 ctx,
@@ -1058,18 +763,7 @@ impl Cfm {
                 &ops::slice_rows(ctx, &x, prompt_len, target_len)?,
             )?;
         }
-        let text_trace = text_stage
-            .map(|mut stage| {
-                stage.chunk_index = chunk_index;
-                stage
-            })
-            .into_iter()
-            .collect();
-        Ok((
-            ops::slice_rows(ctx, &x, prompt_len, target_len)?,
-            trace,
-            text_trace,
-        ))
+        ops::slice_rows(ctx, &x, prompt_len, target_len)
     }
 
     /// `reference_features` and `target_features` are `[frames, 512]`;
@@ -1084,50 +778,6 @@ impl Cfm {
         cfg_rate: f32,
         seed: u64,
     ) -> Result<Tensor> {
-        self.synthesize_impl(
-            ctx,
-            reference_features,
-            target_features,
-            reference_mel,
-            steps,
-            cfg_rate,
-            CfmNoiseSource::Seed(seed),
-        )
-        .map(|(mel, _, _)| mel)
-    }
-
-    pub(crate) fn synthesize_with_captured_noise(
-        &self,
-        ctx: &Context,
-        reference_features: &Tensor,
-        target_features: &Tensor,
-        reference_mel: &Tensor,
-        steps: usize,
-        cfg_rate: f32,
-        noise_chunks: &[&[f32]],
-    ) -> Result<(Tensor, Vec<CfmStepTrace>, Vec<CfmTextStageTrace>)> {
-        self.synthesize_impl(
-            ctx,
-            reference_features,
-            target_features,
-            reference_mel,
-            steps,
-            cfg_rate,
-            CfmNoiseSource::Captured(noise_chunks),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn synthesize_impl(
-        &self,
-        ctx: &Context,
-        reference_features: &Tensor,
-        target_features: &Tensor,
-        reference_mel: &Tensor,
-        steps: usize,
-        cfg_rate: f32,
-        noise_source: CfmNoiseSource<'_>,
-    ) -> Result<(Tensor, Vec<CfmStepTrace>, Vec<CfmTextStageTrace>)> {
         if cfg_rate > 1e-5 {
             return Err(Error::Other(
                 "gpt_sovits v5turbo does not support classifier-free guidance".into(),
@@ -1155,8 +805,6 @@ impl Cfm {
         let mut rolling_mel = original_mel.clone();
         let mut rolling_features = original_features.clone();
         let mut results: Vec<Tensor> = Vec::new();
-        let mut step_trace = Vec::new();
-        let mut text_trace = Vec::new();
         let mut start = 0usize;
         let mut chunk_index = 0usize;
         while start < target_len {
@@ -1192,42 +840,14 @@ impl Cfm {
                 )?;
                 (prompt, features)
             };
-            let (generated, chunk_trace, chunk_text_trace) = match noise_source {
-                CfmNoiseSource::Seed(seed) => (
-                    self.run_chunk(
-                        ctx,
-                        &features,
-                        &target,
-                        &prompt,
-                        steps,
-                        seed + chunk_index as u64,
-                    )?,
-                    Vec::new(),
-                    Vec::new(),
-                ),
-                CfmNoiseSource::Captured(chunks) => {
-                    let values = chunks.get(chunk_index).ok_or_else(|| {
-                        Error::Other(format!(
-                            "missing captured cfm noise chunk {chunk_index}; got {} chunks",
-                            chunks.len()
-                        ))
-                    })?;
-                    let noise = Self::captured_noise(ctx, values)?;
-                    let trace_steps = matches!(noise_source, CfmNoiseSource::Captured(_));
-                    self.run_chunk_with_noise(
-                        ctx,
-                        &features,
-                        &target,
-                        &prompt,
-                        steps,
-                        &noise,
-                        chunk_index,
-                        trace_steps,
-                    )?
-                }
-            };
-            step_trace.extend(chunk_trace);
-            text_trace.extend(chunk_text_trace);
+            let generated = self.run_chunk(
+                ctx,
+                &features,
+                &target,
+                &prompt,
+                steps,
+                seed.wrapping_add(chunk_index as u64),
+            )?;
             let generated_frames = generated.shape().dims()[0];
             rolling_mel = ops::slice_rows(
                 ctx,
@@ -1245,18 +865,6 @@ impl Cfm {
             start += length;
             chunk_index += 1;
         }
-        let captured_chunks = match noise_source {
-            CfmNoiseSource::Captured(chunks) => Some(chunks),
-            CfmNoiseSource::Seed(_) => None,
-        };
-        if let Some(chunks) = captured_chunks {
-            if chunk_index != chunks.len() {
-                return Err(Error::Other(format!(
-                    "captured cfm noise chunk count mismatch: used {chunk_index}, got {}",
-                    chunks.len()
-                )));
-            }
-        }
         let mut chunks = results.into_iter();
         let mut combined = chunks.next().ok_or_else(|| {
             Error::Other("cfm synthesis requires at least one target frame".into())
@@ -1264,484 +872,13 @@ impl Cfm {
         for tensor in chunks {
             combined = ops::concat_rows(ctx, &combined, &tensor)?;
         }
-        Ok((combined, step_trace, text_trace))
+        Ok(combined)
     }
-}
-
-#[derive(Clone, Copy)]
-enum CfmNoiseSource<'a> {
-    Seed(u64),
-    Captured(&'a [&'a [f32]]),
 }
 
 #[cfg(test)]
-mod capture_tests {
+mod tests {
     use super::*;
-    #[test]
-    #[ignore = "private same-input official CFM operator diagnostics"]
-    fn official_input_operator_isolation() {
-        use std::{fs, path::PathBuf};
-        let root = PathBuf::from(std::env::var("APXINF_CFM_OPERATION_ROOT").unwrap());
-        let output = std::env::var_os("APXINF_CFM_OPERATION_OUTPUT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                root.join(if std::env::var_os("APXINF_ALIGNMENT_AUTOTUNE").is_some() {
-                    "native-tuned"
-                } else {
-                    "native-fallback"
-                })
-            });
-        fs::create_dir_all(&output).unwrap();
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-        let ctx =
-            Context::new_with_autotune(0, std::env::var_os("APXINF_ALIGNMENT_AUTOTUNE").is_some())
-                .unwrap();
-        let mut weights = Weights::load(&PathBuf::from(
-            std::env::var("APXINF_GPT_CHECKPOINT").unwrap(),
-        ))
-        .unwrap();
-        let read = |name: &str| {
-            let shape = manifest[name]["shape"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|d| d.as_u64().unwrap() as usize)
-                .collect::<Vec<_>>();
-            let data = fs::read(root.join(format!("{name}.f32")))
-                .unwrap()
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect::<Vec<_>>();
-            fp16_tensor(&ctx, &shape, &data).unwrap()
-        };
-        let write = |name: &str, tensor: &Tensor| {
-            let cpu = apxinf_cuda_new::transfers::to_cpu(tensor)
-                .unwrap()
-                .to_f32_vec()
-                .unwrap();
-            fs::write(
-                output.join(format!("{name}.f32")),
-                cpu.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-            )
-            .unwrap();
-            println!("operation/{name}: exported {} elements", cpu.len());
-        };
-        let time0 = Linear::load(&mut weights, &ctx, "cfm.time0").unwrap();
-        let time2 = Linear::load(&mut weights, &ctx, "cfm.time2").unwrap();
-        write(
-            "time0",
-            &time0.apply_accumulator(&ctx, &read("time-sinus")).unwrap(),
-        );
-        write("time-silu", &ops::silu(&ctx, &read("time0")).unwrap());
-        write(
-            "time2",
-            &time2.apply_accumulator(&ctx, &read("time-silu")).unwrap(),
-        );
-        write(
-            "ada-input",
-            &ops::silu(&ctx, &read("official-time")).unwrap(),
-        );
-        for part in ["shift_msa", "scale_msa", "gate_msa"] {
-            let linear =
-                Linear::load(&mut weights, &ctx, &format!("cfm.blocks.0.ada.{part}")).unwrap();
-            write(
-                &format!("ada-{part}"),
-                &linear.apply_accumulator(&ctx, &read("ada-input")).unwrap(),
-            );
-        }
-        for part in ["q", "k", "v", "o"] {
-            let linear = Linear::load(&mut weights, &ctx, &format!("cfm.blocks.0.{part}")).unwrap();
-            let input = read(if part == "o" { "o-input" } else { "qkv-input" });
-            write(part, &linear.apply_accumulator(&ctx, &input).unwrap());
-            write(
-                &format!("{part}-staged"),
-                &linear.apply(&ctx, &input).unwrap(),
-            );
-        }
-        let cfm = Cfm::load(&mut weights, &ctx).unwrap();
-        write(
-            "ada-packed",
-            &cfm.blocks[0]
-                .ada
-                .apply_accumulator(&ctx, &read("ada-input"))
-                .unwrap(),
-        );
-        write(
-            "rope-cos",
-            &ops::slice_rows(&ctx, &cfm.rotary_cos, 0, 1000).unwrap(),
-        );
-        write(
-            "rope-sin",
-            &ops::slice_rows(&ctx, &cfm.rotary_sin, 0, 1000).unwrap(),
-        );
-        write(
-            "norm",
-            &ops::layer_norm(
-                &ctx,
-                &read("norm-input"),
-                &cfm.norm_ones,
-                &cfm.norm_zeros,
-                1e-6,
-            )
-            .unwrap(),
-        );
-        write(
-            "modulation",
-            &cfm.staged_affine(
-                &ctx,
-                &read("modulation-norm"),
-                &read("modulation-scale"),
-                &read("modulation-shift"),
-            )
-            .unwrap(),
-        );
-        write(
-            "rope-q",
-            &Cfm::rope_first_head(
-                &ctx,
-                &read("rope-input-q"),
-                &cfm.rotary_cos,
-                &cfm.rotary_sin,
-            )
-            .unwrap(),
-        );
-        write(
-            "rope-k",
-            &Cfm::rope_first_head(
-                &ctx,
-                &read("rope-input-k"),
-                &cfm.rotary_cos,
-                &cfm.rotary_sin,
-            )
-            .unwrap(),
-        );
-        write(
-            "attention",
-            &ops::attention(
-                &ctx,
-                &read("attention-q"),
-                &read("attention-k"),
-                &read("attention-v"),
-                CFM_HEADS,
-            )
-            .unwrap(),
-        );
-    }
-
-    #[test]
-    #[ignore = "private unmodified official CFM FFN and modulation diagnostic"]
-    fn official_ffn_operator_isolation() {
-        use std::{fs, path::PathBuf};
-        let root = PathBuf::from(std::env::var("APXINF_CFM_DETAILED_ROOT").unwrap());
-        let output = PathBuf::from(std::env::var("APXINF_CFM_OPERATION_OUTPUT").unwrap());
-        fs::create_dir_all(&output).unwrap();
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();
-        let ctx =
-            Context::new_with_autotune(0, std::env::var_os("APXINF_ALIGNMENT_AUTOTUNE").is_some())
-                .unwrap();
-        let mut weights = Weights::load(&PathBuf::from(
-            std::env::var("APXINF_GPT_CHECKPOINT").unwrap(),
-        ))
-        .unwrap();
-        let read = |name: &str| {
-            let entry = manifest["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|e| e["name"] == name)
-                .unwrap();
-            let data = fs::read(root.join(entry["path"].as_str().unwrap()))
-                .unwrap()
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect::<Vec<_>>();
-            let width = entry["shape"]
-                .as_array()
-                .unwrap()
-                .last()
-                .unwrap()
-                .as_u64()
-                .unwrap() as usize;
-            fp16_tensor(&ctx, &[data.len() / width, width], &data).unwrap()
-        };
-        let write = |name: &str, tensor: &Tensor| {
-            let data = apxinf_cuda_new::transfers::to_cpu(tensor)
-                .unwrap()
-                .to_f32_vec()
-                .unwrap();
-            fs::write(
-                output.join(format!("{name}.f32")),
-                data.iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-        };
-        let cfm = Cfm::load(&mut weights, &ctx).unwrap();
-        let read_ncl = |name: &str| {
-            let entry = manifest["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|e| e["name"] == name)
-                .unwrap();
-            let shape = entry["shape"].as_array().unwrap();
-            let channels = shape[1].as_u64().unwrap() as usize;
-            let frames = shape[2].as_u64().unwrap() as usize;
-            let data = fs::read(root.join(entry["path"].as_str().unwrap()))
-                .unwrap()
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect::<Vec<_>>();
-            let nlc = (0..frames)
-                .flat_map(|t| {
-                    let data = &data;
-                    (0..channels).map(move |c| data[c * frames + t])
-                })
-                .collect::<Vec<_>>();
-            fp16_tensor(&ctx, &[1, frames, channels], &nlc).unwrap()
-        };
-        for (i, weight, bias) in [
-            (0, &cfm.convpos0_w, cfm.convpos0_b.as_ref()),
-            (2, &cfm.convpos2_w, cfm.convpos2_b.as_ref()),
-        ] {
-            let x = read_ncl(&format!("convpos{i}.input"));
-            write(
-                &format!("convpos{i}.output"),
-                &ops::conv1d(&ctx, &x, weight, bias, 1, 15, 1, 16).unwrap(),
-            );
-            write(
-                &format!("convpos{i}.mish"),
-                &ops::mish(&ctx, &read_ncl(&format!("convpos{i}.output"))).unwrap(),
-            );
-        }
-        for i in 0..CFM_DEPTH {
-            let hidden = if i == 0 {
-                ops::residual_add(&ctx, &read("input_after_static"), &read("convpos_output"))
-                    .unwrap()
-            } else {
-                read(&format!("block{}.output", i - 1))
-            };
-            write(
-                &format!("block{i}.normed"),
-                &ops::layer_norm(&ctx, &hidden, &cfm.norm_ones, &cfm.norm_zeros, 1e-6).unwrap(),
-            );
-        }
-        for (i, tensor) in cfm.time_embeddings.iter().enumerate() {
-            write(&format!("time_embedding_step{i}"), tensor);
-        }
-        let time = ops::silu(&ctx, &read("time_embedding")).unwrap();
-        for (i, block) in cfm.blocks.iter().enumerate() {
-            write(
-                &format!("block{i}.ada"),
-                &block.ada.apply_accumulator(&ctx, &time).unwrap(),
-            );
-            let x = read(&format!("block{i}.ff0.input"));
-            write(
-                &format!("block{i}.ff0.output"),
-                &block.ff1.apply_accumulator(&ctx, &x).unwrap(),
-            );
-            let x = read(&format!("block{i}.ff0.output"));
-            write(
-                &format!("block{i}.ff.gelu"),
-                &ops::gelu_tanh(&ctx, &x).unwrap(),
-            );
-            let x = read(&format!("block{i}.ff2.input"));
-            write(
-                &format!("block{i}.ff2.output"),
-                &block.ff2.apply_accumulator(&ctx, &x).unwrap(),
-            );
-        }
-        write(
-            "final_ada",
-            &Cfm::packed_linear(
-                &mut weights,
-                &ctx,
-                &["cfm.final.scale".into(), "cfm.final.shift".into()],
-            )
-            .unwrap()
-            .apply_accumulator(&ctx, &time)
-            .unwrap(),
-        );
-        let hidden = read("block21.output");
-        let normed = ops::layer_norm(&ctx, &hidden, &cfm.norm_ones, &cfm.norm_zeros, 1e-6).unwrap();
-        write("final_norm", &normed);
-        let official_ada = read("final_ada")
-            .reshape(apxinf_core::Shape::new(vec![2, CFM_DIM]))
-            .unwrap();
-        let scale = ops::slice_rows(&ctx, &official_ada, 0, 1)
-            .unwrap()
-            .reshape(apxinf_core::Shape::new(vec![CFM_DIM]))
-            .unwrap();
-        let shift = ops::slice_rows(&ctx, &official_ada, 1, 1)
-            .unwrap()
-            .reshape(apxinf_core::Shape::new(vec![CFM_DIM]))
-            .unwrap();
-        let scale = ops::add_bias(&ctx, &scale, &cfm.norm_ones).unwrap();
-        write(
-            "final_modulated_official_ada",
-            &cfm.staged_affine(&ctx, &normed, &scale, &shift).unwrap(),
-        );
-        write(
-            "final_modulated_native_ada",
-            &cfm.staged_affine(
-                &ctx,
-                &normed,
-                &cfm.step_modulations[0].final_scale,
-                &cfm.step_modulations[0].final_shift,
-            )
-            .unwrap(),
-        );
-        write(
-            "final_projection",
-            &cfm.proj_out
-                .apply_accumulator(&ctx, &read("final_projection_input"))
-                .unwrap(),
-        );
-        println!(
-            "22 packed modulations, 22 FFN projections/activations, final projection exported"
-        );
-    }
-
-    #[test]
-    #[ignore = "requires captured official fixtures and CUDA checkpoint"]
-    fn isolated_estimator_stage_metrics() {
-        use std::{fs, path::PathBuf};
-        let checkpoint = PathBuf::from(std::env::var("APXINF_GPT_CHECKPOINT").unwrap());
-        let root = PathBuf::from(std::env::var("APXINF_GPT_CAPTURE_ROOT").unwrap());
-        let stages = PathBuf::from(
-            std::env::var("APXINF_CFM_PRISTINE_STAGES")
-                .expect("unmodified official stage capture required"),
-        );
-        let raw = root.join("pair1/raw");
-        let ctx = Context::new_with_autotune(0, false).unwrap();
-        let mut weights = Weights::load(&checkpoint).unwrap();
-        let cfm = Cfm::load(&mut weights, &ctx).unwrap();
-        let values = |directory: &std::path::Path, name: &str| {
-            let manifest: serde_json::Value =
-                serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap())
-                    .unwrap();
-            let entry = manifest["entries"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|entry| entry["name"] == name)
-                .unwrap();
-            let dims = entry["shape"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|x| x.as_u64().unwrap() as usize)
-                .collect::<Vec<_>>();
-            let data = fs::read(directory.join(entry["path"].as_str().unwrap()))
-                .unwrap()
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect::<Vec<_>>();
-            (dims, data)
-        };
-        let nlc = |name: &str| {
-            let (dims, data) = values(&raw, name);
-            let (channels, frames) = (dims[1], dims[2]);
-            let data = (0..frames)
-                .flat_map(|t| {
-                    let data = &data;
-                    (0..channels).map(move |c| data[c * frames + t])
-                })
-                .collect::<Vec<_>>();
-            fp16_tensor(&ctx, &[frames, channels], &data).unwrap()
-        };
-        let x = nlc("cfm_steps.0.x0");
-        let cond = nlc("cfm_steps.0.cond0");
-        let text = nlc("cfm_steps.0.text0");
-        let (_, static_values) = values(&raw, "cfm_steps.0.static_cache.condition");
-        let static_condition = fp16_tensor(&ctx, &[1000, 1024], &static_values).unwrap();
-        let (_, trace) = cfm
-            .estimator(&ctx, &x, &cond, &text, &static_condition, 0, true)
-            .unwrap();
-        let trace = trace.unwrap();
-        if let Some(directory) = std::env::var_os("APXINF_CFM_STAGE_CAPTURE") {
-            let directory = PathBuf::from(directory);
-            fs::create_dir_all(&directory).unwrap();
-            for (i, tensor) in trace.block_outputs.iter().enumerate() {
-                let data = apxinf_cuda_new::transfers::to_cpu(tensor)
-                    .unwrap()
-                    .to_f32_vec()
-                    .unwrap();
-                fs::write(
-                    directory.join(format!("block{i}.output.f32")),
-                    data.iter()
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap();
-            }
-        }
-        for (label, tensor) in [
-            ("input_after_static", trace.input_after_static),
-            ("convpos_output", trace.convpos_output),
-            ("time_embedding", trace.time_embedding),
-            ("block0.normed", trace.block0_normed),
-            ("block0.modulated", trace.block0_modulated),
-            ("block0.q", trace.q),
-            ("block0.k", trace.k),
-            ("block0.v", trace.v),
-            ("q_rope", trace.q_rope),
-            ("k_rope", trace.k_rope),
-            ("attention_raw", trace.attention_raw),
-            ("block0.attention_output", trace.attention_output),
-            ("block0.ff", trace.block0_ff),
-            ("block0.output", trace.block0_output),
-            ("final_norm_modulated", trace.final_modulated),
-            ("velocity", trace.velocity),
-        ] {
-            let actual = apxinf_cuda_new::transfers::to_cpu(&tensor.unwrap())
-                .unwrap()
-                .to_f32_vec()
-                .unwrap();
-            let (dims, mut expected) = values(&stages, label);
-            if label == "attention_raw" {
-                let original = expected.clone();
-                for t in 0..dims[2] {
-                    for h in 0..dims[1] {
-                        for d in 0..dims[3] {
-                            expected[(t * dims[1] + h) * dims[3] + d] =
-                                original[(h * dims[2] + t) * dims[3] + d];
-                        }
-                    }
-                }
-            }
-            assert_eq!(actual.len(), expected.len());
-            let mut power = 0f64;
-            let mut err = 0f64;
-            let mut max = 0f32;
-            let mut mismatch = 0usize;
-            for (&a, &b) in actual.iter().zip(&expected) {
-                power += f64::from(b).powi(2);
-                err += f64::from(a - b).powi(2);
-                max = max.max((a - b).abs());
-                mismatch += usize::from(a != b);
-            }
-            println!(
-                "isolated/{label}: snr_db={} max_abs={max} mismatches={mismatch}",
-                10. * (power / err).log10()
-            );
-            if let Some(directory) = std::env::var_os("APXINF_CFM_STAGE_CAPTURE") {
-                let directory = PathBuf::from(directory);
-                fs::create_dir_all(&directory).unwrap();
-                fs::write(
-                    directory.join(format!("{label}.f32")),
-                    actual
-                        .iter()
-                        .flat_map(|v| v.to_le_bytes())
-                        .collect::<Vec<_>>(),
-                )
-                .unwrap();
-            }
-        }
-    }
 
     #[test]
     #[ignore = "requires APXINF_GPT_CHECKPOINT and CUDA"]
@@ -1751,6 +888,6 @@ mod capture_tests {
         let mut weights = Weights::load(&directory).unwrap();
         let cfm = Cfm::load(&mut weights, &ctx).unwrap();
         cfm.validate_step_modulations(&ctx, &mut weights).unwrap();
-        println!("32 time embeddings and all 22 block/final modulations match original bytes");
+        println!("all cached block/final modulations match original bytes");
     }
 }

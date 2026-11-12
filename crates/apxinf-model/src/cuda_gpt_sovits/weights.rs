@@ -57,10 +57,6 @@ impl Weights {
         }
     }
 
-    pub fn has(&self, key: &str) -> bool {
-        self.host.contains_key(key) || self.device.contains_key(key)
-    }
-
     /// Read a host tensor without uploading it (used for small constants).
     pub fn host(&mut self, key: &str) -> Result<Tensor> {
         self.host
@@ -104,6 +100,7 @@ impl Linear {
         }
     }
 
+    #[cfg(test)]
     pub fn apply_seq(&self, ctx: &Context, input: &Tensor) -> Result<Tensor> {
         if self.uses_accumulator_semantics(input) {
             let dims = input.shape().dims().to_vec();
@@ -168,16 +165,6 @@ impl Conv {
         )
     }
 
-    pub fn transpose(
-        &self,
-        ctx: &Context,
-        input: &Tensor,
-        stride: usize,
-        padding: usize,
-    ) -> Result<Tensor> {
-        ops::conv_transpose1d(ctx, input, &self.w, self.b.as_ref(), stride, padding, 0)
-    }
-
     /// The bias a direct convolution leaves for its consumer to fold in.
     pub fn deferred_bias(&self) -> Result<&Tensor> {
         self.b.as_ref().ok_or_else(|| {
@@ -212,21 +199,9 @@ impl Conv {
     }
 }
 
-pub fn normalize(weights: &mut Weights, ctx: &Context, prefix: &str) -> Result<(Tensor, Tensor)> {
-    Ok((
-        weights.get(ctx, &format!("{prefix}.w"))?,
-        weights.get(ctx, &format!("{prefix}.b"))?,
-    ))
-}
-
 pub fn ids_tensor(ctx: &Context, ids: &[u32]) -> Result<Tensor> {
     let ids: Vec<i32> = ids.iter().map(|value| *value as i32).collect();
     let host = Tensor::from_i32(vec![ids.len()], &ids)?;
-    transfers::to_cuda(&host, ctx.device_id())
-}
-
-pub fn f32_tensor(ctx: &Context, shape: &[usize], values: &[f32]) -> Result<Tensor> {
-    let host = Tensor::from_f32(shape.to_vec(), values)?;
     transfers::to_cuda(&host, ctx.device_id())
 }
 

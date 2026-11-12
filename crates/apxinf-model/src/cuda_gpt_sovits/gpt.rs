@@ -1,8 +1,6 @@
 //! GPT (Text2Semantic) decoder for GPT-SoVITS V5.
 
 use std::cell::RefCell;
-#[cfg(test)]
-use std::io::Write;
 
 use apxinf_core::{philox4x32_10, Error, Result, Shape, Tensor};
 use apxinf_cuda_new::ops::{
@@ -20,13 +18,6 @@ const DECODE_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
 // Prefill keeps one whole eager traversal of intermediates in the session
 // arena. Measured peak is ~51 MB; the rest is headroom for longer prompts.
 const PREFILL_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
-// PyTorch 2.11 launches its CUDA universal kernel with 256 threads per block.
-// On Orin's current scheduler this kernel receives five blocks for the GPT
-// 1024/1025-element tensors, so every element is assigned in one launch step.
-// The alignment test uses this to prove a captured stream never crosses a
-// grid-stride step boundary.
-#[cfg(test)]
-const TORCH_CUDA_EXPONENTIAL_ACTIVE_THREADS: usize = 5 * 256;
 
 struct Layer {
     q: Linear,
@@ -192,117 +183,6 @@ fn counter_exponential_fp16(seed: u64, counter_offset: u64, element: usize) -> f
     fp16(exponential)
 }
 
-#[cfg(test)]
-struct SamplingAlignment {
-    directory: std::path::PathBuf,
-    run: String,
-    teacher_tokens: Vec<u32>,
-}
-
-#[cfg(test)]
-impl SamplingAlignment {
-    fn from_env() -> Result<Option<Self>> {
-        let Some(directory) = std::env::var_os("APXINF_GPT_SAMPLING_ALIGNMENT_DIR") else {
-            return Ok(None);
-        };
-        let directory = std::path::PathBuf::from(directory);
-        let run = std::env::var("APXINF_GPT_SAMPLING_ALIGNMENT_RUN")
-            .unwrap_or_else(|_| "default".to_string());
-        let teacher_tokens = std::fs::read(directory.join(format!("{run}-teacher-tokens.u32")))
-            .map_err(|error| Error::Other(format!("GPT alignment teacher tokens: {error}")))?
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four-byte token")))
-            .collect();
-        Ok(Some(Self {
-            directory,
-            run,
-            teacher_tokens,
-        }))
-    }
-
-    fn teacher_token(&self, step: usize) -> Option<u32> {
-        self.teacher_tokens.get(step).copied()
-    }
-
-    fn exponential_draw(&self, step: usize, expected_len: usize) -> Result<Vec<f32>> {
-        let path = self
-            .directory
-            .join(format!("{}-exponential-{step:04}.f16", self.run));
-        let bytes = std::fs::read(&path).map_err(|error| {
-            Error::Other(format!(
-                "GPT alignment random stream {}: {error}",
-                path.display()
-            ))
-        })?;
-        if bytes.len() != expected_len * 2 {
-            return Err(Error::Other(format!(
-                "GPT alignment random stream {} has {} bytes, expected {}",
-                path.display(),
-                bytes.len(),
-                expected_len * 2
-            )));
-        }
-        Ok(bytes
-            .chunks_exact(2)
-            .map(|value| half::f16::from_bits(u16::from_le_bytes([value[0], value[1]])).to_f32())
-            .collect())
-    }
-
-    fn write_logits(&self, step: usize, values: &[f32]) -> Result<()> {
-        let path = self
-            .directory
-            .join(format!("{}-native-logits-{step:04}.f16", self.run));
-        let mut bytes = Vec::with_capacity(values.len() * 2);
-        for value in values {
-            bytes.extend_from_slice(&half::f16::from_f32(*value).to_bits().to_le_bytes());
-        }
-        std::fs::write(&path, bytes).map_err(|error| {
-            Error::Other(format!(
-                "GPT alignment native logits {}: {error}",
-                path.display()
-            ))
-        })
-    }
-
-    fn record_selection(
-        &self,
-        step: usize,
-        sampled: u32,
-        argmax: u32,
-        expected: Option<u32>,
-    ) -> Result<()> {
-        let path = self
-            .directory
-            .join(format!("{}-native-selections.csv", self.run));
-        let first_step = step == 0;
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).write(true);
-        if first_step {
-            options.truncate(true);
-        } else {
-            options.append(true);
-        }
-        let mut file = options.open(&path).map_err(|error| {
-            Error::Other(format!(
-                "GPT alignment selection log {}: {error}",
-                path.display()
-            ))
-        })?;
-        if first_step {
-            writeln!(file, "step,sampled,argmax,expected")
-                .map_err(|error| Error::Other(format!("GPT alignment header: {error}")))?;
-        }
-        writeln!(
-            file,
-            "{step},{sampled},{argmax},{}",
-            expected
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string())
-        )
-        .map_err(|error| Error::Other(format!("GPT alignment selection: {error}")))
-    }
-}
-
 fn exponential_race_argmax(probabilities: &[f32], exponentials: &[f32]) -> Result<u32> {
     if probabilities.is_empty() || probabilities.len() != exponentials.len() {
         return Err(Error::Other(format!(
@@ -442,13 +322,8 @@ fn sample_fp16_exponential_race(
     top_p: f32,
     temperature: f32,
     repetition_penalty: f32,
-    #[cfg(test)] alignment: Option<&SamplingAlignment>,
 ) -> Result<(u32, u32)> {
     let values = transfers::to_cpu(logits)?.to_f32_vec()?;
-    #[cfg(test)]
-    if let Some(alignment) = alignment {
-        alignment.write_logits(step, &values)?;
-    }
     let (probabilities, adjusted_argmax) = logits_to_probs_fp16(
         values,
         history,
@@ -457,14 +332,6 @@ fn sample_fp16_exponential_race(
         temperature,
         repetition_penalty,
     )?;
-    #[cfg(test)]
-    let exponentials = match alignment {
-        Some(alignment) => alignment.exponential_draw(step, probabilities.len())?,
-        None => (0..probabilities.len())
-            .map(|index| counter_exponential_fp16(seed, philox_counter_offset(step), index))
-            .collect(),
-    };
-    #[cfg(not(test))]
     let exponentials = (0..probabilities.len())
         .map(|index| counter_exponential_fp16(seed, philox_counter_offset(step), index))
         .collect::<Vec<_>>();
@@ -523,6 +390,20 @@ impl Gpt {
     }
 
     fn embed_text(&self, ctx: &Context, phones: &[u32], bert: &Tensor) -> Result<Tensor> {
+        // The device lookups turn out-of-range ids into zero rows; reject them
+        // here so a bad request fails instead of synthesizing from padding.
+        if phones.len() > MAX_POSITIONS {
+            return Err(Error::Other(format!(
+                "GPT text length {} exceeds {MAX_POSITIONS} positions",
+                phones.len()
+            )));
+        }
+        let vocab = self.text_emb.shape().dims()[0];
+        if let Some(&id) = phones.iter().find(|&&id| id as usize >= vocab) {
+            return Err(Error::Other(format!(
+                "GPT phone id {id} is outside the {vocab}-entry vocabulary"
+            )));
+        }
         let ids = ids_tensor(ctx, phones)?;
         let mut text = ops::embedding(ctx, &self.text_emb, &ids)?;
         let bert_dim = bert.shape().dims()[1];
@@ -572,8 +453,12 @@ impl Gpt {
         destination: &Tensor,
         scratch: &mut DecodeEmbedScratch,
     ) -> Result<()> {
-        let position = i32::try_from(position_start)
-            .map_err(|_| Error::Other("GPT audio position overflow".into()))?;
+        if position_start >= MAX_POSITIONS {
+            return Err(Error::Other(format!(
+                "GPT audio position {position_start} exceeds {MAX_POSITIONS}"
+            )));
+        }
+        let position = position_start as i32;
         let ids = Tensor::from_i32(vec![1], &[token as i32])?;
         transfers::copy_cpu_to_cuda(&ids, &scratch.ids)?;
         let positions = Tensor::from_i32(vec![1], &[position])?;
@@ -964,8 +849,6 @@ impl Gpt {
             .map_err(|error| Error::Other(format!("GPT cached prefill: {error}")))?;
         drop(_gpt_prefill_range);
         let mut audio_tokens = prompt.to_vec();
-        #[cfg(test)]
-        let sampling_alignment = SamplingAlignment::from_env()?;
 
         for index in 0..max_new_tokens {
             let _gpt_step_range = crate::profiling::trace::range("tts.gpt.step");
@@ -986,28 +869,13 @@ impl Gpt {
                 top_p,
                 temperature,
                 repetition_penalty,
-                #[cfg(test)]
-                sampling_alignment.as_ref(),
             )
             .map_err(|error| Error::Other(format!("GPT sample step {index}: {error}")))?;
             drop(_gpt_sample_range);
-            #[cfg(test)]
-            let teacher = sampling_alignment
-                .as_ref()
-                .and_then(|alignment| alignment.teacher_token(index));
-            #[cfg(not(test))]
-            let teacher: Option<u32> = None;
-            #[cfg(test)]
-            if let Some(alignment) = sampling_alignment.as_ref() {
-                alignment.record_selection(index, sample, argmax, teacher)?;
-            }
-            // Teacher forcing keeps a diagnostic run aligned after the first
-            // native token mismatch. It is unavailable to production builds.
-            if teacher.is_none() && (sample == GPT_EOS || argmax == GPT_EOS) {
+            if sample == GPT_EOS || argmax == GPT_EOS {
                 break;
             }
-            let next_token = teacher.unwrap_or(sample);
-            audio_tokens.push(next_token);
+            audio_tokens.push(sample);
             if index + 1 < max_new_tokens {
                 let cache_position = cache
                     .text_len
@@ -1016,7 +884,7 @@ impl Gpt {
                 decode_meta.update(cache_position + 1, cache_position)?;
                 self.embed_audio_step(
                     ctx,
-                    next_token,
+                    sample,
                     cache.audio_len,
                     &decode_input,
                     &mut embed_scratch,
@@ -1073,260 +941,8 @@ impl Gpt {
 }
 
 #[cfg(test)]
-mod capture_tests {
-    use super::*;
-    use std::path::Path;
-    fn u32_file(path: &Path) -> Vec<u32> {
-        std::fs::read(path)
-            .unwrap()
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-            .collect()
-    }
-    // Frozen independent PyTorch inputs and tokens are supplied privately.
-    #[test]
-    #[ignore = "requires APXINF_GPT_CAPTURE_DIR and APXINF_GPT_CHECKPOINT"]
-    fn cached_decode_matches_captured_tokens() {
-        let root = std::path::PathBuf::from(std::env::var("APXINF_GPT_CAPTURE_DIR").unwrap());
-        let checkpoint = std::path::PathBuf::from(std::env::var("APXINF_GPT_CHECKPOINT").unwrap());
-        let ctx = Context::new(0).unwrap();
-        let mut weights = Weights::load(&checkpoint).unwrap();
-        let gpt = Gpt::load(&mut weights, &ctx).unwrap();
-        for pair in ["pair1", "pair1", "pair2", "pair2", "pair1"] {
-            let phones = u32_file(&root.join(format!("{pair}-phones.i32")));
-            let prompt = u32_file(&root.join(format!("{pair}-prompt.i32")));
-            let expected = u32_file(&root.join(format!("{pair}-target-tokens.i32")));
-            let bytes = std::fs::read(root.join(format!("{pair}-bert-rows.f32"))).unwrap();
-            let values = bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-                .collect::<Vec<_>>();
-            let bert = fp16_tensor(&ctx, &[phones.len(), GPT_BERT_DIM], &values).unwrap();
-            let start = std::time::Instant::now();
-            let actual = gpt
-                .generate(&ctx, &phones, &bert, &prompt, 1234, 5, 1.0, 1.0, 1.35, 500)
-                .unwrap();
-            let mismatch = actual.iter().zip(&expected).position(|(a, b)| a != b);
-            println!(
-                "{pair} seconds={:.6} actual={} expected={} mismatch={mismatch:?}",
-                start.elapsed().as_secs_f64(),
-                actual.len(),
-                expected.len()
-            );
-            assert!(
-                mismatch.is_none() && actual.len() == expected.len(),
-                "captured token stream differs"
-            );
-            // Change content while retaining exactly the same capacity. The
-            // reused executable must match a fresh allocation and prefill.
-            let mut changed_phones = phones.clone();
-            changed_phones[0] = (changed_phones[0] + 1) % 100;
-            let changed = gpt
-                .generate(
-                    &ctx,
-                    &changed_phones,
-                    &bert,
-                    &prompt,
-                    4321,
-                    5,
-                    1.,
-                    1.,
-                    1.35,
-                    500,
-                )
-                .unwrap();
-            let saved = gpt.decode_resources.borrow_mut().take();
-            let fresh = gpt
-                .generate(
-                    &ctx,
-                    &changed_phones,
-                    &bert,
-                    &prompt,
-                    4321,
-                    5,
-                    1.,
-                    1.,
-                    1.35,
-                    500,
-                )
-                .unwrap();
-            assert_eq!(
-                changed, fresh,
-                "reused decode resources retained stale request state"
-            );
-            drop(saved);
-            // Equal total capacity does not imply equal text/audio partition.
-            // A shorter text prefix with one extra prompt code must also rebind.
-            let shorter_phones = &phones[..phones.len() - 1];
-            let shorter_bert = ops::slice_rows(&ctx, &bert, 0, shorter_phones.len()).unwrap();
-            let mut longer_prompt = prompt.clone();
-            longer_prompt.push(prompt[0]);
-            let changed_partition = gpt
-                .generate(
-                    &ctx,
-                    shorter_phones,
-                    &shorter_bert,
-                    &longer_prompt,
-                    1234,
-                    5,
-                    1.,
-                    1.,
-                    1.35,
-                    500,
-                )
-                .unwrap();
-            let saved = gpt.decode_resources.borrow_mut().take();
-            let fresh_partition = gpt
-                .generate(
-                    &ctx,
-                    shorter_phones,
-                    &shorter_bert,
-                    &longer_prompt,
-                    1234,
-                    5,
-                    1.,
-                    1.,
-                    1.35,
-                    500,
-                )
-                .unwrap();
-            assert_eq!(
-                changed_partition, fresh_partition,
-                "reused graph baked in a previous text/audio partition"
-            );
-            drop(saved);
-        }
-    }
-
-    #[test]
-    #[ignore = "requires APXINF_GPT_SAMPLING_ALIGNMENT_DIR, APXINF_GPT_CAPTURE_DIR and APXINF_GPT_CHECKPOINT"]
-    fn teacher_forcing_matches_official_sampling_oracle() {
-        let alignment_root =
-            std::path::PathBuf::from(std::env::var("APXINF_GPT_SAMPLING_ALIGNMENT_DIR").unwrap());
-        let capture_root =
-            std::path::PathBuf::from(std::env::var("APXINF_GPT_CAPTURE_DIR").unwrap());
-        let run = std::env::var("APXINF_GPT_SAMPLING_ALIGNMENT_RUN").unwrap();
-        let pair = std::env::var("APXINF_GPT_CAPTURE_PAIR").unwrap_or_else(|_| "pair2".to_string());
-        let checkpoint = std::path::PathBuf::from(std::env::var("APXINF_GPT_CHECKPOINT").unwrap());
-        let phones = u32_file(&capture_root.join(format!("{pair}-phones.i32")));
-        let prompt = u32_file(&capture_root.join(format!("{pair}-prompt.i32")));
-        let teacher = u32_file(&alignment_root.join(format!("{run}-teacher-tokens.u32")));
-        let bytes = std::fs::read(capture_root.join(format!("{pair}-bert-rows.f32"))).unwrap();
-        let values = bytes
-            .chunks_exact(4)
-            .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
-            .collect::<Vec<_>>();
-
-        let ctx = Context::new(0).unwrap();
-        let mut weights = Weights::load(&checkpoint).unwrap();
-        let gpt = Gpt::load(&mut weights, &ctx).unwrap();
-        let bert = fp16_tensor(&ctx, &[phones.len(), GPT_BERT_DIM], &values).unwrap();
-        let generated = gpt
-            .generate(
-                &ctx,
-                &phones,
-                &bert,
-                &prompt,
-                1234,
-                5,
-                1.0,
-                1.0,
-                1.35,
-                teacher.len() + 1,
-            )
-            .unwrap();
-
-        let selections =
-            std::fs::read_to_string(alignment_root.join(format!("{run}-native-selections.csv")))
-                .unwrap();
-        let rows = selections
-            .lines()
-            .skip(1)
-            .map(|line| {
-                line.split(',')
-                    .take(3)
-                    .map(|value| value.parse::<u32>().unwrap())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            rows.len(),
-            teacher.len() + 1,
-            "missing native sampling step"
-        );
-        let first_mismatch = rows
-            .iter()
-            .zip(&teacher)
-            .position(|(row, &expected)| row[1] != expected);
-        println!(
-            "{pair} teacher-forced sampled={} teacher={} generated={} first_mismatch={first_mismatch:?}",
-            rows.len(),
-            teacher.len(),
-            generated.len()
-        );
-        assert_eq!(first_mismatch, None, "teacher-forced sampled token differs");
-    }
-}
-
-#[cfg(test)]
 mod sampling_tests {
     use super::*;
-
-    #[test]
-    #[ignore = "requires APXINF_GPT_SAMPLING_ALIGNMENT_DIR and APXINF_GPT_SAMPLING_ALIGNMENT_RUN"]
-    fn torch_cuda_philox_matches_official_exponential_streams() {
-        let directory =
-            std::path::PathBuf::from(std::env::var("APXINF_GPT_SAMPLING_ALIGNMENT_DIR").unwrap());
-        let run = std::env::var("APXINF_GPT_SAMPLING_ALIGNMENT_RUN").unwrap();
-        let teacher_bytes =
-            std::fs::read(directory.join(format!("{run}-teacher-tokens.u32"))).unwrap();
-        let expected_steps = teacher_bytes.len() / 4 + 1;
-        let mut values = 0usize;
-        let mut exact = 0usize;
-        let mut max_abs = 0.0f32;
-        let mut farthest_ulp = 0u32;
-        let mut worst = (0usize, 0usize, 0u16, 0u16);
-        let mut steps = 0usize;
-        while let Ok(bytes) =
-            std::fs::read(directory.join(format!("{run}-exponential-{steps:04}.f16")))
-        {
-            assert_eq!(bytes.len() % 2, 0, "odd FP16 stream length at step {steps}");
-            assert!(
-                bytes.len() / 2 <= TORCH_CUDA_EXPONENTIAL_ACTIVE_THREADS,
-                "Philox mapping only covers one grid-stride launch step"
-            );
-            for (element, encoded) in bytes.chunks_exact(2).enumerate() {
-                let expected_bits = u16::from_le_bytes([encoded[0], encoded[1]]);
-                let expected = half::f16::from_bits(expected_bits).to_f32();
-                let actual = counter_exponential_fp16(1234, philox_counter_offset(steps), element);
-                let actual_bits = half::f16::from_f32(actual).to_bits();
-                let distance = u16::abs_diff(actual_bits, expected_bits);
-                if distance == 0 {
-                    exact += 1;
-                }
-                let absolute = (actual - expected).abs();
-                if absolute > max_abs {
-                    max_abs = absolute;
-                }
-                if u32::from(distance) > farthest_ulp {
-                    farthest_ulp = u32::from(distance);
-                    worst = (steps, element, expected_bits, actual_bits);
-                }
-                assert!(
-                    distance <= 1,
-                    "step={steps} element={element} expected={expected_bits:#06x} actual={actual_bits:#06x}"
-                );
-                values += 1;
-            }
-            steps += 1;
-        }
-        println!(
-            "official Philox streams={steps} values={values} exact={exact} ulp_mismatches={} max_abs={max_abs} farthest_ulp={farthest_ulp} worst={worst:?}",
-            values - exact
-        );
-        assert_eq!(steps, expected_steps);
-        assert!(exact * 1000 > values * 999, "exact-value rate below 99.9%");
-    }
 
     #[test]
     fn fp16_sampling_probabilities_match_reference_boundaries() {

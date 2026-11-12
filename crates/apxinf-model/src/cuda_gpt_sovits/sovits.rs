@@ -4,8 +4,7 @@ use apxinf_core::{Error, Result, Tensor};
 use apxinf_cuda_new::CudaContext as Context;
 
 use super::config::{
-    SOVITS_DECODER, SOVITS_FF, SOVITS_HEADS, SOVITS_HIDDEN, SOVITS_INTER, SOVITS_WINDOW,
-    SOVITS_WN_LAYERS,
+    SOVITS_DECODER, SOVITS_HEADS, SOVITS_HIDDEN, SOVITS_INTER, SOVITS_WINDOW, SOVITS_WN_LAYERS,
 };
 use super::ops;
 use super::weights::{ids_tensor, Linear, Weights};
@@ -592,14 +591,6 @@ impl Sovits {
         };
         self.wn.forward(ctx, &bridged, ge)
     }
-}
-
-pub fn hidden() -> usize {
-    SOVITS_HIDDEN
-}
-
-pub fn ff() -> usize {
-    SOVITS_FF
 }
 
 // Immutable row maps are created before capture and retained by the graph.
