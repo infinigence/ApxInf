@@ -14,6 +14,44 @@ const EPS: f32 = 1e-6;
 /// 64 tokens), where MPP no longer reproduces it.
 pub const MPP_MIN_TOKENS: usize = 1024;
 
+/// Steps that step reuse may skip: all but the first and last tenth, and never
+/// step 0, which has no previous velocity.
+fn reusable(steps: usize) -> std::ops::Range<usize> {
+    let protected = steps / 10;
+    protected.max(1)..steps - protected
+}
+
+/// How many steps a reuse fraction skips: `round(fraction * steps)`, ties to
+/// even. `None` unless that is at least one and at most every reusable step.
+pub fn reused_step_count(fraction: f32, steps: usize) -> Option<usize> {
+    let count = (f64::from(fraction) * steps as f64).round_ties_even();
+    (count >= 1.0 && count <= reusable(steps).len() as f64).then_some(count as usize)
+}
+
+/// Marks the `count` reusable steps whose timestep embedding moved least from
+/// the previous step's, from row-major per-step embeddings `[steps, dim]`. The
+/// embeddings depend only on the sigma schedule, so the selection is fixed for
+/// a given size and step count and ignores the prompt, the seed and the image.
+fn reused_steps(embeddings: &[f32], dim: usize, count: usize) -> Vec<bool> {
+    let steps = embeddings.len() / dim;
+    let row = |i: usize| &embeddings[i * dim..(i + 1) * dim];
+    let distance = |i: usize| -> f32 {
+        let squared: f64 = row(i)
+            .iter()
+            .zip(row(i - 1))
+            .map(|(&a, &b)| f64::from(a - b).powi(2))
+            .sum();
+        (squared as f32).sqrt()
+    };
+    let mut eligible: Vec<(f32, usize)> = reusable(steps).map(|i| (distance(i), i)).collect();
+    eligible.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut reused = vec![false; steps];
+    for &(_, i) in eligible.iter().take(count) {
+        reused[i] = true;
+    }
+    reused
+}
+
 pub struct Dit {
     w: Transformer,
     qk: InterleavedQkNormRope,
@@ -56,15 +94,23 @@ impl Dit {
         }
     }
 
-    /// `Qwen21TimeTextEmbed` for FP32 timestep rows `[2]`: BF16 `[2, 4096]`.
+    /// `Qwen21TimeTextEmbed` for FP32 timestep rows `[n]`: BF16 `[n, 4096]`.
     fn time_embedding(&self, rows: &Array) -> Result<Array> {
         let args = rows
-            .reshape(&[2, 1])?
+            .reshape(&[rows.numel(), 1])?
             .mul(&self.ops.f32(1000.0)?)?
             .mul(&self.freqs)?;
         let projected = Array::concat(&[&args.cos()?, &args.sin()?], 1)?.cast(MlxDType::BF16)?;
         let hidden = self.ops.silu(&self.w.time_1.apply(&projected)?)?;
         self.w.time_2.apply(&hidden)
+    }
+
+    /// The `count` steps that reuse the previous velocity, for FP32 step
+    /// sigmas `[steps]`.
+    pub fn reused_steps(&self, step_sigmas: &Array, count: usize) -> Result<Vec<bool>> {
+        let embeddings = self.time_embedding(step_sigmas)?;
+        let dim = embeddings.shape()[1];
+        Ok(reused_steps(&embeddings.to_f32_vec()?, dim, count))
     }
 
     /// Shared modulation split into `(mod1, mod2)` rows `[2, 8192]`.
@@ -254,5 +300,53 @@ impl Step {
 
     pub fn call(&self, inputs: &[Array]) -> Result<Array> {
         Ok(self.compiled.call(inputs)?.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reused(selection: &[bool]) -> Vec<usize> {
+        (0..selection.len()).filter(|&i| selection[i]).collect()
+    }
+
+    /// Scalar embeddings whose consecutive distances are the listed values.
+    fn embeddings(distances: &[f32]) -> Vec<f32> {
+        distances.iter().fold(vec![0.0], |mut rows, &d| {
+            rows.push(rows.last().unwrap() + d);
+            rows
+        })
+    }
+
+    #[test]
+    fn reuse_picks_the_smallest_moves_outside_the_protected_steps() {
+        // Twelve steps protect one at each end. The smallest move, into the
+        // last step, is protected.
+        let distances = [4.0, 3.5, 0.5, 3.0, 0.6, 2.0, 0.7, 6.0, 0.8, 5.0, 0.1];
+        let selection = reused_steps(&embeddings(&distances), 1, 3);
+        assert_eq!(reused(&selection), [3, 5, 7]);
+    }
+
+    #[test]
+    fn reuse_never_selects_the_first_or_last_tenth() {
+        let distances: Vec<f32> = (1..40).map(|i| i as f32).collect();
+        let selection = reused_steps(&embeddings(&distances), 1, 32);
+        assert_eq!(reused(&selection), (4..36).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn reuse_count_rounds_ties_to_even_within_the_reusable_steps() {
+        assert_eq!(reused_step_count(0.25, 40), Some(10));
+        // 0.25 * 10 = 2.5; rounding half away from zero would give 3.
+        assert_eq!(reused_step_count(0.25, 10), Some(2));
+        // 0.01 * 40 rounds to no step; 0.8125 * 40 = 32.5 rounds to 32.
+        assert_eq!(reused_step_count(0.01, 40), None);
+        assert_eq!(reused_step_count(0.025, 40), Some(1));
+        assert_eq!(reused_step_count(0.8125, 40), Some(32));
+        assert_eq!(reused_step_count(0.83, 40), None);
+        for fraction in [0.0, -0.25, 1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(reused_step_count(fraction, 40), None, "{fraction}");
+        }
     }
 }

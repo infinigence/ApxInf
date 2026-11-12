@@ -176,8 +176,9 @@ fn probed_gemm(stream: &Stream) -> Option<MppBf16GemmNt> {
     }
 }
 
-/// Request admission, before any device work.
-fn admit_request(request: &ImageRequest<'_>) -> Result<()> {
+/// Request admission, before any device work. Returns how many steps reuse the
+/// previous velocity.
+fn admit_request(request: &ImageRequest<'_>) -> Result<Option<usize>> {
     if request.prompt.trim().is_empty() {
         return Err(Error::Contract("Qwen-Image needs a nonempty prompt"));
     }
@@ -199,7 +200,14 @@ fn admit_request(request: &ImageRequest<'_>) -> Result<()> {
             "Qwen-Image supports exactly 40 denoising steps",
         ));
     }
-    Ok(())
+    request
+        .step_reuse_fraction
+        .map(|fraction| {
+            dit::reused_step_count(fraction, request.steps).ok_or(Error::Contract(
+                "Qwen-Image step reuse fraction must round to between 1 and 32 of the 40 steps",
+            ))
+        })
+        .transpose()
 }
 
 /// `LinearScheduler` sigmas with the Qwen-Image-2.1 shift and terminal
@@ -267,7 +275,7 @@ fn rope(
 
 impl ImageRuntime for QwenImage {
     fn generate(&mut self, request: &ImageRequest<'_>) -> Result<GeneratedImage> {
-        admit_request(request)?;
+        let reuse_count = admit_request(request)?;
         let ops = &self.ops;
         let stream = ops.stream();
         let (width, height) = (request.width, request.height);
@@ -302,16 +310,19 @@ impl ImageRuntime for QwenImage {
         );
         latents.eval()?;
         let sigma = |i: usize| sigmas.slice(&[i], &[i + 1]);
-        let (step, first) = dit::Step::prepare(
+        let reused = match reuse_count {
+            Some(count) => dit.reused_steps(&sigmas.slice(&[0], &[request.steps])?, count)?,
+            None => vec![false; request.steps],
+        };
+        let (step, mut velocity) = dit::Step::prepare(
             dit,
             &dit::Step::inputs(&latents, &sigma(0)?, &cos, &sin, &cache),
         )?;
-        let mut first = Some(first);
-        for t in 0..request.steps {
-            let velocity = match first.take() {
-                Some(velocity) => velocity,
-                None => step.call(&dit::Step::inputs(&latents, &sigma(t)?, &cos, &sin, &cache))?,
-            };
+        for (t, &reuse) in reused.iter().enumerate() {
+            if t > 0 && !reuse {
+                velocity =
+                    step.call(&dit::Step::inputs(&latents, &sigma(t)?, &cos, &sin, &cache))?;
+            }
             let dt = sigma(t + 1)?
                 .sub(&sigma(t)?)?
                 .reshape(&[])?
@@ -354,6 +365,7 @@ mod tests {
             height: 1024,
             seed: 7,
             steps: STEPS,
+            step_reuse_fraction: None,
         };
         for (width, height) in [
             (16, 16),
@@ -448,6 +460,7 @@ mod tests {
             height: 576,
             seed: 7,
             steps: STEPS,
+            step_reuse_fraction: None,
         };
         assert!(admit_request(&request).is_ok());
         for bad in [
@@ -473,6 +486,50 @@ mod tests {
             },
         ] {
             assert!(admit_request(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn step_reuse_admits_fractions_that_reuse_between_1_and_32_steps() {
+        let request = |fraction| ImageRequest {
+            prompt: "a red bicycle",
+            width: 512,
+            height: 512,
+            seed: 7,
+            steps: STEPS,
+            step_reuse_fraction: Some(fraction),
+        };
+        for (fraction, count) in [(0.025, 1), (0.25, 10), (0.5, 20), (0.8, 32)] {
+            assert_eq!(
+                admit_request(&request(fraction)).ok(),
+                Some(Some(count)),
+                "fraction {fraction}"
+            );
+        }
+        assert_eq!(
+            admit_request(&ImageRequest {
+                step_reuse_fraction: None,
+                ..request(0.25)
+            })
+            .ok(),
+            Some(None)
+        );
+        for fraction in [
+            0.0,
+            -0.0,
+            -0.25,
+            0.01,
+            0.9,
+            1.0,
+            1.5,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert!(
+                matches!(admit_request(&request(fraction)), Err(Error::Contract(_))),
+                "admitted {fraction}"
+            );
         }
     }
 

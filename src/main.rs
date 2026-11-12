@@ -200,6 +200,10 @@ enum Commands {
         #[arg(long, default_value_t = 40)]
         steps: usize,
 
+        /// Fraction of steps that reuse the previous velocity; changes the image
+        #[arg(long)]
+        step_reuse_fraction: Option<f32>,
+
         /// Output file (binary PPM, P6)
         #[arg(short, long)]
         output: PathBuf,
@@ -382,6 +386,7 @@ fn main() {
             height,
             seed,
             steps,
+            step_reuse_fraction,
             output,
             device,
         } => {
@@ -391,6 +396,7 @@ fn main() {
                 height,
                 seed,
                 steps,
+                step_reuse_fraction,
             };
             let result = parse_device(&device).and_then(|device| {
                 run_generate_image(
@@ -616,6 +622,33 @@ mod device_tests {
     }
 
     #[test]
+    fn image_cli_step_reuse_is_off_unless_requested() {
+        let parse = |extra: &[&str]| {
+            let mut arguments = vec![
+                "apxinf",
+                "generate-image",
+                "--model",
+                "/checkpoint",
+                "--prompt",
+                "a red bicycle",
+                "--output",
+                "image.ppm",
+            ];
+            arguments.extend_from_slice(extra);
+            let Commands::GenerateImage {
+                step_reuse_fraction,
+                ..
+            } = Cli::try_parse_from(arguments).unwrap().command
+            else {
+                panic!("expected generate-image command");
+            };
+            step_reuse_fraction
+        };
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&["--step-reuse-fraction", "0.25"]), Some(0.25));
+    }
+
+    #[test]
     fn image_cli_preserves_default_and_auto_variants() {
         for variant in [None, Some("auto")] {
             let mut arguments = vec![
@@ -647,6 +680,7 @@ mod device_tests {
             height: 512,
             seed: 7,
             steps: 40,
+            step_reuse_fraction: None,
         };
         let error = run_generate_image(
             &"/missing-qwen-image-checkpoint".into(),
