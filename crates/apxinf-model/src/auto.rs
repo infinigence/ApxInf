@@ -50,8 +50,9 @@ pub struct LoadOptions {
     /// `config.json:model_type`.
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
-    /// auto, bf16, fp8_static and int8_dynamic. Native Metal families parse
-    /// their own variants. Other families migrate separately.
+    /// auto, bf16, fp8_static and int8_dynamic on CUDA; auto/fp32_reference on CPU.
+    /// Native Metal families parse their own variants. Every VLA family accepts
+    /// this option; legacy executors adapt it inside their own loader.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
@@ -346,6 +347,17 @@ impl LoadedModel {
         self.vla()?.infer_action_tokens(request, stop_token)
     }
 
+    /// Token-only inference with a request limit bounded by model capacity.
+    pub fn infer_action_tokens_with_limit(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        self.vla()?
+            .infer_action_tokens_with_limit(request, stop_token, max_new_tokens)
+    }
+
     pub fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
         self.vla()?.calibration_amax(request)
     }
@@ -486,6 +498,10 @@ impl AutoModel {
         }
 
         if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip" | "pi05-musa") {
+            if device == Device::Cpu && model_name == "pi05" {
+                let config = options.config.as_ref().map(cpu_pi05_config);
+                return crate::cpu_pi05::load(path, options, config);
+            }
             #[cfg(feature = "hip")]
             if matches!(device, Device::Hip(_)) {
                 let config = options.config.as_ref().map(hip_pi05_config);
@@ -503,7 +519,7 @@ impl AutoModel {
 
             #[cfg(not(feature = "cuda"))]
             return Err(Error::Other(
-                "PI0.5 requires CUDA, HIP or MUSA support".into(),
+                "PI0.5 requires CPU, CUDA, HIP or MUSA support".into(),
             ));
         }
 
@@ -649,6 +665,43 @@ fn metal_registry_name(model_name: &str) -> String {
 }
 
 /// A frontend's PI0.5 overrides (`LoadOptions::config`, the CUDA family's
+/// type) as the CPU port's own config. Lives here, outside both families, so
+/// neither imports the other.
+fn cpu_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::cpu_pi05::Config {
+    let gemma = |g: &crate::pi05::GemmaVariantConfig| crate::cpu_pi05::config::GemmaConfig {
+        width: g.width,
+        depth: g.depth,
+        mlp_dim: g.mlp_dim,
+        num_heads: g.num_heads,
+        num_kv_heads: g.num_kv_heads,
+        head_dim: g.head_dim,
+    };
+    crate::cpu_pi05::Config {
+        action_dim: frontend.action_dim,
+        action_horizon: frontend.action_horizon,
+        max_token_len: frontend.max_token_len,
+        num_flow_steps: frontend.num_flow_steps,
+        flow_start_time: frontend.flow_start_time,
+        num_views: frontend.num_views,
+        image_size: frontend.image_size,
+        patch_size: frontend.patch_size,
+        vision_width: frontend.vision_width,
+        vision_depth: frontend.vision_depth,
+        vision_mlp_dim: frontend.vision_mlp_dim,
+        vision_heads: frontend.vision_heads,
+        vision_head_dim: frontend.vision_head_dim,
+        vocab_size: frontend.vocab_size,
+        rms_norm_eps: frontend.rms_norm_eps,
+        layer_norm_eps: frontend.layer_norm_eps,
+        rope_theta: frontend.rope_theta,
+        time_min_period: frontend.time_min_period,
+        time_max_period: frontend.time_max_period,
+        language: gemma(&frontend.language),
+        action_expert: gemma(&frontend.action_expert),
+    }
+}
+
+/// A frontend's PI0.5 overrides (`LoadOptions::config`, the CUDA family's
 /// type) as the HIP port's own config. Lives here, outside both families, so
 /// neither imports the other.
 #[cfg(feature = "hip")]
@@ -744,7 +797,19 @@ fn family_name(model_name: &str) -> &str {
 fn supports_model_variant(model_name: &str, device: Device) -> bool {
     matches!(
         family_name(model_name),
-        "pi05" | "qwen_drive" | "d3" | "smolvla" | "smolvla_libero"
+        "pi05"
+            | "qwen_drive"
+            | "d3"
+            | "walloss"
+            | "wall-oss"
+            | "wall_oss_05"
+            | "gr00t"
+            | "gr00t_n1_7"
+            | "Gr00tN1d7"
+            | "pi0_fast"
+            | "pi0fast"
+            | "smolvla"
+            | "smolvla_libero"
     ) || matches!(device, Device::Metal(_))
 }
 #[cfg(test)]
@@ -914,6 +979,22 @@ mod tests {
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
         assert!(supports_model_variant("smolvla", Device::Cuda(0)));
         assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
+        for name in [
+            "walloss",
+            "walloss-cuda",
+            "wall-oss",
+            "wall_oss_05-cuda",
+            "gr00t",
+            "gr00t-cuda",
+            "Gr00tN1d7",
+            "gr00t_n1_7-cuda",
+            "pi0_fast",
+            "pi0_fast-cuda",
+            "pi0fast",
+            "pi0fast-cuda",
+        ] {
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
     }
 
     /// A backend qualifier names the backend the caller meant, not a different

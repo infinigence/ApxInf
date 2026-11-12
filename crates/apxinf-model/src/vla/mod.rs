@@ -384,6 +384,22 @@ pub trait VlaRuntime {
         ))
     }
 
+    /// Bound token generation per request without changing the model's cache capacity.
+    /// With no stop token, a supporting runtime emits exactly `max_new_tokens` ids.
+    fn infer_action_tokens_with_limit(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        if max_new_tokens.is_some() {
+            return Err(Error::Other(
+                "this VLA runtime does not support a token limit".into(),
+            ));
+        }
+        self.infer_action_tokens(request, stop_token)
+    }
+
     /// Collect named BF16 activation maxima for an FP8 calibration profile.
     fn calibration_amax(&self, _request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
         Err(Error::Other(
