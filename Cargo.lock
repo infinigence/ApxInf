@@ -104,6 +104,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "apxinf-coreml"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "cc",
+ "half",
+ "prost",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "apxinf-cuda-new"
 version = "0.1.0"
 dependencies = [
