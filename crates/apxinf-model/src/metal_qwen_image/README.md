@@ -44,6 +44,9 @@ Select it from the CLI with `generate-image --model-variant reference`.
   and file sizes only, preserving layer-at-a-time payload loading.
 - `text.rs` applies the fixed system template, drops the system-prefix states
   and follows Qwen3-VL's FP32 norm, BF16 RoPE and FP32 attention rounding.
+  Attention uses MLX's causal flag instead of an additive `-inf` mask; tests
+  check that the two produce identical bytes on CPU and, ignored by default,
+  on Metal.
 - `dit.rs` computes the text-prefix K/V once per request with the t = 0
   modulation row. The pure image-token forward is explicitly prepared twice
   on the actual first-step inputs. Its second evaluated velocity supplies the
