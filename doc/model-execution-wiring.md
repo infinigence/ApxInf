@@ -21,6 +21,13 @@ prepare static metadata, submit fixed control flow and receive results. CPU
 intermediate computation and D2H/H2D round trips remain private correctness
 scaffolds and must be replaced before port completion.
 
+The requesting Metal maintainer accepted a limited fixed-profile Clef GPU+ANE
+boundary on 2026-10-19. Its native Core ML execution and permitted host work
+are defined only by the [scoped handoff decision](coreml-ane.md#scoped-host-handoff-decision).
+All placement, transfer, numerical, performance, preparation, resource and
+lifetime evidence there remains required. This does not relax GPU-only or
+CUDA acceptance, authorize other host operators or qualify either composition.
+
 For native Qwen3-TTS CustomVoice only, the requesting Metal maintainer accepted
 a one-Boolean EOS stopping boundary on 2026-10-19. Its exact scope and unchanged
 gates are defined in the [family decision](../crates/apxinf-model/src/metal_qwen3_tts/README.md#scoped-eos-control-boundary).
