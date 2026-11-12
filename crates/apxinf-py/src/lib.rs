@@ -2043,6 +2043,16 @@ mod tests {
             }
         }
 
+        fn code_runner(output: apxinf_core::Result<DecisionOutput>) -> DecisionRunner {
+            DecisionRunner {
+                model: LoadedModel::Decision(DecisionModel::Code(Box::new(StubCodeRuntime {
+                    output: Some(output),
+                }))),
+                device: Device::Cpu,
+                model_path: PathBuf::from("/unused-checkpoint"),
+            }
+        }
+
         fn schema_output() -> SchemaDecisionOutput {
             SchemaDecisionOutput {
                 answers: vec![
@@ -2130,19 +2140,7 @@ mod tests {
                         },
                     ],
                 };
-                let runner = Py::new(
-                    py,
-                    DecisionRunner {
-                        model: LoadedModel::Decision(DecisionModel::Code(Box::new(
-                            StubCodeRuntime {
-                                output: Some(Ok(output)),
-                            },
-                        ))),
-                        device: Device::Cpu,
-                        model_path: PathBuf::from("/unused-checkpoint"),
-                    },
-                )
-                .unwrap();
+                let runner = Py::new(py, code_runner(Ok(output))).unwrap();
                 let token_ids = vec![17u32, 42].into_pyarray_bound(py);
                 let result = runner
                     .bind(py)
@@ -2158,6 +2156,45 @@ mod tests {
                     Some(&locals),
                 )
                 .unwrap();
+            });
+        }
+
+        #[test]
+        fn decision_protocol_rejects_the_wrong_python_method() {
+            pyo3::prepare_freethreaded_python();
+            Python::with_gil(|py| {
+                let schema = Py::new(py, schema_runner(Ok(schema_output()))).unwrap();
+                let token_ids = vec![17u32, 42].into_pyarray_bound(py);
+                let error = schema
+                    .bind(py)
+                    .call_method1("decide", (token_ids, 2))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyRuntimeError>(py), "{error}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("decision model takes schema requests, not encoded prompts"),
+                    "{error}"
+                );
+
+                let code = Py::new(
+                    py,
+                    code_runner(Err(apxinf_core::Error::Other(
+                        "unexpected code inference".into(),
+                    ))),
+                )
+                .unwrap();
+                let error = code
+                    .bind(py)
+                    .call_method1("decide_schema", (REQUEST,))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyRuntimeError>(py), "{error}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("decision model takes encoded prompts, not schema requests"),
+                    "{error}"
+                );
             });
         }
 
