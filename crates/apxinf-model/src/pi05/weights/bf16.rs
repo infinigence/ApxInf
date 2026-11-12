@@ -75,7 +75,8 @@ mod linear {
     }
 
     pub fn bf16_to_device(tensor: &Tensor, context: &Context) -> Result<Tensor> {
-        backend::to_device(context, &to_bf16_host(tensor)?)
+        let host = to_bf16_host(tensor)?;
+        backend::to_device(context, host.as_ref())
     }
 
     fn concat_biases_bf16(tensors: &[&Tensor]) -> Result<Tensor> {
