@@ -1,9 +1,9 @@
 pub(crate) mod activation;
 pub(crate) mod attention;
 pub(crate) mod cache;
+pub(crate) mod conv1d;
 pub(crate) mod elementwise;
 pub(crate) mod embedding;
-pub(crate) mod conv1d;
 pub(crate) mod gather;
 pub(crate) mod gdn;
 pub(crate) mod gemm;
