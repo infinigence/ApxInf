@@ -59,6 +59,10 @@ entry from the compiler cache of the thread that created it. Dropping a Rust
 `Compiled` uses that ownership path;
 the bridge does not clear other functions' compiler caches.
 
+`Stream::async_eval` enqueues evaluation and returns, so host work such as a
+Neural Engine prediction overlaps the GPU; a later evaluation, download or
+dependent operation waits for it.
+
 `Stream::counters()` snapshots cumulative trace callbacks, explicit upload and
 download bytes, and evaluation boundaries (including downloads). Cloned streams
 share counters; separate logical streams do not. Byte counters report bridge

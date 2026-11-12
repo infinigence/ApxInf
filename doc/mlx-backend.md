@@ -59,12 +59,24 @@ combinations fail at construction with an explicit error.
 `LlmTrait::forward` retains its full `[seq_len, vocab_size]` logits contract.
 The generation-oriented `prefill(LlmInput)` hook may consume the whole prompt
 and return only `[1, vocab_size]`. Qwen3 uses cache-only prefix chunks of at
-most 512 followed by a final-token forward; MiniCPM5 projects only the final
-normalized prompt row. Call `forward` for every input row's logits. Ordinary
+most 512 followed by a final-token forward; MiniCPM5 uses 512-token chunks above
+4096 prompt tokens and projects the final normalized row of each chunk.
+Long preparation advertises bounded chunk shapes, not a full prompt-sized
+forward. Call `forward` on an admitted shape for every input row's logits. Ordinary
 generation uses the shared sampler/EOS loop; DSpark overrides the request-level
 generation schedule. The infallible `reset`/`prewarm_decode` hooks cannot
 swallow MLX failures: use a fallible family preparation method, or retain an
 invalidated error returned by the next fallible call.
+
+Compiled Qwen3 and ordinary compiled MiniCPM5 use one-step greedy lookahead.
+`greedy_token_arrays` produces an in-vocabulary device ID and a checked ID with
+an invalid-logits sentinel. `mlx_decode.rs` submits only the next checked ID
+with `async_eval` before reading the current checked ID with
+`to_bytes_ready`. The latter waits only for that array. Stop/error cleanup drains
+the stream; EOS/cancellation then trims the unused logical position. No KV
+snapshot is retained. `APXINF_MLX_SYNC_DECODE=1` selects the synchronous fallback.
+Async generation profiles include callback wall time and the final drain, since
+callbacks can overlap GPU execution. Other variants keep their existing schedule.
 
 Keep `LlmTrait` and `VlaRuntime` distinct. A small text model may retain the
 existing `config.rs`, `weights.rs`, `general.rs` organization. A VLA uses its
@@ -97,12 +109,12 @@ selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
 
 | Family selection | Profile admitted by current code | Actual prepared execution |
 | --- | --- | --- |
-| Qwen3 `bf16-public` | Qwen3-0.6B BF16, B1, up to 2048 positions | Ordered device composition; source public SwiGLU remains locally compiled |
+| Qwen3 `bf16-public` | Qwen3-0.6B BF16, B1, up to 40960 total positions | Ordered device composition; source public SwiGLU remains locally compiled |
 | Qwen3 `bf16-compiled` (default) | Same profile | Local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
 | Qwen3 `mixed-w8` | Same profile; affine W8/group 64 | Transformer projections use W8 at M1 and BF16 for larger M; fused gate/up; the tied input/output table is packed at every M; local norm/RoPE and fixed Q/K norm-to-RoPE Metal fusion; no BF16 decoder-block callable |
-| MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 4096 positions | Ordered device composition; source public SwiGLU remains locally compiled |
+| MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 65792 total positions, including 65536 prompt + 256 output | Ordered device composition; source public SwiGLU remains locally compiled |
 | MiniCPM5 `bf16-compiled` (default) | Same profile | Local norm/RoPE and complete decode-step compilation, including the packed residual/RMSNorm kernel |
-| MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within the context profile | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
+| MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within a separate 4096-total-position limit | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
 
 These rows describe implemented scopes, not qualified targets. The maintained
 owners are [Qwen3](../crates/apxinf-model/src/metal_qwen3/README.md) and
@@ -111,6 +123,12 @@ arrays and guarded fusions in [apxinf-mlx](../crates/apxinf-mlx/README.md).
 Qwen3 reads `head_dim` explicitly (128, although hidden/heads is 64). MiniCPM5's
 official `model_type` is `llama`, so select `--model-name metal_minicpm5` explicitly.
 DSpark requires the named `draft` asset and is never selected by default.
+
+The MLX allocator cache budget is process-wide and belongs to the embedding
+application, applied once before model loading. A cache limit does not cap
+active tensors or physical process memory. MiniCPM5 64K qualification on the
+16 GiB M4 uses `2147483648` bytes with the external 12 GiB physical-memory guard.
+Family modules do not change process-wide allocator policy.
 
 ```sh
 cargo run --features mlx -- generate --model /path/to/Qwen3-0.6B \
