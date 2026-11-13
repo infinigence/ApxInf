@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cuda_fp8.h>
+#include <type_traits>
 
 extern "C" cudaError_t apxinf_norm_rms_norm_f16(
     const void* input, const void* weight, void* output, int rows, int cols,
@@ -94,8 +95,14 @@ bool valid_alignment(uint32_t alignment) {
          (alignment & (alignment - 1)) == 0;
 }
 
+bool channel_update(const apxinf_norm_spec_t& spec) {
+  return spec.operation == APXINF_NORM_OPERATION_BIAS_NORM_SILU ||
+         spec.operation == APXINF_NORM_OPERATION_FUSED_ADD_NORM_SILU;
+}
+
 bool writes_hidden(const apxinf_norm_spec_t& spec) {
-  return spec.operation != APXINF_NORM_OPERATION_NORM;
+  return spec.operation == APXINF_NORM_OPERATION_FUSED_ADD_NORM ||
+         spec.operation == APXINF_NORM_OPERATION_RESIDUAL_ADD || channel_update(spec);
 }
 
 bool writes_normalized(const apxinf_norm_spec_t& spec) {
@@ -103,7 +110,7 @@ bool writes_normalized(const apxinf_norm_spec_t& spec) {
 }
 
 bool reads_residual(const apxinf_norm_spec_t& spec) {
-  return writes_hidden(spec);
+  return writes_hidden(spec) && spec.operation != APXINF_NORM_OPERATION_BIAS_NORM_SILU;
 }
 
 bool reads_weight(const apxinf_norm_spec_t& spec) {
@@ -136,6 +143,14 @@ bool is_contract(const apxinf_norm_spec_t& spec, uint32_t operation,
 
 bool valid_contract(const apxinf_norm_spec_t& spec) {
   return
+      (channel_update(spec) && spec.statistic == APXINF_NORM_STATISTIC_CHANNEL_L2 &&
+       spec.affine == APXINF_NORM_AFFINE_WEIGHT && spec.gate == APXINF_NORM_GATE_NONE) ||
+      is_contract(spec, APXINF_NORM_OPERATION_NORM_SILU,
+                  APXINF_NORM_STATISTIC_CHANNEL_L2, APXINF_NORM_AFFINE_WEIGHT,
+                  APXINF_NORM_GATE_NONE) ||
+      is_contract(spec, APXINF_NORM_OPERATION_NORM,
+                  APXINF_NORM_STATISTIC_CHANNEL_L2, APXINF_NORM_AFFINE_WEIGHT,
+                  APXINF_NORM_GATE_NONE) ||
       is_contract(spec, APXINF_NORM_OPERATION_NORM,
                   APXINF_NORM_STATISTIC_RMS, APXINF_NORM_AFFINE_WEIGHT,
                   APXINF_NORM_GATE_NONE) ||
@@ -165,10 +180,49 @@ bool valid_contract(const apxinf_norm_spec_t& spec) {
                   APXINF_NORM_GATE_STYLE) ||
       is_contract(spec, APXINF_NORM_OPERATION_FUSED_ADD_NORM,
                   APXINF_NORM_STATISTIC_LAYER,
-                  APXINF_NORM_AFFINE_ADAPTIVE, APXINF_NORM_GATE_NONE);
+                  APXINF_NORM_AFFINE_ADAPTIVE, APXINF_NORM_GATE_NONE) ||
+      is_contract(spec, APXINF_NORM_OPERATION_FUSED_ADD_NORM,
+                  APXINF_NORM_STATISTIC_LAYER, APXINF_NORM_AFFINE_ADAPTIVE,
+                  APXINF_NORM_GATE_STYLE);
 }
 
 void validate_spec(const apxinf_norm_spec_t& spec) {
+  const bool grouped = spec.style_group_rows != 0;
+  const bool grouped_norm = is_contract(spec, APXINF_NORM_OPERATION_NORM,
+      APXINF_NORM_STATISTIC_LAYER, APXINF_NORM_AFFINE_ADAPTIVE, APXINF_NORM_GATE_NONE);
+  const bool grouped_gate = is_contract(spec, APXINF_NORM_OPERATION_RESIDUAL_ADD,
+      APXINF_NORM_STATISTIC_NONE, APXINF_NORM_AFFINE_NONE, APXINF_NORM_GATE_STYLE) &&
+      spec.style_parts == 3 && spec.shift_first == 0;
+  const bool grouped_fused = is_contract(spec, APXINF_NORM_OPERATION_FUSED_ADD_NORM,
+      APXINF_NORM_STATISTIC_LAYER, APXINF_NORM_AFFINE_ADAPTIVE, APXINF_NORM_GATE_STYLE);
+  if (grouped) {
+    if (spec.style_group_rows < 1 || spec.rows <= 0 || spec.cols <= 0 ||
+        spec.rows % spec.style_group_rows != 0 ||
+        (spec.style_parts != 2 && spec.style_parts != 3) || spec.shift_first > 1 ||
+        spec.numerics != APXINF_NORM_NUMERICS_STAGED_BF16 ||
+        spec.dtype != APXINF_DTYPE_BF16 || spec.weight_offset != 0 ||
+        spec.quantization != APXINF_NORM_QUANTIZATION_NONE ||
+        spec.bias_order != APXINF_NORM_BIAS_ORDER_SINGLE_ROUND ||
+        spec.has_bias != 0 || !(grouped_norm || grouped_gate || grouped_fused)) {
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid grouped adaptive Norm contract");
+    }
+  } else if (grouped_fused || spec.style_parts != 0 || spec.shift_first != 0 ||
+             spec.numerics == APXINF_NORM_NUMERICS_STAGED_BF16) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "staged BF16 requires grouped adaptive Norm");
+  }
+  if (spec.statistic == APXINF_NORM_STATISTIC_CHANNEL_L2 &&
+      !(spec.dtype == APXINF_DTYPE_BF16 &&
+        (spec.operation == APXINF_NORM_OPERATION_NORM ||
+         spec.operation == APXINF_NORM_OPERATION_NORM_SILU || channel_update(spec)) &&
+        spec.affine == APXINF_NORM_AFFINE_WEIGHT &&
+        spec.gate == APXINF_NORM_GATE_NONE &&
+        spec.quantization == APXINF_NORM_QUANTIZATION_NONE &&
+        spec.numerics == APXINF_NORM_NUMERICS_FLEXIBLE &&
+        spec.weight_offset == 0)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "ChannelL2 requires plain unquantized BF16 weighted normalization");
+  }
+  if (channel_update(spec) && spec.bias_order != APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL)
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "channel update requires staged bias/residual rounding");
   const bool stable_decode_plain =
       is_contract(spec, APXINF_NORM_OPERATION_NORM,
                   APXINF_NORM_STATISTIC_RMS, APXINF_NORM_AFFINE_WEIGHT,
@@ -257,7 +311,7 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
   if (spec.version != APXINF_NORM_SPEC_VERSION ||
       !valid_contract(spec) ||
       spec.quantization > APXINF_NORM_QUANTIZATION_ROWWISE_I8 ||
-      spec.numerics > APXINF_NORM_NUMERICS_STABLE_PLANNING ||
+      spec.numerics > APXINF_NORM_NUMERICS_STAGED_BF16 ||
       spec.weight_offset > 1 ||
       (spec.weight_offset != 0 &&
        !weight_offset_plain && !weight_offset_fused) ||
@@ -301,10 +355,11 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
   }
   if (spec.bias_order == APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL &&
       (spec.operation == APXINF_NORM_OPERATION_NORM ||
+       spec.operation == APXINF_NORM_OPERATION_NORM_SILU ||
        spec.gate != APXINF_NORM_GATE_NONE ||
        spec.statistic == APXINF_NORM_STATISTIC_RMS)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
-                  "BiasThenResidual requires ungated residual add or fused LayerNorm");
+                  "BiasThenResidual requires an ungated residual, LayerNorm, or channel update");
   }
   if (spec.has_bias != 0 && !may_have_bias(spec)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -343,6 +398,26 @@ void validate_bindings(const apxinf_norm_spec_t& spec,
       bindings.hidden != bindings.residual) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "stable decode residual RMSNorm must update residual in place");
+  }
+  if (channel_update(spec)) {
+    if ((bindings.residual != nullptr) != reads_residual(spec))
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "channel residual binding disagrees with operation");
+    const size_t bytes = size_t(spec.rows) * size_t(spec.cols) * 2;
+    const size_t vector_bytes = size_t(spec.cols) * 2;
+    auto overlaps=[](const void* a,size_t an,const void* b,size_t bn){
+      const uintptr_t x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);
+      return x<y ? y-x<an : x-y<bn;
+    };
+    if(overlaps(bindings.hidden,bytes,bindings.normalized,bytes))
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"channel outputs must be disjoint");
+    for(const void* out:{bindings.hidden,bindings.normalized}) {
+      for(const void* input:{bindings.input,bindings.residual})
+        if(input && input!=out && overlaps(out,bytes,input,bytes))
+          throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"channel output partially overlaps activation");
+      for(const void* vector:{bindings.weight,bindings.bias})
+        if(vector && overlaps(out,bytes,vector,vector_bytes))
+          throw Failure(APXINF_STATUS_INVALID_ARGUMENT,"channel output overlaps weight or bias");
+    }
   }
   const bool scale_matches_spec =
       (bindings.output_scale == 1.0f) ==
@@ -524,6 +599,40 @@ cudaError_t launch_quantized_bf16(const apxinf_norm_spec_t& spec,
   return cudaErrorInvalidValue;
 }
 
+template <class T, bool Silu>
+void launch_channel_l2(const T* input, const T* weight, T* normalized,
+                       int rows, int cols, float eps, cudaStream_t stream) {
+    if constexpr (Silu && std::is_same_v<T, __nv_bfloat16>) {
+      if (rows >= 1024 && (cols == 96 || cols == 192) &&
+          reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(weight) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(normalized) % 16 == 0) {
+        if (cols == 96) {
+          kernels::channel_l2_silu_packed_bf16<96><<<(rows - 1) / 64 + 1, 256, 0, stream>>>(
+              input, weight, normalized, rows, eps);
+        } else {
+          kernels::channel_l2_silu_packed_bf16<192><<<(rows - 1) / 64 + 1, 256, 0, stream>>>(
+              input, weight, normalized, rows, eps);
+        }
+        return;
+      }
+    }
+    const int blocks = (rows - 1) / 8 + 1;
+    if (rows >= 1024 && cols == 96) {
+      kernels::channel_l2_norm_warp<T, 96, Silu><<<blocks, 256, 0, stream>>>(
+          input, weight, normalized, rows, eps);
+    } else if (rows >= 1024 && cols == 192) {
+      kernels::channel_l2_norm_warp<T, 192, Silu><<<blocks, 256, 0, stream>>>(
+          input, weight, normalized, rows, eps);
+    } else if (rows >= 1024 && cols == 384) {
+      kernels::channel_l2_norm_warp<T, 384, Silu><<<blocks, 256, 0, stream>>>(
+          input, weight, normalized, rows, eps);
+    } else {
+      kernels::channel_l2_norm<T, Silu><<<rows, kThreads, 0, stream>>>(
+          input, weight, normalized, rows, cols, eps);
+    }
+}
+
 template <class T>
 cudaError_t launch(const apxinf_norm_spec_t& spec,
                    const apxinf_norm_bindings_t& bindings);
@@ -618,6 +727,72 @@ cudaError_t launch_fixed_bf16(const apxinf_runtime& runtime,
   const int rows = static_cast<int>(spec.rows);
   const int cols = static_cast<int>(spec.cols);
   const int sm = runtime.compute_major * 10 + runtime.compute_minor;
+  if (spec.style_group_rows != 0 && spec.operation == APXINF_NORM_OPERATION_FUSED_ADD_NORM) {
+    if (cols == 2048 && spec.input_alignment >= 16 && spec.residual_alignment >= 16 &&
+        spec.style_alignment >= 16 && spec.hidden_alignment >= 16 && spec.normalized_alignment >= 16) {
+      kernels::grouped_gate_residual_layer_norm_warp_bf16<<<(uint64_t(rows) + 3) / 4, 128, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(bindings.input), static_cast<const __nv_bfloat16*>(bindings.residual),
+          static_cast<const __nv_bfloat16*>(bindings.gate_style), static_cast<__nv_bfloat16*>(bindings.hidden),
+          static_cast<const __nv_bfloat16*>(bindings.norm_style), static_cast<__nv_bfloat16*>(bindings.normalized),
+          static_cast<int>(spec.style_group_rows), spec.style_parts, spec.shift_first != 0, bindings.eps, rows);
+      return cudaGetLastError();
+    }
+    if (cols == 2048 && spec.input_alignment >= 4 && spec.residual_alignment >= 4 &&
+        spec.style_alignment >= 4 && spec.hidden_alignment >= 4 && spec.normalized_alignment >= 4) {
+      kernels::grouped_gate_residual_layer_norm_packed_bf16<<<rows, 128, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(bindings.input), static_cast<const __nv_bfloat16*>(bindings.residual),
+          static_cast<const __nv_bfloat16*>(bindings.gate_style), static_cast<__nv_bfloat16*>(bindings.hidden),
+          static_cast<const __nv_bfloat16*>(bindings.norm_style), static_cast<__nv_bfloat16*>(bindings.normalized),
+          static_cast<int>(spec.style_group_rows), spec.style_parts, spec.shift_first != 0, bindings.eps);
+      return cudaGetLastError();
+    }
+    // Generic fallback retains the same staged operators and caller-owned hidden storage.
+    auto gate_spec = spec;
+    gate_spec.operation = APXINF_NORM_OPERATION_RESIDUAL_ADD;
+    const auto status = launch_fixed_bf16(runtime, gate_spec, bindings);
+    if (status != cudaSuccess) return status;
+    auto norm_spec = spec;
+    norm_spec.operation = APXINF_NORM_OPERATION_NORM;
+    auto norm_bindings = bindings;
+    norm_bindings.input = bindings.hidden;
+    return launch_fixed_bf16(runtime, norm_spec, norm_bindings);
+  }
+  if (spec.style_group_rows != 0 && spec.operation == APXINF_NORM_OPERATION_RESIDUAL_ADD) {
+    const int64_t count = spec.rows * spec.cols;
+    if (cols % 8 == 0 && count / 8 <= UINT32_MAX && spec.input_alignment >= 16 && spec.residual_alignment >= 16 &&
+        spec.style_alignment >= 16 && spec.hidden_alignment >= 16) {
+      kernels::grouped_gate_residual_bf16_vec8<<<elementwise_blocks(count / 8), kThreads, 0, stream>>>(
+          static_cast<const uint4*>(bindings.input), static_cast<const uint4*>(bindings.residual),
+          static_cast<const uint4*>(bindings.gate_style), static_cast<uint4*>(bindings.hidden),
+          static_cast<uint32_t>(count / 8), cols / 8, static_cast<uint32_t>(spec.style_group_rows));
+    } else {
+      kernels::grouped_gate_residual_bf16<<<elementwise_blocks(count), kThreads, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(bindings.input),
+          static_cast<const __nv_bfloat16*>(bindings.residual),
+          static_cast<const __nv_bfloat16*>(bindings.gate_style),
+          static_cast<__nv_bfloat16*>(bindings.hidden), count, cols,
+          static_cast<int>(spec.style_group_rows));
+    }
+    return cudaGetLastError();
+  }
+  if (spec.style_group_rows != 0) {
+    if (cols == 2048) {
+    kernels::grouped_adaptive_layer_norm_cached_bf16<<<rows, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(bindings.input),
+        static_cast<const __nv_bfloat16*>(bindings.norm_style),
+        static_cast<__nv_bfloat16*>(bindings.normalized), rows, cols,
+        static_cast<int>(spec.style_group_rows), spec.style_parts,
+        spec.shift_first != 0, bindings.eps);
+    } else {
+    kernels::grouped_adaptive_layer_norm_bf16<<<rows, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(bindings.input),
+        static_cast<const __nv_bfloat16*>(bindings.norm_style),
+        static_cast<__nv_bfloat16*>(bindings.normalized), rows, cols,
+        static_cast<int>(spec.style_group_rows), spec.style_parts,
+        spec.shift_first != 0, bindings.eps);
+    }
+    return cudaGetLastError();
+  }
   const bool bias_then_residual =
       spec.bias_order == APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL;
   const bool packed4 = (cols & 3) == 0 && spec.input_alignment >= 8 &&
@@ -722,6 +897,51 @@ cudaError_t launch_fixed_bf16(const apxinf_runtime& runtime,
   return launch<__nv_bfloat16>(spec, bindings);
 }
 
+cudaError_t launch_channel_update(const apxinf_norm_spec_t& spec,
+                                  const apxinf_norm_bindings_t& bindings) {
+  using B=__nv_bfloat16;
+  const auto* input=static_cast<const B*>(bindings.input);
+  const auto* bias=static_cast<const B*>(bindings.bias);
+  const auto* residual=static_cast<const B*>(bindings.residual);
+  const auto* weight=static_cast<const B*>(bindings.weight);
+  auto* hidden=static_cast<B*>(bindings.hidden);
+  auto* normalized=static_cast<B*>(bindings.normalized);
+  const int rows=int(spec.rows),cols=int(spec.cols);
+  const int64_t count=spec.rows*spec.cols;
+  auto stream=static_cast<cudaStream_t>(bindings.stream);
+  auto aligned=[](const void* p,uintptr_t a){return !p || reinterpret_cast<uintptr_t>(p)%a==0;};
+  bool packed=true;
+  for(const void* p:{bindings.input,bindings.bias,bindings.residual,bindings.weight,
+                    static_cast<const void*>(bindings.hidden),static_cast<const void*>(bindings.normalized)})
+    packed=packed&&aligned(p,16);
+  if(rows>=1024 && packed && (cols==96 || cols==192)) {
+    if(cols==96) {
+      if(residual)kernels::channel_l2_silu_update_packed_bf16<96,true><<<(rows-1)/64+1,256,0,stream>>>(input,bias,residual,hidden,weight,normalized,rows,bindings.eps);
+      else kernels::channel_l2_silu_update_packed_bf16<96,false><<<(rows-1)/64+1,256,0,stream>>>(input,bias,residual,hidden,weight,normalized,rows,bindings.eps);
+    } else {
+      if(residual)kernels::channel_l2_silu_update_packed_bf16<192,true><<<(rows-1)/64+1,256,0,stream>>>(input,bias,residual,hidden,weight,normalized,rows,bindings.eps);
+      else kernels::channel_l2_silu_update_packed_bf16<192,false><<<(rows-1)/64+1,256,0,stream>>>(input,bias,residual,hidden,weight,normalized,rows,bindings.eps);
+    }
+    return cudaGetLastError();
+  }
+  cudaError_t error;
+  if(residual) {
+    if(cols%4==0 && aligned(input,8) && aligned(bias,8) && aligned(residual,8) && aligned(hidden,8))
+      error=apxinf_norm_bias_then_residual_bf16_packed4(input,bias,residual,hidden,rows,cols,stream);
+    else error=apxinf_norm_bias_then_residual_bf16(input,bias,residual,hidden,rows,cols,stream);
+  } else {
+    if(cols%8==0 && aligned(input,16) && aligned(bias,16) && aligned(hidden,16))
+      kernels::channel_bias_packed_bf16<<<elementwise_blocks(count/8),256,0,stream>>>(
+        reinterpret_cast<const kernels::ChannelL2Pack8*>(input),reinterpret_cast<const kernels::ChannelL2Pack8*>(bias),
+        reinterpret_cast<kernels::ChannelL2Pack8*>(hidden),count/8,cols/8);
+    else kernels::channel_bias_bf16<<<elementwise_blocks(count),256,0,stream>>>(input,bias,hidden,count,cols);
+    error=cudaGetLastError();
+  }
+  if(error!=cudaSuccess)return error;
+  launch_channel_l2<B,true>(hidden,weight,normalized,rows,cols,bindings.eps,stream);
+  return cudaGetLastError();
+}
+
 template <class T>
 cudaError_t launch(const apxinf_norm_spec_t& spec,
                    const apxinf_norm_bindings_t& bindings) {
@@ -739,11 +959,31 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
   const int64_t count = spec.rows * spec.cols;
   auto stream = static_cast<cudaStream_t>(bindings.stream);
 
-  if (is_contract(spec, APXINF_NORM_OPERATION_NORM,
+  if (spec.statistic == APXINF_NORM_STATISTIC_CHANNEL_L2) {
+    if (channel_update(spec)) return launch_channel_update(spec, bindings);
+    if (spec.operation == APXINF_NORM_OPERATION_NORM_SILU)
+      launch_channel_l2<T, true>(input, weight, normalized, rows, cols, bindings.eps, stream);
+    else
+      launch_channel_l2<T, false>(input, weight, normalized, rows, cols, bindings.eps, stream);
+  } else if (is_contract(spec, APXINF_NORM_OPERATION_NORM,
                   APXINF_NORM_STATISTIC_RMS,
                   APXINF_NORM_AFFINE_WEIGHT, APXINF_NORM_GATE_NONE)) {
-    kernels::rms_norm<T><<<rows, kThreads, 0, stream>>>(
-        input, weight, normalized, rows, cols, bindings.eps);
+    if (cols == 128) {
+      if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        if (reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
+            reinterpret_cast<uintptr_t>(weight) % 16 == 0 &&
+            reinterpret_cast<uintptr_t>(normalized) % 16 == 0) {
+          kernels::rms_norm_128_packed<8><<<(rows - 1) / 64 + 1, 256, 0, stream>>>(
+              input, weight, normalized, rows, bindings.eps);
+          return cudaGetLastError();
+        }
+      }
+      kernels::rms_norm_128<T><<<(rows - 1) / 8 + 1, 256, 0, stream>>>(
+          input, weight, normalized, rows, bindings.eps);
+    } else {
+      kernels::rms_norm<T><<<rows, kThreads, 0, stream>>>(
+          input, weight, normalized, rows, cols, bindings.eps);
+    }
   } else if (is_contract(spec, APXINF_NORM_OPERATION_NORM,
                          APXINF_NORM_STATISTIC_LAYER,
                          APXINF_NORM_AFFINE_WEIGHT,

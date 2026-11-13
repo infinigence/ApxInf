@@ -104,6 +104,11 @@ cudaError_t launch_output_gate_tensor_rounded(void* data, const void* gate,
                                               int64_t elements,
                                               cudaStream_t stream);
 
+size_t wide_bf16_resource_requirements(const Spec&, int);
+void prepare_wide_bf16(Execution&);
+cudaError_t launch_wide_bf16(Execution&);
+void destroy_wide_bf16(Execution&) noexcept;
+
 size_t cublas_f16_resource_requirements(const Spec& spec,
                                         int configuration);
 void prepare_cublas_f16(Execution& execution);
@@ -129,6 +134,10 @@ void destroy_fa2_segmented(Execution& execution) noexcept;
 
 #if defined(APXINF_ATTENTION_CUTLASS)
 size_t cutlass_resource_requirements(const Spec& spec, int configuration);
+size_t cutlass_persistent_resource_requirements(const Spec&, int);
+void prepare_cutlass_persistent(Execution&);
+cudaError_t launch_cutlass_persistent(Execution&);
+void destroy_cutlass_persistent(Execution&) noexcept;
 void prepare_cutlass(Execution& execution);
 cudaError_t launch_cutlass(Execution& execution);
 void destroy_cutlass(Execution& execution) noexcept;

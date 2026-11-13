@@ -15,6 +15,7 @@ pub mod quantization;
 pub mod rope;
 pub mod sampling;
 pub(crate) mod validation;
+mod volume;
 
 // Keep these crate-private aliases while graph/workspace and unit tests still
 // refer to the GEMM implementation through `crate::ops`.
@@ -55,15 +56,16 @@ pub use gdn::{
     GdnFirstPrefillArgs, GdnGate, GdnGatedNormArgs, GdnQuantizedOutput,
 };
 pub use gemm::{
-    gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, gemm_swiglu, gemv, gemv_bias,
-    pack_swiglu_weight_host, BlockQuantizedSwiGluArgs, GemmArgs, GemmBiasArgs, GemmBiasGeluArgs,
-    GemmBiasResidualArgs, GemmGegluArgs, GemmNumerics, GemmPolicy, GemmQuantization,
-    GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales, RepackedWeight,
-    WeightVersion,
+    gemm, gemm_bias, gemm_bias_gelu, gemm_bias_residual, gemm_geglu, gemm_gelu_exact, gemm_swiglu,
+    gemv, gemv_bias, pack_swiglu_weight_host, BlockQuantizedSwiGluArgs, GemmArgs, GemmBiasArgs,
+    GemmBiasGeluArgs, GemmBiasResidualArgs, GemmGegluArgs, GemmNumerics, GemmPolicy,
+    GemmQuantization, GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales,
+    RepackedWeight, WeightVersion,
 };
 pub use norm::{
-    fused_add_norm, residual_add, Affine, BiasOrder, FusedAddNormArgs, NormArgs, NormKind,
-    NormNumerics, QuantOut, ResidualAddArgs, ResidualGate,
+    channel_l2_norm, channel_l2_norm_silu, fused_add_channel_l2_norm_silu, fused_add_norm,
+    residual_add, Affine, BiasOrder, ChannelL2NormArgs, FusedAddChannelL2NormArgs,
+    FusedAddNormArgs, NormArgs, NormKind, NormNumerics, QuantOut, ResidualAddArgs, ResidualGate,
 };
 pub use pointwise::{
     pointwise, swiglu_into, PointwiseActivation, PointwiseArgs, PointwiseSemantic,
@@ -77,13 +79,14 @@ pub use quantization::{
 pub use rope::apply_vision_2d as rope_apply_vision_2d;
 pub use rope::{
     decode_rope, decode_rotation, execute_batched as rope_apply_batched,
-    execute_mrope as rope_apply_mrope, multimodal_rope, partial_rope, rope, rotary_dim,
-    split_grouped_qkv, split_qkv_axial_rope, split_qkv_cache, split_qkv_mrope_cache, AxialRopeArgs,
-    AxialRopeNumerics, DecodeRopeArgs, DecodeRotationArgs, DecodeRotationPosition,
-    GroupedQkvRopeArgs, MropeCacheArgs, MultimodalRopeArgs, QkvCacheRopeArgs, RopeArgs,
-    RopeSemantic,
+    execute_mrope as rope_apply_mrope, multimodal_rope, partial_rope, rms_norm_apply_precomputed,
+    rope, rotary_dim, split_grouped_qkv, split_qkv_axial_rope, split_qkv_cache,
+    split_qkv_mrope_cache, AxialRopeArgs, AxialRopeNumerics, DecodeRopeArgs, DecodeRotationArgs,
+    DecodeRotationPosition, GroupedQkvRopeArgs, MropeCacheArgs, MultimodalRopeArgs,
+    QkvCacheRopeArgs, RopeArgs, RopeSemantic,
 };
 pub use sampling::{argmax, ArgmaxArgs};
+pub use volume::{Conv3dArgs, Conv3dPolicy, PreparedConv3d, Unfold3dGeometry};
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(
@@ -129,3 +132,9 @@ pub fn scratch_buffer_tail_zeroed(
 }
 #[cfg(test)]
 mod tests;
+
+mod recurrence;
+pub use recurrence::{F64RecurrenceState, PreparedRecurrence, RecurrenceCoefficients};
+
+mod reduction;
+pub use reduction::PreparedIndexedMean;

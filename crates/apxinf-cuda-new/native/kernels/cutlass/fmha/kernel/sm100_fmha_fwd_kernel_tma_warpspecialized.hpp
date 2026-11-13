@@ -342,7 +342,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       typename CollectiveEpilogue::TensorStorage epilogue;
     };
 
-    static constexpr bool IsPersistent = std::is_same_v<TileScheduler, PersistentTileScheduler> || std::is_same_v<TileScheduler, CausalPersistentTileScheduler>;
+    static constexpr bool IsPersistent = std::is_base_of_v<PersistentTileScheduler, TileScheduler> || std::is_base_of_v<CausalPersistentTileScheduler, TileScheduler>;
     using MainloopEpilogueStorage = std::conditional_t<IsPersistent, 
                                                        std::conditional_t<IsMla, 
                                                                           std::conditional_t<CollectiveMainloop::IsOrderLoadEpilogue, UnionType, StructType>,

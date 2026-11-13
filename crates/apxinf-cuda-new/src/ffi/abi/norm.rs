@@ -3,12 +3,15 @@ use std::ffi::c_void;
 pub(crate) use super::types::CudaStream;
 use super::types::Runtime;
 
-pub(crate) const SPEC_VERSION: u32 = 7;
+pub(crate) const SPEC_VERSION: u32 = 10;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Spec {
     pub version: u32,
+    pub style_group_rows: i64,
+    pub style_parts: u32,
+    pub shift_first: u32,
     pub operation: u32,
     pub statistic: u32,
     pub affine: u32,

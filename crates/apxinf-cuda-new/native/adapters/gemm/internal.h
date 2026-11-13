@@ -257,4 +257,10 @@ void validate_candidates(const Spec& spec,
                          const apxinf_gemm_bindings_t& bindings, int device,
                          const float* expected, size_t expected_len);
 
+size_t exact_gelu_resource_requirements(const Spec&);
+size_t exact_gelu_lut_resource_requirements(const Spec&);
+void prepare_exact_gelu_lut(Execution&);
+void prepare_exact_gelu(Execution&);
+cudaError_t launch_exact_gelu(Execution&);
+void destroy_exact_gelu(Execution&) noexcept;
 }  // namespace apxinf::gemm

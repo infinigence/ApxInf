@@ -117,7 +117,9 @@ typedef struct {
   const void* value_input;
   /* Stable device u32 read at enqueue/replay time. */
   const uint32_t* position;
-  /* Optional precomputed float2 table selected by rotation_source. */
+  /* PRECOMPUTED_TABLE: vision split uses its float2 axial table; standalone
+     APPLY uses FP32 [tokens, 2, head_dim/2] cosine then sine, broadcast across
+     heads, with separately rounded FP32 products/sum before BF16 conversion. */
   const void* rotation_table;
   apxinf_cuda_stream_t stream;
   /* RoPE base; unused by SPLIT_QKV_BIAS. */
@@ -127,3 +129,19 @@ typedef struct {
   /* Row offset into the K/V destination; 0 for fresh buffers. */
   int32_t kv_output_offset;
 } apxinf_rope_bindings_t;
+
+// BF16 per-head RMSNorm rounded before FP32-table half-split RoPE.
+// Dedicated fixed-operation ABI; existing RoPE v6 declarations are unchanged.
+#define APXINF_RMS_PRECOMPUTED_ROPE_VERSION 1u
+typedef struct {
+  uint32_t version, heads, dim, reserved;
+  int64_t tokens;
+} apxinf_rms_precomputed_rope_spec_t;
+typedef struct {
+  const void* input;
+  const void* weight;
+  const void* table;
+  void* output;
+  apxinf_cuda_stream_t stream;
+  float epsilon;
+} apxinf_rms_precomputed_rope_bindings_t;

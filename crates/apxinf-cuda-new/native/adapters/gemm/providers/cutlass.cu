@@ -594,6 +594,38 @@ cudaError_t launch_cutlass_nvfp4(Execution& state) {
 #endif
 }
 
+#ifdef APXINF_GEMM_CUTLASS
+size_t exact_gelu_resource_requirements(const Spec&) {
+  return apxinf::cuda_new::cutlass_ops::exact_gelu_workspace();
+}
+void prepare_exact_gelu(Execution& state) {
+  const auto& b=state.bindings;
+  state.resource_bytes=exact_gelu_resource_requirements(state.spec);
+  state.provider_state=apxinf::cuda_new::cutlass_ops::prepare_exact_gelu(
+      b.a,b.b,b.output,state.configuration,state.resource_limit,static_cast<cudaStream_t>(b.stream));
+}
+size_t exact_gelu_lut_resource_requirements(const Spec&) {
+  return apxinf::cuda_new::cutlass_ops::exact_gelu_lut_workspace();
+}
+void prepare_exact_gelu_lut(Execution& state) {
+  const auto& b = state.bindings;
+  state.resource_bytes = exact_gelu_lut_resource_requirements(state.spec);
+  state.provider_state = apxinf::cuda_new::cutlass_ops::prepare_exact_gelu_lut(
+      b.a, b.b, b.output, state.configuration, state.resource_limit,
+      static_cast<cudaStream_t>(b.stream));
+}
+cudaError_t launch_exact_gelu(Execution& state) {
+  using namespace apxinf::cuda_new::cutlass_ops;
+  check_cutlass_status(enqueue_exact_gelu(static_cast<ExactGeluExecution*>(state.provider_state),
+      static_cast<cudaStream_t>(state.bindings.stream)));
+  return cudaGetLastError();
+}
+void destroy_exact_gelu(Execution& state) noexcept {
+  apxinf::cuda_new::cutlass_ops::destroy_exact_gelu(
+      static_cast<apxinf::cuda_new::cutlass_ops::ExactGeluExecution*>(state.provider_state));
+  state.provider_state=nullptr;
+}
+#endif
 }  // namespace apxinf::gemm
 
 extern "C" apxinf_status_t apxinf_gemm_relayout_weight(
