@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use apxinf_core::{DType, Error, Result, Tensor};
-use apxinf_hip::native::{self, Activation, AttentionGeometry, HipArena, HipDeviceBytes};
+use apxinf_hip::native::{self, Activation, AttentionGeometry, HipArena, PreparedRowIndices};
 use apxinf_hip::HipContext;
 
 use super::config::Gr00tConfig;
@@ -92,7 +92,11 @@ impl DitConditioning {
                 .into_iter()
                 .map(half::bf16::from_f32)
                 .collect();
-            let projection = upload(ctx, &scratch, &Tensor::from_bf16(vec![1, 256], &projection)?)?;
+            let projection = upload(
+                ctx,
+                &scratch,
+                &Tensor::from_bf16(vec![1, 256], &projection)?,
+            )?;
             let inner = weights.timestep_in.weight.shape().dims()[1];
             let h = scratch.tensor(vec![1, inner], DType::BF16)?;
             native::gemm(ctx, &projection, &weights.timestep_in.weight, &h)?;
@@ -233,26 +237,22 @@ impl CrossAttentionCache {
 /// illegal, and a host-to-device copy captured from a `Vec` that is rebuilt
 /// every call would replay from a pointer that no longer exists.
 pub struct DitRowIndices {
-    non_image: HipDeviceBytes,
-    image: HipDeviceBytes,
+    non_image: PreparedRowIndices,
+    image: PreparedRowIndices,
     non_image_rows: usize,
     image_rows: usize,
 }
 
 impl DitRowIndices {
+    /// The two row groups partition the adapted matrix's rows, so the bound
+    /// they are validated against is their total; an out-of-range row in
+    /// either group would gather from past the matrix into the next arena
+    /// allocation.
     pub fn new(ctx: &Arc<HipContext>, non_image: &[usize], image: &[usize]) -> Result<Self> {
-        let upload = |rows: &[usize]| -> Result<HipDeviceBytes> {
-            let ids: Vec<u32> = rows
-                .iter()
-                .map(|&i| u32::try_from(i).map_err(|_| Error::Contract("row index overflow")))
-                .collect::<Result<_>>()?;
-            let bytes = HipDeviceBytes::new(ctx, ids.len() * std::mem::size_of::<u32>())?;
-            bytes.upload_u32(&ids)?;
-            Ok(bytes)
-        };
+        let bound = non_image.len() + image.len();
         Ok(Self {
-            non_image: upload(non_image)?,
-            image: upload(image)?,
+            non_image: PreparedRowIndices::new(ctx, non_image, bound)?,
+            image: PreparedRowIndices::new(ctx, image, bound)?,
             non_image_rows: non_image.len(),
             image_rows: image.len(),
         })
@@ -267,7 +267,7 @@ pub fn split_backbone(
     indices: &DitRowIndices,
 ) -> Result<DitBackbone> {
     let width = adapted.shape().dims()[1];
-    let gather = |rows: usize, ids: &HipDeviceBytes| -> Result<Tensor> {
+    let gather = |rows: usize, ids: &PreparedRowIndices| -> Result<Tensor> {
         let out = arena.tensor(vec![rows, width], DType::BF16)?;
         native::gather_rows(ctx, adapted, ids, &out)?;
         Ok(out)
@@ -515,11 +515,9 @@ fn flow_step(
             Gr00tDitAttentionSource::NonImageBackbone => &backbone.non_image,
             Gr00tDitAttentionSource::ImageBackbone => &backbone.image,
             Gr00tDitAttentionSource::StateActionSelf => &normalized,
-            Gr00tDitAttentionSource::FullBackbone => {
-                return Err(Error::Contract(
-                    "GR00T on HIP requires AlternateVLDiT; a full-backbone DiT block is unsupported",
-                ))
-            }
+            Gr00tDitAttentionSource::FullBackbone => return Err(Error::Contract(
+                "GR00T on HIP requires AlternateVLDiT; a full-backbone DiT block is unsupported",
+            )),
         };
 
         let next_modulation = conditioning.block_modulations[step].get(index + 1);
@@ -648,9 +646,9 @@ fn dit_block(
     let project = |linear: &Linear, input: &Tensor, rows: usize| -> Result<Tensor> {
         let raw = arena.tensor(vec![rows, width], DType::BF16)?;
         let biased = arena.tensor(vec![rows, width], DType::BF16)?;
-    // Fused: where the recipe routes this shape to hipBLASLt, the bias and
-    // activation are applied inside the GEMM epilogue, on the F32 accumulator.
-    // Where it does not, this falls back to exactly the two calls it replaces.
+        // Fused: where the recipe routes this shape to hipBLASLt, the bias and
+        // activation are applied inside the GEMM epilogue, on the F32 accumulator.
+        // Where it does not, this falls back to exactly the two calls it replaces.
         native::gemm_bias_activation(
             ctx,
             input,

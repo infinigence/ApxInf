@@ -585,14 +585,86 @@ pub fn copy_row_range(
     ctx.copy_on_device(pd.cast(), ps.cast(), rows * cols * element)
 }
 
+/// A bounds-checked `u32` row-index table on the device, the HIP mirror of
+/// cuda-new's `PreparedRowIndices`.
+///
+/// `gather_rows` and `scatter_rows` read whatever the device buffer holds, so
+/// the values must be validated while they are still on the host: an
+/// out-of-range gather reads garbage, and an out-of-range scatter writes past
+/// the destination into the next arena allocation. Both are caught in
+/// [`Self::new`]; the row count and the bound travel with the buffer, so the
+/// gather/scatter signatures cannot be satisfied with an unchecked
+/// `HipDeviceBytes`.
+pub struct PreparedRowIndices {
+    bytes: HipDeviceBytes,
+    row_count: usize,
+    /// The matrix row count the indices were validated against. Gather and
+    /// scatter re-check it against the tensor they are given, so an index
+    /// table built for one token layout cannot be replayed against another.
+    bound: usize,
+    /// Whether the target rows are distinct. `scatter_rows` accumulates
+    /// without atomics, so a repeated row races with itself; even the
+    /// replacing scatter resolves duplicate writes by launch order rather
+    /// than by intent.
+    unique: bool,
+}
+
+impl PreparedRowIndices {
+    /// Validate `rows` against `bound` and upload them to the device.
+    pub fn new(ctx: &Arc<HipContext>, rows: &[usize], bound: usize) -> Result<Self> {
+        if rows.is_empty() {
+            return Err(Error::Other(
+                "apxinf-hip row selection requires at least one row".into(),
+            ));
+        }
+        let indices = rows
+            .iter()
+            .map(|&row| {
+                if row >= bound {
+                    return Err(Error::Other(format!(
+                        "apxinf-hip row index {row} is outside 0..{bound}"
+                    )));
+                }
+                u32::try_from(row).map_err(|_| Error::Contract("row index exceeds u32"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bytes = HipDeviceBytes::new(ctx, indices.len() * std::mem::size_of::<u32>())?;
+        bytes.upload_u32(&indices)?;
+        let unique = rows.iter().collect::<std::collections::HashSet<_>>().len() == rows.len();
+        Ok(Self {
+            bytes,
+            row_count: rows.len(),
+            bound,
+            unique,
+        })
+    }
+
+    fn validate(&self, matrix_rows: usize, operation: &str) -> Result<()> {
+        if self.bound != matrix_rows {
+            return Err(Error::Other(format!(
+                "{operation}: indices were validated against 0..{}, but the matrix has \
+                 {matrix_rows} rows",
+                self.bound
+            )));
+        }
+        Ok(())
+    }
+
+    /// How many rows the table selects. `out`/`source` must match this.
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+}
+
 /// Gather whole rows of `input` named by `indices` into `out`.
 ///
-/// `indices` holds `out`'s row count as `u32`, each below `input`'s rows;
-/// cuda-new validates the same bound in `prepare_row_indices`.
+/// The indices are validated against `input`'s row count when the table is
+/// built ([`PreparedRowIndices::new`]) and re-checked here, as cuda-new's
+/// `prepare_row_indices` does.
 pub fn gather_rows(
     ctx: &HipContext,
     input: &Tensor,
-    indices: &HipDeviceBytes,
+    indices: &PreparedRowIndices,
     out: &Tensor,
 ) -> Result<()> {
     let (input_rows, cols) = rows_cols(input)?;
@@ -603,10 +675,11 @@ pub fn gather_rows(
             got: out.shape().to_string(),
         });
     }
-    if indices.len() < rows * std::mem::size_of::<u32>() {
+    indices.validate(input_rows, "apxinf-hip gather_rows")?;
+    if rows != indices.row_count {
         return Err(Error::DataLengthMismatch {
-            expected: rows * std::mem::size_of::<u32>(),
-            got: indices.len(),
+            expected: indices.row_count,
+            got: rows,
         });
     }
     if rows > input_rows {
@@ -618,7 +691,7 @@ pub fn gather_rows(
     check("gather_rows", unsafe {
         ffi::apxinf_hip_native_gather_rows(
             pi.cast_const(),
-            indices.ptr(),
+            indices.bytes.ptr(),
             py,
             int(rows)?,
             int(cols)?,
@@ -630,13 +703,14 @@ pub fn gather_rows(
 /// Scatter the rows of `source` into the rows of `destination` named by
 /// `indices`, replacing them or adding to them.
 ///
-/// The indices must be distinct: accumulation reads and writes each target
-/// row once, without atomics, which is what cuda-new's permutation scatter
-/// relies on.
+/// The indices are validated against `destination`'s row count when the table
+/// is built and re-checked here, and must be distinct: accumulation reads and
+/// writes each target row once, without atomics, which is what cuda-new's
+/// permutation scatter relies on.
 pub fn scatter_rows(
     ctx: &HipContext,
     destination: &Tensor,
-    indices: &HipDeviceBytes,
+    indices: &PreparedRowIndices,
     source: &Tensor,
     add: bool,
 ) -> Result<()> {
@@ -648,10 +722,16 @@ pub fn scatter_rows(
             got: source.shape().to_string(),
         });
     }
-    if indices.len() < rows * std::mem::size_of::<u32>() {
+    indices.validate(destination_rows, "apxinf-hip scatter_rows")?;
+    if !indices.unique {
+        return Err(Error::Other(
+            "apxinf-hip scatter_rows: destination rows must be distinct".into(),
+        ));
+    }
+    if rows != indices.row_count {
         return Err(Error::DataLengthMismatch {
-            expected: rows * std::mem::size_of::<u32>(),
-            got: indices.len(),
+            expected: indices.row_count,
+            got: rows,
         });
     }
     if rows > destination_rows {
@@ -663,7 +743,7 @@ pub fn scatter_rows(
     check("scatter_rows", unsafe {
         ffi::apxinf_hip_native_scatter_rows(
             pd,
-            indices.ptr(),
+            indices.bytes.ptr(),
             ps.cast_const(),
             int(rows)?,
             int(cols)?,
@@ -677,12 +757,7 @@ pub fn scatter_rows(
 ///
 /// Column concatenation is one call per source, the way [`copy_rows`]
 /// composes into row concatenation.
-pub fn copy_columns(
-    ctx: &HipContext,
-    src: &Tensor,
-    dst: &Tensor,
-    dst_col: usize,
-) -> Result<()> {
+pub fn copy_columns(ctx: &HipContext, src: &Tensor, dst: &Tensor, dst_col: usize) -> Result<()> {
     let (rows, src_cols) = rows_cols(src)?;
     let (dst_rows, dst_cols) = rows_cols(dst)?;
     if rows != dst_rows || dst_col + src_cols > dst_cols {

@@ -36,6 +36,8 @@
 
 #include <hip/hip_runtime.h>
 
+#include <limits>
+
 #include "ck/example/ck_tile/01_fmha/fmha_fwd.hpp"
 
 #include "common.h"
@@ -111,6 +113,19 @@ extern "C" int apxinf_hip_ck_attention(int dtype, const void* q, const void* k,
   }
   if (q_heads % kv_heads != 0) return kInvalidArgument;
   if (q_token_stride < static_cast<long long>(q_heads) * head_dim) return kInvalidArgument;
+  // CK's `index_t` is 32-bit; the strides arrive as 64-bit. A stride that does
+  // not fit wraps to a negative offset and reads K/V from the wrong place, so
+  // it is a routing miss rather than an error: apxinf's own kernel takes
+  // 64-bit strides. `batch_stride_q` is checked at its computed value because
+  // two factors that each fit can still overflow the product.
+  const auto fits_int32 = [](long long v) {
+    return v >= 0 && v <= static_cast<long long>(std::numeric_limits<int>::max());
+  };
+  if (!fits_int32(q_token_stride) || !fits_int32(kv_token_stride) ||
+      !fits_int32(kv_batch_stride) ||
+      !fits_int32(static_cast<long long>(q_tokens) * q_token_stride)) {
+    return kUnsupported;
+  }
 
   fmha_fwd_traits traits{};
   traits.hdim_q = head_dim;
@@ -168,7 +183,24 @@ extern "C" int apxinf_hip_ck_attention(int dtype, const void* q, const void* k,
   // negative duration when it found no instance, which is the same routing
   // outcome as `supported()` returning false and must not become an error.
   const ck_tile::stream_config config{static_cast<hipStream_t>(stream), false};
-  const float elapsed = fmha_fwd(traits, args, config);
-  if (elapsed < 0.0f) return kUnsupported;
+  // CK reports a failed launch by throwing (`launch_and_check` ->
+  // `HIP_CHECK_ERROR` -> `throw`), and an exception unwinding through
+  // `extern "C"` into Rust is UB. Catch it here and treat it as a routing
+  // miss, so the documented fallback to apxinf's own kernel actually happens.
+  float elapsed;
+  try {
+    elapsed = fmha_fwd(traits, args, config);
+  } catch (...) {
+    // The error that made CK throw latches on the device; clear it so the
+    // fallback kernel's `last_launch_status()` reports only its own launch.
+    (void)hipGetLastError();
+    return kUnsupported;
+  }
+  if (elapsed < 0.0f) {
+    // No instance for this geometry. Whatever CK did while deciding may have
+    // left a sticky error; clear it for the same reason as above.
+    (void)hipGetLastError();
+    return kUnsupported;
+  }
   return last_launch_status();
 }

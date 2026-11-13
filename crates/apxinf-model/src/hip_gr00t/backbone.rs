@@ -16,7 +16,9 @@
 use std::sync::Arc;
 
 use apxinf_core::{DType, Error, Result, Tensor};
-use apxinf_hip::native::{self, Activation, AttentionGeometry, HipArena, HipDeviceBytes};
+use apxinf_hip::native::{
+    self, Activation, AttentionGeometry, HipArena, HipDeviceBytes, PreparedRowIndices,
+};
 use apxinf_hip::HipContext;
 
 use super::config::{Gr00tConfig, Qwen3VLConfig};
@@ -35,7 +37,7 @@ pub struct PreparedBackbone {
     /// buffer must be refilled on every run. See [`Self::refill_tokens`].
     token_ids: HipDeviceBytes,
     positions: HipDeviceBytes,
-    image_indices: HipDeviceBytes,
+    image_indices: PreparedRowIndices,
     tokens: usize,
     image_rows: usize,
 }
@@ -100,15 +102,14 @@ pub fn prepare(
         bytes.upload_u32(values)?;
         Ok(bytes)
     };
-    let indices: Vec<u32> = groups
-        .image
-        .iter()
-        .map(|&index| u32::try_from(index).map_err(|_| Error::Contract("row index overflow")))
-        .collect::<Result<_>>()?;
+    // Validated against the token count: the scatter destinations are rows of
+    // the `[tokens, width]` hidden state, and an out-of-range row would write
+    // past it into the next arena allocation.
+    let image_indices = PreparedRowIndices::new(ctx, &groups.image, token_ids.len())?;
     Ok(PreparedBackbone {
         token_ids: upload(token_ids)?,
         positions: upload(&positions)?,
-        image_indices: upload(&indices)?,
+        image_indices,
         tokens: token_ids.len(),
         image_rows: groups.image.len(),
     })
@@ -378,9 +379,9 @@ fn vl_block(
     // Q, K and V are separate biased projections here, not one packed matrix.
     let project = |linear: &super::weights::Linear| -> Result<Tensor> {
         let biased = arena.tensor(vec![tokens, width], DType::BF16)?;
-    // Fused: where the recipe routes this shape to hipBLASLt, the bias and
-    // activation are applied inside the GEMM epilogue, on the F32 accumulator.
-    // Where it does not, this falls back to exactly the two calls it replaces.
+        // Fused: where the recipe routes this shape to hipBLASLt, the bias and
+        // activation are applied inside the GEMM epilogue, on the F32 accumulator.
+        // Where it does not, this falls back to exactly the two calls it replaces.
         native::gemm_bias_activation(
             ctx,
             &normed,
@@ -420,11 +421,9 @@ fn vl_block(
     )?;
     let residual = arena.tensor(vec![tokens, width], DType::BF16)?;
     let ffn_normed = arena.tensor(vec![tokens, width], DType::BF16)?;
-    let ffn_norm_bias = block
-        .ffn_norm
-        .bias
-        .as_ref()
-        .ok_or(Error::Contract("GR00T VL self-attention norm3 needs a bias"))?;
+    let ffn_norm_bias = block.ffn_norm.bias.as_ref().ok_or(Error::Contract(
+        "GR00T VL self-attention norm3 needs a bias",
+    ))?;
     native::bias_residual_layer_norm(
         ctx,
         &projected,
@@ -492,8 +491,7 @@ fn multimodal_rope_positions(
     let mut next = 0u32;
     let overflow = || Error::Contract("Qwen3-VL position overflow");
     loop {
-        let found =
-            (start..token_ids.len()).find(|index| token_ids[*index] == image_token_id);
+        let found = (start..token_ids.len()).find(|index| token_ids[*index] == image_token_id);
         let Some(image_start) = found else {
             for _ in start..token_ids.len() {
                 positions.extend_from_slice(&[next; 3]);
@@ -608,7 +606,9 @@ mod tests {
         let error = positions(&[9, 9], &[[1, 4, 4]]).unwrap_err().to_string();
         assert!(error.contains("consumed 0/1"), "{error}");
         // A grid incompatible with the merge size is refused, not rounded.
-        let error = positions(&[IMAGE; 4], &[[1, 3, 4]]).unwrap_err().to_string();
+        let error = positions(&[IMAGE; 4], &[[1, 3, 4]])
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("incompatible with merge"), "{error}");
     }
 

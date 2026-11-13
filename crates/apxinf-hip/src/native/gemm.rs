@@ -62,7 +62,6 @@ pub fn reset_recorded_shapes() {
     }
 }
 
-
 /// Below this measured ratio a shape stays on hipBLAS. Run-to-run spread on
 /// this part is a few percent, so routing a 1.01x "win" would be routing
 /// noise, and every switch costs a warm-up query and a cached descriptor set.
@@ -199,7 +198,10 @@ fn routing() -> &'static Routing {
         let recipe_path = explicit.clone().or_else(default_recipe_path);
         let recipe = match &recipe_path {
             Some(path) => load_recipe(path),
-            None => Recipe { providers: BTreeMap::new(), tactics: BTreeMap::new() },
+            None => Recipe {
+                providers: BTreeMap::new(),
+                tactics: BTreeMap::new(),
+            },
         };
         // Autotuning without a destination measures on every process start and
         // keeps the result to itself, which is worse than not tuning.
@@ -231,7 +233,35 @@ fn routing() -> &'static Routing {
                 );
             }
         }
-        Routing { mode, recipe, autotune: autotune && recipe_path.is_some(), recipe_path }
+        Routing {
+            mode,
+            recipe,
+            autotune: autotune && recipe_path.is_some(),
+            recipe_path,
+        }
+    })
+}
+
+/// The ROCm and hipBLASLt runtime versions, read once per process.
+///
+/// `apxinf_hip_library_versions` creates a temporary hipBLASLt handle to read
+/// the library version, and hipBLASLt's initialization kernels run on the
+/// legacy default stream -- which fails fatally while a capture is open on
+/// any stream in the process (error 906, and hipblaslt answers by exiting the
+/// process). The read therefore happens under the capture lock, and exactly
+/// once, so no later read can land in a capture window. `None` when the
+/// versions could not be read, or when the calling thread is itself
+/// capturing: callers already treat an unreadable version as "no recipe path
+/// / no stamp", which is the right degradation inside a capture anyway.
+fn library_versions() -> Option<(i32, i32)> {
+    static VERSIONS: OnceLock<Option<(i32, i32)>> = OnceLock::new();
+    *VERSIONS.get_or_init(|| {
+        let (mut rocm, mut blaslt) = (0i32, 0i32);
+        let _exclusive = crate::graph::allocation_exclusive().ok()?;
+        if unsafe { ffi::apxinf_hip_library_versions(&mut rocm, &mut blaslt) } != 0 {
+            return None;
+        }
+        Some((rocm, blaslt))
     })
 }
 
@@ -245,10 +275,7 @@ fn routing() -> &'static Routing {
 /// re-tunes, instead of reading a file that no longer means what it says. This
 /// mirrors `configs/tuning/nvidia/<family>/cuda<..>-cublas<..>/`.
 fn default_recipe_path() -> Option<PathBuf> {
-    let (mut rocm, mut blaslt) = (0i32, 0i32);
-    if unsafe { ffi::apxinf_hip_library_versions(&mut rocm, &mut blaslt) } != 0 {
-        return None;
-    }
+    let (rocm, blaslt) = library_versions()?;
     let arch = env!("APXINF_HIP_ARCH");
     if arch == "none" {
         return None;
@@ -281,7 +308,10 @@ fn rocm_version(packed: i32) -> String {
 /// it. Every rejection is printed once, because a silently ignored recipe
 /// looks exactly like a recipe that did not help.
 fn load_recipe(path: &Path) -> Recipe {
-    let mut recipe = Recipe { providers: BTreeMap::new(), tactics: BTreeMap::new() };
+    let mut recipe = Recipe {
+        providers: BTreeMap::new(),
+        tactics: BTreeMap::new(),
+    };
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) => {
@@ -363,23 +393,27 @@ fn load_recipe(path: &Path) -> Recipe {
         }
     }
     if rejected > 0 {
-        eprintln!("apxinf-hip: ignored {rejected} malformed line(s) in {}", path.display());
+        eprintln!(
+            "apxinf-hip: ignored {rejected} malformed line(s) in {}",
+            path.display()
+        );
     }
     recipe
 }
 
 /// `Some(reason)` when the recipe was not measured on what is running now.
 fn header_mismatch(text: &str) -> Option<String> {
-    let (mut rocm, mut blaslt) = (0i32, 0i32);
-    unsafe { ffi::apxinf_hip_library_versions(&mut rocm, &mut blaslt) };
+    let (rocm, blaslt) = library_versions().unwrap_or((0, 0));
     let want = format!(
         "{} rocm{} hipblaslt{blaslt}",
         env!("APXINF_HIP_ARCH"),
         rocm_version(rocm)
     );
-    let found = text
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("# measured-on ").map(str::to_owned));
+    let found = text.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("# measured-on ")
+            .map(str::to_owned)
+    });
     match found {
         // An older hand-written recipe has no stamp. Its tactics are still
         // validated one at a time by the trial launch, so it is accepted with
@@ -392,10 +426,7 @@ fn header_mismatch(text: &str) -> Option<String> {
             None
         }
         Some(stamp) if stamp.trim() == want => None,
-        Some(stamp) => Some(format!(
-            "measured on `{}`, running `{want}`",
-            stamp.trim()
-        )),
+        Some(stamp) => Some(format!("measured on `{}`, running `{want}`", stamp.trim())),
     }
 }
 
@@ -425,7 +456,9 @@ fn register_tactics(ctx: &HipContext, recipe: &Recipe) {
     for (&(m, k, n, epilogue), blob) in &recipe.tactics {
         // Shapes too large for the C ABI's `int` are skipped here and
         // rejected by `gemm` itself, which is where the error belongs.
-        let (Ok(m), Ok(n), Ok(k)) = (int(m), int(n), int(k)) else { continue };
+        let (Ok(m), Ok(n), Ok(k)) = (int(m), int(n), int(k)) else {
+            continue;
+        };
         let status = unsafe {
             ffi::apxinf_hip_blaslt_set_tactic(
                 handle,
@@ -444,7 +477,6 @@ fn register_tactics(ctx: &HipContext, recipe: &Recipe) {
     }
     TACTICS_REGISTERED.store(address, Ordering::Relaxed);
 }
-
 
 /// Measure both providers for a shape the recipe does not cover, and persist
 /// the winner.
@@ -517,8 +549,16 @@ fn tune_shape(
         "apxinf-hip: tuned {m}x{k}x{n}{}: hipBLAS {blas_ms:.4} ms, hipBLASLt {} -> {} \
          (worst candidate drift {worst:.1e})",
         epilogue_suffix(epilogue),
-        if lt_ms > 0.0 { format!("{lt_ms:.4} ms, {ratio:.2}x") } else { "none".into() },
-        if entry.0 == Provider::HipBlasLt { "hipBLASLt" } else { "hipBLAS" },
+        if lt_ms > 0.0 {
+            format!("{lt_ms:.4} ms, {ratio:.2}x")
+        } else {
+            "none".into()
+        },
+        if entry.0 == Provider::HipBlasLt {
+            "hipBLASLt"
+        } else {
+            "hipBLAS"
+        },
     );
     // Hand the tactic to the handle here, while the blob is in hand and the
     // lock is already held. Doing it from the dispatch path instead would mean
@@ -598,8 +638,7 @@ fn persist(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let (mut rocm, mut blaslt) = (0i32, 0i32);
-    unsafe { ffi::apxinf_hip_library_versions(&mut rocm, &mut blaslt) };
+    let (rocm, blaslt) = library_versions().unwrap_or((0, 0));
     let mut text = String::from("# apxinf-hip gemm recipe v1\n");
     text.push_str(&format!(
         "# measured-on {} rocm{} hipblaslt{blaslt}\n",
@@ -633,17 +672,14 @@ fn persist(
     for (&(m, k, n, epilogue), (provider, blob)) in &merged {
         let epi = epilogue_name(epilogue);
         match provider {
-            Provider::HipBlasLt if !blob.is_empty() => text.push_str(&format!(
-                "bf16 {m} {k} {n} {epi} lt {}\n",
-                encode_hex(blob)
-            )),
+            Provider::HipBlasLt if !blob.is_empty() => {
+                text.push_str(&format!("bf16 {m} {k} {n} {epi} lt {}\n", encode_hex(blob)))
+            }
             // No tactic recorded: hipBLASLt still serves the shape, by its own
             // heuristic. Measurement puts that at 78% of the achievable gain,
             // which is worth keeping over a silent demotion to hipBLAS.
             Provider::HipBlasLt => text.push_str(&format!("bf16 {m} {k} {n} {epi} lt\n")),
-            Provider::HipBlas => {
-                text.push_str(&format!("bf16 {m} {k} {n} {epi} hipblas\n"))
-            }
+            Provider::HipBlas => text.push_str(&format!("bf16 {m} {k} {n} {epi} hipblas\n")),
         }
     }
     // Same directory as the destination, so the rename stays within one
@@ -816,13 +852,21 @@ fn dispatch(
     let (epilogue, bias_ptr, provider) = match wanted {
         EPILOGUE_NONE => {
             let key = (m, k, n, EPILOGUE_NONE);
-            (EPILOGUE_NONE, std::ptr::null(), resolve(key, std::ptr::null()))
+            (
+                EPILOGUE_NONE,
+                std::ptr::null(),
+                resolve(key, std::ptr::null()),
+            )
         }
         code => match resolve((m, k, n, code), bias_ptr) {
             Provider::HipBlasLt => (code, bias_ptr, Provider::HipBlasLt),
             Provider::HipBlas => {
                 let key = (m, k, n, EPILOGUE_NONE);
-                (EPILOGUE_NONE, std::ptr::null(), resolve(key, std::ptr::null()))
+                (
+                    EPILOGUE_NONE,
+                    std::ptr::null(),
+                    resolve(key, std::ptr::null()),
+                )
             }
         },
     };
@@ -883,7 +927,8 @@ mod tests {
     /// model, because the model is still correct either way -- only slower.
     #[test]
     fn a_written_recipe_reads_back_with_the_same_choices() {
-        let directory = std::env::temp_dir().join(format!("apxinf-hip-recipe-{}", std::process::id()));
+        let directory =
+            std::env::temp_dir().join(format!("apxinf-hip-recipe-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("gemm.recipe");
 
@@ -899,10 +944,16 @@ mod tests {
             (41, 6144, 1536, EPILOGUE_BIAS_GELU_TANH),
             (Provider::HipBlas, Vec::new()),
         );
-        written.insert((512, 1024, 3072, EPILOGUE_NONE), (Provider::HipBlas, Vec::new()));
+        written.insert(
+            (512, 1024, 3072, EPILOGUE_NONE),
+            (Provider::HipBlas, Vec::new()),
+        );
         // A single-byte tactic: shorter than any real algorithm, so it must be
         // rejected as a tactic while the provider choice on that line survives.
-        written.insert((1, 132, 1024, EPILOGUE_BIAS), (Provider::HipBlasLt, vec![0x01]));
+        written.insert(
+            (1, 132, 1024, EPILOGUE_BIAS),
+            (Provider::HipBlasLt, vec![0x01]),
+        );
         persist(&path, &empty_recipe(), &written).unwrap();
 
         let read = load_recipe(&path);
@@ -911,7 +962,8 @@ mod tests {
             Some(&Provider::HipBlasLt)
         );
         assert_eq!(
-            read.providers.get(&(41, 6144, 1536, EPILOGUE_BIAS_GELU_TANH)),
+            read.providers
+                .get(&(41, 6144, 1536, EPILOGUE_BIAS_GELU_TANH)),
             Some(&Provider::HipBlas),
             "the two epilogues of one shape must not collapse into a single entry"
         );
@@ -924,7 +976,9 @@ mod tests {
         let expected_bytes = unsafe { ffi::apxinf_hip_blaslt_tactic_bytes() };
         if expected_bytes == 4 {
             assert_eq!(
-                read.tactics.get(&(41, 6144, 1536, EPILOGUE_NONE)).map(Vec::as_slice),
+                read.tactics
+                    .get(&(41, 6144, 1536, EPILOGUE_NONE))
+                    .map(Vec::as_slice),
                 Some([0x52u8, 0x15, 0x00, 0xff].as_slice())
             );
         }
@@ -968,7 +1022,10 @@ mod tests {
     }
 
     fn empty_recipe() -> Recipe {
-        Recipe { providers: BTreeMap::new(), tactics: BTreeMap::new() }
+        Recipe {
+            providers: BTreeMap::new(),
+            tactics: BTreeMap::new(),
+        }
     }
 
     /// Tuning one key must not delete the rest of the recipe.
@@ -986,7 +1043,10 @@ mod tests {
         let path = directory.join("gemm.recipe");
 
         // Thirty-one keys on disk, one of them tuned again in this process.
-        let mut on_disk = Recipe { providers: BTreeMap::new(), tactics: BTreeMap::new() };
+        let mut on_disk = Recipe {
+            providers: BTreeMap::new(),
+            tactics: BTreeMap::new(),
+        };
         for i in 0..31 {
             let key = (41 + i, 1536, 1536, EPILOGUE_NONE);
             on_disk.providers.insert(key, Provider::HipBlas);
@@ -1009,13 +1069,19 @@ mod tests {
             Some(&Provider::HipBlasLt),
             "the freshly tuned key must win over the one read from disk"
         );
-        assert_eq!(read.providers.get(&(60, 1536, 1536, EPILOGUE_NONE)), Some(&Provider::HipBlas));
+        assert_eq!(
+            read.providers.get(&(60, 1536, 1536, EPILOGUE_NONE)),
+            Some(&Provider::HipBlas)
+        );
         std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]
     fn hex_round_trips_and_rejects_malformed_input() {
-        assert_eq!(decode_hex(&encode_hex(&[0, 1, 0x7f, 0xff])), Some(vec![0, 1, 0x7f, 0xff]));
+        assert_eq!(
+            decode_hex(&encode_hex(&[0, 1, 0x7f, 0xff])),
+            Some(vec![0, 1, 0x7f, 0xff])
+        );
         assert_eq!(decode_hex("abc"), None, "odd length");
         assert_eq!(decode_hex("zz"), None, "not hex");
         assert_eq!(decode_hex(""), Some(Vec::new()));

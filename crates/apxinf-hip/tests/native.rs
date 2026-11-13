@@ -228,9 +228,7 @@ fn hipblaslt_matches_the_reference_where_it_is_available() {
         // The provider is process-wide and read once, so this test only means
         // something in a run configured for it. CI covers both arms by
         // invoking the suite twice.
-        eprintln!(
-            "skipping: set APXINF_HIP_GEMM_PROVIDER=lt to exercise the hipBLASLt path"
-        );
+        eprintln!("skipping: set APXINF_HIP_GEMM_PROVIDER=lt to exercise the hipBLASLt path");
         return;
     }
     let ctx = ctx();
@@ -239,7 +237,12 @@ fn hipblaslt_matches_the_reference_where_it_is_available() {
     // GR00T's dominant DiT shapes, where the measurement puts hipBLASLt ahead,
     // plus one vision shape where it is behind: being slower is allowed, being
     // wrong is not.
-    let shapes = [(41, 6144, 1536), (41, 1536, 1536), (21, 2048, 1536), (512, 1024, 3072)];
+    let shapes = [
+        (41, 6144, 1536),
+        (41, 1536, 1536),
+        (21, 2048, 1536),
+        (512, 1024, 3072),
+    ];
     let mut routed = 0usize;
     for (m, k, n) in shapes {
         let (a, ah) = input(&ctx, &[m, k], 30 + m as u64, 1.0);
@@ -307,14 +310,45 @@ fn ck_attention_matches_the_apxinf_kernel_where_it_is_available() {
         (2usize, 256usize, 256usize, 16usize, 64usize, None, "vision"),
         (1, 149, 149, 32, 64, None, "VL"),
         (1, 41, 149, 32, 48, None, "DiT"),
-        (1, 149, 149, 16, 128, Some(0), "text backbone (causal, top-left)"),
-        (1, 41, 149, 16, 128, Some(108), "prefill over a cache (bottom-right)"),
+        (
+            1,
+            149,
+            149,
+            16,
+            128,
+            Some(0),
+            "text backbone (causal, top-left)",
+        ),
+        (
+            1,
+            41,
+            149,
+            16,
+            128,
+            Some(108),
+            "prefill over a cache (bottom-right)",
+        ),
     ];
     let mut served = 0usize;
     for (batch, q_tokens, kv_tokens, heads, head_dim, causal, name) in cases {
-        let (q, _) = input(&ctx, &[batch, q_tokens, heads, head_dim], 7 + head_dim as u64, 1.0);
-        let (k, _) = input(&ctx, &[batch, kv_tokens, heads, head_dim], 11 + heads as u64, 1.0);
-        let (v, _) = input(&ctx, &[batch, kv_tokens, heads, head_dim], 13 + q_tokens as u64, 1.0);
+        let (q, _) = input(
+            &ctx,
+            &[batch, q_tokens, heads, head_dim],
+            7 + head_dim as u64,
+            1.0,
+        );
+        let (k, _) = input(
+            &ctx,
+            &[batch, kv_tokens, heads, head_dim],
+            11 + heads as u64,
+            1.0,
+        );
+        let (v, _) = input(
+            &ctx,
+            &[batch, kv_tokens, heads, head_dim],
+            13 + q_tokens as u64,
+            1.0,
+        );
         let geometry = native::AttentionGeometry {
             batch,
             q_tokens,
@@ -389,8 +423,10 @@ fn packed_qkv_attention_matches_split_tensors_exactly() {
                 })
                 .collect()
         }
-        let to_device =
-            |v: Vec<bf16>| ctx.to_device(&Tensor::from_bf16(vec![rows, width], &v).unwrap()).unwrap();
+        let to_device = |v: Vec<bf16>| {
+            ctx.to_device(&Tensor::from_bf16(vec![rows, width], &v).unwrap())
+                .unwrap()
+        };
         let q = to_device(section_of(&packed_host, 0, rows, width));
         let k = to_device(section_of(&packed_host, 1, rows, width));
         let v = to_device(section_of(&packed_host, 2, rows, width));
@@ -467,7 +503,16 @@ fn split_qkv_axial_rope_matches_split_then_rotate_exactly() {
             arena.tensor(head_shape(), DType::BF16).unwrap(),
         );
         native::split_qkv_axial_rope(
-            &ctx, &qkv, bias.as_ref(), &positions, heads, head_dim, 10_000.0, &q1, &k1, &v1,
+            &ctx,
+            &qkv,
+            bias.as_ref(),
+            &positions,
+            heads,
+            head_dim,
+            10_000.0,
+            &q1,
+            &k1,
+            &v1,
         )
         .unwrap();
 
@@ -497,12 +542,29 @@ fn rms_norm_mrope_qk_matches_rms_norm_then_apply_mrope_exactly() {
     // The text backbone's shape, and a small case with a different head
     // layout and an odd token count.
     let cases = [
-        (156usize, 16usize, 8usize, 128usize, [8usize, 4, 4], "text backbone"),
+        (
+            156usize,
+            16usize,
+            8usize,
+            128usize,
+            [8usize, 4, 4],
+            "text backbone",
+        ),
         (11, 3, 2, 12, [1, 2, 1], "small"),
     ];
     for (tokens, q_heads, kv_heads, head_dim, sections, name) in cases {
-        let (q, _) = input(&ctx, &[tokens * q_heads, head_dim], 61 + head_dim as u64, 1.0);
-        let (k, _) = input(&ctx, &[tokens * kv_heads, head_dim], 63 + head_dim as u64, 1.0);
+        let (q, _) = input(
+            &ctx,
+            &[tokens * q_heads, head_dim],
+            61 + head_dim as u64,
+            1.0,
+        );
+        let (k, _) = input(
+            &ctx,
+            &[tokens * kv_heads, head_dim],
+            63 + head_dim as u64,
+            1.0,
+        );
         let (qw, _) = input(&ctx, &[head_dim], 65, 0.5);
         let (kw, _) = input(&ctx, &[head_dim], 67, 0.5);
         // (t, h, w) ids per token; any distinct triplets serve, since both
@@ -515,8 +577,12 @@ fn rms_norm_mrope_qk_matches_rms_norm_then_apply_mrope_exactly() {
 
         // The fused kernel.
         let (qo, ko) = (
-            arena.tensor(vec![tokens, q_heads, head_dim], DType::BF16).unwrap(),
-            arena.tensor(vec![tokens, kv_heads, head_dim], DType::BF16).unwrap(),
+            arena
+                .tensor(vec![tokens, q_heads, head_dim], DType::BF16)
+                .unwrap(),
+            arena
+                .tensor(vec![tokens, kv_heads, head_dim], DType::BF16)
+                .unwrap(),
         );
         native::rms_norm_apply_mrope_qk(
             &ctx, &q, &qw, &k, &kw, &positions, q_heads, kv_heads, head_dim, EPS, 10_000.0,
@@ -526,14 +592,22 @@ fn rms_norm_mrope_qk_matches_rms_norm_then_apply_mrope_exactly() {
 
         // The sequence the backbone ran before the fusion.
         let (qn, kn) = (
-            arena.tensor(vec![tokens * q_heads, head_dim], DType::BF16).unwrap(),
-            arena.tensor(vec![tokens * kv_heads, head_dim], DType::BF16).unwrap(),
+            arena
+                .tensor(vec![tokens * q_heads, head_dim], DType::BF16)
+                .unwrap(),
+            arena
+                .tensor(vec![tokens * kv_heads, head_dim], DType::BF16)
+                .unwrap(),
         );
         native::rms_norm(&ctx, &q, &qw, EPS, &qn).unwrap();
         native::rms_norm(&ctx, &k, &kw, EPS, &kn).unwrap();
         let (qr, kr) = (
-            arena.tensor(vec![tokens, q_heads, head_dim], DType::BF16).unwrap(),
-            arena.tensor(vec![tokens, kv_heads, head_dim], DType::BF16).unwrap(),
+            arena
+                .tensor(vec![tokens, q_heads, head_dim], DType::BF16)
+                .unwrap(),
+            arena
+                .tensor(vec![tokens, kv_heads, head_dim], DType::BF16)
+                .unwrap(),
         );
         native::apply_mrope(
             &ctx,
@@ -761,7 +835,9 @@ fn pointwise_operators_match_the_reference() {
     let (biasf, biasfh) = input(&ctx, &[cols_f], 22, 0.5);
     let outf = arena.tensor(vec![rows_f, cols_f], DType::BF16).unwrap();
     native::bias_activation(&ctx, &xf, Some(&biasf), Activation::GeluTanh, &outf).unwrap();
-    let want_f: Vec<f32> = (0..rows_f * cols_f).map(|i| gelu_tanh(xfh[i] + biasfh[i % cols_f])).collect();
+    let want_f: Vec<f32> = (0..rows_f * cols_f)
+        .map(|i| gelu_tanh(xfh[i] + biasfh[i % cols_f]))
+        .collect();
     assert_close(
         &host(&ctx, &outf),
         &want_f,
@@ -799,8 +875,14 @@ fn embedding_scales_rows_by_sqrt_width_and_zeroes_unknown_ids() {
     let bytes = HipDeviceBytes::new(&ctx, 4 * 200).unwrap();
     bytes.upload_u32(&ids).unwrap();
     let out = arena.tensor(vec![ids.len(), width], DType::BF16).unwrap();
-    native::embedding(&ctx, &table, &bytes, native::EmbeddingScale::SqrtWidth, &out)
-        .unwrap();
+    native::embedding(
+        &ctx,
+        &table,
+        &bytes,
+        native::EmbeddingScale::SqrtWidth,
+        &out,
+    )
+    .unwrap();
     let scale = (width as f32).sqrt();
     let th = &th;
     let want: Vec<f32> = ids
@@ -1392,7 +1474,17 @@ fn apply_mrope_is_correct_in_place_and_rejects_a_broken_contract() {
         .unwrap();
     // H + W may not claim more than the half-split pairs they share.
     assert!(
-        native::apply_mrope(&ctx, &x, &positions, heads, head_dim, theta, [2, 5, 5], &out).is_err(),
+        native::apply_mrope(
+            &ctx,
+            &x,
+            &positions,
+            heads,
+            head_dim,
+            theta,
+            [2, 5, 5],
+            &out
+        )
+        .is_err(),
         "sections h+w over head_dim/2"
     );
     // Too few positions for the token count.
@@ -1402,7 +1494,9 @@ fn apply_mrope_is_correct_in_place_and_rejects_a_broken_contract() {
         "truncated positions"
     );
     // A rank-2 input is not [tokens, heads, head_dim].
-    let flat = arena.tensor(vec![tokens, heads * head_dim], DType::BF16).unwrap();
+    let flat = arena
+        .tensor(vec![tokens, heads * head_dim], DType::BF16)
+        .unwrap();
     assert!(
         native::apply_mrope(&ctx, &flat, &positions, heads, head_dim, theta, sections, &out)
             .is_err(),
@@ -1490,7 +1584,11 @@ fn split_qkv_bias_then_vision_2d_rounds_like_the_fused_cuda_kernel() {
     let positions = HipDeviceBytes::new(&ctx, ids.len() * 4).unwrap();
     positions.upload_u32(&ids).unwrap();
 
-    let make = || arena.tensor(vec![tokens, heads, head_dim], DType::BF16).unwrap();
+    let make = || {
+        arena
+            .tensor(vec![tokens, heads, head_dim], DType::BF16)
+            .unwrap()
+    };
     let (q, k, v) = (make(), make(), make());
     native::split_qkv_bias(&ctx, &qkv, Some(&bias), &q, &k, &v).unwrap();
     native::apply_vision_2d(&ctx, &q, &positions, heads, head_dim, theta, &q).unwrap();
@@ -1638,9 +1736,9 @@ fn ada_layer_norm_conditions_layer_statistics_with_scale_then_shift() {
         let mut want = Vec::with_capacity(rows * cols);
         for row in xh.chunks(cols) {
             let (mean, inverse) = mean_inverse_std_eps(row, eps);
-            want.extend((0..cols).map(|c| {
-                (row[c] - mean) * inverse * (1.0 + sh[c]) + sh[cols + c]
-            }));
+            want.extend(
+                (0..cols).map(|c| (row[c] - mean) * inverse * (1.0 + sh[c]) + sh[cols + c]),
+            );
         }
         assert_close(
             &host(&ctx, &out),
@@ -1822,16 +1920,13 @@ fn row_and_column_movement_matches_the_reference() {
 
     // gather_rows: the backbone's image / non-image row split.
     let (features, fh) = input(&ctx, &[149, cols], 81, 1.0);
-    let picked: Vec<u32> = (0..149u32).filter(|i| i % 3 == 1).collect();
-    let indices = HipDeviceBytes::new(&ctx, picked.len() * 4).unwrap();
-    indices.upload_u32(&picked).unwrap();
-    let gathered = arena
-        .tensor(vec![picked.len(), cols], DType::BF16)
-        .unwrap();
+    let picked: Vec<usize> = (0..149usize).filter(|i| i % 3 == 1).collect();
+    let indices = native::PreparedRowIndices::new(&ctx, &picked, 149).unwrap();
+    let gathered = arena.tensor(vec![picked.len(), cols], DType::BF16).unwrap();
     native::gather_rows(&ctx, &features, &indices, &gathered).unwrap();
     let want: Vec<f32> = picked
         .iter()
-        .flat_map(|&row| fh[row as usize * cols..(row as usize + 1) * cols].to_vec())
+        .flat_map(|&row| fh[row * cols..(row + 1) * cols].to_vec())
         .collect();
     assert_close(&host(&ctx, &gathered), &want, 0.0, "gather is bit exact");
 
@@ -1848,7 +1943,7 @@ fn row_and_column_movement_matches_the_reference() {
     native::scatter_rows(&ctx, &destination, &indices, &gathered, true).unwrap();
     let mut want_added = fh.clone();
     for &row in &picked {
-        let base = row as usize * cols;
+        let base = row * cols;
         for c in 0..cols {
             want_added[base + c] = r(want_added[base + c] + fh[base + c]);
         }
@@ -1887,10 +1982,27 @@ fn row_and_column_movement_matches_the_reference() {
         native::copy_columns(&ctx, &time, &joined, 1025).is_err(),
         "column window past the end"
     );
-    let few = HipDeviceBytes::new(&ctx, (picked.len() - 1) * 4).unwrap();
+
+    // An out-of-range index is refused while it is still on the host: an
+    // unchecked gather reads garbage and an unchecked scatter writes past the
+    // destination into the next arena allocation.
     assert!(
-        native::gather_rows(&ctx, &features, &few, &gathered).is_err(),
-        "truncated indices"
+        native::PreparedRowIndices::new(&ctx, &[0, 149], 149).is_err(),
+        "row index equal to the row count"
+    );
+    // A table validated against one row count cannot be replayed against a
+    // different matrix.
+    let (other, _) = input(&ctx, &[148, cols], 91, 1.0);
+    assert!(
+        native::gather_rows(&ctx, &other, &indices, &gathered).is_err(),
+        "indices prepared for a different row count"
+    );
+    // Repeated scatter rows race with themselves under accumulation, so they
+    // are refused rather than trusted to a comment.
+    let repeated = native::PreparedRowIndices::new(&ctx, &[1, 1, 4], 149).unwrap();
+    assert!(
+        native::scatter_rows(&ctx, &destination, &repeated, &gathered, false).is_err(),
+        "duplicate scatter rows"
     );
 }
 
@@ -1960,11 +2072,26 @@ fn the_fused_adaptive_layer_norm_matches_the_separate_pair_exactly() {
     native::bias_residual(&ctx, &projection, None, &residual, &h1).unwrap();
     native::ada_layer_norm(&ctx, &h1, &style, 1e-5, &n1).unwrap();
     native::bias_residual_ada_layer_norm(
-        &ctx, &projection, None, &residual, &style, 1e-5, &h2, &n2,
+        &ctx,
+        &projection,
+        None,
+        &residual,
+        &style,
+        1e-5,
+        &h2,
+        &n2,
     )
     .unwrap();
-    assert_eq!(host(&ctx, &h2), host(&ctx, &h1), "fused hidden differs without bias");
-    assert_eq!(host(&ctx, &n2), host(&ctx, &n1), "fused normalized differs without bias");
+    assert_eq!(
+        host(&ctx, &h2),
+        host(&ctx, &h1),
+        "fused hidden differs without bias"
+    );
+    assert_eq!(
+        host(&ctx, &n2),
+        host(&ctx, &n1),
+        "fused normalized differs without bias"
+    );
 }
 
 // ── HIP graphs ───────────────────────────────────────────────────────
@@ -2015,8 +2142,8 @@ fn a_replayed_graph_reproduces_the_eager_result_exactly() {
     // nothing from host memory, and does not synchronize or download. The arena
     // was reset to the same base before capture and is reset again before each
     // replay below.
-    let (graph, ()) = unsafe { apxinf_hip::graph::HipGraph::capture(&ctx, || run(&captured)) }
-        .expect("capture");
+    let (graph, ()) =
+        unsafe { apxinf_hip::graph::HipGraph::capture(&ctx, || run(&captured)) }.expect("capture");
     assert!(
         graph.nodes() >= 2,
         "the graph holds {} nodes; the sequence issues a norm and a GEMM, so a count \
@@ -2029,7 +2156,11 @@ fn a_replayed_graph_reproduces_the_eager_result_exactly() {
     let zeros = apxinf_core::Tensor::zeros(vec![64, 128], DType::BF16);
     native::upload(&ctx, &zeros, &captured).unwrap();
     ctx.synchronize().unwrap();
-    assert_ne!(host(&ctx, &captured), expected, "the output was not cleared");
+    assert_ne!(
+        host(&ctx, &captured),
+        expected,
+        "the output was not cleared"
+    );
 
     graph.launch(&ctx).unwrap();
     ctx.synchronize().unwrap();
@@ -2056,5 +2187,47 @@ fn an_empty_capture_is_refused() {
     let ctx = ctx();
     // SAFETY: the closure issues nothing at all, which is the case under test.
     let result = unsafe { apxinf_hip::graph::HipGraph::capture(&ctx, || Ok(())) };
-    assert!(result.is_err(), "a capture that recorded no work was accepted");
+    assert!(
+        result.is_err(),
+        "a capture that recorded no work was accepted"
+    );
+}
+
+/// A panic inside `work` must not leave the stream in capture mode.
+///
+/// While a capture is open, `hipMalloc` fails device-wide and every launch on
+/// the stream fails, so a leaked capture turns one panicking inference into a
+/// process-wide hazard. The guard ends the capture and resumes the panic; what
+/// is checked here is that afterwards the stream allocates and runs again.
+#[test]
+fn a_panic_inside_capture_still_ends_the_capture() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    arena.reset();
+    // Allocated before the capture: nothing inside `work` may allocate.
+    let (a, _) = input(&ctx, &[64, 128], 3, 1.0);
+    let (norm_weight, _) = input(&ctx, &[128], 5, 1.0);
+
+    // SAFETY: the closure allocates only from the arena (no device
+    // allocation), copies nothing from host memory, and does not synchronize
+    // or download. It panics on purpose; the panic path is the case under
+    // test, and the capture is expected to be ended before the panic escapes.
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        apxinf_hip::graph::HipGraph::capture(&ctx, || -> apxinf_core::Result<()> {
+            let out = arena.tensor(vec![64, 128], DType::BF16)?;
+            native::rms_norm(&ctx, &a, &norm_weight, 1e-6, &out)?;
+            panic!("inference code panicked inside the capture");
+        })
+    }));
+    assert!(
+        panic.is_err(),
+        "the panic inside the capture must escape to its caller"
+    );
+
+    // If the capture leaked, the next allocation on the device fails with
+    // "operation not permitted when stream is capturing" and the first launch
+    // on the stream fails; both are checked by issuing normal work again.
+    let out = arena.tensor(vec![64, 128], DType::BF16).unwrap();
+    native::rms_norm(&ctx, &a, &norm_weight, 1e-6, &out).unwrap();
+    host(&ctx, &out);
 }

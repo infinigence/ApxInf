@@ -13,6 +13,7 @@
 //! answer. See [`HipGraph::capture`].
 
 use std::ffi::c_void;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use apxinf_core::{Error, Result};
@@ -37,11 +38,50 @@ use crate::runtime::HipContext;
 /// open. So capture is only safe when the caller knows nothing else is
 /// allocating: in this crate that is the model's own `prepare`/`run` sequence,
 /// which is single-threaded by construction.
-fn capture_lock() -> MutexGuard<'static, ()> {
+///
+/// `HipContext::new` also takes this lock while it initializes hipBLAS and
+/// hipBLASLt: their init kernels run on the legacy default stream, and a
+/// legacy-stream operation while a capture is open fails with error 906 --
+/// which hipblaslt answers by exiting the process. Under the lock that race
+/// blocks instead of dying. This also means constructing a `HipContext`
+/// inside `HipGraph::capture`'s `work` would deadlock; the capture contract
+/// already forbids allocating inside `work`, and a context is the largest
+/// allocation there is.
+pub(crate) fn capture_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether the calling thread is between `hipStreamBeginCapture` and
+/// `hipStreamEndCapture`. Thread-local, so a thread that is capturing can be
+/// distinguished from a thread that is merely waiting for another thread's
+/// capture to close.
+thread_local! {
+    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Take the capture lock for a device allocation, or refuse.
+///
+/// `hipMalloc` fails device-wide while a capture is open (900). When another
+/// thread is capturing, waiting for it to close is the correct behaviour --
+/// the allocation is legal, just mistimed. When the *calling* thread is
+/// capturing, the allocation is the contract violation `capture` documents,
+/// and blocking would deadlock: the lock is already held by this thread, and
+/// the capture will not end until this call returns. That case stays a loud
+/// error.
+pub(crate) fn allocation_exclusive() -> Result<MutexGuard<'static, ()>> {
+    let capturing = CAPTURING.with(std::cell::Cell::get);
+    if capturing {
+        return Err(Error::Other(
+            "apxinf-hip: device allocation inside a capture. A captured replay \
+             reads addresses fixed at capture time, so `work` must not allocate; \
+             see `HipGraph::capture`'s contract."
+                .into(),
+        ));
+    }
+    Ok(capture_lock())
 }
 
 /// An instantiated HIP graph, replayable on the context's stream.
@@ -109,6 +149,13 @@ impl HipGraph {
         // poisons every later launch on it. End the capture before returning
         // the error, and discard whatever was recorded.
         //
+        // A panic inside `work` must end the capture too: the capture lock is
+        // released while the stream is still capturing, and while a capture is
+        // open `hipMalloc` fails device-wide and every launch on this stream
+        // fails, so an unguarded panic converts one panicking inference into a
+        // process-wide hang. Unwind the panic, end the capture, discard the
+        // record, then resume the panic so the caller still sees it.
+        //
         // Ending it does not make the stream usable again: the failure that
         // broke `work` latches an error on the stream itself, and clearing the
         // thread-local last error does not reach it. Measured -- a forward with
@@ -116,9 +163,15 @@ impl HipGraph {
         // device-to-host copy with "a previous error during capture". So the
         // caller must treat this as fatal for the stream rather than as a
         // reason to retry eagerly on it.
-        let value = match work() {
-            Ok(value) => value,
-            Err(error) => {
+        let unwound = {
+            CAPTURING.with(|flag| flag.set(true));
+            let unwound = panic::catch_unwind(AssertUnwindSafe(work));
+            CAPTURING.with(|flag| flag.set(false));
+            unwound
+        };
+        let value = match unwound {
+            Ok(Ok(value)) => value,
+            outcome => {
                 let mut exec = std::ptr::null_mut();
                 let mut nodes = 0i32;
                 unsafe {
@@ -127,7 +180,11 @@ impl HipGraph {
                         ffi::apxinf_hip_graph_destroy(exec);
                     }
                 }
-                return Err(error);
+                match outcome {
+                    Ok(Err(error)) => return Err(error),
+                    Err(panic) => panic::resume_unwind(panic),
+                    Ok(Ok(_)) => unreachable!(),
+                }
             }
         };
 
@@ -137,9 +194,8 @@ impl HipGraph {
         // reportable failure for an unexplainable one.
         let mut exec = std::ptr::null_mut();
         let mut nodes = 0i32;
-        let ended = unsafe {
-            ffi::apxinf_hip_graph_capture_end(ctx.stream(), &mut exec, &mut nodes)
-        };
+        let ended =
+            unsafe { ffi::apxinf_hip_graph_capture_end(ctx.stream(), &mut exec, &mut nodes) };
         check("hipStreamEndCapture", ended)?;
         if nodes <= 0 {
             unsafe { ffi::apxinf_hip_graph_destroy(exec) };
@@ -150,7 +206,13 @@ impl HipGraph {
                     .into(),
             ));
         }
-        Ok((Self { exec, nodes: nodes as usize }, value))
+        Ok((
+            Self {
+                exec,
+                nodes: nodes as usize,
+            },
+            value,
+        ))
     }
 
     /// Kernels and copies the graph holds. Fixed at capture.
