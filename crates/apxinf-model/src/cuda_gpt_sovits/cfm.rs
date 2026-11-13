@@ -76,7 +76,7 @@ fn sinus_tensor(ctx: &Context) -> Result<Tensor> {
     let times = (0..32).map(|i| i as f32 / 32.).collect::<Vec<_>>();
     let times = fp16_tensor(ctx, &[32], &times)?;
     let output = ops::alloc(ctx, &[32, 256])?;
-    apxinf_cuda_new::ops::sinusoidal_embedding(ctx, &times, &output, 1000., 10000.)?;
+    apxinf_cuda_new::ops::sinusoidal_embedding_table(ctx, &times, &output, 1000., 10000.)?;
     Ok(output)
 }
 
