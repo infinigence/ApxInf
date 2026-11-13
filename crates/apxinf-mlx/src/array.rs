@@ -1,8 +1,11 @@
-use crate::ffi;
+use crate::{ffi, MetalDeviceCaps};
 use apxinf_core::{Error, Result};
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     ffi::{c_void, CStr, CString},
+    os::unix::ffi::OsStrExt,
+    path::Path,
     ptr::NonNull,
     rc::Rc,
 };
@@ -26,6 +29,15 @@ fn dims(shape: &[usize]) -> Result<Vec<i32>> {
         .iter()
         .map(|&x| i32::try_from(x).map_err(|_| error("MLX shape exceeds i32")))
         .collect()
+}
+
+fn normalize_axis(axis: i32, rank: usize) -> Result<usize> {
+    let rank = i32::try_from(rank).map_err(|_| error("MLX rank exceeds i32"))?;
+    let normalized = if axis < 0 { axis + rank } else { axis };
+    if normalized < 0 || normalized >= rank {
+        return Err(error("axis is outside the array rank"));
+    }
+    Ok(normalized as usize)
 }
 
 /// Process-wide MLX allocator observations, in bytes. This is not per stream,
@@ -95,6 +107,15 @@ impl MlxDType {
     }
 }
 
+fn metal_caps(index: i32) -> Result<MetalDeviceCaps> {
+    let (mut name, mut architecture) = (std::ptr::null(), std::ptr::null());
+    check(unsafe { ffi::apx_mlx_device_info(index, &mut name, &mut architecture) })?;
+    // SAFETY: on success both point to NUL-terminated strings in MLX's
+    // process-lifetime device information map.
+    let text = |p| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned();
+    Ok(MetalDeviceCaps::new(text(name), text(architecture)))
+}
+
 #[derive(Clone)]
 pub struct Stream(Rc<StreamInner>);
 /// Cumulative observations for one logical execution stream and its clones.
@@ -112,6 +133,7 @@ pub struct StreamCounters {
 struct StreamInner {
     raw: NonNull<c_void>,
     metal: Option<usize>,
+    caps: Option<MetalDeviceCaps>,
     counters: Cell<StreamCounters>,
 }
 impl Drop for StreamInner {
@@ -134,14 +156,23 @@ impl Stream {
         let mut raw = std::ptr::null_mut();
         let index_i = i32::try_from(index).map_err(|_| error("device index exceeds i32"))?;
         check(unsafe { ffi::apx_mlx_stream_new(gpu as i32, index_i, &mut raw) })?;
-        Ok(Self(Rc::new(StreamInner {
+        let mut inner = StreamInner {
             raw: NonNull::new(raw).ok_or_else(|| error("null MLX stream"))?,
             metal: gpu.then_some(index),
+            caps: None,
             counters: Cell::new(StreamCounters::default()),
-        })))
+        };
+        if gpu {
+            inner.caps = Some(metal_caps(index_i)?);
+        }
+        Ok(Self(Rc::new(inner)))
     }
     pub fn metal_index(&self) -> Option<usize> {
         self.0.metal
+    }
+    /// Device facts of a Metal stream; `None` for a CPU stream.
+    pub fn metal_caps(&self) -> Option<&MetalDeviceCaps> {
+        self.0.caps.as_ref()
     }
     pub fn counters(&self) -> StreamCounters {
         self.0.counters.get()
@@ -518,6 +549,244 @@ impl Array {
         }
         self.stream().op(38, &[self, weight], &[], &[epsilon])
     }
+    /// Stock MLX fused RMSNorm without a weight multiplication.
+    pub fn fast_rms_norm_unweighted(&self, epsilon: f32) -> Result<Self> {
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(error("RMSNorm epsilon must be finite and positive"));
+        }
+        self.stream().op(38, &[self], &[], &[epsilon])
+    }
+    /// Stock MLX fused LayerNorm over the last axis, with optional affine terms.
+    pub fn fast_layer_norm(
+        &self,
+        weight: Option<&Self>,
+        bias: Option<&Self>,
+        epsilon: f32,
+    ) -> Result<Self> {
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(error("LayerNorm epsilon must be finite and positive"));
+        }
+        let mut a = vec![self];
+        a.extend(weight);
+        a.extend(bias);
+        let flags = [weight.is_some() as i32, bias.is_some() as i32];
+        self.stream().op(42, &a, &flags, &[epsilon])
+    }
+    pub fn erf(&self) -> Result<Self> {
+        self.unary(40)
+    }
+    pub fn abs(&self) -> Result<Self> {
+        self.unary(44)
+    }
+    pub fn logaddexp(&self, b: &Self) -> Result<Self> {
+        self.binary(41, b)
+    }
+    pub fn maximum(&self, b: &Self) -> Result<Self> {
+        self.binary(45, b)
+    }
+    pub fn minimum(&self, b: &Self) -> Result<Self> {
+        self.binary(46, b)
+    }
+    /// `beta * self + alpha * (a @ b)`, rounded once like MLX `addmm`.
+    pub fn addmm(&self, a: &Self, b: &Self, alpha: f32, beta: f32) -> Result<Self> {
+        self.stream().op(47, &[self, a, b], &[], &[alpha, beta])
+    }
+    /// MLX `linalg::norm` (2-norm for vectors) over `axes`.
+    pub fn norm(&self, axes: &[i32], keepdims: bool) -> Result<Self> {
+        self.reduce(48, axes, keepdims)
+    }
+    /// Softmax over one axis; `precise` accumulates in FP32 for low-precision input.
+    pub fn softmax_with(&self, axis: i32, precise: bool) -> Result<Self> {
+        self.stream().op(49, &[self], &[axis, precise as i32], &[])
+    }
+    pub fn tanh(&self) -> Result<Self> {
+        self.unary(50)
+    }
+    pub fn sqrt(&self) -> Result<Self> {
+        self.unary(51)
+    }
+    /// MLX `clip` with array bounds; pass scalars in the operand's dtype to
+    /// match MLX Python's scalar promotion.
+    pub fn clip(&self, min: &Self, max: &Self) -> Result<Self> {
+        self.stream().op(52, &[self, min, max], &[], &[])
+    }
+    /// MLX `repeat` along one axis: each element is repeated `repeats` times.
+    pub fn repeat(&self, repeats: usize, axis: i32) -> Result<Self> {
+        let repeats = i32::try_from(repeats).map_err(|_| error("repeat count exceeds i32"))?;
+        self.stream().op(54, &[self], &[repeats, axis], &[])
+    }
+    /// MLX `conv2d`: input `[N, H, W, C_in]`, weight `[C_out, KH, KW, C_in / groups]`.
+    pub fn conv2d(
+        &self,
+        weight: &Self,
+        stride: [usize; 2],
+        padding: [usize; 2],
+        dilation: [usize; 2],
+        groups: usize,
+    ) -> Result<Self> {
+        let p = [
+            stride[0],
+            stride[1],
+            padding[0],
+            padding[1],
+            dilation[0],
+            dilation[1],
+            groups,
+        ]
+        .iter()
+        .map(|&v| i32::try_from(v).map_err(|_| error("conv2d parameter exceeds i32")))
+        .collect::<Result<Vec<_>>>()?;
+        if [p[0], p[1], p[4], p[5], p[6]].contains(&0) {
+            return Err(error("conv2d stride, dilation and groups must be positive"));
+        }
+        self.stream().op(53, &[self, weight], &p, &[])
+    }
+    /// The MLX threefry PRNG key for `seed`, as `mx.random.key(seed)`.
+    pub fn random_key(stream: &Stream, seed: u64) -> Result<Self> {
+        stream.op(
+            55,
+            &[],
+            &[seed as u32 as i32, (seed >> 32) as u32 as i32],
+            &[],
+        )
+    }
+    /// Standard normal samples from `key`, as `mx.random.normal(shape, dtype, key=key)`.
+    pub fn random_normal(shape: &[usize], dtype: MlxDType, key: &Self) -> Result<Self> {
+        if key.dtype() != MlxDType::U32 || key.shape() != [2] {
+            return Err(error("random key must be a uint32 [2] array"));
+        }
+        let mut p = vec![dtype as i32];
+        p.extend(dims(shape)?);
+        key.stream().op(56, &[key], &p, &[])
+    }
+    /// Two keys from `key`, as `mx.random.split(key)`: the next state and the
+    /// subkey that MLX's global key sequence hands to one random call.
+    pub fn random_split(key: &Self) -> Result<(Self, Self)> {
+        if key.dtype() != MlxDType::U32 || key.shape() != [2] {
+            return Err(error("random key must be a uint32 [2] array"));
+        }
+        let both = key.stream().op(61, &[key], &[], &[])?;
+        let row = |i: usize| both.slice(&[i, 0], &[i + 1, 2])?.reshape(&[2]);
+        Ok((row(0)?, row(1)?))
+    }
+    /// One sample index per row along `axis` from unnormalized log
+    /// probabilities, as `mx.random.categorical(logits, axis, key=key)`; uint32.
+    pub fn categorical(&self, axis: i32, key: &Self) -> Result<Self> {
+        if key.dtype() != MlxDType::U32 || key.shape() != [2] {
+            return Err(error("random key must be a uint32 [2] array"));
+        }
+        self.stream().op(62, &[self, key], &[axis], &[])
+    }
+    /// MLX `argpartition`: indices whose element `kth` is in sorted position,
+    /// with smaller elements before it and larger ones after, along `axis`.
+    pub fn argpartition(&self, kth: usize, axis: i32) -> Result<Self> {
+        let kth = i32::try_from(kth).map_err(|_| error("argpartition kth exceeds i32"))?;
+        self.stream().op(57, &[self], &[kth, axis], &[])
+    }
+    /// Write values at checked host indices with the given shape along `axis`.
+    /// Negative indices count from the end. Invalid indices fail before upload.
+    /// Arbitrary device index arrays are not accepted: MLX does not bound their writes.
+    pub fn put_along_axis(
+        &self,
+        indices: &[i32],
+        index_shape: &[usize],
+        values: &Self,
+        axis: i32,
+    ) -> Result<Self> {
+        let normalized = normalize_axis(axis, self.shape().len())?;
+        if index_shape.len() != self.shape().len() {
+            return Err(error("index rank must match the source rank"));
+        }
+        let width = i32::try_from(self.shape()[normalized])
+            .map_err(|_| error("indexed dimension exceeds i32"))?;
+        if indices
+            .iter()
+            .any(|&index| index < -width || index >= width)
+        {
+            return Err(error(
+                "put_along_axis index is outside the indexed dimension",
+            ));
+        }
+        let indices = Self::from_i32(self.stream(), index_shape, indices)?;
+        self.stream()
+            .op(58, &[self, &indices, values], &[normalized as i32], &[])
+    }
+    /// Keep the largest `count` values along `axis`, masking the rest with -inf.
+    /// Ties follow MLX argpartition. Generated indices stay on the device.
+    pub fn top_k_mask(&self, count: usize, axis: i32) -> Result<Self> {
+        let normalized = normalize_axis(axis, self.shape().len())?;
+        let width = self.shape()[normalized];
+        if count == 0 || count > width {
+            return Err(error(
+                "top_k_mask count must be between 1 and the axis length",
+            ));
+        }
+        if !matches!(self.dtype(), MlxDType::F32 | MlxDType::F16 | MlxDType::BF16) {
+            return Err(error("top_k_mask requires floating-point values"));
+        }
+        if count == width {
+            return Ok(self.clone());
+        }
+        let order = self.neg()?.argpartition(count - 1, normalized as i32)?;
+        let mut start = vec![0; self.shape().len()];
+        start[normalized] = count;
+        let indices = order.slice(&start, self.shape())?;
+        let masked = Self::scalar(self.stream(), f32::NEG_INFINITY, self.dtype())?;
+        self.stream()
+            .op(58, &[self, &indices, &masked], &[normalized as i32], &[])
+    }
+    /// MLX constant `pad` with zeros: `low[d]` and `high[d]` elements before
+    /// and after axis `d`.
+    pub fn pad(&self, low: &[usize], high: &[usize]) -> Result<Self> {
+        let rank = self.shape().len();
+        if low.len() != rank || high.len() != rank {
+            return Err(error("pad widths must cover every axis"));
+        }
+        let mut p = vec![rank as i32];
+        p.extend(dims(low)?);
+        p.extend(dims(high)?);
+        let zero = Self::zeros(self.stream(), &[], self.dtype())?;
+        self.stream().op(59, &[self, &zero], &p, &[])
+    }
+    /// MLX `conv_transpose1d`: input `[N, L, C_in]`, weight `[C_out, K, C_in / groups]`.
+    pub fn conv_transpose1d(
+        &self,
+        weight: &Self,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        output_padding: usize,
+        groups: usize,
+    ) -> Result<Self> {
+        let p = [stride, padding, dilation, output_padding, groups]
+            .iter()
+            .map(|&v| i32::try_from(v).map_err(|_| error("conv_transpose1d parameter exceeds i32")))
+            .collect::<Result<Vec<_>>>()?;
+        if p[0] == 0 || p[2] == 0 || p[4] == 0 {
+            return Err(error(
+                "conv_transpose1d stride, dilation and groups must be positive",
+            ));
+        }
+        self.stream().op(60, &[self, weight], &p, &[])
+    }
+    /// MLX `conv1d`: input `[N, L, C_in]`, weight `[C_out, K, C_in / groups]`.
+    pub fn conv1d(
+        &self,
+        weight: &Self,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    ) -> Result<Self> {
+        let p = [stride, padding, dilation, groups]
+            .iter()
+            .map(|&v| i32::try_from(v).map_err(|_| error("conv1d parameter exceeds i32")))
+            .collect::<Result<Vec<_>>>()?;
+        if p[0] == 0 || p[2] == 0 || p[3] == 0 {
+            return Err(error("conv1d stride, dilation and groups must be positive"));
+        }
+        self.stream().op(43, &[self, weight], &p, &[])
+    }
     /// MLX fast attention semantics; model caller owns its numerical contract.
     pub fn sdpa(
         &self,
@@ -632,6 +901,70 @@ fn own_many(stream: &Stream, raw: &mut [ffi::Handle]) -> Result<Vec<Array>> {
                 return Err(e);
             }
         }
+    }
+    Ok(out)
+}
+
+/// Reads the tensors of SafeTensors files whose names satisfy `keep` into
+/// evaluated arrays attributed to `stream`. Other tensors are never read.
+///
+/// MLX reads each file on its CPU device, without a host staging copy.
+/// Tensor names must be unique across files, and every kept tensor must have
+/// a bridge dtype; MLX-format affine checkpoints store packed weights as U32.
+/// Checkpoint keys, shapes and quantization belong to the model family. Bytes
+/// read count as uploads, and each file is one evaluation boundary.
+pub fn load_safetensors<P: AsRef<Path>>(
+    stream: &Stream,
+    files: &[P],
+    keep: impl Fn(&str) -> bool,
+) -> Result<HashMap<String, Array>> {
+    struct Loaded(NonNull<c_void>);
+    impl Drop for Loaded {
+        fn drop(&mut self) {
+            unsafe { ffi::apx_mlx_safetensors_free(self.0.as_ptr()) }
+        }
+    }
+    let mut out = HashMap::new();
+    for file in files {
+        let file = file.as_ref();
+        let label = |e: Error| error(format!("SafeTensors {}: {e}", file.display()));
+        let path = CString::new(file.as_os_str().as_bytes())
+            .map_err(|_| error("NUL in SafeTensors path"))?;
+        let mut raw = std::ptr::null_mut();
+        let mut count = 0;
+        check(unsafe { ffi::apx_mlx_safetensors_load(path.as_ptr(), &mut raw, &mut count) })
+            .map_err(label)?;
+        let loaded = Loaded(NonNull::new(raw).ok_or_else(|| error("null SafeTensors load"))?);
+        let mut arrays = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut name = std::ptr::null();
+            let mut handle = std::ptr::null_mut();
+            check(unsafe {
+                ffi::apx_mlx_safetensors_entry(loaded.0.as_ptr(), index, &mut name, &mut handle)
+            })
+            .map_err(label)?;
+            let name = unsafe { CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned();
+            if !keep(&name) {
+                // An unevaluated load reads nothing; release the handle.
+                unsafe { ffi::apx_mlx_array_free(handle) };
+                continue;
+            }
+            let array = unsafe { Array::own(stream.clone(), handle) }
+                .map_err(|e| label(error(format!("tensor `{name}`: {e}"))))?;
+            if out.contains_key(&name) {
+                return Err(label(error(format!("duplicate tensor `{name}`"))));
+            }
+            arrays.push(array.clone());
+            out.insert(name, array);
+        }
+        stream.eval(&arrays).map_err(label)?;
+        let bytes = arrays
+            .iter()
+            .map(|a| a.numel() * a.dtype().size_in_bytes())
+            .sum::<usize>();
+        stream.record(|c| c.uploads_bytes = c.uploads_bytes.saturating_add(bytes));
     }
     Ok(out)
 }
@@ -783,6 +1116,14 @@ unsafe extern "C" fn trace_callback(
 
 /// Prepared custom Metal primitive. Source validity and operand geometry remain
 /// the safe model-neutral wrapper's contract; no Python execution is involved.
+/// Compile-time argument of a custom Metal kernel template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TemplateArg {
+    DType(MlxDType),
+    Int(i32),
+    Bool(bool),
+}
+
 pub struct MetalKernel {
     raw: NonNull<c_void>,
     stream: Stream,
@@ -840,7 +1181,7 @@ impl MetalKernel {
         output_specs: &[(&[usize], MlxDType)],
         grid: [usize; 3],
         threadgroup: [usize; 3],
-        template_dtype: Option<MlxDType>,
+        templates: &[(&str, TemplateArg)],
     ) -> Result<Vec<Array>> {
         if inputs.len() != self.input_count || output_specs.len() != self.output_count {
             return Err(error("Metal kernel arity mismatch"));
@@ -860,6 +1201,19 @@ impl MetalKernel {
         if g.contains(&0) || tg.contains(&0) {
             return Err(error("zero Metal launch geometry"));
         }
+        let names = templates
+            .iter()
+            .map(|(n, _)| CString::new(*n).map_err(|_| error("NUL in Metal template name")))
+            .collect::<Result<Vec<_>>>()?;
+        let name_ptrs: Vec<_> = names.iter().map(|n| n.as_ptr()).collect();
+        let (kinds, values): (Vec<i32>, Vec<i32>) = templates
+            .iter()
+            .map(|(_, arg)| match *arg {
+                TemplateArg::DType(d) => (0, d as i32),
+                TemplateArg::Int(v) => (1, v),
+                TemplateArg::Bool(v) => (2, v as i32),
+            })
+            .unzip();
         let mut out = vec![std::ptr::null_mut(); self.output_count];
         check(ffi::apx_mlx_metal_call(
             self.stream.raw(),
@@ -872,7 +1226,10 @@ impl MetalKernel {
             self.output_count,
             g.as_ptr(),
             tg.as_ptr(),
-            template_dtype.map_or(-1, |d| d as i32),
+            name_ptrs.as_ptr(),
+            kinds.as_ptr(),
+            values.as_ptr(),
+            templates.len(),
             out.as_mut_ptr(),
         ))?;
         own_many(&self.stream, &mut out)

@@ -21,7 +21,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Tensor};
 
 use super::{bf16_ptr, int, long, require_numel};
 use crate::ffi::{self, check, DTYPE_BF16};
@@ -113,13 +113,17 @@ pub struct AttentionGeometry {
 /// `[batch, rows, kv_heads, head_dim]` with `rows >= kv_tokens`: a cache may
 /// hold more rows than the call attends, and only the first `kv_tokens` of
 /// each batch are read. Any leading-dimension grouping of these element
-/// counts is accepted.
+/// counts is accepted. `scratch` is an F32 tensor of at least
+/// [`attention_scratch_elements`] elements, or `None` when that is zero.
+#[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &HipContext,
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
     geometry: &AttentionGeometry,
+    kernel: AttentionKernel,
+    scratch: Option<&Tensor>,
     out: &Tensor,
 ) -> Result<()> {
     attention_inner(ctx, q, k, v, geometry, out, ck_enabled())

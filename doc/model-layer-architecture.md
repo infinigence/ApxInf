@@ -32,8 +32,12 @@ apxinf-model
   architecture, weights, schedules and execution orchestration
                          |
                          v
-apxinf-core / apxinf-cuda-new / apxinf-mlx
-  tensors, devices, model-neutral operators, kernel APIs
+apxinf-cpu / apxinf-cuda-new / apxinf-hip / apxinf-mlx
+  model-neutral operators, kernel APIs
+                         |
+                         v
+apxinf-core
+  tensors, devices, backend and sampling contracts
 ```
 
 Dependencies flow downward. Backend crates never import model concepts.
@@ -58,6 +62,24 @@ Generation-oriented `prefill(LlmInput)` may consume every prompt position and
 return its final `[1, vocab_size]` row. The common sampler selects the last row
 through `NextTokenLogits::last`; specialized schedules such as DSpark override
 the request-level generation hook without weakening `forward`.
+
+`decision.rs` defines the non-generative Decision category and two request
+protocols. A family implements the one it supports, and loading wraps it in
+`DecisionModel`, so `LoadedModel::Decision` states the protocol at load time.
+
+- `CodeDecisionRuntime` (`d3`): `decide(DecisionInput)` scores a caller-encoded
+  prompt over the package code table and returns `DecisionOutput`;
+  `code_names()` and `token_ids()` describe that table. `DecisionRuntime`
+  remains its name in the `d3` and root exports, with the existing input and
+  output types.
+- `SchemaDecisionRuntime` (`metal_clef`): `decide_schema(DecisionSchema)`
+  encodes the state and typed questions inside the family and returns
+  `SchemaDecisionOutput`: question IDs and option scores, without package
+  token IDs.
+
+`LoadedModel::decide` and `decision_code_names` reject a schema model, and
+`decide_schema` rejects a code model, with an error naming the protocol the
+model does take.
 
 `LlmTrait::preparation_status` exposes `TextPreparationStatus` as data only:
 state, selected implementation/variant, prepared compilation scopes and shape
@@ -84,7 +106,7 @@ not a port requirement.
 | --- | --- | --- |
 | Python policy (`<Family>Policy`) | Public observation → canonical native inputs → decoded actions; prompt, tokenizer, state/action normalization and output context | [Pi05Policy](../python/apxinf/apxinf/policies/impls/pi05.py) |
 | Native binding (`ModelRunner`) | NumPy/Rust conversion, public shape validation, default sampling keys, host result conversion; delegates family computation to `VlaRuntime` | [PyO3 ModelRunner](../crates/apxinf-py/src/lib.rs) |
-| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text` or `Vla`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
+| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision`, `Image` or `Speech`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
 | `config.rs`, `load.rs` | Validate family config; select a supported implementation, materialize weights and fixed embeddings, construct the runner through its constructor | [load.rs](../crates/apxinf-model/src/pi05/load.rs) |
 | `model_runner/` (`<Family>ModelRunner`) | Implements `VlaRuntime`; validates requests, owns preparation policy, input/RNG binding, bounded cache and invalidation | [runner.rs](../crates/apxinf-model/src/pi05/model_runner/runner.rs) |
 | `model_runner/prepare.rs` and prepared inference | Query requirements, allocate stable inputs/output/workspace, warm up, capture and retain resources; compatible `run` executes without capture/autotune | [prepare.rs](../crates/apxinf-model/src/pi05/model_runner/prepare.rs) |
@@ -94,6 +116,8 @@ not a port requirement.
 | `weights/` | Checkpoint mapping, model-local packing, device weight trees and fixed calibration scales; fixed weight operations stay with their physical representation | [weights/mod.rs](../crates/apxinf-model/src/pi05/weights/mod.rs) |
 | `backend.rs` | Concentrates imports/type aliases for safe CUDA resources and operations; it is not an execution engine or provider abstraction | [backend.rs](../crates/apxinf-model/src/pi05/backend.rs) |
 | `math.rs` (when needed) | CUDA-independent helpers/reference semantics; PI0.5 loading uses its time embedding, while prompt/Euler helpers are CPU references | [math.rs](../crates/apxinf-model/src/pi05/math.rs) |
+| `apxinf-core` | Tensor/storage data and backend, KV cache and sampling contracts; no concrete CPU operators or BLAS linking | [Core crate](../crates/apxinf-core/src/lib.rs) |
+| `apxinf-cpu` | Synchronous CPU operators, concrete KV storage and sampling; owns optional OpenBLAS calls and linking | [CPU crate](../crates/apxinf-cpu/README.md) |
 | `apxinf-cuda-new` | Model-neutral operations, dispatch, allocation and CUDA Graph mechanisms; kernel implementations and vendor calls remain behind safe APIs | [CUDA crate](../crates/apxinf-cuda-new/src/lib.rs) |
 | `apxinf-mlx` | Owned thread-affine arrays/streams, native operations, pure compiled callbacks and shape-guarded Metal fusions; no family schedule or checkpoint interpretation | [MLX crate](../crates/apxinf-mlx/README.md) |
 
@@ -105,12 +129,126 @@ does not need a precision-dispatch enum. `StepModulation` is computed per-step
 scale/shift/gate data, distinct from learned modulation weights. Keep model
 semantics such as `prefix` and `denoise`; flow steps are not token decode steps.
 
+`ImageRuntime` ([image.rs](../crates/apxinf-model/src/image.rs)) is the shared
+text-to-image contract. A request carries the prompt, size, seed and step count;
+the result is caller-owned row-major RGB8. Each family documents the sizes and
+step counts it supports, rejects others before device work, and keeps guidance,
+scheduler and file encoding out of the request.
+
+`SpeechRuntime` ([speech.rs](../crates/apxinf-model/src/speech.rs)) is the shared
+text-to-speech contract. A request carries the text, voice, language, an optional
+style instruction and a seed; the result is caller-owned interleaved `f32` samples
+with their sample rate and channel count, and whether generation reached its end
+token. The family owns its random stream: the seed resets it per request. Each
+family documents its voices and languages and rejects others before device work.
+Streaming output is not part of this contract.
+
 The native binding and the family runner are existing language-boundary and
 execution owners. `apxinf.ModelRunner` re-exports `apxinf_py.ModelRunner`; there
 is no separate Python `Pi05Model` or Python `AutoModel`. Python `AutoPolicy`
 selects a policy; that policy calls the binding, which invokes Rust `AutoModel`.
 Reuse these entry points for a new family instead of adding a factory/runner
 wrapper merely to reproduce the names in this table.
+
+### Repacked GEMM weight ownership
+
+PI0.5 device linear weights retain cuda-new `RepackedWeight` layout state next
+to their allocation. INT8 row/channel W8A8 loading uses
+`RepackedWeight::upload_row_channel`: the backend checks compiled device capabilities and
+K/N geometry, converts canonical CPU bytes to fixed NK layout when supported,
+and uploads only that representation. Otherwise it uploads canonical bytes.
+The layout is committed before any execution exists and does not depend on M;
+prepare only selects compatible execution recipes. GR00T's separate W8A8 path
+already generates output-major weights during loading.
+
+Other PI0.5 weights initially upload canonical bytes and create layout state.
+The first native GEMM preparation selects a recipe, then repacks through a local
+RAII temporary, copies back to the original weight address, and frees the temporary
+before returning. There is no separate commit call and no packed-weight buffer,
+borrowed packed pointer, or ownership flag in the W8A8/GeGLU Execution. Its kernel
+reads `bindings.b` directly. Autotuning and candidate validation own isolated
+trial weights; they never rewrite model weights while evaluating candidates.
+
+Layout participates in recipe and execution keys. Every consumer of a repackable
+allocation must use the same state. cuda-new registers the allocation owner and
+address range when adopting it: a second independent state is rejected, as is a
+canonical GEMM binding to that allocation (including tensor/buffer views). Clone
+the existing state instead. Registration lasts until the allocation dies, even
+if the public state handle is dropped; it does not retain device memory. This
+check protects GEMM preparation, not arbitrary raw readback/export or other
+tensor operations, which must still respect the prepared representation.
+Later IO addresses and shapes may create new
+Executions and select different kernels, but only implementations compatible with
+the prepared layout are eligible. Canonical choices are fixed too, protecting
+existing graph readers. The cuBLAS baseline can read prepared layouts for shape
+or semantic changes. A failed writeback invalidates the weight; reload it rather
+than retrying partially overwritten bytes. Weight replacement requires new
+storage/state and retiring the old graph readers.
+
+Ordinary Tensor/`WeightVersion` arguments stay canonical: they do not authorize
+in-place packing and cannot select kernels requiring packed weights. Callers
+wanting these kernels must attach `RepackedWeight`. This change does not move
+computation scratch out of provider state or change activation workspace ownership.
+
+Kernel weight layout is an explicit property of each native `Implementation`
+registry entry. Implementation IDs are local to a semantic registry and must
+not be used to infer layout across registries; in particular CUTLASS ID 4 means
+different implementations for GEMM and GeGLU.
+
+### Shared layouts for heterogeneous consumers
+
+`RepackedWeight::new` commits one layout for consumers known to share a physical
+representation. Every weight retains CPU profile choices independently of any
+GPU layout-copy budget. The key covers the full logical Spec and policy and
+normalizes layout discovery, so committing canonical layout 0 to 4 does not
+retune the same operation for later IO bindings. Rebinding preserves the full
+implementation identity, configuration and effective resource limit. This
+prevents later denoising steps from switching providers and retaining different
+per-execution workspaces merely because the first binding committed a layout.
+
+`RepackedWeight::with_layout_cache` additionally permits independently selected
+physical layouts for heterogeneous profiles. PI0.5 BF16/FP8 language gate/up uses this
+mode: fixed two-view input with T=10 has M=522 (fused GeGLU), whereas T=11 has
+M=523 (plain GEMM plus pointwise). Camera count remains fixed per instance.
+
+The base allocation can change layout during preparation only when no live
+execution leases it. Default inference synchronizes and retires the previous
+plan before preparing another shape, so it can reuse the original address for
+the new representation without retaining a second full weight. A temporary
+bit-preserving permutation completes before the new execution is published;
+failed writeback invalidates the state.
+
+When an older execution/graph still leases the base, preparation selects on a
+private canonical trial. An extra layout is allocated only if concurrent
+consumers need it and the budget permits it. Consumers selecting the same layout
+share its allocation. Each Execution owns a physical-storage lease; the weight
+state holds only weak entries for extra layouts. Retiring the last consumer
+reclaims that extra allocation even while the model remains loaded. One capture
+can contain multiple layouts, and explicitly retained older graphs remain valid.
+
+The model retains CPU selection metadata separately: semantic/provider/implementation/
+version/configuration, physical layout and the effective resource limit. Rebinding
+new IO rebuilds the exact provider resources from this metadata; a heuristic
+configuration must retain the resource limit under which it was chosen. Metadata
+owns no native execution or GPU buffer. Native operation descriptors must not
+retain pointers to discarded trials. Leases, rather than Tensor alias reference
+counts, determine whether changing base bytes is safe.
+
+PI0.5 BF16/FP8 permits at most one extra live layout per language gate/up weight
+by default, allocated lazily only for concurrent incompatible consumers. `LoadOptions` and native
+Python `ModelRunner.load` expose `weight_layout_budget_bytes`; the policy frontend
+forwards this load-time option. The budget covers additional leased weight
+allocations, not graph arenas, provider workspace or prepare-local trial storage.
+A zero budget fixes canonical at adoption, eliminating first-call dependence
+without an extra copy, but may slow a fixed fused-GeGLU profile. Partial budgets
+are assigned deterministically in layer order, not by whichever request arrives
+first. INT8 and unrelated BF16/FP8 weights retain the single-layout path.
+
+Evaluate fixed profiles, mixed profiles, both prepare orders, prepare cost,
+steady latency, live/peak allocations and precision together. A per-kernel timing
+winner is not automatically an end-to-end memory/latency optimum. Benchmark
+shared layouts against canonical-only when choosing a deployment budget rather
+than embedding a universal speedup threshold in the backend.
 
 ### Dependency direction within a family
 
@@ -131,14 +269,15 @@ That guard checks PI0.5 only; a new family must enforce its own declared boundar
 
 ### Where backend-native model code lives
 
-A model written directly against one backend's native API (cuda-new, MLX, HIP),
-rather than through `dyn Backend`, is a **port**. Ports follow one rule, whether
-or not another backend already implements the same family:
+A model written directly against one backend's native API (cuda-new, MLX, HIP,
+MUSA), rather than through `dyn Backend`, is a **port**. Ports follow one rule,
+whether or not another backend already implements the same family:
 
 1. **A port is a top-level module `<backend>_<family>/`** in `apxinf-model/src/`,
-   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`. For example
-   `metal_qwen3/` is the Metal port of Qwen3; a CUDA port of the same family would
-   be `cuda_qwen3/`, beside it rather than inside it.
+   named by the `Device` it targets: `cuda_`, `hip_`, `metal_`, `musa_`, `cpu_`.
+   For example `metal_qwen3/` is the Metal port of Qwen3, `musa_pi05/` is the MUSA
+   port of PI0.5, and a CUDA port of the same family would be `cuda_qwen3/`,
+   beside it rather than inside it.
 2. **A port is self-contained.** It depends only on the core crates
    (`apxinf-core`, `apxinf-loader`), its backend crate, and the cross-model
    interfaces (`vla`, `llm_trait`, `auto`/`registry`, `LoadOptions`). It never
@@ -172,7 +311,9 @@ renamed as part of unrelated work.
 
 | Family / contract | Current organization and limits |
 | --- | --- |
-| PI0.5 / `VlaRuntime` | `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| PI0.5 / `VlaRuntime` | CUDA: `model/`, `model_runner/`, `weights/`; explicit preparation policy/status, stale-plan checks and retained-resource tests; `model_variant` selects `auto`, `bf16`, `fp8_static`, `int8_dynamic` |
+| PI0.5 CPU / `VlaRuntime` | Independent `cpu_pi05/{config,weights,model,runner,load}.rs`; concrete `CpuPi05Model` and `CpuPi05Runner`, FP32 eager reference. See [CPU contract](pi05-cpu-reference.md). |
+| PI0.5 / `VlaRuntime`, MUSA | Independent `musa_pi05/` (`config.rs`, `math.rs`, `load.rs`, `model/`, `model_runner/`, `weights/`); `model_variant` selects `auto` (resolves to BF16), `bf16`, `int8_dynamic` or `int8_dynamic_no_encode`, while `fp8_static` is rejected before weights load; eager and captured execution, a prepared-shape ledger and a load-time tactic database. See [MUSA backend](musa-backend.md). |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | `model/` (`WallossModel` + `ModelVariant` over BF16 and dynamic FP8, `blocks/`), `model_runner/` (`WallossModelRunner`, `prepare.rs`: explicit preparation policy/status, capture during preparation, one implicit plan replaced on shape change), `weights/`; per-request grids via `VlaMetadata::image_grid_thw` kept in the family's plan key; model-reported workspace backed by the config-only `workspace.rs` budget; rejected host requests preserve the cached plan; `check_walloss_module_boundaries.py`. See [WallOSS](walloss.md). |
@@ -180,6 +321,7 @@ renamed as part of unrelated work.
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
 | Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
 | MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
+| Clef Flash / `SchemaDecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 16384 tokens; `auto` (default) selects the composition qualified on the device: on `applegpu_g13s`, optimized GPU kernels (gate GEMM with SwiGLU epilogue, wm1/wn2 split projections, causal convolution and eight-lane recurrence), which passed quality and paired latency gates there; elsewhere the reference; `reference` is the stock MLX-VLM composition. Both prepare the local shapeless decay/beta callable at load for lengths 1, 2 and 16384; this is not whole-backbone/head preparation. |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
@@ -188,13 +330,13 @@ separately migrated; do not rename or import them as part of an unrelated port.
 `PreparedInference::status` is `RuntimeManaged`. A successful legacy `prepare`
 does not prove graph readiness or PI0.5-equivalent guarantees.
 
-The common loader accepts `model_variant` for PI0.5 and Qwen-Drive registry
-names, and for every Metal request. Metal admission reaches only a registered
-`metal_` factory, and each MLX family parses its variants locally; the common
-loader does not infer quantization from a shared CUDA precision choice. A new
-Metal family needs no central admission edit. Supporting it for a new non-Metal
-family requires updating that admission check and implementing family-local
-parsing/validation; registration alone is not
+The common loader accepts `model_variant` for all six built-in Python VLA
+families and D3, and for every Metal request. Metal admission reaches only a
+registered `metal_` factory, and each MLX family parses its variants locally;
+the common loader does not infer quantization from a shared CUDA precision
+choice. A new Metal family needs no central admission edit. Supporting it for a
+new non-Metal family requires updating that admission check and implementing
+family-local parsing/validation; registration alone is not
 enough. `LoadOptions.config`, Python `config_json`/shape overrides and
 `ModelRunner.random` are currently PI0.5-specific. A new family's config belongs
 in that family and its loader; use existing named assets where applicable and
@@ -417,3 +559,26 @@ See the [implemented component view](model-lifecycle/architecture.md#implemented
 and [migration tracker](model-lifecycle/migration.md) for qualification and scope.
 WallOSS follows the same model/, model_runner/ and weights/ split ([WallOSS](walloss.md)).
 GR00T retains its previous implementation pending its own stage.
+
+## Public VLA variant selection
+
+All six Python VLA policies accept `model_variant` and pass it unchanged to
+`ModelRunner.load` / `LoadOptions.model_variant`. Python policy `precision`
+is rejected. PI0.5, SmolVLA, Qwen-Drive and WallOSS select their implementations
+in their model-local loaders. WallOSS selects BF16 or dynamic FP8 directly;
+it does not convert through `ModelPrecision`. GR00T and PI0-FAST keep a single
+family-local `config::load_precision` adapter for their legacy executors.
+The generic loader only admits model names; it does not interpret variant names.
+
+| Family | Public variants |
+| --- | --- |
+| PI0.5 | auto, bf16, fp8_static, int8_dynamic |
+| WallOSS | auto, bf16, fp8_dynamic |
+| SmolVLA | bf16, fp16 |
+| Qwen-Drive | auto, bf16 |
+| GR00T | auto, bf16, fp8_static, int8_dynamic (hardware restrictions still apply) |
+| PI0-FAST | auto, bf16, fp8_static |
+
+CPU CI exercises each policy through AutoPolicy up to the actual native load
+signature and tests the Rust selection/adaptation rules. It does not establish
+GPU numerical or performance parity.

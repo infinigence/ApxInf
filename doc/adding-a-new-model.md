@@ -110,6 +110,12 @@ HF tokenizer, state/action normalization, two-camera resize-with-padding, and
 action unnormalization. Its maintained latency and LIBERO entry points are
 `scripts/bench_smolvla.py` and `scripts/eval_smolvla_libero.py`.
 
+The [PI0.5 CPU reference](pi05-cpu-reference.md) is an independent
+`cpu_pi05/` port with its own config, weights, concrete model and eager runner.
+It shares public contracts and reference fixtures with other ports. CPU operator
+implementation and BLAS linking belong to `apxinf-cpu`; see the
+[CPU backend contract](../crates/apxinf-cpu/README.md).
+
 Inspect or copy PI0.5's model/Blocks and runner
 structure when semantics fit; use `<Family>Model` and `<Family>ModelRunner` for
 those roles. Preserve static precision specialization and keep one owner of
@@ -152,6 +158,29 @@ higher-rank convolutional weights require semantics-aware flattening.
 Keep source weights, device weights, and precision-specific packed weights as
 separate concepts when their lifecycles differ. Perform stable transformations
 once during load, not in every inference.
+For cuda-new GEMMs that may repack, retain `RepackedWeight` beside the model's
+weight allocation and attach it to every GEMM consumer. The first preparation
+selects a kernel, repacks through a local temporary, writes back to the same
+allocation, and releases the temporary; later executions reuse that layout across
+IO addresses and shapes. Do not read committed bytes as a canonical tensor or
+create independent layout states for aliases of the same allocation. Reload
+weights after a failed layout commit, and retire old graph readers before
+replacing storage.
+cuda-new rejects independent states for the same allocation and ordinary
+canonical GEMM bindings to adopted storage, including views. Dropping the state
+does not make its surviving tensor aliases canonical again. This enforcement
+does not make raw tensor readback/export layout-aware.
+For weights shared across shapes or semantics, use `with_layout_cache` with an
+explicit extra-weight budget when their optimal implementations require different
+physical layouts. It caches CPU selection metadata separately; executions own
+physical-storage leases and the model retains weak extra-layout entries. When
+all readers of the base retire, prepare may transition that allocation in place.
+Concurrent incompatible consumers share extra layouts, reclaimed with their
+last execution/graph. Preparation never overwrites a live reader's bytes. A zero budget fixes canonical before
+any execution. Benchmark every consumer and both preparation orders, including
+prepare time, live/peak allocations and steady replay; a layout-aware fallback
+establishes correctness but not performance parity.
+
 
 ### Model mathematics
 
@@ -167,7 +196,7 @@ not belong on the portable trait. Trait is the floor; concrete types are the
 ceiling.
 
 A port written directly against one backend's native API goes in a
-self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`) that
+self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`, `cpu_`) that
 copies, rather than imports, any config, checkpoint or math code it shares with
 another backend's port; see
 [where backend-native model code lives](model-layer-architecture.md#where-backend-native-model-code-lives).

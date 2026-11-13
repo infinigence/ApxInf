@@ -109,9 +109,9 @@ def test_autopolicy_detects_walloss_checkpoint_signature(tmp_path, monkeypatch):
         "from_pretrained",
         classmethod(lambda cls, model_dir, **kwargs: (model_dir, kwargs)),
     )
-    model_dir, kwargs = AutoPolicy.from_pretrained(tmp_path, precision="bf16")
+    model_dir, kwargs = AutoPolicy.from_pretrained(tmp_path, model_variant="bf16")
     assert model_dir == tmp_path
-    assert kwargs == {"precision": "bf16"}
+    assert kwargs == {"model_variant": "bf16"}
 
 
 def test_caller_supplied_wire_keys_reach_the_published_metadata(tmp_path, monkeypatch):
@@ -180,7 +180,7 @@ def test_walloss_rejects_static_fp8_calibration(tmp_path):
         WallossPolicy.from_pretrained(
             tmp_path,
             model_runner=_FakeModel(),
-            precision="fp8",
+            model_variant="fp8_dynamic",
             calibration=tmp_path / "calibration.json",
         )
 

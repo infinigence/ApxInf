@@ -1,8 +1,12 @@
 //! Compile the HIP device code when a ROCm toolchain is present.
 //!
-//! With ROCm: every translation unit in [`SOURCES`] is compiled by `hipcc` for
-//! one GPU architecture, the objects are archived, the archive is linked with
-//! `amdhip64` and `hipblas`, and the `apxinf_hip_runtime` cfg is set.
+//! With ROCm: every translation unit in [`SOURCES`], plus the Composable Kernel
+//! attention units (`ck_attention.hip` and `kernels/ck/generated/`, see
+//! `kernels/ck/VENDOR.md`), is compiled by `hipcc` for one GPU architecture,
+//! the objects are archived, the archive is linked with `amdhip64` and
+//! `hipblas`, and the `apxinf_hip_runtime` cfg is set. Units compile in
+//! parallel, and a unit whose object is newer than everything it depends on is
+//! not recompiled: the CK units are slow and their inputs rarely change.
 //!
 //! hipBLASLt is optional. When its header is present the second GEMM provider
 //! is compiled in and `hipblaslt` is linked; otherwise the provider's entry
@@ -24,6 +28,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 /// Device translation units under `kernels/`. All of them include `common.h`.
 const SOURCES: &[&str] = &[
@@ -84,6 +89,10 @@ fn main() {
     let arch = target_arch(&rocm);
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernels = Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("kernels");
+    // Freshness alone would reuse objects across a toolchain change: an
+    // in-place ROCm upgrade touches no file in this repository. Fold the
+    // compiler's identity into the object names, like the arch below.
+    let toolchain = hipcc_version(&hipcc);
 
     // Probed by header, not by ROCm version: a version table would go stale,
     // and a missing header is exactly what breaks the compile.
@@ -183,8 +192,27 @@ fn main() {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        objects.push(object);
-    }
+    };
+    // Respect cargo's job count (`cargo build -j2`); each hipcc uses ~1.5 GB.
+    let jobs = env::var("NUM_JOBS")
+        .ok()
+        .and_then(|jobs| jobs.parse::<usize>().ok())
+        .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
+        .unwrap_or(4)
+        .max(1);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(units.len()) {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                match units.get(index) {
+                    Some(unit) => compile(unit),
+                    None => break,
+                }
+            });
+        }
+    });
+    let objects: Vec<&PathBuf> = units.iter().map(|unit| &unit.object).collect();
 
     let archive = out_dir.join("libapxinf_hip_kernels.a");
     let _ = std::fs::remove_file(&archive);
@@ -198,7 +226,10 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=apxinf_hip_kernels");
-    println!("cargo:rustc-link-search=native={}", rocm.join("lib").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        rocm.join("lib").display()
+    );
     println!("cargo:rustc-link-lib=dylib=amdhip64");
     println!("cargo:rustc-link-lib=dylib=hipblas");
     if blaslt {
@@ -241,4 +272,79 @@ fn target_arch(rocm: &Path) -> String {
                 "apxinf-hip: found hipcc but no GPU to target; set APXINF_HIP_ARCH (e.g. gfx1151)"
             )
         })
+}
+
+struct Unit {
+    source: PathBuf,
+    object: PathBuf,
+    /// Compiled with Composable Kernel's include paths and flags.
+    ck: bool,
+    /// Newest modification time among the unit's headers.
+    inputs_changed: SystemTime,
+}
+
+/// A short token identifying the hipcc that will compile the objects.
+fn hipcc_version(hipcc: &Path) -> String {
+    let output = Command::new(hipcc).arg("--version").output();
+    let text = output
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    // "HIP version: 7.2.53211-..." -> "7.2.53211"; hash the line as a fallback.
+    let version = text
+        .lines()
+        .find_map(|line| line.strip_prefix("HIP version: "))
+        .map(|v| {
+            v.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "h{:08x}",
+                text.bytes()
+                    .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32))
+            )
+        });
+    version.replace('.', "_")
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn newest(paths: &[PathBuf]) -> SystemTime {
+    paths
+        .iter()
+        .filter_map(|p| modified(p))
+        .max()
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Newest modification time of any file under `dir`.
+fn newest_in(dir: &Path) -> SystemTime {
+    let mut newest = SystemTime::UNIX_EPOCH;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Some(time) = modified(&path) {
+                newest = newest.max(time);
+            }
+        }
+    }
+    newest
+}
+
+/// An object is fresh when it is newer than its sources, its headers and this
+/// build script (whose flags it was compiled with).
+fn is_fresh(object: &Path, sources: &[PathBuf], inputs: SystemTime) -> bool {
+    let Some(built) = modified(object) else {
+        return false;
+    };
+    let script = modified(&Path::new(&env::var("CARGO_MANIFEST_DIR").unwrap()).join("build.rs"));
+    built > newest(sources) && built > inputs && script.is_none_or(|time| built > time)
 }

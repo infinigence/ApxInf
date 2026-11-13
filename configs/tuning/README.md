@@ -23,6 +23,22 @@ the whole legacy database. Provider
 `implementation_version` (plus the relevant CUDA/cuBLAS compatibility for that
 provider) controls record-local invalidation.
 
+## MUSA
+
+MUSA keeps its databases under `musa/`, with the device name lowercased and the
+MP generation in the directory name:
+
+```text
+configs/tuning/musa/<device-name-lowercased>-mp<mp>/
+├── tactics.json
+├── tuning_report.json
+└── musa<major.minor>-mublaslt<major.minor>/
+```
+
+A clean checkout has no `configs/tuning/musa` and
+every shape uses the safe default; the shipped-database test validates a
+database only when one is present.
+
 ## cuda-new recipes
 
 cuda-new GEMM and Attention default to the hardware/toolkit directory above,

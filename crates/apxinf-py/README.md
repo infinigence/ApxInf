@@ -23,7 +23,7 @@ Returns `float32` `[action_horizon, action_dim]` in the **normalized** domain.
 
 ## Build
 
-The VLA runtimes are CUDA-only, so real inference needs the `cuda` feature and a
+GPU VLA inference needs the `cuda` feature and a
 CUDA machine (e.g. Thor). Without CUDA the module still imports and reports its
 shape contract, but model loading errors.
 
@@ -67,7 +67,60 @@ noise = np.random.default_rng(0).standard_normal(
 action = model.infer_rgb(rgb, "nhwc", tokens, noise)  # -> [horizon, dim] float32
 ```
 
+## Decision requests
+
+`DecisionRunner` supports both encoded-prompt and schema requests on the same
+loaded handle. `decide(token_ids, candidate_count)` keeps the D3 output contract:
+`{"selected_index": int, "scores": [...]}`.
+
+For a schema-only model such as Clef, build with `--features mlx` and use
+`decide_schema(request_json)`:
+
+```python
+import json
+import apxinf_py
+
+runner = apxinf_py.DecisionRunner.load("/path/to/clef", device="metal:0")
+request = {
+    "state": {"signal": "red"},
+    "questions": {
+        "action": {
+            "type": "choice",
+            "instructions": "Choose an action",
+            "criteria": {"go": "Proceed", "stay": "Wait"},
+        }
+    },
+}
+result = runner.decide_schema(json.dumps(request))
+answer = result["answers"][0]
+selected = answer["scores"][answer["selected_index"]]
+```
+
+The JSON request uses the shared `DecisionSchema` parser, which rejects duplicate
+question IDs and unknown fields. The returned `answers` list preserves question
+order. Each answer contains `question_id`, `selected_index`, and `scores` with
+`code`, `token_id`, and `probability`. Schema options have `token_id=None`.
+Scores retain their option order and per-question probabilities. Invalid requests
+raise `ValueError`; model errors raise `RuntimeError`. The loaded family decides
+which input forms it supports. Clef does not accept encoded D3 prompts or tuning
+options.
+
 ## Tests
+
+### CPU binding checks
+
+The Rust unit tests exercise both Python decision methods with stub
+`CodeDecisionRuntime` and `SchemaDecisionRuntime` models, without loading a
+model or using a GPU. They check schema
+dispatch, question order, grouped probabilities, errors, and the D3 output shape.
+Use a Python interpreter supported by PyO3 0.22 with NumPy installed. Keep
+`extension-module` disabled so the test executable links libpython:
+
+```sh
+PYO3_PYTHON=/path/to/python3.11 cargo test -p apxinf-py --lib
+```
+
+### CUDA smoke tests
 
 Python smoke + L0/L1 consistency tests live in `tests/` and are gated on
 environment variables (they skip cleanly without CUDA / a checkpoint):
@@ -84,3 +137,11 @@ CUDA:
 ```sh
 cargo test -p apxinf-py
 ```
+
+## PI0.5 CPU reference
+
+Build with `maturin develop --features openblas` on Linux or macOS with
+OpenBLAS installed, and load PI0.5 with `device="cpu"`,
+`model_variant="fp32_reference"`. This FP32 path is eager-only and requires no
+CUDA toolkit. See the [CPU contract](../../doc/pi05-cpu-reference.md) for input
+limitations, threading, and verification scope.

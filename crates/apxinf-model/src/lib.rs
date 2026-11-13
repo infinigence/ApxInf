@@ -4,6 +4,7 @@ mod accelerator;
 pub mod auto;
 pub mod builtin;
 pub mod d3;
+pub mod decision;
 pub mod debug;
 mod generation_config;
 pub mod gr00t;
@@ -11,12 +12,21 @@ pub mod gr00t;
 pub mod hip_gr00t;
 #[cfg(feature = "hip")]
 pub mod hip_pi05;
+pub mod image;
 pub mod llama;
 pub mod llm_trait;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_clef;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3;
+#[cfg(feature = "musa")]
+pub mod musa_pi05;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_qwen_image;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_qwen3_tts;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
@@ -27,17 +37,24 @@ pub mod qwen_drive;
 pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
+pub mod speech;
 pub mod vla;
 mod walloss;
 
 pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWeights};
 pub use builtin::register_builtin_models;
 pub use d3::{
-    D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig, DecisionInput,
-    DecisionOutput, DecisionRuntime, DecisionScore, D3_DEFAULT_TEXT_PROFILE_LIMIT,
-    D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
+    D3Config, D3DecisionConfig, D3PackageConfig, D3TextConfig, D3VisionConfig,
+    D3_DEFAULT_TEXT_PROFILE_LIMIT, D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
+};
+pub use decision::{
+    CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionQuestion,
+    DecisionRuntime, DecisionSchema, DecisionScore, SchemaDecisionAnswer, SchemaDecisionOutput,
+    SchemaDecisionRuntime, SchemaDecisionScore,
 };
 pub use debug::{DebugCapture, DebugConfig};
+pub use image::{GeneratedImage, ImageRequest, ImageRuntime};
+pub use speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
@@ -59,3 +76,6 @@ pub use vla::{
     PreparationStatus, PreparedInference, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
     VlaRuntime,
 };
+
+/// Self-contained FP32 CPU PI0.5 port.
+pub mod cpu_pi05;
