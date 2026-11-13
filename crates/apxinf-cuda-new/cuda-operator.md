@@ -181,8 +181,9 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Output | `Y=[B,Tq,Hq,D]`, with the same dtype as the inputs |
 | Mathematical semantic | scaled dot-product attention from the query to the first `valid_key_tokens` rows of the cache |
 | Constraints | `0<valid_key_tokens<=key_capacity`; when causal, token i is at `query_start+i`, and `query_start+Tq<=valid_key_tokens` is required |
+| hd32 decode fast path | Under Flexible numerics only, the custom provider dispatches a fused single-token kernel for batch=1, single-token causal decode, `head_dim=32`, capacity `<=4096` and 16-byte-aligned q/k/v bindings. The kernel's tree-ordered FP32 softmax and value reductions are not bit-identical to the sequential reference path; the accuracy contract and the re-validation instruction live in `attention.cuh`. Misaligned bindings, larger capacities, Stable numerics, non-decode shapes and other head dims keep the sequential path, and Stable numerics leaves dynamic decode with no registered candidate |
 | Graph/tuning identity | For dynamic decode, `key_tokens` in the Spec equals fixed `key_capacity`; exact valid length and query position live only in `decode_meta`, so one execution and graph cover all positions within capacity |
-| Reference test | `kv_cache_attention_all_candidates_match_reference` |
+| Reference test | `kv_cache_attention_all_candidates_match_reference`; hd32 fast-path precision, boundaries and dispatch guards are in `ops::tests::hd32_decode` |
 
 <!-- l3-operator:segmented_attention -->
 ### `segmented_attention`

@@ -162,7 +162,10 @@ __global__ void attention_values(const float* probabilities, const T* value,
 // (key_tokens 720, 16 heads x 32 channels, valid 24/96/186/372) the fp16 output
 // matches the float64 reference rounded to fp16 exactly (0 ULP), with the same
 // max |delta| as the sequential implementation. Re-run the fp64 comparison when
-// editing this, not only the end-to-end audio. Because the rounding differs,
+// editing this, not only the end-to-end audio. `ops::tests::hd32_decode` is the
+// crate-level gate for this path: reference comparisons over the dispatch
+// window (key lengths, GQA ratios, F16/BF16, graph replay), plus the misaligned
+// and over-limit guards. Because the rounding differs,
 // `launch_attention` dispatches here only for Flexible numerics and 32-channel
 // heads; every other shape keeps the reference path.
 //
