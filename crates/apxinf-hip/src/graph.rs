@@ -54,10 +54,10 @@ pub(crate) fn capture_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Whether the calling thread is between `hipStreamBeginCapture` and
-/// `hipStreamEndCapture`. Thread-local, so a thread that is capturing can be
-/// distinguished from a thread that is merely waiting for another thread's
-/// capture to close.
+// Whether the calling thread is between `hipStreamBeginCapture` and
+// `hipStreamEndCapture`. Thread-local, so a thread that is capturing can be
+// distinguished from a thread that is merely waiting for another thread's
+// capture to close.
 thread_local! {
     static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

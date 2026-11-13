@@ -13,6 +13,10 @@ pub struct Gr00tFlowStep {
 
 /// Match GR00T N1.7 inference: `t = step / steps`, then truncate
 /// `t * timestep_buckets` to an integer.
+///
+/// `continuous_time` stays f32 because it feeds BF16 device math directly;
+/// the bucket index is the one that must match Python bit for bit, so its
+/// intermediate runs in f64 exactly as Python's `float` does.
 pub fn flow_schedule(steps: usize, timestep_buckets: usize) -> Result<Vec<Gr00tFlowStep>> {
     if steps == 0 {
         return Err(Error::Other(

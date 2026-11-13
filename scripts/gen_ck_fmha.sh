@@ -43,8 +43,10 @@ fi
 # against `-d`. Within a direction only fwd_splitkv and bwd split further on
 # `@`; fwd passes its pattern straight to one `fnmatch` call. So the masked and
 # unmasked fwd instances have to come from a single pattern -- `*mask` covers
-# both `mask` and `nmask`, and the mask variants sit under `logits` rather than
-# `nlogits`, which is why that position is pinned and this one is not.
+# both `mask` and `nmask`. That forces the logits position to be pinned to
+# `nlogits` (apxinf runs with `has_logits_soft_cap = false`, and the wrapper
+# never sets a soft cap): a bare `*logits*` would also pull in the soft-cap
+# variants, and the dispatcher would then pick those for every call.
 #
 # Generating in two passes is not an option: each pass also emits
 # `fmha_fwd_api.cpp`, the dispatcher, and a dispatcher only knows the instances
@@ -76,7 +78,7 @@ for required in \
   "fmha_fwd_api.cpp" \
   "fmha_fwd_d64_*_nmask_*" "fmha_fwd_d64_*_nbias_mask_*" \
   "fmha_fwd_d128_*_nmask_*" "fmha_fwd_d128_*_nbias_mask_*" \
-  "fmha_fwd_d256_*_nmask_*" \
+  "fmha_fwd_d256_*_nmask_*" "fmha_fwd_d256_*_nbias_mask_*" \
   "fmha_fwd_splitkv_api.cpp" "fmha_fwd_splitkv_d256_*"; do
   # shellcheck disable=SC2086
   if ! compgen -G "$tmp"/$required > /dev/null; then

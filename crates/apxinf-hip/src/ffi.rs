@@ -17,11 +17,6 @@ pub(crate) const NOT_COMPILED: i32 = -1;
 /// another way to do the work can treat it as "not available here".
 pub(crate) const INVALID_ARGUMENT: i32 = 200_000;
 
-/// `apxinf_hip_blaslt_tactic_bytes` returns a size rather than a status, so
-/// Rust never hard-codes the C++ `hipblasLtMatmulAlgo_t` layout. It is the one
-/// entry point here whose return value is not a status code; on a build
-/// without hipBLASLt it returns 0, which reads as "no tactic can be set".
-///
 /// Shim dtype codes. Mirror `kDTypeF32` / `kDTypeBF16` in the device code.
 pub(crate) const DTYPE_F32: i32 = 0;
 pub(crate) const DTYPE_BF16: i32 = 1;
@@ -97,6 +92,10 @@ hip_abi! {
         blob: *const u8,
         len: i32,
     );
+    // Returns a size rather than a status: the byte length of a serialized
+    // `hipblasLtMatmulAlgo_t`, so Rust never hard-codes the C++ layout. On a
+    // build without hipBLASLt it returns 0, which reads as "no tactic can be
+    // set".
     fn apxinf_hip_blaslt_tactic_bytes();
     fn apxinf_hip_library_versions(rocm: *mut i32, blaslt: *mut i32);
     fn apxinf_hip_gemm_tune(

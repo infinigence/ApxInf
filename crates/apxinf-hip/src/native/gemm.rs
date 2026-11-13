@@ -1,8 +1,8 @@
 //! Row-major BF16 GEMM, through hipBLAS or hipBLASLt.
 //!
 //! Neither library wins everywhere. Measured over GR00T N1.7's 26 GEMM shapes
-//! on gfx1151, hipBLASLt is 1.11x-3.65x faster on the 13 shapes below the
-//! roofline ridge point and 0.61x-0.95x *slower* on the 5 above it, and the
+//! on gfx1151, hipBLASLt is 1.05x-3.71x faster on the 13 shapes below the
+//! roofline ridge point and 0.58x-0.90x *slower* on the 5 above it, and the
 //! shapes within +/-15% of the ridge go either way with no rule separating
 //! them: `128x2048x1536` and `128x4096x4096` have near-identical arithmetic
 //! intensity and opposite verdicts. So the provider is chosen per shape from a
@@ -266,7 +266,7 @@ fn library_versions() -> Option<(i32, i32)> {
 }
 
 /// `configs/tuning/amd/<arch>/rocm<version>-hipblaslt<version>/gemm.recipe`,
-/// relative to the working directory.
+/// resolved against the working directory first and the crate second.
 ///
 /// The library versions are in the path because a recorded tactic does not
 /// survive either of them changing -- hipBLASLt's header says a solution index
@@ -274,18 +274,47 @@ fn library_versions() -> Option<(i32, i32)> {
 /// rather than inside the file means an upgraded host simply misses and
 /// re-tunes, instead of reading a file that no longer means what it says. This
 /// mirrors `configs/tuning/nvidia/<family>/cuda<..>-cublas<..>/`.
+///
+/// Two locations, in order:
+///
+/// 1. `<cwd>/configs/tuning/amd/...` -- the machine's own autotune output,
+///    git-ignored at the root exactly like the CUDA recipe caches. Autotune
+///    writes here, so a tuned host never touches the source tree.
+/// 2. The crate's `configs/tuning/amd/...` -- the recipe measured on the
+///    validated device, committed with the code so a fresh checkout runs the
+///    tuned provider choices with no flags and no prior tuning run. Both the
+///    directory name and the `# measured-on` header still have to match the
+///    running device and libraries, so shipping it cannot mis-tune another
+///    host: it simply misses.
 fn default_recipe_path() -> Option<PathBuf> {
     let (rocm, blaslt) = library_versions()?;
     let arch = env!("APXINF_HIP_ARCH");
     if arch == "none" {
         return None;
     }
-    Some(
+    let relative = Path::new("configs/tuning/amd")
+        .join(arch)
+        .join(format!("rocm{}-hipblaslt{blaslt}", rocm_version(rocm)))
+        .join("gemm.recipe");
+    if relative.is_file() {
+        return Some(relative);
+    }
+    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join(&relative);
+    shipped.is_file().then_some(shipped)
+}
+
+/// Where autotune writes when it loaded no recipe at all: the
+/// working-directory cache path, which is git-ignored at the root like the
+/// CUDA recipe caches.
+fn writable_recipe_target() -> Option<PathBuf> {
+    let (rocm, blaslt) = library_versions()?;
+    let arch = env!("APXINF_HIP_ARCH");
+    (arch != "none").then(|| {
         Path::new("configs/tuning/amd")
             .join(arch)
             .join(format!("rocm{}-hipblaslt{blaslt}", rocm_version(rocm)))
-            .join("gemm.recipe"),
-    )
+            .join("gemm.recipe")
+    })
 }
 
 /// `70125424` -> `7.1`.
@@ -581,7 +610,13 @@ fn tune_shape(
     table.insert(key, entry.clone());
 
     let routing = routing();
-    if let Some(path) = routing.recipe_path.as_deref() {
+    // Never the crate's committed copy, even when that is the file the recipe
+    // was loaded from: tuning output belongs in the working-directory cache.
+    let write_target = routing
+        .recipe_path
+        .clone()
+        .or_else(writable_recipe_target);
+    if let Some(path) = write_target.as_deref() {
         if let Err(error) = persist(path, &routing.recipe, &table) {
             eprintln!(
                 "apxinf-hip: tuned {m}x{k}x{n} but could not write {}: {error}",
@@ -630,6 +665,11 @@ fn epilogue_name(epilogue: i32) -> &'static str {
 /// inside a real inference and can be interrupted, and a partial recipe is
 /// still worth keeping. The rename is what makes an interrupted write leave
 /// the previous file intact rather than a truncated one.
+///
+/// The destination is the working-directory path, never the crate's committed
+/// copy: autotune output is machine-local cache, and a build in a read-only or
+/// shared checkout must not try to edit source. [`default_recipe_path`] falls
+/// back to the crate's copy only for reading.
 fn persist(
     path: &Path,
     loaded: &Recipe,

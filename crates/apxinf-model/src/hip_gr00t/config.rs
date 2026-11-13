@@ -589,6 +589,58 @@ pub struct Qwen3VLConfig {
     pub image_token_id: u32,
 }
 
+/// A field that may be absent but must be well-formed when present -- a
+/// wrong type, an explicit `null`, or a misspelled sibling key is an error,
+/// never a silent default. The activation guard depends on this: with a
+/// defaulting parser, `"hidden_act": null` or a misspelled key would parse
+/// as the default tanh GELU and pass validation while the checkpoint was
+/// configured otherwise.
+fn optional<'v>(owner: &'v serde_json::Value, key: &str) -> Option<&'v serde_json::Value> {
+    owner.get(key)
+}
+
+fn optional_u64(owner: &serde_json::Value, key: &str, default: u64) -> Result<u64> {
+    match optional(owner, key) {
+        None => Ok(default),
+        Some(value) => value.as_u64().ok_or_else(|| {
+            Error::Other(format!(
+                "qwen3vl config: {key} must be a non-negative integer, got {value}"
+            ))
+        }),
+    }
+}
+
+fn optional_f64(owner: &serde_json::Value, key: &str, default: f64) -> Result<f64> {
+    match optional(owner, key) {
+        None => Ok(default),
+        Some(value) => value.as_f64().ok_or_else(|| {
+            Error::Other(format!("qwen3vl config: {key} must be a number, got {value}"))
+        }),
+    }
+}
+
+fn optional_str<'v>(
+    owner: &'v serde_json::Value,
+    key: &str,
+    default: &'v str,
+) -> Result<&'v str> {
+    match optional(owner, key) {
+        None => Ok(default),
+        Some(value) => value.as_str().ok_or_else(|| {
+            Error::Other(format!("qwen3vl config: {key} must be a string, got {value}"))
+        }),
+    }
+}
+
+/// An array entry that the caller has already required to exist.
+fn entry_u64(value: &serde_json::Value, name: &str) -> Result<u64> {
+    value.as_u64().ok_or_else(|| {
+        Error::Other(format!(
+            "qwen3vl config: {name} must be a non-negative integer, got {value}"
+        ))
+    })
+}
+
 impl Qwen3VLConfig {
     /// Parse from a HuggingFace `config.json` file.
     pub fn from_json_file(path: &Path) -> Result<Self> {
@@ -616,11 +668,18 @@ impl Qwen3VLConfig {
             )));
         }
         let mrope_section = [
-            section[0].as_u64().unwrap_or(24) as usize,
-            section[1].as_u64().unwrap_or(20) as usize,
-            section[2].as_u64().unwrap_or(20) as usize,
+            entry_u64(&section[0], "mrope_section[0]")? as usize,
+            entry_u64(&section[1], "mrope_section[1]")? as usize,
+            entry_u64(&section[2], "mrope_section[2]")? as usize,
         ];
-        let mrope_interleaved = rope_scaling["mrope_interleaved"].as_bool().unwrap_or(true);
+        let mrope_interleaved = match optional(rope_scaling, "mrope_interleaved") {
+            None => true,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                Error::Other(format!(
+                    "qwen3vl config: mrope_interleaved must be a boolean, got {value}"
+                ))
+            })?,
+        };
 
         let text = Qwen3VLTextConfig {
             hidden_size: tc["hidden_size"].as_u64().unwrap_or(2048) as usize,
@@ -632,22 +691,33 @@ impl Qwen3VLConfig {
             vocab_size: tc["vocab_size"].as_u64().unwrap_or(151936) as usize,
             max_position_embeddings: tc["max_position_embeddings"].as_u64().unwrap_or(262144)
                 as usize,
-            rms_norm_eps: tc["rms_norm_eps"].as_f64().unwrap_or(1e-6) as f32,
-            rope_theta: tc["rope_theta"].as_f64().unwrap_or(5_000_000.0) as f32,
+            rms_norm_eps: optional_f64(tc, "rms_norm_eps", 1e-6)? as f32,
+            rope_theta: optional_f64(tc, "rope_theta", 5_000_000.0)? as f32,
             mrope_section,
             mrope_interleaved,
         };
 
         let vc = &v["vision_config"];
-        let dvi = vc["deepstack_visual_indexes"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_u64())
-                    .map(|x| x as usize)
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![5, 11, 17]);
+        // A malformed deepstack index would silently vanish through
+        // filter_map and leave the mergers reading the default blocks.
+        let dvi = match optional(vc, "deepstack_visual_indexes") {
+            None => vec![5, 11, 17],
+            Some(value) => {
+                let list = value.as_array().ok_or_else(|| {
+                    Error::Other(format!(
+                        "qwen3vl config: deepstack_visual_indexes must be a list, got {value}"
+                    ))
+                })?;
+                let mut indexes = Vec::with_capacity(list.len());
+                for (position, entry) in list.iter().enumerate() {
+                    indexes.push(
+                        entry_u64(entry, &format!("deepstack_visual_indexes[{position}]"))?
+                            as usize,
+                    );
+                }
+                indexes
+            }
+        };
         let vision = Qwen3VLVisionConfig {
             depth: vc["depth"].as_u64().unwrap_or(24) as usize,
             hidden_size: vc["hidden_size"].as_u64().unwrap_or(1024) as usize,
@@ -666,10 +736,7 @@ impl Qwen3VLConfig {
                 as usize,
             out_hidden_size: vc["out_hidden_size"].as_u64().unwrap_or(2048) as usize,
             deepstack_visual_indexes: dvi,
-            hidden_act: vc["hidden_act"]
-                .as_str()
-                .unwrap_or("gelu_pytorch_tanh")
-                .to_owned(),
+            hidden_act: optional_str(vc, "hidden_act", "gelu_pytorch_tanh")?.to_owned(),
         };
 
         Ok(Qwen3VLConfig {
@@ -794,5 +861,44 @@ mod tests {
         assert!(cfg.text.mrope_interleaved);
         assert_eq!(cfg.text.rope_theta, 5_000_000.0);
         assert_eq!(cfg.image_token_id, 151655);
+    }
+
+    /// A field that is absent takes the default; a field that is present but
+    /// malformed -- including an explicit `null` -- is an error. The
+    /// activation guard is only as good as this: `"hidden_act": null` or a
+    /// misspelled key used to parse as the default tanh GELU and pass
+    /// validation while the checkpoint was configured otherwise.
+    #[test]
+    fn present_but_malformed_fields_are_errors_not_defaults() {
+        // Absent (no vision_config section at all): the default stands.
+        let base = Qwen3VLConfig::from_json_str(MIN_CONFIG).unwrap();
+        assert_eq!(base.vision.hidden_act, "gelu_pytorch_tanh");
+
+        for (label, target, patch) in [
+            ("null hidden_act", "\"text_config\": {", "\"vision_config\": {\"hidden_act\": null}, \"text_config\": {"),
+            ("non-string hidden_act", "\"text_config\": {", "\"vision_config\": {\"hidden_act\": 5}, \"text_config\": {"),
+            ("non-numeric rope_theta", "\"rope_theta\": 5000000", "\"rope_theta\": \"big\""),
+            ("null rms_norm_eps", "\"rms_norm_eps\": 1e-6", "\"rms_norm_eps\": null"),
+            ("null mrope_section entry", "\"mrope_section\": [24, 20, 20]", "\"mrope_section\": [24, null, 20]"),
+            ("null mrope_interleaved", "\"mrope_interleaved\": true", "\"mrope_interleaved\": null"),
+        ] {
+            let raw = MIN_CONFIG.replace(target, patch);
+            let error = Qwen3VLConfig::from_json_str(&raw)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("must be"), "{label}: {error}");
+        }
+
+        let bad_deepstack = MIN_CONFIG.replace(
+            "\"text_config\": {",
+            "\"vision_config\": {\"deepstack_visual_indexes\": [5, \"x\"]}, \"text_config\": {",
+        );
+        let error = Qwen3VLConfig::from_json_str(&bad_deepstack)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("deepstack_visual_indexes[1]"),
+            "malformed deepstack entry: {error}"
+        );
     }
 }

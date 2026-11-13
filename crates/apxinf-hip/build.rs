@@ -5,8 +5,9 @@
 //! `kernels/ck/VENDOR.md`), is compiled by `hipcc` for one GPU architecture,
 //! the objects are archived, the archive is linked with `amdhip64` and
 //! `hipblas`, and the `apxinf_hip_runtime` cfg is set. Units compile in
-//! parallel, and a unit whose object is newer than everything it depends on is
-//! not recompiled: the CK units are slow and their inputs rarely change.
+//! parallel through a bounded pool, and a unit whose object is newer than
+//! everything it depends on is not recompiled: the CK units are slow and
+//! their inputs rarely change.
 //!
 //! hipBLASLt is optional. When its header is present the second GEMM provider
 //! is compiled in and `hipblaslt` is linked; otherwise the provider's entry
@@ -28,6 +29,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 /// Device translation units under `kernels/`. All of them include `common.h`.
@@ -37,31 +39,6 @@ const SOURCES: &[&str] = &[
     "elementwise.hip",
     "native_attention.hip",
     "rope.hip",
-];
-
-/// Flags the vendored Composable Kernel units must be built with.
-///
-/// Copied from `kernels/ck/VENDOR.md`, which records them as the flags CK's
-/// own CMake uses for these kernels and the ones the instances were validated
-/// with. They apply to CK's units and to apxinf's wrapper over them, never to
-/// the rest of `SOURCES`: `-enable-post-misched=0` in particular is a
-/// different code generator, and the kernels in `SOURCES` are tuned and
-/// measured without it.
-const CK_FLAGS: &[&str] = &[
-    "-O3",
-    "-fPIC",
-    "-std=c++20",
-    "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
-    "-fgpu-flush-denormals-to-zero",
-    "-fno-offload-uniform-block",
-    "-mllvm",
-    "--lsr-drop-solution=1",
-    "-mllvm",
-    "-enable-post-misched=0",
-    "-fbracket-depth=1024",
-    "-DCK_TILE_FMHA_FWD_SPLITKV_API=1",
-    "-DCK_TILE_FMHA_FWD_APPENDKV_API=0",
-    "-DCK_TILE_FMHA_FWD_PAGEDKV_API=0",
 ];
 
 fn main() {
@@ -105,69 +82,49 @@ fn main() {
         );
     }
 
+    let ck = kernels.join("ck");
+    let ck_include = ck.join("include");
+    let ck_fmha = ck.join("example/ck_tile/01_fmha");
+    let ck_generated = ck.join("generated");
     // Probed before anything is spawned: the always-compiled units need to
     // know whether `ck_attention.hip` will define the CK entry points or they
     // must carry stubs.
-    let ck = kernels.join("ck");
-    let has_ck = ck.join("generated/fmha_fwd_api.cpp").is_file();
+    let has_ck = ck_generated.join("fmha_fwd_api.cpp").is_file();
 
-    // Every translation unit is compiled as its own `hipcc` process, and they
-    // are spawned together rather than in sequence. CK contributes 20 units
-    // that take about five minutes serially; in parallel the whole build is
-    // bounded by the slowest one.
-    let mut jobs = Vec::new();
-    for source in SOURCES {
-        let object = out_dir.join(Path::new(source).with_extension("o"));
-        let child = Command::new(&hipcc)
-            .args(["-c", "-O3", "-fPIC", "-std=c++17"])
-            .arg(format!("-DAPXINF_HIP_HAS_BLASLT={}", blaslt as i32))
-            .arg(format!("-DAPXINF_HIP_HAS_CK={}", has_ck as i32))
-            .arg(format!("--offload-arch={arch}"))
-            .arg(kernels.join(source))
-            .arg("-o")
-            .arg(&object)
-            .spawn()
-            .unwrap_or_else(|e| panic!("apxinf-hip: failed to run {}: {e}", hipcc.display()));
-        jobs.push(((*source).to_string(), object, child));
-    }
-
-    // CK's FMHA, when the vendored copy is present. Absent, the entry points
-    // are the stubs in `apxinf_hip.hip` and `native::attention` keeps using
-    // apxinf's own kernel -- the same shape of fallback the hipBLASLt provider
-    // has.
+    let common = newest(&[kernels.join("common.h")]);
+    let mut units: Vec<Unit> = SOURCES
+        .iter()
+        .map(|source| Unit {
+            source: kernels.join(source),
+            // The arch is part of the name: an object compiled for another
+            // `APXINF_HIP_ARCH` must not be mistaken for a fresh one, or it
+            // defeats the arch check in `HipContext::new`.
+            object: out_dir.join(format!(
+                "{arch}_{toolchain}_{}.o",
+                Path::new(source).file_stem().unwrap().to_string_lossy()
+            )),
+            ck: false,
+            inputs_changed: common,
+        })
+        .collect();
     if has_ck {
-        let mut ck_sources: Vec<PathBuf> = std::fs::read_dir(ck.join("generated"))
-            .expect("apxinf-hip: cannot read kernels/ck/generated")
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                (path.extension()? == "cpp").then_some(path)
-            })
+        // CK units depend on the whole vendored tree, which only changes on a
+        // CK bump.
+        let ck_inputs = newest_in(&ck).max(common);
+        let mut generated: Vec<PathBuf> = std::fs::read_dir(&ck_generated)
+            .unwrap_or_else(|e| panic!("apxinf-hip: read {}: {e}", ck_generated.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "cpp"))
             .collect();
-        ck_sources.sort();
-        ck_sources.push(kernels.join("ck_attention.hip"));
-        for source in ck_sources {
-            let object = out_dir.join(format!(
-                "ck_{}.o",
-                source.file_stem().unwrap().to_string_lossy()
-            ));
-            let child = Command::new(&hipcc)
-                .arg("-c")
-                .args(CK_FLAGS)
-                .arg(format!("--offload-arch={arch}"))
-                .arg("-I")
-                .arg(&kernels)
-                .arg("-I")
-                .arg(ck.join("include"))
-                // CK's generated units include "fmha_fwd.hpp" by name, so the
-                // example directory holding it has to be on the path too.
-                .arg("-I")
-                .arg(ck.join("example/ck_tile/01_fmha"))
-                .arg(&source)
-                .arg("-o")
-                .arg(&object)
-                .spawn()
-                .unwrap_or_else(|e| panic!("apxinf-hip: failed to run {}: {e}", hipcc.display()));
-            jobs.push((source.display().to_string(), object, child));
+        generated.sort();
+        for source in std::iter::once(kernels.join("ck_attention.hip")).chain(generated) {
+            let name = source.file_stem().unwrap().to_string_lossy().into_owned();
+            units.push(Unit {
+                object: out_dir.join(format!("{arch}_{toolchain}_ck_{name}.o")),
+                source,
+                ck: true,
+                inputs_changed: ck_inputs,
+            });
         }
     } else {
         println!(
@@ -177,34 +134,79 @@ fn main() {
         );
     }
 
-    let mut objects = Vec::with_capacity(jobs.len());
-    for (name, object, child) in jobs {
-        let output = child
-            .wait_with_output()
-            .unwrap_or_else(|e| panic!("apxinf-hip: {} failed: {e}", hipcc.display()));
+    let compile = |unit: &Unit| {
+        if is_fresh(
+            &unit.object,
+            std::slice::from_ref(&unit.source),
+            unit.inputs_changed,
+        ) {
+            return;
+        }
+        let mut command = Command::new(&hipcc);
+        command
+            .args(["-c", "-O3", "-fPIC"])
+            .arg(format!("--offload-arch={arch}"))
+            .arg(format!("-DAPXINF_HIP_HAS_BLASLT={}", blaslt as i32))
+            .arg(format!("-DAPXINF_HIP_HAS_CK={}", has_ck as i32));
+        if unit.ck {
+            // CK's own CMake flags for its FMHA forward kernels (ROCm >= 6.2);
+            // recorded in kernels/ck/VENDOR.md.
+            command
+                .args(["-std=c++20", "-DCK_TILE_FMHA_FWD_FAST_EXP2=1"])
+                .args([
+                    "-fgpu-flush-denormals-to-zero",
+                    "-fno-offload-uniform-block",
+                ])
+                .args([
+                    "-mllvm",
+                    "--lsr-drop-solution=1",
+                    "-mllvm",
+                    "-enable-post-misched=0",
+                ])
+                .arg("-fbracket-depth=1024")
+                .args([
+                    "-DCK_TILE_FMHA_FWD_SPLITKV_API=1",
+                    "-DCK_TILE_FMHA_FWD_APPENDKV_API=0",
+                ])
+                .arg("-DCK_TILE_FMHA_FWD_PAGEDKV_API=0")
+                .args(["-Wno-undefined-func-template", "-Wno-float-equal"])
+                .arg("-I")
+                .arg(&ck_include)
+                .arg("-I")
+                .arg(&ck_fmha)
+                .arg("-I")
+                .arg(&kernels);
+        } else {
+            command.arg("-std=c++17");
+        }
+        let output = command
+            .arg(&unit.source)
+            .arg("-o")
+            .arg(&unit.object)
+            .output()
+            .unwrap_or_else(|e| panic!("apxinf-hip: failed to run {}: {e}", hipcc.display()));
         if !output.status.success() {
-            // ROCm's device linker needs libxml2.so.2; distributions that ship a
-            // newer libxml2 report it here. LD_LIBRARY_PATH must reach a
+            // ROCm's device linker needs libxml2.so.2; distributions that ship
+            // a newer libxml2 report it here. LD_LIBRARY_PATH must reach a
             // compatible copy before the build starts.
             panic!(
-                "apxinf-hip: hipcc failed on {name} for {arch}\n{}{}",
+                "apxinf-hip: hipcc failed on {} for {arch}\n{}{}",
+                unit.source.display(),
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
         }
     };
-    // Respect cargo's job count (`cargo build -j2`); each hipcc uses ~1.5 GB.
-    let jobs = env::var("NUM_JOBS")
-        .ok()
-        .and_then(|jobs| jobs.parse::<usize>().ok())
-        .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
-        .unwrap_or(4)
-        .max(1);
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    // Each hipcc takes about 1.5 GB and the host may be unified-memory: the
+    // pool is bounded, never one process per unit. `APXINF_HIP_BUILD_JOBS`
+    // overrides Cargo's `NUM_JOBS`; 16 is the ceiling either way so a large
+    // host cannot be scaled into an OOM.
+    let jobs = job_limit();
+    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..jobs.min(units.len()) {
             scope.spawn(|| loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let index = next.fetch_add(1, Ordering::Relaxed);
                 match units.get(index) {
                     Some(unit) => compile(unit),
                     None => break,
@@ -274,6 +276,8 @@ fn target_arch(rocm: &Path) -> String {
         })
 }
 
+/// One `hipcc` translation unit, its output object, and whether it builds
+/// with Composable Kernel's include paths and flags.
 struct Unit {
     source: PathBuf,
     object: PathBuf,
@@ -281,6 +285,22 @@ struct Unit {
     ck: bool,
     /// Newest modification time among the unit's headers.
     inputs_changed: SystemTime,
+}
+
+/// How many `hipcc` processes run at once: `APXINF_HIP_BUILD_JOBS`, then
+/// Cargo's `NUM_JOBS`, then the machine's parallelism, capped at 16 so the
+/// pool cannot scale a large host into an OOM.
+fn job_limit() -> usize {
+    env::var("APXINF_HIP_BUILD_JOBS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| env::var("NUM_JOBS").ok().and_then(|value| value.parse().ok()))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
+        .clamp(1, 16)
 }
 
 /// A short token identifying the hipcc that will compile the objects.

@@ -89,23 +89,28 @@ impl Gr00tWeights {
     }
 }
 
-/// The released checkpoint includes Qwen's language-model output head even
-/// though GR00T consumes a selected hidden state and never computes token
-/// logits. Require and validate this tensor before deliberately discarding it,
-/// so strict checkpoint loading still detects incomplete or mismatched files.
+/// GR00T consumes a selected hidden state and never computes token logits,
+/// so the language-model output head is dead weight. When the checkpoint
+/// carries one (the released N1.7 checkpoints do), validate it before
+/// discarding, so strict checkpoint loading still detects mismatched files;
+/// a tied-embedding checkpoint without `lm_head.weight` is equally valid --
+/// the field is optional the way `qwen3vl` treats it, not a completeness
+/// marker.
 fn discard_unused_lm_head(
     config: &Qwen3VLConfig,
     tensors: &mut HashMap<String, Tensor>,
 ) -> Result<()> {
     let name = "lm_head.weight";
-    let tensor = tensors
-        .remove(name)
-        .ok_or_else(|| Error::Other(format!("missing GR00T backbone weight {name}")))?;
-    expect_bf16_shape(
-        "unused backbone language-model head",
-        &tensor,
-        &[config.text.vocab_size, config.text.hidden_size],
-    )
+    match tensors.remove(name) {
+        Some(tensor) => {
+            expect_bf16_shape(
+                "unused backbone language-model head",
+                &tensor,
+                &[config.text.vocab_size, config.text.hidden_size],
+            )
+        }
+        None => Ok(()),
+    }
 }
 
 /// Parse and validate Cosmos-Reason2-2B's Qwen3-VL config, then truncate the
@@ -544,6 +549,23 @@ mod tests {
             "lm_head.weight".into(),
             Tensor::from_bf16(vec![3, 2], &[bf16::ZERO; 6]).unwrap(),
         )]);
+        discard_unused_lm_head(&config, &mut tensors).unwrap();
+        assert!(tensors.is_empty());
+    }
+
+    #[test]
+    fn a_tied_checkpoint_without_a_language_model_head_is_accepted() {
+        let config = Qwen3VLConfig::from_json_str(
+            r#"{
+                "text_config": {
+                    "hidden_size": 2,
+                    "vocab_size": 3,
+                    "rope_scaling": {"mrope_section": [1, 1, 1]}
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut tensors = HashMap::new();
         discard_unused_lm_head(&config, &mut tensors).unwrap();
         assert!(tensors.is_empty());
     }

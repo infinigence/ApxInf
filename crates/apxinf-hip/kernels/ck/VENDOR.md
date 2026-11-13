@@ -60,11 +60,11 @@ in generated code (see `mask.hpp`'s `decode`, where both set
 are the only causal attention either model issues; without them those layers
 fall back to apxinf's own kernel at 190 us each against CK's 20 us.
 
-The mask variants are generated under `logits` rather than `nlogits` -- the
-logits soft-cap is compiled in and disabled at runtime through
-`fmha_fwd_traits::has_logits_soft_cap`. One `fnmatch` pattern has to cover both
-settings, because `generate.py` splits `-f` on `@` only for `fwd_splitkv` and
-`bwd`; for `fwd` it passes the whole string to a single match
+Every instance -- masked included -- is generated under `nlogits`: the soft-cap
+code path is simply not compiled in, and `fmha_fwd_traits::has_logits_soft_cap`
+is always false here (the wrapper never sets a cap). One `fnmatch` pattern has
+to cover both mask settings, because `generate.py` splits `-f` on `@` only for
+`fwd_splitkv` and `bwd`; for `fwd` it passes the whole string to a single match
 (`codegen/ops/fmha_fwd.py`). Two passes would not work either: each emits its
 own `fmha_fwd_api.cpp`, and a dispatcher only knows its own pass's instances.
 

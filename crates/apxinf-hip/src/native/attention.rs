@@ -173,6 +173,18 @@ fn attention_inner(
             per_batch / kv_row
         )));
     }
+    // A causal start at or past the last key is never "mask the rows before
+    // it": the apxinf kernel would clamp it and return full attention, and
+    // the CK path reads it as an alignment it has no instance for. Both are
+    // silent nonsense, so refuse it here.
+    if let Some(start) = geometry.causal_query_start {
+        if start >= kv_tokens {
+            return Err(Error::Other(format!(
+                "apxinf-hip attention: causal_query_start {start} is not inside the \
+                 {kv_tokens}-key window"
+            )));
+        }
+    }
     let (pq, pk, pv, po) = (
         bf16_ptr(ctx, q)?,
         bf16_ptr(ctx, k)?,

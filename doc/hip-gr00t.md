@@ -68,6 +68,10 @@ path a policy gets.
 
 - AlternateVLDiT only; a checkpoint that disables it is refused at load.
 - `select_layer` and DiT depth come from the checkpoint, not config defaults.
+- Mixed-resolution multi-view input is rejected: every frame must hold the
+  same patch count (`equal_segment` in the vision blocks), because per-frame
+  attention is expressed as one batched call over equal segments. The
+  acceptance fixture's two same-resolution views are the supported shape.
 - One prompt shape per plan; tokens are refilled per request
   (`PreparedBackbone::refill_tokens`).
 - Captured graphs are device-resident from public input upload to public

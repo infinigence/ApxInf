@@ -73,10 +73,9 @@ pub fn layer_norm(
     })
 }
 
-/// Adaptive RMSNorm: `out = rms(x) * (1 + scale) + shift`, with `style`'s
-/// first `2 * cols` elements holding scale then shift.
-/// `out = (x - mean) * rsqrt(var + eps) * (1 + scale) + shift`, per row, with
-/// `style` holding `[scale; shift]` as `2 * cols` values.
+/// Adaptive LayerNorm: `out = (x - mean) * rsqrt(var + eps) * (1 + scale)
+/// + shift`, per row, with `style` holding `[scale; shift]` as `2 * cols`
+/// values.
 ///
 /// GR00T's DiT conditioning: the same per-call modulation
 /// [`ada_rms_norm`] takes, over LayerNorm statistics instead of RMS.
@@ -108,6 +107,8 @@ pub fn ada_layer_norm(
     })
 }
 
+/// Adaptive RMSNorm: `out = rms(x) * (1 + scale) + shift`, with `style`'s
+/// first `2 * cols` elements holding scale then shift.
 pub fn ada_rms_norm(
     ctx: &HipContext,
     x: &Tensor,

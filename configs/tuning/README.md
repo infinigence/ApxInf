@@ -76,6 +76,12 @@ file that no longer means what it says. The file also carries a
 `# measured-on <arch> rocm<..> hipblaslt<..>` line, and a mismatch is refused
 whole.
 
+The path resolves in two places, in order: `<cwd>/configs/tuning/amd/...`
+(this machine's autotune output, written here, git-ignored) and the same
+relative path inside the `apxinf-hip` crate (the recipe measured on the
+validated device, committed so a fresh checkout ships the tuned choices).
+Autotune always writes the working-directory copy, never the crate's.
+
 | Situation | Behaviour |
 | --- | --- |
 | No recipe at the path | hipBLAS everywhere, as before |
@@ -94,7 +100,8 @@ which is not the state a real inference sees — the DiT alone streams 576 MB of
 weights per flow step. The difference changes the answer: 3 of 12 shapes pick a
 different provider when measured warm.
 
-Tuning GR00T's 29 shapes costs about 5 s of load time, once.
+Tuning GR00T's 26 shapes — 31 recipe keys once the fused-epilogue variants of
+the same shape count separately — costs about 5 s of load time, once.
 
 Overrides, for A/B measurement rather than deployment:
 

@@ -139,7 +139,23 @@ fn arena_reuses_addresses_after_reset_and_refuses_overflow() {
         arena.tensor(vec![1 << 20], DType::BF16).is_err(),
         "2 MiB from a 1 MiB arena"
     );
-    assert!(arena.peak() <= arena.capacity());
+    // The peak must track exactly what was handed out: the maximum end offset
+    // any round reached, replaying the arena's own arithmetic -- align to 256,
+    // then add the tensor bytes. A peak that only ever read `capacity` would
+    // pass the old form of this check while telling callers nothing.
+    let round = |dims: &[&[usize]]| -> usize {
+        let mut offset = 0usize;
+        for d in dims {
+            offset = offset.next_multiple_of(256) + d.iter().product::<usize>() * 2;
+        }
+        offset
+    };
+    let expected = round(&[&[3, 5], &[7], &[1, 1, 9]]);
+    assert_eq!(
+        arena.peak(),
+        expected,
+        "peak must equal the handed-out bytes, not the capacity"
+    );
 }
 
 #[test]
@@ -201,6 +217,65 @@ fn gemm_matches_the_reference_at_prefix_and_action_shapes() {
         &arena.tensor(vec![4, 4], DType::BF16).unwrap()
     )
     .is_err());
+}
+
+/// `gemm_bias_activation` against the host reference: bias mapped per output
+/// feature, then GELU-tanh, with the rounding points of the fused epilogue.
+///
+/// The reference does not round the product to BF16 before the bias: the
+/// hipBLASLt epilogue applies both to the F32 accumulator and rounds once,
+/// which is the numerical point of fusing. A reference that rounded first
+/// would be the *unfused* contract, and the fused path would fail it for the
+/// right reason. The unfused fallback (hipBLAS + `bias_activation`) does round
+/// first, which is why the tolerance stays at the accumulation tolerance
+/// rather than bit-exact: the same test covers both providers.
+///
+/// `None` and `ReLU` cover the other epilogue modes the GEMM can take, so a
+/// mode mix-up (epilogue code 2 applied where 3 was meant, say) cannot pass.
+#[test]
+fn gemm_bias_activation_matches_the_reference_in_every_epilogue_mode() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // GR00T's DiT block shape, where the recipe routes the fused epilogue to
+    // hipBLASLt, plus a small shape the reference can be read by eye.
+    for (m, k, n) in [(41usize, 1536usize, 6144usize), (4, 8, 6)] {
+        let (a, ah) = input(&ctx, &[m, k], 30 + m as u64, 1.0);
+        let (b, bh) = input(&ctx, &[k, n], 40 + n as u64, 0.05);
+        let (bias, _) = input(&ctx, &[n], 50 + n as u64, 1.0);
+
+        let cases: [(Option<&Tensor>, Activation, &str); 3] = [
+            (Some(&bias), Activation::GeluTanh, "bias+gelu_tanh"),
+            (Some(&bias), Activation::Relu, "bias+relu"),
+            (None, Activation::GeluTanh, "gelu_tanh only"),
+        ];
+        let bias_host = host(&ctx, &bias);
+        for (bias, activation, name) in cases {
+            let out = arena.tensor(vec![m, n], DType::BF16).unwrap();
+            native::gemm_bias_activation(&ctx, &a, &b, bias, activation, &out).unwrap();
+
+            let mut reference = gemm_reference(&ah, &bh, m, k, n);
+            for row in 0..m {
+                for col in 0..n {
+                    let at = &mut reference[row * n + col];
+                    // One bias entry per column: the output feature.
+                    if bias.is_some() {
+                        *at += bias_host[col];
+                    }
+                    *at = match activation {
+                        Activation::GeluTanh => gelu_tanh(*at),
+                        Activation::Relu => at.max(0.0),
+                        Activation::None | Activation::Silu | Activation::GeluErf => *at,
+                    };
+                }
+            }
+            assert_close(
+                &host(&ctx, &out),
+                &reference,
+                ACCUMULATE_TOL,
+                &format!("gemm_bias_activation {name} {m}x{k}x{n}"),
+            );
+        }
+    }
 }
 
 /// hipBLASLt must agree with the reference wherever it is routed to.
@@ -299,7 +374,11 @@ fn ck_attention_matches_the_apxinf_kernel_where_it_is_available() {
     let arena = arena(&ctx);
     native::reset_attention_counts();
 
-    // GR00T's four sites plus a bottom-right-aligned causal case.
+    // GR00T's four sites plus a bottom-right-aligned causal case, plus a GQA
+    // geometry: q heads over half as many kv heads, which the kernel serves by
+    // dividing the q-head index (its `nhead_ratio_qk`), so a head-mapping bug
+    // reads K/V from out of range or pairs the wrong heads -- wrong answers
+    // that a same-head-count comparison never exercises.
     //
     // Vision is 2x256 because Qwen3-VL masks attention to within each frame
     // and the port expresses that as the batch dimension. The causal rows are
@@ -307,13 +386,15 @@ fn ck_attention_matches_the_apxinf_kernel_where_it_is_available() {
     // or not applied at all, still produces a plausible-looking tensor, and
     // only a comparison catches it.
     let cases = [
-        (2usize, 256usize, 256usize, 16usize, 64usize, None, "vision"),
-        (1, 149, 149, 32, 64, None, "VL"),
-        (1, 41, 149, 32, 48, None, "DiT"),
+        (2usize, 256usize, 256usize, 16usize, 16usize, 64usize, None, "vision"),
+        (1, 149, 149, 32, 32, 64, None, "VL"),
+        (1, 41, 149, 32, 32, 48, None, "DiT"),
+        (1, 149, 149, 16, 8, 64, None, "GQA 2:1"),
         (
             1,
             149,
             149,
+            16,
             16,
             128,
             Some(0),
@@ -324,41 +405,42 @@ fn ck_attention_matches_the_apxinf_kernel_where_it_is_available() {
             41,
             149,
             16,
+            16,
             128,
             Some(108),
             "prefill over a cache (bottom-right)",
         ),
     ];
     let mut served = 0usize;
-    for (batch, q_tokens, kv_tokens, heads, head_dim, causal, name) in cases {
+    for (batch, q_tokens, kv_tokens, q_heads, kv_heads, head_dim, causal, name) in cases {
         let (q, _) = input(
             &ctx,
-            &[batch, q_tokens, heads, head_dim],
+            &[batch, q_tokens, q_heads, head_dim],
             7 + head_dim as u64,
             1.0,
         );
         let (k, _) = input(
             &ctx,
-            &[batch, kv_tokens, heads, head_dim],
-            11 + heads as u64,
+            &[batch, kv_tokens, kv_heads, head_dim],
+            11 + kv_heads as u64,
             1.0,
         );
         let (v, _) = input(
             &ctx,
-            &[batch, kv_tokens, heads, head_dim],
+            &[batch, kv_tokens, kv_heads, head_dim],
             13 + q_tokens as u64,
             1.0,
         );
         let geometry = native::AttentionGeometry {
             batch,
             q_tokens,
-            q_heads: heads,
-            kv_heads: heads,
+            q_heads,
+            kv_heads,
             head_dim,
             kv_tokens,
             causal_query_start: causal,
         };
-        let dims = vec![batch, q_tokens, heads, head_dim];
+        let dims = vec![batch, q_tokens, q_heads, head_dim];
 
         let reference = arena.tensor(dims.clone(), DType::BF16).unwrap();
         let before = native::attention_counts();
@@ -377,14 +459,15 @@ fn ck_attention_matches_the_apxinf_kernel_where_it_is_available() {
             &host(&ctx, &out),
             &host(&ctx, &reference),
             2.0e-2,
-            &format!("CK attention {name} {batch}x{q_tokens}x{heads}x{head_dim}"),
+            &format!("CK attention {name} {batch}x{q_tokens}x{q_heads}h/{kv_heads}kvx{head_dim}"),
         );
     }
     assert_eq!(
         served,
         cases.len(),
         "CK served {served} of {} geometries. Every one of them has a vendored instance: \
-         the three non-causal ones and both causal alignments. A shortfall means an \
+         the four non-causal ones (GQA included -- the kernel derives the kv head by \
+         dividing the q head index) and both causal alignments. A shortfall means an \
          instance went missing from kernels/ck/generated, and the shapes it covered are \
          silently back on the slow kernel",
         cases.len()
@@ -1662,6 +1745,29 @@ fn causal_attention_masks_each_query_to_its_own_prefix() {
             &want,
             ACCUMULATE_TOL,
             &format!("causal attention q={q_tokens} kv={kv_tokens} start={start}"),
+        );
+    }
+
+    // A start at or past the last key has no causal meaning: the kernel would
+    // clamp it and return full attention, so it is refused up front.
+    let kv_149 = 149usize;
+    for start in [kv_149, kv_149 + 1] {
+        let geometry = AttentionGeometry {
+            batch: 1,
+            q_tokens: 4,
+            q_heads: 8,
+            kv_heads: 8,
+            head_dim: 64,
+            kv_tokens: kv_149,
+            causal_query_start: Some(start),
+        };
+        let (q, _) = input(&ctx, &[1, 4, 8, 64], 66, 1.0);
+        let (k, _) = input(&ctx, &[1, 149, 8, 64], 67, 1.0);
+        let (v, _) = input(&ctx, &[1, 149, 8, 64], 68, 1.0);
+        let out = arena.tensor(vec![1, 4, 8, 64], DType::BF16).unwrap();
+        assert!(
+            native::attention(&ctx, &q, &k, &v, &geometry, &out).is_err(),
+            "causal_query_start {start} at/after the {kv_149}-key window must be rejected"
         );
     }
 }

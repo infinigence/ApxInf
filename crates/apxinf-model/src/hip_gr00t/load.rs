@@ -86,7 +86,13 @@ pub fn load_runner(
     let model = model::build_bf16_model(blocks, &mut weights)?;
     drop(weights);
     let runner = HipGr00tRunner::new(Rc::new(model));
-    debug_assert!(runner.contract().action_shape[1] > 0);
+    if runner.contract().action_shape[1] == 0 {
+        return Err(Error::Other(
+            "GR00T config yields a zero action width; the checkpoint's action head config is \
+             unusable"
+                .into(),
+        ));
+    }
     Ok(runner)
 }
 

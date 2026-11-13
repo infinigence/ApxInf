@@ -545,8 +545,8 @@ extern "C" int apxinf_hip_gemm(void* handle, int dtype, int m, int n, int k, con
 //
 // A second GEMM provider, selected per shape by `apxinf_hip::native::gemm`.
 // Neither library wins everywhere on gfx1151: measured over GR00T's 26 GEMM
-// shapes, hipBLASLt is 1.11x-3.65x faster on the 13 shapes below the roofline
-// ridge point and 0.61x-0.95x *slower* on the 5 above it, so the choice has to
+// shapes, hipBLASLt is 1.05x-3.71x faster on the 13 shapes below the roofline
+// ridge point and 0.58x-0.90x *slower* on the 5 above it, so the choice has to
 // be made per shape rather than globally. See
 // `devlocal/gr00t-hip-port/reports/perf/gemm-provider-comparison.md`.
 //
@@ -658,7 +658,10 @@ LtProblem* problem_for(LtContext* lt, int dtype, int m, int n, int k, int epilog
       hipblasLtMatrixLayoutCreate(&problem.b, type, n, k, n) != HIPBLAS_STATUS_SUCCESS ||
       hipblasLtMatrixLayoutCreate(&problem.a, type, k, m, k) != HIPBLAS_STATUS_SUCCESS ||
       hipblasLtMatrixLayoutCreate(&problem.c, type, n, m, n) != HIPBLAS_STATUS_SUCCESS) {
-    return &problem;  // not usable; the caller falls back to hipBLAS
+    // Transient, like a failed heuristic: do not cache the failure for the
+    // handle's lifetime.
+    lt->problems.erase(key);
+    return nullptr;  // not usable; the caller falls back to hipBLAS
   }
 
   // The bias is one value per output feature. Row-major `C[m, n]` is
@@ -683,14 +686,16 @@ LtProblem* problem_for(LtContext* lt, int dtype, int m, int n, int k, int epilog
             HIPBLAS_STATUS_SUCCESS ||
         hipblasLtMatmulDescSetAttribute(problem.desc, HIPBLASLT_MATMUL_DESC_BIAS_POINTER,
                                         &bias, sizeof(bias)) != HIPBLAS_STATUS_SUCCESS) {
-      return &problem;
+      lt->problems.erase(key);
+      return nullptr;
     }
     problem.has_bias = true;
   }
 
   hipblasLtMatmulPreference_t preference = nullptr;
   if (hipblasLtMatmulPreferenceCreate(&preference) != HIPBLAS_STATUS_SUCCESS) {
-    return &problem;
+    lt->problems.erase(key);
+    return nullptr;
   }
   const uint64_t workspace = 0;
   hipblasLtMatmulPreferenceSetAttribute(preference,
@@ -704,9 +709,32 @@ LtProblem* problem_for(LtContext* lt, int dtype, int m, int n, int k, int epilog
       lt->handle, problem.desc, problem.b, problem.a, problem.c, problem.c, preference, 8,
       heuristics, &found_count);
   hipblasLtMatmulPreferenceDestroy(preference);
-  if (status != HIPBLAS_STATUS_SUCCESS || found_count == 0) return &problem;
+  // A non-success status or an empty list is a transient failure, not a
+  // property of the problem: Tensile's host side initializes lazily and its
+  // first query can fail. Caching `usable = false` here would pin the
+  // fallback for the handle's lifetime, so erase the entry and let the next
+  // call build it again.
+  if (status != HIPBLAS_STATUS_SUCCESS || found_count == 0) {
+    lt->problems.erase(key);
+    return nullptr;
+  }
+  // `found_count` entries were written, but each one carries its own state:
+  // a heuristic can report candidates whose introspection failed. Only a
+  // candidate with `state == SUCCESS` has a valid `algo`; anything else is
+  // not a usable algorithm no matter what the count said.
+  int chosen = -1;
+  for (int i = 0; i < found_count; ++i) {
+    if (heuristics[i].state == HIPBLAS_STATUS_SUCCESS) {
+      chosen = i;
+      break;
+    }
+  }
+  if (chosen < 0) {
+    lt->problems.erase(key);
+    return nullptr;
+  }
 
-  problem.algo = heuristics[0].algo;
+  problem.algo = heuristics[chosen].algo;
   problem.usable = true;
 
   auto tactic = lt->tactics.find(key);
@@ -725,10 +753,20 @@ LtProblem* problem_for(LtContext* lt, int dtype, int m, int n, int k, int epilog
 // A recipe naming a solution the current library does not have is the case
 // this guards: it must degrade to the heuristic's pick, not to a wrong answer
 // or a crash.
+//
+// Under graph capture there is no trial: the synchronize is illegal inside a
+// capture, and a launch that failed would invalidate it. The tactic stays
+// unpromoted and this call runs the heuristic's pick, captured like any other
+// launch -- the graph then replays the heuristic's kernel for this shape
+// until a capture-free process promotes the tactic. Slower, never wrong.
 void promote_tactic(LtContext* lt, LtProblem* problem, const void* a, const void* b,
                     void* c) {
   const hipblasLtMatmulAlgo_t candidate = *problem->pending;
   problem->pending = nullptr;
+  hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
+  unsigned long long capture_id = 0;
+  if (hipStreamGetCaptureInfo(lt->stream, &capture, &capture_id) != hipSuccess) return;
+  if (capture != hipStreamCaptureStatusNone) return;
   const float alpha = 1.0f, beta = 0.0f;
   hipblasLtMatmulAlgo_t trial = candidate;
   if (hipblasLtMatmul(lt->handle, problem->desc, &alpha, b, problem->b, a, problem->a,
@@ -817,7 +855,7 @@ extern "C" int apxinf_hip_gemm_lt(void* handle, int dtype, int m, int n, int k,
   if (epilogue != kEpilogueNone && !bias) return kInvalidArgument;
   LtContext* lt = static_cast<LtContext*>(handle);
   LtProblem* problem = problem_for(lt, dtype, m, n, k, epilogue, bias);
-  if (!problem->usable) return kInvalidArgument;
+  if (!problem || !problem->usable) return kInvalidArgument;
   // The descriptor caches the bias *pointer*, but one cached problem serves
   // every site with this shape -- all 32 DiT blocks share `41x1536x6144` and
   // each has its own bias. Refreshing it per call is a write into the
@@ -840,14 +878,16 @@ extern "C" int apxinf_hip_gemm_lt(void* handle, int dtype, int m, int n, int k,
 #else  // APXINF_HIP_HAS_BLASLT
 
 // ROCm without hipBLASLt headers: the provider is simply unavailable, and
-// `native::gemm` keeps using hipBLAS.
+// `native::gemm` keeps using hipBLAS. Every stub keeps the full real
+// signature -- argument count included -- so the Rust declarations in
+// `ffi.rs` are checked against these too when a header-less build links.
 extern "C" int apxinf_hip_blaslt_create(void** handle, void*) {
   *handle = nullptr;
   return kInvalidArgument;
 }
 extern "C" int apxinf_hip_blaslt_destroy(void*) { return 0; }
-extern "C" int apxinf_hip_blaslt_set_tactic(void*, int, int, int, int, const unsigned char*,
-                                            int) {
+extern "C" int apxinf_hip_blaslt_set_tactic(void*, int, int, int, int, int,
+                                            const unsigned char*, int) {
   return kInvalidArgument;
 }
 extern "C" int apxinf_hip_blaslt_tactic_bytes() { return 0; }
@@ -988,7 +1028,8 @@ namespace {
 constexpr size_t kTuneSpanBytes = 256u << 20;
 constexpr int kTuneMaxRing = 256;
 // Per candidate. Long enough to average out launch jitter, short enough that
-// tuning 26 shapes stays within a second or two of load time.
+// tuning GR00T's 26 shapes (31 keys with the epilogue variants) stays within
+// a few seconds of load time.
 constexpr int kTuneIterations = 40;
 // A candidate whose answer drifts from hipBLAS by more than this is not a
 // faster way to do the work, it is a different computation. Both accumulate
@@ -1068,7 +1109,7 @@ extern "C" int apxinf_hip_gemm_tune(void* lt_handle, void* blas_handle, int dtyp
   if (epilogue != kEpilogueNone && !bias) return kInvalidArgument;
   LtContext* lt = static_cast<LtContext*>(lt_handle);
   LtProblem* problem = problem_for(lt, dtype, m, n, k, epilogue, bias);
-  if (!problem->usable) return kInvalidArgument;
+  if (!problem || !problem->usable) return kInvalidArgument;
 
   *blas_ms = -1.0;
   *lt_ms = -1.0;
@@ -1239,8 +1280,8 @@ extern "C" int apxinf_hip_gemm_tune(void* lt_handle, void* blas_handle, int dtyp
 #else
 
 extern "C" int apxinf_hip_gemm_tune(void*, void*, int, int, int, int, const void*,
-                                    const void*, double*, double*, unsigned char*, int,
-                                    double*) {
+                                    const void*, int, const void*, double*, double*,
+                                    unsigned char*, int, double*) {
   return kInvalidArgument;
 }
 
