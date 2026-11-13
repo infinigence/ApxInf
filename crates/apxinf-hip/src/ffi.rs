@@ -64,6 +64,7 @@ hip_abi! {
     fn apxinf_hip_stream_create(stream: *mut *mut c_void);
     fn apxinf_hip_stream_destroy(stream: *mut c_void);
     fn apxinf_hip_stream_synchronize(stream: *mut c_void);
+    fn apxinf_hip_stream_query(stream: *mut c_void);
     fn apxinf_hip_malloc(ptr: *mut *mut c_void, bytes: u64, stream_ordered: i32, stream: *mut c_void);
     fn apxinf_hip_free(ptr: *mut c_void, stream_ordered: i32, stream: *mut c_void);
     fn apxinf_hip_memcpy_htod(dst: *mut c_void, src: *const c_void, bytes: u64, stream: *mut c_void);

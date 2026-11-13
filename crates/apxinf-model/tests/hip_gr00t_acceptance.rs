@@ -235,7 +235,7 @@ fn the_libero_fixture_matches_the_nvidia_reference_within_the_release_gate() {
     // so a stale buffer would show up here.
     let again = runner.infer_host_f32(&request).expect("second inference");
     assert_eq!(actions, again, "a repeated request changed the action chunk");
-    assert_eq!(runner.execution_mode(), "eager");
+    assert_eq!(runner.execution_mode(), "graph");
 }
 
 #[test]
@@ -310,11 +310,32 @@ fn preparation_refuses_a_spec_that_cannot_bind_grooots_shapes() {
         .expect("prepare_for");
     assert_eq!(boxed.spec().token_count, observation.token_ids.len());
 
-    // Graph capture is not implemented; asking for it must fail rather than
-    // quietly serve an eager run that a benchmark would then mis-attribute.
-    assert!(runner
-        .prepare_for(&request, ExecutionPolicy::RequireGraph)
-        .is_err());
+    // Preparation honors the policy: RequireGraph prepares a plan that
+    // reports Graph mode (the warmup and capture happened inside `prepare`,
+    // not on the first `run`), and Eager prepares one that reports Eager.
+    let graphed = runner
+        .prepare_plan(&request, ExecutionPolicy::RequireGraph)
+        .expect("RequireGraph prepares and captures");
+    assert_eq!(
+        graphed.status(),
+        apxinf_model::vla::PreparationStatus::Ready {
+            mode: apxinf_model::vla::ExecutionMode::Graph,
+            fallback_reason: None,
+        }
+    );
+    let eager = runner
+        .prepare_plan(&request, ExecutionPolicy::Eager)
+        .expect("Eager prepares");
+    assert_eq!(
+        eager.status(),
+        apxinf_model::vla::PreparationStatus::Ready {
+            mode: apxinf_model::vla::ExecutionMode::Eager,
+            fallback_reason: None,
+        }
+    );
+    // An eager plan never captured, so it has served zero replays.
+    let (replays, nodes) = eager.graph_usage();
+    assert_eq!((replays, nodes), (0, 0));
 }
 
 #[test]
@@ -388,7 +409,7 @@ fn a_different_prompt_changes_the_action_on_a_shared_plan() {
         "two different prompts gave the identical action chunk, so the token \
          IDs are not reaching the model -- the plan's token buffer is stale"
     );
-    assert_eq!(runner.execution_mode(), "eager");
+    assert_eq!(runner.execution_mode(), "graph");
 }
 
 #[test]
@@ -453,7 +474,7 @@ fn a_request_missing_grooots_metadata_is_refused() {
 ///
 /// Not a performance test -- capture is worth about -0.03 +/- 0.11 ms here,
 /// which is nothing. It is an executable form of the fixed-profile contract in
-/// `CLAUDE.md`: device-resident from input upload to output transfer, with
+/// `doc/model-execution-wiring.md#accelerator-port-acceptance`: device-resident from input upload to output transfer, with
 /// host round-trips counted as unfinished work rather than debt.
 ///
 /// Capturing checks exactly that, and checks it rather than trusting a
@@ -471,13 +492,6 @@ fn the_forward_is_device_resident_enough_to_capture() {
         eprintln!("set APXINF_GR00T_CHECKPOINT and APXINF_GR00T_FIXTURE; skipping");
         return;
     };
-    if matches!(
-        std::env::var("APXINF_HIP_GRAPH").unwrap_or_default().trim(),
-        "0" | "false" | "off"
-    ) {
-        eprintln!("skipping: APXINF_HIP_GRAPH=0 disables the mechanism under test");
-        return;
-    }
 
     let loaded = load_fixture(&fixture);
     let ctx = Arc::new(HipContext::new(0).expect("HIP device 0"));
@@ -497,8 +511,9 @@ fn the_forward_is_device_resident_enough_to_capture() {
     };
     let request = VlaRequest::provided_with_metadata(&observation, &loaded.noise, metadata);
 
-    // Two inferences: the first builds the plan and runs eagerly, the second
-    // is where capture happens.
+    // The implicit `infer` path prepares under PreferGraph, so the first
+    // inference is the warmup inside preparation and every later one replays
+    // the captured graph.
     let first = runner.infer_host_f32(&request).expect("first inference");
     let second = runner.infer_host_f32(&request).expect("second inference");
     let third = runner.infer_host_f32(&request).expect("third inference");

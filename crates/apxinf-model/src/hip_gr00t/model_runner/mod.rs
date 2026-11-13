@@ -1,4 +1,6 @@
 //! Execution lifecycle; model and weights never depend on this module.
 
+mod prepare;
 mod runner;
-pub use runner::{HipGr00tPrepared, HipGr00tRunner};
+pub use prepare::HipGr00tPrepared;
+pub use runner::HipGr00tRunner;

@@ -254,6 +254,16 @@ impl HipContext {
         })
     }
 
+    /// Probe the stream without disturbing it: `Ok(())` when it is idle and
+    /// healthy, `Err` naming either pending work (`hipErrorNotReady`) or the
+    /// first error latched on it. Unlike a real call, `hipStreamQuery` does
+    /// not clear a latched error, so this is how a caller decides whether a
+    /// failed capture left the stream usable for eager execution.
+    pub fn stream_status(&self) -> Result<()> {
+        self.bind()?;
+        check("hipStreamQuery", unsafe { ffi::apxinf_hip_stream_query(self.stream()) })
+    }
+
     pub(crate) fn alloc(&self, bytes: usize) -> Result<HipBuffer> {
         // `hipMalloc` fails device-wide while a capture is open anywhere in
         // the process. When another thread is capturing, wait for it to close

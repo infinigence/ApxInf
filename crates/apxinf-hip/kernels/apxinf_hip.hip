@@ -437,6 +437,15 @@ extern "C" int apxinf_hip_stream_synchronize(void* stream) {
   return static_cast<int>(hipStreamSynchronize(as_stream(stream)));
 }
 
+// Non-destructive stream probe: hipStreamQuery returns hipSuccess when the
+// stream is idle and healthy, hipErrorNotReady while work is pending, and the
+// first latched error when an earlier operation failed. Unlike the calls
+// around it, this reports the error instead of clearing it, so a capture
+// fallback can tell a recoverable failure from a poisoned stream.
+extern "C" int apxinf_hip_stream_query(void* stream) {
+  return static_cast<int>(hipStreamQuery(as_stream(stream)));
+}
+
 // Stream-ordered allocation when the device supports memory pools: a free is
 // ordered after all work already queued on the stream, so dropping a tensor
 // cannot release memory a pending kernel still reads. Without pools, hipFree

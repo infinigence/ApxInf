@@ -175,22 +175,18 @@ fn main() -> AnyResult<()> {
     // measurement: an A/B arm that never left the default path looks exactly
     // like one that found no speedup. Both counts are zero on the default
     // provider, which touches no atomics.
-    // Whether the forward actually replayed from a graph. Capture being off,
-    // or having failed, leaves the eager path in use and the right answer
-    // returned, so a latency number alone cannot tell the two apart.
+    // Whether the forward actually replayed from a graph. Preparation runs
+    // under PreferGraph, so a plan that fell back -- or never captured --
+    // leaves the eager path in use and the right answer returned; a latency
+    // number alone cannot tell the two apart.
     if let Some(prepared) = runner.prepared_for_report() {
         let (replays, nodes) = prepared.graph_usage();
         if nodes > 0 {
             println!("HIP graph: {nodes} nodes, {replays} of the runs replayed from it");
-        } else if matches!(
-            std::env::var("APXINF_HIP_GRAPH").unwrap_or_default().trim(),
-            "0" | "false" | "off"
-        ) {
-            println!("HIP graph: disabled by APXINF_HIP_GRAPH; every run was eager");
         } else {
             println!(
-                "HIP graph: NOT captured, though capture is on. The forward is not \
-                 device-resident; see the apxinf-hip message above."
+                "HIP graph: NOT captured; preparation fell back to eager. The forward is \
+                 not device-resident; see the apxinf-hip message above."
             );
         }
     }
