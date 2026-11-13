@@ -25,12 +25,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use apxinf_core::{DType, Tensor};
+use apxinf_core::Tensor;
 use apxinf_hip::native::HipArena;
 use apxinf_hip::HipContext;
-use apxinf_model::hip_gr00t::model::blocks::action_head::{self, DitConditioning};
 use apxinf_model::hip_gr00t::load_runner;
-use apxinf_model::hip_gr00t::model::blocks::{backbone, vision};
 use apxinf_model::vla::{
     Observation, VisionObservation, VlaMetadata, VlaRequest, VlaRuntime,
 };
@@ -200,10 +198,13 @@ fn main() -> AnyResult<()> {
         );
     }
 
-    let arena_bound = runner.model().arena_bytes(
-        fixture.pixel_values.shape().dims()[0],
-        fixture.token_ids.len(),
-    );
+    let arena_bound = runner
+        .model()
+        .workspace_requirements(
+            fixture.pixel_values.shape().dims()[0],
+            fixture.token_ids.len(),
+        )?
+        .arena_bytes;
     println!("arena bound {:.0} MiB", arena_bound as f64 / (1 << 20) as f64);
 
     // One clean inference with the recorder armed, so the shape census counts
@@ -245,27 +246,23 @@ fn main() -> AnyResult<()> {
     if args.iter().any(|a| a == "--stages") {
         println!("\nstage split (each synchronized, so the sum exceeds the total above):");
         let model = runner.model();
-        let config = model.config();
-        let backbone_config = model.backbone_config();
         let patches = fixture.pixel_values.shape().dims()[0];
-        let (vision_plan, backbone_plan) = model.prepare_shape(
+        let blocks = model.prepare_shape(
             patches,
             &fixture.grid,
             &fixture.token_ids,
             &fixture.attention_mask,
         )?;
         let embodiment = model.embodiment(fixture.embodiment_id)?;
-        let constants = HipArena::new(&ctx, 64 << 20)?;
-        let conditioning = DitConditioning::new(&ctx, config, model.weights(), &constants)?;
-        let arena = HipArena::new(&ctx, model.arena_bytes(patches, fixture.token_ids.len()))?;
+        let arena = HipArena::new(
+            &ctx,
+            model
+                .workspace_requirements(patches, fixture.token_ids.len())?
+                .arena_bytes,
+        )?;
         let pixel_values = ctx.to_device(&fixture.pixel_values)?;
         let state = ctx.to_device(&fixture.state)?;
         let noise = ctx.to_device(&fixture.noise)?;
-        let groups = apxinf_model::hip_gr00t::model::token_groups::build_backbone_token_groups(
-            &fixture.token_ids,
-            &fixture.attention_mask,
-            backbone_config.image_token_id,
-        )?;
 
         // One repeat runs the whole chain and synchronizes between stages. Timing
         // a single stage in isolation would need either an arena reset (which
@@ -277,35 +274,23 @@ fn main() -> AnyResult<()> {
         for _ in 0..repeats {
             arena.reset();
             let mut mark = Instant::now();
-            let mut lap = |totals: &mut [f64; 4], index: usize, mark: &mut Instant| -> AnyResult<()> {
+            let lap = |totals: &mut [f64; 4], index: usize, mark: &mut Instant| -> AnyResult<()> {
                 ctx.synchronize()?;
                 totals[index] += mark.elapsed().as_secs_f64() * 1000.0;
                 *mark = Instant::now();
                 Ok(())
             };
 
-            let vision_output = vision::forward(
-                &ctx, backbone_config, model.weights(), &arena, &pixel_values, &vision_plan,
-            )?;
+            let vision_output = model.vision_stage(&arena, &pixel_values, &blocks)?;
             lap(&mut totals, 0, &mut mark)?;
 
-            let hidden = backbone::forward(
-                &ctx, backbone_config, model.weights(), &arena, &vision_output, &backbone_plan,
-            )?;
+            let hidden = model.backbone_stage(&arena, &vision_output, &blocks)?;
             lap(&mut totals, 1, &mut mark)?;
 
-            let adapted =
-                backbone::forward_adapter(&ctx, config, model.weights(), &arena, &hidden)?;
+            let adapted = model.adapter_stage(&arena, &hidden)?;
             lap(&mut totals, 2, &mut mark)?;
 
-            let split = action_head::split_backbone(
-                &ctx, &arena, &adapted,
-                &action_head::DitRowIndices::new(&ctx, &groups.non_image, &groups.image)?,
-            )?;
-            action_head::forward(
-                &ctx, config, model.weights(), &embodiment, &conditioning, &arena, &split,
-                &state, &noise,
-            )?;
+            model.action_stage(&arena, &adapted, &state, &noise, &blocks, &embodiment)?;
             lap(&mut totals, 3, &mut mark)?;
         }
         let names = ["vision tower", "text backbone", "VLLN + VL blocks", "DiT (4 flow steps)"];

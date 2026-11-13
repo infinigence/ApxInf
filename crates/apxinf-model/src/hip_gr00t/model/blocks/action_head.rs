@@ -19,7 +19,6 @@ use apxinf_hip::HipContext;
 use crate::hip_gr00t::config::Gr00tConfig;
 use crate::hip_gr00t::model::blocks::dit_source::Gr00tDitAttentionSource;
 use crate::hip_gr00t::math::{action_timestep_embedding, dit_timestep_projection, flow_schedule};
-use crate::hip_gr00t::model::stages::{NoStages, StageSink};
 use crate::hip_gr00t::weights::{DitBlock, Embodiment, HipGr00tWeights, Linear};
 
 /// Everything about the four timesteps that the observation cannot change.
@@ -327,34 +326,6 @@ pub fn forward(
     state: &Tensor,
     noise: &Tensor,
 ) -> Result<Tensor> {
-    forward_observed(
-        ctx,
-        cfg,
-        weights,
-        embodiment,
-        conditioning,
-        arena,
-        backbone,
-        state,
-        noise,
-        &mut NoStages,
-    )
-}
-
-/// [`forward`], reporting the reference's stage names to `stages`.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_observed(
-    ctx: &HipContext,
-    cfg: &Gr00tConfig,
-    weights: &HipGr00tWeights,
-    embodiment: &Embodiment,
-    conditioning: &DitConditioning,
-    arena: &HipArena,
-    backbone: &DitBackbone,
-    state: &Tensor,
-    noise: &Tensor,
-    stages: &mut dyn StageSink,
-) -> Result<Tensor> {
     let (horizon, action_dim) = (cfg.action_horizon, cfg.max_action_dim);
     if noise.shape().dims() != [horizon, action_dim] {
         return Err(Error::ShapeMismatch {
@@ -371,7 +342,6 @@ pub fn forward_observed(
     }
 
     let state_features = encode_state(ctx, arena, embodiment, state)?;
-    stages.stage("state_features", &state_features)?;
 
     let mut actions = arena.tensor(vec![horizon, action_dim], DType::BF16)?;
     native::copy_rows(ctx, noise, &actions, 0)?;
@@ -384,7 +354,6 @@ pub fn forward_observed(
     let cross = CrossAttentionCache::build(ctx, cfg, weights, arena, backbone)?;
 
     for step in 0..conditioning.steps() {
-        stages.stage(&format!("step_{step}_action_in"), &actions)?;
         let velocity = flow_step(
             ctx,
             cfg,
@@ -397,15 +366,11 @@ pub fn forward_observed(
             &state_features,
             &actions,
             step,
-            stages,
         )?;
-        stages.stage(&format!("step_{step}_velocity"), &velocity)?;
         let next = arena.tensor(vec![horizon, action_dim], DType::BF16)?;
         native::euler_update(ctx, &actions, &velocity, conditioning.deltas[step], &next)?;
         actions = next;
-        stages.stage(&format!("step_{step}_action_out"), &actions)?;
     }
-    stages.stage("final_action", &actions)?;
     Ok(actions)
 }
 
@@ -423,7 +388,6 @@ fn flow_step(
     state_features: &Tensor,
     actions: &Tensor,
     step: usize,
-    stages: &mut dyn StageSink,
 ) -> Result<Tensor> {
     let (horizon, action_dim) = (cfg.action_horizon, cfg.max_action_dim);
     let width = cfg.input_embedding_dim;
@@ -485,7 +449,6 @@ fn flow_step(
             &action_features,
         )?,
     }
-    stages.stage(&format!("step_{step}_action_features"), &action_features)?;
 
     let tokens = horizon + 1;
     let mut hidden = arena.tensor(vec![tokens, width], DType::BF16)?;
@@ -496,7 +459,6 @@ fn flow_step(
     // 33 reference tensors per step be compared without an offset table --
     // and an offset here is indistinguishable from a real error, since a
     // block's output correlates well with its neighbour's.
-    stages.stage(&format!("step_{step}_dit_hidden_0"), &hidden)?;
 
     // The first block normalizes its own input; every later one is handed the
     // normalization its predecessor already produced, because that pass is
@@ -539,7 +501,6 @@ fn flow_step(
         if let Some(next) = next_normed {
             normalized = next;
         }
-        stages.stage(&format!("step_{step}_dit_hidden_{}", index + 1), &hidden)?;
     }
 
     // Final adaptive norm, at its own epsilon, then the shared projection.
@@ -562,7 +523,6 @@ fn flow_step(
         Activation::None,
         &dit_output,
     )?;
-    stages.stage(&format!("step_{step}_dit_output"), &dit_output)?;
 
     // Action decoder, then drop the state row: the velocity covers the action
     // tokens only.

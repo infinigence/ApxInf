@@ -22,7 +22,6 @@ use apxinf_hip::native::{
 use apxinf_hip::HipContext;
 
 use crate::hip_gr00t::config::{Gr00tConfig, Qwen3VLConfig};
-use crate::hip_gr00t::model::stages::{NoStages, StageSink};
 use super::vision::VisionOutput;
 use crate::hip_gr00t::weights::{HipGr00tWeights, Norm, TextLayer, VlBlock};
 
@@ -125,20 +124,6 @@ pub fn forward(
     vision: &VisionOutput,
     prepared: &PreparedBackbone,
 ) -> Result<Tensor> {
-    forward_observed(ctx, cfg, weights, arena, vision, prepared, &mut NoStages)
-}
-
-/// [`forward`], reporting each layer's output to `stages`.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_observed(
-    ctx: &HipContext,
-    cfg: &Qwen3VLConfig,
-    weights: &HipGr00tWeights,
-    arena: &HipArena,
-    vision: &VisionOutput,
-    prepared: &PreparedBackbone,
-    stages: &mut dyn StageSink,
-) -> Result<Tensor> {
     let text = &cfg.text;
     let (tokens, hidden_size) = (prepared.tokens, text.hidden_size);
 
@@ -168,7 +153,6 @@ pub fn forward_observed(
         &vision.primary,
         false,
     )?;
-    stages.stage("embedded", &hidden)?;
 
     for (index, layer) in weights.text_layers.iter().enumerate() {
         hidden = text_layer(ctx, cfg, arena, layer, &hidden, prepared, tokens)?;
@@ -178,7 +162,6 @@ pub fn forward_observed(
         if let Some(deepstack) = vision.deepstack.get(index) {
             native::scatter_rows(ctx, &hidden, &prepared.image_indices, deepstack, true)?;
         }
-        stages.stage(&format!("text_layer_{index:02}"), &hidden)?;
     }
     Ok(hidden)
 }
@@ -306,24 +289,11 @@ pub fn forward_adapter(
     arena: &HipArena,
     hidden: &Tensor,
 ) -> Result<Tensor> {
-    forward_adapter_observed(ctx, cfg, weights, arena, hidden, &mut NoStages)
-}
-
-/// [`forward_adapter`], reporting each block's output to `stages`.
-pub fn forward_adapter_observed(
-    ctx: &HipContext,
-    cfg: &Gr00tConfig,
-    weights: &HipGr00tWeights,
-    arena: &HipArena,
-    hidden: &Tensor,
-    stages: &mut dyn StageSink,
-) -> Result<Tensor> {
     let dims = hidden.shape().dims().to_vec();
     let mut current = match &weights.backbone_layer_norm {
         Some(norm) => {
             let out = arena.tensor(dims.clone(), DType::BF16)?;
             layer_norm_into(ctx, norm, hidden, ADAPTER_EPS, &out)?;
-            stages.stage("vlln", &out)?;
             out
         }
         None => hidden.clone(),
@@ -343,7 +313,6 @@ pub fn forward_adapter_observed(
             vl.num_attention_heads,
             vl.attention_head_dim,
         )?;
-        stages.stage(&format!("vl_self_attention_{index}"), &current)?;
     }
     Ok(current)
 }

@@ -16,10 +16,8 @@ use apxinf_core::{DType, Error, Result, Tensor};
 use apxinf_hip::graph::HipGraph;
 use apxinf_hip::native::{self, HipArena};
 
-use crate::hip_gr00t::model::blocks::action_head::DitRowIndices;
-use crate::hip_gr00t::model::blocks::backbone::PreparedBackbone;
-use crate::hip_gr00t::model::blocks::vision::PreparedVision;
-use crate::hip_gr00t::model::HipGr00tModel;
+use crate::hip_gr00t::model::blocks::PreparedBlocks;
+use crate::hip_gr00t::model::ModelVariant;
 use crate::hip_gr00t::weights::Embodiment;
 use crate::vla::{Action, ExecutionMode, ExecutionPolicy, InferenceSpec, PreparationStatus, PreparedInference, VlaRequest};
 
@@ -28,7 +26,7 @@ use super::runner::{Inputs, PlanKey};
 /// One fully bound plan: fixed device inputs, the per-shape host preparation,
 /// the selected embodiment, and the activation arena.
 pub struct HipGr00tPrepared {
-    pub(super) model: Rc<HipGr00tModel>,
+    pub(super) model: Rc<ModelVariant>,
     pub(super) key: PlanKey,
     /// Derived for the trait's benefit; [`PlanKey`] is what `run` checks.
     spec: InferenceSpec,
@@ -36,16 +34,11 @@ pub struct HipGr00tPrepared {
     pixel_values: Tensor,
     state: Tensor,
     noise: Tensor,
-    vision_plan: PreparedVision,
-    backbone_plan: PreparedBackbone,
-    /// The DiT's cross-attention row groups, uploaded once.
-    ///
-    /// These are a function of the plan key, so building them here rather than
-    /// in the forward path keeps the forward free of device allocations and
-    /// host-to-device copies -- the two things that would make it
-    /// uncapturable, and two allocations plus two copies per inference either
-    /// way.
-    rows: DitRowIndices,
+    /// Everything shape-bound the forward needs: interpolated vision
+    /// positions, mRoPE positions, token and image-row tables, and the DiT
+    /// cross-attention row groups. An opaque handle here -- the runner never
+    /// reaches the block internals.
+    blocks: PreparedBlocks,
     embodiment: Rc<Embodiment>,
     /// The forward, captured as one launch, and the output tensor it writes.
     ///
@@ -71,12 +64,13 @@ impl HipGr00tPrepared {
     /// Build and bind a plan, then warm it up and capture it if the policy
     /// asks. The warmup inputs are the caller's representative request.
     pub(super) fn new(
-        model: Rc<HipGr00tModel>,
+        model: Rc<ModelVariant>,
         key: PlanKey,
         inputs: &Inputs,
+        embodiment: Rc<Embodiment>,
         policy: ExecutionPolicy,
     ) -> Result<Self> {
-        let mut prepared = Self::allocate(model, key, &inputs.token_ids)?;
+        let mut prepared = Self::allocate(model, key, &inputs.token_ids, embodiment)?;
 
         // Warm up eagerly, whatever the policy: this run performs the
         // libraries' first-touch work for this shape and checks the forward
@@ -112,7 +106,12 @@ impl HipGr00tPrepared {
         Ok(prepared)
     }
 
-    fn allocate(model: Rc<HipGr00tModel>, key: PlanKey, token_ids: &[u32]) -> Result<Self> {
+    fn allocate(
+        model: Rc<ModelVariant>,
+        key: PlanKey,
+        token_ids: &[u32],
+        embodiment: Rc<Embodiment>,
+    ) -> Result<Self> {
         let config = model.config();
         let backbone = model.backbone_config();
         let ctx = model.context();
@@ -123,17 +122,20 @@ impl HipGr00tPrepared {
         for index in key.groups.non_image.iter().chain(&key.groups.image) {
             attention_mask[*index] = 1;
         }
-        let (vision_plan, backbone_plan) =
+        let blocks =
             model.prepare_shape(key.patches, &key.grid, token_ids, &attention_mask)?;
-        let embodiment = model.embodiment(key.embodiment_id)?;
 
         let patch_width = backbone.vision.in_channels
             * backbone.vision.temporal_patch_size
             * backbone.vision.patch_size
             * backbone.vision.patch_size;
         let zeros = |dims: Vec<usize>| ctx.to_device(&Tensor::zeros(dims, DType::BF16));
-        let arena = HipArena::new(ctx, model.arena_bytes(key.patches, key.token_count))?;
-        let rows = DitRowIndices::new(ctx, &key.groups.non_image, &key.groups.image)?;
+        let arena = HipArena::new(
+            ctx,
+            model
+                .workspace_requirements(key.patches, key.token_count)?
+                .arena_bytes,
+        )?;
         Ok(Self {
             spec: InferenceSpec {
                 token_count: key.token_count,
@@ -145,9 +147,7 @@ impl HipGr00tPrepared {
             model,
             key,
             arena,
-            vision_plan,
-            backbone_plan,
-            rows,
+            blocks,
             embodiment,
             graph: RefCell::new(None),
             fallback_reason: None,
@@ -169,7 +169,7 @@ impl HipGr00tPrepared {
         native::upload(ctx, &inputs.pixel_values, &self.pixel_values)?;
         native::upload(ctx, &inputs.state, &self.state)?;
         native::upload(ctx, &inputs.noise, &self.noise)?;
-        self.backbone_plan.refill_tokens(&inputs.token_ids)?;
+        self.blocks.refill_tokens(&inputs.token_ids)?;
         self.arena.reset();
 
         if let Some((graph, output)) = self.graph.borrow().as_ref() {
@@ -183,10 +183,8 @@ impl HipGr00tPrepared {
             &self.pixel_values,
             &self.state,
             &self.noise,
-            &self.vision_plan,
-            &self.backbone_plan,
+            &self.blocks,
             &self.embodiment,
-            &self.rows,
         )?;
         Ok(Action::new(actions))
     }
@@ -217,10 +215,8 @@ impl HipGr00tPrepared {
                     &self.pixel_values,
                     &self.state,
                     &self.noise,
-                    &self.vision_plan,
-                    &self.backbone_plan,
+                    &self.blocks,
                     &self.embodiment,
-                    &self.rows,
                 )
             })
         }?;
@@ -242,7 +238,7 @@ impl HipGr00tPrepared {
 
     /// High-water mark of the activation arena, and its capacity.
     ///
-    /// `HipGr00tModel::arena_bytes` is an audited bound rather than an
+    /// The blocks' `workspace_requirements` is an audited bound rather than an
     /// estimate; exposing both lets a test assert it stays above the real
     /// peak as the forward path changes.
     pub fn arena_usage(&self) -> (usize, usize) {

@@ -13,6 +13,8 @@
 //! blocks keep separate projections: their Q reads the 1536-wide state while
 //! K and V read the 2048-wide backbone rows, so they cannot share a GEMM.
 
+use std::sync::OnceLock;
+
 use apxinf_core::{Device, DType, Error, Result, Shape, Tensor};
 use apxinf_hip::HipContext;
 
@@ -311,6 +313,32 @@ fn dit_block(block: &host_action::Gr00tDitBlockWeights, ctx: &HipContext) -> Res
     })
 }
 
+/// Whether a self-attending DiT block's q/k/v is packed into one `[k, 3n]`
+/// matrix, selected by `APXINF_GR00T_QKV` (`fused` by default, `serial` for
+/// the rollback path and the A/B baseline). Resolved once per process: the
+/// packing decides which kernels the forward runs, so it must not change
+/// between the eager check run and the graph captured from it.
+fn fused_qkv_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("APXINF_GR00T_QKV")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "serial" => false,
+            "" | "fused" | "pack" | "packed" => true,
+            other => {
+                eprintln!(
+                    "apxinf: APXINF_GR00T_QKV={other} is not serial or fused; using fused"
+                );
+                true
+            }
+        }
+    })
+}
+
 /// Concatenate a DiT block's q/k/v weights along the output dimension.
 ///
 /// Only self-attending blocks qualify: a cross-attending block projects K/V
@@ -322,7 +350,7 @@ fn fused_qkv(
     block: &host_action::Gr00tDitBlockWeights,
     ctx: &HipContext,
 ) -> Result<Option<Linear>> {
-    if crate::hip_gr00t::model::blocks::qkv::mode() != crate::hip_gr00t::model::blocks::qkv::QkvMode::Fused {
+    if !fused_qkv_enabled() {
         return Ok(None);
     }
     let (q, k, v) = (
@@ -413,6 +441,64 @@ pub fn select_embodiment(
         action_decoder_in: category(&action.action_decoder.input, id, ctx)?,
         action_decoder_out: category(&action.action_decoder.output, id, ctx)?,
     })
+}
+
+/// The only part of the host checkpoint that must outlive upload: the seven
+/// `[embodiment, ...]` category tensors, from which one embodiment's adapters
+/// are selected and uploaded on demand.
+///
+/// Everything else the host reader produced is dropped once the device
+/// weights exist -- on gfx1151 host RAM *is* device DRAM, so retaining
+/// already-uploaded host copies would be a real memory cost, not bookkeeping.
+pub struct EmbodimentSource {
+    state_encoder: host_action::Gr00tCategoryMlpWeights,
+    action_encoder_input: host_action::Gr00tCategoryLinearWeights,
+    action_encoder_time: host_action::Gr00tCategoryLinearWeights,
+    action_encoder_output: host_action::Gr00tCategoryLinearWeights,
+    action_decoder: host_action::Gr00tCategoryMlpWeights,
+}
+
+impl EmbodimentSource {
+    /// Split the category tensors out of the host action-head weights;
+    /// `from_checkpoint` consumes the rest and the remainder of `host` is
+    /// dropped by the caller after upload.
+    pub fn take(host: &mut Gr00tWeights) -> Self {
+        let action = &mut host.action_head;
+        let take_linear = |slot: &mut host_action::Gr00tCategoryLinearWeights| host_action::Gr00tCategoryLinearWeights {
+            weight: std::mem::replace(&mut slot.weight, Tensor::zeros(vec![0, 0], DType::BF16)),
+            bias: std::mem::replace(&mut slot.bias, Tensor::zeros(vec![0, 0], DType::BF16)),
+        };
+        let take_mlp = |slot: &mut host_action::Gr00tCategoryMlpWeights| host_action::Gr00tCategoryMlpWeights {
+            input: take_linear(&mut slot.input),
+            output: take_linear(&mut slot.output),
+        };
+        Self {
+            state_encoder: take_mlp(&mut action.state_encoder),
+            action_encoder_input: take_linear(&mut action.action_encoder_input),
+            action_encoder_time: take_linear(&mut action.action_encoder_time),
+            action_encoder_output: take_linear(&mut action.action_encoder_output),
+            action_decoder: take_mlp(&mut action.action_decoder),
+        }
+    }
+
+    /// The requested embodiment's adapters, uploaded on demand.
+    pub fn select(&self, id: usize, config: &Gr00tConfig, ctx: &HipContext) -> Result<Embodiment> {
+        if id >= config.max_num_embodiments {
+            return Err(Error::Other(format!(
+                "GR00T embodiment {id} is outside 0..{}",
+                config.max_num_embodiments
+            )));
+        }
+        Ok(Embodiment {
+            state_encoder_in: category(&self.state_encoder.input, id, ctx)?,
+            state_encoder_out: category(&self.state_encoder.output, id, ctx)?,
+            action_encoder_in: category(&self.action_encoder_input, id, ctx)?,
+            action_encoder_time: category(&self.action_encoder_time, id, ctx)?,
+            action_encoder_out: category(&self.action_encoder_output, id, ctx)?,
+            action_decoder_in: category(&self.action_decoder.input, id, ctx)?,
+            action_decoder_out: category(&self.action_decoder.output, id, ctx)?,
+        })
+    }
 }
 
 /// One embodiment's slice of a `[embodiment, in, out]` weight and

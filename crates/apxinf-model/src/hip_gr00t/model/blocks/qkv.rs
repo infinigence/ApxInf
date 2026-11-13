@@ -1,5 +1,4 @@
-//! How a DiT block's self-attention q/k/v is projected, selected by
-//! `APXINF_GR00T_QKV`.
+//! How a DiT block's self-attention q/k/v is projected.
 //!
 //! `fused` (the default) concatenates the three weight matrices along N at
 //! load time so one GEMM produces `[tokens, 3 * width]`, and attention reads
@@ -13,23 +12,20 @@
 //! context stream. It stays selectable as the rollback path and as the
 //! baseline for A/B measurement.
 //!
+//! The layout is chosen at upload time by `APXINF_GR00T_QKV`
+//! (weights/bf16.rs); this forward dispatches on which layout the weights
+//! actually carry, so the compute path can never disagree with what was
+//! packed -- captured and eager runs see the same weights.
+//!
 //! Only self-attending DiT blocks use this. Cross-attending blocks take their
 //! K and V from `CrossAttentionCache`, so they project Q alone and have no
 //! independent work to fuse.
 
-use std::sync::OnceLock;
-
-use apxinf_core::{DType, Error, Result, Tensor};
+use apxinf_core::{DType, Result, Tensor};
 use apxinf_hip::native::{self, Activation, HipArena};
 use apxinf_hip::HipContext;
 
 use crate::hip_gr00t::weights::{DitBlock, Linear};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QkvMode {
-    Fused,
-    Serial,
-}
 
 /// How a self-attending block's projection came out, and what attention
 /// consumes.
@@ -42,30 +38,6 @@ pub enum QkvProjection {
     /// `native::attention_qkv_packed`; the split kernel that would copy them
     /// out is what the fused mode no longer has.
     Packed(Tensor),
-}
-
-/// The mode for this process. Resolved once: a plan and every run it serves
-/// must agree on the shape of the forward, or a captured graph would replay a
-/// different set of kernels than the eager run it was checked against.
-pub fn mode() -> QkvMode {
-    static MODE: OnceLock<QkvMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        match std::env::var("APXINF_GR00T_QKV")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "serial" => QkvMode::Serial,
-            "" | "fused" | "pack" | "packed" => QkvMode::Fused,
-            other => {
-                eprintln!(
-                    "apxinf: APXINF_GR00T_QKV={other} is not serial or fused; using fused"
-                );
-                QkvMode::Fused
-            }
-        }
-    })
 }
 
 fn project_one(
@@ -106,20 +78,17 @@ pub fn project_qkv(
     heads: usize,
     head_dim: usize,
 ) -> Result<QkvProjection> {
-    match mode() {
-        QkvMode::Serial => Ok(QkvProjection::Separate(
+    // The uploaded weights carry the layout `APXINF_GR00T_QKV` chose at load
+    // time: packed when fused (the default), three separate projections when
+    // serial. Dispatching here on what the weights hold keeps the forward and
+    // the packing from ever disagreeing.
+    match block.qkv_fused.as_ref() {
+        None => Ok(QkvProjection::Separate(
             project_one(ctx, arena, &block.q, normalized, tokens, width, heads, head_dim)?,
             project_one(ctx, arena, &block.k, normalized, tokens, width, heads, head_dim)?,
             project_one(ctx, arena, &block.v, normalized, tokens, width, heads, head_dim)?,
         )),
-        QkvMode::Fused => {
-            let packed = block.qkv_fused.as_ref().ok_or_else(|| {
-                Error::Other(
-                    "apxinf: fused q/k/v needs packed weights, but this DiT block \
-                     has projections with different input widths"
-                        .into(),
-                )
-            })?;
+        Some(packed) => {
             let fused = arena.tensor(vec![tokens, 3 * width], DType::BF16)?;
             native::gemm_bias_activation(
                 ctx,

@@ -22,7 +22,8 @@ use apxinf_core::{Device, Result, Tensor};
 use half::bf16;
 
 use crate::hip_gr00t::model::token_groups::{build_backbone_token_groups, Gr00tBackboneTokenGroups};
-use crate::hip_gr00t::model::HipGr00tModel;
+use crate::hip_gr00t::model::ModelVariant;
+use crate::hip_gr00t::weights::Embodiment;
 use crate::vla::{
     Action, ExecutionPolicy, InferenceSpec, InitialLatent,
     PreparedInference, VisionObservation, VlaContract, VlaRequest, VlaRuntime,
@@ -48,21 +49,39 @@ pub(in crate::hip_gr00t::model_runner) struct PlanKey {
 }
 
 pub struct HipGr00tRunner {
-    model: Rc<HipGr00tModel>,
+    model: Rc<ModelVariant>,
     /// The implicit plan `infer` keeps, for the most recent key only: an arena
     /// is large, so a replacement is built after the old one is gone.
     prepared: RefCell<Option<(PlanKey, Rc<HipGr00tPrepared>)>>,
+    /// The selected embodiment's adapters. Cache policy is a runner concern
+    /// (the model owns no request state): one deployment uses one embodiment,
+    /// so this is normally a single upload, and a request that switches
+    /// embodiment uploads the new set and drops the old one's allocations.
+    embodiment: RefCell<Option<(usize, Rc<Embodiment>)>>,
 }
 
 impl HipGr00tRunner {
-    pub fn new(model: Rc<HipGr00tModel>) -> Self {
+    pub fn new(model: Rc<ModelVariant>) -> Self {
         Self {
             model,
             prepared: RefCell::new(None),
+            embodiment: RefCell::new(None),
         }
     }
 
-    pub fn model(&self) -> &Rc<HipGr00tModel> {
+    /// The requested embodiment's adapters, from the runner's cache.
+    fn embodiment(&self, id: usize) -> Result<Rc<Embodiment>> {
+        if let Some((cached, weights)) = self.embodiment.borrow().as_ref() {
+            if *cached == id {
+                return Ok(Rc::clone(weights));
+            }
+        }
+        let weights = Rc::new(self.model.embodiment(id)?);
+        *self.embodiment.borrow_mut() = Some((id, Rc::clone(&weights)));
+        Ok(weights)
+    }
+
+    pub fn model(&self) -> &Rc<ModelVariant> {
         &self.model
     }
 
@@ -86,7 +105,8 @@ impl HipGr00tRunner {
         policy: ExecutionPolicy,
     ) -> Result<HipGr00tPrepared> {
         let (key, inputs) = self.read_request(request)?;
-        HipGr00tPrepared::new(Rc::clone(&self.model), key, &inputs, policy)
+        let embodiment = self.embodiment(key.embodiment_id)?;
+        HipGr00tPrepared::new(Rc::clone(&self.model), key, &inputs, embodiment, policy)
     }
 
     fn read_request(&self, request: &VlaRequest<'_>) -> Result<(PlanKey, Inputs)> {
@@ -99,7 +119,7 @@ impl HipGr00tRunner {
 ///
 /// A free function rather than a method: a prepared plan has to re-derive the
 /// key to check a request against itself, and it holds the model but no runner.
-pub(super) fn read_request(model: &HipGr00tModel, request: &VlaRequest<'_>) -> Result<(PlanKey, Inputs)> {
+pub(super) fn read_request(model: &ModelVariant, request: &VlaRequest<'_>) -> Result<(PlanKey, Inputs)> {
     let observation = request.observation;
     observation.validate()?;
     let config = model.config();

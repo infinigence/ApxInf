@@ -22,7 +22,7 @@ pub mod weights;
 
 pub use config::{Gr00tConfig, Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig};
 pub use load::load_runner;
-pub use model::HipGr00tModel;
+pub use model::{HipGr00tModel, ModelVariant};
 pub use model_runner::HipGr00tRunner;
 
 pub(crate) use load::register_builtin;

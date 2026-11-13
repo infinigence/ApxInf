@@ -12,9 +12,8 @@ use std::sync::Arc;
 use apxinf_core::{Backend, Device, Error, Result};
 use apxinf_hip::{HipBackend, HipContext};
 
-use super::weights::host::Gr00tWeights;
 use super::config::Gr00tConfig;
-use super::model::{self, HipGr00tModel};
+use super::model;
 use super::model_runner::HipGr00tRunner;
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::VlaRuntime;
@@ -72,14 +71,20 @@ pub fn load_runner(
 
     let config = Gr00tConfig::from_json_file(&root.join("config.json"))?;
     model::validate_servable(&config)?;
-    let (backbone_config, weights) =
-        Gr00tWeights::from_safetensors(&config, &backbone_path, root)?;
+    let (backbone_config, mut weights) =
+        super::weights::host::Gr00tWeights::from_safetensors(&config, &backbone_path, root)?;
 
     eprintln!(
         "[apxinf] GR00T N1.7 model_variant=bf16 (hip): {} Qwen layers, {} DiT blocks, {} flow steps",
         config.select_layer, config.diffusion.num_layers, config.num_inference_timesteps
     );
-    let model = HipGr00tModel::new(ctx, config, backbone_config, weights)?;
+    // Build the BF16 blocks, then let the model take the embodiment category
+    // tensors out of the host weights before the rest is dropped: on gfx1151
+    // host RAM is device DRAM, so retained host copies of uploaded tensors
+    // are a real memory cost.
+    let blocks = model::blocks::Bf16Blocks::new(ctx, config, backbone_config, &weights)?;
+    let model = model::build_bf16_model(blocks, &mut weights)?;
+    drop(weights);
     let runner = HipGr00tRunner::new(Rc::new(model));
     debug_assert!(runner.contract().action_shape[1] > 0);
     Ok(runner)

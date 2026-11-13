@@ -21,7 +21,6 @@ use apxinf_hip::native::{self, Activation, AttentionGeometry, HipArena, HipDevic
 use apxinf_hip::HipContext;
 
 use crate::hip_gr00t::config::Qwen3VLConfig;
-use crate::hip_gr00t::model::stages::{NoStages, StageSink};
 use crate::hip_gr00t::weights::{HipGr00tWeights, Merger, Norm, VisionBlock};
 
 /// What the vision tower hands the backbone and the DiT.
@@ -105,21 +104,6 @@ pub fn forward(
     pixel_values: &Tensor,
     prepared: &PreparedVision,
 ) -> Result<VisionOutput> {
-    forward_observed(ctx, cfg, weights, arena, pixel_values, prepared, &mut NoStages)
-}
-
-/// [`forward`], reporting each stage to `stages` for comparison against the
-/// reference dump. Stage names match `step3_vision_stage_reference.py`.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_observed(
-    ctx: &HipContext,
-    cfg: &Qwen3VLConfig,
-    weights: &HipGr00tWeights,
-    arena: &HipArena,
-    pixel_values: &Tensor,
-    prepared: &PreparedVision,
-    stages: &mut dyn StageSink,
-) -> Result<VisionOutput> {
     let vc = &cfg.vision;
     let (hidden, heads, head_dim) = (vc.hidden_size, vc.num_heads, vc.head_dim());
     let merge = vc.spatial_merge_size;
@@ -146,11 +130,9 @@ pub fn forward_observed(
         Activation::None,
         &biased,
     )?;
-    stages.stage("patch_embed", &biased)?;
     x = arena.tensor(vec![patches, hidden], DType::BF16)?;
     // `bias_residual` with no bias is the plain elementwise add.
     native::bias_residual(ctx, &biased, None, &prepared.position_embeddings, &x)?;
-    stages.stage("patch_embed_positioned", &x)?;
 
     let mut deepstack_states: Vec<Tensor> = Vec::with_capacity(3);
     // The next block's norm1, produced by the previous block's tail in the
@@ -175,11 +157,9 @@ pub fn forward_observed(
             head_dim,
             eps,
             index,
-            stages,
         )?;
         x = out;
         prepared_norm1 = norm1;
-        stages.stage(&format!("block_{index:02}"), &x)?;
         if vc.deepstack_visual_indexes.contains(&index) {
             // The merger reads this state after the loop has moved on, so it
             // needs its own buffer rather than an arena slot a later block
@@ -194,16 +174,9 @@ pub fn forward_observed(
     let primary = merge_primary(
         ctx, arena, &weights.merger, &x, patches, hidden, merge, eps,
     )?;
-    stages.stage("primary", &primary)?;
     let mut deepstack = Vec::with_capacity(deepstack_states.len());
-    for (index, (merger, state)) in weights
-        .deepstack_mergers
-        .iter()
-        .zip(&deepstack_states)
-        .enumerate()
-    {
+    for (merger, state) in weights.deepstack_mergers.iter().zip(&deepstack_states) {
         let out = merge_deepstack(ctx, arena, merger, state, patches, hidden, merge, eps)?;
-        stages.stage(&format!("deepstack_out_{index}"), &out)?;
         deepstack.push(out);
     }
     Ok(VisionOutput { primary, deepstack })
@@ -224,7 +197,6 @@ fn vision_block(
     head_dim: usize,
     eps: f32,
     index: usize,
-    stages: &mut dyn StageSink,
 ) -> Result<(Tensor, Option<Tensor>)> {
     // Pre-attention LayerNorm: the previous block's tail computed this one.
     let normed = match prepared_norm1 {
@@ -235,7 +207,6 @@ fn vision_block(
             normed
         }
     };
-    stages.stage(&format!("block_{index:02}_norm1"), &normed)?;
 
     // QKV projection, then split, bias and axial rotation in one kernel --
     // cuda-new's fused vision path. It rounds the biased projection to BF16
@@ -309,7 +280,6 @@ fn vision_block(
         &residual,
         &normed2,
     )?;
-    stages.stage(&format!("block_{index:02}_norm2"), &normed2)?;
 
     // MLP: FC1, bias + GELU (tanh), FC2, then the residual.
     let inner = block.fc1.weight.shape().dims()[1];
