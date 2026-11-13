@@ -268,7 +268,7 @@ impl Blocks for Bf16Blocks {
     }
 
     fn adapter_stage(&self, arena: &HipArena, hidden: &Tensor) -> Result<Tensor> {
-        backbone::forward_adapter(&self.ctx, &self.config, &self.weights, arena, hidden)
+        action_head::forward_adapter(&self.ctx, &self.config, &self.weights, arena, hidden)
     }
 
     fn action_stage(
@@ -319,7 +319,7 @@ impl Blocks for Bf16Blocks {
             &vision_output,
             &blocks.backbone,
         )?;
-        let adapted = backbone::forward_adapter(
+        let adapted = action_head::forward_adapter(
             &self.ctx,
             &self.config,
             &self.weights,

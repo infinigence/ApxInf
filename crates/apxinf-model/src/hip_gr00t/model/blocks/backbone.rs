@@ -11,24 +11,23 @@
 //!
 //! The stack deliberately stops before the language model's final RMSNorm:
 //! GR00T reads `hidden_states[-1]`, which Qwen captures before that norm. The
-//! action head's own LayerNorm comes next, in the adapter.
+//! action head's own LayerNorm comes next, in
+//! [`super::action_head::forward_adapter`].
 
 use std::sync::Arc;
 
 use apxinf_core::{DType, Error, Result, Tensor};
 use apxinf_hip::native::{
-    self, Activation, AttentionGeometry, HipArena, HipDeviceBytes, PreparedRowIndices,
+    self, AttentionGeometry, HipArena, HipDeviceBytes, PreparedRowIndices,
 };
 use apxinf_hip::HipContext;
 
-use crate::hip_gr00t::config::{Gr00tConfig, Qwen3VLConfig};
+use crate::hip_gr00t::config::Qwen3VLConfig;
 use super::vision::VisionOutput;
-use crate::hip_gr00t::weights::{HipGr00tWeights, Norm, TextLayer, VlBlock};
+use crate::hip_gr00t::weights::{HipGr00tWeights, TextLayer};
 
 /// Per-request host work: the mRoPE positions and the row indices the vision
 /// output scatters into, uploaded once.
-/// Every LayerNorm in GR00T's action head, VLLN included.
-const ADAPTER_EPS: f32 = 1e-5;
 
 pub struct PreparedBackbone {
     /// The only per-request value here: two prompts of the same length with
@@ -274,169 +273,6 @@ fn text_layer(
     let out = arena.tensor(vec![tokens, hidden_size], DType::BF16)?;
     native::bias_residual(ctx, &down, None, &residual, &out)?;
     Ok(out)
-}
-
-/// GR00T's VLLN adapter: a LayerNorm over the backbone features, then the
-/// action head's VL self-attention blocks. The reference's
-/// `backbone_features_post_adapter`.
-///
-/// The released LIBERO checkpoint sets `use_vl_self_attention` and ships four
-/// blocks, so this is on the acceptance path, not an optional extra.
-pub fn forward_adapter(
-    ctx: &HipContext,
-    cfg: &Gr00tConfig,
-    weights: &HipGr00tWeights,
-    arena: &HipArena,
-    hidden: &Tensor,
-) -> Result<Tensor> {
-    let dims = hidden.shape().dims().to_vec();
-    let mut current = match &weights.backbone_layer_norm {
-        Some(norm) => {
-            let out = arena.tensor(dims.clone(), DType::BF16)?;
-            layer_norm_into(ctx, norm, hidden, ADAPTER_EPS, &out)?;
-            out
-        }
-        None => hidden.clone(),
-    };
-    if weights.vl_self_attention.is_empty() {
-        return Ok(current);
-    }
-    let vl = cfg.vl_self_attention.as_ref().ok_or(Error::Contract(
-        "GR00T has VL self-attention weights but no config for them",
-    ))?;
-    for (index, block) in weights.vl_self_attention.iter().enumerate() {
-        current = vl_block(
-            ctx,
-            arena,
-            block,
-            &current,
-            vl.num_attention_heads,
-            vl.attention_head_dim,
-        )?;
-    }
-    Ok(current)
-}
-
-/// GR00T's `BasicTransformerBlock`: biased non-causal self-attention, then a
-/// plain (not gated) GELU feed-forward.
-///
-/// `SelfAttentionTransformer` defaults `activation_fn` to
-/// `"gelu-approximate"`, which diffusers' `FeedForward` maps to
-/// `GELU(approximate="tanh")`. The released checkpoint's
-/// `vl_self_attention_cfg` carries no `activation_fn`, so that default stands.
-/// Only the Qwen vision patch merger -- `nn.GELU()` hardcoded in
-/// `transformers` -- wants the exact error function.
-fn vl_block(
-    ctx: &HipContext,
-    arena: &HipArena,
-    block: &VlBlock,
-    input: &Tensor,
-    heads: usize,
-    head_dim: usize,
-) -> Result<Tensor> {
-    let dims = input.shape().dims();
-    let (tokens, width) = (dims[0], dims[1]);
-    if heads * head_dim != width {
-        return Err(Error::Other(format!(
-            "GR00T VL self-attention declares {heads} x {head_dim} but the backbone is {width} wide"
-        )));
-    }
-
-    let normed = arena.tensor(vec![tokens, width], DType::BF16)?;
-    layer_norm_into(ctx, &block.attn_norm, input, ADAPTER_EPS, &normed)?;
-
-    // Q, K and V are separate biased projections here, not one packed matrix.
-    let project = |linear: &crate::hip_gr00t::weights::Linear| -> Result<Tensor> {
-        let biased = arena.tensor(vec![tokens, width], DType::BF16)?;
-        // Fused: where the recipe routes this shape to hipBLASLt, the bias and
-        // activation are applied inside the GEMM epilogue, on the F32 accumulator.
-        // Where it does not, this falls back to exactly the two calls it replaces.
-        native::gemm_bias_activation(
-            ctx,
-            &normed,
-            &linear.weight,
-            linear.bias.as_ref(),
-            Activation::None,
-            &biased,
-        )?;
-        biased.reshape(vec![tokens, heads, head_dim])
-    };
-    let (q, k, v) = (project(&block.q)?, project(&block.k)?, project(&block.v)?);
-
-    let attended = arena.tensor(vec![tokens, heads, head_dim], DType::BF16)?;
-    native::attention(
-        ctx,
-        &q,
-        &k,
-        &v,
-        &AttentionGeometry {
-            batch: 1,
-            q_tokens: tokens,
-            q_heads: heads,
-            kv_heads: heads,
-            head_dim,
-            kv_tokens: tokens,
-            causal_query_start: None,
-        },
-        &attended,
-    )?;
-
-    let projected = arena.tensor(vec![tokens, width], DType::BF16)?;
-    native::gemm(
-        ctx,
-        &attended.reshape(vec![tokens, width])?,
-        &block.output.weight,
-        &projected,
-    )?;
-    let residual = arena.tensor(vec![tokens, width], DType::BF16)?;
-    let ffn_normed = arena.tensor(vec![tokens, width], DType::BF16)?;
-    let ffn_norm_bias = block.ffn_norm.bias.as_ref().ok_or(Error::Contract(
-        "GR00T VL self-attention norm3 needs a bias",
-    ))?;
-    native::bias_residual_layer_norm(
-        ctx,
-        &projected,
-        block.output.bias.as_ref(),
-        input,
-        &block.ffn_norm.weight,
-        ffn_norm_bias,
-        ADAPTER_EPS,
-        &residual,
-        &ffn_normed,
-    )?;
-
-    let inner = block.ffn_in.weight.shape().dims()[1];
-    let activated = arena.tensor(vec![tokens, inner], DType::BF16)?;
-    // Fused: where the recipe routes this shape to hipBLASLt, the bias and
-    // activation are applied inside the GEMM epilogue, on the F32 accumulator.
-    // Where it does not, this falls back to exactly the two calls it replaces.
-    native::gemm_bias_activation(
-        ctx,
-        &ffn_normed,
-        &block.ffn_in.weight,
-        block.ffn_in.bias.as_ref(),
-        Activation::GeluTanh,
-        &activated,
-    )?;
-    let down = arena.tensor(vec![tokens, width], DType::BF16)?;
-    native::gemm(ctx, &activated, &block.ffn_out.weight, &down)?;
-    let out = arena.tensor(vec![tokens, width], DType::BF16)?;
-    native::bias_residual(ctx, &down, block.ffn_out.bias.as_ref(), &residual, &out)?;
-    Ok(out)
-}
-
-fn layer_norm_into(
-    ctx: &HipContext,
-    norm: &Norm,
-    input: &Tensor,
-    eps: f32,
-    out: &Tensor,
-) -> Result<()> {
-    let bias = norm
-        .bias
-        .as_ref()
-        .ok_or(Error::Contract("GR00T adapter LayerNorm needs a bias"))?;
-    native::layer_norm(ctx, input, &norm.weight, bias, eps, out)
 }
 
 /// Qwen3-VL mRoPE positions as `(t, h, w)` per token.
