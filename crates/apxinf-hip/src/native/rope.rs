@@ -6,7 +6,7 @@
 use apxinf_core::{Error, Result, Tensor};
 
 use super::elementwise::HipDeviceBytes;
-use super::{bf16_ptr, int, same_shape};
+use super::{bf16_ptr, int, require_numel, rows_cols, same_shape};
 use crate::ffi::{self, check};
 use crate::runtime::HipContext;
 
@@ -79,6 +79,117 @@ pub fn apply_mrope(
     })
 }
 
+/// Qwen3-VL text QK-norm and mRoPE in one pass -- cuda-new's fused
+/// `rms_norm_apply_mrope_qk`.
+///
+/// `query` and `key` hold flat `[tokens * heads, head_dim]` projections; the
+/// per-head RMSNorm (weight `[head_dim]`, eps) runs first and its result is
+/// rounded to BF16 -- the rounding the separate [`rms_norm`] store performed
+/// -- and then the half-split pairs rotate with the same interleaved-section
+/// layout [`apply_mrope`] uses. `query_out` and `key_out` receive the rotated
+/// values; the result is bit-identical to `rms_norm` followed by
+/// [`apply_mrope`], which is the acceptance contract between the two forms.
+#[allow(clippy::too_many_arguments)]
+pub fn rms_norm_apply_mrope_qk(
+    ctx: &HipContext,
+    query: &Tensor,
+    query_weight: &Tensor,
+    key: &Tensor,
+    key_weight: &Tensor,
+    positions: &HipDeviceBytes,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    theta: f32,
+    sections: [usize; 3],
+    query_out: &Tensor,
+    key_out: &Tensor,
+) -> Result<()> {
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return Err(Error::Contract(
+            "apxinf-hip QK rms+mRoPE: head_dim must be an even, non-zero width",
+        ));
+    }
+    // The three sections share the half-split pairs, so H and W together
+    // cannot claim more than half the head. Same bound apply_mrope enforces.
+    let section_hw = sections[1]
+        .checked_add(sections[2])
+        .ok_or(Error::Contract("apxinf-hip QK rms+mRoPE: section overflow"))?;
+    if section_hw > head_dim / 2 {
+        return Err(Error::Other(format!(
+            "apxinf-hip QK rms+mRoPE: sections h+w {section_hw} exceed head_dim/2 {}",
+            head_dim / 2
+        )));
+    }
+    let (q_rows, cols) = rows_cols(query)?;
+    let (k_rows, k_cols) = rows_cols(key)?;
+    if cols != head_dim || k_cols != head_dim {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[tokens * heads, {head_dim}]"),
+            got: format!("{} columns and {}", cols, k_cols),
+        });
+    }
+    if q_rows % q_heads != 0 || k_rows % kv_heads != 0 {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[{q_heads}]- and [{kv_heads}]-divisible row counts"),
+            got: format!("{q_rows} and {k_rows} rows"),
+        });
+    }
+    let tokens = q_rows / q_heads;
+    if tokens == 0 || k_rows / kv_heads != tokens {
+        return Err(Error::ShapeMismatch {
+            expected: format!("the same token count, {tokens}"),
+            got: format!("{} q rows, {} k rows", q_rows / q_heads, k_rows / kv_heads),
+        });
+    }
+    for (weight, what) in [(query_weight, "query"), (key_weight, "key")] {
+        require_numel(weight, head_dim, || format!("[{head_dim}] {what} norm weight"))?;
+    }
+    require_numel(query_out, q_rows * head_dim, || format!("[{tokens}, {q_heads}, {head_dim}]"))?;
+    require_numel(key_out, k_rows * head_dim, || {
+        format!("[{tokens}, {kv_heads}, {head_dim}]")
+    })?;
+    let needed = tokens
+        .checked_mul(3)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or(Error::Contract("apxinf-hip QK rms+mRoPE: position size overflow"))?;
+    if positions.len() < needed {
+        return Err(Error::DataLengthMismatch {
+            expected: needed,
+            got: positions.len(),
+        });
+    }
+    let (pq, pqw, pk, pkw, po, pok) = (
+        bf16_ptr(ctx, query)?,
+        bf16_ptr(ctx, query_weight)?,
+        bf16_ptr(ctx, key)?,
+        bf16_ptr(ctx, key_weight)?,
+        bf16_ptr(ctx, query_out)?,
+        bf16_ptr(ctx, key_out)?,
+    );
+    check("rms_norm_apply_mrope_qk", unsafe {
+        ffi::apxinf_hip_native_rms_norm_apply_mrope_qk(
+            pq.cast_const(),
+            pqw.cast_const(),
+            po,
+            pk.cast_const(),
+            pkw.cast_const(),
+            pok,
+            positions.ptr(),
+            int(tokens)?,
+            int(q_heads)?,
+            int(kv_heads)?,
+            int(head_dim)?,
+            eps,
+            theta,
+            int(sections[1])?,
+            int(sections[2])?,
+            ctx.stream(),
+        )
+    })
+}
+
 /// Qwen3-VL vision-tower 2D RoPE over a `[tokens, heads, head_dim]` BF16
 /// tensor.
 ///
@@ -86,9 +197,10 @@ pub fn apply_mrope(
 /// first `head_dim/4` half-split pairs rotate by the height position and the
 /// rest by the width one. `out` may alias `input`.
 ///
-/// Pair this with [`super::split_qkv_bias`] to reproduce cuda-new's fused
-/// `split_qkv_axial_rope`: that kernel rounds the biased projection to BF16
-/// before rotating, which is exactly what the split writes out.
+/// The tower's QKV path runs the fused [`super::split_qkv_axial_rope`]; this
+/// rotation-only op is that fusion's acceptance reference: paired with
+/// [`super::split_qkv_bias`] it reproduces the fused kernel bit for bit,
+/// because both round the biased projection to BF16 before rotating.
 pub fn apply_vision_2d(
     ctx: &HipContext,
     input: &Tensor,

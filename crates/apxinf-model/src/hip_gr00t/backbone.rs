@@ -209,28 +209,32 @@ fn text_layer(
     native::gemm(ctx, &normed, &layer.k.weight, &k)?;
     native::gemm(ctx, &normed, &layer.v.weight, &v)?;
 
-    let per_head = |tensor: &Tensor, count: usize| tensor.reshape(vec![tokens * count, head_dim]);
-    let q_normed = arena.tensor(vec![tokens * heads, head_dim], DType::BF16)?;
-    let k_normed = arena.tensor(vec![tokens * kv_heads, head_dim], DType::BF16)?;
-    native::rms_norm(ctx, &per_head(&q, heads)?, &layer.q_norm, eps, &q_normed)?;
-    native::rms_norm(ctx, &per_head(&k, kv_heads)?, &layer.k_norm, eps, &k_normed)?;
-
-    let q_heads = q_normed.reshape(vec![tokens, heads, head_dim])?;
-    let k_heads = k_normed.reshape(vec![tokens, kv_heads, head_dim])?;
-    let rope = |tensor: &Tensor, count: usize| {
-        native::apply_mrope(
-            ctx,
-            tensor,
-            &prepared.positions,
-            count,
-            head_dim,
-            text.rope_theta,
-            text.mrope_section,
-            tensor,
-        )
-    };
-    rope(&q_heads, heads)?;
-    rope(&k_heads, kv_heads)?;
+    // Q/K are separate projections without bias, and each is RMS-normalized
+    // per head before the rotation -- Qwen3's QK-norm -- with the rotation in
+    // the same kernel: cuda-new's fused rms_norm_apply_mrope_qk. The norm
+    // rounds its head to BF16 before rotating, exactly the rounding the
+    // separate rms_norm store performed, so the rotated values are
+    // bit-identical to the two-kernel sequence.
+    let q_rotated = arena.tensor(vec![tokens, heads, head_dim], DType::BF16)?;
+    let k_rotated = arena.tensor(vec![tokens, kv_heads, head_dim], DType::BF16)?;
+    native::rms_norm_apply_mrope_qk(
+        ctx,
+        &q.reshape(vec![tokens * heads, head_dim])?,
+        &layer.q_norm,
+        &k.reshape(vec![tokens * kv_heads, head_dim])?,
+        &layer.k_norm,
+        &prepared.positions,
+        heads,
+        kv_heads,
+        head_dim,
+        eps,
+        text.rope_theta,
+        text.mrope_section,
+        &q_rotated,
+        &k_rotated,
+    )?;
+    let q_heads = q_rotated;
+    let k_heads = k_rotated;
 
     // Causal prefill: query row `i` sees keys `[0, i]`.
     let attended = arena.tensor(vec![tokens, heads, head_dim], DType::BF16)?;

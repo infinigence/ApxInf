@@ -87,6 +87,59 @@ __global__ void rms_norm_kernel(const T* x, const T* weight, T* y, int64_t cols,
   }
 }
 
+// Vectorized BF16 RMSNorm: uint4 loads with a contiguous 8-per-thread
+// mapping (one slice = 256 threads x 8 = 2048 columns, S = ceil(cols/2048)),
+// the row register-resident so the input is read once instead of twice and
+// the loads are one instruction per 8 elements. The product expression
+// (v * inverse_rms) * weight and the single rounding are unchanged; the
+// reduction partitioning differs from the 256-wide tree, so inverse_rms can
+// differ by 1 ulp (the norm.hip vec kernels' precedent). Gated on
+// cols % 8 == 0, cols <= 8192 and 16-byte alignment; RmsNormLaunch routes
+// everything else back to the templated scalar kernel.
+template <int S>
+__global__ void rms_norm_vec_kernel(const uint16_t* x, const uint16_t* weight, uint16_t* y,
+                                    int64_t cols, float eps) {
+  __shared__ float scratch[kReduceBlock];
+  const int64_t base = static_cast<int64_t>(blockIdx.x) * cols;
+  float cache[S][8];
+  float square_sum = 0.0f;
+#pragma unroll
+  for (int s = 0; s < S; ++s) {
+    const int64_t v0 = static_cast<int64_t>(threadIdx.x) * 8 + s * 2048;
+    if (v0 < cols) {
+      const uint4 raw = *reinterpret_cast<const uint4*>(x + base + v0);
+      const uint32_t w[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float v = bf16_to_f32(static_cast<uint16_t>(w[j >> 1] >> ((j & 1) * 16)));
+        cache[s][j] = v;
+        square_sum += v * v;
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) cache[s][j] = 0.0f;
+    }
+  }
+  const float inverse_rms =
+      rsqrtf(block_sum(square_sum, scratch) / static_cast<float>(cols) + eps);
+#pragma unroll
+  for (int s = 0; s < S; ++s) {
+    const int64_t v0 = static_cast<int64_t>(threadIdx.x) * 8 + s * 2048;
+    if (v0 < cols) {
+      const uint4 raww = *reinterpret_cast<const uint4*>(weight + v0);
+      const uint32_t ww[4] = {raww.x, raww.y, raww.z, raww.w};
+      uint32_t r[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float wv = bf16_to_f32(static_cast<uint16_t>(ww[j >> 1] >> ((j & 1) * 16)));
+        r[j >> 1] |=
+            static_cast<uint32_t>(f32_to_bf16(cache[s][j] * inverse_rms * wv)) << ((j & 1) * 16);
+      }
+      *reinterpret_cast<uint4*>(y + base + v0) = uint4{r[0], r[1], r[2], r[3]};
+    }
+  }
+}
+
 // ── RoPE (half-split) ───────────────────────────────────────────────
 
 // Input [seq, heads, head_dim]. Pairs (p, p + head_dim/2), position
@@ -268,6 +321,48 @@ template <typename T>
 struct RmsNormLaunch {
   static int run(const void* x, const void* w, void* y, int64_t rows, int64_t cols, float eps,
                  void* stream) {
+    // BF16 rows that fit the vec kernel's 4-slice bound take the vectorized
+    // path; everything else (other dtypes, odd or wide columns, misaligned
+    // tensors) keeps the templated scalar kernel.
+    if constexpr (sizeof(T) == 2) {
+      const bool aligned = [](std::initializer_list<const void*> ps) {
+        for (const void* p : ps) {
+          if (p == nullptr || (reinterpret_cast<uintptr_t>(p) & 0xf) != 0) return false;
+        }
+        return true;
+      }({x, w, y});
+      if (aligned && cols > 0 && cols <= 8192 && cols % 8 == 0) {
+        const int slices = static_cast<int>((cols + 2047) / 2048);
+        switch (slices) {
+          case 1:
+            rms_norm_vec_kernel<1><<<static_cast<unsigned>(rows), kReduceBlock, 0,
+                                    as_stream(stream)>>>(static_cast<const uint16_t*>(x),
+                                                         static_cast<const uint16_t*>(w),
+                                                         static_cast<uint16_t*>(y), cols, eps);
+            return last_launch_status();
+          case 2:
+            rms_norm_vec_kernel<2><<<static_cast<unsigned>(rows), kReduceBlock, 0,
+                                    as_stream(stream)>>>(static_cast<const uint16_t*>(x),
+                                                         static_cast<const uint16_t*>(w),
+                                                         static_cast<uint16_t*>(y), cols, eps);
+            return last_launch_status();
+          case 3:
+            rms_norm_vec_kernel<3><<<static_cast<unsigned>(rows), kReduceBlock, 0,
+                                    as_stream(stream)>>>(static_cast<const uint16_t*>(x),
+                                                         static_cast<const uint16_t*>(w),
+                                                         static_cast<uint16_t*>(y), cols, eps);
+            return last_launch_status();
+          case 4:
+            rms_norm_vec_kernel<4><<<static_cast<unsigned>(rows), kReduceBlock, 0,
+                                    as_stream(stream)>>>(static_cast<const uint16_t*>(x),
+                                                         static_cast<const uint16_t*>(w),
+                                                         static_cast<uint16_t*>(y), cols, eps);
+            return last_launch_status();
+          default:
+            break;
+        }
+      }
+    }
     rms_norm_kernel<T><<<static_cast<unsigned>(rows), kReduceBlock, 0, as_stream(stream)>>>(
         static_cast<const T*>(x), static_cast<const T*>(w), static_cast<T*>(y), cols, eps);
     return last_launch_status();
@@ -753,7 +848,7 @@ extern "C" int apxinf_hip_library_versions(int* rocm, int* blaslt) {
   return kInvalidArgument;
 }
 extern "C" int apxinf_hip_gemm_lt(void*, int, int, int, int, const void*, const void*,
-                                  void*) {
+                                  void*, int, const void*) {
   return kInvalidArgument;
 }
 
@@ -843,7 +938,7 @@ extern "C" int apxinf_hip_graph_destroy(void* exec) {
 extern "C" int apxinf_hip_ck_attention_supported(int, int, int, int, int) { return 0; }
 extern "C" int apxinf_hip_ck_attention(int, const void*, const void*, const void*, void*,
                                        int, int, int, int, int, int, long long, long long,
-                                       float, int, void*) {
+                                       long long, float, int, void*) {
   return kInvalidArgument;
 }
 

@@ -357,6 +357,218 @@ fn ck_attention_matches_the_apxinf_kernel_where_it_is_available() {
     );
 }
 
+/// A packed q/k/v projection must feed attention exactly the values the split
+/// tensors do, bit for bit. The fused DiT path skips the split kernel, so
+/// this equality is its whole numerical contract. Both calls share a geometry
+/// and therefore a provider, so the comparison isolates the strided reads.
+#[test]
+fn packed_qkv_attention_matches_split_tensors_exactly() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // DiT self-attention's shape, a batched case that exercises the derived q
+    // and kv batch strides as well as the token strides, and a causal case:
+    // a mask applied to a strided read is the error a plain-value comparison
+    // would catch last.
+    let cases = [
+        (1usize, 41usize, 32usize, 48usize, None, "DiT self"),
+        (2, 37, 8, 64, None, "batched"),
+        (1, 41, 32, 48, Some(0), "DiT self, causal"),
+    ];
+    for (batch, tokens, heads, head_dim, causal, name) in cases {
+        let width = heads * head_dim;
+        let rows = batch * tokens;
+        let (packed, packed_host) = input(&ctx, &[rows, 3 * width], 7 + head_dim as u64, 1.0);
+        // The same values, as the three separate tensors a split would have
+        // produced.
+        fn section_of(packed: &[f32], first: usize, rows: usize, width: usize) -> Vec<bf16> {
+            (0..rows)
+                .flat_map(|row| {
+                    (0..width).map(move |col| {
+                        bf16::from_f32(packed[row * 3 * width + first * width + col])
+                    })
+                })
+                .collect()
+        }
+        let to_device =
+            |v: Vec<bf16>| ctx.to_device(&Tensor::from_bf16(vec![rows, width], &v).unwrap()).unwrap();
+        let q = to_device(section_of(&packed_host, 0, rows, width));
+        let k = to_device(section_of(&packed_host, 1, rows, width));
+        let v = to_device(section_of(&packed_host, 2, rows, width));
+
+        let geometry = AttentionGeometry {
+            batch,
+            q_tokens: tokens,
+            q_heads: heads,
+            kv_heads: heads,
+            head_dim,
+            kv_tokens: tokens,
+            causal_query_start: causal,
+        };
+        let dims = vec![batch, tokens, heads, head_dim];
+        let out_packed = arena.tensor(dims.clone(), DType::BF16).unwrap();
+        let out_split = arena.tensor(dims, DType::BF16).unwrap();
+        native::attention_qkv_packed(&ctx, &packed, width, width, &geometry, &out_packed).unwrap();
+        native::attention(&ctx, &q, &k, &v, &geometry, &out_split).unwrap();
+        assert_eq!(
+            host(&ctx, &out_packed),
+            host(&ctx, &out_split),
+            "{name}: reading the packed sections in place changed the result"
+        );
+    }
+}
+
+/// The fused vision split + axial rotation must produce exactly the values
+/// the three-kernel sequence produces: the kernel rounds the biased
+/// projection to BF16 before rotating, the rounding `split_qkv_bias`
+/// performs when it writes q, k and v out. Bit equality is the fused path's
+/// whole numerical contract -- the vision tower switched to it wholesale.
+#[test]
+fn split_qkv_axial_rope_matches_split_then_rotate_exactly() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // The tower's own shape, and a small case with a different head count, an
+    // odd token count and no bias, so the null-bias branch is covered too.
+    let cases = [
+        (512usize, 16usize, 64usize, true, "vision tower"),
+        (7, 5, 12, false, "small, no bias"),
+    ];
+    for (tokens, heads, head_dim, with_bias, name) in cases {
+        let width = heads * head_dim;
+        let (qkv, _) = input(&ctx, &[tokens, 3 * width], 41 + head_dim as u64, 1.0);
+        let bias = if with_bias {
+            Some(input(&ctx, &[3 * width], 43, 0.5).0)
+        } else {
+            None
+        };
+        // (h, w) ids in the spirit of compute_vision_pos_ids; any distinct
+        // pairs serve, since both arms read the same table.
+        let ids: Vec<u32> = (0..tokens)
+            .flat_map(|t| [(t % 23) as u32, (t / 23 % 19) as u32])
+            .collect();
+        let positions = HipDeviceBytes::new(&ctx, ids.len() * std::mem::size_of::<u32>()).unwrap();
+        positions.upload_u32(&ids).unwrap();
+
+        let head_shape = || vec![tokens, heads, head_dim];
+        let (q0, k0, v0) = (
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+        );
+        // The sequence the tower ran before the fusion, rotating q and k in
+        // place exactly as vision.rs called it.
+        native::split_qkv_bias(&ctx, &qkv, bias.as_ref(), &q0, &k0, &v0).unwrap();
+        native::apply_vision_2d(&ctx, &q0, &positions, heads, head_dim, 10_000.0, &q0).unwrap();
+        native::apply_vision_2d(&ctx, &k0, &positions, heads, head_dim, 10_000.0, &k0).unwrap();
+
+        // The fused kernel, into fresh buffers so a stray write cannot pass.
+        let (q1, k1, v1) = (
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+        );
+        native::split_qkv_axial_rope(
+            &ctx, &qkv, bias.as_ref(), &positions, heads, head_dim, 10_000.0, &q1, &k1, &v1,
+        )
+        .unwrap();
+
+        for (split, fused, what) in [(&q0, &q1, "q"), (&k0, &k1, "k"), (&v0, &v1, "v")] {
+            assert_eq!(
+                host(&ctx, split),
+                host(&ctx, fused),
+                "{name}: fused {what} differs from split + rotate"
+            );
+        }
+    }
+}
+
+/// The fused text QK RMSNorm + mRoPE must produce the values the two-kernel
+/// sequence produces: the fused kernel rounds the normalized head to BF16
+/// before rotating, the rounding `rms_norm`'s store performed. The two arms
+/// now differ only by reduction partitioning (the warp-per-head fused kernel
+/// and the vectorized `rms_norm` each sum a row in a different lane order),
+/// which moves individual outputs by at most a BF16 ulp -- the same tolerance
+/// every other norm kernel's fused/unfused pair is held to. Bit equality was
+/// the contract while the fusion only reordered a shared sequence; the
+/// vectorization campaigns deliberately traded that for 1-ulp-level drift.
+#[test]
+fn rms_norm_mrope_qk_matches_rms_norm_then_apply_mrope_exactly() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // The text backbone's shape, and a small case with a different head
+    // layout and an odd token count.
+    let cases = [
+        (156usize, 16usize, 8usize, 128usize, [8usize, 4, 4], "text backbone"),
+        (11, 3, 2, 12, [1, 2, 1], "small"),
+    ];
+    for (tokens, q_heads, kv_heads, head_dim, sections, name) in cases {
+        let (q, _) = input(&ctx, &[tokens * q_heads, head_dim], 61 + head_dim as u64, 1.0);
+        let (k, _) = input(&ctx, &[tokens * kv_heads, head_dim], 63 + head_dim as u64, 1.0);
+        let (qw, _) = input(&ctx, &[head_dim], 65, 0.5);
+        let (kw, _) = input(&ctx, &[head_dim], 67, 0.5);
+        // (t, h, w) ids per token; any distinct triplets serve, since both
+        // arms read the same table.
+        let ids: Vec<u32> = (0..tokens)
+            .flat_map(|t| [(t % 250) as u32, (t % 120) as u32, (t / 7) as u32])
+            .collect();
+        let positions = HipDeviceBytes::new(&ctx, ids.len() * std::mem::size_of::<u32>()).unwrap();
+        positions.upload_u32(&ids).unwrap();
+
+        // The fused kernel.
+        let (qo, ko) = (
+            arena.tensor(vec![tokens, q_heads, head_dim], DType::BF16).unwrap(),
+            arena.tensor(vec![tokens, kv_heads, head_dim], DType::BF16).unwrap(),
+        );
+        native::rms_norm_apply_mrope_qk(
+            &ctx, &q, &qw, &k, &kw, &positions, q_heads, kv_heads, head_dim, EPS, 10_000.0,
+            sections, &qo, &ko,
+        )
+        .unwrap();
+
+        // The sequence the backbone ran before the fusion.
+        let (qn, kn) = (
+            arena.tensor(vec![tokens * q_heads, head_dim], DType::BF16).unwrap(),
+            arena.tensor(vec![tokens * kv_heads, head_dim], DType::BF16).unwrap(),
+        );
+        native::rms_norm(&ctx, &q, &qw, EPS, &qn).unwrap();
+        native::rms_norm(&ctx, &k, &kw, EPS, &kn).unwrap();
+        let (qr, kr) = (
+            arena.tensor(vec![tokens, q_heads, head_dim], DType::BF16).unwrap(),
+            arena.tensor(vec![tokens, kv_heads, head_dim], DType::BF16).unwrap(),
+        );
+        native::apply_mrope(
+            &ctx,
+            &qn.reshape(vec![tokens, q_heads, head_dim]).unwrap(),
+            &positions,
+            q_heads,
+            head_dim,
+            10_000.0,
+            sections,
+            &qr,
+        )
+        .unwrap();
+        native::apply_mrope(
+            &ctx,
+            &kn.reshape(vec![tokens, kv_heads, head_dim]).unwrap(),
+            &positions,
+            kv_heads,
+            head_dim,
+            10_000.0,
+            sections,
+            &kr,
+        )
+        .unwrap();
+
+        for (split, fused, what) in [(&qr, &qo, "q"), (&kr, &ko, "k")] {
+            assert_close(
+                &host(&ctx, fused),
+                &host(&ctx, split),
+                BF16_TOL,
+                &format!("{name}: fused {what} differs from rms_norm + apply_mrope"),
+            );
+        }
+    }
+}
+
 // ── Norms ────────────────────────────────────────────────────────────
 
 #[test]
@@ -541,6 +753,21 @@ fn pointwise_operators_match_the_reference() {
             &format!("bias_activation {activation:?}"),
         );
     }
+
+    // cols % 8 != 0 takes the scalar fallback of the vectorized
+    // `bias_activation`; keep it covered so the two paths cannot drift.
+    let (rows_f, cols_f) = (17, 333);
+    let (xf, xfh) = input(&ctx, &[rows_f, cols_f], 21, 4.0);
+    let (biasf, biasfh) = input(&ctx, &[cols_f], 22, 0.5);
+    let outf = arena.tensor(vec![rows_f, cols_f], DType::BF16).unwrap();
+    native::bias_activation(&ctx, &xf, Some(&biasf), Activation::GeluTanh, &outf).unwrap();
+    let want_f: Vec<f32> = (0..rows_f * cols_f).map(|i| gelu_tanh(xfh[i] + biasfh[i % cols_f])).collect();
+    assert_close(
+        &host(&ctx, &outf),
+        &want_f,
+        BF16_TOL,
+        "bias_activation scalar fallback (cols % 8 != 0)",
+    );
 
     let inner = 4096;
     let (gu, guh) = input(&ctx, &[10, 2 * inner], 19, 3.0);

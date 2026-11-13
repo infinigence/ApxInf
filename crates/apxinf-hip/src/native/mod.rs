@@ -31,13 +31,14 @@ use apxinf_core::{DType, Error, NormalGenerator, Result, Tensor};
 
 pub use arena::HipArena;
 pub use attention::{
-    attention, attention_apxinf_for_test, attention_counts, reset_attention_counts,
-    AttentionGeometry,
+    attention, attention_apxinf_for_test, attention_counts, attention_qkv_packed,
+    reset_attention_counts, AttentionGeometry,
 };
 pub use elementwise::{
     add_position, bias_activation, copy_columns, copy_row_range, copy_rows, embedding,
-    euler_update, gather_rows, geglu, rgb_to_patches, scatter_rows, silu_mul, split_qkv_bias,
-    split_qkv_rope, Activation, EmbeddingScale, HipDeviceBytes, ImageLayout, QkvRope,
+    euler_update, gather_rows, geglu, rgb_to_patches, scatter_rows, silu_mul,
+    split_qkv_axial_rope, split_qkv_bias, split_qkv_rope, Activation, EmbeddingScale,
+    HipDeviceBytes, ImageLayout, QkvRope,
 };
 pub use gemm::{
     gemm_bias_activation,
@@ -51,7 +52,8 @@ pub use norm::{
     bias_residual_rms_norm, layer_norm, rms_norm,
 };
 pub use rope::{
-apply_mrope, apply_vision_2d};
+    apply_mrope, apply_vision_2d, rms_norm_apply_mrope_qk,
+};
 
 use crate::runtime::HipContext;
 

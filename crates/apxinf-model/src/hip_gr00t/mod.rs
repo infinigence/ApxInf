@@ -19,6 +19,7 @@ pub mod geometry;
 pub mod load;
 pub mod math;
 pub mod model;
+pub mod qkv;
 pub mod runner;
 pub mod stages;
 pub mod vision;

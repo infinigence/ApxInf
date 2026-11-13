@@ -153,12 +153,21 @@ pub fn forward_observed(
     stages.stage("patch_embed_positioned", &x)?;
 
     let mut deepstack_states: Vec<Tensor> = Vec::with_capacity(3);
+    // The next block's norm1, produced by the previous block's tail in the
+    // same kernel as its residual write -- cuda-new's `prepared_norm1` path.
+    // One launch fewer at each of the 23 boundaries, and the same values: the
+    // fused kernel normalizes the stored, rounded residual exactly as the
+    // separate `bias_residual` + `layer_norm` pair did.
+    let mut prepared_norm1: Option<Tensor> = None;
     for (index, block) in weights.vision_blocks.iter().enumerate() {
-        x = vision_block(
+        let next_norm1 = weights.vision_blocks.get(index + 1).map(|next| &next.norm1);
+        let (out, norm1) = vision_block(
             ctx,
             arena,
             block,
             &x,
+            prepared_norm1.take(),
+            next_norm1,
             prepared,
             patches,
             hidden,
@@ -168,6 +177,8 @@ pub fn forward_observed(
             index,
             stages,
         )?;
+        x = out;
+        prepared_norm1 = norm1;
         stages.stage(&format!("block_{index:02}"), &x)?;
         if vc.deepstack_visual_indexes.contains(&index) {
             // The merger reads this state after the loop has moved on, so it
@@ -204,6 +215,8 @@ fn vision_block(
     arena: &HipArena,
     block: &VisionBlock,
     x: &Tensor,
+    prepared_norm1: Option<Tensor>,
+    next_norm1: Option<&Norm>,
     prepared: &PreparedVision,
     patches: usize,
     hidden: usize,
@@ -212,23 +225,40 @@ fn vision_block(
     eps: f32,
     index: usize,
     stages: &mut dyn StageSink,
-) -> Result<Tensor> {
-    let normed = arena.tensor(vec![patches, hidden], DType::BF16)?;
-    norm_into(ctx, &block.norm1, x, eps, &normed)?;
+) -> Result<(Tensor, Option<Tensor>)> {
+    // Pre-attention LayerNorm: the previous block's tail computed this one.
+    let normed = match prepared_norm1 {
+        Some(normed) => normed,
+        None => {
+            let normed = arena.tensor(vec![patches, hidden], DType::BF16)?;
+            norm_into(ctx, &block.norm1, x, eps, &normed)?;
+            normed
+        }
+    };
     stages.stage(&format!("block_{index:02}_norm1"), &normed)?;
 
-    // QKV projection, then split with the bias and rotate Q and K. The split
-    // writes the biased projection as BF16, which is the rounding cuda-new's
-    // fused QKV/RoPE kernel performs before it rotates.
+    // QKV projection, then split, bias and axial rotation in one kernel --
+    // cuda-new's fused vision path. It rounds the biased projection to BF16
+    // before rotating, exactly the rounding the split-then-rotate sequence it
+    // replaced performed, so the block's outputs are bit-identical.
     let qkv = arena.tensor(vec![patches, 3 * hidden], DType::BF16)?;
     native::gemm(ctx, &normed, &block.qkv.weight, &qkv)?;
     let head_shape = || vec![patches, heads, head_dim];
     let q = arena.tensor(head_shape(), DType::BF16)?;
     let k = arena.tensor(head_shape(), DType::BF16)?;
     let v = arena.tensor(head_shape(), DType::BF16)?;
-    native::split_qkv_bias(ctx, &qkv, block.qkv.bias.as_ref(), &q, &k, &v)?;
-    native::apply_vision_2d(ctx, &q, &prepared.position_ids, heads, head_dim, 10_000.0, &q)?;
-    native::apply_vision_2d(ctx, &k, &prepared.position_ids, heads, head_dim, 10_000.0, &k)?;
+    native::split_qkv_axial_rope(
+        ctx,
+        &qkv,
+        block.qkv.bias.as_ref(),
+        &prepared.position_ids,
+        heads,
+        head_dim,
+        10_000.0,
+        &q,
+        &k,
+        &v,
+    )?;
 
     // Non-causal attention inside each frame: Qwen3-VL's block-diagonal
     // cu_seqlens mask is the batch dimension when every frame has the same
@@ -298,8 +328,34 @@ fn vision_block(
     let h2 = arena.tensor(vec![patches, hidden], DType::BF16)?;
     native::gemm(ctx, &activated, &block.fc2.weight, &h2)?;
     let out = arena.tensor(vec![patches, hidden], DType::BF16)?;
-    native::bias_residual(ctx, &h2, block.fc2.bias.as_ref(), &residual, &out)?;
-    Ok(out)
+    match next_norm1 {
+        Some(next) => {
+            // The residual write and the next block's norm1 in one pass: the
+            // same kernel `norm2` uses above, over the same stored-and-rounded
+            // residual, so the boundary's values are bit-identical to the
+            // separate pair.
+            let normed = arena.tensor(vec![patches, hidden], DType::BF16)?;
+            let next_bias = next.bias.as_ref().ok_or(Error::Contract(
+                "Qwen3-VL vision norm1 needs a bias",
+            ))?;
+            native::bias_residual_layer_norm(
+                ctx,
+                &h2,
+                block.fc2.bias.as_ref(),
+                &residual,
+                &next.weight,
+                next_bias,
+                eps,
+                &out,
+                &normed,
+            )?;
+            Ok((out, Some(normed)))
+        }
+        None => {
+            native::bias_residual(ctx, &h2, block.fc2.bias.as_ref(), &residual, &out)?;
+            Ok((out, None))
+        }
+    }
 }
 
 /// Every frame must hold the same patch count for the batched attention above.

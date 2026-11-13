@@ -5,12 +5,15 @@
 // the action expert's queries over the whole prefix plus every action row.
 // One kernel covers all three:
 //
-//   q   [batch, q_tokens, q_heads, head_dim]   contiguous
+//   q   [batch, q_tokens, q_heads, head_dim]   rows `q_token_stride` apart
 //   k,v batch b, token j, KV head g at  b * kv_batch_stride + j * kv_token_stride + g * head_dim
-//   out [batch, q_tokens, q_heads, head_dim]
+//   out [batch, q_tokens, q_heads, head_dim]   contiguous
 //
 // with query head h reading KV head h / (q_heads / kv_heads). The strides let
-// the action expert read a prefix cache that holds more rows than it attends.
+// the action expert read a prefix cache that holds more rows than it attends,
+// and let the fused DiT projection attend straight out of the packed
+// `[rows, q_width + 2 * kv_width]` GEMM output, where q's rows sit
+// `q_width + 2 * kv_width` elements apart.
 //
 // One block per (query token, query head, batch); a single pass with an online
 // softmax, so no score matrix is materialized. Scores, probabilities and the PV
@@ -29,7 +32,7 @@ using bf16 = uint16_t;
 __global__ void attention_kernel(const bf16* q, const bf16* k, const bf16* v, bf16* out,
                                  int q_tokens, int q_heads, int kv_heads, int head_dim,
                                  int kv_tokens, int64_t kv_batch_stride, int64_t kv_token_stride,
-                                 float scale, int query_start) {
+                                 int64_t q_token_stride, float scale, int query_start) {
   extern __shared__ float smem[];
   float* q_s = smem;
   float* acc = q_s + head_dim;
@@ -43,7 +46,14 @@ __global__ void attention_kernel(const bf16* q, const bf16* k, const bf16* v, bf
   const int tile = blockDim.x;
   const int64_t kv_base = static_cast<int64_t>(b) * kv_batch_stride +
                           static_cast<int64_t>(h / (q_heads / kv_heads)) * head_dim;
-  const int64_t q_base = ((static_cast<int64_t>(b) * q_tokens + i) * q_heads + h) * head_dim;
+  // q may be a column section of a packed q/k/v projection, so its rows carry
+  // an explicit stride; the output is always contiguous, so it keeps the
+  // derived address.
+  const int64_t q_row = static_cast<int64_t>(b) * q_tokens * q_token_stride +
+                        static_cast<int64_t>(i) * q_token_stride +
+                        static_cast<int64_t>(h) * head_dim;
+  const int64_t out_base =
+      ((static_cast<int64_t>(b) * q_tokens + i) * q_heads + h) * head_dim;
   // Causal masking: query row `i` sees keys [0, query_start + i]. A negative
   // `query_start` is the non-causal case, where every key is visible. The
   // masked keys are never visited rather than scored and discarded, so the
@@ -51,7 +61,7 @@ __global__ void attention_kernel(const bf16* q, const bf16* k, const bf16* v, bf
   const int limit = query_start < 0 ? kv_tokens : min(kv_tokens, query_start + i + 1);
 
   for (int d = tid; d < head_dim; d += tile) {
-    q_s[d] = bf16_to_f32(q[q_base + d]);
+    q_s[d] = bf16_to_f32(q[q_row + d]);
     acc[d] = 0.0f;
   }
   __syncthreads();
@@ -104,7 +114,7 @@ __global__ void attention_kernel(const bf16* q, const bf16* k, const bf16* v, bf
 
   const float inverse_sum = 1.0f / running_sum;
   for (int d = tid; d < head_dim; d += tile) {
-    out[q_base + d] = f32_to_bf16(acc[d] * inverse_sum);
+    out[out_base + d] = f32_to_bf16(acc[d] * inverse_sum);
   }
 }
 
@@ -113,10 +123,11 @@ __global__ void attention_kernel(const bf16* q, const bf16* k, const bf16* v, bf
 extern "C" int apxinf_hip_native_attention(const void* q, const void* k, const void* v, void* out,
                                            int batch, int q_tokens, int q_heads, int kv_heads,
                                            int head_dim, int kv_tokens, int64_t kv_batch_stride,
-                                           int64_t kv_token_stride, float scale, int query_start,
-                                           void* stream) {
+                                           int64_t kv_token_stride, int64_t q_token_stride,
+                                           float scale, int query_start, void* stream) {
   if (batch <= 0 || q_tokens <= 0 || q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 ||
       head_dim <= 0 || kv_tokens <= 0 || kv_token_stride < static_cast<int64_t>(kv_heads) * head_dim ||
+      q_token_stride < static_cast<int64_t>(q_heads) * head_dim ||
       batch > 65535 || q_heads > 65535 || query_start < -1) {
     return kInvalidArgument;
   }
@@ -125,6 +136,6 @@ extern "C" int apxinf_hip_native_attention(const void* q, const void* k, const v
   attention_kernel<<<dim3(q_tokens, q_heads, batch), kAttentionBlock, shared, as_stream(stream)>>>(
       static_cast<const bf16*>(q), static_cast<const bf16*>(k), static_cast<const bf16*>(v),
       static_cast<bf16*>(out), q_tokens, q_heads, kv_heads, head_dim, kv_tokens, kv_batch_stride,
-      kv_token_stride, scale, query_start);
+      kv_token_stride, q_token_stride, scale, query_start);
   return last_launch_status();
 }

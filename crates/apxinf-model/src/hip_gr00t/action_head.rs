@@ -661,36 +661,42 @@ fn dit_block(
         )?;
         biased.reshape(vec![rows, heads, head_dim])
     };
-    let q = project(&block.q, normalized, tokens)?;
-    // K and V come from the cache when this block cross-attends: their input is
-    // a backbone row group, unchanged across the flow. A self-attending block
-    // reads its own normalized state, which the loop rewrites, so it projects
-    // here as before.
-    let (k, v) = match cached_kv {
-        Some((k, v)) => (k.clone(), v.clone()),
-        None => (
-            project(&block.k, source, kv_tokens)?,
-            project(&block.v, source, kv_tokens)?,
+    // A cross-attending block has only Q to project: its K and V are cached
+    // outside the flow loop. A self-attending block recomputes all three from
+    // the same normalized state, which is where the fused and serial modes
+    // differ.
+    let projection = match cached_kv {
+        Some((k, v)) => super::qkv::QkvProjection::Separate(
+            project(&block.q, normalized, tokens)?,
+            k.clone(),
+            v.clone(),
         ),
+        None => super::qkv::project_qkv(
+            ctx, arena, block, normalized, tokens, width, heads, head_dim,
+        )?,
     };
 
     let attended = arena.tensor(vec![tokens, heads, head_dim], DType::BF16)?;
-    native::attention(
-        ctx,
-        &q,
-        &k,
-        &v,
-        &AttentionGeometry {
-            batch: 1,
-            q_tokens: tokens,
-            q_heads: heads,
-            kv_heads: heads,
-            head_dim,
-            kv_tokens,
-            causal_query_start: None,
-        },
-        &attended,
-    )?;
+    let geometry = AttentionGeometry {
+        batch: 1,
+        q_tokens: tokens,
+        q_heads: heads,
+        kv_heads: heads,
+        head_dim,
+        kv_tokens,
+        causal_query_start: None,
+    };
+    match &projection {
+        super::qkv::QkvProjection::Separate(q, k, v) => {
+            native::attention(ctx, q, k, v, &geometry, &attended)?
+        }
+        super::qkv::QkvProjection::Packed(packed) => {
+            // The self-attending block projects K and V from the same
+            // `normalized` rows it queries, so the packed sections share the
+            // width and every row is a key.
+            native::attention_qkv_packed(ctx, packed, width, width, &geometry, &attended)?
+        }
+    };
 
     let output = arena.tensor(vec![tokens, width], DType::BF16)?;
     native::gemm(

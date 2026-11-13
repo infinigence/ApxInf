@@ -95,17 +95,22 @@ extern "C" int apxinf_hip_ck_attention_supported(int dtype, int head_dim, int qu
 // `[batch, rows, kv_heads, head_dim]` where `rows >= kv_tokens` so a cache may
 // hold more rows than the call reads. `kv_batch_stride` and `kv_token_stride`
 // carry that, which is why they are passed rather than derived.
+// `q_token_stride` is the address stride between q rows, in elements: at least
+// `q_heads * head_dim` (contiguous), or wider when q is a column section of a
+// packed `[rows, q_width + 2 * kv_width]` projection. `out` is always
+// contiguous; q's batch stride is derived as `q_tokens * q_token_stride`.
 extern "C" int apxinf_hip_ck_attention(int dtype, const void* q, const void* k,
                                        const void* v, void* out, int batch, int q_tokens,
                                        int q_heads, int kv_heads, int head_dim,
                                        int kv_tokens, long long kv_batch_stride,
-                                       long long kv_token_stride, float scale,
-                                       int query_start, void* stream) {
+                                       long long kv_token_stride, long long q_token_stride,
+                                       float scale, int query_start, void* stream) {
   if (!supported(dtype, head_dim, query_start, q_tokens, kv_tokens)) return kUnsupported;
   if (batch <= 0 || q_tokens <= 0 || q_heads <= 0 || kv_heads <= 0 || kv_tokens <= 0) {
     return kInvalidArgument;
   }
   if (q_heads % kv_heads != 0) return kInvalidArgument;
+  if (q_token_stride < static_cast<long long>(q_heads) * head_dim) return kInvalidArgument;
 
   fmha_fwd_traits traits{};
   traits.hdim_q = head_dim;
@@ -136,8 +141,9 @@ extern "C" int apxinf_hip_ck_attention(int dtype, const void* q, const void* k,
   args.nhead_k = kv_heads;
   args.scale_s = scale;
   args.logits_soft_cap = 0.0f;
-  // Row (token) strides.
-  args.stride_q = q_heads * head_dim;
+  // Row (token) strides. q's comes from the caller: contiguous, or a packed
+  // q/k/v section whose rows are `q_width + 2 * kv_width` elements apart.
+  args.stride_q = static_cast<ck_tile::index_t>(q_token_stride);
   args.stride_o = q_heads * head_dim;
   args.stride_k = static_cast<ck_tile::index_t>(kv_token_stride);
   args.stride_v = static_cast<ck_tile::index_t>(kv_token_stride);
@@ -146,7 +152,8 @@ extern "C" int apxinf_hip_ck_attention(int dtype, const void* q, const void* k,
   args.nhead_stride_o = head_dim;
   args.nhead_stride_k = head_dim;
   args.nhead_stride_v = head_dim;
-  args.batch_stride_q = q_tokens * q_heads * head_dim;
+  args.batch_stride_q = static_cast<ck_tile::index_t>(q_tokens) *
+                        static_cast<ck_tile::index_t>(q_token_stride);
   args.batch_stride_o = q_tokens * q_heads * head_dim;
   args.batch_stride_k = static_cast<ck_tile::index_t>(kv_batch_stride);
   args.batch_stride_v = static_cast<ck_tile::index_t>(kv_batch_stride);

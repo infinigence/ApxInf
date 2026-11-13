@@ -6,12 +6,14 @@
 //!
 //! Unlike `gr00t/`, there is no `DeviceLinearWeights` trait and no precision
 //! dispatch: gfx1151 has no FP8 tensor cores, so BF16 is the only path and the
-//! concrete types are written out. Q/K/V stay separate here rather than packed
-//! into one GEMM -- the checkpoint stores them apart and the eager path gains
-//! nothing from fusing them; packing is a performance-milestone change, and
-//! doing it now would move a rounding point before anything can detect it.
+//! concrete types are written out. A self-attending DiT block's q/k/v are
+//! packed along N into one `[k, 3n]` matrix (`qkv_fused`), displacing rather
+//! than duplicating the three separate ones, so one GEMM and an in-place
+//! strided attention read replace three GEMMs and a split. Cross-attending
+//! blocks keep separate projections: their Q reads the 1536-wide state while
+//! K and V read the 2048-wide backbone rows, so they cannot share a GEMM.
 
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{Device, DType, Error, Result, Shape, Tensor};
 use apxinf_hip::HipContext;
 
 use super::checkpoint::action_head as host_action;
@@ -89,6 +91,9 @@ pub struct VlBlock {
 
 pub struct DitBlock {
     pub adaptive_norm: Linear,
+    /// q/k/v concatenated along N, built only in fused mode and only for
+    /// self-attending blocks (whose three projections share the same K).
+    pub qkv_fused: Option<Linear>,
     pub q: Linear,
     pub k: Linear,
     pub v: Linear,
@@ -280,14 +285,103 @@ fn vl_block(
 }
 
 fn dit_block(block: &host_action::Gr00tDitBlockWeights, ctx: &HipContext) -> Result<DitBlock> {
+    let qkv_fused = fused_qkv(block, ctx)?;
+    // In fused mode a self-attending block reads only the packed matrix, so
+    // its separate q/k/v never reach the device. Empty placeholders keep the
+    // struct non-Optional; an accidental use fails on a shape or device check
+    // rather than quietly reading something stale.
+    let (q, k, v) = if qkv_fused.is_some() {
+        (empty_linear()?, empty_linear()?, empty_linear()?)
+    } else {
+        (
+            dense(&block.attention.query, ctx)?,
+            dense(&block.attention.key, ctx)?,
+            dense(&block.attention.value, ctx)?,
+        )
+    };
     Ok(DitBlock {
         adaptive_norm: dense(&block.adaptive_norm, ctx)?,
-        q: dense(&block.attention.query, ctx)?,
-        k: dense(&block.attention.key, ctx)?,
-        v: dense(&block.attention.value, ctx)?,
+        qkv_fused,
+        q,
+        k,
+        v,
         output: dense(&block.attention.output, ctx)?,
         ffn_in: dense(&block.feed_forward.input, ctx)?,
         ffn_out: dense(&block.feed_forward.output, ctx)?,
+    })
+}
+
+/// Concatenate a DiT block's q/k/v weights along the output dimension.
+///
+/// Only self-attending blocks qualify: a cross-attending block projects K/V
+/// from the 2048-wide backbone rows while Q comes from the 1536-wide DiT
+/// state, so the three matrices do not share K and cannot be one GEMM.
+/// Packing happens on the host, before anything is uploaded, so the fused
+/// path reads exactly the same BF16 bytes as the three separate projections.
+fn fused_qkv(
+    block: &host_action::Gr00tDitBlockWeights,
+    ctx: &HipContext,
+) -> Result<Option<Linear>> {
+    if super::qkv::mode() != super::qkv::QkvMode::Fused {
+        return Ok(None);
+    }
+    let (q, k, v) = (
+        &block.attention.query,
+        &block.attention.key,
+        &block.attention.value,
+    );
+    let shape = q.weight.shape().dims();
+    if shape.len() != 2
+        || k.weight.shape().dims() != shape
+        || v.weight.shape().dims() != shape
+    {
+        // Cross-attention block: its K/V use a different input width.
+        return Ok(None);
+    }
+    let (kin, n) = (shape[0], shape[1]);
+    let element = DType::BF16.size_in_bytes();
+    fn cpu(tensor: &Tensor) -> Result<&[u8]> {
+        tensor.storage().as_cpu().ok_or_else(|| {
+            Error::Other("apxinf: q/k/v packing needs host-side tensors".into())
+        })
+    }
+    let mut weight_bytes = Vec::with_capacity(kin * 3 * n * element);
+    for row in 0..kin {
+        for source in [&q.weight, &k.weight, &v.weight] {
+            let bytes = cpu(source)?;
+            let start = row * n * element;
+            weight_bytes.extend_from_slice(&bytes[start..start + n * element]);
+        }
+    }
+    let mut bias_bytes = Vec::with_capacity(3 * n * element);
+    for source in [&q.bias, &k.bias, &v.bias] {
+        bias_bytes.extend_from_slice(cpu(source)?);
+    }
+    let weight = Tensor::from_raw(
+        Shape::new(vec![kin, 3 * n]),
+        DType::BF16,
+        Device::Cpu,
+        weight_bytes,
+    )?;
+    let bias = Tensor::from_raw(
+        Shape::new(vec![3 * n]),
+        DType::BF16,
+        Device::Cpu,
+        bias_bytes,
+    )?;
+    Ok(Some(Linear {
+        weight: to_device(&weight, ctx)?,
+        bias: Some(to_device(&bias, ctx)?),
+    }))
+}
+
+/// A `[0, 0]` placeholder for a projection that was packed into `qkv_fused`
+/// and is never read. Any accidental device-side use fails on a shape or
+/// device check rather than quietly reading something stale.
+fn empty_linear() -> Result<Linear> {
+    Ok(Linear {
+        weight: Tensor::from_raw(Shape::new(vec![0, 0]), DType::BF16, Device::Cpu, Vec::new())?,
+        bias: None,
     })
 }
 

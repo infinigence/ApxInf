@@ -455,6 +455,80 @@ pub fn split_qkv_bias(
     })
 }
 
+/// Split a packed `[tokens, 3 * heads * head_dim]` projection into `q`, `k`
+/// and `v` of `[tokens, heads, head_dim]` elements each, adding the optional
+/// bias and rotating Q and K by (h, w) axial positions -- cuda-new's fused
+/// vision `split_qkv_axial_rope`, one kernel.
+///
+/// `positions` holds `tokens * 2` `u32` values as `(h, w)` per token, the
+/// layout [`super::apply_vision_2d`] reads. The first quarter of each head's
+/// half-split pairs rotate by the height position, the rest by the width one.
+/// The biased projection is rounded to BF16 before rotating, so the result is
+/// bit-identical to [`split_qkv_bias`] followed by [`super::apply_vision_2d`]
+/// on q and k -- which is the acceptance contract between the two forms.
+#[allow(clippy::too_many_arguments)]
+pub fn split_qkv_axial_rope(
+    ctx: &HipContext,
+    qkv: &Tensor,
+    bias: Option<&Tensor>,
+    positions: &HipDeviceBytes,
+    heads: usize,
+    head_dim: usize,
+    theta: f32,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+) -> Result<()> {
+    let (tokens, fused) = rows_cols(qkv)?;
+    if fused != 3 * heads * head_dim {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[tokens, {}]", 3 * heads * head_dim),
+            got: qkv.shape().to_string(),
+        });
+    }
+    // head_dim % 4 keeps the half-split pairs evenly divisible between the two
+    // axes, which the per-axis frequency indexing assumes.
+    if head_dim == 0 || head_dim % 4 != 0 {
+        return Err(Error::Contract(
+            "apxinf-hip split_qkv_axial_rope: head_dim must be a non-zero multiple of 4",
+        ));
+    }
+    let elements = tokens * heads * head_dim;
+    for t in [q, k, v] {
+        require_numel(t, elements, || format!("[{tokens}, {heads}, {head_dim}]"))?;
+    }
+    let needed = tokens
+        .checked_mul(2)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or(Error::Contract(
+            "apxinf-hip split_qkv_axial_rope: position size overflow",
+        ))?;
+    if positions.len() < needed {
+        return Err(Error::DataLengthMismatch {
+            expected: needed,
+            got: positions.len(),
+        });
+    }
+    let pb = optional_ptr(ctx, bias, fused)?;
+    let pqkv = bf16_ptr(ctx, qkv)?;
+    let (pq, pk, pv) = (bf16_ptr(ctx, q)?, bf16_ptr(ctx, k)?, bf16_ptr(ctx, v)?);
+    check("split_qkv_axial_rope", unsafe {
+        ffi::apxinf_hip_native_split_qkv_axial_rope(
+            pqkv,
+            pb,
+            positions.ptr(),
+            pq,
+            pk,
+            pv,
+            int(tokens)?,
+            int(heads)?,
+            int(head_dim)?,
+            theta,
+            ctx.stream(),
+        )
+    })
+}
+
 /// Copy all rows of `src` into `dst` starting at row `dst_row`; both are
 /// `[.., cols]` with the same column count. Concatenation is two of these.
 pub fn copy_rows(ctx: &HipContext, src: &Tensor, dst: &Tensor, dst_row: usize) -> Result<()> {

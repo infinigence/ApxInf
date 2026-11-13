@@ -401,6 +401,19 @@ hip_abi! {
         width: i32,
         stream: *mut c_void,
     );
+    fn apxinf_hip_native_split_qkv_axial_rope(
+        qkv: *const c_void,
+        bias: *const c_void,
+        positions: *const c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        tokens: i32,
+        heads: i32,
+        head_dim: i32,
+        theta: f32,
+        stream: *mut c_void,
+    );
     fn apxinf_hip_ck_attention_supported(
         dtype: i32,
         head_dim: i32,
@@ -422,6 +435,7 @@ hip_abi! {
         kv_tokens: i32,
         kv_batch_stride: i64,
         kv_token_stride: i64,
+        q_token_stride: i64,
         scale: f32,
         query_start: i32,
         stream: *mut c_void,
@@ -439,6 +453,7 @@ hip_abi! {
         kv_tokens: i32,
         kv_batch_stride: i64,
         kv_token_stride: i64,
+        q_token_stride: i64,
         scale: f32,
         query_start: i32,
         stream: *mut c_void,
@@ -466,6 +481,25 @@ hip_abi! {
         heads: i32,
         head_dim: i32,
         theta: f32,
+        stream: *mut c_void,
+    );
+
+    fn apxinf_hip_native_rms_norm_apply_mrope_qk(
+        q: *const c_void,
+        q_weight: *const c_void,
+        q_out: *mut c_void,
+        k: *const c_void,
+        k_weight: *const c_void,
+        k_out: *mut c_void,
+        positions: *const c_void,
+        tokens: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        head_dim: i32,
+        eps: f32,
+        theta: f32,
+        section_h: i32,
+        section_w: i32,
         stream: *mut c_void,
     );
 }
