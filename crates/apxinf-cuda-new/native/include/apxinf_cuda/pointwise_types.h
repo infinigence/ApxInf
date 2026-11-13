@@ -19,6 +19,13 @@
  *   SWIGLU_ROWWISE_E4M3
  *                     input [rows, input_cols], optional bias [input_cols]
  *                     -> output [rows, cols], scales [rows]
+ *   AFFINE            input [rows, cols], bias [2 * cols]
+ *                     (scale then shift)                -> output [rows, cols]
+ *   GLU_SEPARATE      input [rows, cols] (value),
+ *                     secondary [rows, cols] (gate)     -> output [rows, cols]
+ *   TANH_SIGMOID_GATE input [rows, 2 * cols] (a then b),
+ *                     optional secondary [rows, 2 * cols]
+ *                                                       -> output [rows, cols]
  *
  * `cols` is always the *output* width, so GeGLU's input is twice as wide.
  */
@@ -29,6 +36,9 @@ typedef enum {
   APXINF_POINTWISE_SEMANTIC_SWIGLU = 3,
   APXINF_POINTWISE_SEMANTIC_ADD_INTO = 4,
   APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3 = 5,
+  APXINF_POINTWISE_SEMANTIC_AFFINE = 6,
+  APXINF_POINTWISE_SEMANTIC_GLU_SEPARATE = 7,
+  APXINF_POINTWISE_SEMANTIC_TANH_SIGMOID_GATE = 8,
 } apxinf_pointwise_semantic_t;
 
 /* Stable pointwise activation ABI encoding. */
@@ -38,9 +48,24 @@ typedef enum {
   APXINF_POINTWISE_ACTIVATION_SILU = 2,
   APXINF_POINTWISE_ACTIVATION_GELU_EXACT = 3,
   APXINF_POINTWISE_ACTIVATION_RELU = 4,
+  APXINF_POINTWISE_ACTIVATION_MISH = 5,
+  APXINF_POINTWISE_ACTIVATION_TANH = 6,
+  APXINF_POINTWISE_ACTIVATION_LEAKY_RELU = 7,
+  APXINF_POINTWISE_ACTIVATION_SIGMOID = 8,
+  APXINF_POINTWISE_ACTIVATION_LEAKY_RELU_ONE_PERCENT = 9,
 } apxinf_pointwise_activation_t;
 
-#define APXINF_POINTWISE_SPEC_VERSION 2u
+/* Rounding applied to input + bias inside BIAS_ACTIVATION before the
+ * activation evaluates. SingleRound keeps the FP32 sum; RoundBiasSum
+ * materializes the sum in the tensor dtype first, matching a deferred
+ * producer bias that is read back through storage before an activation
+ * consumes it. */
+typedef enum {
+  APXINF_POINTWISE_BIAS_ROUNDING_SINGLE_ROUND = 0,
+  APXINF_POINTWISE_BIAS_ROUNDING_ROUND_BIAS_SUM = 1,
+} apxinf_pointwise_bias_rounding_t;
+
+#define APXINF_POINTWISE_SPEC_VERSION 3u
 
 typedef struct {
   uint32_t version;
@@ -51,6 +76,8 @@ typedef struct {
   uint32_t activation;
   /* A null bias is a different kernel path, so it belongs to the identity. */
   uint32_t has_bias;
+  /* Only meaningful for BIAS_ACTIVATION; see the rounding enum above. */
+  uint32_t bias_rounding;
   /* Largest guaranteed power-of-two byte alignment, capped at 256. */
   uint32_t input_alignment;
   uint32_t secondary_alignment;
@@ -77,5 +104,7 @@ typedef struct {
   apxinf_cuda_stream_t stream;
   /* EULER_UPDATE step size; unused elsewhere. */
   float dt;
+  /* LEAKY_RELU / LEAKY_RELU_ONE_PERCENT negative slope; unused elsewhere. */
+  float negative_slope;
   float output_scale;
 } apxinf_pointwise_bindings_t;

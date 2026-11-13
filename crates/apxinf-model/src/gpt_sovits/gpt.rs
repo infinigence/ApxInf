@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 
-use apxinf_core::{philox4x32_10, Error, Result, Shape, Tensor};
+use apxinf_core::{philox4x32_10, DType, Error, Result, Shape, Tensor};
 use apxinf_cuda_new::ops::{
     self as cuda_ops, AttentionMask, KvCacheAttentionArgs, KvCacheDecodeMeta,
 };
@@ -54,6 +54,12 @@ struct DecodeResources {
     input: Tensor,
     cache: DecodeCache,
     embed: DecodeEmbedScratch,
+    /// Repetition-penalty flags for the device sampler: `seen[token] != 0`
+    /// marks scores the penalty has already been applied to, matching the
+    /// host sampler's first-occurrence dedup over the token history.
+    seen: Tensor,
+    /// Device sampler output words: `[sampled, adjusted_argmax, status, 0]`.
+    sample_out: Tensor,
 }
 
 /// Fixed buffers for the one-token decode embedding.
@@ -337,6 +343,65 @@ fn sample_fp16_exponential_race(
         .collect::<Vec<_>>();
     let sampled = exponential_race_argmax(&probabilities, &exponentials)?;
     Ok((sampled, adjusted_argmax))
+}
+
+/// Largest `top_k` the device sampler resolves with its masked pivot passes;
+/// larger requests keep the host sampler.
+const DEVICE_SAMPLING_MAX_TOP_K: usize = 128;
+
+/// Device-side sampling for one decode step. Returns `Ok(None)` when the
+/// request falls outside the device kernel's exact-match envelope (nucleus
+/// truncation, an oversized `top_k`, or an unsupported logits dtype); the
+/// caller then uses the reference host sampler. When it samples, `seen` is
+/// updated for the next step and only the four output words cross PCIe.
+#[allow(clippy::too_many_arguments)]
+fn device_sample_fp16_exponential_race(
+    ctx: &Context,
+    logits: &Tensor,
+    seen: &Tensor,
+    output: &Tensor,
+    seed: u64,
+    step: usize,
+    top_k: usize,
+    top_p: f32,
+    temperature: f32,
+    repetition_penalty: f32,
+) -> Result<Option<(u32, u32)>> {
+    let vocab = logits.shape().numel();
+    if top_p < 1.0
+        || vocab > cuda_ops::EXPONENTIAL_RACE_MAX_VOCAB
+        || (top_k != 0 && top_k < vocab && top_k > DEVICE_SAMPLING_MAX_TOP_K)
+        || top_k > u32::MAX as usize
+        || !matches!(
+            logits.dtype(),
+            apxinf_core::DType::F16 | apxinf_core::DType::BF16
+        )
+    {
+        return Ok(None);
+    }
+    cuda_ops::exponential_race_sample(
+        ctx,
+        cuda_ops::ExponentialRaceArgs {
+            logits,
+            seen,
+            output,
+            seed,
+            step: step as u64,
+            top_k: top_k as u32,
+            temperature,
+            repetition_penalty,
+        },
+    )?;
+    let host = transfers::to_cpu(output)?;
+    let words = host.as_i32()?.to_vec();
+    if words.len() < 3 {
+        return Err(Error::Other("GPT device sampler output too short".into()));
+    }
+    match words[2] {
+        0 => Ok(Some((words[0] as u32, words[1] as u32))),
+        1 => Err(Error::Other("GPT filtered logits are all invalid".into())),
+        _ => Err(Error::Other("GPT probability mass is invalid".into())),
+    }
 }
 
 impl Gpt {
@@ -832,6 +897,8 @@ impl Gpt {
                     audio_len: 0,
                     capacity,
                 },
+                seen: ctx.allocate_output(Shape::new(vec![GPT_AUDIO_VOCAB]), DType::I8)?,
+                sample_out: ctx.allocate_output(Shape::new(vec![4]), DType::I32)?,
             },
         };
         let DecodeResources {
@@ -842,6 +909,8 @@ impl Gpt {
             input: decode_input,
             mut cache,
             embed: mut embed_scratch,
+            seen: decode_seen,
+            sample_out: decode_sample_out,
         } = resources;
         let _gpt_prefill_range = crate::profiling::trace::range("tts.gpt.prefill");
         let mut logits = self
@@ -849,6 +918,37 @@ impl Gpt {
             .map_err(|error| Error::Other(format!("GPT cached prefill: {error}")))?;
         drop(_gpt_prefill_range);
         let mut audio_tokens = prompt.to_vec();
+
+        // The device sampler reproduces the host pipeline bit for bit inside
+        // its envelope (top_p >= 1.0, bounded top_k); outside it the decode
+        // loop keeps the reference host sampler.
+        let device_sampling = top_p >= 1.0
+            && top_k <= u32::MAX as usize
+            && (top_k == 0
+                || top_k >= GPT_AUDIO_VOCAB
+                || top_k <= DEVICE_SAMPLING_MAX_TOP_K);
+        if device_sampling {
+            // The flags vector below defines the entire buffer state (zeros
+            // except the prompt entries), and the synchronous copy lands
+            // before any later kernel launch. Do NOT prepend a stream-level
+            // fill_zero: on the non-blocking context stream it can trail the
+            // default-stream copy — on the second and later calls it queues
+            // behind the prefill replay and wipes the prompt flags, silently
+            // dropping the repetition penalty.
+            // First-occurrence dedup of the prompt history, matching the host
+            // sampler's seen marking; generated tokens are flagged by the
+            // kernel itself as they are sampled.
+            let mut flags = vec![0i8; GPT_AUDIO_VOCAB];
+            for &token in prompt {
+                let token = token as usize;
+                if token < GPT_AUDIO_VOCAB {
+                    flags[token] = 1;
+                }
+            }
+            let host = Tensor::from_i8(Shape::new(vec![GPT_AUDIO_VOCAB]), &flags)?;
+            transfers::copy_cpu_to_cuda(&host, &decode_seen)
+                .map_err(|error| Error::Other(format!("GPT sampler flag upload: {error}")))?;
+        }
 
         for index in 0..max_new_tokens {
             let _gpt_step_range = crate::profiling::trace::range("tts.gpt.step");
@@ -860,17 +960,50 @@ impl Gpt {
             let active_logits = logits_prefix(&logits, active_vocab)
                 .map_err(|error| Error::Other(format!("GPT logits view step {index}: {error}")))?;
             let _gpt_sample_range = crate::profiling::trace::range("tts.gpt.sample");
-            let (sample, argmax) = sample_fp16_exponential_race(
-                &active_logits,
-                &audio_tokens,
-                seed,
-                index,
-                top_k,
-                top_p,
-                temperature,
-                repetition_penalty,
-            )
-            .map_err(|error| Error::Other(format!("GPT sample step {index}: {error}")))?;
+            let (sample, argmax) = if device_sampling {
+                match device_sample_fp16_exponential_race(
+                    ctx,
+                    &active_logits,
+                    &decode_seen,
+                    &decode_sample_out,
+                    seed,
+                    index,
+                    top_k,
+                    top_p,
+                    temperature,
+                    repetition_penalty,
+                )
+                .map_err(|error| {
+                    Error::Other(format!("GPT device sample step {index}: {error}"))
+                })? {
+                    Some(sampled) => sampled,
+                    None => sample_fp16_exponential_race(
+                        &active_logits,
+                        &audio_tokens,
+                        seed,
+                        index,
+                        top_k,
+                        top_p,
+                        temperature,
+                        repetition_penalty,
+                    )
+                    .map_err(|error| {
+                        Error::Other(format!("GPT sample step {index}: {error}"))
+                    })?,
+                }
+            } else {
+                sample_fp16_exponential_race(
+                    &active_logits,
+                    &audio_tokens,
+                    seed,
+                    index,
+                    top_k,
+                    top_p,
+                    temperature,
+                    repetition_penalty,
+                )
+                .map_err(|error| Error::Other(format!("GPT sample step {index}: {error}")))?
+            };
             drop(_gpt_sample_range);
             if sample == GPT_EOS || argmax == GPT_EOS {
                 break;
@@ -935,6 +1068,8 @@ impl Gpt {
             input: decode_input,
             cache,
             embed: embed_scratch,
+            seen: decode_seen,
+            sample_out: decode_sample_out,
         });
         Ok(generated)
     }
@@ -1035,6 +1170,93 @@ mod sampling_tests {
             .unwrap();
             assert_eq!(actual, expected, "{name}: reference FP16 probabilities");
             assert_eq!(actual_argmax, argmax, "{name}: first-index adjusted argmax");
+        }
+    }
+
+    /// Device-vs-host 对拍: the exponential-race kernel must reproduce the
+    /// reference host sampler's token sequence exactly, step after step, for
+    /// every request inside its envelope. Runs only where a CUDA device is
+    /// available (CI on the target machines).
+    #[test]
+    fn device_exponential_race_matches_host_sampler() {
+        let ctx = Context::new(0).unwrap();
+        let lcg = |mut state: u64| -> f32 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // FP16-quantized logits create real ties for the argmax paths.
+            let value = (((state >> 33) as f32) / (u32::MAX as f32)) * 16.0 - 8.0;
+            fp16(value)
+        };
+
+        let cases: &[(&str, u64, usize, f32, f32)] = &[
+            ("defaults", 0x5eed_1111_2222_3333, 5, 1.0, 1.35),
+            ("no_topk", 0x0000_0000_0000_0001, 0, 1.0, 1.35),
+            ("cold_temperature", 0xdead_beef_cafe_f00d, 5, 0.7, 1.35),
+            ("no_penalty", 0x0123_4567_89ab_cdef, 1, 1.0, 1.0),
+            ("wide_topk", 0x7777_7777_7777_7777, 64, 1.0, 1.35),
+        ];
+        for &(name, seed, top_k, temperature, repetition) in cases {
+            let host_logits: Vec<f32> = (0..GPT_AUDIO_VOCAB)
+                .map(|index| lcg((seed as usize).wrapping_add(index) as u64))
+                .collect::<Vec<f32>>();
+            let device_logits =
+                fp16_tensor(&ctx, &[GPT_AUDIO_VOCAB], &host_logits).unwrap();
+            // A short repeated history exercises the penalty-dedup path.
+            let initial_history: Vec<u32> =
+                [3, 7, 3, 1024, 12, 7, 0, 500].iter().copied().collect();
+            let history_flags: Vec<u32> = initial_history.clone();
+
+            let seen = ctx
+                .allocate_output(Shape::new(vec![GPT_AUDIO_VOCAB]), DType::I8)
+                .unwrap();
+            let sample_out = ctx.allocate_output(Shape::new(vec![4]), DType::I32).unwrap();
+            let mut flags = vec![0i8; GPT_AUDIO_VOCAB];
+            for &token in &history_flags {
+                flags[token as usize] = 1;
+            }
+            let host_flags = Tensor::from_i8(Shape::new(vec![GPT_AUDIO_VOCAB]), &flags).unwrap();
+            transfers::copy_cpu_to_cuda(&host_flags, &seen).unwrap();
+
+            let mut host_history = initial_history.clone();
+            let mut device_history = initial_history.clone();
+            for step in 0..64 {
+                let host = sample_fp16_exponential_race(
+                    &device_logits,
+                    &host_history,
+                    seed,
+                    step,
+                    top_k,
+                    1.0,
+                    temperature,
+                    repetition,
+                )
+                .unwrap();
+                let device = device_sample_fp16_exponential_race(
+                    &ctx,
+                    &device_logits,
+                    &seen,
+                    &sample_out,
+                    seed,
+                    step,
+                    top_k,
+                    1.0,
+                    temperature,
+                    repetition,
+                )
+                .unwrap();
+                let device = device.unwrap_or_else(|| {
+                    panic!("{name}: device sampler declined its envelope at step {step}")
+                });
+                assert_eq!(
+                    device, host,
+                    "{name}: step {step} token sequence diverged"
+                );
+                host_history.push(host.0);
+                device_history.push(device.0);
+                assert_eq!(host_history, device_history);
+                ctx.synchronize().unwrap();
+            }
         }
     }
 }

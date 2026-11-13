@@ -393,12 +393,15 @@ fn main() {
         "attention/fixed_decode.cu",
         "attention/fixed_f16.cu",
         "cache/fixed_decode.cu",
+        "cache/write_token.cu",
         "elementwise/fixed_bf16.cu",
         "elementwise/fixed_decode.cu",
         "elementwise/fixed_f16.cu",
+        "elementwise/fixed_rows.cu",
         "attention/gates_rounded_bf16.cu",
         "embedding/fixed_bf16.cu",
         "embedding/fixed_decode.cu",
+        "embedding/sinusoidal_table.cu",
         "gemm/gemv.cpp",
         "gdn/fixed.cu",
         "norm/fixed_bf16.cu",
@@ -414,6 +417,7 @@ fn main() {
         "rope/fixed_bf16.cu",
         "rope/fixed_decode.cu",
         "rope/fixed_f16.cu",
+        "rope/interleaved.cu",
         "rope/qkv_bf16.cu",
         "rope/partial.cpp",
         "preprocess/ops.cpp",
@@ -421,6 +425,7 @@ fn main() {
         "sampling/argmax.cpp",
         "sampling/suppress_bf16.cu",
         "sampling/launch.cu",
+        "sampling/exponential_race.cu",
         "norm/launch.cu",
         "pointwise/launch.cu",
         "rope/launch.cu",
@@ -447,7 +452,6 @@ fn main() {
     generic_sources.push(native.join("kernels/custom/sampling_argmax.cu"));
     generic_sources.push(native.join("adapters/conv1d/launch.cu"));
     generic_sources.push(native.join("adapters/relative_attention/launch.cu"));
-    generic_sources.push(native.join("adapters/tts/launch.cu"));
     generic_sources.push(native.join("tests/framework_backend.cu"));
     let cutlass_root = native.join("kernels/cutlass");
     let fa2_root = native.join("kernels/fa2");

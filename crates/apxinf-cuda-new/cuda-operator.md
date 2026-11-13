@@ -220,154 +220,151 @@ geometry and are not tuned for large batches.
 | Numerical policy | scores and the weighted sum accumulate in FP32; each relative term is added in FP32 before the scale |
 | Reference test | model-level: the official-capture SoVITS encoder comparison covers this path; no crate-level candidate test yet |
 
-<!-- l3-operator:bias-activation -->
-### `bias_activation`
+### `bias_activation` (pointwise family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::bias_activation(ctx, input, bias, out, activation, round_bias)` |
-| Inputs | `input` of any nonempty rank with last-axis width `cols`; optional `bias=[cols]` |
-| Output | `out`, the shape of `input` |
-| Mathematical semantic | `out = activation(input + bias)` with the bias broadcast over every row; `activation` is a `TtsActivation` variant |
-| Constraints | `cols` divides the element count; with `round_bias` the sum is rounded to the tensor dtype before the activation |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::BiasActivation` |
+| Inputs | `input=[rows,cols]` (F16/BF16); optional `bias=[cols]` |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | `out = activation(input + bias)` with the bias broadcast over every row; `activation` is a `PointwiseActivation` variant, `bias_rounding` rounds the sum to the tensor dtype before the activation |
 | Reference test | `leaky_relu_bias_reproduces_the_ordinary_paths_rounding` (model-level) |
 
-<!-- l3-operator:residual-add-bias -->
-### `residual_add_bias`
+### `residual_add_bias` (norm family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::residual_add_bias(ctx, input, bias, residual, out)` |
+| Rust API | `ops::residual_add` with `ResidualGate::None` and `BiasOrder::BiasThenResidual` |
 | Inputs | `input` and `residual` with the same shape; `bias=[cols]` |
 | Output | `out`, the shape of `input` |
 | Mathematical semantic | `out = round(round(input + bias) + residual)` |
 | Constraints | the intermediate sum is rounded to the tensor dtype, so this matches a deferred producer bias followed by an ordinary residual add |
 | Reference test | `residual_add_bias_reproduces_the_ordinary_paths_rounding` (model-level) |
 
-<!-- l3-operator:affine -->
-### `affine`
+### `affine` (pointwise family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::affine(ctx, input, style, out)` |
-| Inputs | `input` with last-axis width `cols`; `style=[2*cols]` holding gamma then beta |
-| Output | `out`, the shape of `input` |
-| Mathematical semantic | `out = input * style[col] + style[cols+col]` |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::Affine` |
+| Inputs | `input=[rows,cols]`; `bias=[2*cols]` holding scale then shift |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | `out = input * bias[col] + bias[cols+col]` |
 | Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
 
-<!-- l3-operator:glu-separate -->
-### `glu_separate`
+### `glu_separate` (pointwise family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::glu_separate(ctx, input, gate, out)` |
-| Inputs | `input` and `gate` with the same shape |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::GluSeparate` |
+| Inputs | `input` and `secondary` (gate) with the same shape |
 | Output | `out`, the shape of `input` |
-| Mathematical semantic | `out = input * sigmoid(gate)` |
+| Mathematical semantic | `out = input * sigmoid(secondary)` |
 | Reference test | model-level: `official_ffn_operator_isolation` compares the CFM FFN intermediates |
 
-<!-- l3-operator:tanh-sigmoid-gate -->
-### `tanh_sigmoid_gate`
+### `tanh_sigmoid_gate` (pointwise family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::tanh_sigmoid_gate(ctx, input, secondary, out)` |
-| Inputs | `input=[rows,2*cols]`, whose last axis holds the `a` half then the `b` half; optional same-shaped `secondary` |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::TanhSigmoidGate` |
+| Inputs | `input=[rows,2*cols]`, whose last axis holds the `a` half then the `b` half; optional same-shaped `secondary` added element-wise to both halves first |
 | Output | `out=[rows,cols]` |
 | Mathematical semantic | `out = tanh(a + secondary_a) * sigmoid(b + secondary_b)` |
 | Reference test | model-level: `official_ffn_operator_isolation` compares the CFM FFN intermediates |
 
-<!-- l3-operator:grn -->
-### `grn`
+### `grn` (norm family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::grn(ctx, input, style, out)` |
+| Rust API | `ops::norm` with `NormKind::Grn` and `Affine::Adaptive` |
 | Inputs | `input=[rows,cols]`; `style=[2*cols]` holding gamma then beta |
 | Output | `out=[rows,cols]` |
 | Mathematical semantic | with `n_c = sqrt(sum_r input[r,c]^2)` and `m = mean_c(n_c) + 1e-6`, `out = gamma_c * (input * n_c/m) + beta_c`, every intermediate rounded to the tensor dtype |
 | Constraints | `cols<=12288`, the FP32 normalizers that fit the 48 KiB shared window |
 | Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
 
-<!-- l3-operator:column-norm -->
-### `column_norm`
+### `column_norm` (norm family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::column_norm(ctx, input, style, out, eps)` |
+| Rust API | `ops::norm` with `NormKind::ColumnLayer`, `Affine::Adaptive`, and `eps=1e-5` |
 | Inputs | `input=[rows,cols]`; `style=[2*cols]` holding gamma then beta |
 | Output | `out=[rows,cols]` |
 | Mathematical semantic | per-column LayerNorm over rows, `out = gamma_c * (x - mean_c) * rsqrt(var_c + eps) + beta_c` |
 | Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
 
-<!-- l3-operator:rope-apply -->
-### `rope_apply`
+### `rope_apply` (rope family, interleaved table)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::rope_apply(ctx, input, cos, sin, out)` |
-| Inputs | `input=[batch,time,heads,head_dim]`; `cos`/`sin=[time,head_dim]` |
+| Rust API | `ops::rope::apply_interleaved_table(ctx, input, cos, sin, out)` |
+| Inputs | `input=[batch,time,heads,head_dim]` (F32/F16/BF16); `cos`/`sin` tables of at least `time*head_dim` |
 | Output | `out`, the shape of `input` |
 | Mathematical semantic | interleaved rotary embedding over adjacent `(2p, 2p+1)` pairs using the pair's own `cos`/`sin` entry |
 | Constraints | every product is rounded to the tensor dtype before the final add or subtract, so the result never depends on FP16/BF16 fused-contract behavior |
 | Reference test | `layer_norm_linear_rope_attention_match_reference` |
 
-<!-- l3-operator:sinusoidal-embedding -->
-### `sinusoidal_embedding`
+### `sinusoidal_embedding_table` (embedding family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::sinusoidal_embedding(ctx, times, output, scale, max_period)` |
-| Inputs | `times=[rows]`; `out=[rows,width]` with `width>=4` and even |
+| Rust API | `ops::embedding::sinusoidal_embedding_table(ctx, times, output, scale, max_period)` |
+| Inputs | `times=[rows]`; `out=[rows,width]` with `width>=4` and even, F32/F16/BF16 |
 | Output | caller-owned `out` |
-| Mathematical semantic | `angle = (scale*times[row]) * exp(-(col % (width/2)) * ln(max_period)/(width/2-1))`; the first half of each row is `sin(angle)` and the second half `cos(angle)` |
+| Mathematical semantic | `angle = (scale*times[row]) * exp(-(col % (width/2)) * ln(max_period)/(width/2-1))`; the product `scale*times[row]` is rounded to the storage dtype before the sweep; the first half of each row is `sin(angle)` and the second half `cos(angle)` |
 | Constraints | `scale` is finite and `max_period>1` |
 | Reference test | model-level: the official-capture CFM time embedding comparison |
 
-<!-- l3-operator:mean-rows -->
-### `mean_rows`
+### `mean_rows` (elementwise family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::mean_rows(ctx, input, out)` |
-| Inputs | `input=[rows,cols]` |
+| Rust API | `ops::elementwise::mean_rows(ctx, input, out)` |
+| Inputs | `input=[rows,cols]`, F32/F16/BF16 |
 | Output | `out=[1,cols]` |
-| Mathematical semantic | per-column mean over rows |
+| Mathematical semantic | per-column mean over rows, summed sequentially in FP32 |
 | Reference test | model-level: the official-capture SoVITS encoder comparison |
 
-<!-- l3-operator:argmax-rows -->
-### `argmax_rows`
+### `argmax_rows` (elementwise family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::argmax_rows(ctx, logits, index)` |
-| Inputs | `logits=[rows,cols]` |
+| Rust API | `ops::elementwise::argmax_rows(ctx, logits, index)` |
+| Inputs | `logits=[rows,cols]`, F32/F16/BF16 |
 | Output | I32 `index=[rows]` |
 | Mathematical semantic | per-row argmax with first-index tie breaking |
 | Reference test | model-level: `hubert` codebook assignment inside the official capture replay |
 
-<!-- l3-operator:write-kv-cache-token -->
-### `write_kv_cache_token`
+### `write_kv_cache_token` (cache family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::write_kv_cache_token(ctx, input, cache, meta)` |
+| Rust API | `ops::cache::write_kv_cache_token(ctx, input, cache, meta)` |
 | Inputs | `input=[1,1,heads,head_dim]`; `cache=[1,capacity,heads,head_dim]`; a `KvCacheDecodeMeta` whose second word is the write row |
 | Output | `cache` updated in place |
 | Mathematical semantic | copy the token into cache row `meta[1]` |
 | Constraints | F16 or BF16 with both tensors agreeing; the write row is device state, and a row at or past `capacity` writes nothing, mirroring the clamp `kv_cache_attention` applies to the same metadata |
 | Reference test | model-level: the dynamic decode-graph replay tests write and then attend over the same cache |
 
-<!-- l3-operator:fill-zero -->
-### `fill_zero`
+### `fill_zero` (elementwise family)
 
 | Item | Contract |
 | --- | --- |
-| Rust API | `ops::tts::fill_zero(ctx, tensor)` |
-| Inputs | any nonempty supported tensor |
-| Output | the same tensor zeroed in place |
+| Rust API | `ops::elementwise::fill_zero(ctx, tensor)` |
+| Inputs | any nonempty F32/F16/BF16/I32/I8 tensor |
+| Output | the same tensor zeroed in place (memset) |
 | Mathematical semantic | write zero to every element |
 | Reference test | model-level: exercised by every decode and capture-replay test that starts from a zeroed buffer |
+
+### `exponential_race_sample` (sampling family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::sampling::exponential_race_sample(ctx, ExponentialRaceArgs { logits, seen, output, seed, step, top_k, temperature, repetition_penalty })` |
+| Inputs | `logits=[1,vocab]` F16 or BF16 with `vocab <= 2048`; `seen`: one byte flag per entry (`I8`); `output`: four `I32` words; scalar `seed`, `step`, `top_k <= 128`, `temperature > 0`, `repetition_penalty` |
+| Output | `output = [sampled, adjusted_argmax, status, 0]`; `seen` gains a flag on the sampled token; status 0 ok, 1 filtered logits invalid, 2 probability mass invalid |
+| Mathematical semantic | repetition-penalized, temperature-scaled, top-k-truncated softmax probabilities raced against one Philox4x32-10 exponential per candidate; winner maximizes FP16(prob/noise), strict greater with lowest-index ties |
+| Constraints | replicates the reference host sampler bit for bit (FP16 rounding boundaries, sequential FP32 softmax sum, first-index tie-break, counter words `[step_lo, step_hi, elem_lo, elem_hi]`, key `[seed_lo, seed_hi]`); nucleus (`top_p < 1.0`) truncation is not covered — callers keep that on the host |
+| Reference test | model-level: `device_exponential_race_matches_host_sampler` runs the kernel against the reference sampler for 64 steps across five sampling configurations and asserts identical token sequences |
 
 ## Testing Responsibilities
 

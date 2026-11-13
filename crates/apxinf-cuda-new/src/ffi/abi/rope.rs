@@ -222,6 +222,18 @@ mod fixed_launchers {
             eps: f32,
             stream: cudaStream_t,
         ) -> cudaError_t;
+        pub(crate) fn apxinf_rope_apply_interleaved_table(
+            input: *const c_void,
+            cos_values: *const c_void,
+            sin_values: *const c_void,
+            output: *mut c_void,
+            tokens: i64,
+            time: i64,
+            heads: i64,
+            head_dim: i64,
+            dtype: u32,
+            stream: cudaStream_t,
+        ) -> cudaError_t;
     }
 }
 pub(crate) use fixed_launchers::*;

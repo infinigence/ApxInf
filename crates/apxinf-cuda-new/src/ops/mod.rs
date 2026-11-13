@@ -16,7 +16,6 @@ pub mod quantization;
 pub mod relative_attention;
 pub mod rope;
 pub mod sampling;
-pub mod tts;
 pub(crate) mod validation;
 
 // Keep these crate-private aliases while graph/workspace and unit tests still
@@ -88,8 +87,11 @@ pub use rope::{
     GroupedQkvRopeArgs, MropeCacheArgs, MultimodalRopeArgs, QkvCacheRopeArgs, RopeArgs,
     RopeSemantic,
 };
-pub use sampling::{argmax, ArgmaxArgs};
-pub use tts::{argmax_rows, sinusoidal_embedding, write_kv_cache_token};
+pub use sampling::{argmax, exponential_race_sample, ArgmaxArgs, ExponentialRaceArgs,
+    EXPONENTIAL_RACE_MAX_TOP_K, EXPONENTIAL_RACE_MAX_VOCAB};
+pub use cache::write_kv_cache_token;
+pub use elementwise::{argmax_rows, fill_zero, mean_rows};
+pub use embedding::sinusoidal_embedding_table;
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(

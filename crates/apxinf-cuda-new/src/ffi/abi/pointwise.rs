@@ -3,7 +3,7 @@ use std::ffi::c_void;
 pub(crate) use super::types::CudaStream;
 use super::types::Runtime;
 
-pub(crate) const SPEC_VERSION: u32 = 2;
+pub(crate) const SPEC_VERSION: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -14,6 +14,9 @@ pub(crate) struct Spec {
     pub output_dtype: u32,
     pub activation: u32,
     pub has_bias: u32,
+    /// Only meaningful for [`PointwiseSemantic::BiasActivation`]; see
+    /// `apxinf_pointwise_bias_rounding_t`.
+    pub bias_rounding: u32,
     pub input_alignment: u32,
     pub secondary_alignment: u32,
     pub bias_alignment: u32,
@@ -36,6 +39,8 @@ pub(crate) struct Bindings {
     pub scales: *mut c_void,
     pub stream: CudaStream,
     pub dt: f32,
+    /// LeakyReLU negative slope; unused elsewhere.
+    pub negative_slope: f32,
     pub output_scale: f32,
 }
 

@@ -2,7 +2,7 @@
 
 use apxinf_core::{DType, Error, Result, Tensor};
 use apxinf_cuda_new::ops::{
-    self, tts, AttentionArgs, BiasOrder, Conv1dAccumulation, Conv1dArgs, Conv1dSemantic, GemmArgs,
+    self, rope, AttentionArgs, BiasOrder, Conv1dAccumulation, Conv1dArgs, Conv1dSemantic, GemmArgs,
     NormArgs, PointwiseArgs, PointwiseSemantic, RelativeAttentionArgs, ResidualAddArgs,
     WeightVersion,
 };
@@ -340,7 +340,17 @@ pub(crate) fn residual_add_bias(
     let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
     let residual = residual.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
     let hidden = alloc(ctx, &[rows, cols])?;
-    tts::residual_add_bias(ctx, &flat, bias, &residual, &hidden)?;
+    ops::residual_add(
+        ctx,
+        ops::ResidualAddArgs {
+            input: &flat,
+            bias: Some(bias),
+            residual: &residual,
+            gate: None,
+            hidden: &hidden,
+            bias_order: BiasOrder::BiasThenResidual,
+        },
+    )?;
     hidden.reshape(apxinf_core::Shape::new(dims))
 }
 
@@ -411,8 +421,10 @@ pub(crate) fn affine(
     let combined = combined.reshape(apxinf_core::Shape::new(vec![2 * cols]))?;
     let rows = input.numel() / cols;
     let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
-    let out = alloc(ctx, &[rows, cols])?;
-    tts::affine(ctx, &flat, &combined, &out)?;
+    let mut out = alloc(ctx, &[rows, cols])?;
+    let mut args = ops::PointwiseArgs::new(ops::PointwiseSemantic::Affine, &flat, &mut out);
+    args.bias = Some(&combined);
+    ops::pointwise(ctx, args)?;
     out.reshape(apxinf_core::Shape::new(dims))
 }
 
@@ -420,7 +432,7 @@ fn activation(
     ctx: &Context,
     input: &Tensor,
     bias: Option<&Tensor>,
-    activation: tts::TtsActivation,
+    activation: ops::PointwiseActivation,
     round_bias: bool,
 ) -> Result<Tensor> {
     let dims = input.shape().dims().to_vec();
@@ -429,35 +441,56 @@ fn activation(
         .ok_or_else(|| Error::Other("activation needs a rank".into()))?;
     let rows = input.numel() / cols;
     let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
-    let out = alloc(ctx, &[rows, cols])?;
-    tts::bias_activation(ctx, &flat, bias, &out, activation, round_bias)?;
+    let mut out = alloc(ctx, &[rows, cols])?;
+    // The speech reference hard-codes the 0.1 leaky slope; the other
+    // activations ignore the binding.
+    let negative_slope = match activation {
+        ops::PointwiseActivation::LeakyReluOnePercent => 0.01,
+        _ => 0.1,
+    };
+    let mut args = ops::PointwiseArgs::new(
+        ops::PointwiseSemantic::BiasActivation,
+        &flat,
+        &mut out,
+    );
+    args.bias = bias;
+    args.activation = activation;
+    args.bias_rounding = round_bias;
+    args.negative_slope = negative_slope;
+    ops::pointwise(ctx, args)?;
     out.reshape(apxinf_core::Shape::new(dims))
 }
 
 pub(crate) fn gelu_exact(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::GeluExact, false)
+    activation(ctx, input, None, ops::PointwiseActivation::GeluExact, false)
 }
 
 pub(crate) fn mish(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Mish, false)
+    activation(ctx, input, None, ops::PointwiseActivation::Mish, false)
 }
 
 pub(crate) fn leaky_relu(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::LeakyRelu, false)
+    activation(ctx, input, None, ops::PointwiseActivation::LeakyRelu, false)
 }
 
 /// Adds `bias`, rounds the sum to the activation dtype, then applies
 /// leaky-relu (slope 0.1). One launch reproduces the value a bias-applying
 /// producer writes and the following activation reads.
 pub(crate) fn leaky_relu_bias(ctx: &Context, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, Some(bias), tts::TtsActivation::LeakyRelu, true)
+    activation(
+        ctx,
+        input,
+        Some(bias),
+        ops::PointwiseActivation::LeakyRelu,
+        true,
+    )
 }
 
 /// Adds `bias` to `input` and rounds the sum to the activation dtype. A direct
 /// convolution defers its bias, so a trace point sitting right after one has to
 /// reconstruct the value the ordinary path would have written into that buffer.
 pub(crate) fn add_bias_rounded(ctx: &Context, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, Some(bias), tts::TtsActivation::None, true)
+    activation(ctx, input, Some(bias), ops::PointwiseActivation::None, true)
 }
 
 pub(crate) fn leaky_relu_one_percent(ctx: &Context, input: &Tensor) -> Result<Tensor> {
@@ -465,7 +498,7 @@ pub(crate) fn leaky_relu_one_percent(ctx: &Context, input: &Tensor) -> Result<Te
         ctx,
         input,
         None,
-        tts::TtsActivation::LeakyReluOnePercent,
+        ops::PointwiseActivation::LeakyReluOnePercent,
         false,
     )
 }
@@ -488,8 +521,16 @@ pub(crate) fn tanh_gate(
         Some(tensor) => Some(tensor.reshape(apxinf_core::Shape::new(vec![rows, cols]))?),
         None => None,
     };
-    let out = alloc(ctx, &[rows, cols / 2])?;
-    tts::tanh_sigmoid_gate(ctx, &flat, secondary_flat.as_ref(), &out)?;
+    let mut out = alloc(ctx, &[rows, cols / 2])?;
+    let mut args = ops::PointwiseArgs::new(
+        ops::PointwiseSemantic::TanhSigmoidGate,
+        &flat,
+        &mut out,
+    );
+    if let Some(tensor) = &secondary_flat {
+        args.secondary = Some(tensor);
+    }
+    ops::pointwise(ctx, args)?;
     let mut out_dims = dims.clone();
     *out_dims
         .last_mut()
@@ -505,8 +546,14 @@ pub(crate) fn glu_separate(ctx: &Context, first: &Tensor, second: &Tensor) -> Re
     let rows = first.numel() / cols;
     let flat_first = first.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
     let flat_second = second.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
-    let out = alloc(ctx, &[rows, cols])?;
-    tts::glu_separate(ctx, &flat_first, &flat_second, &out)?;
+    let mut out = alloc(ctx, &[rows, cols])?;
+    let mut args = ops::PointwiseArgs::new(
+        ops::PointwiseSemantic::GluSeparate,
+        &flat_first,
+        &mut out,
+    );
+    args.secondary = Some(&flat_second);
+    ops::pointwise(ctx, args)?;
     out.reshape(apxinf_core::Shape::new(dims))
 }
 
@@ -528,8 +575,19 @@ pub(crate) fn column_norm(
         &bias.reshape(apxinf_core::Shape::new(vec![1, cols]))?,
     )?;
     let style = style.reshape(apxinf_core::Shape::new(vec![2 * cols]))?;
-    let out = alloc(ctx, &[rows, cols])?;
-    tts::column_norm(ctx, &flat, &style, &out, 1e-5)?;
+    let mut out = alloc(ctx, &[rows, cols])?;
+    ops::norm::norm(
+        ctx,
+        ops::NormArgs {
+            input: &flat,
+            output: Some(&out),
+            kind: ops::NormKind::ColumnLayer,
+            affine: ops::Affine::Adaptive { style: &style },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            eps: 1e-5,
+        },
+    )?;
     out.reshape(apxinf_core::Shape::new(dims))
 }
 
@@ -546,8 +604,19 @@ pub(crate) fn grn(ctx: &Context, input: &Tensor, gamma: &Tensor, beta: &Tensor) 
         &beta.reshape(apxinf_core::Shape::new(vec![1, cols]))?,
     )?;
     let style = style.reshape(apxinf_core::Shape::new(vec![2 * cols]))?;
-    let out = alloc(ctx, &[rows, cols])?;
-    tts::grn(ctx, &flat, &style, &out)?;
+    let mut out = alloc(ctx, &[rows, cols])?;
+    ops::norm::norm(
+        ctx,
+        ops::NormArgs {
+            input: &flat,
+            output: Some(&out),
+            kind: ops::NormKind::Grn,
+            affine: ops::Affine::Adaptive { style: &style },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            eps: 0.0,
+        },
+    )?;
     out.reshape(apxinf_core::Shape::new(dims))
 }
 
@@ -790,20 +859,20 @@ pub(crate) fn rope_apply(
 ) -> Result<Tensor> {
     let dims = input.shape().dims().to_vec();
     let out = alloc(ctx, &dims)?;
-    tts::rope_apply(ctx, input, cos, sin, &out)?;
+    rope::apply_pair_table(ctx, input, cos, sin, &out)?;
     Ok(out)
 }
 
 pub(crate) fn add_bias(ctx: &Context, input: &Tensor, bias: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, Some(bias), tts::TtsActivation::None, false)
+    activation(ctx, input, Some(bias), ops::PointwiseActivation::None, false)
 }
 
 pub(crate) fn relu(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Relu, false)
+    activation(ctx, input, None, ops::PointwiseActivation::Relu, false)
 }
 
 pub(crate) fn silu(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Silu, false)
+    activation(ctx, input, None, ops::PointwiseActivation::Silu, false)
 }
 
 /// Zeroed storage with `input`'s shape.
@@ -812,7 +881,7 @@ pub(crate) fn silu(ctx: &Context, input: &Tensor) -> Result<Tensor> {
 /// previous graph left there, so the accumulator has to be cleared explicitly.
 pub(crate) fn zeros_like(ctx: &Context, input: &Tensor) -> Result<Tensor> {
     let out = alloc(ctx, input.shape().dims())?;
-    tts::fill_zero(ctx, &out)?;
+    ops::fill_zero(ctx, &out)?;
     Ok(out)
 }
 
@@ -824,16 +893,16 @@ pub(crate) fn mean_rows(ctx: &Context, input: &Tensor) -> Result<Tensor> {
     let rows = input.numel() / cols;
     let flat = input.reshape(apxinf_core::Shape::new(vec![rows, cols]))?;
     let out = alloc(ctx, &[1, cols])?;
-    tts::mean_rows(ctx, &flat, &out)?;
+    ops::mean_rows(ctx, &flat, &out)?;
     out.reshape(apxinf_core::Shape::new(vec![cols]))
 }
 
 pub(crate) fn fill_zero(ctx: &Context, tensor: &Tensor) -> Result<()> {
-    tts::fill_zero(ctx, tensor)
+    ops::fill_zero(ctx, tensor)
 }
 
 pub(crate) fn gelu_tanh(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Gelu, false)
+    activation(ctx, input, None, ops::PointwiseActivation::Gelu, false)
 }
 
 pub(crate) fn euler_update(
@@ -858,7 +927,7 @@ pub(crate) fn euler_update(
 }
 
 pub(crate) fn tanh(ctx: &Context, input: &Tensor) -> Result<Tensor> {
-    activation(ctx, input, None, tts::TtsActivation::Tanh, false)
+    activation(ctx, input, None, ops::PointwiseActivation::Tanh, false)
 }
 
 pub(crate) fn sync(ctx: &Context) -> Result<()> {

@@ -162,3 +162,73 @@ pub fn lookup_into(
     };
     check_cuda(status)
 }
+
+/// Reference sinusoidal table from scalar `times`, matching the speech
+/// reference's `sin`-then-`cos` column layout. Unlike [`sinusoidal`], which
+/// takes F32 positions, this keeps `times` in the storage dtype and rounds
+/// `time * scale` to it before the frequency sweep — bit-identical to the
+/// legacy kernel this replaces.
+///
+/// `max_period` derives the log frequency step exactly as the reference
+/// does: `ln(max_period) / (width / 2 - 1)`.
+pub fn sinusoidal_embedding_table(
+    ctx: &CudaContext,
+    times: &Tensor,
+    output: &Tensor,
+    scale: f32,
+    max_period: f64,
+) -> Result<()> {
+    use crate::ops::validation::check_cuda;
+
+    fn invalid(message: impl Into<String>) -> Error {
+        Error::Other(message.into())
+    }
+    fn dtype_code(dtype: DType) -> Result<u32> {
+        match dtype {
+            DType::F32 => Ok(0),
+            DType::F16 => Ok(1),
+            DType::BF16 => Ok(2),
+            _ => Err(invalid("sinusoidal table supports F32, F16, and BF16")),
+        }
+    }
+    let dims = output.shape().dims().to_vec();
+    if dims.len() != 2
+        || dims[0] == 0
+        || dims[1] < 4
+        || dims[1] % 2 != 0
+        || times.shape().dims() != [dims[0]]
+        || !scale.is_finite()
+        || !max_period.is_finite()
+        || max_period <= 1.0
+    {
+        return Err(invalid(
+            "invalid sinusoidal embedding geometry or frequency",
+        ));
+    }
+    let dtype = times.dtype();
+    if output.dtype() != dtype {
+        return Err(invalid("sinusoidal table dtype mismatch"));
+    }
+    let code = dtype_code(dtype)?;
+    let log_step = (max_period.ln() / (dims[1] / 2 - 1) as f64) as f32;
+    let times_buffer = CudaBuffer::from_tensor(times).map_err(Error::Cuda)?;
+    let output_buffer = CudaBuffer::from_tensor(output).map_err(Error::Cuda)?;
+    if times_buffer.len() < dims[0] * dtype.size_in_bytes()
+        || output_buffer.len() < dims[0] * dims[1] * dtype.size_in_bytes()
+    {
+        return Err(invalid("sinusoidal table storage is too small"));
+    }
+    unsafe {
+        check_cuda(crate::ffi::abi::embedding::apxinf_embedding_sinusoidal_table(
+            times_buffer.ptr(),
+            output_buffer.ptr(),
+            dims[0] as i64,
+            dims[1] as i64,
+            scale,
+            log_step,
+            code,
+            ctx.stream().handle(),
+        ))?;
+    }
+    Ok(())
+}

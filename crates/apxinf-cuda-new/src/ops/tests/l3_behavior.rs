@@ -3069,3 +3069,133 @@ fn conv1d_rejects_geometry_dtype_and_deferred_bias_violations() {
     .unwrap_err();
     assert!(error.to_string().contains("dtypes must match"), "{error}");
 }
+
+#[test]
+fn argmax_rows_picks_the_first_maximal_index_per_row() {
+    let ctx = CudaContext::new(0).unwrap();
+    let rows = 3;
+    let cols = 257;
+    let mut logits = vec![0.0f32; rows * cols];
+    // Row 0: clear winner. Row 1: tie between columns 4 and 130 — first wins.
+    // Row 2: all equal — column 0 wins.
+    logits[7] = 2.5;
+    logits[4] = 1.0;
+    logits[130 + cols] = 1.0;
+    logits[cols + 4] = 1.0;
+    let input = f16_tensor(0, vec![rows, cols], &logits);
+    let index = zeros_tensor(0, vec![rows], DType::I32);
+    argmax_rows(&ctx, &input, &index).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(i32_values(&index), [7, 4, 0]);
+}
+
+#[test]
+fn fill_zero_clears_every_supported_dtype() {
+    let ctx = CudaContext::new(0).unwrap();
+    for (shape, dtype, bytes_per_element) in [
+        (vec![3, 5], DType::F32, 4usize),
+        (vec![7], DType::F16, 2),
+        (vec![2, 2, 2], DType::BF16, 2),
+        (vec![9], DType::I32, 4),
+        (vec![11], DType::I8, 1),
+    ] {
+        let count: usize = shape.iter().product();
+        let bytes = vec![0xa5u8; count * bytes_per_element];
+        let buffer = bytes_tensor(0, shape, dtype, &bytes);
+        fill_zero(&ctx, &buffer).unwrap();
+        ctx.synchronize().unwrap();
+        assert!(
+            raw_bytes(&buffer).iter().all(|&byte| byte == 0),
+            "{dtype:?} fill zero left nonzero bytes"
+        );
+    }
+}
+
+#[test]
+fn write_kv_cache_token_writes_the_metadata_row_in_place() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (capacity, heads, head_dim) = (8usize, 2usize, 4usize);
+    let row_elements = heads * head_dim;
+    let cache_values: Vec<f32> = (0..capacity * row_elements)
+        .map(|index| index as f32)
+        .collect();
+    let cache = f16_tensor(0, vec![1, capacity, heads, head_dim], &cache_values);
+    let token_values: Vec<f32> = (0..row_elements).map(|index| 100.0 + index as f32).collect();
+    let input = f16_tensor(0, vec![1, 1, heads, head_dim], &token_values);
+    let meta = KvCacheDecodeMeta::new(0, capacity).unwrap();
+    meta.update(6, 5).unwrap();
+    write_kv_cache_token(&ctx, &input, &cache, &meta).unwrap();
+    ctx.synchronize().unwrap();
+
+    let after = f16_values(&cache);
+    let written: Vec<f32> = after[5 * row_elements..6 * row_elements].to_vec();
+    assert_eq!(written, token_values, "meta row 5 must receive the token");
+    for row in 0..capacity {
+        if row == 5 {
+            continue;
+        }
+        let original: Vec<f32> = cache_values[row * row_elements..(row + 1) * row_elements].to_vec();
+        assert_eq!(
+            &after[row * row_elements..(row + 1) * row_elements],
+            &original[..],
+            "row {row} must stay untouched"
+        );
+    }
+}
+
+#[test]
+fn interleaved_table_rope_rotates_adjacent_pairs_with_f16_boundaries() {
+    // The speech CFM decoder's table convention: tables are [time, head_dim]
+    // whose even entry (and its odd duplicate) drives the rotation of the
+    // matching element pair. The wrapper must expand one thread per (row,
+    // pair) over batch * time rows -- not per element -- so the launch covers
+    // exactly the activation.
+    let ctx = CudaContext::new(0).unwrap();
+    let (batch, time, heads, head_dim) = (2usize, 3usize, 2usize, 4usize);
+    let rows = batch * time * heads;
+    let input: Vec<f32> = (0..rows * head_dim)
+        .map(|index| ((index % 17) as f32 - 8.0) * 0.25)
+        .collect();
+    let mut cos_table = Vec::with_capacity(time * head_dim);
+    let mut sin_table = Vec::with_capacity(time * head_dim);
+    for t in 0..time {
+        for pair in 0..head_dim / 2 {
+            let c = (0.125 * (t as f32 + 1.0) + 0.03125 * pair as f32).cos();
+            let s = (0.125 * (t as f32 + 1.0) + 0.03125 * pair as f32).sin();
+            cos_table.push(c);
+            cos_table.push(c);
+            sin_table.push(s);
+            sin_table.push(s);
+        }
+    }
+    let input_tensor = f16_tensor(0, vec![batch, time, heads, head_dim], &input);
+    let cos_tensor = f16_tensor(0, vec![time, head_dim], &cos_table);
+    let sin_tensor = f16_tensor(0, vec![time, head_dim], &sin_table);
+    let mut output = zeros_tensor(0, vec![batch, time, heads, head_dim], DType::F16);
+
+    rope::apply_pair_table(&ctx, &input_tensor, &cos_tensor, &sin_tensor, &mut output).unwrap();
+    ctx.synchronize().unwrap();
+
+    let round16 = |value: f32| f16::from_f32(value).to_f32();
+    let actual = f16_values(&output);
+    for b in 0..batch {
+        for t in 0..time {
+            for h in 0..heads {
+                for pair in 0..head_dim / 2 {
+                    let first = ((b * time + t) * heads + h) * head_dim + 2 * pair;
+                    let c = round16(cos_table[t * head_dim + 2 * pair] as f64 as f32);
+                    let s = round16(sin_table[t * head_dim + 2 * pair] as f64 as f32);
+                    let x1 = round16(input[first]);
+                    let x2 = round16(input[first + 1]);
+                    let expected_first = round16(round16(x1 * c) - round16(x2 * s));
+                    let expected_second = round16(round16(x2 * c) + round16(x1 * s));
+                    assert_eq!(
+                        (actual[first], actual[first + 1]),
+                        (expected_first, expected_second),
+                        "row ({b},{t},{h}) pair {pair}"
+                    );
+                }
+            }
+        }
+    }
+}
