@@ -18,7 +18,8 @@
 use std::sync::Arc;
 
 use apxinf_core::{DType, Error, Result, Tensor};
-use apxinf_hip::native::{self, Activation, AttentionGeometry, HipArena, PreparedRowIndices};
+use apxinf_hip::native::{self, Activation, AttentionGeometry, AttentionKernel, HipArena,
+    PreparedRowIndices};
 use apxinf_hip::HipContext;
 
 use crate::hip_gr00t::config::Gr00tConfig;
@@ -420,6 +421,8 @@ fn vl_block(
             kv_tokens: tokens,
             causal_query_start: None,
         },
+        AttentionKernel::Ck,
+        None,
         &attended,
     )?;
 
@@ -821,7 +824,7 @@ fn dit_block(
     };
     match &projection {
         super::qkv::QkvProjection::Separate(q, k, v) => {
-            native::attention(ctx, q, k, v, &geometry, &attended)?
+            native::attention(ctx, q, k, v, &geometry, AttentionKernel::Ck, None, &attended)?
         }
         super::qkv::QkvProjection::Packed(packed) => {
             // The self-attending block projects K and V from the same

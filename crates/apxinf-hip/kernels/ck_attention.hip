@@ -48,8 +48,9 @@ using namespace apxinf_hip;
 
 // Returned when no vendored instance covers the call. The caller falls back to
 // apxinf's own kernel, which is correct for every geometry; this is a routing
-// outcome, not a failure.
-constexpr int kUnsupported = kInvalidArgument;
+// outcome, not a failure. It is a distinct code from `kInvalidArgument` so the
+// Rust side can tell "fall back" from "report an error".
+constexpr int kUnsupported = kNoCkInstance;
 
 // What the generated set can dispatch. The head-dim rule is CK's own, from
 // `generated/fmha_fwd_api.cpp`: the 128 tile takes `hdim <= 128`, and within
@@ -199,6 +200,119 @@ extern "C" int apxinf_hip_ck_attention(int dtype, const void* q, const void* k,
   if (elapsed < 0.0f) {
     // No instance for this geometry. Whatever CK did while deciding may have
     // left a sticky error; clear it for the same reason as above.
+    (void)hipGetLastError();
+    return kUnsupported;
+  }
+  return last_launch_status();
+}
+
+// `out = softmax(q k^T * scale) v` through CK's split-KV forward: the keys are
+// split across `num_splits` workgroups per query tile and combined, which pays
+// off when few query rows face many keys — one 16-row query tile per head
+// cannot fill the GPU. pi05's action expert (10 queries over 532 keys) is the
+// caller this exists for; 4 splits measured fastest on gfx1151.
+//
+// The partial log-sum-exps and outputs land in caller-provided F32 scratch:
+//   lse_acc  batch * q_heads * num_splits * q_tokens            floats
+//   o_acc    batch * q_heads * num_splits * q_tokens * head_dim floats
+// The Rust side sizes and aligns this; here it is two pointers.
+//
+// q and out are [batch, q_tokens, q_heads, head_dim] contiguous; k and v
+// follow the same cache layout contract as `apxinf_hip_ck_attention`. The
+// vendored split-KV instances are unmasked, which is why this entry has no
+// mask parameter: a causal call belongs on the fused entry or apxinf's kernel.
+// 128 is CK's own split ceiling (its `num_splits_heuristic`); empty trailing
+// splits are handled by the combine kernel, so `kv_tokens` is not a bound.
+extern "C" int apxinf_hip_ck_attention_splitkv(
+    int dtype, const void* q, const void* k, const void* v, void* out, int batch, int q_tokens,
+    int q_heads, int kv_heads, int head_dim, int kv_tokens, long long kv_batch_stride,
+    long long kv_token_stride, int num_splits, void* lse_acc, void* o_acc, float scale,
+    void* stream) {
+  if (dtype != kDTypeBF16) return kInvalidArgument;
+  if (batch <= 0 || q_tokens <= 0 || q_heads <= 0 || kv_heads <= 0 ||
+      q_heads % kv_heads != 0 || head_dim <= 0 || kv_tokens <= 0 || num_splits < 1 ||
+      num_splits > 128 || lse_acc == nullptr || o_acc == nullptr) {
+    return kInvalidArgument;
+  }
+  if (kv_token_stride < static_cast<long long>(kv_heads) * head_dim) return kInvalidArgument;
+  // CK's `index_t` is 32-bit; see the fused entry for why a stride that does
+  // not fit is a routing miss rather than an error.
+  const auto fits_int32 = [](long long v) {
+    return v >= 0 && v <= static_cast<long long>(std::numeric_limits<int>::max());
+  };
+  if (!fits_int32(kv_batch_stride) || !fits_int32(kv_token_stride) ||
+      !fits_int32(static_cast<long long>(q_tokens) * q_heads * head_dim)) {
+    return kUnsupported;
+  }
+
+  fmha_fwd_splitkv_traits traits{};
+  traits.hdim_q = head_dim;
+  traits.hdim_v = head_dim;
+  traits.data_type = "bf16";
+  traits.is_group_mode = false;
+  traits.is_v_rowmajor = true;
+  traits.has_logits_soft_cap = false;
+  traits.mask_type = mask_enum::no_mask;
+  traits.bias_type = bias_enum::no_bias;
+  traits.has_lse = false;
+
+  fmha_fwd_splitkv_args a{};
+  a.q_ptr = q;
+  a.k_ptr = k;
+  a.v_ptr = v;
+  a.o_ptr = out;
+  a.lse_acc_ptr = lse_acc;
+  a.o_acc_ptr = o_acc;
+  a.seqlen_q = q_tokens;
+  a.seqlen_k = kv_tokens;
+  a.batch = batch;
+  a.max_seqlen_q = q_tokens;
+  a.hdim_q = head_dim;
+  a.hdim_v = head_dim;
+  a.nhead_q = q_heads;
+  a.nhead_k = kv_heads;
+  a.num_splits = num_splits;
+  a.scale_s = scale;
+  a.scale_p = 1.0f;
+  a.scale_o = 1.0f;
+  // Strides are in elements: [batch, seq, head, dim] with dim innermost. q
+  // and out are contiguous here; k and v carry the caller's cache strides.
+  a.stride_q = q_heads * head_dim;
+  a.stride_k = static_cast<ck_tile::index_t>(kv_token_stride);
+  a.stride_v = static_cast<ck_tile::index_t>(kv_token_stride);
+  a.stride_o = q_heads * head_dim;
+  a.nhead_stride_q = head_dim;
+  a.nhead_stride_k = head_dim;
+  a.nhead_stride_v = head_dim;
+  a.nhead_stride_o = head_dim;
+  a.batch_stride_q = q_tokens * q_heads * head_dim;
+  a.batch_stride_k = static_cast<ck_tile::index_t>(kv_batch_stride);
+  a.batch_stride_v = static_cast<ck_tile::index_t>(kv_batch_stride);
+  a.batch_stride_o = q_tokens * q_heads * head_dim;
+  a.window_size_left = -1;
+  a.window_size_right = -1;
+  a.mask_type = static_cast<ck_tile::index_t>(mask_enum::no_mask);
+  // Partial results: [batch, q_heads, num_splits, q_tokens(, head_dim)], F32.
+  a.stride_o_acc = head_dim;
+  a.split_stride_lse_acc = q_tokens;
+  a.split_stride_o_acc = q_tokens * head_dim;
+  a.nhead_stride_lse_acc = num_splits * q_tokens;
+  a.nhead_stride_o_acc = num_splits * q_tokens * head_dim;
+  a.batch_stride_lse_acc = q_heads * num_splits * q_tokens;
+  a.batch_stride_o_acc = q_heads * num_splits * q_tokens * head_dim;
+
+  // `time_kernel = false`: no events, no synchronization. A negative duration
+  // is a routing outcome, and an exception is caught for the same reason as
+  // in the fused entry — it must not unwind through `extern "C"` into Rust.
+  const ck_tile::stream_config config{static_cast<hipStream_t>(stream), false};
+  float elapsed;
+  try {
+    elapsed = fmha_fwd_splitkv(traits, a, config);
+  } catch (...) {
+    (void)hipGetLastError();
+    return kUnsupported;
+  }
+  if (elapsed < 0.0f) {
     (void)hipGetLastError();
     return kUnsupported;
   }

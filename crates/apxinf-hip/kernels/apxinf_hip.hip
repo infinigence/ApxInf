@@ -980,7 +980,8 @@ extern "C" int apxinf_hip_graph_destroy(void* exec) {
 // present. Without it the symbols still have to exist, or the crate fails to
 // link rather than falling back: `native::attention` is written to continue on
 // apxinf's own kernel whenever CK reports that it cannot serve a call, and
-// "not built in" is one of those cases.
+// "not built in" is one of those cases — which is why the stubs return
+// `kNoCkInstance`, the routing-miss code, rather than an error.
 
 #if !APXINF_HIP_HAS_CK
 
@@ -988,7 +989,12 @@ extern "C" int apxinf_hip_ck_attention_supported(int, int, int, int, int) { retu
 extern "C" int apxinf_hip_ck_attention(int, const void*, const void*, const void*, void*,
                                        int, int, int, int, int, int, long long, long long,
                                        long long, float, int, void*) {
-  return kInvalidArgument;
+  return kNoCkInstance;
+}
+extern "C" int apxinf_hip_ck_attention_splitkv(int, const void*, const void*, const void*, void*,
+                                               int, int, int, int, int, int, long long,
+                                               long long, int, void*, void*, float, void*) {
+  return kNoCkInstance;
 }
 
 #endif  // !APXINF_HIP_HAS_CK

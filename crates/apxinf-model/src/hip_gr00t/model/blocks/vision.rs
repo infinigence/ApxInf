@@ -17,7 +17,8 @@
 use std::sync::Arc;
 
 use apxinf_core::{DType, Error, Result, Tensor};
-use apxinf_hip::native::{self, Activation, AttentionGeometry, HipArena, HipDeviceBytes};
+use apxinf_hip::native::{self, Activation, AttentionGeometry, AttentionKernel, HipArena,
+    HipDeviceBytes};
 use apxinf_hip::HipContext;
 
 use crate::hip_gr00t::config::Qwen3VLConfig;
@@ -250,6 +251,8 @@ fn vision_block(
             kv_tokens: segment,
             causal_query_start: None,
         },
+        AttentionKernel::Ck,
+        None,
         &attended,
     )?;
 

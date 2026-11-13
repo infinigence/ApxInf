@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use apxinf_core::{DType, Error, Result, Tensor};
 use apxinf_hip::native::{
-    self, AttentionGeometry, HipArena, HipDeviceBytes, PreparedRowIndices,
+    self, AttentionGeometry, AttentionKernel, HipArena, HipDeviceBytes, PreparedRowIndices,
 };
 use apxinf_hip::HipContext;
 
@@ -235,6 +235,9 @@ fn text_layer(
             kv_tokens: tokens,
             causal_query_start: Some(0),
         },
+        // CK where a vendored instance covers this mask, apxinf's kernel otherwise.
+        AttentionKernel::Ck,
+        None,
         &attended,
     )?;
 

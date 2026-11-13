@@ -445,7 +445,8 @@ fn ck_attention_matches_the_apxinf_kernel_where_it_is_available() {
         let reference = arena.tensor(dims.clone(), DType::BF16).unwrap();
         let before = native::attention_counts();
         let out = arena.tensor(dims, DType::BF16).unwrap();
-        native::attention(&ctx, &q, &k, &v, &geometry, &out).unwrap();
+        native::attention(&ctx, &q, &k, &v, &geometry, AttentionKernel::Ck, None, &out)
+            .unwrap();
         let after = native::attention_counts();
         if after.1 == before.1 {
             eprintln!("  {name}: CK did not serve this geometry; skipping the comparison");
@@ -527,7 +528,8 @@ fn packed_qkv_attention_matches_split_tensors_exactly() {
         let out_packed = arena.tensor(dims.clone(), DType::BF16).unwrap();
         let out_split = arena.tensor(dims, DType::BF16).unwrap();
         native::attention_qkv_packed(&ctx, &packed, width, width, &geometry, &out_packed).unwrap();
-        native::attention(&ctx, &q, &k, &v, &geometry, &out_split).unwrap();
+        native::attention(&ctx, &q, &k, &v, &geometry, AttentionKernel::Ck, None, &out_split)
+            .unwrap();
         assert_eq!(
             host(&ctx, &out_packed),
             host(&ctx, &out_split),
@@ -1364,6 +1366,7 @@ fn ck_without_an_instance_falls_back_to_the_reference_kernel() {
         kv_heads: 4,
         head_dim: 40,
         kv_tokens: 64,
+        causal_query_start: None,
     };
     let (q, qh) = input(&ctx, &[1, 12, 4, 40], 90, 2.0);
     let (k, kh) = input(&ctx, &[64, 4, 40], 91, 2.0);
@@ -1383,6 +1386,7 @@ fn default_attention_kernels_for_pi05() {
         kv_heads,
         head_dim,
         kv_tokens,
+        causal_query_start: None,
     };
     // Vision and prefix: CK flash-attention forward.
     assert_eq!(
@@ -1738,7 +1742,8 @@ fn causal_attention_masks_each_query_to_its_own_prefix() {
         let out = arena
             .tensor(vec![1, q_tokens, q_heads, head_dim], DType::BF16)
             .unwrap();
-        native::attention(&ctx, &q, &k, &v, &geometry, &out).unwrap();
+        native::attention(&ctx, &q, &k, &v, &geometry, AttentionKernel::Ck, None, &out)
+            .unwrap();
         let want = attention_reference(&qh, &kh, &vh, &geometry, kv_tokens);
         assert_close(
             &host(&ctx, &out),
@@ -1766,7 +1771,8 @@ fn causal_attention_masks_each_query_to_its_own_prefix() {
         let (v, _) = input(&ctx, &[1, 149, 8, 64], 68, 1.0);
         let out = arena.tensor(vec![1, 4, 8, 64], DType::BF16).unwrap();
         assert!(
-            native::attention(&ctx, &q, &k, &v, &geometry, &out).is_err(),
+            native::attention(&ctx, &q, &k, &v, &geometry, AttentionKernel::Ck, None, &out)
+                .is_err(),
             "causal_query_start {start} at/after the {kv_149}-key window must be rejected"
         );
     }
@@ -1795,7 +1801,7 @@ fn causal_attention_differs_from_the_unmasked_result() {
         kv_tokens: tokens,
         causal_query_start: None,
     };
-    native::attention(&ctx, &q, &k, &v, &base, &dense).unwrap();
+    native::attention(&ctx, &q, &k, &v, &base, AttentionKernel::Ck, None, &dense).unwrap();
     native::attention(
         &ctx,
         &q,
@@ -1805,6 +1811,8 @@ fn causal_attention_differs_from_the_unmasked_result() {
             causal_query_start: Some(0),
             ..base
         },
+        AttentionKernel::Ck,
+        None,
         &masked,
     )
     .unwrap();
@@ -2337,3 +2345,4 @@ fn a_panic_inside_capture_still_ends_the_capture() {
     native::rms_norm(&ctx, &a, &norm_weight, 1e-6, &out).unwrap();
     host(&ctx, &out);
 }
+

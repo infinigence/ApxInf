@@ -31,8 +31,9 @@ use apxinf_core::{DType, Error, NormalGenerator, Result, Tensor};
 
 pub use arena::HipArena;
 pub use attention::{
-    attention, attention_apxinf_for_test, attention_counts, attention_qkv_packed,
-    reset_attention_counts, AttentionGeometry,
+    attention, attention_apxinf_for_test, attention_counts, attention_kernel,
+    attention_qkv_packed, attention_scratch_elements, reset_attention_counts, AttentionGeometry,
+    AttentionKernel,
 };
 pub use elementwise::{
     add_position, bias_activation, copy_columns, copy_row_range, copy_rows, embedding,
