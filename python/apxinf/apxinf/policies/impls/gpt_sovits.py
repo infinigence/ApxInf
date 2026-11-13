@@ -644,6 +644,7 @@ class GptSovitsPolicy:
                     "text": fragment,
                     "samples": int(audio.size),
                     "duration": float(audio.size) / float(sample_rate),
+                    "complete": bool(result.get("complete", True)),
                 }
             )
         model_finished = time.perf_counter()
@@ -657,6 +658,7 @@ class GptSovitsPolicy:
             "samples": samples,
             "sample_rate": int(sample_rate or 0),
             "valid_length": int(samples.size),
+            "complete": all(fragment["complete"] for fragment in detail),
             "fragments": detail,
             "timing": {
                 "preprocess_ms": (prepared - started) * 1000.0,

@@ -41,7 +41,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
-use apxinf_model::tts_trait::{PreparedTts, TtsCacheConfig, TtsRequest, TtsSpec};
+use apxinf_model::tts_trait::{
+    GptSovitsInputs, PreparedTts, TtsCacheConfig, TtsExtension, TtsRequest, TtsSampling, TtsSpec,
+};
 use apxinf_model::{
     AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout,
     LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer,
@@ -294,8 +296,9 @@ fn schema_answer_to_python<'py>(
     result.set_item("scores", scores)?;
     Ok(result)
 }
-/// Python binding for a loaded text-to-speech runtime
-/// (`apxinf_model::tts_trait::TtsTrait`).
+/// Python binding for a loaded GPT-SoVITS V5 tts runtime: the Python policy
+/// owns the text front-end and passes phone/BERT IDs and reference features
+/// through the tts contract's typed request extension.
 #[pyclass(unsendable)]
 pub struct SpeechRunner {
     model: LoadedModel,
@@ -306,7 +309,7 @@ pub struct SpeechRunner {
 
 #[pymethods]
 impl SpeechRunner {
-    /// Load a speech checkpoint through AutoModel.
+    /// Load a tts checkpoint through AutoModel.
     #[staticmethod]
     #[pyo3(signature = (
         model_path,
@@ -329,10 +332,11 @@ impl SpeechRunner {
             autotune,
             ..LoadOptions::default()
         };
-        let model = AutoModel::load_model(device, &model_path, &options).map_err(runtime_err)?;
-        model.tts().map_err(|_| {
+        let mut model =
+            AutoModel::load_model(device, &model_path, &options).map_err(runtime_err)?;
+        model.tts_mut().map_err(|_| {
             PyValueError::new_err(format!(
-                "apxinf_py.SpeechRunner.from_pretrained: {:?} is not a speech model",
+                "apxinf_py.SpeechRunner.from_pretrained: {:?} is not a tts model",
                 model_path
             ))
         })?;
@@ -358,7 +362,7 @@ impl SpeechRunner {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn prepare(
-        &self,
+        &mut self,
         phone_count: usize,
         bert_token_count: usize,
         reference_phone_count: usize,
@@ -382,7 +386,7 @@ impl SpeechRunner {
         };
         let prepared = self
             .model
-            .tts()
+            .tts_mut()
             .map_err(runtime_err)?
             .prepare(&spec)
             .map_err(runtime_err)?;
@@ -396,9 +400,14 @@ impl SpeechRunner {
 
     /// Control conditioning reuse independently of CUDA Graph preparation.
     #[pyo3(signature = (*, prompt=true, text=true, max_text_entries=32))]
-    fn configure_cache(&self, prompt: bool, text: bool, max_text_entries: usize) -> PyResult<()> {
+    fn configure_cache(
+        &mut self,
+        prompt: bool,
+        text: bool,
+        max_text_entries: usize,
+    ) -> PyResult<()> {
         self.model
-            .tts()
+            .tts_mut()
             .map_err(runtime_err)?
             .configure_cache(TtsCacheConfig {
                 prompt,
@@ -409,16 +418,16 @@ impl SpeechRunner {
     }
 
     #[pyo3(signature = (*, reset_stats=true))]
-    fn clear_cache(&self, reset_stats: bool) -> PyResult<()> {
+    fn clear_cache(&mut self, reset_stats: bool) -> PyResult<()> {
         self.model
-            .tts()
+            .tts_mut()
             .map_err(runtime_err)?
-            .clear_cache(reset_stats);
-        Ok(())
+            .clear_cache(reset_stats)
+            .map_err(runtime_err)
     }
 
-    fn cache_info(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let info = self.model.tts().map_err(runtime_err)?.cache_info();
+    fn cache_info(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        let info = self.model.tts_mut().map_err(runtime_err)?.cache_info();
         let result = PyDict::new_bound(py);
         result.set_item("supported", info.supported)?;
         result.set_item("prompt_enabled", info.prompt_enabled)?;
@@ -465,7 +474,7 @@ impl SpeechRunner {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn synthesize<'py>(
-        &self,
+        &mut self,
         py: Python<'py>,
         phone_ids: PyReadonlyArray1<'py, u32>,
         bert_token_ids: PyReadonlyArray1<'py, u32>,
@@ -592,65 +601,83 @@ impl SpeechRunner {
             || speed_factor <= 0.0
         {
             return Err(PyValueError::new_err(
-                "invalid sampling parameters for speech synthesis",
+                "invalid sampling parameters for tts synthesis",
             ));
         }
 
+        // The policy layer already turned the text into front-end IDs, so the
+        // shared text field stays empty; the GptSovits extension carries it.
         let request = TtsRequest {
-            phone_ids,
-            bert_token_ids,
-            word2ph,
-            reference_phone_ids,
-            reference_bert_token_ids,
-            reference_word2ph,
-            reference_audio_16k,
-            reference_mel,
-            reference_spec,
+            text: "",
             seed,
-            top_k,
-            top_p,
-            temperature,
-            repetition_penalty,
-            sample_steps,
-            cfg_rate,
-            max_seconds,
-            speed_factor,
+            sampling: TtsSampling {
+                top_k: Some(top_k),
+                top_p: Some(top_p),
+                temperature: Some(temperature),
+                repetition_penalty: Some(repetition_penalty),
+                max_seconds: Some(max_seconds),
+                ..Default::default()
+            },
+            extension: TtsExtension::GptSovits(GptSovitsInputs {
+                phone_ids,
+                bert_token_ids,
+                word2ph,
+                reference_phone_ids,
+                reference_bert_token_ids,
+                reference_word2ph,
+                reference_audio_16k,
+                reference_mel,
+                reference_spec,
+                sample_steps,
+                cfg_rate,
+                speed_factor,
+            }),
         };
         // Prepared graphs contain shape-specialised SoVITS/CFM captures at the
         // native rate. A speed change alters the target frame count, so those
         // requests must use the eager runtime.
-        let audio = if (request.speed_factor - 1.0).abs() <= 1e-6 {
+        let audio = if (speed_factor - 1.0).abs() <= 1e-6 {
             if let Some(prepared) = self.prepared.borrow().as_ref() {
                 prepared.run(&request)
             } else {
-                self.model.tts().map_err(runtime_err)?.synthesize(&request)
+                self.model
+                    .tts_mut()
+                    .map_err(runtime_err)?
+                    .synthesize(&request)
             }
         } else {
-            self.model.tts().map_err(runtime_err)?.synthesize(&request)
+            self.model
+                .tts_mut()
+                .map_err(runtime_err)?
+                .synthesize(&request)
         }
         .map_err(runtime_err)?;
-        if audio.valid_length > audio.samples.len() {
+        if audio.channels != 1 {
             return Err(PyRuntimeError::new_err(format!(
-                "speech runtime returned valid_length {} for {} samples",
-                audio.valid_length,
-                audio.samples.len()
+                "tts runtime returned {} channels; SpeechRunner yields mono PCM",
+                audio.channels
             )));
         }
 
+        // `valid_length` is kept for API stability; every returned sample is
+        // valid, so it always equals `len(samples)`.
+        let valid_length = audio.samples.len();
         let result = PyDict::new_bound(py);
         result.set_item("samples", audio.samples.into_pyarray_bound(py))?;
         result.set_item("sample_rate", audio.sample_rate)?;
-        result.set_item("valid_length", audio.valid_length)?;
+        result.set_item("valid_length", valid_length)?;
+        result.set_item("complete", audio.complete)?;
         Ok(result.into())
     }
 
     #[getter]
-    fn sample_rate(&self) -> PyResult<u32> {
+    fn sample_rate(&mut self) -> PyResult<u32> {
         Ok(self
             .model
-            .tts()
+            .tts_mut()
             .map_err(runtime_err)?
             .contract()
+            .map_err(runtime_err)?
             .sample_rate)
     }
 
@@ -664,11 +691,18 @@ impl SpeechRunner {
         self.model_path.display().to_string()
     }
 
-    fn __repr__(&self) -> PyResult<String> {
+    fn __repr__(&mut self) -> PyResult<String> {
+        let sample_rate = self
+            .model
+            .tts_mut()
+            .map_err(runtime_err)
+            .and_then(|tts| tts.contract().map_err(runtime_err))
+            .map(|contract| contract.sample_rate)
+            .unwrap_or(0);
         Ok(format!(
             "SpeechRunner(device={}, sample_rate={}, path={:?})",
             self.device(),
-            self.sample_rate()?,
+            sample_rate,
             self.model_path
         ))
     }
@@ -2142,7 +2176,8 @@ impl ModelRunner {
         if let Some(limit) = max_new_tokens {
             if limit == 0 || limit > token_shape[1] {
                 return Err(PyValueError::new_err(format!(
-                    "max_new_tokens must be in 1..={}, got {limit}", token_shape[1]
+                    "max_new_tokens must be in 1..={}, got {limit}",
+                    token_shape[1]
                 )));
             }
         }

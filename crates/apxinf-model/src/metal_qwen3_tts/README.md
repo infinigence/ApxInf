@@ -2,7 +2,7 @@
 
 This Metal-specific module owns checkpoint interpretation, the generation
 schedule and per-request state for Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice. It
-implements `SpeechRuntime` with safe `apxinf-mlx` operations, without Python.
+implements `TtsTrait` with safe `apxinf-mlx` operations, without Python.
 The reference is the EngineTailor MLX parity path: mlx-audio revision
 `70f4add32911bab6f869b824864ad9f1e24dcb97` with the cast seams of EngineTailor
 `282adc1dc5af4c48ffd17ea2f41e75cc5a24b7ee`, eager, on MLX 0.32.3.
