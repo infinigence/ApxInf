@@ -266,7 +266,7 @@ fn library_versions() -> Option<(i32, i32)> {
 }
 
 /// `configs/tuning/amd/<arch>/rocm<version>-hipblaslt<version>/gemm.recipe`,
-/// resolved against the working directory first and the crate second.
+/// resolved against the working directory first and the checkout root second.
 ///
 /// The library versions are in the path because a recorded tactic does not
 /// survive either of them changing -- hipBLASLt's header says a solution index
@@ -275,17 +275,18 @@ fn library_versions() -> Option<(i32, i32)> {
 /// re-tunes, instead of reading a file that no longer means what it says. This
 /// mirrors `configs/tuning/nvidia/<family>/cuda<..>-cublas<..>/`.
 ///
-/// Two locations, in order:
+/// One relative path, two roots, in order:
 ///
-/// 1. `<cwd>/configs/tuning/amd/...` -- the machine's own autotune output,
-///    git-ignored at the root exactly like the CUDA recipe caches. Autotune
-///    writes here, so a tuned host never touches the source tree.
-/// 2. The crate's `configs/tuning/amd/...` -- the recipe measured on the
-///    validated device, committed with the code so a fresh checkout runs the
-///    tuned provider choices with no flags and no prior tuning run. Both the
-///    directory name and the `# measured-on` header still have to match the
-///    running device and libraries, so shipping it cannot mis-tune another
-///    host: it simply misses.
+/// 1. `<cwd>/configs/tuning/amd/...` -- autotune writes here. A deployed
+///    directory without the checkout keeps its own re-tuned copy; run from
+///    the checkout root this is the committed recipe itself, and a re-tune
+///    becomes a reviewable diff rather than an ignored cache.
+/// 2. The checkout root, derived from this crate's manifest -- Cargo runs
+///    tests with the crate directory as the working directory, so only this
+///    root finds the committed recipe from there. Both the directory name and
+///    the `# measured-on` header still have to match the running device and
+///    libraries, so committing it cannot mis-tune another host: it simply
+///    misses and that host stays on hipBLAS.
 fn default_recipe_path() -> Option<PathBuf> {
     let (rocm, blaslt) = library_versions()?;
     let arch = env!("APXINF_HIP_ARCH");
@@ -299,13 +300,16 @@ fn default_recipe_path() -> Option<PathBuf> {
     if relative.is_file() {
         return Some(relative);
     }
-    let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join(&relative);
-    shipped.is_file().then_some(shipped)
+    // `crates/apxinf-hip` -> the checkout root, where the recipe is committed.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2)?;
+    let committed = root.join(&relative);
+    committed.is_file().then_some(committed)
 }
 
 /// Where autotune writes when it loaded no recipe at all: the
-/// working-directory cache path, which is git-ignored at the root like the
-/// CUDA recipe caches.
+/// working-directory path. From the checkout root that is the committed
+/// recipe, so a re-tune arrives as a diff to review; from a deployed
+/// directory it is that host's own copy.
 fn writable_recipe_target() -> Option<PathBuf> {
     let (rocm, blaslt) = library_versions()?;
     let arch = env!("APXINF_HIP_ARCH");
