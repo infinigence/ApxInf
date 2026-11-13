@@ -95,7 +95,7 @@ def _load_frontend(checkpoint: Path, root: Optional[Path]):
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         str(tokenizer_dir), local_files_only=True
     )
-    # The official API defaults to cut5. Load the same segmentation module the
+    # The official webui defaults to cut5 (its HTTP API to cut1). Load the same segmentation module the
     # PyTorch pipeline uses instead of re-implementing its punctuation rules.
     segmentation = None
     if root is not None:
@@ -489,8 +489,8 @@ class GptSovitsPolicy:
             if sample_steps is None
             else sample_steps
         )
-        if steps <= 0:
-            raise ValueError("sample_steps must be positive")
+        if steps not in (1, 2, 4, 8, 16, 32):
+            raise ValueError("sample_steps must be 1, 2, 4, 8, 16 or 32")
 
         # The captured profile is fixed to one fragment's phone count, so it
         # must be prepared on exactly what infer() will synthesize.
