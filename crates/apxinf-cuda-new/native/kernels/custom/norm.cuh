@@ -504,4 +504,139 @@ __global__ void ada_gate_residual_rms_norm_quant_f16_e4m3_10x1024(
   *reinterpret_cast<uint32_t*>(normalized + row * cols + col) = output.packed;
 }
 
+/* Global response normalization. One block owns the whole [rows, cols]
+ * activation (the speech models run batch size one). style holds gamma then
+ * beta. Each intermediate is rounded to the input dtype, matching the
+ * materialized reference tensor graph. The eps 1e-6f is part of the kernel's
+ * arithmetic, not the spec eps binding. */
+template <class T>
+__global__ void grn(const T* input, const T* style, T* output, int64_t rows,
+                    int cols) {
+  extern __shared__ float column_norm[];
+  float local_sum = 0.0f;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    float lane_sum[4];
+#pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+      float partial[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      for (int64_t base = lane; base < rows; base += 16) {
+#pragma unroll
+        for (int part = 0; part < 4; ++part) {
+          const int64_t row = base + part * 4;
+          if (row < rows) {
+            const float value = to_float(input[row * cols + col]);
+            partial[part] = __fadd_rn(partial[part], __fmul_rn(value, value));
+          }
+        }
+      }
+      lane_sum[lane] = __fadd_rn(
+          __fadd_rn(__fadd_rn(partial[0], partial[1]), partial[2]), partial[3]);
+    }
+    const float sum = __fadd_rn(__fadd_rn(lane_sum[0], lane_sum[2]),
+                                __fadd_rn(lane_sum[1], lane_sum[3]));
+    const float norm = to_float(from_float<T>(sqrtf(sum)));
+    column_norm[col] = norm;
+    local_sum += norm;
+  }
+
+  __shared__ float shared_total[32];
+  float warp_sum = local_sum;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    warp_sum += __shfl_down_sync(0xFFFFFFFFu, warp_sum, offset);
+  }
+  const int warp = threadIdx.x >> 5;
+  const int lanes = (blockDim.x + 31) >> 5;
+  if ((threadIdx.x & 31) == 0) shared_total[warp] = warp_sum;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0f;
+    for (int i = 0; i < lanes; ++i) total += shared_total[i];
+    shared_total[0] = total;
+  }
+  __syncthreads();
+  const float mean = to_float(from_float<T>(to_float(from_float<T>(
+      shared_total[0] / static_cast<float>(cols))) + 1e-6f));
+
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float scale = to_float(from_float<T>(column_norm[col] / mean));
+    const float gamma = to_float(style[col]);
+    const float beta = to_float(style[cols + col]);
+    for (int64_t row = 0; row < rows; ++row) {
+      const int64_t index = row * cols + col;
+      const float value = to_float(input[index]);
+      const float normalized = to_float(from_float<T>(value * scale));
+      const float weighted = to_float(from_float<T>(gamma * normalized));
+      const float shifted = to_float(from_float<T>(weighted + beta));
+      output[index] = from_float<T>(shifted + value);
+    }
+  }
+}
+
+struct ColumnMoments {
+  float mean, m2, count;
+};
+
+__device__ inline ColumnMoments combine_column_moments(
+    ColumnMoments a, ColumnMoments b) {
+  if (a.count == 0.0f) return b;
+  if (b.count == 0.0f) return a;
+  const float delta = b.mean - a.mean;
+  const float count = a.count + b.count;
+  const float ratio = b.count / count;
+  return {a.mean + delta * ratio,
+          a.m2 + b.m2 + delta * delta * a.count * ratio, count};
+}
+
+__device__ inline ColumnMoments warp_column_moments(ColumnMoments value) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const ColumnMoments other = {
+        __shfl_down_sync(0xFFFFFFFFu, value.mean, offset),
+        __shfl_down_sync(0xFFFFFFFFu, value.m2, offset),
+        __shfl_down_sync(0xFFFFFFFFu, value.count, offset)};
+    value = combine_column_moments(value, other);
+  }
+  return value;
+}
+
+/* Per-column mean/variance over FP32 moments followed by an explicit
+ * input-dtype statistics boundary. One block per column; style holds scale
+ * then shift. */
+template <class T>
+__global__ void column_norm_input_statistics(
+    const T* input, const T* style, T* output, int64_t rows, int cols, float eps) {
+  __shared__ ColumnMoments partial[16];
+  __shared__ float scale, shift;
+  const int col = blockIdx.x;
+  ColumnMoments value = {0.0f, 0.0f, 0.0f};
+  int64_t count = 0;
+  for (int64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+    const float x = to_float(input[row * cols + col]);
+    const float delta = x - value.mean;
+    ++count;
+    const float mean = value.mean + delta / static_cast<float>(count);
+    value = {mean, value.m2 + delta * (x - mean), static_cast<float>(count)};
+  }
+  value = warp_column_moments(value);
+  if ((threadIdx.x & 31) == 0) partial[threadIdx.x / 32] = value;
+  __syncthreads();
+  if (blockDim.x > 32) {
+    value = threadIdx.x < blockDim.x / 32
+        ? partial[threadIdx.x] : ColumnMoments{0.0f, 0.0f, 0.0f};
+    if (threadIdx.x < 32) value = warp_column_moments(value);
+  }
+  if (threadIdx.x == 0) {
+    const float mean = to_float(from_float<T>(value.mean));
+    const float rounded_eps = to_float(from_float<T>(eps));
+    const float rstd = to_float(from_float<T>(
+        rsqrtf(value.m2 / value.count + rounded_eps)));
+    scale = rstd * to_float(style[col]);
+    shift = -scale * mean + to_float(style[cols + col]);
+  }
+  __syncthreads();
+  for (int64_t row = threadIdx.x; row < rows; row += blockDim.x) {
+    const int64_t index = row * cols + col;
+    output[index] = from_float<T>(scale * to_float(input[index]) + shift);
+  }
+}
+
 }  // namespace apxinf::norm::kernels

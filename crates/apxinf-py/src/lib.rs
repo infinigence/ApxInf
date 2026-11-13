@@ -27,7 +27,7 @@
 //! and a CUDA device.
 //!
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -41,10 +41,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
+use apxinf_model::tts_trait::{
+    GptSovitsInputs, PreparedTts, TtsCacheConfig, TtsExtension, TtsRequest, TtsSampling, TtsSpec,
+};
 use apxinf_model::{
-    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout, LoadOptions,
-    LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer, SyntheticWeights,
-    VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout,
+    LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer,
+    SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
@@ -293,7 +296,417 @@ fn schema_answer_to_python<'py>(
     result.set_item("scores", scores)?;
     Ok(result)
 }
+/// Python binding for a loaded GPT-SoVITS V5 tts runtime: the Python policy
+/// owns the text front-end and passes phone/BERT IDs and reference features
+/// through the tts contract's typed request extension.
+#[pyclass(unsendable)]
+pub struct SpeechRunner {
+    model: LoadedModel,
+    prepared: RefCell<Option<Box<dyn PreparedTts>>>,
+    device: Device,
+    model_path: PathBuf,
+}
 
+#[pymethods]
+impl SpeechRunner {
+    /// Load a tts checkpoint through AutoModel.
+    #[staticmethod]
+    #[pyo3(signature = (
+        model_path,
+        device="cuda:0",
+        precision="auto",
+        model_name="gpt_sovits",
+        autotune=false,
+    ))]
+    fn from_pretrained(
+        model_path: PathBuf,
+        device: &str,
+        precision: &str,
+        model_name: &str,
+        autotune: bool,
+    ) -> PyResult<Self> {
+        let device = parse_device(device)?;
+        let options = LoadOptions {
+            model_name: Some(model_name.to_owned()),
+            precision: parse_precision(precision)?,
+            autotune,
+            ..LoadOptions::default()
+        };
+        let mut model =
+            AutoModel::load_model(device, &model_path, &options).map_err(runtime_err)?;
+        model.tts_mut().map_err(|_| {
+            PyValueError::new_err(format!(
+                "apxinf_py.SpeechRunner.from_pretrained: {:?} is not a tts model",
+                model_path
+            ))
+        })?;
+        Ok(Self {
+            model,
+            prepared: RefCell::new(None),
+            device,
+            model_path,
+        })
+    }
+
+    /// Prepare fixed-shape CFM and vocoder CUDA graphs.
+    #[pyo3(signature = (
+        phone_count,
+        bert_token_count,
+        reference_phone_count,
+        reference_bert_token_count,
+        reference_audio_samples,
+        reference_frames,
+        reference_spec_frames,
+        target_frames,
+        sample_steps=4,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        &mut self,
+        phone_count: usize,
+        bert_token_count: usize,
+        reference_phone_count: usize,
+        reference_bert_token_count: usize,
+        reference_audio_samples: usize,
+        reference_frames: usize,
+        reference_spec_frames: usize,
+        target_frames: usize,
+        sample_steps: usize,
+    ) -> PyResult<()> {
+        let spec = TtsSpec {
+            phone_count,
+            bert_token_count,
+            reference_phone_count,
+            reference_bert_token_count,
+            reference_audio_samples,
+            reference_frames,
+            reference_spec_frames,
+            target_frames,
+            sample_steps,
+        };
+        let prepared = self
+            .model
+            .tts_mut()
+            .map_err(runtime_err)?
+            .prepare(&spec)
+            .map_err(runtime_err)?;
+        self.prepared.replace(Some(prepared));
+        Ok(())
+    }
+
+    fn clear_prepared(&self) {
+        self.prepared.replace(None);
+    }
+
+    /// Control conditioning reuse independently of CUDA Graph preparation.
+    #[pyo3(signature = (*, prompt=true, text=true, max_text_entries=32))]
+    fn configure_cache(
+        &mut self,
+        prompt: bool,
+        text: bool,
+        max_text_entries: usize,
+    ) -> PyResult<()> {
+        self.model
+            .tts_mut()
+            .map_err(runtime_err)?
+            .configure_cache(TtsCacheConfig {
+                prompt,
+                text,
+                max_text_entries,
+            })
+            .map_err(runtime_err)
+    }
+
+    #[pyo3(signature = (*, reset_stats=true))]
+    fn clear_cache(&mut self, reset_stats: bool) -> PyResult<()> {
+        self.model
+            .tts_mut()
+            .map_err(runtime_err)?
+            .clear_cache(reset_stats)
+            .map_err(runtime_err)
+    }
+
+    fn cache_info(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        let info = self.model.tts_mut().map_err(runtime_err)?.cache_info();
+        let result = PyDict::new_bound(py);
+        result.set_item("supported", info.supported)?;
+        result.set_item("prompt_enabled", info.prompt_enabled)?;
+        result.set_item("text_enabled", info.text_enabled)?;
+        result.set_item("prompt_entries", info.prompt_entries)?;
+        result.set_item("text_entries", info.text_entries)?;
+        result.set_item("max_text_entries", info.max_text_entries)?;
+        result.set_item("prompt_hits", info.prompt_hits)?;
+        result.set_item("prompt_misses", info.prompt_misses)?;
+        result.set_item("text_hits", info.text_hits)?;
+        result.set_item("text_misses", info.text_misses)?;
+        result.set_item("host_bytes", info.host_bytes)?;
+        result.set_item("device_bytes", info.device_bytes)?;
+        result.set_item("text_device_budget_bytes", info.text_device_budget_bytes)?;
+        Ok(result.into())
+    }
+
+    #[getter]
+    fn is_prepared(&self) -> bool {
+        self.prepared.borrow().is_some()
+    }
+
+    /// Synthesize mono PCM from canonical GPT-SoVITS inputs.
+    #[pyo3(signature = (
+        phone_ids,
+        bert_token_ids,
+        word2ph,
+        reference_phone_ids,
+        reference_bert_token_ids,
+        reference_word2ph,
+        reference_audio_16k,
+        reference_mel,
+        reference_spec,
+        *,
+        seed=0,
+        top_k=5,
+        top_p=1.0,
+        temperature=1.0,
+        repetition_penalty=1.35,
+        sample_steps=4,
+        cfg_rate=0.0,
+        max_seconds=30.0,
+        speed_factor=1.0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize<'py>(
+        &mut self,
+        py: Python<'py>,
+        phone_ids: PyReadonlyArray1<'py, u32>,
+        bert_token_ids: PyReadonlyArray1<'py, u32>,
+        word2ph: PyReadonlyArray1<'py, u32>,
+        reference_phone_ids: PyReadonlyArray1<'py, u32>,
+        reference_bert_token_ids: PyReadonlyArray1<'py, u32>,
+        reference_word2ph: PyReadonlyArray1<'py, u32>,
+        reference_audio_16k: PyReadonlyArray1<'py, f32>,
+        reference_mel: PyReadonlyArray2<'py, f32>,
+        reference_spec: PyReadonlyArray2<'py, f32>,
+        seed: u64,
+        top_k: usize,
+        top_p: f32,
+        temperature: f32,
+        repetition_penalty: f32,
+        sample_steps: usize,
+        cfg_rate: f32,
+        max_seconds: f32,
+        speed_factor: f32,
+    ) -> PyResult<PyObject> {
+        let phone_ids = phone_ids
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("phone_ids must be contiguous uint32 [phones]"))?;
+        let bert_token_ids = bert_token_ids.as_slice().map_err(|_| {
+            PyValueError::new_err("bert_token_ids must be contiguous uint32 [tokens]")
+        })?;
+        let word2ph = word2ph.as_slice().map_err(|_| {
+            PyValueError::new_err("word2ph must be contiguous uint32 [tokens_without_specials]")
+        })?;
+        let reference_phone_ids = reference_phone_ids.as_slice().map_err(|_| {
+            PyValueError::new_err("reference_phone_ids must be contiguous uint32 [phones]")
+        })?;
+        let reference_bert_token_ids = reference_bert_token_ids.as_slice().map_err(|_| {
+            PyValueError::new_err("reference_bert_token_ids must be contiguous uint32 [tokens]")
+        })?;
+        let reference_word2ph = reference_word2ph.as_slice().map_err(|_| {
+            PyValueError::new_err(
+                "reference_word2ph must be contiguous uint32 [tokens_without_specials]",
+            )
+        })?;
+        let reference_audio_16k = reference_audio_16k.as_slice().map_err(|_| {
+            PyValueError::new_err("reference_audio_16k must be contiguous float32 [samples]")
+        })?;
+        let reference_mel_shape = reference_mel.shape();
+        if reference_mel_shape.len() != 2
+            || reference_mel_shape[0] == 0
+            || reference_mel_shape[1] != 100
+        {
+            return Err(PyValueError::new_err(format!(
+                "reference_mel must have shape [frames, 100], got {reference_mel_shape:?}"
+            )));
+        }
+        let reference_spec_shape = reference_spec.shape();
+        if reference_spec_shape.len() != 2
+            || reference_spec_shape[0] == 0
+            || reference_spec_shape[1] != 704
+        {
+            return Err(PyValueError::new_err(format!(
+                "reference_spec must have shape [frames, 704], got {reference_spec_shape:?}"
+            )));
+        }
+        let reference_mel = reference_mel
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("reference_mel must be C-contiguous float32"))?;
+        let reference_spec = reference_spec
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("reference_spec must be C-contiguous float32"))?;
+
+        if phone_ids.is_empty() || reference_phone_ids.is_empty() || reference_audio_16k.is_empty()
+        {
+            return Err(PyValueError::new_err(
+                "phone IDs and reference_audio_16k must be non-empty",
+            ));
+        }
+        if bert_token_ids.len() < 3 || word2ph.len() + 2 != bert_token_ids.len() {
+            return Err(PyValueError::new_err(format!(
+                "word2ph length {} must match BERT tokens without specials ({})",
+                word2ph.len(),
+                bert_token_ids.len().saturating_sub(2)
+            )));
+        }
+        if reference_bert_token_ids.len() < 3
+            || reference_word2ph.len() + 2 != reference_bert_token_ids.len()
+        {
+            return Err(PyValueError::new_err(format!(
+                "reference_word2ph length {} must match reference BERT tokens without specials ({})",
+                reference_word2ph.len(),
+                reference_bert_token_ids.len().saturating_sub(2)
+            )));
+        }
+        let phone_sum = word2ph
+            .iter()
+            .try_fold(0usize, |sum, &count| sum.checked_add(count as usize));
+        if phone_sum != Some(phone_ids.len()) {
+            return Err(PyValueError::new_err(format!(
+                "word2ph sums to {:?}, expected {} phone IDs",
+                phone_sum,
+                phone_ids.len()
+            )));
+        }
+        let reference_phone_sum = reference_word2ph
+            .iter()
+            .try_fold(0usize, |sum, &count| sum.checked_add(count as usize));
+        if reference_phone_sum != Some(reference_phone_ids.len()) {
+            return Err(PyValueError::new_err(format!(
+                "reference_word2ph sums to {:?}, expected {} reference phone IDs",
+                reference_phone_sum,
+                reference_phone_ids.len()
+            )));
+        }
+        if top_k == 0
+            || sample_steps == 0
+            || !top_p.is_finite()
+            || !(0.0..=1.0).contains(&top_p)
+            || !temperature.is_finite()
+            || temperature <= 0.0
+            || !repetition_penalty.is_finite()
+            || repetition_penalty <= 0.0
+            || !cfg_rate.is_finite()
+            || cfg_rate < 0.0
+            || !max_seconds.is_finite()
+            || max_seconds <= 0.0
+            || !speed_factor.is_finite()
+            || speed_factor <= 0.0
+        {
+            return Err(PyValueError::new_err(
+                "invalid sampling parameters for tts synthesis",
+            ));
+        }
+
+        // The policy layer already turned the text into front-end IDs, so the
+        // shared text field stays empty; the GptSovits extension carries it.
+        let request = TtsRequest {
+            text: "",
+            seed,
+            sampling: TtsSampling {
+                top_k: Some(top_k),
+                top_p: Some(top_p),
+                temperature: Some(temperature),
+                repetition_penalty: Some(repetition_penalty),
+                max_seconds: Some(max_seconds),
+                ..Default::default()
+            },
+            extension: TtsExtension::GptSovits(GptSovitsInputs {
+                phone_ids,
+                bert_token_ids,
+                word2ph,
+                reference_phone_ids,
+                reference_bert_token_ids,
+                reference_word2ph,
+                reference_audio_16k,
+                reference_mel,
+                reference_spec,
+                sample_steps,
+                cfg_rate,
+                speed_factor,
+            }),
+        };
+        // Prepared graphs contain shape-specialised SoVITS/CFM captures at the
+        // native rate. A speed change alters the target frame count, so those
+        // requests must use the eager runtime.
+        let audio = if (speed_factor - 1.0).abs() <= 1e-6 {
+            if let Some(prepared) = self.prepared.borrow().as_ref() {
+                prepared.run(&request)
+            } else {
+                self.model
+                    .tts_mut()
+                    .map_err(runtime_err)?
+                    .synthesize(&request)
+            }
+        } else {
+            self.model
+                .tts_mut()
+                .map_err(runtime_err)?
+                .synthesize(&request)
+        }
+        .map_err(runtime_err)?;
+        if audio.channels != 1 {
+            return Err(PyRuntimeError::new_err(format!(
+                "tts runtime returned {} channels; SpeechRunner yields mono PCM",
+                audio.channels
+            )));
+        }
+
+        // `valid_length` is kept for API stability; every returned sample is
+        // valid, so it always equals `len(samples)`.
+        let valid_length = audio.samples.len();
+        let result = PyDict::new_bound(py);
+        result.set_item("samples", audio.samples.into_pyarray_bound(py))?;
+        result.set_item("sample_rate", audio.sample_rate)?;
+        result.set_item("valid_length", valid_length)?;
+        result.set_item("complete", audio.complete)?;
+        Ok(result.into())
+    }
+
+    #[getter]
+    fn sample_rate(&mut self) -> PyResult<u32> {
+        Ok(self
+            .model
+            .tts_mut()
+            .map_err(runtime_err)?
+            .contract()
+            .map_err(runtime_err)?
+            .sample_rate)
+    }
+
+    #[getter]
+    fn device(&self) -> String {
+        self.device.to_string()
+    }
+
+    #[getter]
+    fn model_path(&self) -> String {
+        self.model_path.display().to_string()
+    }
+
+    fn __repr__(&mut self) -> PyResult<String> {
+        let sample_rate = self
+            .model
+            .tts_mut()
+            .map_err(runtime_err)
+            .and_then(|tts| tts.contract().map_err(runtime_err))
+            .map(|contract| contract.sample_rate)
+            .unwrap_or(0);
+        Ok(format!(
+            "SpeechRunner(device={}, sample_rate={}, path={:?})",
+            self.device(),
+            sample_rate,
+            self.model_path
+        ))
+    }
+}
 /// Decision model runner (d3-mini, Clef, etc.). Loads via `AutoModel` and exposes
 /// encoded-prompt and schema requests through the same model handle.
 #[pyclass(unsendable)]
@@ -1763,7 +2176,8 @@ impl ModelRunner {
         if let Some(limit) = max_new_tokens {
             if limit == 0 || limit > token_shape[1] {
                 return Err(PyValueError::new_err(format!(
-                    "max_new_tokens must be in 1..={}, got {limit}", token_shape[1]
+                    "max_new_tokens must be in 1..={}, got {limit}",
+                    token_shape[1]
                 )));
             }
         }
@@ -1958,6 +2372,7 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
         apxinf_model::qwen_drive::FIXED_SCENE_TOKENS,
     )?;
     module.add_class::<ModelRunner>()?;
+    module.add_class::<SpeechRunner>()?;
     module.add_class::<DecisionRunner>()?;
     module.add_class::<PackedRgbU8>()?;
     module.add_class::<HfTokenizer>()?;

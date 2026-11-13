@@ -65,4 +65,12 @@ unsafe extern "C" {
         kv_offset: u32,
         stream: cudaStream_t,
     ) -> cudaError_t;
+    pub(crate) fn apxinf_cache_write_token(
+        input: *const c_void,
+        cache: *mut c_void,
+        meta: *const c_void,
+        capacity: i64,
+        elements: i64,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
 }

@@ -25,6 +25,13 @@ FORBIDDEN_L3_NAME = re.compile(
     r"cached_1024|cached_1536|interleaved|aot|m41)(?:_|$)"
 )
 
+# Model-domain names must not leak into the shared operator families: a
+# family is defined by its semantics, not by which model needed it. The
+# legacy per-domain families were removed for exactly this reason.
+FORBIDDEN_DOMAIN_NAME = re.compile(
+    r"(?:^|_|/)(?:tts|asr|vla|gsv|sovits|hubert|bark|vall_e|vll_e)(?:_|$|/)"
+)
+
 # Existing debt is explicit and reviewable. New entries must not be added merely
 # to make CI green: move dtype/layout/shape/implementation details into a Spec,
 # candidate config, or supports() condition. Removing an entry requires deleting
@@ -83,6 +90,18 @@ def main() -> int:
         errors.append(f"new public L3 dtype/layout/shape/provider name: {item}")
     for item in sorted(ALLOWED_L3_NAME_DEBT - forbidden):
         errors.append(f"stale public L3 name allowlist entry: {item}")
+
+    domain_hits = set()
+    for path, line, kind, name in items:
+        if FORBIDDEN_DOMAIN_NAME.search(name):
+            domain_hits.add(f"{path}:{name}")
+    for path in sorted(Path(REPO_ROOT / "crates/apxinf-cuda-new").rglob("*")):
+        if path.is_file() and FORBIDDEN_DOMAIN_NAME.search(path.relative_to(
+            REPO_ROOT / "crates/apxinf-cuda-new"
+        ).as_posix()):
+            domain_hits.add(path.relative_to(REPO_ROOT).as_posix())
+    for item in sorted(domain_hits):
+        errors.append(f"forbidden model-domain name in cuda-new: {item}")
 
     model_ffi = re.compile(r"(?:apxinf_cuda_new::)?ffi::abi|apxinf_cuda_new::raw")
     for path, line, source in matching_lines(MODEL_ROOT, (".rs",), model_ffi):

@@ -14,6 +14,16 @@ pub enum PointwiseSemantic {
     Swiglu,
     AddInto,
     SwigluRowwiseE4m3,
+    /// `input [rows, cols]`, `bias [2 * cols]` (scale then shift)
+    /// -> `output [rows, cols]`.
+    Affine,
+    /// `input [rows, cols]` (value), `secondary [rows, cols]` (gate)
+    /// -> `output [rows, cols]`: `value * sigmoid(gate)`.
+    GluSeparate,
+    /// `input [rows, 2 * cols]` (a then b), optional `secondary [rows, 2 * cols]`
+    /// -> `output [rows, cols]`: `tanh(a) * sigmoid(b)` with the secondary added
+    /// element-wise to both halves first.
+    TanhSigmoidGate,
 }
 
 impl PointwiseSemantic {
@@ -25,15 +35,24 @@ impl PointwiseSemantic {
             Self::Swiglu => 3,
             Self::AddInto => 4,
             Self::SwigluRowwiseE4m3 => 5,
+            Self::Affine => 6,
+            Self::GluSeparate => 7,
+            Self::TanhSigmoidGate => 8,
         }
     }
 
     fn reads_secondary(self) -> bool {
-        matches!(self, Self::EulerUpdate)
+        matches!(
+            self,
+            Self::EulerUpdate | Self::GluSeparate | Self::TanhSigmoidGate
+        )
     }
 
     fn may_have_bias(self) -> bool {
-        matches!(self, Self::BiasActivation | Self::SwigluRowwiseE4m3)
+        matches!(
+            self,
+            Self::BiasActivation | Self::Affine | Self::SwigluRowwiseE4m3
+        )
     }
 }
 
@@ -44,6 +63,12 @@ pub enum PointwiseActivation {
     Silu,
     GeluExact,
     Relu,
+    Mish,
+    Tanh,
+    LeakyRelu,
+    Sigmoid,
+    /// Fixed 0.01 negative slope; `negative_slope` is ignored.
+    LeakyReluOnePercent,
 }
 
 impl PointwiseActivation {
@@ -54,6 +79,11 @@ impl PointwiseActivation {
             Self::Silu => 2,
             Self::GeluExact => 3,
             Self::Relu => 4,
+            Self::Mish => 5,
+            Self::Tanh => 6,
+            Self::LeakyRelu => 7,
+            Self::Sigmoid => 8,
+            Self::LeakyReluOnePercent => 9,
         }
     }
 }
@@ -72,6 +102,11 @@ pub struct PointwiseArgs<'a> {
     /// Logical, unpadded SwiGLU width. Zero means the physical output width.
     pub logical_cols: usize,
     pub activation: PointwiseActivation,
+    /// Only meaningful for [`PointwiseSemantic::BiasActivation`]: round
+    /// `input + bias` to the tensor dtype before the activation evaluates.
+    pub bias_rounding: bool,
+    /// [`PointwiseActivation::LeakyRelu`] negative slope; unused elsewhere.
+    pub negative_slope: f32,
     pub dt: f32,
     pub output_scale: f32,
 }
@@ -87,6 +122,8 @@ impl<'a> PointwiseArgs<'a> {
             scales: None,
             logical_cols: 0,
             activation: PointwiseActivation::None,
+            bias_rounding: false,
+            negative_slope: 0.1,
             dt: 0.0,
             output_scale: 1.0,
         }
@@ -215,9 +252,16 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
                 "Pointwise gated activation input width must be twice the output width",
             ));
         }
+        PointwiseSemantic::TanhSigmoidGate if input_cols != 2 * cols => {
+            return Err(invalid(
+                "Pointwise tanh-sigmoid-gate input width must be twice the output width",
+            ));
+        }
         PointwiseSemantic::BiasActivation
         | PointwiseSemantic::EulerUpdate
         | PointwiseSemantic::AddInto
+        | PointwiseSemantic::Affine
+        | PointwiseSemantic::GluSeparate
             if input_cols != cols =>
         {
             return Err(invalid("Pointwise input/output width mismatch"));
@@ -252,8 +296,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         .checked_mul(input_cols)
         .ok_or_else(|| invalid("Pointwise size overflow"))?;
 
-    if !args.dt.is_finite() {
-        return Err(invalid("Pointwise dt must be finite"));
+    if !args.dt.is_finite() || !args.negative_slope.is_finite() {
+        return Err(invalid("Pointwise dt/negative_slope must be finite"));
     }
     if !(args.output_scale.is_finite() && args.output_scale > 0.0) {
         return Err(invalid(
@@ -292,6 +336,14 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
     {
         return Err(invalid("Pointwise bias-activation is a no-op"));
     }
+    if matches!(semantic, PointwiseSemantic::Affine) && args.bias.is_none() {
+        return Err(invalid("Pointwise affine requires a scale/shift bias"));
+    }
+    if args.bias_rounding && !matches!(semantic, PointwiseSemantic::BiasActivation) {
+        return Err(invalid(
+            "Pointwise bias rounding is only supported for bias-activation",
+        ));
+    }
 
     let mut storage = Vec::new();
 
@@ -308,7 +360,8 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
             storage.push(buffer);
             (pointer, alignment)
         }
-        None if semantic.reads_secondary() => {
+        None if semantic.reads_secondary()
+            && semantic != PointwiseSemantic::TanhSigmoidGate => {
             return Err(invalid("Pointwise semantic requires a secondary input"))
         }
         None => (std::ptr::null(), 256),
@@ -320,6 +373,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
                 logical_cols
                     .checked_mul(2)
                     .ok_or_else(|| invalid("Pointwise SwiGLU bias size overflow"))?
+            } else if matches!(semantic, PointwiseSemantic::Affine) {
+                cols.checked_mul(2)
+                    .ok_or_else(|| invalid("Pointwise affine bias size overflow"))?
             } else {
                 cols
             };
@@ -377,6 +433,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         output_dtype: output_dtype_code(output_dtype)?,
         activation: args.activation.code(),
         has_bias: u32::from(!bias.is_null()),
+        bias_rounding: u32::from(args.bias_rounding),
         input_alignment,
         secondary_alignment,
         bias_alignment,
@@ -398,6 +455,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: PointwiseArgs<'_>) -> Result<No
         scales,
         stream: ctx.stream().handle() as abi::CudaStream,
         dt: args.dt,
+        negative_slope: args.negative_slope,
         output_scale: args.output_scale,
     };
 

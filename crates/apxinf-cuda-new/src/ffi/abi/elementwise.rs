@@ -183,6 +183,28 @@ mod fixed_launchers {
             scale: f32,
             stream: cudaStream_t,
         ) -> cudaError_t;
+        pub(crate) fn apxinf_elementwise_mean_rows(
+            input: *const c_void,
+            output: *mut c_void,
+            rows: i64,
+            cols: i64,
+            dtype: u32,
+            stream: cudaStream_t,
+        ) -> cudaError_t;
+        pub(crate) fn apxinf_elementwise_argmax_rows(
+            logits: *const c_void,
+            index: *mut c_void,
+            rows: i64,
+            cols: i64,
+            dtype: u32,
+            stream: cudaStream_t,
+        ) -> cudaError_t;
+        pub(crate) fn apxinf_elementwise_fill_zero(
+            tensor: *mut c_void,
+            elements: i64,
+            dtype: u32,
+            stream: cudaStream_t,
+        ) -> cudaError_t;
     }
 }
 pub(crate) use fixed_launchers::*;

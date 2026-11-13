@@ -120,6 +120,41 @@ Quantization occurs before the API call; the current L3 contract does not includ
 | Constraints | `2N` is divisible by 512; scales are unit; provider padding is private and never changes the output shape |
 | Candidates | cuBLAS fallback, cuBLASLt, and fixed SM110 CUTLASS at M3387/N9216/K2560 |
 
+## Shared Convolution Contract
+
+Both convolution semantics take a channel-last input and return a channel-last
+output, accumulate the projection in FP32, and write the result in the tensor
+dtype. The build serves them through cuDNN when it is compiled in and the shape
+is supported, otherwise through the direct temporal kernel; the choice is
+private, is made per prepared execution, and never changes the result.
+
+<!-- l3-operator:conv1d -->
+### `conv1d`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::conv1d(ctx, Conv1dArgs)` |
+| Inputs | `input=[B,Lin,Cin]`, `weight=[Cout,Cin/groups,K]`, optional `bias=[Cout]`; input, weight, bias, and output share F32, F16, or BF16 |
+| Output | caller-owned `out=[B,Lout,Cout]` with `Lout=(Lin+2*padding-dilation*(K-1)-1)/stride+1`; any other length is rejected |
+| Mathematical semantic | temporal cross-correlation, with `groups` splitting the channels into independent groups |
+| Constraints | `stride`, `dilation`, and `groups` are nonzero; `Cin` and `Cout` are divisible by `groups`; `output_padding` is zero |
+| Numerical policy | `Conv1dAccumulation::Default` lets the provider choose its FP32 accumulation order; `OrderedF32` keeps the direct kernel's sequential order for a result that feeds a discrete decision |
+| Deferred bias | `with_direct_channel_last` binds the caller's channel-last buffers in place, takes no bias, and skips both layout transforms; the caller must then add it with this path's rounding, `round_dtype(x+bias)`. It needs a build with the cuDNN provider and a geometry that provider serves (an output channel count above one), and it rejects ordered accumulation; a shape the provider serves with a single deterministic engine keeps its NCHW path and reports `.channel_last_fallback` in the prepared summary |
+| Reference test | `conv1d_matches_reference` |
+
+<!-- l3-operator:conv-transpose1d -->
+### `conv-transpose1d`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::conv1d(ctx, Conv1dArgs)` with `Conv1dSemantic::ConvTranspose1d` |
+| Inputs | `input=[B,Lin,Cin]`, `weight=[Cin,Cout/groups,K]`, optional `bias=[Cout]`; same dtype rule as `conv1d` |
+| Output | caller-owned `out=[B,Lout,Cout]` with `Lout=(Lin-1)*stride-2*padding+dilation*(K-1)+output_padding+1` |
+| Mathematical semantic | adjoint of `conv1d`: each input position scatters its weight along the dilated, strided time axis |
+| Constraints | `dilation` is 1 and `0<=output_padding<stride`; every other constraint is that of `conv1d` |
+| Numerical policy | the same `Conv1dAccumulation` choice, except that `direct_channel_last` has no ordered-accumulation path and is rejected together with `OrderedF32` |
+| Reference test | `conv_transpose1d_matches_reference` |
+
 ## Shared Attention Contract
 
 Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same dtype, and `scale` is finite and positive with a default of `1/sqrt(head_dim)`. Dense and KV-cache support MHA, GQA, and MQA and require `query_heads % kv_heads == 0`.
@@ -146,8 +181,9 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Output | `Y=[B,Tq,Hq,D]`, with the same dtype as the inputs |
 | Mathematical semantic | scaled dot-product attention from the query to the first `valid_key_tokens` rows of the cache |
 | Constraints | `0<valid_key_tokens<=key_capacity`; when causal, token i is at `query_start+i`, and `query_start+Tq<=valid_key_tokens` is required |
+| hd32 decode fast path | Under Flexible numerics only, the custom provider dispatches a fused single-token kernel for batch=1, single-token causal decode, `head_dim=32`, capacity `<=4096` and 16-byte-aligned q/k/v bindings. The kernel's tree-ordered FP32 softmax and value reductions are not bit-identical to the sequential reference path; the accuracy contract and the re-validation instruction live in `attention.cuh`. Misaligned bindings, larger capacities, Stable numerics, non-decode shapes and other head dims keep the sequential path, and Stable numerics leaves dynamic decode with no registered candidate |
 | Graph/tuning identity | For dynamic decode, `key_tokens` in the Spec equals fixed `key_capacity`; exact valid length and query position live only in `decode_meta`, so one execution and graph cover all positions within capacity |
-| Reference test | `kv_cache_attention_all_candidates_match_reference` |
+| Reference test | `kv_cache_attention_all_candidates_match_reference`; hd32 fast-path precision, boundaries and dispatch guards are in `ops::tests::hd32_decode` |
 
 <!-- l3-operator:segmented_attention -->
 ### `segmented_attention`
@@ -161,11 +197,186 @@ Attention computes `softmax(mask(scale * (Q @ K^T))) @ V`. Q/K/V have the same d
 | Constraints | offsets contain at least two elements, are monotonically nondecreasing, begin at 0, and end at `total_tokens`; empty segments are allowed; causal and differing Q/KV head counts are unsupported |
 | Reference test | `segmented_attention_all_candidates_match_reference` |
 
+## Shared Speech Pipeline Contract
+
+The speech pipeline needs relative attention plus elementwise, statistics, and
+layout semantics that the language-model Pointwise ABI does not expose. Every
+operator in the family below accepts F32, F16, or BF16 tensors, requires all
+tensors of one call to share the dtype and CUDA device, and writes FP32
+accumulation back in the tensor dtype at the rounding points its table names.
+The speech models run one batch at a time, so these kernels are sized for that
+geometry and are not tuned for large batches.
+
+<!-- l3-operator:relative-attention -->
+### `relative_attention`
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::relative_attention(ctx, RelativeAttentionArgs)` |
+| Inputs | `Q/K/V=[batch,length,heads,head_dim]`; head-shared `relative_key`, `relative_value` are `[2*window+1,head_dim]` |
+| Output | caller-owned `out=[batch,length,heads,head_dim]`, the shape of `Q` |
+| Mathematical semantic | `softmax(scale*(Q@K^T + Q@rk[j-pos+window])) @ (V + rv[j-pos+window])`; a relative row outside `[0,2*window]` contributes nothing and the attention is unmasked |
+| Constraints | all five tensors and the output share dtype and device; `scale` is finite; `length<=12288`, the number of FP32 scores that fit the 48 KiB shared window |
+| Numerical policy | scores and the weighted sum accumulate in FP32; each relative term is added in FP32 before the scale |
+| Reference test | model-level: the official-capture SoVITS encoder comparison covers this path; no crate-level candidate test yet |
+
+### `bias_activation` (pointwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::BiasActivation` |
+| Inputs | `input=[rows,cols]` (F16/BF16); optional `bias=[cols]` |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | `out = activation(input + bias)` with the bias broadcast over every row; `activation` is a `PointwiseActivation` variant, `bias_rounding` rounds the sum to the tensor dtype before the activation |
+| Reference test | `leaky_relu_bias_reproduces_the_ordinary_paths_rounding` (model-level) |
+
+### `residual_add_bias` (norm family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::residual_add` with `ResidualGate::None` and `BiasOrder::BiasThenResidual` |
+| Inputs | `input` and `residual` with the same shape; `bias=[cols]` |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | `out = round(round(input + bias) + residual)` |
+| Constraints | the intermediate sum is rounded to the tensor dtype, so this matches a deferred producer bias followed by an ordinary residual add |
+| Reference test | `residual_add_bias_reproduces_the_ordinary_paths_rounding` (model-level) |
+
+### `affine` (pointwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::Affine` |
+| Inputs | `input=[rows,cols]`; `bias=[2*cols]` holding scale then shift |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | `out = input * bias[col] + bias[cols+col]` |
+| Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
+
+### `glu_separate` (pointwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::GluSeparate` |
+| Inputs | `input` and `secondary` (gate) with the same shape |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | `out = input * sigmoid(secondary)` |
+| Reference test | model-level: `official_ffn_operator_isolation` compares the CFM FFN intermediates |
+
+### `tanh_sigmoid_gate` (pointwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::pointwise` with `PointwiseSemantic::TanhSigmoidGate` |
+| Inputs | `input=[rows,2*cols]`, whose last axis holds the `a` half then the `b` half; optional same-shaped `secondary` added element-wise to both halves first |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | `out = tanh(a + secondary_a) * sigmoid(b + secondary_b)` |
+| Reference test | model-level: `official_ffn_operator_isolation` compares the CFM FFN intermediates |
+
+### `grn` (norm family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::norm` with `NormKind::Grn` and `Affine::Adaptive` |
+| Inputs | `input=[rows,cols]`; `style=[2*cols]` holding gamma then beta |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | with `n_c = sqrt(sum_r input[r,c]^2)` and `m = mean_c(n_c) + 1e-6`, `out = gamma_c * (input * n_c/m) + beta_c`, every intermediate rounded to the tensor dtype |
+| Constraints | `cols<=12288`, the FP32 normalizers that fit the 48 KiB shared window |
+| Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
+
+### `column_norm` (norm family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::norm` with `NormKind::ColumnLayer`, `Affine::Adaptive`, and `eps=1e-5` |
+| Inputs | `input=[rows,cols]`; `style=[2*cols]` holding gamma then beta |
+| Output | `out=[rows,cols]` |
+| Mathematical semantic | per-column LayerNorm over rows, `out = gamma_c * (x - mean_c) * rsqrt(var_c + eps) + beta_c` |
+| Reference test | model-level: the official-capture CFM operator isolation compares every intermediate |
+
+### `rope_apply` (rope family, interleaved table)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::rope::apply_interleaved_table(ctx, input, cos, sin, out)` |
+| Inputs | `input=[batch,time,heads,head_dim]` (F32/F16/BF16); `cos`/`sin` tables of at least `time*head_dim` |
+| Output | `out`, the shape of `input` |
+| Mathematical semantic | interleaved rotary embedding over adjacent `(2p, 2p+1)` pairs using the pair's own `cos`/`sin` entry |
+| Constraints | every product is rounded to the tensor dtype before the final add or subtract, so the result never depends on FP16/BF16 fused-contract behavior |
+| Reference test | `layer_norm_linear_rope_attention_match_reference` |
+
+### `sinusoidal_embedding_table` (embedding family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::embedding::sinusoidal_embedding_table(ctx, times, output, scale, max_period)` |
+| Inputs | `times=[rows]`; `out=[rows,width]` with `width>=4` and even, F32/F16/BF16 |
+| Output | caller-owned `out` |
+| Mathematical semantic | `angle = (scale*times[row]) * exp(-(col % (width/2)) * ln(max_period)/(width/2-1))`; the product `scale*times[row]` is rounded to the storage dtype before the sweep; the first half of each row is `sin(angle)` and the second half `cos(angle)` |
+| Constraints | `scale` is finite and `max_period>1` |
+| Reference test | model-level: the official-capture CFM time embedding comparison |
+
+### `mean_rows` (elementwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::elementwise::mean_rows(ctx, input, out)` |
+| Inputs | `input=[rows,cols]`, F32/F16/BF16 |
+| Output | `out=[1,cols]` |
+| Mathematical semantic | per-column mean over rows, summed sequentially in FP32 |
+| Reference test | model-level: the official-capture SoVITS encoder comparison |
+
+### `argmax_rows` (elementwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::elementwise::argmax_rows(ctx, logits, index)` |
+| Inputs | `logits=[rows,cols]`, F32/F16/BF16 |
+| Output | I32 `index=[rows]` |
+| Mathematical semantic | per-row argmax with first-index tie breaking |
+| Reference test | model-level: `hubert` codebook assignment inside the official capture replay |
+
+### `write_kv_cache_token` (cache family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::cache::write_kv_cache_token(ctx, input, cache, meta)` |
+| Inputs | `input=[1,1,heads,head_dim]`; `cache=[1,capacity,heads,head_dim]`; a `KvCacheDecodeMeta` whose second word is the write row |
+| Output | `cache` updated in place |
+| Mathematical semantic | copy the token into cache row `meta[1]` |
+| Constraints | F16 or BF16 with both tensors agreeing; the write row is device state, and a row at or past `capacity` writes nothing, mirroring the clamp `kv_cache_attention` applies to the same metadata |
+| Reference test | model-level: the dynamic decode-graph replay tests write and then attend over the same cache |
+
+### `fill_zero` (elementwise family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::elementwise::fill_zero(ctx, tensor)` |
+| Inputs | any nonempty F32/F16/BF16/I32/I8 tensor |
+| Output | the same tensor zeroed in place (memset) |
+| Mathematical semantic | write zero to every element |
+| Reference test | model-level: exercised by every decode and capture-replay test that starts from a zeroed buffer |
+
+### `exponential_race_sample` (sampling family)
+
+| Item | Contract |
+| --- | --- |
+| Rust API | `ops::sampling::exponential_race_sample(ctx, ExponentialRaceArgs { logits, seen, output, seed, step, top_k, temperature, repetition_penalty })` |
+| Inputs | `logits=[1,vocab]` F16 or BF16 with `vocab <= 2048`; `seen`: one byte flag per entry (`I8`); `output`: four `I32` words; scalar `seed`, `step`, `top_k <= 128`, `temperature > 0`, `repetition_penalty` |
+| Output | `output = [sampled, adjusted_argmax, status, 0]`; `seen` gains a flag on the sampled token; status 0 ok, 1 filtered logits invalid, 2 probability mass invalid |
+| Mathematical semantic | repetition-penalized, temperature-scaled, top-k-truncated softmax probabilities raced against one Philox4x32-10 exponential per candidate; winner maximizes FP16(prob/noise), strict greater with lowest-index ties |
+| Constraints | replicates the reference host sampler bit for bit (FP16 rounding boundaries, sequential FP32 softmax sum, first-index tie-break, counter words `[step_lo, step_hi, elem_lo, elem_hi]`, key `[seed_lo, seed_hi]`); nucleus (`top_p < 1.0`) truncation is not covered — callers keep that on the host |
+| Reference test | model-level: `device_exponential_race_matches_host_sampler` runs the kernel against the reference sampler for 64 steps across five sampling configurations and asserts identical token sequences |
+
 ## Testing Responsibilities
 
 The catalog test ensures only that semantics are neither missing nor duplicated; it cannot validate the written contracts. A new L3 semantic must also add a semantic test to `src/ops/tests/l3_behavior.rs` and an independent-reference all-candidate numerical test to `src/ops/tests/precision/precision.rs`.
 
 Tests must run through `crates/apxinf-cuda-new/test-new.sh`; a normal `cargo test` from the repository root does not automatically test this crate.
+
+The speech-pipeline family is currently validated through the model-level
+official-capture comparisons listed in its tables: those tests compare every
+intermediate the reference implementation materializes, one operator at a time,
+but they run only with captured fixtures present. A crate-level reference test
+still has to be added before a second model depends on these semantics.
 
 The translated fixed-shape implementations are not separate model APIs.
 D256 attention and the 624/2200 vision schedule are candidates in the existing

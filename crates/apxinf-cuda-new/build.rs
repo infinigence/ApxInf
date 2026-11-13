@@ -178,6 +178,37 @@ fn run(command: &mut Command, action: &str) {
     assert!(status.success(), "{action} failed with {status}");
 }
 
+/// Locate a cuDNN installation for the optional conv1d provider.
+///
+/// The provider is an optimization, not a requirement: without cuDNN the
+/// adapter still runs its own kernels, so a missing installation degrades
+/// performance instead of failing the build. `APXINF_CUDNN_ROOT` pins a
+/// specific installation; otherwise the CUDA toolkit include directory and the
+/// distribution multiarch include directories are searched.
+fn cudnn_include_directory(cuda: &str, cpu_arch: &str) -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed=APXINF_CUDNN_ROOT");
+    let mut candidates = Vec::new();
+    if let Some(root) = env::var_os("APXINF_CUDNN_ROOT") {
+        let root = PathBuf::from(root);
+        for library in ["lib64", "lib"] {
+            let directory = root.join(library);
+            if directory.is_dir() {
+                println!("cargo:rustc-link-search=native={}", directory.display());
+            }
+        }
+        candidates.push(root.join("include"));
+        candidates.push(root);
+    }
+    candidates.push(PathBuf::from(cuda).join("include"));
+    candidates.push(PathBuf::from("/usr/include"));
+    if !cpu_arch.is_empty() {
+        candidates.push(PathBuf::from(format!("/usr/include/{cpu_arch}-linux-gnu")));
+    }
+    candidates
+        .into_iter()
+        .find(|directory| directory.join("cudnn.h").is_file())
+}
+
 fn configure_nvtx(cuda: &str, library_directories: &[PathBuf]) {
     if env::var_os("CARGO_FEATURE_NVTX").is_none() {
         return;
@@ -254,6 +285,14 @@ fn main() {
         println!("cargo:rustc-link-search=native={}", directory.display());
     }
     configure_nvtx(&cuda, &library_directories);
+    let cudnn_include = cudnn_include_directory(&cuda, &cpu_arch);
+    println!(
+        "cargo:warning=conv1d cuDNN provider: {}",
+        match &cudnn_include {
+            Some(directory) => format!("enabled ({})", directory.display()),
+            None => "disabled (cudnn.h not found)".to_string(),
+        }
+    );
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let host = env::var("HOST").unwrap_or_default();
@@ -354,12 +393,15 @@ fn main() {
         "attention/fixed_decode.cu",
         "attention/fixed_f16.cu",
         "cache/fixed_decode.cu",
+        "cache/write_token.cu",
         "elementwise/fixed_bf16.cu",
         "elementwise/fixed_decode.cu",
         "elementwise/fixed_f16.cu",
+        "elementwise/fixed_rows.cu",
         "attention/gates_rounded_bf16.cu",
         "embedding/fixed_bf16.cu",
         "embedding/fixed_decode.cu",
+        "embedding/sinusoidal_table.cu",
         "gemm/gemv.cpp",
         "gdn/fixed.cu",
         "norm/fixed_bf16.cu",
@@ -375,6 +417,7 @@ fn main() {
         "rope/fixed_bf16.cu",
         "rope/fixed_decode.cu",
         "rope/fixed_f16.cu",
+        "rope/interleaved.cu",
         "rope/qkv_bf16.cu",
         "rope/partial.cpp",
         "preprocess/ops.cpp",
@@ -382,6 +425,7 @@ fn main() {
         "sampling/argmax.cpp",
         "sampling/suppress_bf16.cu",
         "sampling/launch.cu",
+        "sampling/exponential_race.cu",
         "norm/launch.cu",
         "pointwise/launch.cu",
         "rope/launch.cu",
@@ -406,6 +450,8 @@ fn main() {
     generic_sources.push(native.join("kernels/custom/attention_gates.cu"));
     generic_sources.push(native.join("kernels/custom/gather_embedding.cu"));
     generic_sources.push(native.join("kernels/custom/sampling_argmax.cu"));
+    generic_sources.push(native.join("adapters/conv1d/launch.cu"));
+    generic_sources.push(native.join("adapters/relative_attention/launch.cu"));
     generic_sources.push(native.join("tests/framework_backend.cu"));
     let cutlass_root = native.join("kernels/cutlass");
     let fa2_root = native.join("kernels/fa2");
@@ -653,6 +699,13 @@ fn main() {
             .args(["--compiler-options", "-fPIC", "-O3", "-std=c++17"])
             .arg(format!("-I{}", native.join("include").display()))
             .arg(format!("-I{}", out.display()));
+        // The conv1d adapter carries an optional cuDNN provider.
+        if source.components().any(|part| part.as_os_str() == "conv1d") {
+            if let Some(directory) = &cudnn_include {
+                command.arg("-DAPXINF_CONV1D_CUDNN=1");
+                command.arg(format!("-I{}", directory.display()));
+            }
+        }
         // The build IDs fold a whole-tree fingerprint, so they change on any
         // kernel edit. Only the two tuning-key translation units read them;
         // putting them on every command line would invalidate the whole object
@@ -861,6 +914,9 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=apxinf_gemm_native");
+    if cudnn_include.is_some() {
+        println!("cargo:rustc-link-lib=cudnn");
+    }
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");

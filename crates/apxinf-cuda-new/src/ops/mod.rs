@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod cache;
+pub mod conv1d;
 pub mod elementwise;
 pub mod embedding;
 pub mod gather;
@@ -12,6 +13,7 @@ pub mod pillow_bicubic;
 pub mod pointwise;
 pub mod preprocess;
 pub mod quantization;
+pub mod relative_attention;
 pub mod rope;
 pub mod sampling;
 pub(crate) mod validation;
@@ -38,6 +40,7 @@ pub use attention::{
     AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta, SegmentedAttentionArgs,
 };
 pub use cache::core::{append as cache_append, concat_rows, copy_tensor, reserve_prefix};
+pub use conv1d::{conv1d, Conv1dAccumulation, Conv1dArgs, Conv1dSemantic};
 pub use elementwise::add_into;
 pub use elementwise::core::{
     activation as elementwise_activation, add as elementwise_add, add_bias as elementwise_add_bias,
@@ -74,6 +77,7 @@ pub use quantization::{
     BlockQuantizationArgs, BlockQuantizationSemantic, PackBlockScalesArgs, QuantizationArgs,
     QuantizationSemantic, ScaleLayout,
 };
+pub use relative_attention::{relative_attention, RelativeAttentionArgs};
 pub use rope::apply_vision_2d as rope_apply_vision_2d;
 pub use rope::{
     decode_rope, decode_rotation, execute_batched as rope_apply_batched,
@@ -83,7 +87,11 @@ pub use rope::{
     GroupedQkvRopeArgs, MropeCacheArgs, MultimodalRopeArgs, QkvCacheRopeArgs, RopeArgs,
     RopeSemantic,
 };
-pub use sampling::{argmax, ArgmaxArgs};
+pub use sampling::{argmax, exponential_race_sample, ArgmaxArgs, ExponentialRaceArgs,
+    EXPONENTIAL_RACE_MAX_TOP_K, EXPONENTIAL_RACE_MAX_VOCAB};
+pub use cache::write_kv_cache_token;
+pub use elementwise::{argmax_rows, fill_zero, mean_rows};
+pub use embedding::sinusoidal_embedding_table;
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(

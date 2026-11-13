@@ -26,8 +26,8 @@
  *   BIAS_RESIDUAL_ADAPTIVE_LAYER
  *                          input, bias, residual, norm_style -> hidden, normalized
  *
- * The bias_order field selects whether input+bias is rounded to BF16 before
- * adding residual. The two-step order is BF16-only.
+ * The bias_order field selects whether input+bias is rounded to the tensor
+ * dtype before adding residual. The two-step order is F16/BF16-only.
  *
  * The two adaptive-conditioning vectors are distinct and are not
  * interchangeable:
@@ -50,6 +50,13 @@ typedef enum {
   APXINF_NORM_STATISTIC_NONE = 0,
   APXINF_NORM_STATISTIC_RMS = 1,
   APXINF_NORM_STATISTIC_LAYER = 2,
+  /* Global response normalization: one block owns the whole [rows, cols]
+   * activation; the adaptive style holds gamma then beta and the input is
+   * carried through additively: gamma * x * norm + beta + x. */
+  APXINF_NORM_STATISTIC_GRN = 3,
+  /* Per-column mean/variance (Welford) with an input-dtype statistics
+   * boundary; the adaptive style holds scale then shift. */
+  APXINF_NORM_STATISTIC_COLUMN_LAYER = 4,
 } apxinf_norm_statistic_t;
 
 typedef enum {
@@ -81,7 +88,7 @@ typedef enum {
   APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL = 1,
 } apxinf_norm_bias_order_t;
 
-#define APXINF_NORM_SPEC_VERSION 7u
+#define APXINF_NORM_SPEC_VERSION 8u
 
 typedef struct {
   uint32_t version;

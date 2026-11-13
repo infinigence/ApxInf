@@ -104,6 +104,22 @@ bool supports_native_fp8_bias_gelu(const Spec& spec) {
          spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE;
 }
 
+bool supports_native_f16_bias(const Spec& spec) {
+  return supports_cublaslt(spec) &&
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+         spec.a_dtype == APXINF_DTYPE_F16 &&
+         spec.b_dtype == APXINF_DTYPE_F16 &&
+         spec.output_dtype == APXINF_DTYPE_F16 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.k % 2 == 0 && spec.n % 2 == 0 &&
+         spec.alpha_is_unit != 0 && spec.output_scale_is_unit != 0 &&
+         // The fused heuristic is only equivalent to the staged F32 projection
+         // plus bias-before-cast when every binding meets the 256-byte contract
+         // used to choose it.
+         spec.a_alignment >= 256 && spec.b_alignment >= 256 &&
+         spec.bias_alignment >= 256 && spec.output_alignment >= 256;
+}
+
 AlignmentRequirements vendor_alignment(const Spec&) {
   return {};
 }
@@ -117,6 +133,18 @@ AlignmentRequirements cublaslt_alignment(const Spec&) {
   requirements.b = 16;
   requirements.output = 16;
   requirements.residual = 16;
+  return requirements;
+}
+
+AlignmentRequirements fused_f16_bias_alignment(const Spec& spec) {
+  auto requirements = cublaslt_alignment(spec);
+  // The Torch-compatible dense-linear recipe is selected with a 256-byte
+  // minimum alignment; this is what selects the same split-K implementation as
+  // aten::addmm on the target architecture.
+  requirements.a = 256;
+  requirements.b = 256;
+  requirements.bias = 256;
+  requirements.output = 256;
   return requirements;
 }
 
@@ -454,6 +482,11 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        cublaslt_alignment, cublaslt_native_fp8_resource_requirements,
        cublaslt_configurations, prepare_cublaslt_native_fp8, launch_cublaslt,
        destroy_cublaslt},
+      {kProviderCublasLt, 6, 1, "cublasLt-native-f16-bias",
+       WeightLayout::Canonical, 0, true, false, false,
+       supports_native_f16_bias, fused_f16_bias_alignment,
+       cublaslt_f16_bias_resource_requirements, one_configuration,
+       prepare_cublaslt_f16_bias, launch_cublaslt, destroy_cublaslt},
 #ifdef APXINF_GEMM_CUTLASS_SM87_W8A8
       {kProviderCutlass, 9, 1, "cutlass-w8a8-bias-m41-n4608-k1536-sm87", WeightLayout::NK, kDeviceFeatureCutlassSm87W8A8, true, true, false,
        supports_cutlass_w8a8_bias_m41_n4608_k1536,

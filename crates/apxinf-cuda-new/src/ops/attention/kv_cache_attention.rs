@@ -21,6 +21,24 @@ pub struct KvCacheDecodeMeta {
 }
 
 impl KvCacheDecodeMeta {
+    pub(crate) fn capacity(&self) -> usize {
+        self.key_capacity
+    }
+
+    pub(crate) fn device(&self) -> usize {
+        self.storage.address().device()
+    }
+
+    pub(crate) fn device_address(&self) -> *mut std::ffi::c_void {
+        self.storage.address().ptr()
+    }
+
+    pub(crate) fn retain(&self) {
+        crate::workspace::retain_resource(&self.storage);
+    }
+}
+
+impl KvCacheDecodeMeta {
     pub fn new(device: usize, key_capacity: usize) -> Result<Self> {
         if key_capacity == 0 || key_capacity > i32::MAX as usize {
             return Err(invalid(

@@ -636,3 +636,74 @@ pub(super) fn apply_mrope_into(
         )
     })
 }
+
+/// Apply rotary embedding to adjacent element pairs from precomputed
+/// cos/sin tables.
+///
+/// `input` is a rank-4 `[batch, time, heads, head_dim]` tensor and the tables
+/// hold `[time, head_dim]` values whose element `2 * pair` (and its duplicate
+/// `2 * pair + 1`) drives the rotation of the matching element pair. This is
+/// the speech CFM decoder's table convention, ported verbatim from the legacy
+/// kernel including its independent product rounding.
+pub fn apply_pair_table(
+    ctx: &CudaContext,
+    input: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    output: &Tensor,
+) -> Result<()> {
+    use crate::ffi::abi::rope as abi;
+    use crate::ops::validation::check_cuda;
+
+    let dims = input.shape().dims();
+    if dims.len() != 4 {
+        return Err(Error::Other(
+            "interleaved-table RoPE expects [batch, time, heads, head_dim]".into(),
+        ));
+    }
+    let (batch, time, heads, head_dim) = (dims[0], dims[1], dims[2], dims[3]);
+    if batch == 0 || time == 0 || heads == 0 || head_dim == 0 || head_dim % 2 != 0 {
+        return Err(Error::Other("interleaved-table RoPE geometry is invalid".into()));
+    }
+    let dtype = input.dtype();
+    if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return Err(Error::Other("interleaved-table RoPE does not support this dtype".into()));
+    }
+    let elements = batch
+        .checked_mul(time)
+        .and_then(|value| value.checked_mul(heads))
+        .and_then(|value| value.checked_mul(head_dim))
+        .ok_or_else(|| Error::Other("interleaved-table RoPE element count overflow".into()))?;
+    if output.shape().numel() != elements || output.dtype() != dtype {
+        return Err(Error::Other(
+            "interleaved-table RoPE output shape/dtype mismatch".into(),
+        ));
+    }
+    let table_elements = time * head_dim;
+    let input_buffer = super::contracts::tensor_storage(ctx, input, dtype, elements)?;
+    let output_buffer = super::contracts::tensor_storage(ctx, output, dtype, elements)?;
+    let cos_buffer = super::contracts::tensor_storage(ctx, cos, dtype, table_elements)?;
+    let sin_buffer = super::contracts::tensor_storage(ctx, sin, dtype, table_elements)?;
+    let status = unsafe {
+        abi::apxinf_rope_apply_interleaved_table(
+            input_buffer.ptr(),
+            cos_buffer.ptr(),
+            sin_buffer.ptr(),
+            output_buffer.ptr(),
+            // The launcher expands one thread per (row, pair): `tokens` counts
+            // the [batch, time] rows, not total elements.
+            (batch * time) as i64,
+            time as i64,
+            heads as i64,
+            head_dim as i64,
+            match dtype {
+                DType::F32 => 0,
+                DType::F16 => 1,
+                DType::BF16 => 2,
+                _ => unreachable!("validated dtype"),
+            },
+            ctx.stream().handle(),
+        )
+    };
+    check_cuda(status)
+}

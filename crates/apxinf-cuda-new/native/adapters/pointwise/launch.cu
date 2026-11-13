@@ -26,11 +26,14 @@ bool valid_alignment(uint32_t alignment) {
 }
 
 bool reads_secondary(uint32_t semantic) {
-  return semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE;
+  return semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE ||
+         semantic == APXINF_POINTWISE_SEMANTIC_GLU_SEPARATE ||
+         semantic == APXINF_POINTWISE_SEMANTIC_TANH_SIGMOID_GATE;
 }
 
 bool may_have_bias(uint32_t semantic) {
   return semantic == APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION ||
+         semantic == APXINF_POINTWISE_SEMANTIC_AFFINE ||
          semantic == APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3;
 }
 
@@ -44,13 +47,13 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
       spec.dtype == APXINF_DTYPE_BF16 &&
       spec.output_dtype == APXINF_DTYPE_E4M3;
   if (spec.version != APXINF_POINTWISE_SPEC_VERSION ||
-      spec.semantic > APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3 ||
+      spec.semantic > APXINF_POINTWISE_SEMANTIC_TANH_SIGMOID_GATE ||
       (spec.dtype != APXINF_DTYPE_F16 && spec.dtype != APXINF_DTYPE_BF16) ||
       (!quantized_geglu && !quantized_swiglu &&
        spec.output_dtype != spec.dtype) ||
-      spec.activation > APXINF_POINTWISE_ACTIVATION_RELU ||
-      spec.has_bias > 1 || spec.rows <= 0 || spec.cols <= 0 ||
-      spec.input_cols <= 0 || spec.logical_cols <= 0 ||
+      spec.activation > APXINF_POINTWISE_ACTIVATION_LEAKY_RELU_ONE_PERCENT ||
+      spec.has_bias > 1 || spec.bias_rounding > 1 || spec.rows <= 0 ||
+      spec.cols <= 0 || spec.input_cols <= 0 || spec.logical_cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||
       spec.input_cols > INT32_MAX || spec.logical_cols > INT32_MAX ||
       spec.output_scale_is_unit > 1 ||
@@ -83,6 +86,24 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid Pointwise rowwise SwiGLU contract");
   }
+  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_AFFINE &&
+      (spec.input_cols != spec.cols || spec.has_bias == 0 ||
+       spec.activation != APXINF_POINTWISE_ACTIVATION_NONE)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid Pointwise affine contract");
+  }
+  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_GLU_SEPARATE &&
+      (spec.input_cols != spec.cols ||
+       spec.activation != APXINF_POINTWISE_ACTIVATION_NONE)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid Pointwise glu-separate contract");
+  }
+  if (spec.semantic == APXINF_POINTWISE_SEMANTIC_TANH_SIGMOID_GATE &&
+      (spec.input_cols != 2 * spec.cols ||
+       spec.activation != APXINF_POINTWISE_ACTIVATION_NONE)) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "invalid Pointwise tanh-sigmoid-gate contract");
+  }
   if (spec.has_bias != 0 && !may_have_bias(spec.semantic)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "Pointwise semantic does not take a bias");
@@ -103,7 +124,9 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
 void validate_bindings(const apxinf_pointwise_spec_t& spec,
                        const apxinf_pointwise_bindings_t& bindings) {
   if (bindings.input == nullptr || bindings.output == nullptr ||
-      (reads_secondary(spec.semantic) && bindings.secondary == nullptr) ||
+      ((reads_secondary(spec.semantic) &&
+        spec.semantic != APXINF_POINTWISE_SEMANTIC_TANH_SIGMOID_GATE) &&
+       bindings.secondary == nullptr) ||
       ((spec.semantic == APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3) !=
        (bindings.scales != nullptr))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -116,7 +139,8 @@ void validate_bindings(const apxinf_pointwise_spec_t& spec,
   if (!std::isfinite(bindings.output_scale) || bindings.output_scale <= 0.0f ||
       ((bindings.output_scale == 1.0f) !=
        (spec.output_scale_is_unit != 0)) ||
-      !std::isfinite(bindings.dt)) {
+      !std::isfinite(bindings.dt) ||
+      !std::isfinite(bindings.negative_slope)) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Pointwise scalar");
   }
   if (spec.semantic == APXINF_POINTWISE_SEMANTIC_GEGLU &&
@@ -206,10 +230,15 @@ cudaError_t launch_bf16_geglu(const __nv_bfloat16* input,
 
 cudaError_t launch_bf16_bias_activation(
     const __nv_bfloat16* input, const __nv_bfloat16* bias,
-    __nv_bfloat16* output, int rows, int cols, int activation,
-    cudaStream_t stream) {
+    __nv_bfloat16* output, int rows, int cols, int activation, int round_bias,
+    float negative_slope, cudaStream_t stream) {
   const int64_t count = static_cast<int64_t>(rows) * cols;
+  // The packed paths only know the original activation codes and the
+  // SingleRound bias order; anything else goes to the generic template.
+  const bool packed_eligible =
+      activation <= APXINF_POINTWISE_ACTIVATION_RELU && round_bias == 0;
   const bool packed8_gelu =
+      packed_eligible &&
       activation == APXINF_POINTWISE_ACTIVATION_GELU && bias != nullptr &&
       cols % 8 == 0 && reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
       reinterpret_cast<uintptr_t>(bias) % 16 == 0 &&
@@ -219,12 +248,14 @@ cudaError_t launch_bf16_bias_activation(
         input, bias, output, rows, cols, stream);
   }
   const bool packed4 =
+      packed_eligible &&
       cols % 4 == 0 &&
       reinterpret_cast<uintptr_t>(input) % alignof(Bf16x4) == 0 &&
       reinterpret_cast<uintptr_t>(output) % alignof(Bf16x4) == 0 &&
       (bias == nullptr ||
        reinterpret_cast<uintptr_t>(bias) % alignof(Bf16x4) == 0);
   const bool packed2 =
+      packed_eligible &&
       cols % 2 == 0 &&
       reinterpret_cast<uintptr_t>(input) % alignof(__nv_bfloat162) == 0 &&
       reinterpret_cast<uintptr_t>(output) % alignof(__nv_bfloat162) == 0 &&
@@ -266,7 +297,20 @@ cudaError_t launch(const apxinf_pointwise_spec_t& spec,
       break;
     case APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION:
       kernels::bias_activation<T><<<grid, kDirectThreads, 0, stream>>>(
-          input, bias, output, count, cols, static_cast<int>(spec.activation));
+          input, bias, output, count, cols, static_cast<int>(spec.activation),
+          static_cast<int>(spec.bias_rounding), bindings.negative_slope);
+      break;
+    case APXINF_POINTWISE_SEMANTIC_AFFINE:
+      kernels::affine<T><<<grid, kDirectThreads, 0, stream>>>(
+          input, bias, output, count, cols);
+      break;
+    case APXINF_POINTWISE_SEMANTIC_GLU_SEPARATE:
+      kernels::glu_separate<T><<<grid, kDirectThreads, 0, stream>>>(
+          input, secondary, output, count);
+      break;
+    case APXINF_POINTWISE_SEMANTIC_TANH_SIGMOID_GATE:
+      kernels::tanh_sigmoid_gate<T><<<grid, kDirectThreads, 0, stream>>>(
+          input, secondary, output, count, cols);
       break;
     case APXINF_POINTWISE_SEMANTIC_EULER_UPDATE:
       kernels::euler_update<T><<<grid, kDirectThreads, 0, stream>>>(
@@ -292,7 +336,7 @@ cudaError_t launch_bf16(const apxinf_pointwise_spec_t& spec,
   if (spec.semantic == APXINF_POINTWISE_SEMANTIC_BIAS_ACTIVATION) {
     return launch_bf16_bias_activation(
         input, bias, output, rows, cols, static_cast<int>(spec.activation),
-        stream);
+        static_cast<int>(spec.bias_rounding), bindings.negative_slope, stream);
   }
   return launch<__nv_bfloat16>(spec, bindings);
 }

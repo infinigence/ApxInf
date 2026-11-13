@@ -148,6 +148,12 @@ bool valid_contract(const apxinf_norm_spec_t& spec) {
       is_contract(spec, APXINF_NORM_OPERATION_NORM,
                   APXINF_NORM_STATISTIC_LAYER, APXINF_NORM_AFFINE_ADAPTIVE,
                   APXINF_NORM_GATE_NONE) ||
+      is_contract(spec, APXINF_NORM_OPERATION_NORM,
+                  APXINF_NORM_STATISTIC_GRN, APXINF_NORM_AFFINE_ADAPTIVE,
+                  APXINF_NORM_GATE_NONE) ||
+      is_contract(spec, APXINF_NORM_OPERATION_NORM,
+                  APXINF_NORM_STATISTIC_COLUMN_LAYER,
+                  APXINF_NORM_AFFINE_ADAPTIVE, APXINF_NORM_GATE_NONE) ||
       is_contract(spec, APXINF_NORM_OPERATION_RESIDUAL_ADD,
                   APXINF_NORM_STATISTIC_NONE, APXINF_NORM_AFFINE_NONE,
                   APXINF_NORM_GATE_NONE) ||
@@ -289,9 +295,10 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Norm Spec");
   }
   if (spec.bias_order == APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL &&
-      spec.dtype != APXINF_DTYPE_BF16) {
+      spec.dtype != APXINF_DTYPE_BF16 &&
+      spec.dtype != APXINF_DTYPE_F16) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
-                  "BiasThenResidual order requires BF16 input and output");
+                  "BiasThenResidual order requires F16 or BF16 input and output");
   }
   if (spec.statistic == APXINF_NORM_STATISTIC_LAYER &&
       spec.affine == APXINF_NORM_AFFINE_ADAPTIVE &&
@@ -347,13 +354,18 @@ void validate_bindings(const apxinf_norm_spec_t& spec,
   const bool scale_matches_spec =
       (bindings.output_scale == 1.0f) ==
       (spec.output_scale_is_unit != 0);
+  // GRN folds its epsilon into the kernel's arithmetic and never reads the
+  // eps binding, so only the mean-based statistics gate on it.
+  const bool eps_consumed =
+      !is_contract(spec, APXINF_NORM_OPERATION_NORM, APXINF_NORM_STATISTIC_GRN,
+                   APXINF_NORM_AFFINE_ADAPTIVE, APXINF_NORM_GATE_NONE);
   const bool valid_output_scale =
       std::isfinite(bindings.output_scale) && bindings.output_scale > 0.0f &&
       scale_matches_spec &&
       (spec.output_dtype == APXINF_DTYPE_E4M3 ||
        bindings.output_scale == 1.0f);
-  if (!valid_output_scale || !(bindings.eps > 0.0f) ||
-      !std::isfinite(bindings.eps)) {
+  if (!valid_output_scale ||
+      (eps_consumed && (!(bindings.eps > 0.0f) || !std::isfinite(bindings.eps)))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid Norm scalar");
   }
 }
@@ -760,9 +772,30 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
                          APXINF_NORM_STATISTIC_NONE,
                          APXINF_NORM_AFFINE_NONE,
                          APXINF_NORM_GATE_NONE)) {
-    kernels::bias_residual<T>
-        <<<elementwise_blocks(count), kThreads, 0, stream>>>(
-            input, bias, residual, hidden, count, cols);
+    if (spec.bias_order == APXINF_NORM_BIAS_ORDER_THEN_RESIDUAL) {
+      kernels::bias_then_residual<T>
+          <<<elementwise_blocks(count), kThreads, 0, stream>>>(
+              input, bias, residual, hidden, count, cols);
+    } else {
+      kernels::bias_residual<T>
+          <<<elementwise_blocks(count), kThreads, 0, stream>>>(
+              input, bias, residual, hidden, count, cols);
+    }
+  } else if (is_contract(spec, APXINF_NORM_OPERATION_NORM,
+                         APXINF_NORM_STATISTIC_GRN,
+                         APXINF_NORM_AFFINE_ADAPTIVE,
+                         APXINF_NORM_GATE_NONE)) {
+    // One block owns the whole activation; the style holds gamma then beta.
+    const size_t shared = static_cast<size_t>(cols) * sizeof(float);
+    kernels::grn<T><<<1, kThreads, shared, stream>>>(
+        input, norm_style, normalized, spec.rows, cols);
+  } else if (is_contract(spec, APXINF_NORM_OPERATION_NORM,
+                         APXINF_NORM_STATISTIC_COLUMN_LAYER,
+                         APXINF_NORM_AFFINE_ADAPTIVE,
+                         APXINF_NORM_GATE_NONE)) {
+    const int threads = rows < 512 ? 32 : 512;
+    kernels::column_norm_input_statistics<T><<<cols, threads, 0, stream>>>(
+        input, norm_style, normalized, spec.rows, cols, bindings.eps);
   } else if (is_contract(spec, APXINF_NORM_OPERATION_FUSED_ADD_NORM,
                          APXINF_NORM_STATISTIC_RMS,
                          APXINF_NORM_AFFINE_WEIGHT,

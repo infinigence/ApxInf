@@ -586,6 +586,62 @@ fn gemm_bias_all_candidates_match_torch() {
 }
 
 #[test]
+fn gemm_bias_f16_all_candidates_match_reference() {
+    // The native epilogue is the only non-fallback candidate this bias
+    // projection has, so this test is its single precision gate. The reference
+    // accumulates in f64 and rounds to f32, which is the same contract as an
+    // F32 projection with the bias added before the cast; compare_reference
+    // supplies the tolerance.
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (64usize, 256usize, 256usize);
+    // Eighths, sixteenths and quarters are exact in F16, so the reference can
+    // read the same f32 inputs without carrying an extra input-quantization
+    // error.
+    let a_values: Vec<f32> = (0..m * k)
+        .map(|index| ((index * 7 % 33) as f32 - 16.0) / 8.0)
+        .collect();
+    let b_values: Vec<f32> = (0..k * n)
+        .map(|index| ((index * 5 % 31) as f32 - 15.0) / 16.0)
+        .collect();
+    let bias_values: Vec<f32> = (0..n)
+        .map(|index| ((index * 3 % 17) as f32 - 8.0) / 4.0)
+        .collect();
+
+    let a = f16_tensor(0, vec![m, k], &a_values);
+    let b = f16_tensor(0, vec![k, n], &b_values);
+    // contracts::normalize ties the bias dtype to the projection: F16 A means an
+    // F16 bias.
+    let bias = f16_tensor(0, vec![n], &bias_values);
+    let mut out = zeros_tensor(0, vec![m, n], DType::F16);
+    let mut args = GemmArgs::new(&a, &b, &mut out);
+    args.alpha = 1.0;
+    args.output_scale = 1.0;
+    args.policy.allow_fallback = false;
+    args.policy.graph_safe = true;
+
+    let mut expected = vec![0f32; m * n];
+    for row in 0..m {
+        for column in 0..n {
+            let mut accumulator = 0f64;
+            for inner in 0..k {
+                accumulator +=
+                    a_values[row * k + inner] as f64 * b_values[inner * n + column] as f64;
+            }
+            expected[row * n + column] = (accumulator + bias_values[column] as f64) as f32;
+        }
+    }
+
+    let normalized = super::contracts::normalize(
+        &ctx,
+        args,
+        super::contracts::Semantic::GemmBias,
+        Some(&bias),
+    )
+    .unwrap();
+    super::execution::validate_candidates(&ctx, &normalized, &expected).unwrap();
+}
+
+#[test]
 fn gemm_bias_gelu_all_candidates_match_torch() {
     use torch_fixture as f;
 
@@ -705,4 +761,537 @@ fn gemm_geglu_three_view_all_candidates_match_torch() {
             .unwrap();
         }
     }
+}
+
+/// Host reference for `conv1d`: PyTorch's temporal cross-correlation,
+/// accumulated in F32 from the channel-last operands.
+#[allow(clippy::too_many_arguments)]
+fn conv1d_reference(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    batch: usize,
+    in_length: usize,
+    in_channels: usize,
+    out_channels: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    groups: usize,
+) -> Vec<f32> {
+    let out_length = (in_length + 2 * padding - dilation * (kernel - 1) - 1) / stride + 1;
+    let in_per_group = in_channels / groups;
+    let out_per_group = out_channels / groups;
+    let mut output = vec![0.0f32; batch * out_length * out_channels];
+    for item in 0..batch {
+        for out_channel in 0..out_channels {
+            let group = out_channel / out_per_group;
+            for position in 0..out_length {
+                let mut sum = 0.0f32;
+                for tap in 0..kernel {
+                    let offset = position * stride + tap * dilation;
+                    if offset < padding {
+                        continue;
+                    }
+                    let source = offset - padding;
+                    if source >= in_length {
+                        continue;
+                    }
+                    for channel in 0..in_per_group {
+                        let input_index = (item * in_length + source) * in_channels
+                            + group * in_per_group
+                            + channel;
+                        let weight_index = (out_channel * in_per_group + channel) * kernel + tap;
+                        sum += input[input_index] * weight[weight_index];
+                    }
+                }
+                output[(item * out_length + position) * out_channels + out_channel] =
+                    sum + bias[out_channel];
+            }
+        }
+    }
+    output
+}
+
+/// Host reference for `conv-transpose1d`: the adjoint scatter of `conv1d`.
+#[allow(clippy::too_many_arguments)]
+fn conv_transpose1d_reference(
+    input: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    batch: usize,
+    in_length: usize,
+    in_channels: usize,
+    out_channels: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    output_padding: usize,
+    groups: usize,
+) -> Vec<f32> {
+    let out_length = (in_length - 1) * stride - 2 * padding + (kernel - 1) + output_padding + 1;
+    let in_per_group = in_channels / groups;
+    let out_per_group = out_channels / groups;
+    let mut output = vec![0.0f32; batch * out_length * out_channels];
+    for item in 0..batch {
+        for position in 0..in_length {
+            for in_channel in 0..in_channels {
+                let group = in_channel / in_per_group;
+                for tap in 0..kernel {
+                    let scatter = position * stride + tap;
+                    if scatter < padding {
+                        continue;
+                    }
+                    let target = scatter - padding;
+                    if target >= out_length {
+                        continue;
+                    }
+                    for channel in 0..out_per_group {
+                        let out_channel = group * out_per_group + channel;
+                        output[(item * out_length + target) * out_channels + out_channel] += input
+                            [(item * in_length + position) * in_channels + in_channel]
+                            * weight[(in_channel * out_per_group + channel) * kernel + tap];
+                    }
+                }
+            }
+        }
+    }
+    for position in 0..batch * out_length {
+        for out_channel in 0..out_channels {
+            output[position * out_channels + out_channel] += bias[out_channel];
+        }
+    }
+    output
+}
+
+fn f32_tensor_values(tensor: &Tensor) -> Vec<f32> {
+    let buffer = crate::CudaBuffer::from_tensor(tensor).unwrap();
+    let mut bytes = vec![0; buffer.len()];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_ne_bytes(value.try_into().unwrap()))
+        .collect()
+}
+
+fn assert_matches_reference(actual: &[f32], expected: &[f32], label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label} length");
+    let error: f32 = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual - expected) * (actual - expected))
+        .sum();
+    let signal: f32 = expected.iter().map(|value| value * value).sum();
+    let relative_l2 = (error / signal.max(f32::MIN_POSITIVE)).sqrt();
+    assert!(
+        relative_l2 < 1e-5,
+        "{label} drifted from the reference by relative L2 {relative_l2}"
+    );
+}
+
+#[test]
+fn conv1d_matches_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (batch, in_length, in_channels, out_channels, kernel) = (2, 5, 4, 6, 3);
+    let (stride, padding, dilation, groups) = (2, 1, 2, 2);
+    let out_length = (in_length + 2 * padding - dilation * (kernel - 1) - 1) / stride + 1;
+    let input_values: Vec<_> = (0..batch * in_length * in_channels)
+        .map(|index| ((index * 7 % 23) as f32 - 11.0) / 32.0)
+        .collect();
+    let weight_values: Vec<_> = (0..out_channels * (in_channels / groups) * kernel)
+        .map(|index| ((index * 5 % 19) as f32 - 9.0) / 16.0)
+        .collect();
+    let bias_values: Vec<_> = (0..out_channels)
+        .map(|index| (index as f32 - 2.0) / 8.0)
+        .collect();
+    let expected = conv1d_reference(
+        &input_values,
+        &weight_values,
+        &bias_values,
+        batch,
+        in_length,
+        in_channels,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+        dilation,
+        groups,
+    );
+
+    let input = f32_tensor(0, vec![batch, in_length, in_channels], &input_values);
+    let weight = f32_tensor(
+        0,
+        vec![out_channels, in_channels / groups, kernel],
+        &weight_values,
+    );
+    let bias = f32_tensor(0, vec![out_channels], &bias_values);
+    let mut output = zeros_tensor(0, vec![batch, out_length, out_channels], DType::F32);
+    let mut args =
+        Conv1dArgs::new(Conv1dSemantic::Conv1d, &input, &weight, &mut output).with_bias(&bias);
+    args.stride = stride;
+    args.padding = padding;
+    args.dilation = dilation;
+    args.groups = groups;
+    conv1d(&ctx, args).unwrap();
+    ctx.synchronize().unwrap();
+    assert_matches_reference(&f32_tensor_values(&output), &expected, "conv1d");
+}
+
+#[test]
+fn conv_transpose1d_matches_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (batch, in_length, in_channels, out_channels, kernel) = (2, 4, 4, 6, 3);
+    let (stride, padding, output_padding, groups) = (2, 1, 1, 2);
+    let out_length = (in_length - 1) * stride - 2 * padding + (kernel - 1) + output_padding + 1;
+    let input_values: Vec<_> = (0..batch * in_length * in_channels)
+        .map(|index| ((index * 11 % 17) as f32 - 8.0) / 16.0)
+        .collect();
+    let weight_values: Vec<_> = (0..in_channels * (out_channels / groups) * kernel)
+        .map(|index| ((index * 3 % 13) as f32 - 6.0) / 16.0)
+        .collect();
+    let bias_values: Vec<_> = (0..out_channels)
+        .map(|index| (index as f32 - 2.0) / 16.0)
+        .collect();
+    let expected = conv_transpose1d_reference(
+        &input_values,
+        &weight_values,
+        &bias_values,
+        batch,
+        in_length,
+        in_channels,
+        out_channels,
+        kernel,
+        stride,
+        padding,
+        output_padding,
+        groups,
+    );
+
+    let input = f32_tensor(0, vec![batch, in_length, in_channels], &input_values);
+    let weight = f32_tensor(
+        0,
+        vec![in_channels, out_channels / groups, kernel],
+        &weight_values,
+    );
+    let bias = f32_tensor(0, vec![out_channels], &bias_values);
+    let mut output = zeros_tensor(0, vec![batch, out_length, out_channels], DType::F32);
+    let mut args = Conv1dArgs::new(
+        Conv1dSemantic::ConvTranspose1d,
+        &input,
+        &weight,
+        &mut output,
+    )
+    .with_bias(&bias);
+    args.stride = stride;
+    args.padding = padding;
+    args.output_padding = output_padding;
+    args.groups = groups;
+    conv1d(&ctx, args).unwrap();
+    ctx.synchronize().unwrap();
+    assert_matches_reference(&f32_tensor_values(&output), &expected, "conv-transpose1d");
+}
+
+fn fp16_round(value: f32) -> f32 {
+    half::f16::from_f32(value).to_f32()
+}
+
+#[test]
+fn mean_rows_all_candidates_match_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (rows, cols) = (17usize, 251usize);
+    let values: Vec<f32> = (0..rows * cols)
+        .map(|index| (((index * 37) % 91) as f32 - 45.0) / 8.0)
+        .collect();
+    // Independent reference: sequential f32 row sum per column, one division.
+    let mut expected = vec![0.0f32; cols];
+    for col in 0..cols {
+        let mut sum = 0.0f32;
+        for row in 0..rows {
+            sum += half::f16::from_f32(values[row * cols + col]).to_f32();
+        }
+        expected[col] = sum / rows as f32;
+    }
+    for make in [
+        |values: &[f32], shape: Vec<usize>| f16_tensor(0, shape, values),
+        |values: &[f32], shape: Vec<usize>| tensor(0, shape, values),
+    ] {
+        let input = make(&values, vec![rows, cols]);
+        let out = zeros_tensor(0, vec![1, cols], input.dtype());
+        mean_rows(&ctx, &input, &out).unwrap();
+        ctx.synchronize().unwrap();
+        let actual = if input.dtype() == DType::F16 {
+            f16_values_of(&out)
+        } else {
+            values_of(&out)
+        };
+        let rounded: Vec<f32> = expected
+            .iter()
+            .map(|value| {
+                if input.dtype() == DType::F16 {
+                    fp16_round(*value)
+                } else {
+                    half::bf16::from_f32(*value).to_f32()
+                }
+            })
+            .collect();
+        assert_eq!(actual, rounded, "mean_rows {:?} mismatch", input.dtype());
+    }
+}
+
+fn f16_values_of(out: &Tensor) -> Vec<f32> {
+    let buffer = crate::CudaBuffer::from_tensor(out).unwrap();
+    let mut bytes = vec![0; buffer.len()];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    bytes
+        .chunks_exact(2)
+        .map(|value| half::f16::from_bits(u16::from_ne_bytes([value[0], value[1]])).to_f32())
+        .collect()
+}
+
+fn values_of(out: &Tensor) -> Vec<f32> {
+    let buffer = crate::CudaBuffer::from_tensor(out).unwrap();
+    let mut bytes = vec![0; buffer.len()];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    bytes
+        .chunks_exact(2)
+        .map(|value| half::bf16::from_bits(u16::from_ne_bytes([value[0], value[1]])).to_f32())
+        .collect()
+}
+
+#[test]
+fn sinusoidal_embedding_table_all_candidates_match_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (rows, width) = (33usize, 64usize);
+    let scale = 1000.0f32;
+    let max_period = 10000.0f64;
+    let log_step = (max_period.ln() / (width / 2 - 1) as f64) as f32;
+    let times_f32: Vec<f32> = (0..rows).map(|index| index as f32 * 1.25).collect();
+
+    // Independent reference, including the storage-dtype rounding of the
+    // scaled time before the frequency sweep. The per-entry angle is kept so
+    // the tolerance can absorb a one-ulp expf difference between CUDA and the
+    // host, which a large angle amplifies into an absolute sine error.
+    let reference = |round: fn(f32) -> f32| -> (Vec<f32>, Vec<f32>) {
+        let mut output = vec![0.0f32; rows * width];
+        let mut angles = vec![0.0f32; rows * width];
+        for row in 0..rows {
+            let scaled = round(round(times_f32[row]) * scale);
+            for column in 0..width {
+                let half_width = width / 2;
+                let frequency = (-((column % half_width) as f32) * log_step).exp();
+                let angle = scaled * frequency;
+                let slot = row * width + column;
+                angles[slot] = angle;
+                output[slot] =
+                    round(if column < half_width { angle.sin() } else { angle.cos() });
+            }
+        }
+        (output, angles)
+    };
+
+    for (name, tolerance_scale) in [("f16", 0.001f64), ("bf16", 0.008f64)] {
+        let (make, round): (fn(&[f32], Vec<usize>) -> Tensor, fn(f32) -> f32) = if name == "f16" {
+            (
+                |values: &[f32], shape: Vec<usize>| f16_tensor(0, shape, values),
+                fp16_round,
+            )
+        } else {
+            (
+                |values: &[f32], shape: Vec<usize>| tensor(0, shape, values),
+                |value: f32| half::bf16::from_f32(value).to_f32(),
+            )
+        };
+        let times = make(&times_f32, vec![rows]);
+        let output = zeros_tensor(0, vec![rows, width], times.dtype());
+        sinusoidal_embedding_table(&ctx, &times, &output, scale, max_period).unwrap();
+        ctx.synchronize().unwrap();
+        let actual = if times.dtype() == DType::F16 {
+            f16_values_of(&output)
+        } else {
+            values_of(&output)
+        };
+        let (expected, angles) = reference(round);
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = expected.abs() * tolerance_scale as f32
+                + angles[index].abs() * f32::EPSILON * 4.0
+                + 1e-5;
+            assert!(
+                (actual - expected).abs() <= tolerance as f32,
+                "{name}: entry {index} deviates: {actual} vs {expected}"
+            );
+        }
+    }
+}
+
+/// Independent host reference for the exponential-race sampling pipeline,
+/// written from the documented numeric contract rather than from the kernel.
+fn exponential_race_reference(
+    values: &[f32],
+    seen: &[bool],
+    seed: u64,
+    step: u64,
+    top_k: usize,
+    temperature: f32,
+    repetition: f32,
+) -> (u32, u32) {
+    let vocab = values.len();
+    let mut adjusted: Vec<f32> = values.to_vec();
+    for token in 0..vocab {
+        if seen[token] {
+            adjusted[token] = if adjusted[token] < 0.0 {
+                fp16_round(adjusted[token] * repetition)
+            } else {
+                fp16_round(adjusted[token] / repetition)
+            };
+        }
+    }
+    let mut best = f32::NEG_INFINITY;
+    let mut adjusted_argmax = 0usize;
+    for (index, &value) in adjusted.iter().enumerate() {
+        if value > best {
+            best = value;
+            adjusted_argmax = index;
+        }
+    }
+    let temperature = temperature.max(1.0e-5);
+    for value in &mut adjusted {
+        *value = fp16_round(*value / temperature);
+    }
+    if top_k != 0 && top_k < vocab {
+        let mut sorted = adjusted.clone();
+        sorted.sort_unstable_by(|left, right| right.total_cmp(left));
+        let pivot = sorted[top_k - 1];
+        for value in &mut adjusted {
+            if *value < pivot {
+                *value = f32::NEG_INFINITY;
+            }
+        }
+    }
+    let maximum = *adjusted
+        .iter()
+        .max_by(|left, right| left.total_cmp(right))
+        .expect("adjusted logits are nonempty");
+    let exponentials: Vec<f32> = adjusted
+        .iter()
+        .map(|value| if value.is_finite() { (value - maximum).exp() } else { 0.0 })
+        .collect();
+    let mut sum = 0.0f32;
+    for &exponential in &exponentials {
+        sum += exponential;
+    }
+    let probabilities: Vec<f32> = exponentials.iter().map(|e| fp16_round(e / sum)).collect();
+    let mut race_best = f32::NEG_INFINITY;
+    let mut sampled = 0usize;
+    for (index, &probability) in probabilities.iter().enumerate() {
+        let words = apxinf_core::philox4x32_10(
+            [
+                step as u32,
+                (step >> 32) as u32,
+                index as u32,
+                ((index as u64) >> 32) as u32,
+            ],
+            [seed as u32, (seed >> 32) as u32],
+        );
+        let uniform = (f64::from(words[0]) * 2.328_306_436_538_696_3e-10
+            + 1.164_153_218_269_348_1e-10) as f32;
+        let exponential = if uniform >= 1.0 - f32::EPSILON / 2.0 {
+            f32::EPSILON / 2.0
+        } else {
+            -uniform.ln()
+        };
+        let noise = fp16_round(exponential);
+        let score = fp16_round(probability / noise);
+        if score > race_best {
+            race_best = score;
+            sampled = index;
+        }
+    }
+    (sampled as u32, adjusted_argmax as u32)
+}
+
+#[test]
+fn exponential_race_sample_matches_reference() {
+    let ctx = CudaContext::new(0).unwrap();
+    let vocab = 1025usize;
+    let configurations: &[(&str, u64, usize, f32, f32)] = &[
+        ("defaults", 0x5eed_1111_2222_3333, 5, 1.0, 1.35),
+        ("no_topk", 0x0000_0000_0000_0001, 0, 1.0, 1.35),
+        ("cold_temperature", 0xdead_beef_cafe_f00d, 5, 0.7, 1.35),
+        ("no_penalty", 0x0123_4567_89ab_cdef, 1, 1.0, 1.0),
+        ("wide_topk", 0x7777_7777_7777_7777, 64, 1.0, 1.35),
+    ];
+    for &(name, seed, top_k, temperature, repetition) in configurations {
+        // FP16-quantized logits create genuine ties; a few -inf entries
+        // exercise the masked softmax path.
+        let logits: Vec<f32> = (0..vocab)
+            .map(|index| {
+                let mut state = (seed as usize).wrapping_add(index) as u64;
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let value = (((state >> 33) as f32) / (u32::MAX as f32)) * 16.0 - 8.0;
+                if index % 97 == 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    fp16_round(value)
+                }
+            })
+            .collect();
+        let device_logits = f16_tensor(0, vec![1, vocab], &logits);
+        let seen = zeros_tensor(0, vec![vocab], DType::I8);
+        let output = zeros_tensor(0, vec![4], DType::I32);
+        let mut seen_host = vec![false; vocab];
+        // A short repeated history exercises the penalty-dedup path.
+        for &token in &[3usize, 7, 3, 1024, 12, 7, 0, 500] {
+            seen_host[token] = true;
+        }
+        let flags: Vec<u8> = seen_host.iter().map(|&flag| flag as u8).collect();
+        let buffer = crate::CudaBuffer::from_tensor(&seen).unwrap();
+        buffer.copy_from_host(&flags).unwrap();
+        for step in 0u64..64 {
+            exponential_race_sample(
+                &ctx,
+                ExponentialRaceArgs {
+                    logits: &device_logits,
+                    seen: &seen,
+                    output: &output,
+                    seed,
+                    step,
+                    top_k: top_k as u32,
+                    temperature,
+                    repetition_penalty: repetition,
+                },
+            )
+            .unwrap();
+            ctx.synchronize().unwrap();
+            let words = i32_values_of(&output);
+            let expected = exponential_race_reference(
+                &logits,
+                &seen_host,
+                seed,
+                step,
+                top_k,
+                temperature,
+                repetition,
+            );
+            assert_eq!(
+                (words[0] as u32, words[1] as u32),
+                expected,
+                "{name}: step {step} diverged"
+            );
+            seen_host[expected.0 as usize] = true;
+        }
+    }
+}
+
+fn i32_values_of(out: &Tensor) -> Vec<i32> {
+    let buffer = crate::CudaBuffer::from_tensor(out).unwrap();
+    let mut bytes = vec![0u8; buffer.len()];
+    buffer.copy_to_host(&mut bytes).unwrap();
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| i32::from_ne_bytes(chunk.try_into().unwrap()))
+        .collect()
 }
