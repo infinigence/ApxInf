@@ -16,6 +16,7 @@ model-specific examples and historical evidence link back to it.
 | A required safe device operation is missing | [Adding New Kernels](adding-new-kernels.md) |
 | Designing the native MLX backend or migrating a qualified Mac model | [MLX Backend](mlx-backend.md) — ownership, supported selections and execution contracts |
 | Running PI0.5 on AMD (HIP), comparing it with CUDA, or extending it | [PI0.5 on HIP](hip-pi05.md) — layout, entry points, validation and status |
+| Running GR00T on AMD (HIP), or extending that port | [GR00T on HIP](hip-gr00t.md) — layout, acceptance gate, known limits, fixture provenance |
 | Building, tuning or measuring the Moore Threads backend | [MUSA Backend](musa-backend.md) — build, generations, INT8 routes, capture, tactics database and the accuracy gate |
 | Profiling PI0.5 on MUSA with msys | [Profiling PI0.5 on MUSA](pi05-mttx.md) — markers, recordings and the two known reading defects |
 | Running the PI0.5 FP32 reference on CPU | [PI0.5 CPU reference](pi05-cpu-reference.md) — build, input and execution contracts, numerical validation |

@@ -18,7 +18,7 @@ use apxinf_hip::native::{self, HipArena};
 
 use crate::hip_gr00t::model::blocks::PreparedBlocks;
 use crate::hip_gr00t::model::ModelVariant;
-use crate::hip_gr00t::weights::Embodiment;
+use crate::hip_gr00t::Embodiment;
 use crate::vla::{Action, ExecutionMode, ExecutionPolicy, InferenceSpec, PreparationStatus, PreparedInference, VlaRequest};
 
 use super::runner::{Inputs, PlanKey};

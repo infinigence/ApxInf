@@ -12,7 +12,7 @@ use apxinf_hip::HipContext;
 use super::super::config::{Gr00tConfig, Qwen3VLConfig};
 use super::blocks::{Bf16Blocks, Blocks, PreparedBlocks, VisionOutput, WorkspaceRequirements};
 use super::HipGr00tModel;
-use crate::hip_gr00t::weights::Embodiment;
+use crate::hip_gr00t::Embodiment;
 
 /// One loaded GR00T model, precision-dispatched. The runner holds this and
 /// nothing below it.

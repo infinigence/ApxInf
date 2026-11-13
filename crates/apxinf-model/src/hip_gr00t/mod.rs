@@ -24,5 +24,9 @@ pub use config::{Gr00tConfig, Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionCon
 pub use load::load_runner;
 pub use model::{HipGr00tModel, ModelVariant};
 pub use model_runner::HipGr00tRunner;
+/// The uploaded embodiment adapters, produced through the model interface and
+/// opaque below it. Re-exported at the family root so the runner never names a
+/// `weights::` path.
+pub use weights::Embodiment;
 
 pub(crate) use load::register_builtin;

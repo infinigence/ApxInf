@@ -19,8 +19,8 @@
 //! ```
 //!
 //! `<fixture>` is an `apxinf.gr00t-n1.7.preprocessed-fixture.v1` directory.
-//! `devlocal/gr00t-hip-port/scripts/compare_stages.py` pairs the dump with a
-//! reference `.npz`.
+//! Pair the dump with a reference `.npz` — the workflow and the fixture
+//! provenance are documented in [doc/hip-gr00t.md](../../../doc/hip-gr00t.md).
 
 #![cfg(feature = "hip")]
 

@@ -24,7 +24,8 @@ use apxinf_hip::HipContext;
 use crate::hip_gr00t::config::Gr00tConfig;
 use crate::hip_gr00t::model::blocks::dit_source::Gr00tDitAttentionSource;
 use crate::hip_gr00t::math::{action_timestep_embedding, dit_timestep_projection, flow_schedule};
-use crate::hip_gr00t::weights::{DitBlock, Embodiment, HipGr00tWeights, Linear, Norm, VlBlock};
+use crate::hip_gr00t::Embodiment;
+use crate::hip_gr00t::weights::{DitBlock, HipGr00tWeights, Linear, Norm, VlBlock};
 
 /// Everything about the four timesteps that the observation cannot change.
 ///

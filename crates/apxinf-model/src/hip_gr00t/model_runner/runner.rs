@@ -23,7 +23,7 @@ use half::bf16;
 
 use crate::hip_gr00t::model::token_groups::{build_backbone_token_groups, Gr00tBackboneTokenGroups};
 use crate::hip_gr00t::model::ModelVariant;
-use crate::hip_gr00t::weights::Embodiment;
+use crate::hip_gr00t::Embodiment;
 use crate::vla::{
     Action, ExecutionPolicy, InferenceSpec, InitialLatent,
     PreparedInference, VisionObservation, VlaContract, VlaRequest, VlaRuntime,

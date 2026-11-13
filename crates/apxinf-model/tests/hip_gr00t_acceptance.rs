@@ -1,31 +1,33 @@
 //! End-to-end acceptance for GR00T N1.7 on HIP, through [`VlaRuntime`].
 //!
-//! Runs the frozen LIBERO fixture through the registered runner and compares
-//! the action chunk against the NVIDIA GPU reference. This is the gate from
-//! `doc/gr00t-n1.7.md`: BF16 cosine at least `0.999`, relative L2 at most
-//! `0.05`.
+//! Runs the frozen LIBERO fixture through the registered runner -- loaded via
+//! [`AutoModel`] from `config.json` detection, the way the Python frontend
+//! does -- and compares the action chunk against the NVIDIA GPU reference.
+//! This is the gate from `doc/gr00t-n1.7.md`: BF16 cosine at least `0.999`,
+//! relative L2 at most `0.05`.
 //!
 //! Unlike the `hip_gr00t_stage_dump` example, this goes through the public
 //! runtime, so it also covers request validation, the plan cache and the
 //! preparation contract -- the parts a stage dump bypasses.
 //!
 //! ```text
-//! APXINF_GR00T_CHECKPOINT=/models/GR00T-N1.7-LIBERO/libero_10 \
-//!   APXINF_GR00T_FIXTURE=devlocal/gr00t-hip-port/fixtures/libero-task0-2view \
-//!   APXINF_GR00T_REFERENCE=devlocal/gr00t-hip-port/fixtures/nvidia-reference/final_action.npy \
+//! APXINF_GR00T_CHECKPOINT=<checkpoint> APXINF_GR00T_FIXTURE=<fixture-dir> \
+//!   APXINF_GR00T_REFERENCE=<final-action.npy> \
 //!   cargo test -p apxinf-model --features hip --test hip_gr00t_acceptance -- --nocapture
 //! ```
 //!
-//! The reference is one F32 `.npy` extracted from the reference `.npz`; see
-//! that directory's `PROVENANCE.md`. Every variable must be set or the test
-//! skips, so the suite still runs on a machine without the checkpoint.
+//! Use absolute paths: relative ones resolve against `crates/apxinf-model`.
+//! The fixture and reference are regenerable; see
+//! [doc/hip-gr00t.md](../../../doc/hip-gr00t.md)'s fixture-provenance section.
+//! Every variable must be set or the test skips, so the suite still runs on a
+//! machine without the checkpoint.
 
 #![cfg(feature = "hip")]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use apxinf_core::Tensor;
+use apxinf_core::{Device, Tensor};
 use apxinf_hip::HipContext;
 use apxinf_model::hip_gr00t::load_runner;
 use apxinf_model::vla::PreparedInference as _;
@@ -33,7 +35,7 @@ use apxinf_model::vla::{
     ExecutionPolicy, InferenceSpec, Observation, VisionObservation, VlaMetadata, VlaRequest,
     VlaRuntime,
 };
-use apxinf_model::LoadOptions;
+use apxinf_model::{AutoModel, LoadedModel, LoadOptions};
 
 /// `doc/gr00t-n1.7.md`: BF16 release gate.
 const MIN_COSINE: f64 = 0.999;
@@ -171,8 +173,15 @@ fn the_libero_fixture_matches_the_nvidia_reference_within_the_release_gate() {
     };
 
     let fixture = load_fixture(&fixture_dir);
-    let ctx = Arc::new(HipContext::new(0).expect("HIP device 0"));
-    let runner = load_runner(&checkpoint, ctx, &LoadOptions::default()).expect("load GR00T");
+    // Through `AutoModel`, as the Python frontend loads it: detection from
+    // `config.json:model_type`, the `Gr00tN1d7-hip` registry entry, the
+    // backend the registry opens. `load_runner` is for benches that already
+    // own a context; the acceptance path is the registered one.
+    let loaded = AutoModel::load_model(Device::Hip(0), &checkpoint, &LoadOptions::default())
+        .expect("load GR00T through AutoModel");
+    let LoadedModel::Vla(runner) = loaded else {
+        panic!("GR00T must load as a VLA model");
+    };
 
     let contract = runner.contract();
     assert_eq!(contract.action_shape, [40, 132]);

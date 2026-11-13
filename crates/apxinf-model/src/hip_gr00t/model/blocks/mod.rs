@@ -109,7 +109,7 @@ pub trait Blocks {
         state: &Tensor,
         noise: &Tensor,
         rows: &DitRowIndices,
-        embodiment: &crate::hip_gr00t::weights::Embodiment,
+        embodiment: &crate::hip_gr00t::Embodiment,
     ) -> Result<Tensor>;
 
     /// One inference, every activation from `arena`. `blocks` is what
@@ -121,7 +121,7 @@ pub trait Blocks {
         state: &Tensor,
         noise: &Tensor,
         blocks: &PreparedBlocks,
-        embodiment: &crate::hip_gr00t::weights::Embodiment,
+        embodiment: &crate::hip_gr00t::Embodiment,
     ) -> Result<Tensor>;
 }
 
@@ -278,7 +278,7 @@ impl Blocks for Bf16Blocks {
         state: &Tensor,
         noise: &Tensor,
         rows: &DitRowIndices,
-        embodiment: &crate::hip_gr00t::weights::Embodiment,
+        embodiment: &crate::hip_gr00t::Embodiment,
     ) -> Result<Tensor> {
         let split = action_head::split_backbone(&self.ctx, arena, adapted, rows)?;
         action_head::forward(
@@ -301,7 +301,7 @@ impl Blocks for Bf16Blocks {
         state: &Tensor,
         noise: &Tensor,
         blocks: &PreparedBlocks,
-        embodiment: &crate::hip_gr00t::weights::Embodiment,
+        embodiment: &crate::hip_gr00t::Embodiment,
     ) -> Result<Tensor> {
         let vision_output = vision::forward(
             &self.ctx,
