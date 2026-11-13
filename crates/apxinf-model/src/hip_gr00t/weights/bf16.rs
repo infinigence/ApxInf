@@ -16,11 +16,11 @@
 use apxinf_core::{Device, DType, Error, Result, Shape, Tensor};
 use apxinf_hip::HipContext;
 
-use super::checkpoint::action_head as host_action;
-use super::checkpoint::text as host_text;
-use super::checkpoint::vision as host_vision;
-use super::checkpoint::Gr00tWeights;
-use super::config::{Gr00tConfig, Qwen3VLConfig};
+use super::host::action_head as host_action;
+use super::host::text as host_text;
+use super::host::vision as host_vision;
+use super::host::Gr00tWeights;
+use crate::hip_gr00t::config::{Gr00tConfig, Qwen3VLConfig};
 
 /// A row-major `[in, out]` projection and its bias.
 pub struct Linear {
@@ -322,7 +322,7 @@ fn fused_qkv(
     block: &host_action::Gr00tDitBlockWeights,
     ctx: &HipContext,
 ) -> Result<Option<Linear>> {
-    if super::qkv::mode() != super::qkv::QkvMode::Fused {
+    if crate::hip_gr00t::model::blocks::qkv::mode() != crate::hip_gr00t::model::blocks::qkv::QkvMode::Fused {
         return Ok(None);
     }
     let (q, k, v) = (

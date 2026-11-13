@@ -21,10 +21,10 @@ use apxinf_hip::native::{
 };
 use apxinf_hip::HipContext;
 
-use super::config::{Gr00tConfig, Qwen3VLConfig};
-use super::stages::{NoStages, StageSink};
+use crate::hip_gr00t::config::{Gr00tConfig, Qwen3VLConfig};
+use crate::hip_gr00t::model::stages::{NoStages, StageSink};
 use super::vision::VisionOutput;
-use super::weights::{HipGr00tWeights, Norm, TextLayer, VlBlock};
+use crate::hip_gr00t::weights::{HipGr00tWeights, Norm, TextLayer, VlBlock};
 
 /// Per-request host work: the mRoPE positions and the row indices the vision
 /// output scatters into, uploaded once.
@@ -85,7 +85,7 @@ pub fn prepare(
     attention_mask: &[u8],
     grid_thw: &[[u32; 3]],
 ) -> Result<PreparedBackbone> {
-    let groups = super::geometry::build_backbone_token_groups(
+    let groups = crate::hip_gr00t::model::token_groups::build_backbone_token_groups(
         token_ids,
         attention_mask,
         cfg.image_token_id,
@@ -377,7 +377,7 @@ fn vl_block(
     layer_norm_into(ctx, &block.attn_norm, input, ADAPTER_EPS, &normed)?;
 
     // Q, K and V are separate biased projections here, not one packed matrix.
-    let project = |linear: &super::weights::Linear| -> Result<Tensor> {
+    let project = |linear: &crate::hip_gr00t::weights::Linear| -> Result<Tensor> {
         let biased = arena.tensor(vec![tokens, width], DType::BF16)?;
         // Fused: where the recipe routes this shape to hipBLASLt, the bias and
         // activation are applied inside the GEMM epilogue, on the F32 accumulator.

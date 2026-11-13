@@ -27,11 +27,11 @@ use apxinf_hip::graph::HipGraph;
 use apxinf_hip::native::{self, HipArena};
 use half::bf16;
 
-use super::geometry::{build_backbone_token_groups, Gr00tBackboneTokenGroups};
-use super::model::HipGr00tModel;
-use super::vision::PreparedVision;
-use super::backbone::PreparedBackbone;
-use super::weights::Embodiment;
+use crate::hip_gr00t::model::token_groups::{build_backbone_token_groups, Gr00tBackboneTokenGroups};
+use crate::hip_gr00t::model::HipGr00tModel;
+use crate::hip_gr00t::model::blocks::vision::PreparedVision;
+use crate::hip_gr00t::model::blocks::backbone::PreparedBackbone;
+use crate::hip_gr00t::weights::Embodiment;
 use crate::vla::{
     Action, ExecutionMode, ExecutionPolicy, InferenceSpec, InitialLatent, PreparationStatus,
     PreparedInference, VisionObservation, VlaContract, VlaRequest, VlaRuntime,
@@ -231,7 +231,7 @@ pub struct HipGr00tPrepared {
     /// host-to-device copies -- the two things that would make it
     /// uncapturable, and two allocations plus two copies per inference either
     /// way.
-    rows: super::action_head::DitRowIndices,
+    rows: crate::hip_gr00t::model::blocks::action_head::DitRowIndices,
     embodiment: Rc<Embodiment>,
     /// The forward, captured as one launch, and the output tensor it writes.
     ///
@@ -276,7 +276,7 @@ impl HipGr00tPrepared {
         let zeros = |dims: Vec<usize>| ctx.to_device(&Tensor::zeros(dims, DType::BF16));
         let arena = HipArena::new(ctx, model.arena_bytes(key.patches, key.token_count))?;
         let rows =
-            super::action_head::DitRowIndices::new(ctx, &key.groups.non_image, &key.groups.image)?;
+            crate::hip_gr00t::model::blocks::action_head::DitRowIndices::new(ctx, &key.groups.non_image, &key.groups.image)?;
         Ok(Self {
             spec: InferenceSpec {
                 token_count: key.token_count,

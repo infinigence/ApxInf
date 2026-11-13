@@ -12,10 +12,10 @@ use std::sync::Arc;
 use apxinf_core::{Backend, Device, Error, Result};
 use apxinf_hip::{HipBackend, HipContext};
 
-use super::checkpoint::Gr00tWeights;
+use super::weights::host::Gr00tWeights;
 use super::config::Gr00tConfig;
 use super::model::{self, HipGr00tModel};
-use super::runner::HipGr00tRunner;
+use super::model_runner::HipGr00tRunner;
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::VlaRuntime;
 

@@ -23,7 +23,7 @@ use apxinf_core::{DType, Error, Result, Tensor};
 use apxinf_hip::native::{self, Activation, HipArena};
 use apxinf_hip::HipContext;
 
-use super::weights::{DitBlock, Linear};
+use crate::hip_gr00t::weights::{DitBlock, Linear};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QkvMode {

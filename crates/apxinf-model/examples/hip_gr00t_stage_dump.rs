@@ -20,12 +20,12 @@ use std::sync::Arc;
 use apxinf_core::{Result, Tensor};
 use apxinf_hip::native::HipArena;
 use apxinf_hip::HipContext;
-use apxinf_model::hip_gr00t::action_head::{self, DitConditioning};
-use apxinf_model::hip_gr00t::backbone;
-use apxinf_model::hip_gr00t::checkpoint::Gr00tWeights;
+use apxinf_model::hip_gr00t::model::blocks::action_head::{self, DitConditioning};
+use apxinf_model::hip_gr00t::model::blocks::backbone;
+use apxinf_model::hip_gr00t::weights::Gr00tWeights;
 use apxinf_model::hip_gr00t::config::Gr00tConfig;
-use apxinf_model::hip_gr00t::stages::StageSink;
-use apxinf_model::hip_gr00t::vision;
+use apxinf_model::hip_gr00t::model::stages::StageSink;
+use apxinf_model::hip_gr00t::model::blocks::vision;
 use apxinf_model::hip_gr00t::weights::HipGr00tWeights;
 
 type AnyResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -225,7 +225,7 @@ fn main() -> AnyResult<()> {
     // gets its own arena rather than the per-request one.
     let constants = HipArena::new(&ctx, 64 << 20)?;
     let conditioning = DitConditioning::new(&ctx, &config, &device, &constants)?;
-    let groups = apxinf_model::hip_gr00t::geometry::build_backbone_token_groups(
+    let groups = apxinf_model::hip_gr00t::model::token_groups::build_backbone_token_groups(
         &token_ids,
         &attention_mask,
         backbone_config.image_token_id,

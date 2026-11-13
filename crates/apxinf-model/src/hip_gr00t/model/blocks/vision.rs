@@ -20,9 +20,9 @@ use apxinf_core::{DType, Error, Result, Tensor};
 use apxinf_hip::native::{self, Activation, AttentionGeometry, HipArena, HipDeviceBytes};
 use apxinf_hip::HipContext;
 
-use super::config::Qwen3VLConfig;
-use super::stages::{NoStages, StageSink};
-use super::weights::{HipGr00tWeights, Merger, Norm, VisionBlock};
+use crate::hip_gr00t::config::Qwen3VLConfig;
+use crate::hip_gr00t::model::stages::{NoStages, StageSink};
+use crate::hip_gr00t::weights::{HipGr00tWeights, Merger, Norm, VisionBlock};
 
 /// What the vision tower hands the backbone and the DiT.
 pub struct VisionOutput {

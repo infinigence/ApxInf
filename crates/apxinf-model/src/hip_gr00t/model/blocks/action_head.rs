@@ -3,7 +3,7 @@
 //! Four Euler steps over a 32-block DiT. Each block is adaptively normalized
 //! by the timestep, then attends either to the backbone (alternating between
 //! its non-image and image rows) or to itself, per
-//! [`super::geometry::dit_attention_source`].
+//! [`crate::hip_gr00t::model::blocks::dit_source::dit_attention_source`].
 //!
 //! The timestep conditioning is **static**: nothing in it depends on the
 //! observation, so all four steps' modulations are computed once at load time
@@ -16,11 +16,11 @@ use apxinf_core::{DType, Error, Result, Tensor};
 use apxinf_hip::native::{self, Activation, AttentionGeometry, HipArena, PreparedRowIndices};
 use apxinf_hip::HipContext;
 
-use super::config::Gr00tConfig;
-use super::geometry::Gr00tDitAttentionSource;
-use super::math::{action_timestep_embedding, dit_timestep_projection, flow_schedule};
-use super::stages::{NoStages, StageSink};
-use super::weights::{DitBlock, Embodiment, HipGr00tWeights, Linear};
+use crate::hip_gr00t::config::Gr00tConfig;
+use crate::hip_gr00t::model::blocks::dit_source::Gr00tDitAttentionSource;
+use crate::hip_gr00t::math::{action_timestep_embedding, dit_timestep_projection, flow_schedule};
+use crate::hip_gr00t::model::stages::{NoStages, StageSink};
+use crate::hip_gr00t::weights::{DitBlock, Embodiment, HipGr00tWeights, Linear};
 
 /// Everything about the four timesteps that the observation cannot change.
 ///
@@ -187,7 +187,7 @@ impl CrossAttentionCache {
         );
         let mut per_block = Vec::with_capacity(weights.dit_blocks.len());
         for (index, block) in weights.dit_blocks.iter().enumerate() {
-            let source = match super::geometry::dit_attention_source(cfg, index)? {
+            let source = match crate::hip_gr00t::model::blocks::dit_source::dit_attention_source(cfg, index)? {
                 Gr00tDitAttentionSource::NonImageBackbone => &backbone.non_image,
                 Gr00tDitAttentionSource::ImageBackbone => &backbone.image,
                 // Self-attention reads the block's own normalized state, which
@@ -511,7 +511,7 @@ fn flow_step(
     )?;
 
     for (index, block) in weights.dit_blocks.iter().enumerate() {
-        let source = match super::geometry::dit_attention_source(cfg, index)? {
+        let source = match crate::hip_gr00t::model::blocks::dit_source::dit_attention_source(cfg, index)? {
             Gr00tDitAttentionSource::NonImageBackbone => &backbone.non_image,
             Gr00tDitAttentionSource::ImageBackbone => &backbone.image,
             Gr00tDitAttentionSource::StateActionSelf => &normalized,

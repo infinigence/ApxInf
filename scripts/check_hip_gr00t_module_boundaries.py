@@ -23,12 +23,14 @@ ROOT = Path(__file__).resolve().parents[1] / "crates/apxinf-model/src/hip_gr00t"
 
 # Per module, the dependencies that would invert the intended direction.
 RULES = {
-    "weights.rs": r"\b(HipGr00tRunner|HipGr00tPrepared|HipGr00tModel|VlaRequest|InferenceSpec|PreparedVision|PreparedBackbone|DitConditioning)\b",
-    "vision.rs": r"\b(HipGr00tRunner|HipGr00tPrepared|HipGr00tModel|VlaRequest|InferenceSpec)\b",
-    "backbone.rs": r"\b(HipGr00tRunner|HipGr00tPrepared|HipGr00tModel|VlaRequest|InferenceSpec)\b",
-    "action_head.rs": r"\b(HipGr00tRunner|HipGr00tPrepared|HipGr00tModel|VlaRequest|InferenceSpec)\b",
+    "weights/bf16.rs": r"\b(HipGr00tRunner|HipGr00tPrepared|HipGr00tModel|VlaRequest|InferenceSpec|PreparedVision|PreparedBackbone|DitConditioning)\b",
+    "weights/host.rs": r"\b(HipGr00tRunner|HipGr00tPrepared|HipGr00tModel|VlaRequest|InferenceSpec|PreparedVision|PreparedBackbone|DitConditioning|HipContext|HipArena|native::)\b",
+    "model/blocks/vision.rs": r"\b(HipGr00tRunner|HipGr00tPrepared|HipGr00tModel|VlaRequest|InferenceSpec)\b",
+    "model/blocks/backbone.rs": r"\b(HipGr00tRunner|HipGr00tPrepared|HipGr00tModel|VlaRequest|InferenceSpec)\b",
+    "model/blocks/action_head.rs": r"\b(HipGr00tRunner|HipGr00tPrepared|HipGr00tModel|VlaRequest|InferenceSpec)\b",
     "math.rs": r"\b(HipContext|HipArena|native::)\b",
-    "geometry.rs": r"\b(HipContext|HipArena|native::)\b",
+    "model/blocks/dit_source.rs": r"\b(HipContext|HipArena|native::)\b",
+    "model/token_groups.rs": r"\b(HipContext|HipArena|native::)\b",
 }
 
 # Every file: the port is a private module and owns its own copies.
@@ -81,7 +83,7 @@ def main():
     # `checkpoint::tests::a_checkpoint_asking_for_a_different_activation_is_refused`
     # drives `from_map` and asserts the rejection. What is checked here is only
     # that the function still exists to be tested.
-    guard = source(ROOT / "checkpoint/mod.rs")
+    guard = source(ROOT / "weights/host.rs")
     if not re.search(r"fn validate_activations\b", guard):
         violations.append(
             "checkpoint/mod.rs: validate_activations is gone; a config-driven activation "

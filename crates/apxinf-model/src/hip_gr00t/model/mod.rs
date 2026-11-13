@@ -5,7 +5,7 @@
 //! interpolates per shape, and the per-embodiment adapters.
 //!
 //! Request-shaped state (arenas, input buffers, prepared positions) belongs to
-//! [`super::runner`], not here.
+//! [`crate::hip_gr00t::model_runner`], not here.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -15,13 +15,17 @@ use apxinf_core::{Error, Result, Tensor};
 use apxinf_hip::native::HipArena;
 use apxinf_hip::HipContext;
 
-use super::action_head::{self, DitBackbone, DitConditioning};
-use super::backbone::{self, PreparedBackbone};
-use super::checkpoint::action_head::Gr00tActionHeadWeights;
-use super::checkpoint::Gr00tWeights;
+pub mod blocks;
+pub mod stages;
+pub mod token_groups;
+
+use blocks::action_head::{self, DitBackbone, DitConditioning};
+use blocks::backbone::{self, PreparedBackbone};
+use blocks::vision::{self, PreparedVision};
+use stages::{NoStages, StageSink};
 use super::config::{Gr00tConfig, Qwen3VLConfig};
-use super::stages::{NoStages, StageSink};
-use super::vision::{self, PreparedVision};
+use super::weights::host::action_head::Gr00tActionHeadWeights;
+use super::weights::host::Gr00tWeights;
 use super::weights::{Embodiment, HipGr00tWeights};
 
 /// Backs the static timestep conditioning for the model's lifetime: 4 steps

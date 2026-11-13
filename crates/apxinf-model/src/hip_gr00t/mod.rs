@@ -1,5 +1,4 @@
-//! GR00T N1.7 on AMD GPUs, written directly against HIP (`apxinf_hip::native`)
-//! the way `gr00t/` is written against `apxinf-cuda-new`.
+//! GR00T N1.7 on AMD GPUs, written directly against HIP (`apxinf_hip::native`).
 //!
 //! A self-contained port: it owns its config, checkpoint reader, device
 //! weights, vision tower, text backbone, DiT action head, inference runner and
@@ -7,27 +6,23 @@
 //! implementation comes from both passing the same accuracy fixtures, not from
 //! shared code.
 //!
-//! BF16 only, eager. `select_layer` and the DiT depth come from the
-//! checkpoint, not from the configuration defaults.
+//! The module layout mirrors PI0.5: `model/` owns the forward math
+//! (`model::blocks` holds the concrete BF16 blocks), `model_runner/` owns
+//! request validation, the plan cache and execution, `weights/` owns checkpoint
+//! mapping and the device weight tree. BF16 only; `select_layer` and the DiT
+//! depth come from the checkpoint, not from the configuration defaults.
 
-pub mod action_head;
 pub mod assets;
-pub mod backbone;
-pub mod checkpoint;
 pub mod config;
-pub mod geometry;
 pub mod load;
 pub mod math;
 pub mod model;
-pub mod qkv;
-pub mod runner;
-pub mod stages;
-pub mod vision;
+pub mod model_runner;
 pub mod weights;
 
 pub use config::{Gr00tConfig, Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVisionConfig};
 pub use load::load_runner;
 pub use model::HipGr00tModel;
-pub use runner::HipGr00tRunner;
+pub use model_runner::HipGr00tRunner;
 
 pub(crate) use load::register_builtin;

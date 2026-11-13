@@ -19,7 +19,7 @@ use apxinf_core::{DType, Error, Result, Tensor};
 use self::action_head::Gr00tActionHeadWeights;
 use self::text::Qwen3VLTextWeights;
 use self::vision::Qwen3VLVisionWeights;
-use super::config::{Gr00tConfig, Qwen3VLConfig};
+use crate::hip_gr00t::config::{Gr00tConfig, Qwen3VLConfig};
 
 pub mod action_head;
 pub mod text;

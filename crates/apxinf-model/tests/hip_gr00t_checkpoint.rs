@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use apxinf_model::hip_gr00t::checkpoint::Gr00tWeights;
+use apxinf_model::hip_gr00t::weights::Gr00tWeights;
 use apxinf_model::hip_gr00t::config::Gr00tConfig;
 
 fn checkpoint() -> Option<PathBuf> {

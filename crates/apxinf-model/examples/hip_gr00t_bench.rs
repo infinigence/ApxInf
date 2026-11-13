@@ -28,8 +28,9 @@ use std::time::Instant;
 use apxinf_core::{DType, Tensor};
 use apxinf_hip::native::HipArena;
 use apxinf_hip::HipContext;
-use apxinf_model::hip_gr00t::action_head::{self, DitConditioning};
-use apxinf_model::hip_gr00t::{backbone, load_runner, vision};
+use apxinf_model::hip_gr00t::model::blocks::action_head::{self, DitConditioning};
+use apxinf_model::hip_gr00t::load_runner;
+use apxinf_model::hip_gr00t::model::blocks::{backbone, vision};
 use apxinf_model::vla::{
     Observation, VisionObservation, VlaMetadata, VlaRequest, VlaRuntime,
 };
@@ -264,7 +265,7 @@ fn main() -> AnyResult<()> {
         let pixel_values = ctx.to_device(&fixture.pixel_values)?;
         let state = ctx.to_device(&fixture.state)?;
         let noise = ctx.to_device(&fixture.noise)?;
-        let groups = apxinf_model::hip_gr00t::geometry::build_backbone_token_groups(
+        let groups = apxinf_model::hip_gr00t::model::token_groups::build_backbone_token_groups(
             &fixture.token_ids,
             &fixture.attention_mask,
             backbone_config.image_token_id,
