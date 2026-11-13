@@ -103,6 +103,9 @@ pcm = result["samples"]
 sample_rate = result["sample_rate"]
 ```
 
+`sample_steps` must be 1, 2, 4, 8, 16 or 32: the CFM step modulation is a 32-row
+table of timesteps `i / 32`, so other values would not match the official schedule.
+
 `autotune=False` is the default for both `GptSovitsPolicy.from_pretrained`
 and `SpeechRunner.from_pretrained`. Valid hardware/toolkit recipes are reused;
 recipe misses use the backend fallback without benchmarking. Set

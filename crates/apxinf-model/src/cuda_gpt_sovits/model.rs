@@ -735,7 +735,7 @@ impl GptSovitsModel {
                 &reference_features,
                 &target_features,
                 &reference_mel,
-                inputs.sample_steps.max(1),
+                inputs.sample_steps,
                 inputs.cfg_rate,
                 request.seed,
             )
@@ -1114,7 +1114,7 @@ impl TtsTrait for GptSovitsModel {
             || spec.reference_frames == 0
             || spec.reference_spec_frames == 0
             || spec.target_frames == 0
-            || spec.sample_steps == 0
+            || super::cfm::validate_sample_steps(spec.sample_steps).is_err()
             || spec.target_frames % 4 != 0
         {
             return Err(Error::Other(format!(

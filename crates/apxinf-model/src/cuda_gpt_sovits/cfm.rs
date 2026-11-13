@@ -778,6 +778,7 @@ impl Cfm {
         cfg_rate: f32,
         seed: u64,
     ) -> Result<Tensor> {
+        validate_sample_steps(steps)?;
         if cfg_rate > 1e-5 {
             return Err(Error::Other(
                 "gpt_sovits v5turbo does not support classifier-free guidance".into(),
@@ -878,6 +879,16 @@ impl Cfm {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sample_steps_must_divide_the_timestep_table() {
+        for steps in [1, 2, 4, 8, 16, 32] {
+            assert!(super::validate_sample_steps(steps).is_ok(), "{steps}");
+        }
+        for steps in [0, 3, 5, 6, 7, 12, 33, 64] {
+            assert!(super::validate_sample_steps(steps).is_err(), "{steps}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -890,4 +901,15 @@ mod tests {
         cfm.validate_step_modulations(&ctx, &mut weights).unwrap();
         println!("all cached block/final modulations match original bytes");
     }
+}
+
+/// The step modulation table holds the 32 timesteps `i / 32`; a step count
+/// that does not divide 32 would silently read rows that are not `index / steps`.
+pub(super) fn validate_sample_steps(steps: usize) -> Result<()> {
+    if steps == 0 || steps > 32 || 32 % steps != 0 {
+        return Err(Error::Other(format!(
+            "gpt_sovits sample_steps must be 1, 2, 4, 8, 16 or 32, got {steps}"
+        )));
+    }
+    Ok(())
 }
