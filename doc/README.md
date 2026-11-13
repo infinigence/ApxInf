@@ -37,8 +37,9 @@ Qwen3.8-27B-NVFP4 is a text LLM behind `LlmTrait` with the same
 `weights`/`model`/`model_runner` owners as single files.
 [CLI inference, benchmarking and limits](qwen38-nvfp4.md) cover Jetson Thor.
 
-GPT-SoVITS V5 is a speech synthesizer behind `TtsTrait`, the separate contract
-for canonical phone/BERT input. Its
+GPT-SoVITS V5 is a TTS model behind `TtsTrait`, the single contract shared by
+every TTS family (Qwen3-TTS uses it too), with its phone/BERT/reference inputs
+carried in a typed extension. Its
 [conversion, wiring and quality acceptance](gpt-sovits-v5.md) cover the
 checkpoint converter, the Python text frontend boundary and the quality gates
 run against the official eager backend.
