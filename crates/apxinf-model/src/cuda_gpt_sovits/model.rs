@@ -20,13 +20,55 @@ use super::sovits::Sovits;
 use super::vocoder::Vocoder;
 use super::weights::Weights;
 use crate::tts_trait::{
-    PcmAudio, PreparedTts, TtsCacheConfig, TtsCacheInfo, TtsContract, TtsRequest, TtsSpec, TtsTrait,
+    gpt_sovits_inputs, GeneratedAudio, GptSovitsInputs, PreparedTts, TtsCacheConfig, TtsCacheInfo,
+    TtsContract, TtsRequest, TtsTrait, TtsSampling, TtsSpec,
 };
+
+/// Sampling defaults used when a [`TtsRequest`] leaves its knobs unset. They
+/// mirror the official GPT-SoVITS V5 inference settings.
+const DEFAULT_TOP_K: usize = 5;
+const DEFAULT_TOP_P: f32 = 1.0;
+const DEFAULT_TEMPERATURE: f32 = 1.0;
+const DEFAULT_REPETITION_PENALTY: f32 = 1.35;
+const DEFAULT_MAX_SECONDS: f32 = 30.0;
+
+/// Resolve a request's sampling knobs: explicit values win, otherwise the
+/// family defaults above.
+fn sampling_of(request: &TtsRequest<'_>) -> (usize, f32, f32, f32, f32) {
+    let s: &TtsSampling<'_> = &request.sampling;
+    (
+        s.top_k.unwrap_or(DEFAULT_TOP_K),
+        s.top_p.unwrap_or(DEFAULT_TOP_P),
+        s.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+        s.repetition_penalty.unwrap_or(DEFAULT_REPETITION_PENALTY),
+        s.max_seconds.unwrap_or(DEFAULT_MAX_SECONDS),
+    )
+}
 
 const SPEC_MIN: f32 = -12.0;
 const SPEC_MAX: f32 = 2.0;
 const OUTPUT_SAMPLE_RATE: u32 = 48000;
 const CFM_REFERENCE_FRAMES: usize = 500;
+/// Semantic tokens per second and the hard cap on one request's generation.
+const SEMANTIC_TOKENS_PER_SECOND: f32 = 25.0;
+const MAX_SEMANTIC_TOKENS: usize = 1500;
+
+/// Semantic-token budget for `max_seconds` (at least one second's worth).
+fn max_semantic_tokens(max_seconds: f32) -> usize {
+    ((max_seconds.max(1.0) * SEMANTIC_TOKENS_PER_SECOND) as usize).min(MAX_SEMANTIC_TOKENS)
+}
+
+/// Wrap vocoder output. `Gpt::generate` stops before pushing EOS, so it
+/// returns fewer than `max_new_tokens` tokens exactly when EOS was sampled;
+/// a full budget means the length limit cut generation short.
+fn mono_audio(samples: Vec<f32>, generated_tokens: usize, max_new_tokens: usize) -> GeneratedAudio {
+    GeneratedAudio {
+        sample_rate: OUTPUT_SAMPLE_RATE,
+        channels: 1,
+        samples,
+        complete: generated_tokens < max_new_tokens,
+    }
+}
 
 /// Start offset of the reference-feature window paired with the prompt mel.
 ///
@@ -453,7 +495,7 @@ impl SovitsGraph {
     }
 }
 
-pub struct PreparedGptSovitsSpeech {
+pub struct PreparedGptSovitsTts {
     _bert: Arc<Bert>,
     _hubert: Arc<Hubert>,
     _sovits: Arc<Sovits>,
@@ -562,29 +604,29 @@ impl GptSovitsModel {
         transfers::to_cuda(&host, self.ctx.device_id())
     }
 
-    fn reference_features(&self, request: &TtsRequest<'_>) -> Result<Rc<ReferenceFeatures>> {
-        let key = ReferenceKey::new(request, false);
+    fn reference_features(&self, inputs: &GptSovitsInputs<'_>) -> Result<Rc<ReferenceFeatures>> {
+        let key = ReferenceKey::new(inputs, false);
         if let Some(value) = self.cache.borrow_mut().reference(&key) {
             return Ok(value);
         }
-        let frames = request.reference_mel.len() / 100;
-        let spec_frames = request.reference_spec.len() / 704;
-        let mel = super::weights::fp16_tensor(&self.ctx, &[frames, 100], request.reference_mel)?;
+        let frames = inputs.reference_mel.len() / 100;
+        let spec_frames = inputs.reference_spec.len() / 704;
+        let mel = super::weights::fp16_tensor(&self.ctx, &[frames, 100], inputs.reference_mel)?;
         let spec =
-            super::weights::fp16_tensor(&self.ctx, &[spec_frames, 704], request.reference_spec)?;
+            super::weights::fp16_tensor(&self.ctx, &[spec_frames, 704], inputs.reference_spec)?;
         let bert = self.bert_phone_features_inner(
-            request.reference_bert_token_ids,
-            request.reference_word2ph,
-            request.reference_phone_ids.len(),
+            inputs.reference_bert_token_ids,
+            inputs.reference_word2ph,
+            inputs.reference_phone_ids.len(),
             false,
         )?;
-        let codes = self.hubert.encode(&self.ctx, request.reference_audio_16k)?;
+        let codes = self.hubert.encode(&self.ctx, inputs.reference_audio_16k)?;
         let prompt = self.codes_to_vec(&codes)?;
         let style = self.sovits.style(&self.ctx, &spec)?;
         let features = self.sovits.decode_features(
             &self.ctx,
             &codes,
-            request.reference_phone_ids,
+            inputs.reference_phone_ids,
             &style,
             1.0,
         )?;
@@ -601,43 +643,45 @@ impl GptSovitsModel {
         Ok(value)
     }
 
-    pub fn synthesize(&self, request: &TtsRequest<'_>) -> Result<PcmAudio> {
-        if !request.speed_factor.is_finite() || request.speed_factor <= 0.0 {
+    pub fn synthesize(&self, request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
+        let inputs = gpt_sovits_inputs(request)?;
+        let (top_k, top_p, temperature, repetition_penalty, max_seconds) = sampling_of(request);
+        if !inputs.speed_factor.is_finite() || inputs.speed_factor <= 0.0 {
             return Err(Error::Other(format!(
                 "speed_factor must be finite and positive, got {}",
-                request.speed_factor
+                inputs.speed_factor
             )));
         }
-        if request.phone_ids.is_empty() || request.reference_phone_ids.is_empty() {
+        if inputs.phone_ids.is_empty() || inputs.reference_phone_ids.is_empty() {
             return Err(Error::Other(
-                "speech request requires target and reference text".into(),
+                "tts request requires target and reference text".into(),
             ));
         }
-        if request.reference_audio_16k.len() < 400 {
+        if inputs.reference_audio_16k.len() < 400 {
             return Err(Error::Other("reference audio is too short".into()));
         }
-        let reference_frames = request.reference_mel.len() / 100;
-        let reference_spec_frames = request.reference_spec.len() / 704;
+        let reference_frames = inputs.reference_mel.len() / 100;
+        let reference_spec_frames = inputs.reference_spec.len() / 704;
         if reference_frames == 0 || reference_spec_frames == 0 {
             return Err(Error::Other("reference mel/spec is empty".into()));
         }
-        let reference = self.reference_features(request)?;
+        let reference = self.reference_features(inputs)?;
         let reference_mel = reference.mel.clone();
         let reference_bert = reference.bert.clone();
         let target_bert = self
             .bert_phone_features(
-                request.bert_token_ids,
-                request.word2ph,
-                request.phone_ids.len(),
+                inputs.bert_token_ids,
+                inputs.word2ph,
+                inputs.phone_ids.len(),
             )
             .map_err(|error| Error::Other(format!("target bert: {error}")))?;
         let bert = ops::concat_rows(&self.ctx, &reference_bert, &target_bert)
             .map_err(|error| Error::Other(format!("bert concat: {error}")))?;
-        let mut phones = request.reference_phone_ids.to_vec();
-        phones.extend_from_slice(request.phone_ids);
+        let mut phones = inputs.reference_phone_ids.to_vec();
+        phones.extend_from_slice(inputs.phone_ids);
 
         let prompt = &reference.prompt;
-        let max_new_tokens = ((request.max_seconds.max(1.0) * 25.0) as usize).min(1500);
+        let max_new_tokens = max_semantic_tokens(max_seconds);
         let generated = self
             .gpt
             .generate(
@@ -646,10 +690,10 @@ impl GptSovitsModel {
                 &bert,
                 &prompt,
                 request.seed,
-                request.top_k,
-                request.top_p,
-                request.temperature,
-                request.repetition_penalty,
+                top_k,
+                top_p,
+                temperature,
+                repetition_penalty,
                 max_new_tokens,
             )
             .map_err(|error| Error::Other(format!("gpt: {error}")))?;
@@ -665,12 +709,12 @@ impl GptSovitsModel {
             .decode_features(
                 &self.ctx,
                 &target_codes,
-                request.phone_ids,
+                inputs.phone_ids,
                 &ge,
-                request.speed_factor,
+                inputs.speed_factor,
             )
             .map_err(|error| Error::Other(format!("target decode: {error}")))?;
-        // The speech request carries the final prompt mel (typically 500
+        // The tts request carries the final prompt mel (typically 500
         // frames), while reference features are decoded at the pre-truncation
         // rate derived from the full reference spectrogram. PyTorch first
         // truncates to min(2 * spec_frames, feature_frames), then keeps the
@@ -691,8 +735,8 @@ impl GptSovitsModel {
                 &reference_features,
                 &target_features,
                 &reference_mel,
-                request.sample_steps.max(1),
-                request.cfg_rate,
+                inputs.sample_steps.max(1),
+                inputs.cfg_rate,
                 request.seed,
             )
             .map_err(|error| Error::Other(format!("cfm: {error}")))?;
@@ -712,30 +756,25 @@ impl GptSovitsModel {
         // No implicit trailing pause. The public pipeline appends
         // `fragment_interval` silence after every text fragment, matching the
         // official `audio_postprocess`.
-        let valid_length = samples.len();
-        Ok(PcmAudio {
-            samples,
-            sample_rate: OUTPUT_SAMPLE_RATE,
-            valid_length,
-        })
+        Ok(mono_audio(samples, generated.len(), max_new_tokens))
     }
 }
 
-impl PreparedGptSovitsSpeech {
-    fn validate_request(&self, request: &TtsRequest<'_>) -> Result<()> {
+impl PreparedGptSovitsTts {
+    fn validate_request(&self, inputs: &GptSovitsInputs<'_>) -> Result<()> {
         let actual = TtsSpec {
-            phone_count: request.phone_ids.len(),
-            bert_token_count: request.bert_token_ids.len(),
-            reference_phone_count: request.reference_phone_ids.len(),
-            reference_bert_token_count: request.reference_bert_token_ids.len(),
-            reference_audio_samples: request.reference_audio_16k.len(),
-            reference_frames: request.reference_mel.len() / 100,
-            reference_spec_frames: request.reference_spec.len() / 704,
+            phone_count: inputs.phone_ids.len(),
+            bert_token_count: inputs.bert_token_ids.len(),
+            reference_phone_count: inputs.reference_phone_ids.len(),
+            reference_bert_token_count: inputs.reference_bert_token_ids.len(),
+            reference_audio_samples: inputs.reference_audio_16k.len(),
+            reference_frames: inputs.reference_mel.len() / 100,
+            reference_spec_frames: inputs.reference_spec.len() / 704,
             target_frames: self.spec.target_frames,
-            sample_steps: request.sample_steps,
+            sample_steps: inputs.sample_steps,
         };
-        if request.reference_mel.len() != self.spec.reference_frames * 100
-            || request.reference_spec.len() != self.spec.reference_spec_frames * 704
+        if inputs.reference_mel.len() != self.spec.reference_frames * 100
+            || inputs.reference_spec.len() != self.spec.reference_spec_frames * 704
             || actual.phone_count != self.spec.phone_count
             || actual.bert_token_count != self.spec.bert_token_count
             || actual.reference_phone_count != self.spec.reference_phone_count
@@ -746,16 +785,16 @@ impl PreparedGptSovitsSpeech {
             || actual.sample_steps != self.spec.sample_steps
         {
             return Err(Error::Other(format!(
-                "speech request does not match prepared profile: expected {:?}, got {:?}",
+                "tts request does not match prepared profile: expected {:?}, got {:?}",
                 self.spec, actual
             )));
         }
-        if request.cfg_rate > 1e-5 {
+        if inputs.cfg_rate > 1e-5 {
             return Err(Error::Other(
                 "gpt_sovits v5turbo does not support classifier-free guidance".into(),
             ));
         }
-        if (request.speed_factor - 1.0).abs() > 1e-6 {
+        if (inputs.speed_factor - 1.0).abs() > 1e-6 {
             return Err(Error::Other(
                 "prepared gpt_sovits profiles require speed_factor=1.0; use eager synthesis for other speeds"
                     .into(),
@@ -786,38 +825,38 @@ impl PreparedGptSovitsSpeech {
         Ok(value)
     }
 
-    fn reference_features(&self, request: &TtsRequest<'_>) -> Result<Rc<ReferenceFeatures>> {
-        let key = ReferenceKey::new(request, true);
+    fn reference_features(&self, inputs: &GptSovitsInputs<'_>) -> Result<Rc<ReferenceFeatures>> {
+        let key = ReferenceKey::new(inputs, true);
         if let Some(value) = self.cache.borrow_mut().reference(&key) {
             return Ok(value);
         }
         let mel = super::weights::fp16_tensor(
             &self.ctx,
             &[self.spec.reference_frames, 100],
-            request.reference_mel,
+            inputs.reference_mel,
         )?;
         let spec = super::weights::fp16_tensor(
             &self.ctx,
             &[self.spec.reference_spec_frames, 704],
-            request.reference_spec,
+            inputs.reference_spec,
         )?;
         let bert = self.cached_bert(
             &self.reference_bert,
-            request.reference_bert_token_ids,
-            request.reference_word2ph,
-            request.reference_phone_ids.len(),
+            inputs.reference_bert_token_ids,
+            inputs.reference_word2ph,
+            inputs.reference_phone_ids.len(),
             false,
         )?;
         let codes = self
             .hubert_graph
-            .replay(&self.ctx, request.reference_audio_16k)?;
+            .replay(&self.ctx, inputs.reference_audio_16k)?;
         let host = transfers::to_cpu(&codes)?;
         let prompt = host.as_i32()?.iter().map(|x| *x as u32).collect();
         let generated_style = self.style_graph.replay(&self.ctx, &spec)?;
         let style = owned_tensor(&self.ctx, &generated_style)?;
         let generated_features =
             self.reference_sovits
-                .replay(&self.ctx, &codes, request.reference_phone_ids, &style)?;
+                .replay(&self.ctx, &codes, inputs.reference_phone_ids, &style)?;
         let features = owned_tensor(&self.ctx, &generated_features)?;
         let value = Rc::new(ReferenceFeatures {
             bert,
@@ -832,30 +871,33 @@ impl PreparedGptSovitsSpeech {
         Ok(value)
     }
 
-    fn run_prepared(&self, request: &TtsRequest<'_>) -> Result<PcmAudio> {
-        self.validate_request(request)?;
+    fn run_prepared(&self, request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
+        let inputs = gpt_sovits_inputs(request)?;
+        let (top_k, top_p, temperature, repetition_penalty, max_seconds) = sampling_of(request);
+        self.validate_request(inputs)?;
         // NVTX segment timeline for nsys. This layer is a black box of graph
         // replays, so the four stages are only separable with host-side marks;
         // without the `nvtx` feature each range is a zero-cost no-op.
         let _tts_reference_range = crate::profiling::trace::range("tts.reference");
-        let reference = self.reference_features(request)?;
+        let reference = self.reference_features(inputs)?;
         drop(_tts_reference_range);
         let reference_mel = reference.mel.clone();
         let reference_bert = reference.bert.clone();
         let _tts_bert_range = crate::profiling::trace::range("tts.bert");
         let target_bert = self.cached_bert(
             &self.target_bert,
-            request.bert_token_ids,
-            request.word2ph,
-            request.phone_ids.len(),
+            inputs.bert_token_ids,
+            inputs.word2ph,
+            inputs.phone_ids.len(),
             true,
         )?;
         drop(_tts_bert_range);
         let bert = ops::concat_rows(&self.ctx, &reference_bert, &target_bert)?;
-        let mut phones = request.reference_phone_ids.to_vec();
-        phones.extend_from_slice(request.phone_ids);
+        let mut phones = inputs.reference_phone_ids.to_vec();
+        phones.extend_from_slice(inputs.phone_ids);
         let prompt = &reference.prompt;
         let _tts_gpt_range = crate::profiling::trace::range("tts.gpt");
+        let max_new_tokens = max_semantic_tokens(max_seconds);
         let generated = self
             .gpt
             .generate(
@@ -864,11 +906,11 @@ impl PreparedGptSovitsSpeech {
                 &bert,
                 &prompt,
                 request.seed,
-                request.top_k,
-                request.top_p,
-                request.temperature,
-                request.repetition_penalty,
-                ((request.max_seconds.max(1.0) * 25.0) as usize).min(1500),
+                top_k,
+                top_p,
+                temperature,
+                repetition_penalty,
+                max_new_tokens,
             )
             .map_err(|error| Error::Other(format!("prepared gpt: {error}")))?;
         drop(_tts_gpt_range);
@@ -898,7 +940,7 @@ impl PreparedGptSovitsSpeech {
         let _tts_sovits_range = crate::profiling::trace::range("tts.sovits");
         let target_features =
             self.target_sovits
-                .replay(&self.ctx, &target_codes, request.phone_ids, &ge)?;
+                .replay(&self.ctx, &target_codes, inputs.phone_ids, &ge)?;
         drop(_tts_sovits_range);
         if target_features.shape().dims() != [self.spec.target_frames, 512] {
             return Err(Error::Other(format!(
@@ -1024,35 +1066,30 @@ impl PreparedGptSovitsSpeech {
         drop(_tts_vocoder_range);
         // The public pipeline adds `fragment_interval` silence; the acoustic
         // graph itself must not append an implicit pause.
-        let valid_length = samples.len();
-        Ok(PcmAudio {
-            samples,
-            sample_rate: OUTPUT_SAMPLE_RATE,
-            valid_length,
-        })
+        Ok(mono_audio(samples, generated.len(), max_new_tokens))
     }
 }
 
-impl PreparedTts for PreparedGptSovitsSpeech {
+impl PreparedTts for PreparedGptSovitsTts {
     fn spec(&self) -> &TtsSpec {
         &self.spec
     }
 
-    fn run(&self, request: &TtsRequest<'_>) -> Result<PcmAudio> {
+    fn run(&self, request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
         self.run_prepared(request)
     }
 }
 
 impl TtsTrait for GptSovitsModel {
-    fn contract(&self) -> TtsContract {
-        TtsContract {
+    fn contract(&self) -> Result<TtsContract> {
+        Ok(TtsContract {
             sample_rate: OUTPUT_SAMPLE_RATE,
             mel_frames_per_second: self.config.mel_frames_per_second,
             semantic_frames_per_second: self.config.semantic_frames_per_second,
-        }
+        })
     }
 
-    fn synthesize(&self, request: &TtsRequest<'_>) -> Result<PcmAudio> {
+    fn synthesize(&mut self, request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
         GptSovitsModel::synthesize(self, request)
     }
 
@@ -1060,8 +1097,9 @@ impl TtsTrait for GptSovitsModel {
         self.cache.borrow_mut().configure(config);
         Ok(())
     }
-    fn clear_cache(&self, reset_stats: bool) {
+    fn clear_cache(&self, reset_stats: bool) -> Result<()> {
         self.cache.borrow_mut().clear(reset_stats);
+        Ok(())
     }
     fn cache_info(&self) -> TtsCacheInfo {
         self.cache.borrow().info()
@@ -1114,7 +1152,7 @@ impl TtsTrait for GptSovitsModel {
         let mel_shift = super::weights::fp16_tensor(&self.ctx, &[100], &vec![SPEC_MIN; 100])?;
         let mel_one = super::weights::fp16_tensor(&self.ctx, &[100], &[1.; 100])?;
         let mel_zero = super::weights::fp16_tensor(&self.ctx, &[100], &[0.; 100])?;
-        Ok(Box::new(PreparedGptSovitsSpeech {
+        Ok(Box::new(PreparedGptSovitsTts {
             _bert: Arc::clone(&self.bert),
             _hubert: Arc::clone(&self.hubert),
             _sovits: Arc::clone(&self.sovits),
@@ -1184,5 +1222,27 @@ mod reference_window_tests {
     fn window_is_clamped_to_decoded_features() {
         assert_eq!(reference_feature_window(300, 302, 300), Some(0));
         assert_eq!(reference_feature_window(100, 10, 200), None);
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::{max_semantic_tokens, mono_audio, MAX_SEMANTIC_TOKENS, OUTPUT_SAMPLE_RATE};
+
+    #[test]
+    fn semantic_budget_matches_seconds_and_cap() {
+        assert_eq!(max_semantic_tokens(0.2), 25);
+        assert_eq!(max_semantic_tokens(30.0), 750);
+        assert_eq!(max_semantic_tokens(600.0), MAX_SEMANTIC_TOKENS);
+    }
+
+    #[test]
+    fn audio_is_mono_and_reports_length_limit() {
+        let audio = mono_audio(vec![0.0; 8], 12, 750);
+        assert_eq!(audio.sample_rate, OUTPUT_SAMPLE_RATE);
+        assert_eq!(audio.channels, 1);
+        assert_eq!(audio.samples.len(), 8);
+        assert!(audio.complete, "stopping before the budget means EOS");
+        assert!(!mono_audio(vec![0.0; 8], 750, 750).complete);
     }
 }

@@ -1,13 +1,31 @@
-//! Common model interface for text-to-speech synthesis.
+//! Model-neutral TTS synthesis API.
 //!
-//! The contract is deliberately narrower than a general ASR/TTS framework: it
-//! carries the canonical model inputs a family needs and returns mono PCM. Text
-//! normalization, G2P and BERT tokenization belong to the policy/input layer;
-//! the native runtime owns every neural computation.
+//! One contract covers every TTS family; each loads as
+//! [`crate::LoadedModel::Tts`] and returns [`GeneratedAudio`]. Families
+//! differ in who owns the text front-end, so [`TtsRequest`] carries the
+//! shared core (text, seed), optional sampling knobs ([`TtsSampling`]) and
+//! one typed per-family extension ([`TtsExtension`]) that hands over
+//! whatever else the family needs:
+//!
+//! - A runtime that owns its text front-end (tokenization inside the native
+//!   code) takes the shared core alone; see [`TtsExtension::None`].
+//! - A conditioned runtime leaves text normalization, G2P and BERT
+//!   tokenization to the policy layer and receives the front-end IDs and
+//!   reference-audio features through its extension; see
+//!   [`TtsExtension::GptSovits`].
+//!
+//! Knobs left as `None` fall back to the family's own defaults. Capabilities
+//! beyond `synthesize` are optional and fail explicitly by default instead
+//! of implying they are active: fixed output capabilities
+//! ([`TtsTrait::contract`]), conditioning reuse ([`TtsCacheConfig`]) and
+//! fixed-profile preparation ([`TtsSpec`]). The seed fully determines the
+//! family's sampling stream.
 
-use apxinf_core::Result;
+use apxinf_core::{Error, Result};
 
-/// Fixed capabilities of a loaded speech runtime.
+/// Fixed capabilities of a loaded TTS runtime. Frame rates describe the
+/// family's acoustic and semantic stages; a family without such a stage
+/// reports zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TtsContract {
     pub sample_rate: u32,
@@ -15,9 +33,75 @@ pub struct TtsContract {
     pub semantic_frames_per_second: usize,
 }
 
-/// One synthesis request in the family's canonical input representation.
+/// Optional request knobs shared across TTS families. A `None` knob means
+/// the family applies its own default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TtsSampling<'a> {
+    /// Speaker identity for families with a voice catalog.
+    pub voice: Option<&'a str>,
+    /// Output language for families that need it spelled out.
+    pub language: Option<&'a str>,
+    /// Style instruction; `None` or empty means none.
+    pub instruction: Option<&'a str>,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f32>,
+    pub temperature: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    /// Generation length limit; reaching it yields
+    /// `GeneratedAudio::complete == false`.
+    pub max_seconds: Option<f32>,
+}
+
+/// One complete TTS request: the shared core, optional sampling knobs and
+/// one family extension.
+///
+/// A family documents which extension it accepts and rejects others before
+/// any device work. A conditioned family ignores the shared text — the
+/// policy layer already turned the text into the extension's IDs.
 #[derive(Clone, Copy, Debug)]
 pub struct TtsRequest<'a> {
+    /// Target text for families that own their text front-end; unused by
+    /// conditioned families.
+    pub text: &'a str,
+    /// Fully determines the family's sampling stream.
+    pub seed: u64,
+    /// Optional knobs; `None` fields fall back to family defaults.
+    pub sampling: TtsSampling<'a>,
+    /// Family-specific typed extension; see [`TtsExtension`].
+    pub extension: TtsExtension<'a>,
+}
+
+impl Default for TtsRequest<'_> {
+    fn default() -> Self {
+        Self {
+            text: "",
+            seed: 0,
+            sampling: TtsSampling::default(),
+            extension: TtsExtension::None,
+        }
+    }
+}
+
+/// Typed, per-family extension of a [`TtsRequest`]. One variant per family;
+/// a runtime rejects extensions it cannot serve before any device work.
+#[derive(Clone, Copy, Debug)]
+pub enum TtsExtension<'a> {
+    /// No extension: the runtime owns its text front-end and takes the
+    /// shared core alone.
+    None,
+    /// GPT-SoVITS V5: policy-layer front-end IDs and reference features;
+    /// see [`GptSovitsInputs`].
+    GptSovits(GptSovitsInputs<'a>),
+}
+
+/// Policy-layer front-end output and family-only knobs for GPT-SoVITS V5.
+///
+/// Text normalization, G2P and BERT tokenization are Python front-end code;
+/// everything neural stays native. Sampling knobs shared across TTS families
+/// live in [`TtsSampling`]; only the fields unique to this family remain
+/// here. Field layout follows the family's canonical inputs.
+#[derive(Clone, Copy, Debug)]
+pub struct GptSovitsInputs<'a> {
     /// Target text phone IDs.
     pub phone_ids: &'a [u32],
     /// Target BERT token IDs, including `[CLS]` and `[SEP]`.
@@ -36,14 +120,8 @@ pub struct TtsRequest<'a> {
     pub reference_mel: &'a [f32],
     /// Unnormalized reference spectrogram `[frames, 704]`.
     pub reference_spec: &'a [f32],
-    pub seed: u64,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub temperature: f32,
-    pub repetition_penalty: f32,
     pub sample_steps: usize,
     pub cfg_rate: f32,
-    pub max_seconds: f32,
     /// Playback-speed factor. `1.0` is the model's native rate. The native
     /// runtime applies this to the SoVITS text-encoder latent, matching the
     /// official `TextEncoder.forward(..., speed)` path; it is not a waveform
@@ -51,19 +129,26 @@ pub struct TtsRequest<'a> {
     pub speed_factor: f32,
 }
 
-/// Mono PCM plus its output sample rate and valid length.
-#[derive(Clone, Debug)]
-pub struct PcmAudio {
-    pub samples: Vec<f32>,
+/// Synthesized audio owned by the caller: interleaved samples in `[-1, 1]`,
+/// `channels` per frame. Later requests never overwrite it. Every sample is
+/// valid: the frame count is `samples.len() / channels`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GeneratedAudio {
     pub sample_rate: u32,
-    pub valid_length: usize,
+    pub channels: usize,
+    pub samples: Vec<f32>,
+    /// False when generation stopped at the family's length limit instead of
+    /// its end-of-speech token.
+    pub complete: bool,
 }
 
 /// Fixed request profile for explicit preparation.
 ///
 /// Every field which changes allocation, kernel dispatch, or graph topology is
 /// part of the profile. Runtime values such as token IDs, audio samples, seed,
-/// and sampling temperature may change between replays.
+/// and sampling temperature may change between replays. Field layout follows
+/// the first prepared family, GPT-SoVITS V5; families with different profile
+/// needs extend the spec rather than bypassing preparation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TtsSpec {
     pub phone_count: usize,
@@ -79,10 +164,10 @@ pub struct TtsSpec {
     pub sample_steps: usize,
 }
 
-/// A prepared, fixed-shape speech plan.
+/// A prepared, fixed-shape TTS plan.
 pub trait PreparedTts {
     fn spec(&self) -> &TtsSpec;
-    fn run(&self, request: &TtsRequest<'_>) -> Result<PcmAudio>;
+    fn run(&self, request: &TtsRequest<'_>) -> Result<GeneratedAudio>;
 }
 
 /// Instance-local conditioning cache policy. Generation tokens and PCM are never cached.
@@ -104,7 +189,8 @@ impl Default for TtsCacheConfig {
 }
 
 /// Observable conditioning-cache state; byte counts include retained tensors,
-/// not weights or prepared graph workspaces.
+/// not weights or prepared graph workspaces. `supported == false` means the
+/// runtime has no cache and every other field is zero.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TtsCacheInfo {
     pub supported: bool,
@@ -122,35 +208,98 @@ pub struct TtsCacheInfo {
     pub text_device_budget_bytes: usize,
 }
 
-/// Common interface for TTS implementations, owned by `LoadedModel::Tts`.
+/// One TTS contract for every TTS family, owned by
+/// [`crate::LoadedModel::Tts`].
 ///
-/// Like `LlmTrait`, this contract exposes model capabilities and inference.
-/// The implementation owns request state, caches, and prepared resources;
-/// text normalization and G2P remain in the policy layer.
+/// The implementation owns its weights, request state (prompt embeddings,
+/// caches, random keys), and prepared resources. Capabilities a family does
+/// not have fail explicitly by default rather than implying they are active.
 pub trait TtsTrait {
-    fn contract(&self) -> TtsContract;
-
-    fn synthesize(&self, request: &TtsRequest<'_>) -> Result<PcmAudio>;
-
-    /// Configure instance-local conditioning reuse. Unsupported families reject
-    /// this explicitly rather than implying that a cache is active.
-    fn configure_cache(&self, _config: TtsCacheConfig) -> Result<()> {
-        Err(apxinf_core::Error::Other(
-            "conditioning cache is not supported by this TTS implementation".into(),
-        ))
+    /// Fixed output capabilities of this runtime.
+    fn contract(&self) -> Result<TtsContract> {
+        Err(contract_unsupported())
     }
 
-    fn clear_cache(&self, _reset_stats: bool) {}
+    fn synthesize(&mut self, request: &TtsRequest<'_>) -> Result<GeneratedAudio>;
+
+    /// Configure instance-local conditioning reuse.
+    fn configure_cache(&self, _config: TtsCacheConfig) -> Result<()> {
+        Err(cache_unsupported())
+    }
+
+    /// Drop cached conditioning, optionally resetting hit/miss counters.
+    fn clear_cache(&self, _reset_stats: bool) -> Result<()> {
+        Err(cache_unsupported())
+    }
 
     fn cache_info(&self) -> TtsCacheInfo {
         TtsCacheInfo::default()
     }
 
-    /// Prepare a fixed profile. Implementations that have not adopted explicit
-    /// preparation fail clearly instead of pretending readiness.
+    /// Prepare a fixed profile.
     fn prepare(&self, _spec: &TtsSpec) -> Result<Box<dyn PreparedTts>> {
-        Err(apxinf_core::Error::Other(
-            "explicit speech preparation is not supported by this runtime".into(),
+        Err(Error::Other(
+            "explicit TTS preparation is not supported by this runtime".into(),
         ))
+    }
+}
+
+fn contract_unsupported() -> Error {
+    Error::Other("output capabilities are not reported by this TTS runtime".into())
+}
+
+fn cache_unsupported() -> Error {
+    Error::Other("conditioning cache is not supported by this TTS runtime".into())
+}
+
+/// Extract the GPT-SoVITS extension, rejecting everything else before any
+/// device work.
+pub fn gpt_sovits_inputs<'a>(request: &'a TtsRequest<'a>) -> Result<&'a GptSovitsInputs<'a>> {
+    match &request.extension {
+        TtsExtension::GptSovits(inputs) => Ok(inputs),
+        TtsExtension::None => Err(Error::Other(
+            "this TTS runtime is conditioned and requires GptSovits request inputs".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Bare;
+
+    impl TtsTrait for Bare {
+        fn synthesize(&mut self, _request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
+            Err(Error::Other("unused".into()))
+        }
+    }
+
+    #[test]
+    fn optional_capabilities_fail_explicitly_by_default() {
+        let runtime = Bare;
+        assert!(runtime.contract().is_err());
+        assert!(runtime.configure_cache(TtsCacheConfig::default()).is_err());
+        assert!(runtime.clear_cache(true).is_err());
+        assert!(!runtime.cache_info().supported);
+        let spec = TtsSpec {
+            phone_count: 1,
+            bert_token_count: 3,
+            reference_phone_count: 1,
+            reference_bert_token_count: 3,
+            reference_audio_samples: 400,
+            reference_frames: 1,
+            reference_spec_frames: 1,
+            target_frames: 4,
+            sample_steps: 1,
+        };
+        assert!(runtime.prepare(&spec).is_err());
+        let request = TtsRequest {
+            text: "",
+            seed: 0,
+            sampling: TtsSampling::default(),
+            extension: TtsExtension::None,
+        };
+        assert!(gpt_sovits_inputs(&request).is_err());
     }
 }

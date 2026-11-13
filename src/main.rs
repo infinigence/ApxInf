@@ -7,7 +7,7 @@ use apxinf_core::Backend;
 use apxinf_core::{DType, Device, Tensor};
 use apxinf_model::{
     AutoModel, DecisionInput, GenerationConfigSource, GenerationOptions, ImageInput, ImageRequest,
-    LlmInput, LoadOptions, SamplingMode, SpeechRequest,
+    LlmInput, LoadOptions, SamplingMode, TtsRequest, TtsSampling,
 };
 use apxinf_tokenizer::{ChatMessage, Tokenizer};
 use clap::{Parser, Subcommand};
@@ -211,7 +211,7 @@ enum Commands {
 
     /// Synthesize speech from text and write it as 32-bit float WAV
     Speak {
-        /// Path to the speech model directory
+        /// Path to the tts model directory
         #[arg(short, long)]
         model: PathBuf,
 
@@ -419,12 +419,16 @@ fn main() {
             output,
             device,
         } => {
-            let request = SpeechRequest {
+            let request = TtsRequest {
                 text: &text,
-                voice: &voice,
-                language: &language,
-                instruction: &instruction,
                 seed,
+                sampling: TtsSampling {
+                    voice: Some(&voice),
+                    language: Some(&language),
+                    instruction: Some(&instruction),
+                    ..Default::default()
+                },
+                ..Default::default()
             };
             let result = parse_device(&device).and_then(|device| {
                 run_speak(
@@ -462,7 +466,9 @@ fn parse_device(spec: &str) -> Result<Device, String> {
     let (kind, index) = match normalized.split_once(':') {
         Some((kind, index)) => {
             let index = index.parse::<usize>().map_err(|_| {
-                format!("Invalid device index in '{spec}'; use cpu, cuda:N, hip:N, musa:N, or metal:N")
+                format!(
+                    "Invalid device index in '{spec}'; use cpu, cuda:N, hip:N, musa:N, or metal:N"
+                )
             })?;
             (kind, index)
         }
@@ -1233,7 +1239,7 @@ fn run_speak(
     model_name_override: Option<&str>,
     model_variant: Option<&str>,
     device: Device,
-    request: &SpeechRequest<'_>,
+    request: &TtsRequest<'_>,
     output: &PathBuf,
 ) -> Result<(), String> {
     let model_name = match model_name_override {
@@ -1254,7 +1260,7 @@ fn run_speak(
     let started = std::time::Instant::now();
     let audio = model
         .synthesize(request)
-        .map_err(|error| format!("Speech synthesis failed: {error}"))?;
+        .map_err(|error| format!("TTS synthesis failed: {error}"))?;
     let seconds = audio.samples.len() as f64 / audio.channels as f64 / audio.sample_rate as f64;
     eprintln!(
         "Synthesized {seconds:.2}s of audio in {:.2}s{}",

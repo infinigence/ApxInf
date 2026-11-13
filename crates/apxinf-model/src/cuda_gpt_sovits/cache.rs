@@ -1,5 +1,5 @@
 //! Bounded conditioning reuse owned by one loaded TTS instance.
-use crate::tts_trait::{TtsCacheConfig, TtsCacheInfo, TtsRequest};
+use crate::tts_trait::{GptSovitsInputs, TtsCacheConfig, TtsCacheInfo};
 use apxinf_core::Tensor;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -36,7 +36,7 @@ pub(super) struct ReferenceKey {
     spec: Vec<u32>,
 }
 impl ReferenceKey {
-    pub fn new(request: &TtsRequest<'_>, prepared: bool) -> Self {
+    pub fn new(request: &GptSovitsInputs<'_>, prepared: bool) -> Self {
         Self {
             phones: request.reference_phone_ids.to_vec(),
             text: TextKey::new(

@@ -152,6 +152,27 @@ class CacheTests(unittest.TestCase):
         self.policy.close()
         self.assertIsNone(self.policy.model_runner)
 
+    def test_complete_flag_propagates_from_runner(self):
+        runner = Runner()
+
+        def synthesize(*values, **options):
+            result = Runner.synthesize(runner, *values, **options)
+            result["complete"] = options.get("seed", 0) != 0
+            return result
+
+        runner.synthesize = synthesize
+        policy = GptSovitsPolicy(
+            runner,
+            frontend=self.policy.frontend,
+        )
+        policy._compute_reference_inputs = self.policy._compute_reference_inputs
+        result = policy.infer(self.observation)
+        self.assertTrue(result["complete"])
+        self.assertTrue(result["fragments"][0]["complete"])
+        result = policy.infer({**self.observation, "seed": 0})
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["fragments"][0]["complete"])
+
 
 if __name__ == "__main__":
     unittest.main()
