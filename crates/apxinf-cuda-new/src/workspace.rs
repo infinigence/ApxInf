@@ -13,6 +13,19 @@ use crate::buffer::CudaBuffer;
 
 const WORKSPACE_ALIGNMENT: usize = 256;
 
+/// Provider scratch blocks are rounded up to this granularity, so per-block
+/// overhead stays under one granularity unit instead of up to 2× at each
+/// power-of-two boundary. It is a power of two and a multiple of the 256-byte
+/// alignment the native bind path enforces.
+const PROVIDER_SCRATCH_GRANULARITY: usize = 1 << 20;
+
+/// An execution stays cached until it has been unused for this many prepare
+/// traversals. Tolerating one missed traversal keeps warm executions alive
+/// across a variable-length eager traversal (for example an early decode stop
+/// that skips later steps) while still retiring bindings whose IO addresses no
+/// longer recur within a bounded number of generations.
+pub(crate) const STALE_GENERATIONS: u64 = 2;
+
 #[derive(Default)]
 struct WorkspaceState {
     generation: u64,
@@ -198,9 +211,48 @@ fn merge_adjacent_free_blocks(free_blocks: &mut BTreeMap<usize, usize>) {
     *free_blocks = merged;
 }
 
+/// Runner-owned temporary storage shared by serial operators and profiles.
+/// Separate streams/devices receive disjoint blocks. Clones share ownership;
+/// executions retain their actual block so growth never invalidates old graphs.
+///
+/// Users of a shared block must be serialized on that block's stream: a
+/// captured graph must be replayed on the stream it was captured from, and two
+/// executions borrowing the same block must not be enqueued concurrently on
+/// different streams. Blocks are keyed by the raw stream handle, so a caller
+/// must not reuse a stream handle after destroying a stream while work from the
+/// old stream is still in flight.
+#[derive(Clone, Default)]
+pub struct ProviderWorkspace {
+    buffers: Rc<RefCell<HashMap<(usize, usize), CudaBuffer>>>,
+}
+
+// Type-erased caches retain typed lookup while supporting generation pruning.
+trait ExecutionCache: Any {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn retire_unused(&mut self, generation: u64);
+}
+
+struct TypedExecutionCache<K, V>(HashMap<K, (Rc<V>, Cell<u64>)>);
+
+impl<K: Eq + Hash + 'static, V: Any> ExecutionCache for TypedExecutionCache<K, V> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+    fn retire_unused(&mut self, generation: u64) {
+        self.0
+            .retain(|_, (_, used)| generation.saturating_sub(used.get()) < STALE_GENERATIONS);
+    }
+}
+
 struct ExecutionSessionInner {
-    workspace: GraphWorkspace,
-    caches: RefCell<HashMap<TypeId, Box<dyn Any>>>,
+    workspace: Rc<GraphWorkspace>,
+    scratch: ProviderWorkspace,
+    caches: RefCell<HashMap<TypeId, Box<dyn ExecutionCache>>>,
+    generation: Cell<u64>,
     prepared_sequence: RefCell<Vec<usize>>,
     sequence_cursor: Cell<usize>,
 }
@@ -211,12 +263,14 @@ impl ExecutionSessionInner {
         K: Eq + Hash + 'static,
         V: Any,
     {
-        self.caches
-            .borrow()
+        let caches = self.caches.borrow();
+        let cache = caches
             .get(&TypeId::of::<(K, V)>())?
-            .downcast_ref::<HashMap<K, Rc<V>>>()?
-            .get(key)
-            .cloned()
+            .as_any()
+            .downcast_ref::<TypedExecutionCache<K, V>>()?;
+        let (value, used) = cache.0.get(key)?;
+        used.set(self.generation.get());
+        Some(value.clone())
     }
 
     fn store<K, V>(&self, key: K, value: Rc<V>)
@@ -227,11 +281,16 @@ impl ExecutionSessionInner {
         let mut caches = self.caches.borrow_mut();
         let cache = caches
             .entry(TypeId::of::<(K, V)>())
-            .or_insert_with(|| Box::new(HashMap::<K, Rc<V>>::new()));
+            .or_insert_with(|| Box::new(TypedExecutionCache::<K, V>(HashMap::new())));
+        // Values and per-entry generation marks have interior mutability only
+        // for lookup; insertion uses the concrete cache's Any identity below.
+        let cache = cache
+            .as_any_mut()
+            .downcast_mut::<TypedExecutionCache<K, V>>()
+            .expect("execution cache type identity collision");
         cache
-            .downcast_mut::<HashMap<K, Rc<V>>>()
-            .expect("execution cache type identity collision")
-            .insert(key, value);
+            .0
+            .insert(key, (value, Cell::new(self.generation.get())));
     }
 }
 
@@ -245,10 +304,16 @@ pub struct ExecutionSession {
 
 impl ExecutionSession {
     pub fn new(workspace: GraphWorkspace) -> Self {
+        Self::with_provider_workspace(workspace, ProviderWorkspace::default())
+    }
+
+    pub fn with_provider_workspace(workspace: GraphWorkspace, scratch: ProviderWorkspace) -> Self {
         Self {
             inner: Rc::new(ExecutionSessionInner {
-                workspace,
+                workspace: Rc::new(workspace),
+                scratch,
                 caches: RefCell::new(HashMap::new()),
+                generation: Cell::new(0),
                 prepared_sequence: RefCell::new(Vec::new()),
                 sequence_cursor: Cell::new(0),
             }),
@@ -263,6 +328,12 @@ impl ExecutionSession {
         &self.inner.workspace
     }
 
+    /// Number of shared provider scratch blocks currently held by the pool.
+    #[cfg(test)]
+    pub(crate) fn provider_scratch_blocks(&self) -> usize {
+        self.inner.scratch.buffers.borrow().len()
+    }
+
     pub fn capacity(&self) -> usize {
         self.inner.workspace.capacity()
     }
@@ -274,8 +345,10 @@ impl ExecutionSession {
     /// Traverse the real execution once before graph capture.
     ///
     /// This allocates deterministic workspace slices, prepares native resources,
-    /// and records the order of prepared operators. Stateless operators execute
-    /// directly and do not enter the cache or sequence.
+    /// and records the order of prepared operators. Reuses matching bindings
+    /// and retires unused bindings after traversal; captured graphs retain
+    /// their own resources.
+    /// Stateless operators execute directly and do not enter the cache or sequence.
     pub fn prepare<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         prepare_with_session(self, operation)
     }
@@ -328,6 +401,15 @@ fn with_session_phase<T>(
         }
         session.inner.workspace.reset()?;
         if prepare {
+            // Stable arena bindings must remain cache hits across eager requests.
+            // Retire only entries not used by this traversal, after it completes.
+            let generation = session
+                .inner
+                .generation
+                .get()
+                .checked_add(1)
+                .ok_or_else(|| Error::Other("execution generation overflow".into()))?;
+            session.inner.generation.set(generation);
             session.inner.prepared_sequence.borrow_mut().clear();
         }
         session.inner.sequence_cursor.set(0);
@@ -337,8 +419,19 @@ fn with_session_phase<T>(
             session: previous,
             preparing: previous_preparing,
         };
-        retain_resource(&session.inner);
+        // Captures need the activation arena and each used execution, not the
+        // mutable binding cache. Retaining the whole session would pin a later
+        // eager generation merely because an older graph is still alive.
+        retain_resource(&session.inner.workspace);
         let result = operation();
+        // Retire only after a successful traversal. A partial traversal that
+        // errors out has not established a complete set of used bindings, so
+        // retiring then would drop executions the next request still needs.
+        if prepare && result.is_ok() {
+            for cache in session.inner.caches.borrow_mut().values_mut() {
+                cache.retire_unused(session.inner.generation.get());
+            }
+        }
         if result.is_ok()
             && !prepare
             && session.inner.sequence_cursor.get() != session.inner.prepared_sequence.borrow().len()
@@ -562,4 +655,110 @@ pub(crate) fn output_buffer_tail_zeroed(
         }
         Ok(buffer)
     })
+}
+
+/// Scratch is separate from activation liveness and persistent KV/state. Each
+/// stream uses its own block, rounded up to [`PROVIDER_SCRATCH_GRANULARITY`] so
+/// per-block overhead stays bounded instead of doubling at power-of-two
+/// boundaries. A block is replaced only when it is too small; executions retain
+/// their actual block, so growth never invalidates old graphs, and generation
+/// retirement bounds how many replaced blocks stay referenced at once.
+///
+/// Callers reach this after native prepare already allocated working private
+/// scratch, so sharing is an optimization rather than a requirement. If the
+/// shared block itself cannot be allocated for lack of device memory, this
+/// returns `None` and the execution keeps its private scratch instead of
+/// failing prepare; any other allocation error still propagates.
+pub(crate) fn provider_scratch(
+    ctx: &crate::CudaContext,
+    bytes: usize,
+) -> Result<Option<CudaBuffer>> {
+    if bytes == 0 {
+        return Ok(None);
+    }
+    ACTIVE_SESSION.with(|active| {
+        let inner = active.get();
+        if inner.is_null() {
+            return Ok(None);
+        }
+        let inner = unsafe { &*inner };
+        let key = (ctx.device_id(), ctx.stream().handle() as usize);
+        let mut scratch = inner.scratch.buffers.borrow_mut();
+        if !scratch
+            .get(&key)
+            .is_some_and(|buffer| buffer.len() >= bytes)
+        {
+            let capacity = round_up_to(bytes, PROVIDER_SCRATCH_GRANULARITY)?;
+            #[cfg(test)]
+            let capacity = SCRATCH_ALLOC_OVERRIDE.with(Cell::get).unwrap_or(capacity);
+            let Some(buffer) =
+                CudaBuffer::try_alloc(capacity, ctx.device_id()).map_err(Error::Cuda)?
+            else {
+                return Ok(None);
+            };
+            scratch.insert(key, buffer);
+        }
+        Ok(scratch.get(&key).cloned())
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCRATCH_ALLOC_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Test hook: replace the byte count of new provider scratch blocks, e.g. with
+/// an impossible size to inject a real device out-of-memory failure.
+#[cfg(test)]
+pub(crate) fn override_provider_scratch_alloc(bytes: Option<usize>) {
+    SCRATCH_ALLOC_OVERRIDE.with(|value| value.set(bytes));
+}
+
+/// Round `value` up to a multiple of `align` (a power of two), returning an
+/// error on overflow.
+fn round_up_to(value: usize, align: usize) -> Result<usize> {
+    value
+        .checked_add(align - 1)
+        .map(|end| end & !(align - 1))
+        .ok_or_else(|| Error::Other("provider scratch capacity overflow".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_scratch_shares_serial_profiles_isolates_streams_and_keeps_old_blocks() {
+        let ctx = crate::CudaContext::new(0).unwrap();
+        let other = crate::CudaContext::new(0).unwrap();
+        let pool = ProviderWorkspace::default();
+        let first = ExecutionSession::with_provider_workspace(
+            GraphWorkspace::new(256, 0).unwrap(),
+            pool.clone(),
+        );
+        let second =
+            ExecutionSession::with_provider_workspace(GraphWorkspace::new(256, 0).unwrap(), pool);
+        let small = first
+            .prepare(|| Ok(provider_scratch(&ctx, 257)?.unwrap()))
+            .unwrap();
+        let same = second
+            .prepare(|| Ok(provider_scratch(&ctx, 500)?.unwrap()))
+            .unwrap();
+        assert_eq!(small.ptr(), same.ptr());
+        let separate = second
+            .prepare(|| Ok(provider_scratch(&other, 500)?.unwrap()))
+            .unwrap();
+        assert_ne!(small.ptr(), separate.ptr());
+        small.copy_from_host(&vec![42; small.len()]).unwrap();
+        // Exceed the current block's granularity to force it to grow.
+        let large = second
+            .prepare(|| Ok(provider_scratch(&ctx, PROVIDER_SCRATCH_GRANULARITY + 1)?.unwrap()))
+            .unwrap();
+        assert_ne!(small.ptr(), large.ptr());
+        drop(first);
+        drop(second);
+        let mut bytes = vec![0; small.len()];
+        small.copy_to_host(&mut bytes).unwrap();
+        assert!(bytes.iter().all(|&x| x == 42));
+    }
 }

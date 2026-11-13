@@ -120,6 +120,12 @@ unsafe extern "C" {
         execution: *mut Execution,
     ) -> i32;
     pub(crate) fn apxinf_attention_enqueue(execution: Execution) -> i32;
+    pub(crate) fn apxinf_attention_scratch_bytes(execution: Execution) -> u64;
+    pub(crate) fn apxinf_attention_bind_scratch(
+        execution: Execution,
+        buffer: *mut c_void,
+        bytes: u64,
+    ) -> i32;
     pub(crate) fn apxinf_attention_destroy(execution: Execution);
     #[cfg(test)]
     pub(crate) fn apxinf_attention_summary(execution: Execution) -> *const c_char;

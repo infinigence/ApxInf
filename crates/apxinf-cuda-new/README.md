@@ -243,3 +243,24 @@ outputs with unit and non-unit scales. The framework regression covers recipe
 restoration, all three split schedules, resource rejection, and unsupported
 M789/configuration rejection. Changing these adapter sources invalidates old
 recipes through the normal operator build fingerprint.
+
+### Provider scratch lifetime
+
+`ProviderWorkspace` is a runner-owned pool, separate from each profile's
+activation `GraphWorkspace` and persistent KV/state. Construct sessions with
+`ExecutionSession::with_provider_workspace` to share temporary storage between
+serial profiles. The pool partitions by device and stream; one operator's
+simultaneous temporaries receive disjoint 256-byte-aligned slices. Growing a
+block preserves all previous graph bindings. Executions retain borrowed storage
+but do not allocate a permanent scratch copy per operator. Standalone operators
+without a session keep their own temporary storage.
+
+Vendor GEMM workspace/unpack/dequantization/projection and custom/FA2/CUTLASS
+FMHA attention scratch participate. Constants, the opaque NVFP4 GEMM workspace,
+and the segmented FA2 LSE buffer remain private. Candidate tuning uses isolated
+temporary allocations. If the shared block cannot be allocated for lack of
+device memory, the execution keeps the private scratch its native prepare
+already allocated instead of failing. A new `prepare` traversal reuses matching
+cached executions and retires bindings that have been unused for more than one
+traversal (so a variable-length eager traversal does not evict warm executions);
+old captured graphs retain the executions and buffers they actually reference.

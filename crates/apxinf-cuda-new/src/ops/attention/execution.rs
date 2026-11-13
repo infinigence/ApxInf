@@ -120,7 +120,7 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
     let summary = unsafe { CStr::from_ptr(abi::apxinf_attention_summary(raw)) }
         .to_string_lossy()
         .into_owned();
-    let execution = Rc::new(Execution {
+    let mut execution = Execution {
         raw,
         stream: ctx.shared_stream(),
         _storage: retained_storage,
@@ -128,7 +128,22 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
         #[cfg(test)]
         summary,
         _not_send: PhantomData,
-    });
+    };
+    let scratch_bytes = unsafe { abi::apxinf_attention_scratch_bytes(raw) } as usize;
+    if let Some(scratch) = crate::workspace::provider_scratch(ctx, scratch_bytes)? {
+        // Attention prepare only allocates scratch (it runs no kernels), so
+        // the private buffers are quiesced and rebinding is safe here. See
+        // framework::Scratch::bind for the full contract.
+        unsafe {
+            status::check(abi::apxinf_attention_bind_scratch(
+                raw,
+                scratch.ptr(),
+                scratch.len() as u64,
+            ))?;
+        }
+        execution._storage.push(scratch);
+    }
+    let execution = Rc::new(execution);
     crate::workspace::store_execution(key, Rc::clone(&execution));
     crate::workspace::use_execution(&execution)?;
     Ok(execution)

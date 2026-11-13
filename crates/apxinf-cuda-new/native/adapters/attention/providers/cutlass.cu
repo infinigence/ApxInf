@@ -78,6 +78,8 @@ void prepare_cutlass(Execution& execution) {
                   "CUTLASS FMHA preparation failed with status " +
                       std::to_string(status));
   }
+  execution.scratch.adopt(&state->lse, state->lse_size);
+  execution.scratch.adopt(&state->workspace, state->workspace_size);
   execution.resource_bytes = state->lse_size + state->workspace_size;
   execution.provider_state = state.release();
 }
@@ -91,6 +93,9 @@ cudaError_t launch_cutlass(Execution& execution) {
 void destroy_cutlass(Execution& execution) noexcept {
   auto* state = static_cast<CutlassState*>(execution.provider_state);
   if (state == nullptr) return;
+  // Ownership was transferred to execution.scratch after successful prepare.
+  state->lse = nullptr;
+  state->workspace = nullptr;
   apxinf::cuda_new::cutlass_ops::destroy_mha(*state);
   delete state;
   execution.provider_state = nullptr;

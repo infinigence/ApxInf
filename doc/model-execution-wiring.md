@@ -192,13 +192,18 @@ is not proof that the model uses the right cache lifetime.
 ## Prepare and capture fixed-shape execution
 
 For a fixed target profile, query model/Blocks workspace requirements and let
-the runner's preparation code allocate stable inputs, outputs and scratch.
-Use `GraphWorkspace` and `prepare_with_workspace` for warmup, then `with_workspace`
-during capture through the shared CUDA capture scope. PI0.5's
+the runner's preparation code allocate stable inputs and outputs. In cuda-new,
+the runner owns a `ProviderWorkspace` for serial operator scratch and passes it
+to each profile's `ExecutionSession::with_provider_workspace`, together with a
+separate activation `GraphWorkspace`. Prepare the real traversal with
+`session.prepare`, then use `session.run` during CUDA capture. PI0.5's
 [`model_runner/prepare.rs`](../crates/apxinf-model/src/pi05/model_runner/prepare.rs)
-repeats warmup until tuning generation stabilizes; one invocation is not a
-universal readiness guarantee. Capture and eager call the same model semantics.
-Update captured input contents in place and replay through the prepared object.
+implements this ownership. Persistent KV/state stays outside provider scratch;
+see the [ownership contract](model-layer-architecture.md#repacked-gemm-weight-ownership).
+This contract is cuda-new-specific; other backends own their workspace
+preparation and lease APIs.
+Capture and eager call the same model semantics. Update captured input contents
+in place and replay through the prepared object.
 
 Preparation must exercise the real model computation. A method that only validates a
 configuration object is not execution preparation. If graph capture is
