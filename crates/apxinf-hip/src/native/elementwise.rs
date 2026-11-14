@@ -57,25 +57,69 @@ impl HipDeviceBytes {
         self.len == 0
     }
 
-    fn ptr(&self) -> *const c_void {
+    pub(super) fn ptr(&self) -> *const c_void {
         self.buffer.ptr().cast_const()
     }
+}
+
+/// Whether an embedding lookup multiplies each row by `sqrt(width)`.
+///
+/// pi05's Gemma table is scaled; GR00T's Qwen3-VL table is not
+/// (cuda-new's `EmbeddingScale::None`). The two are numerically different
+/// contracts, so the caller names the one it means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmbeddingScale {
+    SqrtWidth,
+    None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Activation {
     None,
-    /// GELU, tanh approximation.
+    /// GELU, tanh approximation (`gelu_pytorch_tanh`).
     GeluTanh,
     Silu,
+    Relu,
+    /// GELU, exact error function -- Torch's default `nn.GELU()`.
+    GeluErf,
 }
 
+/// Epilogue codes, mirroring `kEpilogue*` in `kernels/apxinf_hip.hip`.
+pub(crate) const EPILOGUE_NONE: i32 = 0;
+pub(crate) const EPILOGUE_BIAS: i32 = 1;
+pub(crate) const EPILOGUE_BIAS_GELU_TANH: i32 = 2;
+pub(crate) const EPILOGUE_BIAS_RELU: i32 = 3;
+
 impl Activation {
+    /// The hipBLASLt epilogue that computes `bias` then this activation, or
+    /// `None` when no epilogue does.
+    ///
+    /// Measured, not assumed: hipblaslt.h documents the epilogue only as
+    /// "Apply GELU point-wise transform". Comparing its output bit for bit
+    /// against both references puts it at 95-97% exact for the tanh
+    /// approximation and 74-75% for the exact erf form, so [`Self::GeluTanh`]
+    /// maps and [`Self::GeluErf`] does not. The two variants agree on about
+    /// 60% of inputs, which is why that had to be a bit-exact count rather
+    /// than a norm.
+    ///
+    /// `Silu` has an `EPILOGUE_SWISH_BIAS_EXT`, left out until it is measured
+    /// the same way: Swish with a non-unit beta is not SiLU.
+    pub(crate) fn epilogue(self) -> Option<i32> {
+        match self {
+            Self::None => Some(EPILOGUE_BIAS),
+            Self::GeluTanh => Some(EPILOGUE_BIAS_GELU_TANH),
+            Self::Relu => Some(EPILOGUE_BIAS_RELU),
+            Self::Silu | Self::GeluErf => None,
+        }
+    }
+
     fn code(self) -> i32 {
         match self {
             Self::None => 0,
             Self::GeluTanh => 1,
             Self::Silu => 2,
+            Self::Relu => 3,
+            Self::GeluErf => 4,
         }
     }
 }
@@ -149,6 +193,7 @@ pub fn embedding(
     ctx: &HipContext,
     table: &Tensor,
     ids: &HipDeviceBytes,
+    scale: EmbeddingScale,
     out: &Tensor,
 ) -> Result<()> {
     let dims = table.shape().dims();
@@ -182,8 +227,26 @@ pub fn embedding(
             int(tokens)?,
             int(width)?,
             vocab,
+            i32::from(scale == EmbeddingScale::SqrtWidth),
             ctx.stream(),
         )
+    })
+}
+
+/// `out = silu(gate) * up`, elementwise over equally shaped operands.
+///
+/// GR00T's SwiGLU MLP keeps the two projections apart; [`geglu`] is the packed
+/// `gate_up` form pi05 uses.
+pub fn silu_mul(ctx: &HipContext, gate: &Tensor, up: &Tensor, out: &Tensor) -> Result<()> {
+    same_shape(gate, up)?;
+    same_shape(gate, out)?;
+    let (pg, pu, py) = (
+        bf16_ptr(ctx, gate)?,
+        bf16_ptr(ctx, up)?,
+        bf16_ptr(ctx, out)?,
+    );
+    check("silu_mul", unsafe {
+        ffi::apxinf_hip_native_silu_mul(pg, pu, py, long(gate.numel())?, ctx.stream())
     })
 }
 
@@ -392,6 +455,80 @@ pub fn split_qkv_bias(
     })
 }
 
+/// Split a packed `[tokens, 3 * heads * head_dim]` projection into `q`, `k`
+/// and `v` of `[tokens, heads, head_dim]` elements each, adding the optional
+/// bias and rotating Q and K by (h, w) axial positions -- cuda-new's fused
+/// vision `split_qkv_axial_rope`, one kernel.
+///
+/// `positions` holds `tokens * 2` `u32` values as `(h, w)` per token, the
+/// layout [`super::apply_vision_2d`] reads. The first quarter of each head's
+/// half-split pairs rotate by the height position, the rest by the width one.
+/// The biased projection is rounded to BF16 before rotating, so the result is
+/// bit-identical to [`split_qkv_bias`] followed by [`super::apply_vision_2d`]
+/// on q and k -- which is the acceptance contract between the two forms.
+#[allow(clippy::too_many_arguments)]
+pub fn split_qkv_axial_rope(
+    ctx: &HipContext,
+    qkv: &Tensor,
+    bias: Option<&Tensor>,
+    positions: &HipDeviceBytes,
+    heads: usize,
+    head_dim: usize,
+    theta: f32,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+) -> Result<()> {
+    let (tokens, fused) = rows_cols(qkv)?;
+    if fused != 3 * heads * head_dim {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[tokens, {}]", 3 * heads * head_dim),
+            got: qkv.shape().to_string(),
+        });
+    }
+    // head_dim % 4 keeps the half-split pairs evenly divisible between the two
+    // axes, which the per-axis frequency indexing assumes.
+    if head_dim == 0 || head_dim % 4 != 0 {
+        return Err(Error::Contract(
+            "apxinf-hip split_qkv_axial_rope: head_dim must be a non-zero multiple of 4",
+        ));
+    }
+    let elements = tokens * heads * head_dim;
+    for t in [q, k, v] {
+        require_numel(t, elements, || format!("[{tokens}, {heads}, {head_dim}]"))?;
+    }
+    let needed = tokens
+        .checked_mul(2)
+        .and_then(|value| value.checked_mul(std::mem::size_of::<u32>()))
+        .ok_or(Error::Contract(
+            "apxinf-hip split_qkv_axial_rope: position size overflow",
+        ))?;
+    if positions.len() < needed {
+        return Err(Error::DataLengthMismatch {
+            expected: needed,
+            got: positions.len(),
+        });
+    }
+    let pb = optional_ptr(ctx, bias, fused)?;
+    let pqkv = bf16_ptr(ctx, qkv)?;
+    let (pq, pk, pv) = (bf16_ptr(ctx, q)?, bf16_ptr(ctx, k)?, bf16_ptr(ctx, v)?);
+    check("split_qkv_axial_rope", unsafe {
+        ffi::apxinf_hip_native_split_qkv_axial_rope(
+            pqkv,
+            pb,
+            positions.ptr(),
+            pq,
+            pk,
+            pv,
+            int(tokens)?,
+            int(heads)?,
+            int(head_dim)?,
+            theta,
+            ctx.stream(),
+        )
+    })
+}
+
 /// Copy all rows of `src` into `dst` starting at row `dst_row`; both are
 /// `[.., cols]` with the same column count. Concatenation is two of these.
 pub fn copy_rows(ctx: &HipContext, src: &Tensor, dst: &Tensor, dst_row: usize) -> Result<()> {
@@ -409,4 +546,236 @@ pub fn copy_rows(ctx: &HipContext, src: &Tensor, dst: &Tensor, dst_row: usize) -
     // inside `dst`'s storage, which `ptr` checked covers its shape.
     let pd = unsafe { pd.cast::<u8>().add(dst_row * cols * element) };
     ctx.copy_on_device(pd.cast(), ps, rows * cols * element)
+}
+
+/// Copy `rows` rows of `src` starting at `src_row` into `dst` at `dst_row`.
+///
+/// The general form of [`copy_rows`]: a row slice (cuda-new's
+/// `contiguous_rows`) is this with a source offset, and concatenation is two
+/// calls at different destination offsets.
+pub fn copy_row_range(
+    ctx: &HipContext,
+    src: &Tensor,
+    src_row: usize,
+    rows: usize,
+    dst: &Tensor,
+    dst_row: usize,
+) -> Result<()> {
+    let (src_rows, cols) = rows_cols(src)?;
+    let (dst_rows, dst_cols) = rows_cols(dst)?;
+    if rows == 0
+        || cols != dst_cols
+        || src.dtype() != dst.dtype()
+        || src_row + rows > src_rows
+        || dst_row + rows > dst_rows
+    {
+        return Err(Error::ShapeMismatch {
+            expected: format!(
+                "{rows} rows of [{src_rows}, {cols}] from {src_row} into [{dst_rows}, {dst_cols}] at {dst_row}"
+            ),
+            got: format!("{} -> {}", src.shape(), dst.shape()),
+        });
+    }
+    let element = src.dtype().size_in_bytes();
+    let (ps, pd) = (ctx.ptr(src)?, ctx.ptr(dst)?);
+    // SAFETY: both ranges were bounds-checked above against the shapes that
+    // `ptr` already confirmed the storages cover.
+    let ps = unsafe { ps.cast::<u8>().add(src_row * cols * element) };
+    let pd = unsafe { pd.cast::<u8>().add(dst_row * cols * element) };
+    ctx.copy_on_device(pd.cast(), ps.cast(), rows * cols * element)
+}
+
+/// A bounds-checked `u32` row-index table on the device, the HIP mirror of
+/// cuda-new's `PreparedRowIndices`.
+///
+/// `gather_rows` and `scatter_rows` read whatever the device buffer holds, so
+/// the values must be validated while they are still on the host: an
+/// out-of-range gather reads garbage, and an out-of-range scatter writes past
+/// the destination into the next arena allocation. Both are caught in
+/// [`Self::new`]; the row count and the bound travel with the buffer, so the
+/// gather/scatter signatures cannot be satisfied with an unchecked
+/// `HipDeviceBytes`.
+pub struct PreparedRowIndices {
+    bytes: HipDeviceBytes,
+    row_count: usize,
+    /// The matrix row count the indices were validated against. Gather and
+    /// scatter re-check it against the tensor they are given, so an index
+    /// table built for one token layout cannot be replayed against another.
+    bound: usize,
+    /// Whether the target rows are distinct. `scatter_rows` accumulates
+    /// without atomics, so a repeated row races with itself; even the
+    /// replacing scatter resolves duplicate writes by launch order rather
+    /// than by intent.
+    unique: bool,
+}
+
+impl PreparedRowIndices {
+    /// Validate `rows` against `bound` and upload them to the device.
+    pub fn new(ctx: &Arc<HipContext>, rows: &[usize], bound: usize) -> Result<Self> {
+        if rows.is_empty() {
+            return Err(Error::Other(
+                "apxinf-hip row selection requires at least one row".into(),
+            ));
+        }
+        let indices = rows
+            .iter()
+            .map(|&row| {
+                if row >= bound {
+                    return Err(Error::Other(format!(
+                        "apxinf-hip row index {row} is outside 0..{bound}"
+                    )));
+                }
+                u32::try_from(row).map_err(|_| Error::Contract("row index exceeds u32"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bytes = HipDeviceBytes::new(ctx, indices.len() * std::mem::size_of::<u32>())?;
+        bytes.upload_u32(&indices)?;
+        let unique = rows.iter().collect::<std::collections::HashSet<_>>().len() == rows.len();
+        Ok(Self {
+            bytes,
+            row_count: rows.len(),
+            bound,
+            unique,
+        })
+    }
+
+    fn validate(&self, matrix_rows: usize, operation: &str) -> Result<()> {
+        if self.bound != matrix_rows {
+            return Err(Error::Other(format!(
+                "{operation}: indices were validated against 0..{}, but the matrix has \
+                 {matrix_rows} rows",
+                self.bound
+            )));
+        }
+        Ok(())
+    }
+
+    /// How many rows the table selects. `out`/`source` must match this.
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+}
+
+/// Gather whole rows of `input` named by `indices` into `out`.
+///
+/// The indices are validated against `input`'s row count when the table is
+/// built ([`PreparedRowIndices::new`]) and re-checked here, as cuda-new's
+/// `prepare_row_indices` does.
+pub fn gather_rows(
+    ctx: &HipContext,
+    input: &Tensor,
+    indices: &PreparedRowIndices,
+    out: &Tensor,
+) -> Result<()> {
+    let (input_rows, cols) = rows_cols(input)?;
+    let (rows, out_cols) = rows_cols(out)?;
+    if cols != out_cols {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[rows, {cols}]"),
+            got: out.shape().to_string(),
+        });
+    }
+    indices.validate(input_rows, "apxinf-hip gather_rows")?;
+    if rows != indices.row_count {
+        return Err(Error::DataLengthMismatch {
+            expected: indices.row_count,
+            got: rows,
+        });
+    }
+    if rows > input_rows {
+        return Err(Error::Other(format!(
+            "apxinf-hip gather_rows: {rows} rows requested from {input_rows}"
+        )));
+    }
+    let (pi, py) = (bf16_ptr(ctx, input)?, bf16_ptr(ctx, out)?);
+    check("gather_rows", unsafe {
+        ffi::apxinf_hip_native_gather_rows(
+            pi.cast_const(),
+            indices.bytes.ptr(),
+            py,
+            int(rows)?,
+            int(cols)?,
+            ctx.stream(),
+        )
+    })
+}
+
+/// Scatter the rows of `source` into the rows of `destination` named by
+/// `indices`, replacing them or adding to them.
+///
+/// The indices are validated against `destination`'s row count when the table
+/// is built and re-checked here, and must be distinct: accumulation reads and
+/// writes each target row once, without atomics, which is what cuda-new's
+/// permutation scatter relies on.
+pub fn scatter_rows(
+    ctx: &HipContext,
+    destination: &Tensor,
+    indices: &PreparedRowIndices,
+    source: &Tensor,
+    add: bool,
+) -> Result<()> {
+    let (destination_rows, cols) = rows_cols(destination)?;
+    let (rows, source_cols) = rows_cols(source)?;
+    if cols != source_cols {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[rows, {cols}]"),
+            got: source.shape().to_string(),
+        });
+    }
+    indices.validate(destination_rows, "apxinf-hip scatter_rows")?;
+    if !indices.unique {
+        return Err(Error::Other(
+            "apxinf-hip scatter_rows: destination rows must be distinct".into(),
+        ));
+    }
+    if rows != indices.row_count {
+        return Err(Error::DataLengthMismatch {
+            expected: indices.row_count,
+            got: rows,
+        });
+    }
+    if rows > destination_rows {
+        return Err(Error::Other(format!(
+            "apxinf-hip scatter_rows: {rows} rows into {destination_rows}"
+        )));
+    }
+    let (pd, ps) = (bf16_ptr(ctx, destination)?, bf16_ptr(ctx, source)?);
+    check("scatter_rows", unsafe {
+        ffi::apxinf_hip_native_scatter_rows(
+            pd,
+            indices.bytes.ptr(),
+            ps.cast_const(),
+            int(rows)?,
+            int(cols)?,
+            i32::from(add),
+            ctx.stream(),
+        )
+    })
+}
+
+/// Copy `src` into the column window of `dst` starting at `dst_col`.
+///
+/// Column concatenation is one call per source, the way [`copy_rows`]
+/// composes into row concatenation.
+pub fn copy_columns(ctx: &HipContext, src: &Tensor, dst: &Tensor, dst_col: usize) -> Result<()> {
+    let (rows, src_cols) = rows_cols(src)?;
+    let (dst_rows, dst_cols) = rows_cols(dst)?;
+    if rows != dst_rows || dst_col + src_cols > dst_cols {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[{rows}, >= {}]", dst_col + src_cols),
+            got: dst.shape().to_string(),
+        });
+    }
+    let (ps, pd) = (bf16_ptr(ctx, src)?, bf16_ptr(ctx, dst)?);
+    check("copy_columns", unsafe {
+        ffi::apxinf_hip_native_copy_columns(
+            ps.cast_const(),
+            pd,
+            int(rows)?,
+            int(src_cols)?,
+            int(dst_cols)?,
+            int(dst_col)?,
+            ctx.stream(),
+        )
+    })
 }

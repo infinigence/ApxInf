@@ -810,6 +810,10 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "pi0fast"
             | "smolvla"
             | "smolvla_libero"
+            | "Gr00tN1d7"
+            | "Gr00tN1d7-hip"
+            | "gr00t-hip"
+            | "gr00t_n1_7-hip"
     ) || matches!(device, Device::Metal(_))
 }
 #[cfg(test)]
@@ -1032,6 +1036,52 @@ mod tests {
                     !error.contains("does not yet support model_variant"),
                     "model_name={alias} model_variant={variant} was rejected before the PI0.5 \
                      loader: {error}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// `Gr00tN1d7` on HIP must resolve through the registry: detection reads
+    /// `config.json:model_type`, the device suffix picks `Gr00tN1d7-hip`, and
+    /// an `auto` or `bf16` model_variant passes admission so the request
+    /// reaches this port's loader, which then rejects the empty directory --
+    /// a rejection from routing instead is the bug this test catches.
+    #[test]
+    fn gr00t_hip_resolves_from_config_json_through_the_registry() {
+        let path = temporary_directory("gr00t-hip-routing");
+        std::fs::write(
+            path.join("config.json"),
+            r#"{"model_type": "Gr00tN1d7"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            AutoModel::detect_model_name(&path).unwrap(),
+            "Gr00tN1d7",
+            "detection must name the family from config.json"
+        );
+        #[cfg(feature = "hip")]
+        {
+            register_builtin_models();
+            for name in ["Gr00tN1d7-hip", "gr00t-hip", "gr00t_n1_7-hip"] {
+                assert!(registry::get(name).is_some(), "{name} is not registered");
+            }
+            for variant in ["auto", "bf16"] {
+                let options = LoadOptions {
+                    model_variant: Some(variant.into()),
+                    ..LoadOptions::default()
+                };
+                let error = match AutoModel::load_model(Device::Hip(0), &path, &options) {
+                    Ok(_) => panic!("an empty directory cannot load as GR00T"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    !error.contains("does not yet support model_variant"),
+                    "model_variant={variant} was rejected before the GR00T loader: {error}"
+                );
+                assert!(
+                    !error.contains("no model implementation"),
+                    "Gr00tN1d7 on HIP did not resolve to the registered factory: {error}"
                 );
             }
         }

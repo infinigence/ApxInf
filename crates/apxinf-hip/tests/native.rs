@@ -104,10 +104,14 @@ fn rms(row: &[f32]) -> f32 {
 }
 
 fn mean_inverse_std(row: &[f32]) -> (f32, f32) {
+    mean_inverse_std_eps(row, EPS)
+}
+
+fn mean_inverse_std_eps(row: &[f32], eps: f32) -> (f32, f32) {
     let n = row.len() as f32;
     let mean = row.iter().sum::<f32>() / n;
     let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
-    (mean, 1.0 / (var + EPS).sqrt())
+    (mean, 1.0 / (var + eps).sqrt())
 }
 
 // ── Arena and transfers ──────────────────────────────────────────────
@@ -135,7 +139,23 @@ fn arena_reuses_addresses_after_reset_and_refuses_overflow() {
         arena.tensor(vec![1 << 20], DType::BF16).is_err(),
         "2 MiB from a 1 MiB arena"
     );
-    assert!(arena.peak() <= arena.capacity());
+    // The peak must track exactly what was handed out: the maximum end offset
+    // any round reached, replaying the arena's own arithmetic -- align to 256,
+    // then add the tensor bytes. A peak that only ever read `capacity` would
+    // pass the old form of this check while telling callers nothing.
+    let round = |dims: &[&[usize]]| -> usize {
+        let mut offset = 0usize;
+        for d in dims {
+            offset = offset.next_multiple_of(256) + d.iter().product::<usize>() * 2;
+        }
+        offset
+    };
+    let expected = round(&[&[3, 5], &[7], &[1, 1, 9]]);
+    assert_eq!(
+        arena.peak(),
+        expected,
+        "peak must equal the handed-out bytes, not the capacity"
+    );
 }
 
 #[test]
@@ -197,6 +217,515 @@ fn gemm_matches_the_reference_at_prefix_and_action_shapes() {
         &arena.tensor(vec![4, 4], DType::BF16).unwrap()
     )
     .is_err());
+}
+
+/// `gemm_bias_activation` against the host reference: bias mapped per output
+/// feature, then GELU-tanh, with the rounding points of the fused epilogue.
+///
+/// The reference does not round the product to BF16 before the bias: the
+/// hipBLASLt epilogue applies both to the F32 accumulator and rounds once,
+/// which is the numerical point of fusing. A reference that rounded first
+/// would be the *unfused* contract, and the fused path would fail it for the
+/// right reason. The unfused fallback (hipBLAS + `bias_activation`) does round
+/// first, which is why the tolerance stays at the accumulation tolerance
+/// rather than bit-exact: the same test covers both providers.
+///
+/// `None` and `ReLU` cover the other epilogue modes the GEMM can take, so a
+/// mode mix-up (epilogue code 2 applied where 3 was meant, say) cannot pass.
+#[test]
+fn gemm_bias_activation_matches_the_reference_in_every_epilogue_mode() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // GR00T's DiT block shape, where the recipe routes the fused epilogue to
+    // hipBLASLt, plus a small shape the reference can be read by eye.
+    for (m, k, n) in [(41usize, 1536usize, 6144usize), (4, 8, 6)] {
+        let (a, ah) = input(&ctx, &[m, k], 30 + m as u64, 1.0);
+        let (b, bh) = input(&ctx, &[k, n], 40 + n as u64, 0.05);
+        let (bias, _) = input(&ctx, &[n], 50 + n as u64, 1.0);
+
+        let cases: [(Option<&Tensor>, Activation, &str); 3] = [
+            (Some(&bias), Activation::GeluTanh, "bias+gelu_tanh"),
+            (Some(&bias), Activation::Relu, "bias+relu"),
+            (None, Activation::GeluTanh, "gelu_tanh only"),
+        ];
+        let bias_host = host(&ctx, &bias);
+        for (bias, activation, name) in cases {
+            let out = arena.tensor(vec![m, n], DType::BF16).unwrap();
+            native::gemm_bias_activation(&ctx, &a, &b, bias, activation, &out).unwrap();
+
+            let mut reference = gemm_reference(&ah, &bh, m, k, n);
+            for row in 0..m {
+                for col in 0..n {
+                    let at = &mut reference[row * n + col];
+                    // One bias entry per column: the output feature.
+                    if bias.is_some() {
+                        *at += bias_host[col];
+                    }
+                    *at = match activation {
+                        Activation::GeluTanh => gelu_tanh(*at),
+                        Activation::Relu => at.max(0.0),
+                        Activation::None | Activation::Silu | Activation::GeluErf => *at,
+                    };
+                }
+            }
+            assert_close(
+                &host(&ctx, &out),
+                &reference,
+                ACCUMULATE_TOL,
+                &format!("gemm_bias_activation {name} {m}x{k}x{n}"),
+            );
+        }
+    }
+}
+
+/// hipBLASLt must agree with the reference wherever it is routed to.
+///
+/// A different library means a different tile and reduction order, so the
+/// answer differs in the last bits -- that is expected and is why the
+/// tolerance is the same accumulation tolerance the hipBLAS path uses. What
+/// would not be acceptable is a transposed or partially written result, which
+/// at these sizes lands nowhere near the reference.
+///
+/// Each comparison is paired with a check that hipBLASLt actually served that
+/// GEMM, and that pairing is the point. Every way hipBLASLt can be unavailable
+/// -- built against a ROCm without it, handle creation refused, no algorithm
+/// for the shape -- ends with hipBLAS doing the work and returning the right
+/// answer, so comparing against the reference alone would pass most
+/// convincingly when hipBLASLt never ran at all.
+///
+/// The counters are process-wide and the harness runs tests concurrently, so
+/// another test's GEMMs can inflate a delta but never suppress one. The
+/// assertion is therefore a lower bound: it catches a fallback that happens to
+/// run alone, and catches "nothing was routed" always.
+#[test]
+fn hipblaslt_matches_the_reference_where_it_is_available() {
+    if std::env::var("APXINF_HIP_GEMM_PROVIDER").as_deref() != Ok("lt") {
+        // The provider is process-wide and read once, so this test only means
+        // something in a run configured for it. CI covers both arms by
+        // invoking the suite twice.
+        eprintln!("skipping: set APXINF_HIP_GEMM_PROVIDER=lt to exercise the hipBLASLt path");
+        return;
+    }
+    let ctx = ctx();
+    let arena = arena(&ctx);
+
+    // GR00T's dominant DiT shapes, where the measurement puts hipBLASLt ahead,
+    // plus one vision shape where it is behind: being slower is allowed, being
+    // wrong is not.
+    let shapes = [
+        (41, 6144, 1536),
+        (41, 1536, 1536),
+        (21, 2048, 1536),
+        (512, 1024, 3072),
+    ];
+    let mut routed = 0usize;
+    for (m, k, n) in shapes {
+        let (a, ah) = input(&ctx, &[m, k], 30 + m as u64, 1.0);
+        let (b, bh) = input(&ctx, &[k, n], 40 + n as u64, 0.05);
+        let out = arena.tensor(vec![m, n], DType::BF16).unwrap();
+
+        let before = native::dispatch_counts().1;
+        native::gemm(&ctx, &a, &b, &out).unwrap();
+        let served_by_lt = native::dispatch_counts().1 > before;
+
+        assert_close(
+            &host(&ctx, &out),
+            &gemm_reference(&ah, &bh, m, k, n),
+            ACCUMULATE_TOL,
+            &format!("hipBLASLt gemm {m}x{k}x{n}"),
+        );
+        assert!(
+            served_by_lt,
+            "{m}x{k}x{n} fell back to hipBLAS, so the comparison above says nothing about \
+             hipBLASLt for this shape"
+        );
+        routed += 1;
+    }
+    assert_eq!(routed, shapes.len());
+}
+
+/// CK's FMHA must agree with apxinf's own kernel wherever it is routed to.
+///
+/// The dispatch count is asserted per call and is the point of the test. CK
+/// reporting that it cannot serve a geometry is a normal outcome -- a causal
+/// call has no vendored instance, and a build without `kernels/ck` has none at
+/// all -- and every such case lands on apxinf's kernel and returns the right
+/// answer. So a comparison on its own passes most convincingly when CK never
+/// ran.
+///
+/// The tolerance is looser than `ACCUMULATE_TOL`. CK runs P.V on the matrix
+/// cores, which measurement puts at 5.6e-3 relative to an F64 reference where
+/// apxinf's kernel sits at 1.7e-3 -- about 1.4 BF16 ulp against 0.4. That gap
+/// was shown not to matter end to end (emulating it moves GR00T's
+/// `final_action` from 0.00235 to 0.00243 against a 0.05 gate), but it is far
+/// too large for a bit-level tolerance and far too small to hide a transposed
+/// or unmasked result, which is what this is guarding.
+#[test]
+fn ck_attention_matches_the_apxinf_kernel_where_it_is_available() {
+    // Skipped, not failed, when the operator turned CK off: that is a
+    // configuration, and the assertion below exists to catch CK being
+    // *unexpectedly* absent -- a build without `kernels/ck`, or a geometry no
+    // instance covers -- not to override a deliberate choice.
+    if std::env::var("APXINF_HIP_ATTENTION").as_deref() == Ok("apxinf") {
+        eprintln!("skipping: APXINF_HIP_ATTENTION=apxinf disables the provider under test");
+        return;
+    }
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    native::reset_attention_counts();
+
+    // GR00T's four sites plus a bottom-right-aligned causal case, plus a GQA
+    // geometry: q heads over half as many kv heads, which the kernel serves by
+    // dividing the q-head index (its `nhead_ratio_qk`), so a head-mapping bug
+    // reads K/V from out of range or pairs the wrong heads -- wrong answers
+    // that a same-head-count comparison never exercises.
+    //
+    // Vision is 2x256 because Qwen3-VL masks attention to within each frame
+    // and the port expresses that as the batch dimension. The causal rows are
+    // the ones that matter most here: a mask applied with the wrong alignment,
+    // or not applied at all, still produces a plausible-looking tensor, and
+    // only a comparison catches it.
+    let cases = [
+        (2usize, 256usize, 256usize, 16usize, 16usize, 64usize, None, "vision"),
+        (1, 149, 149, 32, 32, 64, None, "VL"),
+        (1, 41, 149, 32, 32, 48, None, "DiT"),
+        (1, 149, 149, 16, 8, 64, None, "GQA 2:1"),
+        (
+            1,
+            149,
+            149,
+            16,
+            16,
+            128,
+            Some(0),
+            "text backbone (causal, top-left)",
+        ),
+        (
+            1,
+            41,
+            149,
+            16,
+            16,
+            128,
+            Some(108),
+            "prefill over a cache (bottom-right)",
+        ),
+    ];
+    let mut served = 0usize;
+    for (batch, q_tokens, kv_tokens, q_heads, kv_heads, head_dim, causal, name) in cases {
+        let (q, _) = input(
+            &ctx,
+            &[batch, q_tokens, q_heads, head_dim],
+            7 + head_dim as u64,
+            1.0,
+        );
+        let (k, _) = input(
+            &ctx,
+            &[batch, kv_tokens, kv_heads, head_dim],
+            11 + kv_heads as u64,
+            1.0,
+        );
+        let (v, _) = input(
+            &ctx,
+            &[batch, kv_tokens, kv_heads, head_dim],
+            13 + q_tokens as u64,
+            1.0,
+        );
+        let geometry = native::AttentionGeometry {
+            batch,
+            q_tokens,
+            q_heads,
+            kv_heads,
+            head_dim,
+            kv_tokens,
+            causal_query_start: causal,
+        };
+        let dims = vec![batch, q_tokens, q_heads, head_dim];
+
+        let reference = arena.tensor(dims.clone(), DType::BF16).unwrap();
+        let before = native::attention_counts();
+        let out = arena.tensor(dims, DType::BF16).unwrap();
+        native::attention(&ctx, &q, &k, &v, &geometry, AttentionKernel::Ck, None, &out)
+            .unwrap();
+        let after = native::attention_counts();
+        if after.1 == before.1 {
+            eprintln!("  {name}: CK did not serve this geometry; skipping the comparison");
+            continue;
+        }
+        served += 1;
+
+        // apxinf's kernel on the same inputs, for the comparison.
+        native::attention_apxinf_for_test(&ctx, &q, &k, &v, &geometry, &reference).unwrap();
+        assert_close(
+            &host(&ctx, &out),
+            &host(&ctx, &reference),
+            2.0e-2,
+            &format!("CK attention {name} {batch}x{q_tokens}x{q_heads}h/{kv_heads}kvx{head_dim}"),
+        );
+    }
+    assert_eq!(
+        served,
+        cases.len(),
+        "CK served {served} of {} geometries. Every one of them has a vendored instance: \
+         the four non-causal ones (GQA included -- the kernel derives the kv head by \
+         dividing the q head index) and both causal alignments. A shortfall means an \
+         instance went missing from kernels/ck/generated, and the shapes it covered are \
+         silently back on the slow kernel",
+        cases.len()
+    );
+}
+
+/// A packed q/k/v projection must feed attention exactly the values the split
+/// tensors do, bit for bit. The fused DiT path skips the split kernel, so
+/// this equality is its whole numerical contract. Both calls share a geometry
+/// and therefore a provider, so the comparison isolates the strided reads.
+#[test]
+fn packed_qkv_attention_matches_split_tensors_exactly() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // DiT self-attention's shape, a batched case that exercises the derived q
+    // and kv batch strides as well as the token strides, and a causal case:
+    // a mask applied to a strided read is the error a plain-value comparison
+    // would catch last.
+    let cases = [
+        (1usize, 41usize, 32usize, 48usize, None, "DiT self"),
+        (2, 37, 8, 64, None, "batched"),
+        (1, 41, 32, 48, Some(0), "DiT self, causal"),
+    ];
+    for (batch, tokens, heads, head_dim, causal, name) in cases {
+        let width = heads * head_dim;
+        let rows = batch * tokens;
+        let (packed, packed_host) = input(&ctx, &[rows, 3 * width], 7 + head_dim as u64, 1.0);
+        // The same values, as the three separate tensors a split would have
+        // produced.
+        fn section_of(packed: &[f32], first: usize, rows: usize, width: usize) -> Vec<bf16> {
+            (0..rows)
+                .flat_map(|row| {
+                    (0..width).map(move |col| {
+                        bf16::from_f32(packed[row * 3 * width + first * width + col])
+                    })
+                })
+                .collect()
+        }
+        let to_device = |v: Vec<bf16>| {
+            ctx.to_device(&Tensor::from_bf16(vec![rows, width], &v).unwrap())
+                .unwrap()
+        };
+        let q = to_device(section_of(&packed_host, 0, rows, width));
+        let k = to_device(section_of(&packed_host, 1, rows, width));
+        let v = to_device(section_of(&packed_host, 2, rows, width));
+
+        let geometry = AttentionGeometry {
+            batch,
+            q_tokens: tokens,
+            q_heads: heads,
+            kv_heads: heads,
+            head_dim,
+            kv_tokens: tokens,
+            causal_query_start: causal,
+        };
+        let dims = vec![batch, tokens, heads, head_dim];
+        let out_packed = arena.tensor(dims.clone(), DType::BF16).unwrap();
+        let out_split = arena.tensor(dims, DType::BF16).unwrap();
+        native::attention_qkv_packed(&ctx, &packed, width, width, &geometry, &out_packed).unwrap();
+        native::attention(&ctx, &q, &k, &v, &geometry, AttentionKernel::Ck, None, &out_split)
+            .unwrap();
+        assert_eq!(
+            host(&ctx, &out_packed),
+            host(&ctx, &out_split),
+            "{name}: reading the packed sections in place changed the result"
+        );
+    }
+}
+
+/// The fused vision split + axial rotation must produce exactly the values
+/// the three-kernel sequence produces: the kernel rounds the biased
+/// projection to BF16 before rotating, the rounding `split_qkv_bias`
+/// performs when it writes q, k and v out. Bit equality is the fused path's
+/// whole numerical contract -- the vision tower switched to it wholesale.
+#[test]
+fn split_qkv_axial_rope_matches_split_then_rotate_exactly() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // The tower's own shape, and a small case with a different head count, an
+    // odd token count and no bias, so the null-bias branch is covered too.
+    let cases = [
+        (512usize, 16usize, 64usize, true, "vision tower"),
+        (7, 5, 12, false, "small, no bias"),
+    ];
+    for (tokens, heads, head_dim, with_bias, name) in cases {
+        let width = heads * head_dim;
+        let (qkv, _) = input(&ctx, &[tokens, 3 * width], 41 + head_dim as u64, 1.0);
+        let bias = if with_bias {
+            Some(input(&ctx, &[3 * width], 43, 0.5).0)
+        } else {
+            None
+        };
+        // (h, w) ids in the spirit of compute_vision_pos_ids; any distinct
+        // pairs serve, since both arms read the same table.
+        let ids: Vec<u32> = (0..tokens)
+            .flat_map(|t| [(t % 23) as u32, (t / 23 % 19) as u32])
+            .collect();
+        let positions = HipDeviceBytes::new(&ctx, ids.len() * std::mem::size_of::<u32>()).unwrap();
+        positions.upload_u32(&ids).unwrap();
+
+        let head_shape = || vec![tokens, heads, head_dim];
+        let (q0, k0, v0) = (
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+        );
+        // The sequence the tower ran before the fusion, rotating q and k in
+        // place exactly as vision.rs called it.
+        native::split_qkv_bias(&ctx, &qkv, bias.as_ref(), &q0, &k0, &v0).unwrap();
+        native::apply_vision_2d(&ctx, &q0, &positions, heads, head_dim, 10_000.0, &q0).unwrap();
+        native::apply_vision_2d(&ctx, &k0, &positions, heads, head_dim, 10_000.0, &k0).unwrap();
+
+        // The fused kernel, into fresh buffers so a stray write cannot pass.
+        let (q1, k1, v1) = (
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+            arena.tensor(head_shape(), DType::BF16).unwrap(),
+        );
+        native::split_qkv_axial_rope(
+            &ctx,
+            &qkv,
+            bias.as_ref(),
+            &positions,
+            heads,
+            head_dim,
+            10_000.0,
+            &q1,
+            &k1,
+            &v1,
+        )
+        .unwrap();
+
+        for (split, fused, what) in [(&q0, &q1, "q"), (&k0, &k1, "k"), (&v0, &v1, "v")] {
+            assert_eq!(
+                host(&ctx, split),
+                host(&ctx, fused),
+                "{name}: fused {what} differs from split + rotate"
+            );
+        }
+    }
+}
+
+/// The fused text QK RMSNorm + mRoPE must produce the values the two-kernel
+/// sequence produces: the fused kernel rounds the normalized head to BF16
+/// before rotating, the rounding `rms_norm`'s store performed. The two arms
+/// now differ only by reduction partitioning (the warp-per-head fused kernel
+/// and the vectorized `rms_norm` each sum a row in a different lane order),
+/// which moves individual outputs by at most a BF16 ulp -- the same tolerance
+/// every other norm kernel's fused/unfused pair is held to. Bit equality was
+/// the contract while the fusion only reordered a shared sequence; the
+/// vectorization campaigns deliberately traded that for 1-ulp-level drift.
+#[test]
+fn rms_norm_mrope_qk_matches_rms_norm_then_apply_mrope_exactly() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // The text backbone's shape, and a small case with a different head
+    // layout and an odd token count.
+    let cases = [
+        (
+            156usize,
+            16usize,
+            8usize,
+            128usize,
+            [8usize, 4, 4],
+            "text backbone",
+        ),
+        (11, 3, 2, 12, [1, 2, 1], "small"),
+    ];
+    for (tokens, q_heads, kv_heads, head_dim, sections, name) in cases {
+        let (q, _) = input(
+            &ctx,
+            &[tokens * q_heads, head_dim],
+            61 + head_dim as u64,
+            1.0,
+        );
+        let (k, _) = input(
+            &ctx,
+            &[tokens * kv_heads, head_dim],
+            63 + head_dim as u64,
+            1.0,
+        );
+        let (qw, _) = input(&ctx, &[head_dim], 65, 0.5);
+        let (kw, _) = input(&ctx, &[head_dim], 67, 0.5);
+        // (t, h, w) ids per token; any distinct triplets serve, since both
+        // arms read the same table.
+        let ids: Vec<u32> = (0..tokens)
+            .flat_map(|t| [(t % 250) as u32, (t % 120) as u32, (t / 7) as u32])
+            .collect();
+        let positions = HipDeviceBytes::new(&ctx, ids.len() * std::mem::size_of::<u32>()).unwrap();
+        positions.upload_u32(&ids).unwrap();
+
+        // The fused kernel.
+        let (qo, ko) = (
+            arena
+                .tensor(vec![tokens, q_heads, head_dim], DType::BF16)
+                .unwrap(),
+            arena
+                .tensor(vec![tokens, kv_heads, head_dim], DType::BF16)
+                .unwrap(),
+        );
+        native::rms_norm_apply_mrope_qk(
+            &ctx, &q, &qw, &k, &kw, &positions, q_heads, kv_heads, head_dim, EPS, 10_000.0,
+            sections, &qo, &ko,
+        )
+        .unwrap();
+
+        // The sequence the backbone ran before the fusion.
+        let (qn, kn) = (
+            arena
+                .tensor(vec![tokens * q_heads, head_dim], DType::BF16)
+                .unwrap(),
+            arena
+                .tensor(vec![tokens * kv_heads, head_dim], DType::BF16)
+                .unwrap(),
+        );
+        native::rms_norm(&ctx, &q, &qw, EPS, &qn).unwrap();
+        native::rms_norm(&ctx, &k, &kw, EPS, &kn).unwrap();
+        let (qr, kr) = (
+            arena
+                .tensor(vec![tokens, q_heads, head_dim], DType::BF16)
+                .unwrap(),
+            arena
+                .tensor(vec![tokens, kv_heads, head_dim], DType::BF16)
+                .unwrap(),
+        );
+        native::apply_mrope(
+            &ctx,
+            &qn.reshape(vec![tokens, q_heads, head_dim]).unwrap(),
+            &positions,
+            q_heads,
+            head_dim,
+            10_000.0,
+            sections,
+            &qr,
+        )
+        .unwrap();
+        native::apply_mrope(
+            &ctx,
+            &kn.reshape(vec![tokens, kv_heads, head_dim]).unwrap(),
+            &positions,
+            kv_heads,
+            head_dim,
+            10_000.0,
+            sections,
+            &kr,
+        )
+        .unwrap();
+
+        for (split, fused, what) in [(&qr, &qo, "q"), (&kr, &ko, "k")] {
+            assert_close(
+                &host(&ctx, fused),
+                &host(&ctx, split),
+                BF16_TOL,
+                &format!("{name}: fused {what} differs from rms_norm + apply_mrope"),
+            );
+        }
+    }
 }
 
 // ── Norms ────────────────────────────────────────────────────────────
@@ -384,6 +913,23 @@ fn pointwise_operators_match_the_reference() {
         );
     }
 
+    // cols % 8 != 0 takes the scalar fallback of the vectorized
+    // `bias_activation`; keep it covered so the two paths cannot drift.
+    let (rows_f, cols_f) = (17, 333);
+    let (xf, xfh) = input(&ctx, &[rows_f, cols_f], 21, 4.0);
+    let (biasf, biasfh) = input(&ctx, &[cols_f], 22, 0.5);
+    let outf = arena.tensor(vec![rows_f, cols_f], DType::BF16).unwrap();
+    native::bias_activation(&ctx, &xf, Some(&biasf), Activation::GeluTanh, &outf).unwrap();
+    let want_f: Vec<f32> = (0..rows_f * cols_f)
+        .map(|i| gelu_tanh(xfh[i] + biasfh[i % cols_f]))
+        .collect();
+    assert_close(
+        &host(&ctx, &outf),
+        &want_f,
+        BF16_TOL,
+        "bias_activation scalar fallback (cols % 8 != 0)",
+    );
+
     let inner = 4096;
     let (gu, guh) = input(&ctx, &[10, 2 * inner], 19, 3.0);
     let out = arena.tensor(vec![10, inner], DType::BF16).unwrap();
@@ -414,7 +960,14 @@ fn embedding_scales_rows_by_sqrt_width_and_zeroes_unknown_ids() {
     let bytes = HipDeviceBytes::new(&ctx, 4 * 200).unwrap();
     bytes.upload_u32(&ids).unwrap();
     let out = arena.tensor(vec![ids.len(), width], DType::BF16).unwrap();
-    native::embedding(&ctx, &table, &bytes, &out).unwrap();
+    native::embedding(
+        &ctx,
+        &table,
+        &bytes,
+        native::EmbeddingScale::SqrtWidth,
+        &out,
+    )
+    .unwrap();
     let scale = (width as f32).sqrt();
     let th = &th;
     let want: Vec<f32> = ids
@@ -633,6 +1186,7 @@ fn attention_reference(
         kv_heads,
         head_dim,
         kv_tokens,
+        causal_query_start,
     } = *g;
     let mut out = vec![0.0f32; q.len()];
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -642,7 +1196,11 @@ fn attention_reference(
                 let kv = h / (q_heads / kv_heads);
                 let qb = ((b * q_tokens + i) * q_heads + h) * head_dim;
                 let key = |j: usize| ((b * rows + j) * kv_heads + kv) * head_dim;
-                let scores: Vec<f32> = (0..kv_tokens)
+                let visible = match causal_query_start {
+                    None => kv_tokens,
+                    Some(start) => kv_tokens.min(start + i + 1),
+                };
+                let scores: Vec<f32> = (0..visible)
                     .map(|j| {
                         (0..head_dim)
                             .map(|d| q[qb + d] * k[key(j) + d])
@@ -654,7 +1212,7 @@ fn attention_reference(
                 let weights: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
                 let total: f32 = weights.iter().sum();
                 for d in 0..head_dim {
-                    out[qb + d] = (0..kv_tokens)
+                    out[qb + d] = (0..visible)
                         .map(|j| weights[j] * v[key(j) + d])
                         .sum::<f32>()
                         / total;
@@ -682,6 +1240,7 @@ fn attention_matches_the_reference_for_every_pi05_shape() {
                 kv_heads: 16,
                 head_dim: 72,
                 kv_tokens: 256,
+                causal_query_start: None,
             },
             256,
         ),
@@ -693,6 +1252,7 @@ fn attention_matches_the_reference_for_every_pi05_shape() {
                 kv_heads: 1,
                 head_dim: 256,
                 kv_tokens: 200,
+                causal_query_start: None,
             },
             200,
         ),
@@ -704,6 +1264,7 @@ fn attention_matches_the_reference_for_every_pi05_shape() {
                 kv_heads: 1,
                 head_dim: 256,
                 kv_tokens: 532,
+                causal_query_start: None,
             },
             540,
         ),
@@ -715,6 +1276,7 @@ fn attention_matches_the_reference_for_every_pi05_shape() {
                 kv_heads: 2,
                 head_dim: 64,
                 kv_tokens: 300,
+                causal_query_start: None,
             },
             300,
         ),
@@ -769,6 +1331,7 @@ fn attention_matches_the_reference_for_every_pi05_shape() {
         kv_heads: 1,
         head_dim: 256,
         kv_tokens: 541,
+        causal_query_start: None,
     };
     let (q, _) = input(&ctx, &[1, 10, 8, 256], 1, 1.0);
     let (k, _) = input(&ctx, &[540, 1, 256], 2, 1.0);
@@ -803,6 +1366,7 @@ fn ck_without_an_instance_falls_back_to_the_reference_kernel() {
         kv_heads: 4,
         head_dim: 40,
         kv_tokens: 64,
+        causal_query_start: None,
     };
     let (q, qh) = input(&ctx, &[1, 12, 4, 40], 90, 2.0);
     let (k, kh) = input(&ctx, &[64, 4, 40], 91, 2.0);
@@ -822,6 +1386,7 @@ fn default_attention_kernels_for_pi05() {
         kv_heads,
         head_dim,
         kv_tokens,
+        causal_query_start: None,
     };
     // Vision and prefix: CK flash-attention forward.
     assert_eq!(
@@ -891,3 +1456,893 @@ fn non_bf16_and_host_operands_are_rejected() {
         "host input"
     );
 }
+
+// ── Qwen3-VL mRoPE ───────────────────────────────────────────────────
+
+/// Which position axis frequency pair `pair` reads under Qwen3-VL's
+/// interleaved mRoPE layout: T (0), H (1) or W (2).
+fn mrope_axis(pair: usize, section_h: usize, section_w: usize) -> usize {
+    match pair % 3 {
+        1 if pair < section_h * 3 => 1,
+        2 if pair < section_w * 3 => 2,
+        _ => 0,
+    }
+}
+
+#[test]
+fn apply_mrope_rotates_half_split_pairs_on_the_interleaved_axes() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // GR00T N1.7's text stack: the fixture's 149 tokens, Qwen3-VL 2B's 16 Q /
+    // 8 KV heads at head_dim 128, mrope_section [24, 20, 20], theta 5e6.
+    let (tokens, head_dim, theta) = (149usize, 128usize, 5_000_000.0f32);
+    let sections = [24usize, 20, 20];
+    let half = head_dim / 2;
+
+    // (t, h, w) per token: a text-then-image pattern, so the three axes
+    // genuinely differ and a wrong axis cannot pass by coincidence.
+    let mut position_ids = Vec::with_capacity(tokens * 3);
+    for token in 0..tokens {
+        if token < 40 {
+            position_ids.extend([token as u32, token as u32, token as u32]);
+        } else {
+            let patch = token - 40;
+            position_ids.extend([40u32, 40 + (patch / 16) as u32, 40 + (patch % 16) as u32]);
+        }
+    }
+    let positions = HipDeviceBytes::new(&ctx, position_ids.len() * 4).unwrap();
+    positions.upload_u32(&position_ids).unwrap();
+
+    for heads in [16usize, 8] {
+        let (x, xh) = input(&ctx, &[tokens, heads, head_dim], 40 + heads as u64, 2.0);
+        let out = arena
+            .tensor(vec![tokens, heads, head_dim], DType::BF16)
+            .unwrap();
+        native::apply_mrope(&ctx, &x, &positions, heads, head_dim, theta, sections, &out).unwrap();
+
+        let mut want = vec![0.0f32; tokens * heads * head_dim];
+        for token in 0..tokens {
+            for head in 0..heads {
+                let base = (token * heads + head) * head_dim;
+                for pair in 0..half {
+                    let axis = mrope_axis(pair, sections[1], sections[2]);
+                    let position = position_ids[token * 3 + axis] as f32;
+                    let frequency = theta.powf(-2.0 * pair as f32 / head_dim as f32);
+                    let (sine, cosine) = (position * frequency).sin_cos();
+                    let (low, high) = (xh[base + pair], xh[base + half + pair]);
+                    want[base + pair] = low * cosine - high * sine;
+                    want[base + half + pair] = high * cosine + low * sine;
+                }
+            }
+        }
+        assert_close(
+            &host(&ctx, &out),
+            &want,
+            BF16_TOL,
+            &format!("mrope heads={heads}"),
+        );
+    }
+}
+
+#[test]
+fn apply_mrope_is_correct_in_place_and_rejects_a_broken_contract() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    let (tokens, heads, head_dim, theta) = (6usize, 2usize, 16usize, 10_000.0f32);
+    let sections = [2usize, 3, 3];
+    let half = head_dim / 2;
+    let ids: Vec<u32> = (0..tokens * 3).map(|i| (i % 7) as u32).collect();
+    let positions = HipDeviceBytes::new(&ctx, ids.len() * 4).unwrap();
+    positions.upload_u32(&ids).unwrap();
+
+    // In place: a thread reads both halves of its pair before storing either,
+    // so aliasing input and output is part of the contract.
+    let (x, xh) = input(&ctx, &[tokens, heads, head_dim], 44, 1.0);
+    native::apply_mrope(&ctx, &x, &positions, heads, head_dim, theta, sections, &x).unwrap();
+    let mut want = vec![0.0f32; xh.len()];
+    for token in 0..tokens {
+        for head in 0..heads {
+            let base = (token * heads + head) * head_dim;
+            for pair in 0..half {
+                let axis = mrope_axis(pair, sections[1], sections[2]);
+                let position = ids[token * 3 + axis] as f32;
+                let frequency = theta.powf(-2.0 * pair as f32 / head_dim as f32);
+                let (sine, cosine) = (position * frequency).sin_cos();
+                let (low, high) = (xh[base + pair], xh[base + half + pair]);
+                want[base + pair] = low * cosine - high * sine;
+                want[base + half + pair] = high * cosine + low * sine;
+            }
+        }
+    }
+    assert_close(&host(&ctx, &x), &want, BF16_TOL, "mrope in place");
+
+    let out = arena
+        .tensor(vec![tokens, heads, head_dim], DType::BF16)
+        .unwrap();
+    // H + W may not claim more than the half-split pairs they share.
+    assert!(
+        native::apply_mrope(
+            &ctx,
+            &x,
+            &positions,
+            heads,
+            head_dim,
+            theta,
+            [2, 5, 5],
+            &out
+        )
+        .is_err(),
+        "sections h+w over head_dim/2"
+    );
+    // Too few positions for the token count.
+    let short = HipDeviceBytes::new(&ctx, (tokens * 3 - 1) * 4).unwrap();
+    assert!(
+        native::apply_mrope(&ctx, &x, &short, heads, head_dim, theta, sections, &out).is_err(),
+        "truncated positions"
+    );
+    // A rank-2 input is not [tokens, heads, head_dim].
+    let flat = arena
+        .tensor(vec![tokens, heads * head_dim], DType::BF16)
+        .unwrap();
+    assert!(
+        native::apply_mrope(&ctx, &flat, &positions, heads, head_dim, theta, sections, &out)
+            .is_err(),
+        "rank 2 input"
+    );
+}
+
+#[test]
+fn apply_vision_2d_splits_the_half_pairs_between_height_and_width() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // GR00T's vision tower: the fixture's 512 patches over two 16x16 grids,
+    // Qwen3-VL 2B's 16 heads at head_dim 64, theta 10000.
+    let (tokens, heads, head_dim, theta) = (512usize, 16usize, 64usize, 10_000.0f32);
+    let (half, quarter) = (head_dim / 2, head_dim / 4);
+
+    // Two 16x16 tiles after the spatial merge: (h, w) walks each grid, so the
+    // two axes differ for almost every token.
+    let mut position_ids = Vec::with_capacity(tokens * 2);
+    for token in 0..tokens {
+        let patch = token % 256;
+        position_ids.extend([(patch / 16) as u32, (patch % 16) as u32]);
+    }
+    let positions = HipDeviceBytes::new(&ctx, position_ids.len() * 4).unwrap();
+    positions.upload_u32(&position_ids).unwrap();
+
+    let (x, xh) = input(&ctx, &[tokens, heads, head_dim], 50, 2.0);
+    let out = arena
+        .tensor(vec![tokens, heads, head_dim], DType::BF16)
+        .unwrap();
+    native::apply_vision_2d(&ctx, &x, &positions, heads, head_dim, theta, &out).unwrap();
+
+    let mut want = vec![0.0f32; tokens * heads * head_dim];
+    for token in 0..tokens {
+        for head in 0..heads {
+            let base = (token * heads + head) * head_dim;
+            for pair in 0..half {
+                let (axis, within) = if pair < quarter {
+                    (0, pair)
+                } else {
+                    (1, pair - quarter)
+                };
+                let position = position_ids[token * 2 + axis] as f32;
+                let frequency = theta.powf(-2.0 * within as f32 / half as f32);
+                let (sine, cosine) = (position * frequency).sin_cos();
+                let (low, high) = (xh[base + pair], xh[base + half + pair]);
+                want[base + pair] = low * cosine - high * sine;
+                want[base + half + pair] = low * sine + high * cosine;
+            }
+        }
+    }
+    assert_close(&host(&ctx, &out), &want, BF16_TOL, "vision 2d rope");
+
+    // In place must agree with the out-of-place result.
+    native::apply_vision_2d(&ctx, &x, &positions, heads, head_dim, theta, &x).unwrap();
+    assert_close(&host(&ctx, &x), &want, BF16_TOL, "vision 2d rope in place");
+
+    // head_dim must split evenly between the two axes.
+    let odd = arena.tensor(vec![tokens, heads, 6], DType::BF16).unwrap();
+    assert!(
+        native::apply_vision_2d(&ctx, &odd, &positions, heads, 6, theta, &odd).is_err(),
+        "head_dim not a multiple of 4"
+    );
+    // Too few positions for the token count.
+    let short = HipDeviceBytes::new(&ctx, (tokens * 2 - 1) * 4).unwrap();
+    assert!(
+        native::apply_vision_2d(&ctx, &x, &short, heads, head_dim, theta, &out).is_err(),
+        "truncated positions"
+    );
+}
+
+#[test]
+fn split_qkv_bias_then_vision_2d_rounds_like_the_fused_cuda_kernel() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // cuda-new fuses the vision QKV split and the axial rotation into one
+    // kernel that rounds the biased projection to BF16 before rotating. The
+    // composed HIP pair must land on the same values: `split_qkv_bias` writes
+    // that same rounded projection, and the rope then reads it back.
+    let (tokens, heads, head_dim, theta) = (64usize, 16usize, 64usize, 10_000.0f32);
+    let (width, half, quarter) = (heads * head_dim, head_dim / 2, head_dim / 4);
+    let (qkv, qh) = input(&ctx, &[tokens, 3 * width], 51, 2.0);
+    let (bias, bh) = input(&ctx, &[3 * width], 52, 0.5);
+    let ids: Vec<u32> = (0..tokens * 2).map(|i| (i % 23) as u32).collect();
+    let positions = HipDeviceBytes::new(&ctx, ids.len() * 4).unwrap();
+    positions.upload_u32(&ids).unwrap();
+
+    let make = || {
+        arena
+            .tensor(vec![tokens, heads, head_dim], DType::BF16)
+            .unwrap()
+    };
+    let (q, k, v) = (make(), make(), make());
+    native::split_qkv_bias(&ctx, &qkv, Some(&bias), &q, &k, &v).unwrap();
+    native::apply_vision_2d(&ctx, &q, &positions, heads, head_dim, theta, &q).unwrap();
+    native::apply_vision_2d(&ctx, &k, &positions, heads, head_dim, theta, &k).unwrap();
+
+    // Reference: bias add, round to BF16, then rotate -- the fused order.
+    let mut want_q = vec![0.0f32; tokens * width];
+    let mut want_k = vec![0.0f32; tokens * width];
+    for token in 0..tokens {
+        for head in 0..heads {
+            for pair in 0..half {
+                let (axis, within) = if pair < quarter {
+                    (0, pair)
+                } else {
+                    (1, pair - quarter)
+                };
+                let position = ids[token * 2 + axis] as f32;
+                let frequency = theta.powf(-2.0 * within as f32 / half as f32);
+                let (sine, cosine) = (position * frequency).sin_cos();
+                for (projection, want) in [(0usize, &mut want_q), (1usize, &mut want_k)] {
+                    let column = projection * width + head * head_dim;
+                    let row = token * 3 * width;
+                    let low = r(qh[row + column + pair] + bh[column + pair]);
+                    let high = r(qh[row + column + half + pair] + bh[column + half + pair]);
+                    let base = (token * heads + head) * head_dim;
+                    want[base + pair] = low * cosine - high * sine;
+                    want[base + half + pair] = low * sine + high * cosine;
+                }
+            }
+        }
+    }
+    assert_close(&host(&ctx, &q), &want_q, BF16_TOL, "composed vision q");
+    assert_close(&host(&ctx, &k), &want_k, BF16_TOL, "composed vision k");
+}
+
+#[test]
+fn causal_attention_masks_each_query_to_its_own_prefix() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // GR00T's text backbone prefill: the fixture's 149 tokens, Qwen3-VL 2B's
+    // 16 Q heads over 8 KV heads (GQA 2:1) at head_dim 128. A full prefill has
+    // query_start 0, so row i sees keys [0, i].
+    let cases = [
+        (149usize, 149usize, 0usize, 16usize, 8usize, 128usize),
+        // A prefill appended to a cache that already holds 100 rows: the 49
+        // new queries see their own prefix plus everything cached.
+        (49, 149, 100, 16, 8, 128),
+        // A key count that is not a multiple of the 128-key tile, and MQA.
+        (37, 37, 0, 8, 1, 64),
+    ];
+    for (q_tokens, kv_tokens, start, q_heads, kv_heads, head_dim) in cases {
+        let geometry = AttentionGeometry {
+            batch: 1,
+            q_tokens,
+            q_heads,
+            kv_heads,
+            head_dim,
+            kv_tokens,
+            causal_query_start: Some(start),
+        };
+        let (q, qh) = input(&ctx, &[1, q_tokens, q_heads, head_dim], 60, 1.0);
+        let (k, kh) = input(&ctx, &[1, kv_tokens, kv_heads, head_dim], 61, 1.0);
+        let (v, vh) = input(&ctx, &[1, kv_tokens, kv_heads, head_dim], 62, 1.0);
+        let out = arena
+            .tensor(vec![1, q_tokens, q_heads, head_dim], DType::BF16)
+            .unwrap();
+        native::attention(&ctx, &q, &k, &v, &geometry, AttentionKernel::Ck, None, &out)
+            .unwrap();
+        let want = attention_reference(&qh, &kh, &vh, &geometry, kv_tokens);
+        assert_close(
+            &host(&ctx, &out),
+            &want,
+            ACCUMULATE_TOL,
+            &format!("causal attention q={q_tokens} kv={kv_tokens} start={start}"),
+        );
+    }
+
+    // A start at or past the last key has no causal meaning: the kernel would
+    // clamp it and return full attention, so it is refused up front.
+    let kv_149 = 149usize;
+    for start in [kv_149, kv_149 + 1] {
+        let geometry = AttentionGeometry {
+            batch: 1,
+            q_tokens: 4,
+            q_heads: 8,
+            kv_heads: 8,
+            head_dim: 64,
+            kv_tokens: kv_149,
+            causal_query_start: Some(start),
+        };
+        let (q, _) = input(&ctx, &[1, 4, 8, 64], 66, 1.0);
+        let (k, _) = input(&ctx, &[1, 149, 8, 64], 67, 1.0);
+        let (v, _) = input(&ctx, &[1, 149, 8, 64], 68, 1.0);
+        let out = arena.tensor(vec![1, 4, 8, 64], DType::BF16).unwrap();
+        assert!(
+            native::attention(&ctx, &q, &k, &v, &geometry, AttentionKernel::Ck, None, &out)
+                .is_err(),
+            "causal_query_start {start} at/after the {kv_149}-key window must be rejected"
+        );
+    }
+}
+
+#[test]
+fn causal_attention_differs_from_the_unmasked_result() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // A mask that is silently ignored would still pass a reference that also
+    // ignores it, so pin the two apart: the first query row sees exactly one
+    // key under the mask, and all of them without it.
+    let (tokens, heads, head_dim) = (64usize, 4usize, 64usize);
+    let (q, _) = input(&ctx, &[1, tokens, heads, head_dim], 63, 1.0);
+    let (k, _) = input(&ctx, &[1, tokens, heads, head_dim], 64, 1.0);
+    let (v, vh) = input(&ctx, &[1, tokens, heads, head_dim], 65, 1.0);
+    let shape = vec![1, tokens, heads, head_dim];
+    let masked = arena.tensor(shape.clone(), DType::BF16).unwrap();
+    let dense = arena.tensor(shape, DType::BF16).unwrap();
+    let base = AttentionGeometry {
+        batch: 1,
+        q_tokens: tokens,
+        q_heads: heads,
+        kv_heads: heads,
+        head_dim,
+        kv_tokens: tokens,
+        causal_query_start: None,
+    };
+    native::attention(&ctx, &q, &k, &v, &base, AttentionKernel::Ck, None, &dense).unwrap();
+    native::attention(
+        &ctx,
+        &q,
+        &k,
+        &v,
+        &AttentionGeometry {
+            causal_query_start: Some(0),
+            ..base
+        },
+        AttentionKernel::Ck,
+        None,
+        &masked,
+    )
+    .unwrap();
+    let (got_masked, got_dense) = (host(&ctx, &masked), host(&ctx, &dense));
+    // Row 0 attends key 0 alone, so it must equal V's first row exactly.
+    assert_close(
+        &got_masked[..heads * head_dim],
+        &vh[..heads * head_dim],
+        BF16_TOL,
+        "causal row 0 is V row 0",
+    );
+    let difference = got_masked
+        .iter()
+        .zip(&got_dense)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        difference > 1e-2,
+        "the mask changed nothing: max|causal - dense| = {difference:.3e}"
+    );
+}
+
+#[test]
+fn ada_layer_norm_conditions_layer_statistics_with_scale_then_shift() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // GR00T's DiT: 41 rows (40 action tokens + 1 state) at inner dim 1536,
+    // and the output head's eps 1e-6.
+    for (rows, cols, eps) in [(41usize, 1536usize, 1e-6f32), (40, 1024, 1e-5)] {
+        let (x, xh) = input(&ctx, &[rows, cols], 70, 2.0);
+        let (style, sh) = input(&ctx, &[2 * cols], 71, 0.5);
+        let out = arena.tensor(vec![rows, cols], DType::BF16).unwrap();
+        native::ada_layer_norm(&ctx, &x, &style, eps, &out).unwrap();
+
+        let mut want = Vec::with_capacity(rows * cols);
+        for row in xh.chunks(cols) {
+            let (mean, inverse) = mean_inverse_std_eps(row, eps);
+            want.extend(
+                (0..cols).map(|c| (row[c] - mean) * inverse * (1.0 + sh[c]) + sh[cols + c]),
+            );
+        }
+        assert_close(
+            &host(&ctx, &out),
+            &want,
+            BF16_TOL,
+            &format!("ada_layer_norm {rows}x{cols}"),
+        );
+    }
+
+    // The modulation must cover both segments.
+    let (x, _) = input(&ctx, &[4, 64], 72, 1.0);
+    let (short, _) = input(&ctx, &[64], 73, 1.0);
+    let out = arena.tensor(vec![4, 64], DType::BF16).unwrap();
+    assert!(
+        native::ada_layer_norm(&ctx, &x, &short, 1e-5, &out).is_err(),
+        "style shorter than 2 * cols"
+    );
+}
+
+#[test]
+fn silu_mul_and_relu_match_the_reference() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // GR00T's text MLP keeps gate and up apart: [149, 6144] each.
+    let (rows, inner) = (149usize, 6144usize);
+    let (gate, gh) = input(&ctx, &[rows, inner], 74, 2.0);
+    let (up, uh) = input(&ctx, &[rows, inner], 75, 2.0);
+    let out = arena.tensor(vec![rows, inner], DType::BF16).unwrap();
+    native::silu_mul(&ctx, &gate, &up, &out).unwrap();
+    let want: Vec<f32> = gh
+        .iter()
+        .zip(&uh)
+        .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+        .collect();
+    assert_close(&host(&ctx, &out), &want, BF16_TOL, "silu_mul");
+
+    // Mismatched operands are rejected rather than read out of bounds.
+    let (narrow, _) = input(&ctx, &[rows, inner - 1], 76, 1.0);
+    assert!(
+        native::silu_mul(&ctx, &gate, &narrow, &out).is_err(),
+        "silu_mul shape mismatch"
+    );
+
+    // ReLU joins the activation set the DiT action decoder needs.
+    let (x, xh) = input(&ctx, &[32, 1024], 77, 2.0);
+    let (bias, bh) = input(&ctx, &[1024], 78, 0.5);
+    let relu = arena.tensor(vec![32, 1024], DType::BF16).unwrap();
+    native::bias_activation(&ctx, &x, Some(&bias), native::Activation::Relu, &relu).unwrap();
+    let want: Vec<f32> = (0..xh.len())
+        .map(|i| (xh[i] + bh[i % 1024]).max(0.0))
+        .collect();
+    assert_close(&host(&ctx, &relu), &want, BF16_TOL, "bias + relu");
+}
+
+#[test]
+fn the_two_gelus_are_distinguishable_and_each_matches_its_own_reference() {
+    // Qwen3-VL asks for both: the vision MLP is configured `gelu_pytorch_tanh`
+    // while the patch merger is Torch's default `nn.GELU()`. Serving one where
+    // the other was meant is a silent accuracy loss, so the test pins both
+    // against their own formula and then proves they really do differ in BF16.
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    let (rows, cols) = (64usize, 512usize);
+    let (x, xh) = input(&ctx, &[rows, cols], 101, 3.0);
+
+    let tanh_out = arena.tensor(vec![rows, cols], DType::BF16).unwrap();
+    native::bias_activation(&ctx, &x, None, native::Activation::GeluTanh, &tanh_out).unwrap();
+    let want_tanh: Vec<f32> = xh
+        .iter()
+        .map(|&v| {
+            let inner = 0.797_884_56_f32 * (v + 0.044_715 * v * v * v);
+            0.5 * v * (1.0 + inner.tanh())
+        })
+        .collect();
+    assert_close(&host(&ctx, &tanh_out), &want_tanh, BF16_TOL, "gelu_tanh");
+
+    let erf_out = arena.tensor(vec![rows, cols], DType::BF16).unwrap();
+    native::bias_activation(&ctx, &x, None, native::Activation::GeluErf, &erf_out).unwrap();
+    let want_erf: Vec<f32> = xh
+        .iter()
+        .map(|&v| 0.5 * v * (1.0 + erf(v / std::f32::consts::SQRT_2)))
+        .collect();
+    assert_close(&host(&ctx, &erf_out), &want_erf, BF16_TOL, "gelu_erf");
+
+    let (tanh_host, erf_host) = (host(&ctx, &tanh_out), host(&ctx, &erf_out));
+    let differing = tanh_host
+        .iter()
+        .zip(&erf_host)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        differing > rows * cols / 100,
+        "the two GELUs rounded to the same BF16 for all but {differing} of {} elements, so this \
+         test could not catch a swap",
+        rows * cols
+    );
+}
+
+/// Abramowitz & Stegun 7.1.26, good to ~1.5e-7 -- an independent formula, not
+/// the kernel's own.
+fn erf(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs() as f64;
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
+            + 0.254_829_592)
+            * t
+            * (-x * x).exp();
+    sign * y as f32
+}
+
+#[test]
+fn embedding_scale_is_the_callers_choice() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // GR00T reads the Qwen3-VL table unscaled; pi05 scales by sqrt(width).
+    // The two differ by that factor, so a silent default would be a real bug.
+    let (vocab, width) = (300usize, 2048usize);
+    let (table, th) = input(&ctx, &[vocab, width], 79, 1.0);
+    let ids: Vec<u32> = vec![0, 299, 7, 150, 1_000_000];
+    let bytes = HipDeviceBytes::new(&ctx, ids.len() * 4).unwrap();
+    bytes.upload_u32(&ids).unwrap();
+    let plain = arena.tensor(vec![ids.len(), width], DType::BF16).unwrap();
+    native::embedding(&ctx, &table, &bytes, native::EmbeddingScale::None, &plain).unwrap();
+    let table_host = &th;
+    let want: Vec<f32> = ids
+        .iter()
+        .flat_map(|&id| {
+            let row = id as usize;
+            (0..width).map(move |c| {
+                if row < vocab {
+                    table_host[row * width + c]
+                } else {
+                    0.0
+                }
+            })
+        })
+        .collect();
+    assert_close(&host(&ctx, &plain), &want, BF16_TOL, "embedding unscaled");
+
+    // And the scaled contract still holds, so pi05 is unaffected.
+    let scaled = arena.tensor(vec![ids.len(), width], DType::BF16).unwrap();
+    native::embedding(
+        &ctx,
+        &table,
+        &bytes,
+        native::EmbeddingScale::SqrtWidth,
+        &scaled,
+    )
+    .unwrap();
+    let factor = (width as f32).sqrt();
+    let want_scaled: Vec<f32> = want.iter().map(|v| v * factor).collect();
+    assert_close(
+        &host(&ctx, &scaled),
+        &want_scaled,
+        BF16_TOL,
+        "embedding scaled",
+    );
+}
+
+#[test]
+fn row_and_column_movement_matches_the_reference() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    let cols = 1536usize;
+
+    // contiguous_rows: GR00T drops the DiT's leading state row and keeps the
+    // 40 action rows.
+    let (decoded, dh) = input(&ctx, &[41, cols], 80, 1.0);
+    let sliced = arena.tensor(vec![40, cols], DType::BF16).unwrap();
+    native::copy_row_range(&ctx, &decoded, 1, 40, &sliced, 0).unwrap();
+    assert_close(
+        &host(&ctx, &sliced),
+        &dh[cols..],
+        0.0,
+        "row slice is bit exact",
+    );
+
+    // gather_rows: the backbone's image / non-image row split.
+    let (features, fh) = input(&ctx, &[149, cols], 81, 1.0);
+    let picked: Vec<usize> = (0..149usize).filter(|i| i % 3 == 1).collect();
+    let indices = native::PreparedRowIndices::new(&ctx, &picked, 149).unwrap();
+    let gathered = arena.tensor(vec![picked.len(), cols], DType::BF16).unwrap();
+    native::gather_rows(&ctx, &features, &indices, &gathered).unwrap();
+    let want: Vec<f32> = picked
+        .iter()
+        .flat_map(|&row| fh[row * cols..(row + 1) * cols].to_vec())
+        .collect();
+    assert_close(&host(&ctx, &gathered), &want, 0.0, "gather is bit exact");
+
+    // scatter_rows, replacing then accumulating into the same rows.
+    let destination = arena.tensor(vec![149, cols], DType::BF16).unwrap();
+    native::copy_rows(&ctx, &features, &destination, 0).unwrap();
+    native::scatter_rows(&ctx, &destination, &indices, &gathered, false).unwrap();
+    assert_close(
+        &host(&ctx, &destination),
+        &fh,
+        0.0,
+        "scatter of the gathered rows restores the source",
+    );
+    native::scatter_rows(&ctx, &destination, &indices, &gathered, true).unwrap();
+    let mut want_added = fh.clone();
+    for &row in &picked {
+        let base = row * cols;
+        for c in 0..cols {
+            want_added[base + c] = r(want_added[base + c] + fh[base + c]);
+        }
+    }
+    assert_close(
+        &host(&ctx, &destination),
+        &want_added,
+        BF16_TOL,
+        "accumulating scatter",
+    );
+
+    // copy_columns: the action encoder appends the step's time embedding.
+    let (action, ah) = input(&ctx, &[40, 1024], 82, 1.0);
+    let (time, th) = input(&ctx, &[40, 512], 83, 1.0);
+    let joined = arena.tensor(vec![40, 1536], DType::BF16).unwrap();
+    native::copy_columns(&ctx, &action, &joined, 0).unwrap();
+    native::copy_columns(&ctx, &time, &joined, 1024).unwrap();
+    let mut want_joined = Vec::with_capacity(40 * 1536);
+    for row in 0..40 {
+        want_joined.extend_from_slice(&ah[row * 1024..(row + 1) * 1024]);
+        want_joined.extend_from_slice(&th[row * 512..(row + 1) * 512]);
+    }
+    assert_close(
+        &host(&ctx, &joined),
+        &want_joined,
+        0.0,
+        "column concatenation is bit exact",
+    );
+
+    // Out-of-range ranges and windows are refused, not clamped.
+    assert!(
+        native::copy_row_range(&ctx, &decoded, 2, 40, &sliced, 0).is_err(),
+        "source range past the end"
+    );
+    assert!(
+        native::copy_columns(&ctx, &time, &joined, 1025).is_err(),
+        "column window past the end"
+    );
+
+    // An out-of-range index is refused while it is still on the host: an
+    // unchecked gather reads garbage and an unchecked scatter writes past the
+    // destination into the next arena allocation.
+    assert!(
+        native::PreparedRowIndices::new(&ctx, &[0, 149], 149).is_err(),
+        "row index equal to the row count"
+    );
+    // A table validated against one row count cannot be replayed against a
+    // different matrix.
+    let (other, _) = input(&ctx, &[148, cols], 91, 1.0);
+    assert!(
+        native::gather_rows(&ctx, &other, &indices, &gathered).is_err(),
+        "indices prepared for a different row count"
+    );
+    // Repeated scatter rows race with themselves under accumulation, so they
+    // are refused rather than trusted to a comment.
+    let repeated = native::PreparedRowIndices::new(&ctx, &[1, 1, 4], 149).unwrap();
+    assert!(
+        native::scatter_rows(&ctx, &destination, &repeated, &gathered, false).is_err(),
+        "duplicate scatter rows"
+    );
+}
+
+/// The fused bias/residual/adaptive-LayerNorm must equal the pair it replaces,
+/// to the bit.
+///
+/// Not "close": the fused kernel exists to remove a launch, not to compute
+/// anything differently, and it is written to round `hidden` to BF16 and read
+/// it back exactly where the separate path does. A difference here means that
+/// boundary moved, which is a change of model that an end-to-end cosine of
+/// 0.9999 would absorb without reporting.
+#[test]
+fn the_fused_adaptive_layer_norm_matches_the_separate_pair_exactly() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // GR00T's DiT shape, and a second with an odd row count so the reduction
+    // is exercised off a round grid.
+    for (rows, cols) in [(41usize, 1536usize), (7, 1024)] {
+        let (projection, _) = input(&ctx, &[rows, cols], 3 + rows as u64, 1.0);
+        let (bias, _) = input(&ctx, &[cols], 5, 0.5);
+        let (residual, _) = input(&ctx, &[rows, cols], 7 + cols as u64, 1.0);
+        let (style, _) = input(&ctx, &[2 * cols], 11, 0.25);
+
+        let hidden_pair = arena.tensor(vec![rows, cols], DType::BF16).unwrap();
+        let normalized_pair = arena.tensor(vec![rows, cols], DType::BF16).unwrap();
+        native::bias_residual(&ctx, &projection, Some(&bias), &residual, &hidden_pair).unwrap();
+        native::ada_layer_norm(&ctx, &hidden_pair, &style, 1e-5, &normalized_pair).unwrap();
+
+        let hidden_fused = arena.tensor(vec![rows, cols], DType::BF16).unwrap();
+        let normalized_fused = arena.tensor(vec![rows, cols], DType::BF16).unwrap();
+        native::bias_residual_ada_layer_norm(
+            &ctx,
+            &projection,
+            Some(&bias),
+            &residual,
+            &style,
+            1e-5,
+            &hidden_fused,
+            &normalized_fused,
+        )
+        .unwrap();
+
+        assert_eq!(
+            host(&ctx, &hidden_fused),
+            host(&ctx, &hidden_pair),
+            "fused hidden differs at {rows}x{cols}"
+        );
+        assert_eq!(
+            host(&ctx, &normalized_fused),
+            host(&ctx, &normalized_pair),
+            "fused normalized differs at {rows}x{cols}"
+        );
+    }
+
+    // And without a bias, which the DiT's final projection uses.
+    let (projection, _) = input(&ctx, &[41, 1536], 13, 1.0);
+    let (residual, _) = input(&ctx, &[41, 1536], 17, 1.0);
+    let (style, _) = input(&ctx, &[2 * 1536], 19, 0.25);
+    let (h1, n1) = (
+        arena.tensor(vec![41, 1536], DType::BF16).unwrap(),
+        arena.tensor(vec![41, 1536], DType::BF16).unwrap(),
+    );
+    let (h2, n2) = (
+        arena.tensor(vec![41, 1536], DType::BF16).unwrap(),
+        arena.tensor(vec![41, 1536], DType::BF16).unwrap(),
+    );
+    native::bias_residual(&ctx, &projection, None, &residual, &h1).unwrap();
+    native::ada_layer_norm(&ctx, &h1, &style, 1e-5, &n1).unwrap();
+    native::bias_residual_ada_layer_norm(
+        &ctx,
+        &projection,
+        None,
+        &residual,
+        &style,
+        1e-5,
+        &h2,
+        &n2,
+    )
+    .unwrap();
+    assert_eq!(
+        host(&ctx, &h2),
+        host(&ctx, &h1),
+        "fused hidden differs without bias"
+    );
+    assert_eq!(
+        host(&ctx, &n2),
+        host(&ctx, &n1),
+        "fused normalized differs without bias"
+    );
+}
+
+// ── HIP graphs ───────────────────────────────────────────────────────
+
+/// A replayed graph must produce exactly what the eager sequence produced.
+///
+/// Bit-exact, not close: a graph replays the same kernels against the same
+/// addresses, so any difference means it recorded something other than what
+/// ran -- a buffer that moved, a launch parameter that was re-derived. There
+/// is no honest source of drift here, which makes an exact comparison the
+/// right one and a tolerance a way to hide the failure.
+#[test]
+fn a_replayed_graph_reproduces_the_eager_result_exactly() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+
+    // A sequence with a reduction, an elementwise pass and a GEMM, so the
+    // graph holds more than one kind of node.
+    let (a, _) = input(&ctx, &[64, 256], 5, 1.0);
+    let (w, _) = input(&ctx, &[256, 128], 7, 0.05);
+    let (bias, _) = input(&ctx, &[128], 11, 1.0);
+    let (norm_weight, _) = input(&ctx, &[256], 13, 1.0);
+    let run = |out: &apxinf_core::Tensor| -> apxinf_core::Result<()> {
+        let normed = arena.tensor(vec![64, 256], DType::BF16)?;
+        native::rms_norm(&ctx, &a, &norm_weight, 1e-6, &normed)?;
+        native::gemm_bias_activation(
+            &ctx,
+            &normed,
+            &w,
+            Some(&bias),
+            native::Activation::GeluTanh,
+            out,
+        )
+    };
+
+    arena.reset();
+    let eager = arena.tensor(vec![64, 128], DType::BF16).unwrap();
+    run(&eager).unwrap();
+    ctx.synchronize().unwrap();
+    let expected = host(&ctx, &eager);
+
+    // Capture against an arena reset to the same base, so the addresses the
+    // graph records are the addresses the replay uses -- the property a
+    // shape-keyed plan gives the model.
+    arena.reset();
+    let captured = arena.tensor(vec![64, 128], DType::BF16).unwrap();
+    // SAFETY: `run` allocates only from the arena (no device allocation), copies
+    // nothing from host memory, and does not synchronize or download. The arena
+    // was reset to the same base before capture and is reset again before each
+    // replay below.
+    let (graph, ()) =
+        unsafe { apxinf_hip::graph::HipGraph::capture(&ctx, || run(&captured)) }.expect("capture");
+    assert!(
+        graph.nodes() >= 2,
+        "the graph holds {} nodes; the sequence issues a norm and a GEMM, so a count \
+         below two means the capture missed work",
+        graph.nodes()
+    );
+
+    // Clear the output so a replay that records nothing cannot pass by leaving
+    // the captured run's result behind.
+    let zeros = apxinf_core::Tensor::zeros(vec![64, 128], DType::BF16);
+    native::upload(&ctx, &zeros, &captured).unwrap();
+    ctx.synchronize().unwrap();
+    assert_ne!(
+        host(&ctx, &captured),
+        expected,
+        "the output was not cleared"
+    );
+
+    graph.launch(&ctx).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        host(&ctx, &captured),
+        expected,
+        "the replayed graph differs from the eager sequence"
+    );
+
+    // And again, to catch a graph that is only correct once.
+    native::upload(&ctx, &zeros, &captured).unwrap();
+    graph.launch(&ctx).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(host(&ctx, &captured), expected, "the second replay differs");
+}
+
+/// An empty capture must be refused.
+///
+/// It instantiates and replays without error, leaving whatever was in the
+/// output buffer. On the inference after a real one that is the previous
+/// action -- correct-looking, and wrong.
+#[test]
+fn an_empty_capture_is_refused() {
+    let ctx = ctx();
+    // SAFETY: the closure issues nothing at all, which is the case under test.
+    let result = unsafe { apxinf_hip::graph::HipGraph::capture(&ctx, || Ok(())) };
+    assert!(
+        result.is_err(),
+        "a capture that recorded no work was accepted"
+    );
+}
+
+/// A panic inside `work` must not leave the stream in capture mode.
+///
+/// While a capture is open, `hipMalloc` fails device-wide and every launch on
+/// the stream fails, so a leaked capture turns one panicking inference into a
+/// process-wide hazard. The guard ends the capture and resumes the panic; what
+/// is checked here is that afterwards the stream allocates and runs again.
+#[test]
+fn a_panic_inside_capture_still_ends_the_capture() {
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    arena.reset();
+    // Allocated before the capture: nothing inside `work` may allocate.
+    let (a, _) = input(&ctx, &[64, 128], 3, 1.0);
+    let (norm_weight, _) = input(&ctx, &[128], 5, 1.0);
+
+    // SAFETY: the closure allocates only from the arena (no device
+    // allocation), copies nothing from host memory, and does not synchronize
+    // or download. It panics on purpose; the panic path is the case under
+    // test, and the capture is expected to be ended before the panic escapes.
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        apxinf_hip::graph::HipGraph::capture(&ctx, || -> apxinf_core::Result<()> {
+            let out = arena.tensor(vec![64, 128], DType::BF16)?;
+            native::rms_norm(&ctx, &a, &norm_weight, 1e-6, &out)?;
+            panic!("inference code panicked inside the capture");
+        })
+    }));
+    assert!(
+        panic.is_err(),
+        "the panic inside the capture must escape to its caller"
+    );
+
+    // If the capture leaked, the next allocation on the device fails with
+    // "operation not permitted when stream is capturing" and the first launch
+    // on the stream fails; both are checked by issuing normal work again.
+    let out = arena.tensor(vec![64, 128], DType::BF16).unwrap();
+    native::rms_norm(&ctx, &a, &norm_weight, 1e-6, &out).unwrap();
+    host(&ctx, &out);
+}
+

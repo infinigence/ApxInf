@@ -29,6 +29,7 @@ There is no Python `AutoModel` binding or Python PI0.5 network class.
 | `pi05/` | `load.rs` and `config.rs` construct `Pi05ModelRunner`; `model/` holds `Pi05Model<B>`, Blocks and `ModelVariant`; `model_runner/` owns preparation/cache/resources; `weights/` owns host mapping and device representations |
 | `walloss/` | `load.rs`/`config.rs` construct `WallossModelRunner`; `model/` holds `WallossModel`, `ModelVariant` (BF16, dynamic FP8) and `blocks/`; `model_runner/` owns preparation, the plan cache and capture; `weights/` owns host mapping and device representations; `geometry.rs`/`schedule.rs` are shared leaves |
 | `gr00t/` | Existing `vla_runtime.rs`, shared `executor.rs`, precision runtime/executor and weight files, plus a private `backbone/` |
+| `hip_gr00t/` | GR00T N1.7 written directly against HIP: `model/` (`HipGr00tModel<B>`, `ModelVariant`, public stage methods, `blocks/`), `model_runner/` (validation, plan cache, embodiment selection, `prepare.rs` lifecycle), `weights/` (host tree, BF16 device tree, `EmbodimentSource`); registered as `Gr00tN1d7-hip`; [HIP port notes](hip-gr00t.md) |
 | `llama/` | `GeneralLlama` in `general.rs`, family weights and decode graph; legacy `LlamaModel` remains in `model.rs` |
 | `qwen_drive/` | Planning VLA: `load.rs`, `model/mod.rs`, one `model/blocks/bf16.rs`, `model_runner/` execution state/local GDN graphs, and `weights/`; [scope and current limits](qwen-drive-benchmark.md) |
 | `qwen3vl/` | `GeneralQwen3VL` in `general.rs`, text/vision weights, vision computation and family-specific multimodal/decode state |

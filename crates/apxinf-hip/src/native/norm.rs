@@ -73,6 +73,40 @@ pub fn layer_norm(
     })
 }
 
+/// Adaptive LayerNorm: `out = (x - mean) * rsqrt(var + eps) * (1 + scale)
+/// + shift`, per row, with `style` holding `[scale; shift]` as `2 * cols`
+/// values.
+///
+/// GR00T's DiT conditioning: the same per-call modulation
+/// [`ada_rms_norm`] takes, over LayerNorm statistics instead of RMS.
+pub fn ada_layer_norm(
+    ctx: &HipContext,
+    x: &Tensor,
+    style: &Tensor,
+    eps: f32,
+    out: &Tensor,
+) -> Result<()> {
+    let (rows, cols) = rows_cols(x)?;
+    same_shape(x, out)?;
+    style_covers(style, 2 * cols)?;
+    let (px, ps, py) = (
+        bf16_ptr(ctx, x)?,
+        bf16_ptr(ctx, style)?,
+        bf16_ptr(ctx, out)?,
+    );
+    check("ada_layer_norm", unsafe {
+        ffi::apxinf_hip_native_ada_layer_norm(
+            px,
+            ps,
+            py,
+            long(rows)?,
+            int(cols)?,
+            eps,
+            ctx.stream(),
+        )
+    })
+}
+
 /// Adaptive RMSNorm: `out = rms(x) * (1 + scale) + shift`, with `style`'s
 /// first `2 * cols` elements holding scale then shift.
 pub fn ada_rms_norm(
@@ -201,6 +235,55 @@ pub fn bias_residual_layer_norm(
 /// the gate being elements `[2 cols, 3 cols)` of `gate_style`, then
 /// [`ada_rms_norm`] of `hidden` under `norm_style` into `normalized`.
 #[allow(clippy::too_many_arguments)]
+/// `hidden = round(projection + residual (+ bias))`, and `normalized` its
+/// adaptive LayerNorm under `style`.
+///
+/// Replaces [`bias_residual`] followed by [`ada_layer_norm`], which is how a
+/// DiT block ends and the next one begins. Both outputs are produced because
+/// both are used: `hidden` is the residual the next block carries forward.
+///
+/// Numerically identical to the pair, not merely close: `hidden` is rounded to
+/// BF16 and read back before the statistics, because that is what the separate
+/// path does. Summing the unrounded values would be more accurate and would
+/// not match.
+pub fn bias_residual_ada_layer_norm(
+    ctx: &HipContext,
+    projection: &Tensor,
+    bias: Option<&Tensor>,
+    residual: &Tensor,
+    style: &Tensor,
+    eps: f32,
+    hidden: &Tensor,
+    normalized: &Tensor,
+) -> Result<()> {
+    let (rows, cols) = rows_cols(projection)?;
+    for t in [residual, hidden, normalized] {
+        same_shape(projection, t)?;
+    }
+    style_covers(style, 2 * cols)?;
+    let pb = optional_ptr(ctx, bias, cols)?;
+    let (pp, pr) = (bf16_ptr(ctx, projection)?, bf16_ptr(ctx, residual)?);
+    let (ps, ph, pn) = (
+        bf16_ptr(ctx, style)?,
+        bf16_ptr(ctx, hidden)?,
+        bf16_ptr(ctx, normalized)?,
+    );
+    check("bias_residual_ada_layer_norm", unsafe {
+        ffi::apxinf_hip_native_bias_residual_ada_layer_norm(
+            pp,
+            pb,
+            pr,
+            ps,
+            ph,
+            pn,
+            long(rows)?,
+            int(cols)?,
+            eps,
+            ctx.stream(),
+        )
+    })
+}
+
 pub fn ada_gate_residual_rms_norm(
     ctx: &HipContext,
     projection: &Tensor,
