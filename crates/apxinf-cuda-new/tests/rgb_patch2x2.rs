@@ -57,7 +57,8 @@ fn rectangular_rgb_patches_preserve_rounding_and_mutable_graph_inputs() {
         graph.replay().unwrap();
         assert_eq!(read(), expected(values));
     }
-    let wrong_shape = storage
+    let wrong_storage = CudaBuffer::alloc(count, 0).unwrap();
+    let wrong_shape = wrong_storage
         .as_tensor(vec![frames, height / 2, width / 2, 6].into(), DType::BF16)
         .unwrap();
     assert!(rgb_patch2x2(&ctx, &input, &wrong_shape).is_err());
