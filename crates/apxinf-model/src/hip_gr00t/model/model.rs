@@ -12,7 +12,7 @@ use apxinf_hip::HipContext;
 use super::super::config::{Gr00tConfig, Qwen3VLConfig};
 use super::blocks::{Bf16Blocks, Blocks, PreparedBlocks, VisionOutput, WorkspaceRequirements};
 use super::HipGr00tModel;
-use crate::hip_gr00t::Embodiment;
+use super::EmbodimentHandle;
 
 /// One loaded GR00T model, precision-dispatched. The runner holds this and
 /// nothing below it.
@@ -51,7 +51,7 @@ impl ModelVariant {
     /// upload. A request that switches embodiment uploads the new set and
     /// drops the old one's allocations, so alternating costs bandwidth but
     /// does not grow memory.
-    pub fn embodiment(&self, id: usize) -> Result<Embodiment> {
+    pub fn embodiment(&self, id: usize) -> Result<EmbodimentHandle> {
         match self {
             Self::Bf16 { model } => model.embodiment(id),
         }
@@ -90,13 +90,13 @@ impl ModelVariant {
         state: &Tensor,
         noise: &Tensor,
         blocks: &PreparedBlocks,
-        embodiment: &Embodiment,
+        embodiment: &EmbodimentHandle,
     ) -> Result<Tensor> {
         match self {
             Self::Bf16 { model } => {
                 model
                     .blocks
-                    .infer(arena, pixel_values, state, noise, blocks, embodiment)
+                    .infer(arena, pixel_values, state, noise, blocks, embodiment.as_embodiment())
             }
         }
     }
@@ -150,13 +150,13 @@ impl ModelVariant {
         state: &Tensor,
         noise: &Tensor,
         blocks: &PreparedBlocks,
-        embodiment: &Embodiment,
+        embodiment: &EmbodimentHandle,
     ) -> Result<Tensor> {
         match self {
             Self::Bf16 { model } => {
                 model
                     .blocks
-                    .action_stage(arena, adapted, state, noise, &blocks.rows, embodiment)
+                    .action_stage(arena, adapted, state, noise, &blocks.rows, embodiment.as_embodiment())
             }
         }
     }

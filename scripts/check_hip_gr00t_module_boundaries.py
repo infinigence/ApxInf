@@ -33,7 +33,10 @@ ROOT = Path(__file__).resolve().parents[1] / "crates/apxinf-model/src/hip_gr00t"
 RULES = {
     "model": r"\b(model_runner|HipGr00tRunner|HipGr00tPrepared|ExecutionPolicy|VlaRequest|InferenceSpec|HipGraph)\b|apxinf_hip::graph\b",
     "weights": r"\b(HipGr00tModel|ModelVariant|HipGr00tRunner|HipGr00tPrepared)\b|\b(model_runner|model)\s*::|::(?:model_runner|model)\b",
-    "model_runner": r"\bBf16Blocks\b|ModelVariant\s*::|\bweights\s*::",
+    # `Embodiment` is a weights type re-exported at the family root; naming it
+    # here (as `Embodiment` or `Rc<Embodiment>`) is the same dependency the
+    # literal `weights::` path would state, so both spellings are rejected.
+    "model_runner": r"\bBf16Blocks\b|ModelVariant\s*::|\bweights\s*::|\bEmbodiment\b",
 }
 
 # Modules that must stay free of device types: the host checkpoint reader and

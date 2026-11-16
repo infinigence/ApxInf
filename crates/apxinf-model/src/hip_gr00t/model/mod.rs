@@ -32,6 +32,21 @@ pub(in crate::hip_gr00t) fn build_bf16_model(
 use blocks::Blocks;
 use crate::hip_gr00t::weights::Embodiment;
 
+/// The embodiment adapters as the runner sees them: an opaque handle.
+///
+/// [`Embodiment`] is a weights type (device linear layers); the runner caches
+/// and passes it along but has no business constructing or reading it. The
+/// handle keeps that boundary in the type system: only [`model`](self) and the
+/// blocks it dispatches to unwrap it.
+pub struct EmbodimentHandle(Embodiment);
+
+impl EmbodimentHandle {
+    /// The adapters, for the model's own dispatch into the blocks.
+    pub(in crate::hip_gr00t::model) fn as_embodiment(&self) -> &Embodiment {
+        &self.0
+    }
+}
+
 /// The loaded model over a block implementation `B`.
 ///
 /// Generic in the blocks so precision variants construct and dispatch inside
@@ -62,8 +77,12 @@ impl<B: Blocks> HipGr00tModel<B> {
     /// drops the old one's allocations, so alternating costs bandwidth but
     /// does not grow memory. Caching the selection is runner policy, not
     /// model state, which is why this takes no cache.
-    pub(in crate::hip_gr00t) fn embodiment(&self, id: usize) -> Result<Embodiment> {
+    ///
+    /// Returns [`EmbodimentHandle`]: the runner passes the adapters along,
+    /// and only the model and its blocks read them.
+    pub(in crate::hip_gr00t) fn embodiment(&self, id: usize) -> Result<EmbodimentHandle> {
         self.embodiment_source
             .select(id, self.blocks.config(), self.blocks.context())
+            .map(EmbodimentHandle)
     }
 }

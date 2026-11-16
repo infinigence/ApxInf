@@ -231,10 +231,6 @@ pub fn bias_residual_layer_norm(
     })
 }
 
-/// The action expert's gated residual: `hidden = residual + projection * gate`,
-/// the gate being elements `[2 cols, 3 cols)` of `gate_style`, then
-/// [`ada_rms_norm`] of `hidden` under `norm_style` into `normalized`.
-#[allow(clippy::too_many_arguments)]
 /// `hidden = round(projection + residual (+ bias))`, and `normalized` its
 /// adaptive LayerNorm under `style`.
 ///
@@ -284,6 +280,10 @@ pub fn bias_residual_ada_layer_norm(
     })
 }
 
+/// The action expert's gated residual: `hidden = residual + projection * gate`,
+/// the gate being elements `[2 cols, 3 cols)` of `gate_style`, then
+/// [`ada_rms_norm`] of `hidden` under `norm_style` into `normalized`.
+#[allow(clippy::too_many_arguments)]
 pub fn ada_gate_residual_rms_norm(
     ctx: &HipContext,
     projection: &Tensor,

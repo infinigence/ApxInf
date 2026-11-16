@@ -23,7 +23,7 @@ use half::bf16;
 
 use crate::hip_gr00t::model::token_groups::{build_backbone_token_groups, Gr00tBackboneTokenGroups};
 use crate::hip_gr00t::model::ModelVariant;
-use crate::hip_gr00t::Embodiment;
+use crate::hip_gr00t::model::EmbodimentHandle;
 use crate::vla::{
     Action, ExecutionPolicy, InferenceSpec, InitialLatent,
     PreparedInference, VisionObservation, VlaContract, VlaRequest, VlaRuntime,
@@ -57,7 +57,7 @@ pub struct HipGr00tRunner {
     /// (the model owns no request state): one deployment uses one embodiment,
     /// so this is normally a single upload, and a request that switches
     /// embodiment uploads the new set and drops the old one's allocations.
-    embodiment: RefCell<Option<(usize, Rc<Embodiment>)>>,
+    embodiment: RefCell<Option<(usize, Rc<EmbodimentHandle>)>>,
 }
 
 impl HipGr00tRunner {
@@ -70,7 +70,7 @@ impl HipGr00tRunner {
     }
 
     /// The requested embodiment's adapters, from the runner's cache.
-    fn embodiment(&self, id: usize) -> Result<Rc<Embodiment>> {
+    fn embodiment(&self, id: usize) -> Result<Rc<EmbodimentHandle>> {
         if let Some((cached, weights)) = self.embodiment.borrow().as_ref() {
             if *cached == id {
                 return Ok(Rc::clone(weights));

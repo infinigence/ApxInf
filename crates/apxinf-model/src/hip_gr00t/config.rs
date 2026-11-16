@@ -682,15 +682,14 @@ impl Qwen3VLConfig {
         };
 
         let text = Qwen3VLTextConfig {
-            hidden_size: tc["hidden_size"].as_u64().unwrap_or(2048) as usize,
-            intermediate_size: tc["intermediate_size"].as_u64().unwrap_or(6144) as usize,
-            n_layers: tc["num_hidden_layers"].as_u64().unwrap_or(28) as usize,
-            n_heads: tc["num_attention_heads"].as_u64().unwrap_or(16) as usize,
-            n_kv_heads: tc["num_key_value_heads"].as_u64().unwrap_or(8) as usize,
-            head_dim: tc["head_dim"].as_u64().unwrap_or(128) as usize,
-            vocab_size: tc["vocab_size"].as_u64().unwrap_or(151936) as usize,
-            max_position_embeddings: tc["max_position_embeddings"].as_u64().unwrap_or(262144)
-                as usize,
+            hidden_size: optional_u64(tc, "hidden_size", 2048)? as usize,
+            intermediate_size: optional_u64(tc, "intermediate_size", 6144)? as usize,
+            n_layers: optional_u64(tc, "num_hidden_layers", 28)? as usize,
+            n_heads: optional_u64(tc, "num_attention_heads", 16)? as usize,
+            n_kv_heads: optional_u64(tc, "num_key_value_heads", 8)? as usize,
+            head_dim: optional_u64(tc, "head_dim", 128)? as usize,
+            vocab_size: optional_u64(tc, "vocab_size", 151936)? as usize,
+            max_position_embeddings: optional_u64(tc, "max_position_embeddings", 262144)? as usize,
             rms_norm_eps: optional_f64(tc, "rms_norm_eps", 1e-6)? as f32,
             rope_theta: optional_f64(tc, "rope_theta", 5_000_000.0)? as f32,
             mrope_section,
@@ -719,22 +718,19 @@ impl Qwen3VLConfig {
             }
         };
         let vision = Qwen3VLVisionConfig {
-            depth: vc["depth"].as_u64().unwrap_or(24) as usize,
-            hidden_size: vc["hidden_size"].as_u64().unwrap_or(1024) as usize,
-            intermediate_size: vc["intermediate_size"].as_u64().unwrap_or(4096) as usize,
-            num_heads: vc["num_heads"].as_u64().unwrap_or(16) as usize,
-            head_dim: vc
-                .get("head_dim")
-                .and_then(|x| x.as_u64())
-                .map(|x| x as usize)
-                .unwrap_or(0),
-            patch_size: vc["patch_size"].as_u64().unwrap_or(16) as usize,
-            temporal_patch_size: vc["temporal_patch_size"].as_u64().unwrap_or(2) as usize,
-            in_channels: vc["in_channels"].as_u64().unwrap_or(3) as usize,
-            spatial_merge_size: vc["spatial_merge_size"].as_u64().unwrap_or(2) as usize,
-            num_position_embeddings: vc["num_position_embeddings"].as_u64().unwrap_or(2304)
-                as usize,
-            out_hidden_size: vc["out_hidden_size"].as_u64().unwrap_or(2048) as usize,
+            depth: optional_u64(vc, "depth", 24)? as usize,
+            hidden_size: optional_u64(vc, "hidden_size", 1024)? as usize,
+            intermediate_size: optional_u64(vc, "intermediate_size", 4096)? as usize,
+            num_heads: optional_u64(vc, "num_heads", 16)? as usize,
+            // Absent means "derive it" (0 is the sentinel); present but not
+            // an integer is a malformed config and must not fall back.
+            head_dim: optional_u64(vc, "head_dim", 0)? as usize,
+            patch_size: optional_u64(vc, "patch_size", 16)? as usize,
+            temporal_patch_size: optional_u64(vc, "temporal_patch_size", 2)? as usize,
+            in_channels: optional_u64(vc, "in_channels", 3)? as usize,
+            spatial_merge_size: optional_u64(vc, "spatial_merge_size", 2)? as usize,
+            num_position_embeddings: optional_u64(vc, "num_position_embeddings", 2304)? as usize,
+            out_hidden_size: optional_u64(vc, "out_hidden_size", 2048)? as usize,
             deepstack_visual_indexes: dvi,
             hidden_act: optional_str(vc, "hidden_act", "gelu_pytorch_tanh")?.to_owned(),
         };
@@ -742,7 +738,7 @@ impl Qwen3VLConfig {
         Ok(Qwen3VLConfig {
             text,
             vision,
-            image_token_id: v["image_token_id"].as_u64().unwrap_or(151655) as u32,
+            image_token_id: optional_u64(&v, "image_token_id", 151655)? as u32,
         })
     }
 }
@@ -881,6 +877,12 @@ mod tests {
             ("null rms_norm_eps", "\"rms_norm_eps\": 1e-6", "\"rms_norm_eps\": null"),
             ("null mrope_section entry", "\"mrope_section\": [24, 20, 20]", "\"mrope_section\": [24, null, 20]"),
             ("null mrope_interleaved", "\"mrope_interleaved\": true", "\"mrope_interleaved\": null"),
+            // Integer fields: a present-but-malformed value (string, float,
+            // null) must error, not silently parse as the default.
+            ("string hidden_size", "\"hidden_size\": 2048", "\"hidden_size\": \"big\""),
+            ("float num_hidden_layers", "\"num_hidden_layers\": 28", "\"num_hidden_layers\": 28.5"),
+            ("null vocab_size", "\"vocab_size\": 151936", "\"vocab_size\": null"),
+            ("string image_token_id", "\"image_token_id\": 151655", "\"image_token_id\": \"151655\""),
         ] {
             let raw = MIN_CONFIG.replace(target, patch);
             let error = Qwen3VLConfig::from_json_str(&raw)

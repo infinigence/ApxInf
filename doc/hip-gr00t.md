@@ -43,6 +43,14 @@ cargo run -p apxinf-model --features hip --release --example hip_gr00t_stage_dum
 APXINF_GR00T_CHECKPOINT=<dir> APXINF_GR00T_FIXTURE=<dir> \
 APXINF_GR00T_REFERENCE=<npy> \
 cargo test -p apxinf-model --features hip --test hip_gr00t_acceptance -- --test-threads=1
+
+# GEMM provider arms: the provider is process-wide and read once, so the
+# hipBLASLt numeric test and the forced-hipBLAS dispatch test skip themselves
+# unless the suite is invoked with their provider. All three arms must run
+# before a GEMM-path change is called tested (see the crate README).
+cargo test -p apxinf-hip
+APXINF_HIP_GEMM_PROVIDER=hipblas cargo test -p apxinf-hip   # forced-baseline arm
+APXINF_HIP_GEMM_PROVIDER=lt cargo test -p apxinf-hip        # hipBLASLt arm
 ```
 
 Python: `AutoPolicy` → GR00T policy → `apxinf.ModelRunner` with a

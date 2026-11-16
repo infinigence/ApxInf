@@ -18,7 +18,7 @@ use apxinf_hip::native::{self, HipArena};
 
 use crate::hip_gr00t::model::blocks::PreparedBlocks;
 use crate::hip_gr00t::model::ModelVariant;
-use crate::hip_gr00t::Embodiment;
+use crate::hip_gr00t::model::EmbodimentHandle;
 use crate::vla::{Action, ExecutionMode, ExecutionPolicy, InferenceSpec, PreparationStatus, PreparedInference, VlaRequest};
 
 use super::runner::{Inputs, PlanKey};
@@ -39,7 +39,7 @@ pub struct HipGr00tPrepared {
     /// cross-attention row groups. An opaque handle here -- the runner never
     /// reaches the block internals.
     blocks: PreparedBlocks,
-    embodiment: Rc<Embodiment>,
+    embodiment: Rc<EmbodimentHandle>,
     /// The forward, captured as one launch, and the output tensor it writes.
     ///
     /// Holding the output tensor alongside the graph is what makes the replay
@@ -67,7 +67,7 @@ impl HipGr00tPrepared {
         model: Rc<ModelVariant>,
         key: PlanKey,
         inputs: &Inputs,
-        embodiment: Rc<Embodiment>,
+        embodiment: Rc<EmbodimentHandle>,
         policy: ExecutionPolicy,
     ) -> Result<Self> {
         let mut prepared = Self::allocate(model, key, &inputs.token_ids, embodiment)?;
@@ -110,7 +110,7 @@ impl HipGr00tPrepared {
         model: Rc<ModelVariant>,
         key: PlanKey,
         token_ids: &[u32],
-        embodiment: Rc<Embodiment>,
+        embodiment: Rc<EmbodimentHandle>,
     ) -> Result<Self> {
         let config = model.config();
         let backbone = model.backbone_config();
