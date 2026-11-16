@@ -1,6 +1,8 @@
 # Core ML and Apple Neural Engine execution (proposal)
 
-Status: design under review; no Core ML code is merged. On 2026-10-19 the
+Status: design under review. The `apxinf-coreml` writer and optional native
+runtime (step 2 of the sequence below) are implemented; no family composition
+uses them and no path is qualified. On 2026-10-19 the
 fork operator accepted the fixed-profile Clef host-handoff scope
 below, conditional on completing every qualification gate. This decision does
 not approve unrelated interfaces, qualify an implementation or merge a PR.
@@ -10,9 +12,10 @@ warm-readiness requirements are unchanged.
 
 These fork decisions do not establish upstream maintainer approval.
 The upstream host-handoff proposal remains under review. Except for explicitly
-identified historical observations, the writer, runtime and qualification tests
-below are proposed requirements, not implemented capabilities or passing tests
-in this documentation-only change.
+identified historical observations, the qualification tests and gates below are
+proposed requirements, not passing tests. The
+[crate README](../crates/apxinf-coreml/README.md) describes what the writer and
+runtime implement.
 
 ## Motivation
 
@@ -328,7 +331,7 @@ bit-equal to the GPU and can differ between ANE generations.
   load takes seconds per layer.
 - Should first-load compilation be an explicit preparation step rather than
   part of loading?
-- The implementation must add Linux writer tests and native-feature isolation
-  checks; this documentation-only PR adds no crate or CI coverage. Who owns the
+- `apxinf-coreml` has portable writer tests and builds inert without `native`,
+  but no CI workflow runs them yet. Who owns the
   versioned macOS placement and complete-request qualification evidence until a
   macOS runner exists? A manual smoke test alone cannot qualify it.
