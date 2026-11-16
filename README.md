@@ -527,6 +527,10 @@ format, native LIBERO sampling, and output options.
 
 ## LIBERO evaluation
 
+On native Windows with CUDA, build and run the closed loop with `scripts\build-win.ps1 -Wheel -Libero`
+and `scripts\run-libero-win.ps1`; see [Windows + CUDA](doc/windows-cuda.md#libero-closed-loop).
+The rest of this section is the platform-independent flow.
+
 ### Get the checkpoint
 
 The published accuracy is `pi05_libero_base`, π0.5 fine-tuned on LIBERO — an

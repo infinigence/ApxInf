@@ -6,6 +6,9 @@
   Default      : cargo build of apxinf.exe (--features cuda-no-nvtx).
   -Wheel       : additionally create a conda env, build the apxinf_py CUDA wheel, install it
                  together with the python/apxinf frontend, and import-check it.
+  -Libero      : (needs -Wheel) additionally install the pinned LIBERO simulator dependencies
+                 (scripts\requirements-libero-win.txt) and clone LIBERO at -LiberoRev into -LiberoDir.
+                 Then run the closed loop with scripts\run-libero-win.ps1.
   Details and troubleshooting: doc/windows-cuda.md
 
   Run from a normal PowerShell (not a VS developer prompt):
@@ -18,6 +21,9 @@ param(
   [string]$CudaPath  = $(if ($env:CUDA_PATH) { $env:CUDA_PATH } else { 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0' }),
   [string]$CudaArch  = '',                # default: derived from nvidia-smi (12.0 -> sm_120)
   [switch]$Wheel,
+  [switch]$Libero,                        # with -Wheel: also install the LIBERO simulator (pinned) for closed-loop eval
+  [string]$LiberoDir = 'C:\apx-libero',   # where LIBERO is cloned (keep short)
+  [string]$LiberoRev = '8f1084e3132a39270c3a13ebe37270a43ece2a01',
   [string]$EnvName   = 'apxinf-win',
   [string]$Conda     = '',
   [int]$Jobs         = 2,                 # nvcc / cargo parallelism
@@ -43,6 +49,7 @@ $vc = Get-ChildItem "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022", "$e
 Need ($null -ne $vc) 'Visual Studio 2022 (Build Tools) with "Desktop development with C++": MSVC v143, Windows SDK, C++ CMake tools'
 Need ($null -ne (Get-Command cargo -ErrorAction SilentlyContinue)) 'Rust (rustup, stable-x86_64-pc-windows-msvc)'
 Need ($null -ne (Get-Command git -ErrorAction SilentlyContinue)) 'git on PATH (build.rs runs "git apply" to patch FlashAttention2)'
+Need ($Wheel -or -not $Libero) '-Libero requires -Wheel (the LIBERO packages go into the conda env)'
 Need (Test-Path "$Repo\Cargo.toml") "not an ApxInf checkout: $Repo"
 if ($TargetDir.Length -gt 14) { Write-Warning "TargetDir '$TargetDir' is long; sentencepiece/CMake may hit the 260-char path limit. Use e.g. C:\apx-target." }
 if (-not $CudaArch) {
@@ -163,3 +170,58 @@ Set-Content "$sp\apxinf_cuda_dll.pth" $line -Encoding ascii
 $ver = & $py -c "import apxinf_py;print(apxinf_py.__version__)"
 if ($LASTEXITCODE -ne 0) { throw 'import apxinf_py failed' }
 Write-Host "`nWHEEL OK: apxinf_py $ver   env: $envDir   wheel: $($whl.FullName)" -ForegroundColor Green
+
+# ------------------------------------------------------------ LIBERO simulator
+if ($Libero) {
+  Step 'LIBERO simulator dependencies (pinned)'
+  Run $py (@('-m', 'pip', 'install') + $pipIdx + @('-r', "$Repo\scripts\requirements-libero-win.txt"))
+
+  Step "LIBERO source -> $LiberoDir @ $LiberoRev"
+  # GitHub connections are flaky on some networks: retry, and clear a half-written clone first.
+  for ($try = 1; -not (Test-Path "$LiberoDir\.git") -and $try -le 4; $try++) {
+    if (Test-Path $LiberoDir) { Remove-Item -Recurse -Force $LiberoDir }
+    & git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git $LiberoDir
+    if ($LASTEXITCODE -ne 0) { Write-Warning "git clone failed (attempt $try/4)"; Start-Sleep 5 }
+  }
+  Need (Test-Path "$LiberoDir\.git") "could not clone LIBERO into $LiberoDir (check access to github.com)"
+  Run git @('-C', $LiberoDir, 'checkout', '--quiet', $LiberoRev)
+  Need (Test-Path "$LiberoDir\libero\libero\assets\scenes") "LIBERO assets missing under $LiberoDir\libero\libero\assets"
+  # LIBERO's setup.py does not produce an importable editable install, and its requirements.txt pins
+  # LIBERO's setup.py does not produce an importable editable install, and its requirements.txt pins
+  # numpy==1.22.4 (the pinned set above is what is tested). So put the checkout on sys.path with a .pth
+  # (its outer libero\ has no __init__.py: libero.libero resolves as a namespace package).
+  Need (Test-Path "$LiberoDir\libero\libero\__init__.py") "unexpected LIBERO layout under $LiberoDir"
+  Set-Content "$sp\apxinf_libero_src.pth" $LiberoDir -Encoding ascii
+
+  # robosuite 1.4.1 on Windows loads robosuite\utils\mujoco.dll with ctypes and does not look in the
+  # mujoco package, so copy the DLL that the pinned mujoco wheel ships.
+  Need (Test-Path "$sp\mujoco\mujoco.dll") "mujoco.dll missing from the mujoco package in $sp"
+  Copy-Item "$sp\mujoco\mujoco.dll" "$sp\robosuite\utils\mujoco.dll" -Force
+  # robosuite forces MUJOCO_GL=egl while MUJOCO_GPU_RENDERING is on (the default), which is invalid on
+  # Windows; its macros_private.py hook turns that off so MUJOCO_GL=glfw is honoured.
+  Set-Content "$sp\robosuite\macros_private.py" 'MUJOCO_GPU_RENDERING = False' -Encoding ascii
+
+  # libero prompts interactively for its config on first import; point it at a generated file instead.
+  $cfgDir = Join-Path $LiberoDir '_cfg'; New-Item -ItemType Directory -Force $cfgDir | Out-Null
+  $ls = ($LiberoDir -replace '\\', '/')
+  @"
+assets: $ls/libero/libero/assets
+bddl_files: $ls/libero/libero/bddl_files
+benchmark_root: $ls/libero/libero
+datasets: $ls/libero/datasets
+init_states: $ls/libero/libero/init_files
+"@ | Set-Content "$cfgDir\config.yaml" -Encoding ascii
+  $env:LIBERO_CONFIG_PATH = $cfgDir
+  $env:MUJOCO_GL = 'glfw'
+  # (a temp file, not -c: Windows PowerShell 5.1 strips double quotes from native-command arguments)
+  $chk = Join-Path $env:TEMP 'apx_libero_check.py'
+  @'
+from libero.libero import benchmark
+from libero.libero.envs import OffScreenRenderEnv  # imports bddl, robosuite, mujoco
+import robosuite, mujoco
+names = benchmark.get_benchmark_dict()["libero_10"]().get_task_names()
+print("libero_10 tasks:", len(names))
+'@ | Set-Content $chk -Encoding ascii
+  Run $py @($chk)
+  Write-Host "`nLIBERO OK: $LiberoDir   next: scripts\run-libero-win.ps1 -ModelDir <path-to-pi05_libero_base>" -ForegroundColor Green
+}
