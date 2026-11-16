@@ -219,12 +219,14 @@ until their embedded launch state supports external rebinding.
 Tuning candidates use private scratch. Final prepared executions borrow runner
 storage after selection and retain the actual block for graph lifetime.
 Repeated `ExecutionSession::prepare` reuses matching cached executions and
-retires bindings that have been unused for more than one traversal, so a
-variable-length eager traversal (an early decode stop) does not evict warm
-executions; captured graphs retain their own executions. Changing eager IO
-addresses cannot accumulate obsolete executions in that cache. Stable eager
-arena bindings remain cache hits across repeated preparation; this reuse does
-not require enabling CUDA Graphs.
+retains them until session drop by default. Variable-length eager runners such
+as PI0FAST keep later decode executions warm across multiple early stops.
+Runner authors may opt in with `ExecutionSession::retire_stale_bindings()` before
+cloning the session when changing bindings should be discarded: executions
+unused for two prepare traversals are retired after a successful traversal.
+Captured graphs retain their own executions and storage. Retirement is separate
+from provider scratch sharing; stable eager arena bindings remain cache hits
+across repeated preparation without enabling CUDA Graphs.
 
 Kernel weight layout is an explicit property of each native `Implementation`
 registry entry. Implementation IDs are local to a semantic registry and must

@@ -405,6 +405,10 @@ and the segmented FA2 LSE buffer remain private. Candidate tuning uses isolated
 temporary allocations. If the shared block cannot be allocated for lack of
 device memory, the execution keeps the private scratch its native prepare
 already allocated instead of failing. A new `prepare` traversal reuses matching
-cached executions and retires bindings that have been unused for more than one
-traversal (so a variable-length eager traversal does not evict warm executions);
-old captured graphs retain the executions and buffers they actually reference.
+cached executions. Sessions retain them until drop by default, allowing
+variable-length eager runners such as PI0FAST to reuse later decode steps after
+multiple shorter requests. Runner authors can opt in with
+`ExecutionSession::retire_stale_bindings()` before cloning the session; then
+bindings unused for two prepare traversals are retired after a successful
+traversal. This policy does not change provider scratch sharing. Old captured
+graphs retain the executions and buffers they actually reference.

@@ -19,11 +19,9 @@ const WORKSPACE_ALIGNMENT: usize = 256;
 /// alignment the native bind path enforces.
 const PROVIDER_SCRATCH_GRANULARITY: usize = 1 << 20;
 
-/// An execution stays cached until it has been unused for this many prepare
-/// traversals. Tolerating one missed traversal keeps warm executions alive
-/// across a variable-length eager traversal (for example an early decode stop
-/// that skips later steps) while still retiring bindings whose IO addresses no
-/// longer recur within a bounded number of generations.
+/// For sessions that opt in to stale binding retirement, an execution is
+/// removed after this many unused prepare traversals. One missed traversal is
+/// tolerated; variable-length runners should leave retirement disabled.
 pub(crate) const STALE_GENERATIONS: u64 = 2;
 
 #[derive(Default)]
@@ -253,6 +251,7 @@ struct ExecutionSessionInner {
     scratch: ProviderWorkspace,
     caches: RefCell<HashMap<TypeId, Box<dyn ExecutionCache>>>,
     generation: Cell<u64>,
+    retire_stale_bindings: bool,
     prepared_sequence: RefCell<Vec<usize>>,
     sequence_cursor: Cell<usize>,
 }
@@ -297,6 +296,7 @@ impl ExecutionSessionInner {
 /// Owns reusable prepared resources for one eager/capture/replay session.
 /// Only operators with real prepare state (currently GEMM and Attention) use
 /// the typed cache and prepared sequence. Stateless operators launch directly.
+/// Cached executions are retained until the session is dropped by default.
 #[derive(Clone)]
 pub struct ExecutionSession {
     inner: Rc<ExecutionSessionInner>,
@@ -314,6 +314,7 @@ impl ExecutionSession {
                 scratch,
                 caches: RefCell::new(HashMap::new()),
                 generation: Cell::new(0),
+                retire_stale_bindings: false,
                 prepared_sequence: RefCell::new(Vec::new()),
                 sequence_cursor: Cell::new(0),
             }),
@@ -322,6 +323,24 @@ impl ExecutionSession {
 
     pub fn with_capacity(capacity_bytes: usize, device: usize) -> Result<Self> {
         GraphWorkspace::new(capacity_bytes, device).map(Self::new)
+    }
+
+    /// Opt in to retiring executions after two unused prepare traversals.
+    ///
+    /// Runner authors should enable this only when obsolete bindings should be
+    /// discarded as the session is reused. Leave it disabled for variable-length
+    /// decode: later steps may be needed again after several shorter requests.
+    /// This does not change activation workspace or provider scratch sharing;
+    /// captured graphs retain the executions and storage they reference.
+    /// Configure the session before cloning it.
+    ///
+    /// # Panics
+    /// Panics if the session has already been cloned and is still shared.
+    pub fn retire_stale_bindings(mut self) -> Self {
+        Rc::get_mut(&mut self.inner)
+            .expect("configure stale binding retirement before cloning the session")
+            .retire_stale_bindings = true;
+        self
     }
 
     pub fn workspace(&self) -> &GraphWorkspace {
@@ -401,8 +420,7 @@ fn with_session_phase<T>(
         }
         session.inner.workspace.reset()?;
         if prepare {
-            // Stable arena bindings must remain cache hits across eager requests.
-            // Retire only entries not used by this traversal, after it completes.
+            // Record a new traversal while preserving matching cached bindings.
             let generation = session
                 .inner
                 .generation
@@ -427,7 +445,7 @@ fn with_session_phase<T>(
         // Retire only after a successful traversal. A partial traversal that
         // errors out has not established a complete set of used bindings, so
         // retiring then would drop executions the next request still needs.
-        if prepare && result.is_ok() {
+        if prepare && result.is_ok() && session.inner.retire_stale_bindings {
             for cache in session.inner.caches.borrow_mut().values_mut() {
                 cache.retire_unused(session.inner.generation.get());
             }
@@ -661,8 +679,8 @@ pub(crate) fn output_buffer_tail_zeroed(
 /// stream uses its own block, rounded up to [`PROVIDER_SCRATCH_GRANULARITY`] so
 /// per-block overhead stays bounded instead of doubling at power-of-two
 /// boundaries. A block is replaced only when it is too small; executions retain
-/// their actual block, so growth never invalidates old graphs, and generation
-/// retirement bounds how many replaced blocks stay referenced at once.
+/// their actual block, so growth never invalidates old graphs. Opt-in execution
+/// retirement can release obsolete bindings; graphs retain their own references.
 ///
 /// Callers reach this after native prepare already allocated working private
 /// scratch, so sharing is an optimization rather than a requirement. If the

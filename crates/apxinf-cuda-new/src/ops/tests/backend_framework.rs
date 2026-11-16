@@ -2960,7 +2960,9 @@ fn execution_session_distinguishes_selection_policies() {
 #[test]
 fn repeated_prepare_retires_eager_bindings_and_preserves_captured_graph() {
     let ctx = CudaContext::new(0).unwrap();
-    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0)
+        .unwrap()
+        .retire_stale_bindings();
     let a = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
     let b = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
     let mut old_output = tensor(0, vec![2, 2], &[0.0; 4]);
@@ -3066,7 +3068,9 @@ fn attention_session_shares_scratch_binds_and_replays() {
 #[test]
 fn failed_prepare_traversal_keeps_untouched_executions() {
     let ctx = CudaContext::new(0).unwrap();
-    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0)
+        .unwrap()
+        .retire_stale_bindings();
     let a2 = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
     let b2 = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
     let a3 = tensor(0, vec![3, 3], &[1.0; 9]);
@@ -3124,7 +3128,9 @@ fn failed_prepare_traversal_keeps_untouched_executions() {
 #[test]
 fn temporarily_unused_execution_survives_one_generation() {
     let ctx = CudaContext::new(0).unwrap();
-    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0)
+        .unwrap()
+        .retire_stale_bindings();
     let a2 = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
     let b2 = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
     let a3 = tensor(0, vec![3, 3], &[1.0; 9]);
@@ -3222,4 +3228,58 @@ fn shared_scratch_oom_keeps_private_scratch_and_enqueues() {
     graph.replay().unwrap();
     ctx.synchronize().unwrap();
     assert_eq!(values(&output), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn default_session_reuses_execution_after_many_short_traversals() {
+    let ctx = CudaContext::new(0).unwrap();
+    let session = ExecutionSession::with_capacity(4096, 0).unwrap();
+    let a2 = tensor(0, vec![2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let b2 = tensor(0, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]);
+    let a3 = tensor(0, vec![3, 3], &[1.0; 9]);
+    let b3 = tensor(
+        0,
+        vec![3, 3],
+        &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    );
+    let mut out2 = tensor(0, vec![2, 2], &[0.0; 4]);
+    let mut out3 = tensor(0, vec![3, 3], &[0.0; 9]);
+    let run2 = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a2, &b2, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+    let run3 = |out: &mut Tensor| {
+        let mut args = GemmArgs::new(&a3, &b3, out);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(String::new());
+        gemm(&ctx, args)
+    };
+
+    // Generation 1: prepare both shapes.
+    session
+        .prepare(|| -> apxinf_core::Result<()> {
+            run2(&mut out2)?;
+            run3(&mut out3)
+        })
+        .unwrap();
+
+    // Repeated early stops exceed the opt-in retirement window. The default
+    // policy must retain the unvisited execution until it is needed again.
+    for _ in 0..8 {
+        session.prepare(|| run2(&mut out2)).unwrap();
+    }
+
+    // A long traversal needs the 3x3 GEMM again and must hit the
+    // cache rather than recreate the execution.
+    super::execution::reset_execution_create_count();
+    session.prepare(|| run3(&mut out3)).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        super::execution::execution_create_count(),
+        0,
+        "default session recreated an execution after shorter traversals"
+    );
+    assert_eq!(values(&out3), vec![1.0; 9]);
 }
