@@ -287,7 +287,8 @@ mod tests {
     fn package() -> Package {
         let mut builder = ProgramBuilder::new();
         let input = builder.input("x", &[1]).unwrap();
-        builder.finish(&[&input]).unwrap()
+        let output = builder.identity(&input, None).unwrap();
+        builder.finish(&[&output]).unwrap()
     }
 
     fn write_compiled(target: &Path) -> Result<()> {

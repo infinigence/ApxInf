@@ -18,14 +18,16 @@ Other operations are rejected until added with a test. Operations and their
 constants are named as coremltools 9.0 `mb.program` names them.
 `input` returns `Result<Var>` and rejects zero or unrepresentable dimensions
 and overflowing element counts before adding the input. Weight and operation
-shape checks also precede builder mutation. Scalar shapes (`[]`) remain valid;
-`split` sizes and axes must additionally fit their INT32 parameters.
+shape checks also precede builder mutation. Function inputs and outputs need
+rank >= 1; rank-0 shapes are only valid for internal values. `split` sizes
+and axes must additionally fit their INT32 parameters.
 
 `Var` values belong to the builder that created them, and every input,
 constant and operation output has a unique nonempty name. Operations reject a
-value from another builder, and `finish` rejects foreign, undefined or
-duplicate outputs. `tanh`, `abs` and `identity` also return `Result<Var>` so
-those checks run before an invalid operation enters the program.
+value from another builder, and `finish` rejects foreign, undefined, duplicate,
+rank-0 or passthrough outputs, as well as a program with no operations.
+`tanh`, `abs` and `identity` also return `Result<Var>` so those checks run
+before an invalid operation enters the program.
 
 `Package::write` writes the `.mlpackage` directory: a fixed `Manifest.json`,
 `model.mlmodel` and a MILBlob version 2 `weight.bin`. The protobuf subset in
