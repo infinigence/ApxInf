@@ -265,6 +265,7 @@ pub(crate) enum Semantic {
     GemmBias = 3,
     GemmBiasResidual = 4,
     GemmSwiGlu = 5,
+    GemmGeluExact = 6,
 }
 
 #[cfg(test)]
@@ -278,6 +279,7 @@ impl Semantic {
         Self::GemmGeglu,
         Self::GemmBiasResidual,
         Self::GemmSwiGlu,
+        Self::GemmGeluExact,
     ];
 
     /// Stable identifier used by the operator catalog's machine-readable
@@ -291,6 +293,7 @@ impl Semantic {
             Self::GemmGeglu => "gemm_geglu",
             Self::GemmBiasResidual => "gemm_bias_residual",
             Self::GemmSwiGlu => "gemm_swiglu",
+            Self::GemmGeluExact => "gemm_gelu_exact",
         }
     }
 }
@@ -422,6 +425,19 @@ fn normalize_fused<'a>(
     bias: Option<&Tensor>,
     residual: Option<&Tensor>,
 ) -> Result<Normalized> {
+    if semantic == Semantic::GemmGeluExact
+        && (args.a.dtype() != DType::BF16
+            || args.b.dtype() != DType::BF16
+            || args.out.dtype() != DType::BF16
+            || !matches!(args.quantization, GemmQuantization::None)
+            || args.weight_layout != GemmWeightLayout::Kn
+            || args.alpha != 1.0
+            || args.output_scale != 1.0)
+    {
+        return Err(invalid(
+            "exact staged GELU GEMM requires BF16, KN weights, no quantization and unit scales",
+        ));
+    }
     let a_shape = args.a.shape().dims();
     let b_shape = args.b.shape().dims();
     if a_shape.len() != 2 || b_shape.len() != 2 {

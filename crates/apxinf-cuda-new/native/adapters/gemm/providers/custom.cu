@@ -221,6 +221,21 @@ cudaError_t launch_postprocess(const Spec& spec,
                                CommonResources& resources,
                                const apxinf_gemm_bindings_t& bindings,
                                void* projection) {
+  if (spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT) {
+    const int64_t count = spec.m * spec.n;
+    const auto stream = static_cast<cudaStream_t>(bindings.stream);
+    if (count % 4 == 0 && reinterpret_cast<uintptr_t>(projection) % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(bindings.output) % 8 == 0) {
+      bias_activation_bf16_packed4_kernel<<<std::min<int64_t>((count / 4 + 255) / 256, 4096), 256, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(projection), nullptr,
+          static_cast<__nv_bfloat16*>(bindings.output), count / 4, spec.n, 3);
+    } else {
+      bias_activation_bf16_kernel<<<std::min<int64_t>((count + 255) / 256, 4096), 256, 0, stream>>>(
+          static_cast<const __nv_bfloat16*>(projection), nullptr,
+          static_cast<__nv_bfloat16*>(bindings.output), count, spec.n, 3);
+    }
+    return cudaGetLastError();
+  }
   if (resources.projection == nullptr) {
     return cudaSuccess;
   }

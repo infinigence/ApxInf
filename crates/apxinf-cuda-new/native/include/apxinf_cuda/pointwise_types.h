@@ -29,6 +29,7 @@ typedef enum {
   APXINF_POINTWISE_SEMANTIC_SWIGLU = 3,
   APXINF_POINTWISE_SEMANTIC_ADD_INTO = 4,
   APXINF_POINTWISE_SEMANTIC_SWIGLU_ROWWISE_E4M3 = 5,
+  APXINF_POINTWISE_SEMANTIC_MULTIPLY = 6,
 } apxinf_pointwise_semantic_t;
 
 /* Stable pointwise activation ABI encoding. */

@@ -531,6 +531,16 @@ impl AutoModel {
             return Err(Error::Other("d3-mini requires CUDA support".into()));
         }
 
+        if matches!(
+            model_name,
+            "cosmos-policy" | "cosmos-policy-cuda" | "cuda_cosmos_policy"
+        ) {
+            #[cfg(feature = "cuda")]
+            return crate::cuda_cosmos_policy::load::load_with_cuda_new(path, device, options);
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("Cosmos Policy requires CUDA support".into()));
+        }
+
         register_builtin_models();
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
@@ -810,6 +820,8 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "pi0fast"
             | "smolvla"
             | "smolvla_libero"
+            | "cosmos-policy"
+            | "cuda_cosmos_policy"
     ) || matches!(device, Device::Metal(_))
 }
 #[cfg(test)]
@@ -1007,6 +1019,16 @@ mod tests {
         }
         // The qualifier does not invent a family that has no variants either.
         assert!(!supports_model_variant("llama-musa", Device::Musa(0)));
+    }
+
+    /// Cosmos Policy answers under both the family name and the name it
+    /// registers its factory as, and `cosmos-policy-cuda` reaches it through
+    /// the stripped qualifier rather than an entry of its own.
+    #[test]
+    fn cosmos_policy_admits_every_spelling_of_its_family() {
+        for name in ["cosmos-policy", "cosmos-policy-cuda", "cuda_cosmos_policy"] {
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
     }
 
     /// `Pi05Policy.from_pretrained(model_name="pi05-hip")` — and the same call

@@ -44,6 +44,18 @@ bool supports_segmented_custom(const Spec& spec) {
          supports_custom(spec);
 }
 
+bool supports_wide_bf16(const Spec& spec) {
+  return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
+      spec.qkv_layout == APXINF_ATTENTION_QKV_LAYOUT_SEPARATE &&
+      spec.dtype == APXINF_DTYPE_BF16 && spec.output_dtype == APXINF_DTYPE_BF16 &&
+      spec.batch >= 1 && spec.batch <= 4 && spec.query_heads == 1 && spec.kv_heads == 1 && spec.head_dim == 384 &&
+      spec.query_tokens > 0 && spec.query_tokens <= 4096 && spec.key_tokens > 0 && spec.key_tokens <= 4096 &&
+      spec.mask == APXINF_ATTENTION_MASK_NONE && spec.dynamic_decode == 0 &&
+      spec.numerics == APXINF_ATTENTION_NUMERICS_FLEXIBLE;
+}
+AlignmentRequirements wide_bf16_alignment(const Spec&) { return {16, 16, 16, 16}; }
+void wide_bf16_configurations(const Spec&, std::vector<int>& out) { out.push_back(0); out.push_back(1); }
+
 bool supports_cublas_f16(const Spec& spec) {
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
          spec.qkv_layout == APXINF_ATTENTION_QKV_LAYOUT_SEPARATE &&
@@ -239,12 +251,19 @@ bool supports_cutlass(const Spec& spec) {
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
          spec.qkv_layout == APXINF_ATTENTION_QKV_LAYOUT_SEPARATE &&
          spec.mask == APXINF_ATTENTION_MASK_NONE &&
-         spec.query_tokens == 256 && spec.key_tokens == 256 &&
+         ((spec.query_tokens == 256 && spec.key_tokens == 256 &&
+           spec.head_dim == 72) ||
+          (spec.batch == 1 && spec.query_tokens == 1764 &&
+           (spec.key_tokens == 512 || spec.key_tokens == 1764) &&
+           spec.head_dim == 128)) &&
          spec.query_heads == 16 && spec.kv_heads == 16 &&
-         spec.head_dim == 72 &&
          spec.dtype == APXINF_DTYPE_BF16 &&
          spec.output_dtype == spec.dtype &&
          spec.numerics == APXINF_ATTENTION_NUMERICS_FLEXIBLE;
+}
+
+bool supports_cutlass_persistent(const Spec& spec) {
+  return supports_cutlass(spec) && spec.head_dim == 128;
 }
 
 AlignmentRequirements cutlass_alignment(const Spec&) {
@@ -316,6 +335,12 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        destroy_d256_causal_sm110},
 #endif
 #if defined(APXINF_ATTENTION_CUTLASS)
+      {kProviderCutlass, 2, 1, "cutlass-fmha-persistent-sm100",
+       apxinf::gemm::kDeviceFeatureCutlassSm100, true, true, false,
+       supports_cutlass_persistent, cutlass_alignment,
+       cutlass_persistent_resource_requirements, one_configuration,
+       prepare_cutlass_persistent, launch_cutlass_persistent,
+       destroy_cutlass_persistent},
       {kProviderCutlass, 1, 1, "cutlass-fmha-sm100",
        apxinf::gemm::kDeviceFeatureCutlassSm100, true, true, false,
        supports_cutlass, cutlass_alignment, cutlass_resource_requirements,
@@ -343,6 +368,10 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        fa2_alignment, fa2_resource_requirements, one_configuration,
        prepare_fa2, launch_fa2, destroy_fa2},
 #endif
+      {kProviderCublas, 2, 1, "cublas-bf16-wide-f32-probabilities-sm110",
+       apxinf::gemm::kDeviceFeatureFixedSm110, true, true, false,
+       supports_wide_bf16, wide_bf16_alignment, wide_bf16_resource_requirements,
+       wide_bf16_configurations, prepare_wide_bf16, launch_wide_bf16, destroy_wide_bf16},
       {kProviderCublas, 1, 1, "cublas-f16-gqa-stable", 0, true, true, true,
        supports_cublas_f16, natural_alignment,
        cublas_f16_resource_requirements, one_configuration,

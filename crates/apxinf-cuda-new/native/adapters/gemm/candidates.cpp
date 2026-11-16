@@ -215,6 +215,39 @@ void cublaslt_configurations(const Spec&,
   }
 }
 
+// The extended tile/custom-option sweep is a Cosmos Policy joint-latent
+// optimization. It is gated on the plain-BF16 M=1764 token geometry that only
+// that family produces: enumerating 72 more configurations for every family's
+// BF16 GEMM would multiply first-run autotuning time, and re-tuning can land on
+// algorithms whose FP32 accumulation order was never validated for those
+// models. Heuristic ranks 0..7 therefore stay the only candidates elsewhere.
+bool supports_extended_tiles(const Spec& spec) {
+  return spec.a_dtype == APXINF_DTYPE_BF16 &&
+         spec.b_dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         spec.m == 1764;
+}
+
+void cublaslt_plain_configurations(const Spec& spec, std::vector<int>& configs) {
+  cublaslt_configurations(spec, configs);
+  if (supports_extended_tiles(spec)) {
+    // 0..7 retain their original heuristic-rank meaning. New configurations
+    // encode 8 + 8 * heuristic_rank + custom_option (options 0..7).
+    for (int configuration = 8; configuration < 72; ++configuration) {
+      configs.push_back(configuration);
+    }
+#if CUDART_VERSION >= 13000
+    // Algorithm 66, 128x224 tile, 2x1x1 cluster: all custom options.
+    for (int configuration = 72; configuration < 80; ++configuration) {
+      configs.push_back(configuration);
+    }
+#endif
+  }
+}
+
 #ifdef APXINF_GEMM_CUTLASS
 bool supports_cutlass_fp8(const Spec& spec) {
   // Keep the translated CUTLASS kernel on its original F16 contract.  Its
@@ -413,6 +446,24 @@ bool supports_device(const Implementation& implementation,
   return true;
 }
 
+#ifdef APXINF_GEMM_CUTLASS
+bool supports_exact_gelu(const Spec& s) {
+  return s.semantic == APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT &&
+      s.m==1764 && s.n==8192 && s.k==2048 &&
+      s.a_dtype==APXINF_DTYPE_BF16 && s.b_dtype==APXINF_DTYPE_BF16 &&
+      s.output_dtype==APXINF_DTYPE_BF16 && s.quantization==APXINF_GEMM_QUANT_NONE &&
+      s.b_layout==APXINF_GEMM_LAYOUT_KN && s.alpha_is_unit && s.output_scale_is_unit &&
+      s.numerics==APXINF_GEMM_NUMERICS_DEFAULT;
+}
+AlignmentRequirements exact_gelu_alignment(const Spec&) {
+  AlignmentRequirements requirements{};
+  requirements.a = 32;
+  requirements.b = 32;
+  requirements.output = 16;
+  return requirements;
+}
+void exact_gelu_configurations(const Spec&,std::vector<int>& out) { for(int i=0;i<6;++i)out.push_back(i); }
+#endif
 const ImplementationRegistry& registry(uint32_t semantic) {
   // Every L3 semantic has exactly one baseline fallback. cuBLAS owns that role;
   // faster or more specialized providers remain autotuning candidates only.
@@ -482,7 +533,7 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
       {kProviderCublasLt, 1, 1, "cublasLt+custom-epilogue", WeightLayout::Canonical, 0, true, false, false,
        supports_cublaslt, cublaslt_alignment, cublaslt_resource_requirements,
-       cublaslt_configurations, prepare_cublaslt, launch_cublaslt,
+       cublaslt_plain_configurations, prepare_cublaslt, launch_cublaslt,
        destroy_cublaslt},
       {kProviderCublasLt, 2, 1, "cublasLt-native-fp8+custom-epilogue", WeightLayout::Canonical,
        kDeviceFeatureNativeFp8, true, false, false, supports_native_fp8,
@@ -577,6 +628,22 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        destroy_cutlass},
 #endif
   };
+  static const ImplementationRegistry exact_gelu_entries = {
+      {kProviderCublas, 1, 1, "cublas+staged-exact-gelu", WeightLayout::Canonical, 0, true, true, true,
+       supports_cublas, vendor_alignment, cublas_resource_requirements,
+       one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
+#ifdef APXINF_GEMM_CUTLASS
+      {kProviderCutlass, 11, 1, "cutlass-bf16-staged-exact-gelu", WeightLayout::Canonical,
+       kDeviceFeatureFixedSm110, true, true, false, supports_exact_gelu,
+       exact_gelu_alignment, exact_gelu_resource_requirements,
+       exact_gelu_configurations, prepare_exact_gelu, launch_exact_gelu, destroy_exact_gelu},
+      {kProviderCutlass, 12, 1, "cutlass-bf16-staged-exact-gelu-lut", WeightLayout::Canonical,
+       kDeviceFeatureFixedSm110, true, true, false, supports_exact_gelu,
+       exact_gelu_alignment, exact_gelu_lut_resource_requirements,
+       exact_gelu_configurations, prepare_exact_gelu_lut, launch_exact_gelu,
+       destroy_exact_gelu},
+#endif
+  };
   const ImplementationRegistry* selected = nullptr;
   switch (semantic) {
     case APXINF_GEMM_SEMANTIC_GEMM:
@@ -593,6 +660,9 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       break;
     case APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL:
       selected = &gemm_bias_residual_entries;
+      break;
+    case APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT:
+      selected = &exact_gelu_entries;
       break;
     case APXINF_GEMM_SEMANTIC_GEMM_SWIGLU:
       selected = &gemm_swiglu_entries;

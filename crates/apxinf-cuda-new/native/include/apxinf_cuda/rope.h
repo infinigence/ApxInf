@@ -15,6 +15,9 @@ apxinf_status_t apxinf_rope_launch(
     apxinf_runtime_t runtime, const apxinf_rope_spec_t* spec,
     const apxinf_rope_bindings_t* bindings);
 
+apxinf_status_t apxinf_rope_rms_precomputed_launch(apxinf_runtime_t runtime,
+    const apxinf_rms_precomputed_rope_spec_t* spec,
+    const apxinf_rms_precomputed_rope_bindings_t* bindings);
 #ifdef __cplusplus
 }
 #endif

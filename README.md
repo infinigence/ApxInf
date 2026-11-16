@@ -16,6 +16,7 @@ The first version of ApxInf ships with highly optimized PI-0.5 VLA model on Jets
 Orin devices, and supports BF16, FP8 and INT8 precisions.
 
 ## What's NEW!
+- [2026/11] 🔥 ApxInf supports Moore Threads MUSA as Backend.
 - [2026/10] 🔥 ApxInf supports Decision 3.0 mini and Qwen3.8-27B with image inference.
 - [2026/10] 🔥 ApxInf supoorts SmolVLA, deployable on Jetson Xavier / Thor / Orin / RTX 4090.
 - [2026/09] 🔥 ApxInf supports PI0-FAST, GR00T-N1.7, Qwen-Drive, Qwen3.8-27B.
@@ -58,7 +59,9 @@ Orin devices, and supports BF16, FP8 and INT8 precisions.
         <ul style="margin-left: 0; padding-left: 16px;">
           <li>NVIDIA CUDA ✅
           </li>
-          <li>AMD ROCm
+          <li>Moore Threads MUSA ✅
+          </li>
+          <li>AMD HIP/ROCm
           </li>
           <li>Apple Metal
           </li>
@@ -722,6 +725,15 @@ Built with Rust 1.95 and 1.96; no minimum supported version is declared.
 
 ## Acknowledgement
 
+<div align="left">
+  <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/vendor/MTLOGO-PNG/horizontal-color1.png" alt="moorethreads-logo" width="128"/>
+  <p>
+  We sincerely thank Moore Threads for providing the hardware platform, software ecosystem, and engineering support for adapting APXInf to the MTT E300. This effort focuses on the deployment and inference of the PI 0.5 model, further extending APXInf’s capabilities across diverse computing platforms and contributing valuable practical experience to the efficient on-device deployment of embodied AI models. We look forward to deeper collaboration with Moore Threads across cloud, edge, and on-device computing, jointly exploring new possibilities for efficient on-device AI deployment and applications at scale.
+  </p>
+</div>
+
+
+
 The development of APXInf has been inspired by, and benefits from, the ideas and tooling of the broader open-source community.
 In particular, we would like to thank the teams and contributors behind
 [FasterTransformer](https://github.com/NVIDIA/FasterTransformer),
@@ -747,4 +759,5 @@ Scan the QR Code to join our Wechat Group
 
 <div align="left">
   <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/wechat.jpg" alt="wechat-group" width="256"/>
+  <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/qrcode.xhs.jpg" alt="xhs-account" width="256"/>
 </div>
