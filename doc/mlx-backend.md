@@ -404,6 +404,9 @@ A latency result does not waive retained-memory growth or stale-state errors.
 `Stream::counters` records explicit bridge upload/download bytes and Rust trace
 callbacks. It does not count every internal MLX pipeline compilation or physical
 DMA. `memory_stats` is the process-wide MLX allocator, not process RSS.
+Its buffer cache is bounded to `apxinf_mlx::DEFAULT_CACHE_LIMIT_BYTES` when
+the first Metal stream is created, unless the application has set a limit with
+`apxinf_mlx::set_cache_limit`; model code does not clear the cache to bound it.
 Synchronize before reading allocator statistics, and measure preparation
 separately from warm requests. Keep numerical, semantic and performance
 validation independent of these diagnostic counters.

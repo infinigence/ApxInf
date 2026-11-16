@@ -7,10 +7,12 @@ extern "C" {
 const char* apx_mlx_error(void);
 int apx_mlx_stream_new(int32_t gpu, int32_t index, void** out);
 void apx_mlx_stream_free(void* stream);
+int apx_mlx_default_cache_limit(size_t limit);
 int apx_mlx_sync(void* stream);
 int apx_mlx_memory_stats(size_t* active, size_t* cache, size_t* peak);
 int apx_mlx_reset_peak_memory(void);
 int apx_mlx_clear_cache(void);
+int apx_mlx_set_cache_limit(size_t limit, size_t* previous);
 int apx_mlx_device_info(int32_t index, const char** name, const char** architecture);
 int apx_mlx_array_new(void* stream, const int32_t* shape, size_t rank, int32_t dtype, const uint8_t* bytes, size_t len, void** out);
 int apx_mlx_array_clone(const void* array, void** out);

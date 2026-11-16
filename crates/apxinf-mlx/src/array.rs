@@ -65,6 +65,12 @@ pub fn memory_stats() -> Result<MemoryStats> {
 pub fn reset_peak_memory() -> Result<()> {
     check(unsafe { ffi::apx_mlx_reset_peak_memory() })
 }
+/// Cap the process-wide MLX allocator cache at `limit` bytes; returns the previous limit.
+pub fn set_cache_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_cache_limit(limit, &mut previous) })?;
+    Ok(previous)
+}
 /// Release cached allocator buffers process-wide. Active arrays remain valid.
 /// Synchronize first when measuring release, and use an isolated test process.
 pub fn clear_cache() -> Result<()> {
@@ -116,6 +122,12 @@ fn metal_caps(index: i32) -> Result<MetalDeviceCaps> {
     Ok(MetalDeviceCaps::new(text(name), text(architecture)))
 }
 
+/// Cache limit that every Metal stream construction applies, unless the
+/// caller has already chosen one with [`set_cache_limit`]. MLX keeps freed
+/// buffers for reuse and, by default, lets that cache grow to its memory
+/// limit; each new input shape adds buffers that later shapes rarely reuse.
+pub const DEFAULT_CACHE_LIMIT_BYTES: usize = 1 << 30;
+
 #[derive(Clone)]
 pub struct Stream(Rc<StreamInner>);
 /// Cumulative observations for one logical execution stream and its clones.
@@ -150,7 +162,9 @@ impl Stream {
         if index != 0 {
             return Err(Error::UnsupportedDevice(apxinf_core::Device::Metal(index)));
         }
-        Self::create(true, index)
+        let stream = Self::create(true, index)?;
+        check(unsafe { ffi::apx_mlx_default_cache_limit(DEFAULT_CACHE_LIMIT_BYTES) })?;
+        Ok(stream)
     }
     fn create(gpu: bool, index: usize) -> Result<Self> {
         let mut raw = std::ptr::null_mut();
