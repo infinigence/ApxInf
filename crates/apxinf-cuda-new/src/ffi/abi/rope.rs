@@ -225,3 +225,28 @@ mod fixed_launchers {
     }
 }
 pub(crate) use fixed_launchers::*;
+
+#[repr(C)]
+pub(crate) struct RmsPrecomputedSpec {
+    pub version: u32,
+    pub heads: u32,
+    pub dim: u32,
+    pub reserved: u32,
+    pub tokens: i64,
+}
+#[repr(C)]
+pub(crate) struct RmsPrecomputedBindings {
+    pub input: *const c_void,
+    pub weight: *const c_void,
+    pub table: *const c_void,
+    pub output: *mut c_void,
+    pub stream: CudaStream,
+    pub epsilon: f32,
+}
+unsafe extern "C" {
+    pub(crate) fn apxinf_rope_rms_precomputed_launch(
+        runtime: Runtime,
+        spec: *const RmsPrecomputedSpec,
+        bindings: *const RmsPrecomputedBindings,
+    ) -> i32;
+}

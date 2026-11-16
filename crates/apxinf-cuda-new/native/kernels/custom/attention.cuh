@@ -1,5 +1,7 @@
 #pragma once
 
+#include <climits>
+#include <type_traits>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -105,6 +107,57 @@ __global__ void attention_scores_softmax(
   }
 }
 
+// Parallel key tiles preserve each dot product and softmax summation order.
+// Only the noncausal single-head BF16 d384 launcher below uses this path.
+__global__ void attention_scores_tiled_384(
+    const __nv_bfloat16* query, const __nv_bfloat16* key, float* scores,
+    int query_tokens, int key_tokens, int head_dim, int batch, float scale) {
+  __shared__ __nv_bfloat16 tile[128][33];
+  __shared__ float query_tile[32];
+  const int tiles = (key_tokens - 1) / 128 + 1;
+  const int row = blockIdx.x / tiles;
+  const int base = (blockIdx.x % tiles) * 128;
+  const int batch_index = row / query_tokens;
+  const int key_token = base + threadIdx.x;
+  float dot = 0.0f;
+  for (int dimension = 0; dimension < head_dim; dimension += 32) {
+    if (threadIdx.x < 32) {
+      query_tile[threadIdx.x] = __bfloat162float(
+          query[int64_t(row) * head_dim + dimension + threadIdx.x]);
+    }
+    for (int index = threadIdx.x; index < 128 * 32; index += 128) {
+      const int r = index / 32, c = index % 32;
+      tile[r][c] = base + r < key_tokens
+          ? key[(int64_t(batch_index) * key_tokens + base + r) * head_dim + dimension + c]
+          : __float2bfloat16(0.0f);
+    }
+    __syncthreads();
+    for (int c = 0; c < 32; ++c) {
+      dot += query_tile[c] * __bfloat162float(tile[threadIdx.x][c]);
+    }
+    __syncthreads();
+  }
+  if (key_token < key_tokens) {
+    scores[int64_t(row) * key_tokens + key_token] = dot * scale;
+  }
+}
+
+// Keep the reference's serial max/exp/sum order after parallel score generation.
+__global__ void attention_softmax_serial(float* probabilities, int rows, int keys) {
+  const int64_t row = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  float* scores = probabilities + int64_t(row) * keys;
+  float maximum = -CUDART_INF_F;
+  for (int key = 0; key < keys; ++key) maximum = fmaxf(maximum, scores[key]);
+  float sum = 0.0f;
+  for (int key = 0; key < keys; ++key) {
+    const float value = expf(scores[key] - maximum);
+    scores[key] = value;
+    sum += value;
+  }
+  for (int key = 0; key < keys; ++key) scores[key] /= sum;
+}
+
 template <class T>
 __global__ void attention_values(const float* probabilities, const T* value,
                                  T* output, int query_tokens, int key_tokens,
@@ -153,12 +206,29 @@ cudaError_t launch_attention(const void* query, const void* key,
   constexpr int threads = 128;
   const int64_t rows =
       static_cast<int64_t>(batch) * query_tokens * query_heads;
+  const int key_tiles = (key_tokens - 1) / 128 + 1;
+  if (std::is_same<T, __nv_bfloat16>::value && head_dim == 384 &&
+      query_heads == 1 && kv_heads == 1 && !causal && decode_meta == nullptr &&
+      key_stride == key_tokens && query_tokens >= 128 && key_tokens >= 128 &&
+      rows <= INT32_MAX / key_tiles) {
+    attention_scores_tiled_384<<<static_cast<unsigned>(rows * key_tiles),
+                                 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(query),
+        static_cast<const __nv_bfloat16*>(key), probabilities,
+        query_tokens, key_tokens, head_dim, batch, scale);
+    const auto score_status = cudaGetLastError();
+    if (score_status != cudaSuccess) return score_status;
+    attention_softmax_serial<<<static_cast<unsigned>((rows + threads - 1) / threads),
+                               threads, 0, stream>>>(
+        probabilities, static_cast<int>(rows), key_tokens);
+  } else {
   attention_scores_softmax<T><<<
       static_cast<unsigned>((rows + threads - 1) / threads), threads, 0,
       stream>>>(static_cast<const T*>(query), static_cast<const T*>(key),
                 probabilities, query_tokens, key_tokens, key_stride,
                 query_heads, kv_heads, head_dim, batch, causal, query_start,
                 decode_meta, scale);
+  }
   auto status = cudaGetLastError();
   if (status != cudaSuccess) return status;
   const int64_t elements = rows * head_dim;

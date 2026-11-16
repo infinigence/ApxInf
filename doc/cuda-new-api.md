@@ -273,6 +273,7 @@ The preserved `_seq` and `_interleaved` native launch details are not public L3 
 ### 4.2 RoPE and attention companions
 
 ```rust
+ops::rope::apply_precomputed(ctx, input, table, output)    // BF16 half-split, FP32 cosine/sine table
 partial_rope(ctx, data, positions, rotary_width, theta)    // partial rotary embedding, in place
 decode_rotation(ctx, DecodeRotationArgs { ... })           // one-token 1-D/multimodal rotation
 decode_rope(ctx, DecodeRopeArgs::new(...))                 // rotate Q/K and append head-major K/V
@@ -284,6 +285,11 @@ split_grouped_qkv(ctx, GroupedQkvRopeArgs { ... })         // group-major Q/G/K/
 split_query_and_gate(ctx, fused, query, gate)              // q_proj output split
 apply_output_gate(ctx, OutputGateArgs { ... })             // sigmoid output gate, source/numerics in the contract
 ```
+
+Precomputed BF16 half-split rotation uses compile-time indexing for H=16,
+D=128 and the generic runtime-index path for other supported geometries. Both
+preserve staged FP32 products/sums, BF16 rounding and exact in-place behavior;
+this dispatch adds no workspace or model-visible contract.
 
 Decode callers bind caller-owned Tensor views. The raw fixed-workspace
 launchers are private to the RoPE family. `DecodeRopeArgs` preserves the
@@ -340,7 +346,7 @@ gemv(ctx, GemvArgs {                                       // M=1 projection
 })
 ```
 
-The common norm family ABI uses Spec version 6. `operation`, `statistic`,
+The common norm family ABI uses Spec version 10. `operation`, `statistic`,
 `affine`, `gate`, `quantization`, and `numerics` are independent fields; dtype
 is inferred from the Tensor bindings. Weight-offset RMSNorm is selected with
 `NormArgs::with_weight_offset()`. `NormNumerics::StableDecode` and
@@ -350,6 +356,22 @@ unit-offset residual gating, and strided GDN gating likewise remain behind the
 formal semantic entries; their exact kernels are private candidates/launchers,
 not additional public functions. Input/output aliasing selects the preserved
 head candidate without creating another public function.
+
+Channel L2 normalization internally uses one warp per row for BF16 widths
+96/192/384 when at least 1024 rows are present. It preserves the 256-thread
+reduction tree and staged BF16 sqrt/clamp/divide/scale/weight arithmetic. Smaller
+row counts and other widths keep the generic path; this does not change the
+`ChannelL2NormArgs` / unified norm contract. The additive `channel_l2_norm_silu`
+semantic accepts those same arguments and applies SiLU after rounding the
+weighted normalization result to BF16. Its Norm operation is distinct from
+plain normalization; both support exact input/output aliasing.
+
+Plain weighted RMSNorm internally uses one warp per row for 128-column
+FP16/BF16 inputs, with eight rows per block. Its reduction retains the four
+32-element partial sums and the previous 256-thread combination order; exact
+input/output aliasing is supported. Other widths and stable/fused/quantized
+numerical contracts keep their existing dispatch. This is an implementation
+choice behind `NormArgs`, not a new model-facing API.
 
 `elementwise::add`, `elementwise::mul`, and `elementwise::scale` infer dtype
 from their Tensor bindings. They do not allocate output storage; models and
@@ -526,3 +548,17 @@ ops::kv_cache_attention(&ctx, args)?;
 // (before each replay)
 meta.update(position + 1, position)?;
 ```
+
+Aligned BF16 `embedding_gather` copies eight adjacent elements per thread when
+row width is divisible by eight and the vector count fits uint32. Other widths,
+BF16-aligned but not 16-byte-aligned views, and larger counts retain the scalar
+path. Invalid IDs retain the existing clamp-to-row-zero behavior. The public
+shape, allocation and Graph contracts are unchanged.
+
+Grouped staged BF16 `fused_add_norm` accepts `ResidualGate::GroupedStyle`
+and `Affine::GroupedAdaptive` together with `NormKind::Layer`. The gate and
+normalization styles share group geometry but are separate mutable tensors.
+Hidden and normalized outputs must be disjoint; each may exactly alias an
+activation input. The backend preserves the two-stage BF16 gate/residual
+rounding and grouped normalization semantics, with an aligned 2048-column
+vectorized path and a general two-kernel fallback.
