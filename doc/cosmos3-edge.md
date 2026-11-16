@@ -122,6 +122,51 @@ promoted. The **200 ms whole-policy** and **35 ms UP/DOWN aggregate** targets
 remain unmet. Lower precision, fewer steps or pruning joint video tokens would
 change the model contract and require separate accuracy acceptance.
 
+## Current integration acceptance (2026-11-16)
+
+Fresh Thor SM110 runs use the assembled PR implementation, CUDA 13.2 and the
+same canonical STB-resized RGB / supplied noise fixtures as the independent
+FP32 gold. Each sample passes eager/Graph bitwise parity, request rebinding,
+RNG repeat/advance and retained device-action lifetime checks.
+
+| Input | FP32 cosine | Max-abs | RMSE | Native request median / p95 |
+| --- | ---: | ---: | ---: | ---: |
+| obs | 0.99999459 | 0.012045 | 0.003803 | 272.00 / 272.77 ms |
+| nav0 | 0.99999441 | 0.012108 | 0.003982 | 274.85 / 275.73 ms |
+| dark | 0.99999353 | 0.016157 | 0.004053 | 274.30 / 274.69 ms |
+
+Native timing is five warmups followed by 20 requests, including RGB/noise
+upload, the whole Graph and independent device-action publication; it excludes
+D2H, loading and preparation. A fresh process with autotuning disabled and the
+persisted recipes also passes the full obs gate (275.46 ms median,
+276.16 ms p95). These request timings have a broader scope than the historical
+268.52 ms forward-only measurement and are not a paired speedup comparison.
+
+The public `AutoPolicy → PyO3 → CUDA Graph` path produces bitwise-identical
+outputs to the native gate on all three samples and passes seed reset/advance
+and retained host-action checks. With the same 5 + 20 protocol, canonical RGB
+to **host** actions (including uploads, D2H and Python validation/copies) measures:
+
+| Input | Python request median | p95 |
+| --- | ---: | ---: |
+| obs | 274.45 ms | 275.57 ms |
+| nav0 | 274.46 ms | 275.05 ms |
+| dark | 274.50 ms | 275.04 ms |
+
+Loading, preparation and camera resizing are excluded. Serial operator tests
+pass fractional mRoPE integer parity/rebinding, fused ReLU² exact/random BF16
+parity, and rectangular RGB rounding/rebinding/rejection (4 passed, one timing
+test ignored). The CUDA backend library passes 159 tests (2 ignored); model
+CPU tests pass 173 (1 ignored), and related Python tests pass 110 (2 skipped).
+CUDA model all-target compilation, architecture/API guards and all model-family
+boundary guards also pass.
+
+Validation reuses existing prepared weight/VAE/text files in place. A task-local
+asset view normalizes the one-frame config and prompt table and records actual
+SHA256 hashes; the original stale manifest remains untouched. This validates
+loading and execution of those tensors, **not an end-to-end rerun of the new
+converter**. CPU converter/manifest admission tests cover the conversion logic.
+
 ## Validation and reproducibility
 
 The maintained device gate loads through `AutoModel`, compares all 160 action
