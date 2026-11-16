@@ -217,3 +217,11 @@ reference comparison instead of ending with a list of unfinished components.
 Stop early only when the next required action depends on unavailable external
 information, authority, hardware, or artifacts, and state that dependency
 precisely.
+
+## Cosmos3-Edge follow-up acceptance
+
+Cosmos3-Edge (`cuda_cosmos3_edge`, DROID) is independent of Cosmos Policy
+LIBERO (`cuda_cosmos_policy`). Use `doc/cosmos3-edge.md` for its fixed geometry,
+full video-plus-action noise, rectangular RGB binding and FP32 reference gates.
+Keep eager/session kernel durations distinct from production Graph endpoints;
+standalone GEMM winners require full-model validation before promotion.

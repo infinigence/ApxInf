@@ -231,6 +231,19 @@ bool supports_extended_tiles(const Spec& spec) {
          spec.m == 1764;
 }
 
+// Cosmos3-Edge MLP down-projection: M=1971, N=2048, K=9216. The 36 MiB weight
+// and 34.6 MiB activation both exceed the 32 MiB L2. Split-K offers smaller
+// K-slices and a wider grid to the tuner; a recipe still decides the winner.
+bool supports_cosmos3_splitk(const Spec& spec) {
+  return spec.a_dtype == APXINF_DTYPE_BF16 &&
+         spec.b_dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.accumulation_dtype == APXINF_DTYPE_F32 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.semantic == APXINF_GEMM_SEMANTIC_GEMM &&
+         spec.m == 1971 && spec.n == 2048 && spec.k == 9216;
+}
+
 void cublaslt_plain_configurations(const Spec& spec, std::vector<int>& configs) {
   cublaslt_configurations(spec, configs);
   if (supports_extended_tiles(spec)) {
@@ -246,6 +259,15 @@ void cublaslt_plain_configurations(const Spec& spec, std::vector<int>& configs) 
     }
 #endif
   }
+#if CUDART_VERSION >= 13000
+  // Configurations 80..82 encode the 128x224 tile with split-K 2/4/8, the
+  // lever for the Cosmos3-Edge down-projection's L2 wall.
+  if (supports_cosmos3_splitk(spec)) {
+    for (int configuration = 80; configuration < 83; ++configuration) {
+      configs.push_back(configuration);
+    }
+  }
+#endif
 }
 
 #ifdef APXINF_GEMM_CUTLASS
@@ -463,6 +485,24 @@ AlignmentRequirements exact_gelu_alignment(const Spec&) {
   return requirements;
 }
 void exact_gelu_configurations(const Spec&,std::vector<int>& out) { for(int i=0;i<6;++i)out.push_back(i); }
+
+bool supports_relu2(const Spec& s) {
+  return s.semantic == APXINF_GEMM_SEMANTIC_GEMM_RELU2 &&
+      s.m==1971 && s.n==9216 && s.k==2048 &&
+      s.a_dtype==APXINF_DTYPE_BF16 && s.b_dtype==APXINF_DTYPE_BF16 &&
+      s.output_dtype==APXINF_DTYPE_BF16 && s.quantization==APXINF_GEMM_QUANT_NONE &&
+      s.b_layout==APXINF_GEMM_LAYOUT_KN && s.alpha_is_unit && s.output_scale_is_unit &&
+      s.numerics==APXINF_GEMM_NUMERICS_DEFAULT;
+}
+AlignmentRequirements relu2_alignment(const Spec&) {
+  AlignmentRequirements requirements{};
+  requirements.a = 32;
+  requirements.b = 32;
+  requirements.output = 16;
+  return requirements;
+}
+void relu2_configurations(const Spec&,std::vector<int>& out) { for(int i=0;i<15;++i)out.push_back(i); }
+
 #endif
 const ImplementationRegistry& registry(uint32_t semantic) {
   // Every L3 semantic has exactly one baseline fallback. cuBLAS owns that role;
@@ -644,6 +684,17 @@ const ImplementationRegistry& registry(uint32_t semantic) {
        destroy_exact_gelu},
 #endif
   };
+  static const ImplementationRegistry relu2_entries = {
+      {kProviderCublas, 1, 1, "cublas+staged-relu2", WeightLayout::Canonical, 0, true, true, true,
+       supports_cublas, vendor_alignment, cublas_resource_requirements,
+       one_configuration, prepare_cublas, launch_cublas, destroy_cublas},
+#ifdef APXINF_GEMM_CUTLASS
+      {kProviderCutlass, 13, 1, "cutlass-bf16-relu2", WeightLayout::Canonical,
+       kDeviceFeatureFixedSm110, true, true, false, supports_relu2,
+       relu2_alignment, relu2_resource_requirements,
+       relu2_configurations, prepare_relu2, launch_relu2, destroy_relu2},
+#endif
+  };
   const ImplementationRegistry* selected = nullptr;
   switch (semantic) {
     case APXINF_GEMM_SEMANTIC_GEMM:
@@ -663,6 +714,9 @@ const ImplementationRegistry& registry(uint32_t semantic) {
       break;
     case APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT:
       selected = &exact_gelu_entries;
+      break;
+    case APXINF_GEMM_SEMANTIC_GEMM_RELU2:
+      selected = &relu2_entries;
       break;
     case APXINF_GEMM_SEMANTIC_GEMM_SWIGLU:
       selected = &gemm_swiglu_entries;

@@ -625,6 +625,27 @@ void destroy_exact_gelu(Execution& state) noexcept {
       static_cast<apxinf::cuda_new::cutlass_ops::ExactGeluExecution*>(state.provider_state));
   state.provider_state=nullptr;
 }
+size_t relu2_resource_requirements(const Spec&) {
+  return apxinf::cuda_new::cutlass_ops::relu2_workspace();
+}
+void prepare_relu2(Execution& state) {
+  const auto& b = state.bindings;
+  state.resource_bytes = relu2_resource_requirements(state.spec);
+  state.provider_state = apxinf::cuda_new::cutlass_ops::prepare_relu2(
+      b.a, b.b, b.output, state.configuration, state.resource_limit,
+      static_cast<cudaStream_t>(b.stream));
+}
+cudaError_t launch_relu2(Execution& state) {
+  using namespace apxinf::cuda_new::cutlass_ops;
+  check_cutlass_status(enqueue_relu2(static_cast<Relu2Execution*>(state.provider_state),
+      static_cast<cudaStream_t>(state.bindings.stream)));
+  return cudaGetLastError();
+}
+void destroy_relu2(Execution& state) noexcept {
+  apxinf::cuda_new::cutlass_ops::destroy_relu2(
+      static_cast<apxinf::cuda_new::cutlass_ops::Relu2Execution*>(state.provider_state));
+  state.provider_state=nullptr;
+}
 #endif
 }  // namespace apxinf::gemm
 

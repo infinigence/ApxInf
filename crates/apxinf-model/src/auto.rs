@@ -541,6 +541,13 @@ impl AutoModel {
             return Err(Error::Other("Cosmos Policy requires CUDA support".into()));
         }
 
+        if matches!(model_name, "cosmos3-edge" | "cuda_cosmos3_edge") {
+            #[cfg(feature = "cuda")]
+            return crate::cuda_cosmos3_edge::load::load_with_cuda_new(path, device, options);
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("Cosmos3-Edge requires CUDA support".into()));
+        }
+
         register_builtin_models();
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
@@ -820,6 +827,8 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "pi0fast"
             | "smolvla"
             | "smolvla_libero"
+            | "cosmos3-edge"
+            | "cuda_cosmos3_edge"
             | "cosmos-policy"
             | "cuda_cosmos_policy"
     ) || matches!(device, Device::Metal(_))

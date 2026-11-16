@@ -59,6 +59,7 @@ typedef enum {
      up columns are encoded. Output is [M,N]. */
   APXINF_GEMM_SEMANTIC_GEMM_SWIGLU = 5,
   APXINF_GEMM_SEMANTIC_GEMM_GELU_EXACT = 6,
+  APXINF_GEMM_SEMANTIC_GEMM_RELU2 = 7,
 } apxinf_gemm_semantic_t;
 
 typedef struct {

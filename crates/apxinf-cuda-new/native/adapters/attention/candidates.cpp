@@ -48,7 +48,8 @@ bool supports_wide_bf16(const Spec& spec) {
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
       spec.qkv_layout == APXINF_ATTENTION_QKV_LAYOUT_SEPARATE &&
       spec.dtype == APXINF_DTYPE_BF16 && spec.output_dtype == APXINF_DTYPE_BF16 &&
-      spec.batch >= 1 && spec.batch <= 4 && spec.query_heads == 1 && spec.kv_heads == 1 && spec.head_dim == 384 &&
+      spec.batch >= 1 && spec.batch <= 4 && spec.query_heads == 1 && spec.kv_heads == 1 &&
+      (spec.head_dim == 384 || spec.head_dim == 640) &&
       spec.query_tokens > 0 && spec.query_tokens <= 4096 && spec.key_tokens > 0 && spec.key_tokens <= 4096 &&
       spec.mask == APXINF_ATTENTION_MASK_NONE && spec.dynamic_decode == 0 &&
       spec.numerics == APXINF_ATTENTION_NUMERICS_FLEXIBLE;
@@ -248,15 +249,21 @@ AlignmentRequirements fa2_alignment(const Spec&) {
 
 #if defined(APXINF_ATTENTION_CUTLASS)
 bool supports_cutlass(const Spec& spec) {
+  // Cosmos3-Edge GEN joint attention: 1971 GEN queries over the [UND ; GEN]
+  // keys (126 + 1971), GQA 16/8. The kernel masks the residual key tile.
+  const bool cosmos3_edge_joint =
+      spec.batch == 1 && spec.query_tokens == 1971 && spec.key_tokens == 2097 &&
+      spec.head_dim == 128 && spec.query_heads == 16 && spec.kv_heads == 8;
   return spec.semantic == APXINF_ATTENTION_SEMANTIC_DENSE &&
          spec.qkv_layout == APXINF_ATTENTION_QKV_LAYOUT_SEPARATE &&
          spec.mask == APXINF_ATTENTION_MASK_NONE &&
-         ((spec.query_tokens == 256 && spec.key_tokens == 256 &&
-           spec.head_dim == 72) ||
-          (spec.batch == 1 && spec.query_tokens == 1764 &&
-           (spec.key_tokens == 512 || spec.key_tokens == 1764) &&
-           spec.head_dim == 128)) &&
-         spec.query_heads == 16 && spec.kv_heads == 16 &&
+         (cosmos3_edge_joint ||
+          (((spec.query_tokens == 256 && spec.key_tokens == 256 &&
+             spec.head_dim == 72) ||
+            (spec.batch == 1 && spec.query_tokens == 1764 &&
+             (spec.key_tokens == 512 || spec.key_tokens == 1764) &&
+             spec.head_dim == 128)) &&
+           spec.query_heads == 16 && spec.kv_heads == 16)) &&
          spec.dtype == APXINF_DTYPE_BF16 &&
          spec.output_dtype == spec.dtype &&
          spec.numerics == APXINF_ATTENTION_NUMERICS_FLEXIBLE;

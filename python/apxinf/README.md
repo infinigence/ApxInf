@@ -176,6 +176,26 @@ native model jointly denoises actions, future state, images and value. Supplied
 noise uses `ModelRunner.initial_latent_shape` (`[1,16,9,28,28]`), independently
 of action shape. See [checkpoint preparation, usage and measured validation](../../doc/cosmos-policy.md).
 
+### Cosmos3-Edge DROID direct mode
+
+Prepare the NVIDIA DROID bundle offline with
+`python -m apxinf.checkpoints.cosmos3_edge --assets SOURCE --output PREPARED`.
+`AutoPolicy` recognizes the resulting `cosmos3-edge` config and loads
+`Cosmos3EdgePolicy`. The four-step BF16 profile accepts one cached 126-token
+instruction, one canonical `[544,736,3]` uint8 RGB image and optional standard
+normal FP32 joint noise `[1,376384]`. Source-image resizing and camera
+orientation belong to the caller's adapter. Returned `[16,10]` actions include
+the native DROID gripper inversion; the caller maps them to its robot.
+
+```python
+policy = AutoPolicy.from_pretrained("PREPARED", image_key="camera/image")
+result = policy.infer({"camera": {"image": canonical_rgb},
+                      "prompt": "Pick up the banana and place it in the bowl."})
+```
+
+The converter requires `torch`, `safetensors` and `transformers`; inference
+imports none of them. Asset hashes are verified before native loading.
+
 ### GR00T local assets
 
 `AutoPolicy` dispatches GR00T by its checkpoint config and loads its local

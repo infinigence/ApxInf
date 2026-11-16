@@ -433,6 +433,21 @@ CUTLASS epilogue configurations for 1764×8192×2048; other valid shapes and
 insufficiently aligned bindings use the baseline. Prepared executions retain
 bindings, including mutable weights, across capture; enqueue allocates nothing.
 
+<!-- l3-operator:gemm_relu2 -->
+### BF16 staged squared-ReLU GEMM
+
+`gemm_relu_squared(ctx, GemmArgs)` computes `bf16(relu(bf16(A @ B))^2)` with
+FP32 accumulation. The accumulator is rounded to BF16 before the activation,
+matching the projection boundary of a separate `relu^2` pass. BF16 A `[M,K]`,
+KN weights `[K,N]`, and BF16 output `[M,N]`; no bias, quantization or nonunit
+scales. Existing GEMM device, storage, overflow and non-overlap validation
+applies. cuBLAS plus a staged activation is the baseline. Thor SM110 has fifteen
+prepared CUTLASS epilogue configurations for 1971×9216×2048, including explicit
+tile shapes and tile-scheduler swizzle/raster policies; the in-graph tuner picks
+the 256×192×64 2-SM cluster-2×1 tile. Other valid shapes and insufficiently
+aligned bindings use the baseline. Prepared executions retain bindings,
+including mutable weights, across capture; enqueue allocates nothing.
+
 ### Grouped gated residual followed by adaptive LayerNorm
 
 `fused_add_norm` combines `NormKind::Layer`, `ResidualGate::GroupedStyle` and
@@ -510,3 +525,13 @@ Other legal sizes and alignments use the staged pointwise update followed by the
 existing channel normalization kernel. No scratch allocation or persistent
 state is required. CUDA Graph callers retain all bound storage through replay.
 The Norm Spec version is 10; its layout and the GEMM recipe contract are unchanged.
+
+<!-- l3-operator:RgbPatch2x2 -->
+### RgbPatch2x2
+
+`ops::rgb_patch2x2` converts NHWC RGB bytes to BF16 `[T,H/2,W/2,12]`
+patches for even rectangular image dimensions. Each output cell orders its
+channels as `(color, patch-x, patch-y)` and preserves FP32 division by 127.5,
+FP32 subtraction of one, and a single final BF16 rounding. Input/output storage
+must be on the context device and cannot overlap. The deterministic CUDA
+launch needs no workspace or tuning and retains storage during Graph capture.

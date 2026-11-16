@@ -12,6 +12,13 @@ ExactGeluExecution* prepare_exact_gelu(const void*, const void*, void*, int, siz
 int enqueue_exact_gelu(ExactGeluExecution*, cudaStream_t);
 void destroy_exact_gelu(ExactGeluExecution*);
 
+struct Relu2Execution;
+size_t relu2_workspace();
+Relu2Execution* prepare_relu2(const void*, const void*, void*, int, size_t, cudaStream_t);
+int enqueue_relu2(Relu2Execution*, cudaStream_t);
+void destroy_relu2(Relu2Execution*);
+
+
 
 int bf16_gemm_geglu(
     const void* activation, const void* packed_weight, const void* gate,

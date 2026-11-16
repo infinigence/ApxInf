@@ -19,6 +19,12 @@ pub(super) enum ApplyRotation<'a> {
         positions: &'a CudaBuffer,
         sections: [usize; 3],
     },
+    /// Same three-section layout as `Multimodal`, with f32 position ids for
+    /// fps-modulated streams whose temporal positions are fractional.
+    MultimodalF32 {
+        positions: &'a CudaBuffer,
+        sections: [usize; 3],
+    },
     Axial {
         positions: &'a CudaBuffer,
     },
@@ -124,6 +130,35 @@ pub(super) fn apply_tensor(
                 }
                 (
                     abi::ROTATION_MULTIMODAL_IDS,
+                    abi::CONVENTION_HALF_SPLIT_INTERLEAVED_AXES,
+                    head_dim,
+                    sections,
+                    Some(positions),
+                    0,
+                )
+            }
+            ApplyRotation::MultimodalF32 {
+                positions,
+                sections,
+            } => {
+                let section_hw = sections[1]
+                    .checked_add(sections[2])
+                    .ok_or_else(|| Error::Other("multimodal RoPE section overflow".into()))?;
+                let position_bytes = tokens
+                    .checked_mul(3)
+                    .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                    .ok_or_else(|| Error::Other("multimodal RoPE position size overflow".into()))?;
+                if input.dtype() != DType::BF16
+                    || section_hw > head_dim / 2
+                    || positions.device() != ctx.device_id()
+                    || positions.len() < position_bytes
+                {
+                    return Err(Error::Other(
+                        "multimodal RoPE position/section contract mismatch".into(),
+                    ));
+                }
+                (
+                    abi::ROTATION_MULTIMODAL_F32_IDS,
                     abi::CONVENTION_HALF_SPLIT_INTERLEAVED_AXES,
                     head_dim,
                     sections,
@@ -240,6 +275,15 @@ fn upload_u32(ctx: &CudaContext, values: &[u32], what: &str) -> Result<CudaBuffe
     Ok(buffer)
 }
 
+fn upload_f32(ctx: &CudaContext, values: &[f32], what: &str) -> Result<CudaBuffer> {
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let buffer = CudaBuffer::alloc(bytes.len(), ctx.device_id()).map_err(Error::Cuda)?;
+    buffer
+        .copy_from_host(&bytes)
+        .map_err(|error| Error::Other(format!("{what}: upload positions failed: {error}")))?;
+    Ok(buffer)
+}
+
 /// Standalone half-split RoPE over a contiguous `[seq, n_heads, head_dim]`
 /// BF16 tensor. This is the portable `Backend::rope` semantic, not a packed
 /// QKV split; Q and K each call it with their own head count.
@@ -317,6 +361,81 @@ pub fn apply_mrope(
         },
     )?;
     Ok(output)
+}
+
+/// Multimodal 3D RoPE with fractional positions, for fps-modulated diffusion
+/// streams. Same layout as [`apply_mrope`], but ids are f32.
+pub fn apply_fractional_mrope(
+    ctx: &CudaContext,
+    input: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    sections: [usize; 3],
+    pos_ids: &[f32],
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if dims.len() != 3 || dims[1] != n_heads || dims[2] != head_dim {
+        return Err(Error::Other(
+            "mRoPE requires a [seq, heads, dim] tensor".into(),
+        ));
+    }
+    let seq_len = dims[0];
+    if pos_ids.len() != seq_len * 3 {
+        return Err(Error::Other(format!(
+            "mRoPE pos_ids len {} != seq_len {} * 3",
+            pos_ids.len(),
+            seq_len
+        )));
+    }
+    let output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    let ids = upload_f32(ctx, pos_ids, "mRoPE")?;
+    apply_tensor(
+        ctx,
+        input,
+        &output,
+        n_heads,
+        head_dim,
+        theta,
+        ApplyRotation::MultimodalF32 {
+            positions: &ids,
+            sections,
+        },
+    )?;
+    Ok(output)
+}
+
+/// [`apply_fractional_mrope`] with caller-owned device positions (`[seq, 3]` f32) and
+/// output. No host transfer or allocation happens here, so the call is
+/// CUDA-Graph-capturable and `output` may be a view into a larger buffer.
+pub fn apply_fractional_mrope_into(
+    ctx: &CudaContext,
+    input: &Tensor,
+    output: &Tensor,
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    sections: [usize; 3],
+    positions: &CudaBuffer,
+) -> Result<()> {
+    let dims = input.shape().dims();
+    if dims.len() != 3 || dims[1] != n_heads || dims[2] != head_dim {
+        return Err(Error::Other(
+            "mRoPE requires a [seq, heads, dim] tensor".into(),
+        ));
+    }
+    apply_tensor(
+        ctx,
+        input,
+        output,
+        n_heads,
+        head_dim,
+        theta,
+        ApplyRotation::MultimodalF32 {
+            positions,
+            sections,
+        },
+    )
 }
 
 /// Vision-tower 2D RoPE (Qwen3-VL ViT). `pos_ids` is `(h, w)` per token;

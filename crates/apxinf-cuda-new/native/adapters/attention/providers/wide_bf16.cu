@@ -25,7 +25,7 @@ struct WideState {
 };
 }
 size_t wide_bf16_resource_requirements(const Spec& spec, int) {
-  // The registry bounds both token axes to 4096 and head_dim to 384.
+  // The registry bounds both token axes to 4096 and head_dim to 640.
   return size_t(spec.batch) * size_t(spec.query_tokens * spec.key_tokens +
                 (spec.query_tokens + spec.key_tokens) * spec.head_dim) * sizeof(float) + kBlasWorkspace;
 }
