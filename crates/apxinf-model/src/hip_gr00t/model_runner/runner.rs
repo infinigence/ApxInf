@@ -156,6 +156,16 @@ pub(super) fn read_request(model: &ModelVariant, request: &VlaRequest<'_>) -> Re
         .metadata
         .attention_mask
         .ok_or(apxinf_core::Error::Contract("GR00T requires VlaMetadata.attention_mask"))?;
+    // The mask is used to split image/non-image tokens, but the backbone's
+    // causal attention runs over the whole padded sequence: a masked-out token
+    // would still be read by every later valid one, and the DiT would read the
+    // padding-contaminated rows. This port supports one unpadded sequence per
+    // request, like the CUDA GR00T port; padding belongs to the processor.
+    if attention_mask.iter().any(|&value| value != 1) {
+        return Err(apxinf_core::Error::Contract(
+            "GR00T batch-one HIP backbone requires an unpadded attention mask",
+        ));
+    }
     let embodiment_id = request
         .metadata
         .embodiment_id

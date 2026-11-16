@@ -17,6 +17,10 @@ experiment/
 # higher-priority rule here wins.
 !**/build_support/
 
+# Autotune writes recipes through `<name>.recipe.<pid>.tmp` + rename; an
+# interrupted tune can leave the temporary behind.
+*.recipe.*.tmp
+
 # Local development artifacts (see AGENTS.md)
 /devlocal/
 crates/.gemm-pilot-link.lock

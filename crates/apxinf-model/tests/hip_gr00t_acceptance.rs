@@ -479,6 +479,55 @@ fn a_request_missing_grooots_metadata_is_refused() {
 }
 
 
+/// A padded attention mask is refused at the request entry.
+///
+/// The mask only feeds the image/non-image token split; the backbone's causal
+/// attention still runs over the whole sequence, so a leading 0 would let every
+/// valid token read the masked-out one and the DiT would read the contaminated
+/// rows. Like the CUDA port, this port supports one unpadded sequence per
+/// request, and says so rather than computing a wrong answer. Both paddings
+/// are covered: leading (the reviewer's `[0, 1, ...]` example) and trailing.
+#[test]
+fn a_padded_attention_mask_is_refused() {
+    let Some(fixture_dir) = env_dir("APXINF_GR00T_FIXTURE") else {
+        eprintln!("set APXINF_GR00T_FIXTURE; skipping");
+        return;
+    };
+    let Some(checkpoint) = env_dir("APXINF_GR00T_CHECKPOINT") else {
+        eprintln!("set APXINF_GR00T_CHECKPOINT; skipping");
+        return;
+    };
+    let fixture = load_fixture(&fixture_dir);
+    let ctx = Arc::new(HipContext::new(0).expect("HIP device 0"));
+    let runner = load_runner(&checkpoint, ctx, &LoadOptions::default()).expect("load GR00T");
+
+    let mut leading = fixture.attention_mask.clone();
+    leading[0] = 0;
+    let mut trailing = fixture.attention_mask.clone();
+    *trailing.last_mut().expect("non-empty mask") = 0;
+    for (label, mask) in [("leading", leading), ("trailing", trailing)] {
+        let observation = Observation {
+            vision: VisionObservation::Patches(fixture.pixel_values.clone()),
+            token_ids: fixture.token_ids.clone(),
+            state: Some(fixture.state.clone()),
+            action_mask: None,
+        };
+        let metadata = VlaMetadata {
+            attention_mask: Some(&mask),
+            image_grid_thw: Some(&fixture.grid),
+            embodiment_id: Some(fixture.embodiment_id),
+            planning: None,
+        };
+        let request = VlaRequest::provided_with_metadata(&observation, &fixture.noise, metadata);
+        let error = runner.infer(&request).unwrap_err().to_string();
+        assert!(
+            error.contains("unpadded attention mask"),
+            "{label} padding: expected the unpadded-mask refusal in: {error}"
+        );
+    }
+}
+
+
 /// The GR00T forward must be capturable into a HIP graph.
 ///
 /// Not a performance test -- capture is worth about -0.03 +/- 0.11 ms here,

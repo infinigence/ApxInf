@@ -344,6 +344,55 @@ fn hipblaslt_matches_the_reference_where_it_is_available() {
     assert_eq!(routed, shapes.len());
 }
 
+/// An explicitly requested `hipblas` stays on hipBLAS even where the recipe
+/// measured `lt` the winner.
+///
+/// `APXINF_HIP_GEMM_PROVIDER=hipblas` is the A/B baseline; promoting it to the
+/// recipe behind the default's back would dispatch Lt-tactic entries and
+/// invalidate the very control the flag exists to measure. The shapes below
+/// are recipe entries that chose `lt` (they were, on this device, the ones
+/// hipBLASLt wins), so under the forced provider every one of them must
+/// dispatch hipBLAS. Verified by counts rather than by output: both providers
+/// compute the same GEMM.
+#[test]
+fn forced_hipblas_serves_recipe_lt_shapes_on_hipblas() {
+    if std::env::var("APXINF_HIP_GEMM_PROVIDER").as_deref() != Ok("hipblas") {
+        // The provider is process-wide and read once; this test only means
+        // something in a run explicitly configured for the baseline.
+        eprintln!("skipping: set APXINF_HIP_GEMM_PROVIDER=hipblas to exercise the forced path");
+        return;
+    }
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    // Recipe entries that measured `lt`, spanning the skinny and GEMM-ish
+    // regimes: (1, 132, 1024), (21, 2048, 1536), (512, 1024, 3072)-class.
+    let shapes = [(1usize, 132usize, 1024usize), (21, 2048, 1536), (512, 1024, 3072)];
+    for (m, k, n) in shapes {
+        let (a, ah) = input(&ctx, &[m, k], 30 + m as u64, 1.0);
+        let (b, bh) = input(&ctx, &[k, n], 40 + n as u64, 0.05);
+        let out = arena.tensor(vec![m, n], DType::BF16).unwrap();
+
+        let (_before_hipblas, before_lt) = native::dispatch_counts();
+        native::gemm(&ctx, &a, &b, &out).unwrap();
+        let (_after_hipblas, after_lt) = native::dispatch_counts();
+
+        // The counters track routing decisions, and a forced provider makes
+        // none; hipBLASLt dispatches count in every mode, so an unchanged Lt
+        // count is the assertion that says the recipe was not consulted.
+        assert_eq!(
+            after_lt, before_lt,
+            "{m}x{k}x{n} dispatched hipBLASLt under the forced hipblas provider"
+        );
+        // The forced arm must still compute the same GEMM.
+        assert_close(
+            &host(&ctx, &out),
+            &gemm_reference(&ah, &bh, m, k, n),
+            ACCUMULATE_TOL,
+            &format!("forced hipblas {m}x{k}x{n}"),
+        );
+    }
+}
+
 /// CK's FMHA must agree with apxinf's own kernel wherever it is routed to.
 ///
 /// The dispatch count is asserted per call and is the point of the test. CK

@@ -76,9 +76,15 @@ pub enum Provider {
 
 /// How `gemm` picks a provider, resolved once from the environment.
 ///
-/// - unset or `hipblas` — hipBLAS for everything. The default: a backend that
+/// - unset — hipBLAS for everything, promoted to `auto` when a recipe exists
+///   or autotune is on (see [`routing`]). The promoted default: a backend that
 ///   changes which kernels it runs because an environment variable happens to
-///   be set is not one anyone can reason about.
+///   be set is not one anyone can reason about, so the recipe is honoured
+///   without requiring a flag to remember.
+/// - `hipblas` — hipBLAS for everything, and it stays that way even when a
+///   recipe is found: an explicitly requested provider is an A/B baseline,
+///   and dispatching its shapes per recipe would invalidate the very control
+///   it exists to measure.
 /// - `lt` — hipBLASLt for everything it can serve. For A/B measurement; the
 ///   measurement says this is a net loss on the compute-bound shapes.
 /// - `auto` — the recipe named by `APXINF_HIP_GEMM_TACTICS`, or, with no
@@ -87,7 +93,10 @@ pub enum Provider {
 ///   the most bandwidth unused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
+    /// Unset provider: hipBLAS, but eligible for recipe/autotune promotion.
     HipBlasOnly,
+    /// Explicitly requested `hipblas`: never promoted, never on the recipe.
+    HipBlasForced,
     LtOnly,
     Auto,
 }
@@ -182,13 +191,19 @@ fn routing() -> &'static Routing {
             "lt" | "hipblaslt" => Mode::LtOnly,
             "auto" => Mode::Auto,
             // Resolved below, once it is known whether a recipe was found.
-            "" | "hipblas" => Mode::HipBlasOnly,
+            "" => Mode::HipBlasOnly,
+            // An explicitly requested provider is an A/B control, not a
+            // default: promoting it to `Auto` behind a recipe would let
+            // `APXINF_HIP_GEMM_PROVIDER=hipblas` dispatch Lt-tactic entries
+            // and quietly invalidate the baseline it exists to measure.
+            // `HipBlasForced` stays hipBLAS even when a recipe is found.
+            "hipblas" => Mode::HipBlasForced,
             other => {
                 eprintln!(
                     "apxinf-hip: APXINF_HIP_GEMM_PROVIDER={other} is not hipblas, lt or auto; \
                      using hipblas"
                 );
-                Mode::HipBlasOnly
+                Mode::HipBlasForced
             }
         };
         let autotune = std::env::var("APXINF_HIP_GEMM_AUTOTUNE")
@@ -218,6 +233,10 @@ fn routing() -> &'static Routing {
         // it without a further switch is what makes autotune worth running --
         // tune once, and later loads are faster with no flag to remember.
         //
+        // Only the unset provider is promoted. `HipBlasForced` (an explicit
+        // `hipblas`) is the A/B baseline and stays off the recipe, and `lt` /
+        // `auto` already route per shape.
+        //
         // Nothing changes on a machine where no one has tuned: no file, no
         // recipe, hipBLAS everywhere, exactly as before.
         let mode = match mode {
@@ -231,6 +250,12 @@ fn routing() -> &'static Routing {
                     recipe.providers.len(),
                     path.display()
                 );
+                if mode == Mode::HipBlasForced {
+                    eprintln!(
+                        "apxinf-hip: APXINF_HIP_GEMM_PROVIDER=hipblas is a forced baseline; \
+                         the recipe above is loaded but not dispatched"
+                    );
+                }
             }
         }
         Routing {
@@ -736,7 +761,7 @@ fn persist(
 fn provider_for(routing: &Routing, key: Key) -> Provider {
     let m = key.0;
     match routing.mode {
-        Mode::HipBlasOnly => Provider::HipBlas,
+        Mode::HipBlasOnly | Mode::HipBlasForced => Provider::HipBlas,
         Mode::LtOnly => Provider::HipBlasLt,
         Mode::Auto => match routing.recipe.providers.get(&key) {
             Some(provider) => *provider,
@@ -917,7 +942,7 @@ fn dispatch(
     let key: Key = (m, k, n, epilogue);
     let _ = key;
 
-    if routing.mode != Mode::HipBlasOnly
+    if !matches!(routing.mode, Mode::HipBlasOnly | Mode::HipBlasForced)
         && provider == Provider::HipBlasLt
         && !ctx.blaslt().is_null()
     {
@@ -948,7 +973,7 @@ fn dispatch(
             check("gemm (hipBLASLt)", status)?;
         }
     }
-    if routing.mode != Mode::HipBlasOnly {
+    if !matches!(routing.mode, Mode::HipBlasOnly | Mode::HipBlasForced) {
         DISPATCHES[0].fetch_add(1, Ordering::Relaxed);
     }
 
