@@ -130,10 +130,28 @@ GPU runs, so further GPU speed-ups need graph capture to show.
 
 Python: `crates/apxinf-py/tests/test_smoke_pi05.py` passes on `hip:0` (7 tests).
 LIBERO: in-process `eval_libero.py --device hip:0` runs through `AutoPolicy`.
-LIBERO-10 tasks 0 and 1, 5 trials each (seed 7, H = 10, replan 5): **10/10
-successes**, 162 ms model time per call (266 ms with apxinf's own attention
-kernel, also 10/10). This is a smoke check, not the published 500-episode
-protocol.
+
+## Full LIBERO-10 regression (2026-11-17)
+
+The published protocol — all 10 LIBERO-10 tasks x 50 trials, seed 7,
+H = 10, replan 5, max 520 steps, in-process `--device hip:0`, BF16 — after the
+autotune + GeGLU vectorization + graph capture + folded attention campaign
+(P50 ~132.7 ms on the same machine):
+
+| | result |
+|---|---|
+| **Task success** | **474/500 (94.8%)** |
+| Official `pi05_libero_base` reference | 92.4% |
+| CUDA Thor BF16, same protocol (100-episode historical) | 93% |
+| Model time per inference call | 149.2 ms mean (27,424 calls) |
+| Technical errors | 0 (zero machine faults across the whole run) |
+
+Per task (successes / 50): 48, 49, 49, 49, 47, 49, 50, 49, 37, 47. Task 8's
+13 failures are all 520-step timeouts on the hardest kitchen scene, not
+numerics divergence. Artifacts: `devlocal/pi05-hip/eval/libero10-full.{jsonl,json}`
+(launcher `run_libero10_full.sh`; the checkpoint's `norm_stats.json` and
+PaliGemma `paligemma_tokenizer.model` are not distributed with it and were
+fetched from OpenPI / big_vision once by hand).
 
 ## Graph capture (2026-11-16)
 
@@ -260,8 +278,10 @@ GeGLU run at the roof. The residuals, largest first:
 
 ## Next
 
-1. **Full LIBERO-10** (500 episodes) as the regression gate for the above.
-   With the roofline's kernel-layer levers all closed (action attention
-   shipped, split-K and language-GeGLU-fusion closed by measurement), this
-   baseline (~132.7 ms) is the ceiling of BF16 on this part; anything below
-   ~118 ms needs a precision project.
+The full LIBERO-10 regression above is the gate for the campaign's changes
+(autotune + GeGLU vectorization + graph capture + folded attention): passed
+at 474/500, above both the official 92.4% reference and the CUDA backend's
+historical number. With the roofline's kernel-layer levers all closed
+(action attention shipped; split-K and language-GeGLU-fusion closed by
+measurement), the ~132.7 ms baseline is the ceiling of BF16 on this part —
+anything below ~118 ms needs a precision (int8/quantization) project.
