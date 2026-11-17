@@ -169,8 +169,10 @@ policy caches and its runner.
 
 Measure cache effects with the same binary, inputs, seed, graph profile and PCM
 hash. Separate first misses, warm reference/new text and repeated text; load and
-graph preparation are separate setup costs. A new text whose shapes or generated
-length differ requires eager execution or another explicit prepared profile.
+graph preparation are separate setup costs. A prepared profile rejects requests
+whose shapes, generated length or `sample_steps` differ from the profile; there
+is no automatic eager fallback for shape mismatches. Measure such requests after
+clearing the prepared profile or with another one.
 
 ## Fixed-shape CUDA Graph preparation
 
@@ -182,8 +184,13 @@ step for each Euler iteration. The state, conditioning, modulation and output
 addresses remain fixed; the prepared object retains the state and conditioning
 buffers as well as each step's attention and projection resources. GPT uses
 per-request KV contents and retains one decode executable, KV allocation and
-workspace for the latest exact capacity across requests. Each request recomputes
-and overwrites its complete text/audio prefix before decode. Fixed-address
+workspace for the latest exact capacity across requests. The GPT decode graph is
+not captured during `prepare()`: the first prepared inference runs its first
+decode step eagerly and captures the graph there, so that first request also
+pays one capture. Calls on a prepared plan are serial. Each request recomputes
+and overwrites its complete text/audio prefix before decode, so the plan stays
+usable after a request that failed on its inputs; after a CUDA runtime error
+(sticky for the context) drop the plan and prepare again. Fixed-address
 metadata supplies the current cache length and write position on each replay.
 Token embedding and FP16 exponential-race sampling run outside the decode graph.
 When `top_p >= 1.0` and `top_k <= 128` the sampler runs on the device: the
@@ -229,6 +236,13 @@ rounds epsilon, mean and reciprocal standard deviation to FP16 before forming
 FP32 scale/shift parameters. Other callers retain the default FP32 statistics
 contract. Both paths support fixed-shape graph replay. Large FP16 bias/activation
 operations use four-element loads and stores with the same FP32 arithmetic.
+
+## Target hardware
+
+The CUDA-native runtime targets Jetson-class devices:
+
+- Jetson Orin, compute capability 8.7 (`sm_87`).
+- Jetson Thor, compute capability 11.0 (`sm_110`).
 
 ## Supported scope
 

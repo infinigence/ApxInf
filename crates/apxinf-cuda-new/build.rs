@@ -182,11 +182,15 @@ fn run(command: &mut Command, action: &str) {
 
 /// Locate a cuDNN installation for the optional conv1d provider.
 ///
-/// The provider is an optimization, not a requirement: without cuDNN the
-/// adapter still runs its own kernels, so a missing installation degrades
-/// performance instead of failing the build. `APXINF_CUDNN_ROOT` pins a
-/// specific installation; otherwise the CUDA toolkit include directory and the
-/// distribution multiarch include directories are searched.
+/// For the ordinary conv1d path the provider is an optimization, not a
+/// requirement: without cuDNN the adapter still runs its own kernels, so a
+/// missing installation degrades performance instead of failing the build.
+/// The direct channel-last path (used by the GPT-SoVITS vocoder) is the
+/// exception: it is only implemented by the provider, so without cuDNN a
+/// channel-last launch returns UNSUPPORTED at prepare time rather than
+/// falling back. `APXINF_CUDNN_ROOT` pins a specific installation; otherwise
+/// the CUDA toolkit include directory and the distribution multiarch include
+/// directories are searched.
 fn cudnn_include_directory(cuda: &str, cpu_arch: &str) -> Option<PathBuf> {
     println!("cargo:rerun-if-env-changed=APXINF_CUDNN_ROOT");
     let mut candidates = Vec::new();
@@ -293,7 +297,10 @@ fn main() {
         "cargo:warning=conv1d cuDNN provider: {}",
         match &cudnn_include {
             Some(directory) => format!("enabled ({})", directory.display()),
-            None => "disabled (cudnn.h not found)".to_string(),
+            None => "disabled (cudnn.h not found); conv1d runs its own kernels, \
+                     but the direct channel-last path (GPT-SoVITS vocoder) requires \
+                     the provider and will return UNSUPPORTED"
+                .to_string(),
         }
     );
 
