@@ -8,6 +8,7 @@ import importlib.util
 import operator
 from collections import OrderedDict
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,46 @@ def _immutable_inputs(values):
     # A bytes owner prevents both writes and re-enabling the NumPy write flag.
     return tuple(np.frombuffer(value.tobytes(), dtype=value.dtype).reshape(value.shape)
                  for value in values)
+
+
+def merge_short_text_in_array(texts, threshold: int):
+    """Official TextPreprocessor helper, verbatim from
+    GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py: accumulate fragments until
+    one reaches `threshold` characters, then flush; a remainder is appended to
+    the last flushed fragment."""
+    if len(texts) < 2:
+        return texts
+    result = []
+    text = ""
+    for ele in texts:
+        text += ele
+        if len(text) >= threshold:
+            result.append(text)
+            text = ""
+    if len(text) > 0:
+        if len(result) == 0:
+            result.append(text)
+        else:
+            result[len(result) - 1] += text
+    return result
+
+
+def _get_first(text: str, splits) -> str:
+    """Official TextPreprocessor.get_first: the text before the first split
+    punctuation, stripped. The official helper reads its module-level `splits`
+    set; here the frontend's set is passed explicitly."""
+    pattern = "[" + "".join(re.escape(sep) for sep in splits) + "]"
+    return re.split(pattern, text)[0].strip()
+
+
+def _filter_text(texts):
+    """Official TextPreprocessor.filter_text, verbatim semantics: raise
+    ValueError when every entry is invalid, then drop None, " " and ""
+    entries. A bare "\\n" entry survives and is skipped by the line loop
+    later, matching the official post-processing."""
+    if all(text in [None, " ", "\n", ""] for text in texts):
+        raise ValueError("请输入有效文本")
+    return [text for text in texts if text not in [None, " ", ""]]
 
 
 def _sha256_file(path):
@@ -495,7 +536,7 @@ class GptSovitsPolicy:
         # The captured profile is fixed to one fragment's phone count, so it
         # must be prepared on exactly what infer() will synthesize.
         split_method = str(observation.get("text_split_method", "cut5"))
-        fragments = self._split_text(text, split_method)
+        fragments = self._target_fragments(text, split_method)
         if len(fragments) != 1:
             raise ValueError(
                 f"prepare() captures a single fragment, but text_split_method "
@@ -540,13 +581,36 @@ class GptSovitsPolicy:
     def _split_text(self, text: str, method: str):
         """Split target text with the official GPT-SoVITS method.
 
-        `cut0` is the no-split path. Every other method returns one fragment per
-        line; the official API then synthesizes each line independently and
-        joins it with `fragment_interval` silence.
+        Mirrors the official `TextPreprocessor.pre_seg_text`: leading and
+        trailing newlines are stripped (empty input yields no fragments),
+        text whose first clause is shorter than four characters and does not
+        start with split punctuation gets a leading `。` (`.` for English),
+        and then the segmentation method runs. Its output has doubled
+        newlines collapsed and is split into lines; `filter_text` raises
+        ValueError when every line is blank; short fragments are merged
+        (`merge_short_text_in_array`, threshold 5); the line loop skips
+        blank and punctuation-only lines (`re.sub(r"\\W+", ...)`), appends a
+        terminal split punctuation, and fragments longer than 510
+        characters are split again by the official `split_big_text` so every
+        fragment fits the BERT position window. Every returned fragment is
+        synthesized independently and joined with `fragment_interval`
+        silence.
         """
         segmenter = self.frontend.get("segmentation")
         if segmenter is None:
             raise RuntimeError("GPT-SoVITS text segmentation frontend is not loaded")
+        for attribute in ("splits", "split_big_text"):
+            if not hasattr(segmenter, attribute):
+                raise RuntimeError(
+                    "GPT-SoVITS text segmentation frontend lacks "
+                    f"text_segmentation_method.{attribute}; it is too old for "
+                    "the official pre-segmentation post-processing"
+                )
+        text = text.strip("\n")
+        if not text:
+            return []
+        if text[0] not in segmenter.splits and len(_get_first(text, segmenter.splits)) < 4:
+            text = "。" + text if self.language != "en" else "." + text
         try:
             split = segmenter.get_method(method)
         except ValueError as exc:
@@ -555,10 +619,33 @@ class GptSovitsPolicy:
                 f"unknown text_split_method {method!r}; available: {available}"
             ) from exc
         result = split(text)
-        if method == "cut0":
-            return [result] if result.strip() else [text]
-        fragments = [line for line in result.split("\n") if line.strip()]
-        return fragments or [text]
+        while "\n\n" in result:
+            result = result.replace("\n\n", "\n")
+        lines = _filter_text(result.split("\n"))
+        lines = merge_short_text_in_array(lines, 5)
+        fragments = []
+        for line in lines:
+            if not line.strip():
+                continue
+            if not re.sub(r"\W+", "", line):
+                # Punctuation-only line: skip, as the official pre_seg_text does.
+                continue
+            if line[-1] not in segmenter.splits:
+                line += "。" if self.language != "en" else "."
+            if len(line) > 510:
+                fragments.extend(segmenter.split_big_text(line))
+            else:
+                fragments.append(line)
+        return fragments
+
+    def _target_fragments(self, text: str, method: str):
+        fragments = self._split_text(text, method)
+        if not fragments:
+            raise ValueError(
+                "text has no valid fragment to synthesize "
+                "(empty, newline-only or punctuation-only)"
+            )
+        return fragments
 
     def infer(self, observation: Mapping[str, Any], *, noise=None):
         if noise is not None:
@@ -580,7 +667,7 @@ class GptSovitsPolicy:
             raise ValueError("speed_factor must be finite and positive")
         if not np.isfinite(fragment_interval) or fragment_interval < 0.0:
             raise ValueError("fragment_interval must be finite and non-negative")
-        fragments = self._split_text(text, split_method)
+        fragments = self._target_fragments(text, split_method)
         base_seed = int(observation.get("seed", 0))
         if base_seed < 0 or base_seed + len(fragments) - 1 >= 1 << 64:
             raise ValueError("seed must be a non-negative 64-bit integer")

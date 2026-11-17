@@ -12,6 +12,27 @@ class Segmentation:
     """Stands in for the frontend's TTS_infer_pack/text_segmentation_method.py."""
 
     METHODS = ("cut0", "cut1", "cut2", "cut3", "cut4", "cut5")
+    # The official module exports both; _split_text applies the official
+    # pre_seg_text post-processing through them.
+    splits = {
+        "，", "。", "？", "！", ",", ".", "?", "!", "~", ":", "：", "—", "…",
+    }
+
+    def split_big_text(self, text, max_len=510):
+        import re
+
+        segments = re.split("([" + "".join(self.splits) + "])", text)
+        result = []
+        current_segment = ""
+        for segment in segments:
+            if len(current_segment + segment) > max_len:
+                result.append(current_segment)
+                current_segment = segment
+            else:
+                current_segment += segment
+        if current_segment:
+            result.append(current_segment)
+        return result
 
     def get_method_names(self):
         return list(self.METHODS)

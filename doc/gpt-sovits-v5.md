@@ -129,7 +129,9 @@ at native speed; requests with `speed_factor != 1.0` automatically use the
 eager path.
 
 `text_split_method` accepts `cut0` through `cut5` and uses the official
-GPT-SoVITS `text_segmentation_method.py`. After every fragment, including the
+GPT-SoVITS `text_segmentation_method.py`. Every method, `cut0` included, is
+followed by the official newline post-pass; text with no valid fragment (empty,
+newline-only, punctuation-only) is rejected with `ValueError`. After every fragment, including the
 last, the policy appends `int(32000 * fragment_interval)` zero samples, matching
 the official `audio_postprocess` sample-rate base, normalizes only when the
 fragment peak exceeds 1, and concatenates the results. The engine itself adds
@@ -213,7 +215,8 @@ change while the shape profile remains fixed.
 
 A profile covers one text fragment. `prepare()` applies the request's
 `text_split_method` and rejects text that splits into more than one fragment;
-use `cut0` or prepare per fragment.
+prepare per fragment, or pass text that the chosen method keeps as one
+fragment (no newline, at most 510 characters).
 
 The capture acceptance checks eager-versus-graph parity, repeat replay,
 same-shape input propagation, seed propagation, and incompatible-shape
