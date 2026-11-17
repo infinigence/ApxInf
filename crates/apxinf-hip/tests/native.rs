@@ -524,6 +524,56 @@ fn ck_attention_matches_the_apxinf_kernel_where_it_is_available() {
     );
 }
 
+#[test]
+fn folded_attention_serves_the_action_geometry_and_matches_the_apxinf_kernel() {
+    // pi05's action expert: 10 tokens x 8 q heads over 532 shared-KV-head
+    // keys, head_dim 256 -- the one geometry the folded pair is built for.
+    // It must serve the call (not silently fall back) and agree with the
+    // reference kernel, which shares its F32-score numerics.
+    let ctx = ctx();
+    let arena = arena(&ctx);
+    let (batch, q_tokens, q_heads, kv_heads, head_dim, kv_tokens) = (1, 10, 8, 1, 256, 532);
+    let q = input(&ctx, &[batch, q_tokens, q_heads, head_dim], 31, 1.0).0;
+    let kv_rows = kv_tokens;
+    let k = input(&ctx, &[batch, kv_rows, kv_heads, head_dim], 41, 1.0).0;
+    let v = input(&ctx, &[batch, kv_rows, kv_heads, head_dim], 53, 1.0).0;
+    let geometry = AttentionGeometry {
+        batch,
+        q_tokens,
+        q_heads,
+        kv_heads,
+        head_dim,
+        kv_tokens,
+        causal_query_start: None,
+    };
+    let dims = vec![batch, q_tokens, q_heads, head_dim];
+    let out = arena.tensor(dims.clone(), DType::BF16).unwrap();
+    let reference = arena.tensor(dims, DType::BF16).unwrap();
+
+    native::reset_attention_counts();
+    let kernel = native::attention_kernel(ctx.caps().base_arch(), &geometry);
+    let scratch = arena
+        .tensor(
+            vec![native::attention_scratch_elements(&geometry, kernel)],
+            DType::F32,
+        )
+        .unwrap();
+    native::attention(&ctx, &q, &k, &v, &geometry, kernel, Some(&scratch), &out).unwrap();
+    let served = native::attention_counts().2;
+    assert_eq!(
+        served, 1,
+        "the folded pair must serve the action geometry; a silent fallback is a routing bug"
+    );
+
+    native::attention_apxinf_for_test(&ctx, &q, &k, &v, &geometry, &reference).unwrap();
+    assert_close(
+        &host(&ctx, &out),
+        &host(&ctx, &reference),
+        ACCUMULATE_TOL,
+        "folded attention (action geometry)",
+    );
+}
+
 /// A packed q/k/v projection must feed attention exactly the values the split
 /// tensors do, bit for bit. The fused DiT path skips the split kernel, so
 /// this equality is its whole numerical contract. Both calls share a geometry
@@ -1446,9 +1496,16 @@ fn default_attention_kernels_for_pi05() {
         native::attention_kernel("gfx1151", &g(1, 522, 8, 1, 256, 522)),
         AttentionKernel::Ck
     );
-    // Action expert: 10 queries over the prefix plus its own rows, split-KV.
+    // Action expert: 10 queries over the prefix plus its own rows, the folded
+    // flash-decoding pair (1.4x the CK split-KV pair on gfx1151).
     assert_eq!(
         native::attention_kernel("gfx1151", &g(1, 10, 8, 1, 256, 532)),
+        AttentionKernel::Folded
+    );
+    // A small GQA geometry outside the folded gate (q rows not a multiple of
+    // 8) keeps the CK split-KV path.
+    assert_eq!(
+        native::attention_kernel("gfx1151", &g(1, 12, 9, 1, 256, 532)),
         AttentionKernel::CkSplitKv { splits: 4 }
     );
     // Head dims CK's vendored instances cannot run fall back to apxinf's kernel.
@@ -1476,7 +1533,7 @@ fn default_attention_kernels_for_pi05() {
     );
     assert_eq!(
         native::attention_kernel("gfx1100", &g(1, 10, 8, 1, 256, 532)),
-        AttentionKernel::CkSplitKv { splits: 4 }
+        AttentionKernel::Folded
     );
     assert_eq!(
         native::attention_kernel("gfx1201", &g(2, 256, 16, 16, 72, 256)),

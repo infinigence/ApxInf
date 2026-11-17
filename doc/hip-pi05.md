@@ -221,10 +221,16 @@ attention 8.9, pointwise 10.2) plus 5.7 ms of device-side gaps; the
 per-operator floor is ~115 ms. Language and vision GEMMs and the language
 GeGLU run at the roof. The residuals, largest first:
 
-- **Action attention, ~4.5 ms over its floor.** 180 split-KV + combine
-  pairs at 27.5 µs, each reading 545 KB of K/V (~2.3 µs at bandwidth). The
-  8 query heads share one KV head but are not folded into one head of 80
-  rows the way the prefix path folds them.
+- **Action attention, closed 2026-11-17: the folded flash-decoding pair.**
+  The CK split-KV + combine pair it replaces cost 27.5 µs per call × 180
+  calls. `kernels/action_attention.hip` folds the 8 query heads (which share
+  one KV head) into 80 rows, reads K/V about once, and lands the split
+  reduction in a small combine kernel: 19.9 µs per pair warm (probe
+  `devlocal/pi05-hip/perf/attention_probe.cpp`), and **−3.0 ms end to end**
+  (same-process interleaved A/B, `APXINF_HIP_ATTENTION=ck` as the control:
+  132.7–133.6 against 135.7–136.0 P50). F32 scores and probabilities — the
+  reference kernel's numerics, unlike CK's BF16-rounded ones. Routed by
+  `AttentionKernel::Folded` for one-batch small-GQA geometries on RDNA.
 - **Split-K GEMMs, ~4–6 ms, closed at the library level.** `lang_down`
   (K = 16384) runs 80 workgroups at 25.6 TF/s; `act_down`/`act_out` run 16.
   hipBLASLt's tuner was offering zero workspace
@@ -242,5 +248,4 @@ GeGLU run at the roof. The residuals, largest first:
 
 ## Next
 
-1. An action-expert attention kernel: folded heads, no separate combine.
-2. **Full LIBERO-10** (500 episodes) as the regression gate for the above.
+1. **Full LIBERO-10** (500 episodes) as the regression gate for the above.

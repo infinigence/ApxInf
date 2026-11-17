@@ -478,6 +478,18 @@ hip_abi! {
         query_start: i32,
         stream: *mut c_void,
     );
+    fn apxinf_hip_folded_attention(
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        out: *mut c_void,
+        scratch: *mut c_void,
+        q_rows: i32,
+        kv_tokens: i32,
+        kv_row_stride: i64,
+        scale: f32,
+        stream: *mut c_void,
+    );
 
     fn apxinf_hip_native_apply_mrope(
         input: *const c_void,
