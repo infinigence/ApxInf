@@ -36,6 +36,13 @@ This is normalized model-core gold, not decoded robot actions or LIBERO success
 evaluation. Capture defaults to three warmups and two exact-repeat checks; it
 is not the W10/R50 performance benchmark. Existing outputs are never replaced.
 
+The reference environment used for the current artifact is torch
+2.9.1a0+gitd38164a, CUDA 12.6, transformers 4.57.3, numpy 1.26.4, SDPA
+(no flash_attn), seed 0, with cudnn enabled/benchmark/deterministic and the
+tf32 settings recorded in the manifest runtime block. Cross-process repeat
+means a second independent capture with the same environment and seed;
+compare the manifest hashes and debug.npz bit-for-bit.
+
 ## Artifact
 
 - `inputs.npz`: original canonical fixture, including raw BF16 noise and embodiment.

@@ -228,6 +228,103 @@ pub fn silu_bf16(ctx: &MusaContext, input: &Tensor) -> Result<Tensor> {
     Ok(output)
 }
 
+/// Bias plus tanh-GELU with a static FP8 output scale.
+pub fn bias_gelu_quant_bf16_e4m3(
+    ctx: &MusaContext,
+    input: &Tensor,
+    bias: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    let (rows, cols) = require_matrix_bf16(ctx, input, "bias GELU FP8", "input")?;
+    require_optional_vector_bf16(ctx, Some(bias), cols, "bias GELU FP8", "bias")?;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(Error::Other("bias GELU FP8 requires a positive scale".into()));
+    }
+    #[cfg(not(apxinf_musa_available))]
+    {
+        let _ = (rows, cols);
+        return Err(native_unavailable("activation::bias_gelu_quant_bf16_e4m3"));
+    }
+    #[cfg(apxinf_musa_available)]
+    {
+        if crate::MUSA_ARCH != "mp_31"
+            || (ctx.caps().compute_major, ctx.caps().compute_minor) != (3, 1)
+        {
+            return Err(Error::Other("FP8 activation requires MP31".into()));
+        }
+        let output = output_tensor(
+            ctx,
+            input.shape().clone(),
+            DType::F8E4M3,
+            crate::workspace::output_buffer(ctx, input.numel())?,
+        );
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_bias_gelu_quant_bf16_e4m3(
+                    tensor_ptr(input)?,
+                    tensor_ptr(bias)?,
+                    tensor_ptr(&output)?,
+                    checked_i32("bias GELU FP8", "rows", rows)?,
+                    checked_i32("bias GELU FP8", "cols", cols)?,
+                    scale,
+                    ctx.stream().handle(),
+                ),
+                "bias_gelu_quant_bf16_e4m3",
+            )?;
+        }
+        Ok(output)
+    }
+}
+
+/// SiLU(gate) * up with a static FP8 output scale.
+pub fn silu_mul_quant_bf16_e4m3(
+    ctx: &MusaContext,
+    gate: &Tensor,
+    up: &Tensor,
+    scale: f32,
+) -> Result<Tensor> {
+    require_dtype_on(ctx, gate, DType::BF16, "SiLU multiply FP8", "gate")?;
+    require_dtype_on(ctx, up, DType::BF16, "SiLU multiply FP8", "up")?;
+    if gate.shape() != up.shape() || gate.numel() == 0 {
+        return Err(Error::Other("SiLU multiply FP8 requires equal non-empty inputs".into()));
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(Error::Other("SiLU multiply FP8 requires a positive scale".into()));
+    }
+    #[cfg(not(apxinf_musa_available))]
+    return Err(native_unavailable("activation::silu_mul_quant_bf16_e4m3"));
+    #[cfg(apxinf_musa_available)]
+    {
+        if crate::MUSA_ARCH != "mp_31"
+            || (ctx.caps().compute_major, ctx.caps().compute_minor) != (3, 1)
+        {
+            return Err(Error::Other("FP8 activation requires MP31".into()));
+        }
+        let output = output_tensor(
+            ctx,
+            gate.shape().clone(),
+            DType::F8E4M3,
+            crate::workspace::output_buffer(ctx, gate.numel())?,
+        );
+        unsafe {
+            check_native(
+                ffi::custom::apxinf_musa_silu_mul_quant_bf16_e4m3(
+                    tensor_ptr(gate)?,
+                    tensor_ptr(up)?,
+                    tensor_ptr(&output)?,
+                    i64::try_from(gate.numel()).map_err(|_| {
+                        Error::Other("MUSA SiLU multiply FP8 element count overflow".into())
+                    })?,
+                    scale,
+                    ctx.stream().handle(),
+                ),
+                "silu_mul_quant_bf16_e4m3",
+            )?;
+        }
+        Ok(output)
+    }
+}
+
 /// Gated GELU: splits `[rows, 2 * half]` into gate and up halves.
 ///
 /// Native: `kernels/custom/activation.cuh`'s grid-stride kernel, through
@@ -312,24 +409,6 @@ pub fn bias_gelu_bf16_packed8(
     _bias: &Tensor,
 ) -> Result<Tensor> {
     Err(not_ported("activation::bias_gelu_bf16_packed8"))
-}
-
-pub fn bias_gelu_quant_bf16_e4m3(
-    _ctx: &MusaContext,
-    _input: &Tensor,
-    _bias: &Tensor,
-    _scale: f32,
-) -> Result<Tensor> {
-    Err(not_ported("activation::bias_gelu_quant_bf16_e4m3"))
-}
-
-pub fn silu_mul_quant_bf16_e4m3(
-    _ctx: &MusaContext,
-    _gate: &Tensor,
-    _up: &Tensor,
-    _scale: f32,
-) -> Result<Tensor> {
-    Err(not_ported("activation::silu_mul_quant_bf16_e4m3"))
 }
 
 /// Bias plus SiLU in FP16.

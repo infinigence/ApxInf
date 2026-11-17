@@ -50,14 +50,49 @@ impl Gr00tActiveStrategy {
         *self.strategy.borrow_mut() = Rc::downgrade(strategy);
     }
 
-    fn invalidate(&self, synchronize: impl FnOnce() -> Result<()>) -> Result<()> {
+    /// Retire the active plan and return its arena for reuse.
+    ///
+    /// Synchronization must succeed before the graph and its arena are
+    /// destroyed. The retired payload is dropped only after the plan's
+    /// `RefCell` borrow ends, so graph destruction never runs under it.
+    #[cfg(feature = "musa")]
+    fn retire(
+        &self,
+        synchronize: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<kernels::GraphWorkspace>> {
         let active = self.strategy.borrow().upgrade();
-        if let Some(active) = active {
-            synchronize()?;
-            *active.borrow_mut() = Gr00tPreparedStrategy::Invalidated;
-        }
+        let Some(active) = active else {
+            *self.strategy.borrow_mut() = Weak::new();
+            return Ok(None);
+        };
+        synchronize()?;
+        let retired = {
+            let mut active = active.try_borrow_mut().map_err(|_| {
+                Error::Other(
+                    "GR00T prepared plan is in use; retry after the current run".into(),
+                )
+            })?;
+            std::mem::replace(&mut *active, Gr00tPreparedStrategy::Invalidated)
+        };
         *self.strategy.borrow_mut() = Weak::new();
-        Ok(())
+        Ok(retired.take_workspace())
+    }
+
+    fn invalidate(&self, synchronize: impl FnOnce() -> Result<()>) -> Result<()> {
+        #[cfg(feature = "musa")]
+        {
+            self.retire(synchronize).map(|_| ())
+        }
+        #[cfg(not(feature = "musa"))]
+        {
+            let active = self.strategy.borrow().upgrade();
+            if let Some(active) = active {
+                synchronize()?;
+                *active.borrow_mut() = Gr00tPreparedStrategy::Invalidated;
+            }
+            *self.strategy.borrow_mut() = Weak::new();
+            Ok(())
+        }
     }
 }
 
@@ -79,6 +114,21 @@ enum Gr00tPreparedStrategy {
         workspace: kernels::GraphWorkspace,
         fallback_reason: Option<String>,
     },
+}
+
+#[cfg(feature = "musa")]
+impl Gr00tPreparedStrategy {
+    /// Consume the plan and return its arena, if it owns one.
+    ///
+    /// A captured graph is destroyed first, so the returned arena carries no
+    /// addresses recorded by the retired plan.
+    fn take_workspace(self) -> Option<kernels::GraphWorkspace> {
+        match self {
+            Gr00tPreparedStrategy::Invalidated | Gr00tPreparedStrategy::RuntimeManaged => None,
+            Gr00tPreparedStrategy::Graph { graph, .. } => Some(graph.into_workspace()),
+            Gr00tPreparedStrategy::NoGraph { workspace, .. } => Some(workspace),
+        }
+    }
 }
 
 impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
@@ -178,12 +228,16 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
         &self,
         input: &Gr00tObservation,
         fallback_reason: Option<String>,
+        reused: Option<kernels::GraphWorkspace>,
     ) -> Result<Gr00tPreparedInference<E>> {
         let engine = self.engine.borrow();
         let key = engine.prepared_key(input)?;
         let token_groups = engine.prepared_token_groups(input)?;
         let inputs = engine.allocate_prepared_inputs(input)?;
-        let workspace = engine.allocate_prepared_workspace()?;
+        let workspace = match reused {
+            Some(workspace) => workspace,
+            None => engine.allocate_prepared_workspace()?,
+        };
         drop(engine);
         Ok(Gr00tPreparedInference {
             spec: InferenceSpec {
@@ -218,8 +272,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
         // Validate before retiring a usable plan. Once construction starts,
         // failure leaves no active plan; a later request can retry safely.
         self.engine.borrow().prepared_key(input)?;
-        self.invalidate_prepared()?;
-        let plan = self.build_prepared_impl(input, policy)?;
+        let reused = self
+            .active_strategy
+            .retire(|| self.engine.borrow().backend().synchronize())?;
+        let plan = self.build_prepared_impl(input, policy, reused)?;
         self.active_strategy.register(&plan.strategy);
         Ok(plan)
     }
@@ -229,12 +285,16 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
         &self,
         input: &Gr00tObservation,
         policy: ExecutionPolicy,
+        reused: Option<kernels::GraphWorkspace>,
     ) -> Result<Gr00tPreparedInference<E>> {
         if policy == ExecutionPolicy::Eager {
-            return self.build_prepared_no_graph(input, None);
+            return self.build_prepared_no_graph(input, None, reused);
         }
 
-        let captured = self.engine.borrow_mut().capture_prepared_graph(input);
+        let captured = self
+            .engine
+            .borrow_mut()
+            .capture_prepared_graph(input, reused);
         match captured {
             Ok((key, graph)) => Ok(Gr00tPreparedInference {
                 spec: InferenceSpec {
@@ -250,7 +310,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tModelRunner<E> {
                 eprintln!(
                     "[apxinf] GR00T MUSA graph capture unavailable, using prepared no_graph: {reason}"
                 );
-                self.build_prepared_no_graph(input, Some(reason))
+                self.build_prepared_no_graph(input, Some(reason), None)
             }
             Err(error) => Err(Error::Other(format!(
                 "GR00T MUSA graph capture is required but failed: {error}"
@@ -461,7 +521,7 @@ impl<E: Gr00tPrecisionExecution> VlaRuntime for Gr00tModelRunner<E> {
     fn clear_prepared(&self) -> Result<()> {
         #[cfg(feature = "musa")]
         {
-            self.invalidate_prepared()?;
+            self.engine.borrow().backend().synchronize()?;
             drop(self.prepared.borrow_mut().take());
             Ok(())
         }
@@ -629,6 +689,17 @@ mod lifecycle_tests {
         registry
             .invalidate(|| panic!("dropped plans need no synchronization"))
             .unwrap();
+    }
+
+    #[cfg(feature = "musa")]
+    #[test]
+    fn plans_without_an_arena_have_no_workspace_to_reuse() {
+        assert!(Gr00tPreparedStrategy::Invalidated
+            .take_workspace()
+            .is_none());
+        assert!(Gr00tPreparedStrategy::RuntimeManaged
+            .take_workspace()
+            .is_none());
     }
 }
 

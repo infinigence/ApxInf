@@ -168,6 +168,23 @@ fn note_general_fallback(tokens: usize, capacity: usize) {
     });
 }
 
+/// Note, once, that a general flash-attention launch failed and the call is
+/// falling back to the general GEMM path.
+///
+/// The fallback is correct and slower. The first failure is logged so a
+/// profile can attribute the slowdown; the error itself is retained at the
+/// call site and included if the fallback also fails.
+#[cfg(apxinf_musa_available)]
+fn note_flash_fallback(operation: &str, error: &Error) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "[apxinf] MUSA {operation}: general flash attention failed ({error}); \
+             falling back to the GEMM path."
+        );
+    });
+}
+
 /// The rule [`note_general_fallback`] states, made refusable.
 ///
 /// A decode-shaped call (fewer query rows than KV rows) that the packed decode
@@ -1263,10 +1280,15 @@ pub fn try_noncausal_batched_equal(
     #[cfg(apxinf_musa_available)]
     {
         let output = bf16_tensor(ctx, &[batch * tokens, n_heads * head_dim])?;
-        launch_general_flash_bf16(
+        match launch_general_flash_bf16(
             ctx, q, k, v, batch, n_heads, n_heads, tokens, tokens, head_dim, false, &output,
-        )?;
-        Ok(Some(output))
+        ) {
+            Ok(()) => Ok(Some(output)),
+            Err(error) => {
+                note_flash_fallback("batched noncausal", &error);
+                Ok(None)
+            }
+        }
     }
     #[cfg(not(apxinf_musa_available))]
     {
@@ -1299,10 +1321,10 @@ pub fn noncausal(
     let output = bf16_tensor(ctx, &[query_tokens, hidden])?;
     #[cfg(apxinf_musa_available)]
     {
-        if bf16_sdpa_mode() != Bf16SdpaMode::Legacy
+        let flash_error = if bf16_sdpa_mode() != Bf16SdpaMode::Legacy
             && general_noncausal_flash_shape(query_tokens, key_tokens, n_heads, head_dim)
         {
-            launch_general_flash_bf16(
+            match launch_general_flash_bf16(
                 ctx,
                 q,
                 k,
@@ -1315,9 +1337,16 @@ pub fn noncausal(
                 head_dim,
                 false,
                 &output,
-            )?;
-            return Ok(output);
-        }
+            ) {
+                Ok(()) => return Ok(output),
+                Err(error) => {
+                    note_flash_fallback("noncausal", &error);
+                    Some(error)
+                }
+            }
+        } else {
+            None
+        };
         launch_noncausal_gemm(
             ctx,
             q,
@@ -1328,7 +1357,14 @@ pub fn noncausal(
             key_tokens,
             n_heads,
             head_dim,
-        )?;
+        )
+        .map_err(|gemm| match flash_error {
+            Some(flash) => Error::Other(format!(
+                "MUSA noncausal attention: flash failed ({flash}); \
+                 GEMM fallback failed ({gemm})"
+            )),
+            None => gemm,
+        })?;
         Ok(output)
     }
     #[cfg(not(apxinf_musa_available))]
@@ -1585,18 +1621,26 @@ pub fn noncausal_strided_qkv(
     #[cfg(apxinf_musa_available)]
     {
         let mode = bf16_sdpa_mode();
+        let mut flash_error = None;
+        let mut qkv_parts = None;
         if mode != Bf16SdpaMode::Legacy
             && general_noncausal_flash_shape(dims[0], dims[0], n_heads, head_dim)
         {
             if mode == Bf16SdpaMode::Direct {
-                launch_packed_qkv_flash_bf16(ctx, qkv, dims[0], n_heads, head_dim, &output)?;
+                match launch_packed_qkv_flash_bf16(ctx, qkv, dims[0], n_heads, head_dim, &output) {
+                    Ok(()) => return Ok(output),
+                    Err(error) => {
+                        note_flash_fallback("strided packed QKV", &error);
+                        flash_error = Some(error);
+                    }
+                }
             } else {
-                let qkv_parts = split_qkv_bias_bf16(ctx, qkv, None, n_heads, head_dim)?;
-                launch_general_flash_bf16(
+                let parts = split_qkv_bias_bf16(ctx, qkv, None, n_heads, head_dim)?;
+                match launch_general_flash_bf16(
                     ctx,
-                    &qkv_parts.q,
-                    &qkv_parts.k,
-                    &qkv_parts.v,
+                    &parts.q,
+                    &parts.k,
+                    &parts.v,
                     1,
                     n_heads,
                     n_heads,
@@ -1605,16 +1649,25 @@ pub fn noncausal_strided_qkv(
                     head_dim,
                     false,
                     &output,
-                )?;
+                ) {
+                    Ok(()) => return Ok(output),
+                    Err(error) => {
+                        note_flash_fallback("strided split QKV", &error);
+                        flash_error = Some(error);
+                        qkv_parts = Some(parts);
+                    }
+                }
             }
-            return Ok(output);
         }
         // The packed form is a regular self-attention problem. Split
         // the three contiguous projections with the native QKV kernel, then
         // use the same GEMM/softmax path as vision attention without its
         // vision-only head-dimension restriction. Unsupported toolchains fail
         // explicitly at the facade instead of taking a host fallback.
-        let qkv_parts = split_qkv_bias_bf16(ctx, qkv, None, n_heads, head_dim)?;
+        let qkv_parts = match qkv_parts {
+            Some(parts) => parts,
+            None => split_qkv_bias_bf16(ctx, qkv, None, n_heads, head_dim)?,
+        };
         launch_noncausal_gemm(
             ctx,
             &qkv_parts.q,
@@ -1625,7 +1678,14 @@ pub fn noncausal_strided_qkv(
             dims[0],
             n_heads,
             head_dim,
-        )?;
+        )
+        .map_err(|gemm| match flash_error {
+            Some(flash) => Error::Other(format!(
+                "MUSA strided QKV attention: flash failed ({flash}); \
+                 GEMM fallback failed ({gemm})"
+            )),
+            None => gemm,
+        })?;
         return Ok(output);
     }
     #[cfg(not(apxinf_musa_available))]
@@ -1831,9 +1891,21 @@ pub fn causal_gqa_prefill_bf16(
         if bf16_sdpa_mode() != Bf16SdpaMode::Legacy
             && general_causal_gqa_flash_shape(tokens, q_heads, k_shape.1, head_dim)
         {
-            launch_general_flash_bf16(
+            match launch_general_flash_bf16(
                 ctx, q, k, v, 1, q_heads, k_shape.1, tokens, tokens, head_dim, true, &output,
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(error) => {
+                    note_flash_fallback("causal GQA", &error);
+                    launch_causal_gqa_gemm(ctx, q, k, v, &output, tokens, q_heads, k_shape.1, head_dim)
+                        .map_err(|gemm| {
+                            Error::Other(format!(
+                                "MUSA causal GQA attention: flash failed ({error}); \
+                                 GEMM fallback failed ({gemm})"
+                            ))
+                        })?;
+                }
+            }
         } else {
             launch_causal_gqa_gemm(ctx, q, k, v, &output, tokens, q_heads, k_shape.1, head_dim)?;
         }

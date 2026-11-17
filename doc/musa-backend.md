@@ -276,10 +276,74 @@ FP8 calibration input is refused by name, and `ModelVariantChoice` rejects
 ## GR00T N1.7 on MUSA
 
 `crates/apxinf-model/src/musa_gr00t/` is the independent MUSA port of the
-GR00T N1.7 model core. Its currently validated slice is BF16 on MP22/M1000 with
+GR00T N1.7 model core. Its BF16 path supports MP22/M1000 and MP31/S5000 with
 batch 1, two camera grids, official preprocessed tensors, explicit initial
-noise, and dynamic text sequence lengths. The loader rejects FP8 and INT8
-instead of selecting another precision.
+noise, and dynamic text sequence lengths. MP31 additionally accepts explicit
+`precision=fp8` with a matching static calibration document. This is selective
+FP8 GEMM, not an all-FP8 model: the model-local Rust policy admits measured
+muDNN NN/NT shapes with at least 5% activation-quantization-plus-GEMM latency
+reduction. Other GEMMs and outputs remain BF16. Text rules use `129..=256`
+rather than an exact 145-token match. `auto` remains BF16; INT8 and non-MP31
+FP8 requests remain unsupported. PI0.5 precision selection is unchanged.
+
+Weights are prepared once in the selected layout. Activation scales are
+calibrated offline; inference converts BF16 activations to E4M3, and muDNN
+restores scales inside GEMM and writes BF16 directly. Existing BF16 fusion
+hooks and packed self-QKV remain enabled. Fused self-QKV uses the largest
+calibrated scale of its three shared-input consumers. No MATE or FP8 ASM
+dependency is introduced. The shape policy is in
+`musa_gr00t/weights/fp8_policy.rs`, not in the shared BF16 dispatcher.
+
+During DiT cross-attention K/V preparation, eligible same-scale FP8 consumers
+share one quantized tensor within the pair. The executor checks both consumers'
+actual shape eligibility; the FP8 weights implement tensor-valued input
+quantization. This does not cache activations across requests or change scales,
+GEMM layouts, BF16 output, or BF16 fallback. A request-local executor cache also
+shares that activation across blocks with the same attention source, exact scale
+and tensor shape. It is not retained on the executor or reused across requests;
+graph replay still executes the producer quantization on the current input.
+`APXINF_GR00T_DISABLE_FP8_KV_CROSS_LAYER=1` retains pair-local reuse, whereas
+`APXINF_GR00T_DISABLE_FP8_KV_REUSE=1` disables both levels. Existing direct-FP8
+eligibility switches can also make either consumer ineligible for reuse.
+
+The MP31 backend also supports static E4M3-output LayerNorm, width-2048
+RMSNorm, adaptive LayerNorm, and cached residual LayerNorm producers
+(width 1024 with single-round bias/residual, width 1536 with two-round bias
+then residual, including adaptive affine). They preserve the BF16 normalized
+rounding in registers before FP8 conversion and keep BF16 hidden output when
+needed. GR00T selects these by the actual consumer's M/N/K and scale, not
+merely by whether FP8 weights exist. Noneligible consumers, QK/mRoPE and
+Flash Attention keep their existing precision. PI0.5 INT8 dispatch is unchanged.
+
+GR00T also admits two fusion-only NT consumers: even-index DiT cross-attention
+Query at `41x1536x1536`, and the final output projection at `41x1024x1536`.
+Their eligibility requires both the consumer name and shape; only direct FP8
+Norm input enables these extra cases. BF16 input retains BF16 GEMM, and the
+same-shaped attention output projections are not admitted. Existing generic
+shape rules, including the M=512 projection, remain unchanged.
+
+Production calibration must match checkpoint identity and complete consumer
+coverage. A `fixed-input-benchmark`, `production=false` document is refused
+unless `APXINF_GR00T_ALLOW_BENCHMARK_CALIBRATION=1` is explicitly set; that
+escape hatch logs a warning and is only for fixed-input experiments, not
+task-quality or deployment validation.
+
+GR00T MP31 FP8 diagnostic controls are documented in
+[the script guide](../scripts/gr00t/README.md#fp8-diagnostic-switches).
+FP8 weights own load-time GEMM exclusions and direct-producer eligibility;
+the executor additionally controls K/V sharing. Both use the shared FP8 switch
+parser: `1`/`true` disables, `0`/`false` or unset enables, and invalid values fail
+explicitly. Text QKV checks the same
+shape-aware Norm eligibility rather than bypassing it via activation-scale
+presence. Q10's activation switch changes producers only, not the FP8 GEMM
+policy. BF16 execution does not read these FP8 weight controls.
+
+Vision Bias+GELU resolves its named FC2 consumer, whose tensor-valued FP8 hook
+checks prepared weights, activation dtype and consumer shape policy. The FC2
+matmul consumes that tensor without a second quantization; ineligible consumers
+keep the BF16 callback. Block, primary merger and deepstack consumers use their
+own existing calibration scales. `APXINF_GR00T_DISABLE_FP8_VISION_GELU=1`
+isolates this producer fusion without changing DiT GELU or GEMM precision.
 
 The backend keeps exact-shape acceleration behind model-neutral dispatchers.
 Measured GEMM variants, the MP22 scalar M=1 GEMV, muDNN attention, fused
@@ -287,16 +351,20 @@ residual/norm operations, and precomputed text/vision rotary tables are used
 only when their complete shape predicates match; otherwise the existing
 generic device path remains the fallback. The GEMV route is limited to the two
 measured steady-state shapes `(1,1024,132)` and `(1,1536,1024)`. In particular,
-the optimized text interval is
-`128 < sequence_length <= 256`, not an exact 145-token contract.
+the kernel predicates cover 129/141/145/255/256 tokens, while end-to-end
+validation is limited to the 145-token profile. Not validated: S5000 (MP31),
+single-camera input, and other sequence lengths.
 
 Use `scripts/gr00t/bench_apxinf_musa_rust.py` to launch the native Rust benchmark and apply
 the BF16 parity gate. The script does not execute the model in Python. See
 [GR00T N1.7](gr00t-n1.7.md#musa-bf16) for the fixed-input contract and command.
 The MUSA GR00T loader accepts a tactics JSON file through `--tactics`.
 For direct in-process use of the installed Python wheel, use
-`scripts/gr00t/bench_apxinf_musa_wheel.py`; its timing also includes NumPy/PyO3
-conversion. Both scripts accept the same preprocessed fixture.
+`scripts/gr00t/bench_apxinf_musa_wheel.py`; its v4 report separates Rust-internal
+model timing from `api_latency_ms`, which includes NumPy/PyO3 conversion.
+The wheel uses the additive `_infer_preprocessed_timed` diagnostic entry;
+existing policy calls and their timing fields keep their original boundaries.
+Both scripts accept the same preprocessed fixture.
 Use `--autotune --tactics path_to/tactics.json` to measure missing BF16 GEMM
 choices before Graph capture. Exact assembly routes retain their existing
 dispatch; other supported BF16 shapes tune between muBLAS and muDNN.

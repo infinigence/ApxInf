@@ -1,21 +1,24 @@
 //! Normalization operator contracts.
 
-use apxinf_core::{Error, Result, Tensor};
+use apxinf_core::{Result, Tensor};
 
+mod fp8;
+pub use fp8::{norm_quantized, Fp8Norm, Fp8NormResidual};
+
+use super::contracts::{
+    bf16_output, matrix_tensor, require_matrix_bf16, require_output_matrix, require_positive_eps,
+    require_vector_at_least_bf16, require_vector_bf16,
+};
 #[cfg(apxinf_musa_available)]
 use super::contracts::{checked_i32, tensor_ptr};
-use super::contracts::{
-    bf16_output, matrix_tensor, require_matrix_bf16, require_output_matrix,
-    require_positive_eps, require_vector_at_least_bf16, require_vector_bf16,
-};
 use crate::context::MusaContext;
 #[cfg(apxinf_musa_available)]
 use crate::ffi;
-use crate::kernels::not_ported;
 #[cfg(apxinf_musa_available)]
 use crate::kernels::check_native;
 #[cfg(not(apxinf_musa_available))]
 use crate::kernels::native_unavailable;
+use crate::kernels::not_ported;
 
 /// BF16 RMS normalization over the last axis.
 ///
@@ -165,6 +168,7 @@ pub fn layer_bf16_into(
     output: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
+    require_positive_eps(eps, "layer_norm")?;
     let (rows, cols) = require_matrix_bf16(ctx, input, "layer_norm", "input")?;
     require_vector_bf16(ctx, weight, cols, "layer_norm", "weight")?;
     require_vector_bf16(ctx, bias, cols, "layer_norm", "bias")?;
@@ -258,6 +262,7 @@ pub fn adaptive_rms_bf16_into(
     output: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
+    require_positive_eps(eps, "adaptive_rms_norm")?;
     let (rows, cols) = require_matrix_bf16(ctx, input, "adaptive_rms_norm", "input")?;
     require_vector_at_least_bf16(ctx, style, 2 * cols, "adaptive_rms_norm", "style")?;
     require_output_matrix(ctx, output, rows, cols, "adaptive_rms_norm", "normalized")?;
@@ -315,27 +320,33 @@ fn launch_adaptive_rms(
     Err(native_unavailable("norm::adaptive_rms_bf16"))
 }
 
-// ── FP8-output normalization (not ported) ────────────────────────────────
-
 pub fn rms_quant_bf16_e4m3(
-    _ctx: &MusaContext,
-    _input: &Tensor,
-    _weight: &Tensor,
-    _eps: f32,
-    _scale: f32,
+    ctx: &MusaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+    scale: f32,
 ) -> Result<Tensor> {
-    Err(not_ported("norm::rms_quant_bf16_e4m3"))
+    Ok(norm_quantized(ctx, input, Fp8Norm::Rms { weight }, None, eps, scale)?.1)
 }
 
 pub fn layer_quant_bf16_e4m3(
-    _ctx: &MusaContext,
-    _input: &Tensor,
-    _weight: &Tensor,
-    _bias: &Tensor,
-    _eps: f32,
-    _scale: f32,
+    ctx: &MusaContext,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f32,
+    scale: f32,
 ) -> Result<Tensor> {
-    Err(not_ported("norm::layer_quant_bf16_e4m3"))
+    Ok(norm_quantized(
+        ctx,
+        input,
+        Fp8Norm::Layer { weight, bias },
+        None,
+        eps,
+        scale,
+    )?
+    .1)
 }
 
 // ── FP8-output normalization (not ported) ────────────────────────────────
@@ -436,11 +447,7 @@ pub fn adaptive_layer(
         "adaptive LayerNorm",
         "modulation",
     )?;
-    if !eps.is_finite() || eps <= 0.0 {
-        return Err(Error::Other(
-            "MUSA adaptive LayerNorm needs positive finite epsilon".into(),
-        ));
-    }
+    require_positive_eps(eps, "adaptive LayerNorm")?;
     let output = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
     #[cfg(apxinf_musa_available)]
     {
@@ -493,7 +500,9 @@ mod tests {
         let mut worst = 0.0f32;
         for row in 0..rows {
             let base = row * cols;
-            let sum: f32 = (0..cols).map(|c| input_values[base + c] * input_values[base + c]).sum();
+            let sum: f32 = (0..cols)
+                .map(|c| input_values[base + c] * input_values[base + c])
+                .sum();
             let inverse_rms = 1.0 / (sum / cols as f32 + EPS).sqrt();
             for col in 0..cols {
                 let expected = round(input_values[base + col] * inverse_rms * weight_values[col]);
@@ -506,7 +515,9 @@ mod tests {
                 );
             }
         }
-        println!("  rms_norm [{rows:>4} x {cols:>4}]  worst abs {worst:.3e} (gate {tolerance:.3e})");
+        println!(
+            "  rms_norm [{rows:>4} x {cols:>4}]  worst abs {worst:.3e} (gate {tolerance:.3e})"
+        );
     }
 
     #[test]
@@ -552,11 +563,14 @@ mod tests {
         let mut worst = 0.0f32;
         for row in 0..rows {
             let base = row * cols;
-            let sum: f32 = (0..cols).map(|c| input_values[base + c] * input_values[base + c]).sum();
+            let sum: f32 = (0..cols)
+                .map(|c| input_values[base + c] * input_values[base + c])
+                .sum();
             let inverse_rms = 1.0 / (sum / cols as f32 + EPS).sqrt();
             for col in 0..cols {
                 let normalized = input_values[base + col] * inverse_rms;
-                let expected = round(normalized * (1.0 + style_values[col]) + style_values[cols + col]);
+                let expected =
+                    round(normalized * (1.0 + style_values[col]) + style_values[cols + col]);
                 let error = (got[base + col] - expected).abs();
                 worst = worst.max(error);
                 assert!(
@@ -598,12 +612,16 @@ mod tests {
             let base = row * cols;
             let row_values = &input_values[base..base + cols];
             let mean = row_values.iter().sum::<f32>() / cols as f32;
-            let variance =
-                row_values.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / cols as f32;
+            let variance = row_values
+                .iter()
+                .map(|v| (v - mean) * (v - mean))
+                .sum::<f32>()
+                / cols as f32;
             let inverse_std = 1.0 / (variance + EPS).sqrt();
             for col in 0..cols {
-                let expected =
-                    round((row_values[col] - mean) * inverse_std * weight_values[col] + bias_values[col]);
+                let expected = round(
+                    (row_values[col] - mean) * inverse_std * weight_values[col] + bias_values[col],
+                );
                 let error = (got[base + col] - expected).abs();
                 worst = worst.max(error);
                 assert!(
@@ -622,7 +640,9 @@ mod tests {
         // the *recorded* output -- torch's own reduction, not this one -- is
         // what bounds the kernel itself, and it lands at 7.6e-6 against a 9.7e-2
         // gate.
-        println!("  layer_norm [{rows:>4} x {cols:>4}]  worst abs {worst:.3e} (gate {tolerance:.3e})");
+        println!(
+            "  layer_norm [{rows:>4} x {cols:>4}]  worst abs {worst:.3e} (gate {tolerance:.3e})"
+        );
     }
 
     #[test]

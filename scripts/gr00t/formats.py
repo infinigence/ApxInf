@@ -40,6 +40,14 @@ def normalize_noise(values: np.ndarray) -> np.ndarray:
     return values
 
 
+def fixture_bf16_bits(values: np.ndarray) -> np.ndarray:
+    values = decode_float_array(values, "fixture BF16 input")
+    bits = values.view(np.uint32)
+    if np.any(bits & 0xFFFF):
+        raise ValueError("fixture values must be exactly representable as BF16")
+    return np.ascontiguousarray((bits >> 16).astype(np.uint16))
+
+
 def normalize_actions(values: np.ndarray, name: str = "normalized_actions") -> np.ndarray:
     values = decode_float_array(values, name)
     if values.ndim == 3 and values.shape[0] == 1:
@@ -61,6 +69,19 @@ def load_noise(path: Path) -> np.ndarray:
     raise ValueError(f"{path} must be .npy or .npz")
 
 
+def load_metadata(path: Path) -> dict[str, str]:
+    """Return the optional model/schema metadata of a JSON archive."""
+    path = path.expanduser().resolve()
+    if path.suffix != ".json":
+        return {}
+    document = json.loads(path.read_text())
+    return {
+        key: document[key]
+        for key in ("model", "schema")
+        if isinstance(document.get(key), str)
+    }
+
+
 def checked_shape(shape: object, name: str) -> tuple[int, ...]:
     if not isinstance(shape, list) or not shape or any(
         type(dimension) is not int or dimension <= 0 for dimension in shape
@@ -69,7 +90,12 @@ def checked_shape(shape: object, name: str) -> tuple[int, ...]:
     return tuple(shape)
 
 
-def load_archive(path: Path) -> dict[str, np.ndarray]:
+def load_archive(
+    path: Path,
+    *,
+    expect_model: str | None = None,
+    expect_schema_prefix: str | None = None,
+) -> dict[str, np.ndarray]:
     path = path.expanduser().resolve()
     if path.suffix == ".npy":
         return {"normalized_actions": normalize_actions(np.load(path, allow_pickle=False))}
@@ -95,7 +121,34 @@ def load_archive(path: Path) -> dict[str, np.ndarray]:
             raise ValueError(f"{path} output.values must be numeric and match output.shape")
         with np.errstate(over="ignore", invalid="ignore"):
             values = values.astype(np.float32).reshape(shape)
-        return {"normalized_actions": normalize_actions(values)}
+        result = {"normalized_actions": normalize_actions(values)}
+        if "noise" in document:
+            noise = document["noise"]
+            if not isinstance(noise, dict):
+                raise ValueError(f"{path} noise must be an object with shape and values")
+            try:
+                noise_shape = checked_shape(noise["shape"], "noise")
+                noise_values = np.asarray(noise["values"])
+            except (KeyError, TypeError) as error:
+                raise ValueError(f"{path} noise requires shape and values") from error
+            if noise_values.dtype.kind not in "fiu" or noise_values.size != math.prod(noise_shape):
+                raise ValueError(f"{path} noise.values must be numeric and match noise.shape")
+            with np.errstate(over="ignore", invalid="ignore"):
+                noise_values = noise_values.astype(np.float32).reshape(noise_shape)
+            result["noise"] = normalize_noise(noise_values)
+        model = document.get("model")
+        if expect_model is not None and model is not None:
+            if not isinstance(model, str) or model != expect_model:
+                raise ValueError(
+                    f"{path} model {model!r} does not match expected {expect_model!r}"
+                )
+        schema = document.get("schema")
+        if expect_schema_prefix is not None and schema is not None:
+            if not isinstance(schema, str) or not schema.startswith(expect_schema_prefix):
+                raise ValueError(
+                    f"{path} schema {schema!r} does not match prefix {expect_schema_prefix!r}"
+                )
+        return result
     raise ValueError(f"{path} must be .npy, .npz or .json")
 
 

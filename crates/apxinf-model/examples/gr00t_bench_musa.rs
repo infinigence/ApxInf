@@ -135,7 +135,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut samples = Vec::with_capacity(args.iterations);
-    let mut last_output = Vec::new();
+    let mut first_output: Option<Vec<f32>> = None;
+    let mut deterministic = true;
+    let mut repeat_max_abs = 0.0_f64;
     let mut sample_details = Vec::with_capacity(args.iterations);
     for iteration in 0..args.iterations {
         let request = input.request();
@@ -143,16 +145,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let output = model.infer_host_f32(&request)?;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
         samples.push(elapsed_ms);
-        last_output = output.clone();
+        match &first_output {
+            Some(first) => {
+                if first != &output {
+                    deterministic = false;
+                }
+                for (left, right) in first.iter().zip(&output) {
+                    repeat_max_abs = repeat_max_abs
+                        .max((f64::from(*left) - f64::from(*right)).abs());
+                }
+            }
+            None => first_output = Some(output.clone()),
+        }
         sample_details.push(serde_json::json!({
             "iteration": iteration,
             "fixture": input.name,
             "token_count": input.observation.token_ids.len(),
             "latency_ms": elapsed_ms,
         }));
-        black_box(&last_output);
+        black_box(&output);
     }
     let summary = latency_summary(&samples)?;
+    let reported_output = first_output.unwrap_or_default();
     let [horizon, action_dim] = model.vla()?.action_shape();
     let report = serde_json::json!({
         "schema": "apxinf.gr00t-n1.7.benchmark.v2",
@@ -168,6 +182,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "warmup": args.warmup,
         "iterations": args.iterations,
         "load_ms": load_ms,
+        "deterministic": deterministic,
+        "repeat_normalized_max_abs": repeat_max_abs,
+        "noise": {
+            "shape": input.noise.shape().dims(),
+            "values": input.noise.to_f32_vec()?,
+        },
         "latency_ms": summary,
         "samples_detail": sample_details,
         "input": {
@@ -179,10 +199,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         "output": {
             "shape": [horizon, action_dim],
-            "sum": last_output.iter().copied().map(f64::from).sum::<f64>(),
-            "head": last_output.iter().take(16).copied().collect::<Vec<_>>(),
-            "values": last_output,
+            "sum": reported_output.iter().copied().map(f64::from).sum::<f64>(),
+            "head": reported_output.iter().take(16).copied().collect::<Vec<_>>(),
+            "values": reported_output,
         },
+        "model": "gr00t",
     });
     let rendered = serde_json::to_string_pretty(&report)?;
     if let Some(path) = args.output {
@@ -190,6 +211,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("wrote {}", path.display());
     } else {
         println!("{rendered}");
+    }
+    if !deterministic {
+        return Err(format!(
+            "GR00T benchmark outputs are not deterministic; max abs drift {repeat_max_abs}"
+        )
+        .into());
     }
     Ok(())
 }
@@ -372,10 +399,23 @@ fn entry(
             value.and_then(|value| usize::try_from(value).map_err(|error| error.to_string()))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(TensorEntry {
-        path: root.join(string(value, "file")?),
-        shape,
-    })
+    let root = root.canonicalize().map_err(|error| {
+        format!(
+            "fixture directory {} is not readable: {error}",
+            root.display()
+        )
+    })?;
+    let path = root.join(string(value, "file")?);
+    let path = path.canonicalize().map_err(|error| {
+        format!(
+            "fixture tensor {name} path {} is not readable: {error}",
+            path.display()
+        )
+    })?;
+    if !path.starts_with(&root) {
+        return Err(format!("fixture tensor {name} escapes fixture directory").into());
+    }
+    Ok(TensorEntry { path, shape })
 }
 
 fn read_bf16(entry: &TensorEntry) -> Result<Tensor, Box<dyn std::error::Error>> {
@@ -396,6 +436,13 @@ fn read_bf16(entry: &TensorEntry) -> Result<Tensor, Box<dyn std::error::Error>> 
         .chunks_exact(2)
         .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])))
         .collect::<Vec<_>>();
+    if let Some(value) = values.iter().find(|value| !value.is_finite()) {
+        return Err(format!(
+            "{} contains non-finite BF16 value {value}",
+            entry.path.display()
+        )
+        .into());
+    }
     Ok(Tensor::from_bf16(entry.shape.clone(), &values)?)
 }
 

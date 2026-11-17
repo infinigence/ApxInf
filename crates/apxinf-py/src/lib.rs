@@ -30,11 +30,12 @@
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use numpy::ndarray::{Array1, Array2};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
-    PyUntypedArrayMethods,
+    IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArrayDyn, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -42,9 +43,9 @@ use pyo3::types::{PyDict, PyList};
 
 use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::{
-    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout, LoadOptions,
-    LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer, SyntheticWeights,
-    VisionObservation, VlaContract, VlaMetadata, VlaRequest,
+    AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout,
+    LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer,
+    SyntheticWeights, VisionObservation, VlaContract, VlaMetadata, VlaRequest,
 };
 use apxinf_tokenizer::{SentencePieceTokenizer as NativeSentencePiece, Tokenizer as NativeHf};
 
@@ -439,6 +440,46 @@ struct PreprocessedVlaInput {
     embodiment_id: Option<usize>,
 }
 
+#[derive(FromPyObject)]
+enum PreprocessedFloatArray<'py> {
+    F32(PyReadonlyArrayDyn<'py, f32>),
+    Bf16Bits(PyReadonlyArrayDyn<'py, u16>),
+}
+
+impl PreprocessedFloatArray<'_> {
+    fn shape(&self) -> &[usize] {
+        match self {
+            Self::F32(array) => array.shape(),
+            Self::Bf16Bits(array) => array.shape(),
+        }
+    }
+
+    fn tensor(&self, name: &str) -> PyResult<Tensor> {
+        let dtype = match self {
+            Self::F32(_) => "float32",
+            Self::Bf16Bits(_) => "BF16 uint16 bits",
+        };
+        let contiguous_error =
+            |_| PyValueError::new_err(format!("{name} must be C-contiguous {dtype}"));
+        let shape = Shape::new(self.shape().to_vec());
+        match self {
+            Self::F32(array) => {
+                Tensor::from_f32(shape, array.as_slice().map_err(contiguous_error)?)
+            }
+            Self::Bf16Bits(array) => {
+                let bytes = array
+                    .as_slice()
+                    .map_err(contiguous_error)?
+                    .iter()
+                    .flat_map(|bits| bits.to_ne_bytes())
+                    .collect();
+                Tensor::from_raw(shape, DType::BF16, Device::Cpu, bytes)
+            }
+        }
+        .map_err(runtime_err)
+    }
+}
+
 impl ModelRunner {
     /// Shared front half of every RGB entry point. Bytes are checked against
     /// the request grids when given (one still frame per view, any patch
@@ -637,16 +678,68 @@ impl ModelRunner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn run_preprocessed(
+        &self,
+        input: PreprocessedVlaInput,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
+        timed: bool,
+    ) -> PyResult<(Vec<f32>, f64)> {
+        use apxinf_model::vla::{PlanningOptions, ReasoningOptions};
+        let reasoning = match max_new_tokens {
+            Some(max_new_tokens) => Some(ReasoningOptions {
+                max_new_tokens,
+                min_new_tokens,
+                terminator_ids: terminator_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires terminator_ids"))?,
+                closing_ids: closing_ids
+                    .ok_or_else(|| PyValueError::new_err("reasoning requires closing_ids"))?,
+            }),
+            None => {
+                if min_new_tokens != 0 || terminator_ids.is_some() || closing_ids.is_some() {
+                    return Err(PyValueError::new_err(
+                        "reasoning options require max_new_tokens",
+                    ));
+                }
+                None
+            }
+        };
+        let options = PlanningOptions {
+            num_steps,
+            reasoning,
+            raw_rgb_resize: None,
+        };
+        let metadata = VlaMetadata {
+            attention_mask: Some(&input.attention_mask),
+            image_grid_thw: Some(&input.image_grid_thw),
+            embodiment_id: input.embodiment_id,
+            planning: (options.num_steps.is_some() || options.reasoning.is_some())
+                .then_some(&options),
+        };
+        let request =
+            VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
+        let started = timed.then(Instant::now);
+        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
+        let model_ms = started
+            .map(|started| started.elapsed().as_secs_f64() * 1_000.0)
+            .unwrap_or(0.0);
+        Ok((flat, model_ms))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn preprocessed_vla_input<'py>(
         &self,
         method: &str,
-        pixel_values: PyReadonlyArray2<'py, f32>,
+        pixel_values: PreprocessedFloatArray<'py>,
         image_grid_thw: PyReadonlyArray2<'py, u32>,
         token_ids: PyReadonlyArray1<'py, u32>,
         attention_mask: PyReadonlyArray1<'py, u8>,
-        state: PyReadonlyArrayDyn<'py, f32>,
+        state: PreprocessedFloatArray<'py>,
         embodiment_id: Option<usize>,
-        noise: PyReadonlyArrayDyn<'py, f32>,
+        noise: PreprocessedFloatArray<'py>,
     ) -> PyResult<PreprocessedVlaInput> {
         let pixels_shape = pixel_values.shape();
         if pixels_shape.len() != 2 || pixels_shape[0] == 0 || pixels_shape[1] == 0 {
@@ -700,24 +793,8 @@ impl ModelRunner {
             .chunks_exact(3)
             .map(|row| [row[0], row[1], row[2]])
             .collect::<Vec<_>>();
-        let pixels = Tensor::from_f32(
-            Shape::new(pixels_shape.to_vec()),
-            pixel_values.as_slice().map_err(|_| {
-                PyValueError::new_err(format!(
-                    "apxinf_py.{method}: pixel_values must be C-contiguous float32"
-                ))
-            })?,
-        )
-        .map_err(runtime_err)?;
-        let state = Tensor::from_f32(
-            Shape::new(state.shape().to_vec()),
-            state.as_slice().map_err(|_| {
-                PyValueError::new_err(format!(
-                    "apxinf_py.{method}: state must be C-contiguous float32"
-                ))
-            })?,
-        )
-        .map_err(runtime_err)?;
+        let pixels = pixel_values.tensor(&format!("apxinf_py.{method}: pixel_values"))?;
+        let state = state.tensor(&format!("apxinf_py.{method}: state"))?;
         let [horizon, action_dim] = self.action_shape();
         let noise_shape = noise.shape();
         if noise_shape != [horizon, action_dim] && noise_shape != [1, horizon, action_dim] {
@@ -725,15 +802,7 @@ impl ModelRunner {
                 "apxinf_py.{method}: noise expected [{horizon}, {action_dim}] or [1, {horizon}, {action_dim}], got {noise_shape:?}"
             )));
         }
-        let latent = Tensor::from_f32(
-            Shape::new(noise_shape.to_vec()),
-            noise.as_slice().map_err(|_| {
-                PyValueError::new_err(format!(
-                    "apxinf_py.{method}: noise must be C-contiguous float32"
-                ))
-            })?,
-        )
-        .map_err(runtime_err)?;
+        let latent = noise.tensor(&format!("apxinf_py.{method}: noise"))?;
         Ok(PreprocessedVlaInput {
             observation: Observation {
                 vision: VisionObservation::Patches(pixels),
@@ -1377,6 +1446,56 @@ impl ModelRunner {
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let input = self.preprocessed_vla_input(
             "_infer_preprocessed",
+            PreprocessedFloatArray::F32(pixel_values.to_dyn().readonly()),
+            image_grid_thw,
+            token_ids,
+            attention_mask,
+            PreprocessedFloatArray::F32(state),
+            embodiment_id,
+            PreprocessedFloatArray::F32(noise),
+        )?;
+        let (flat, _) = self.run_preprocessed(
+            input,
+            num_steps,
+            max_new_tokens,
+            min_new_tokens,
+            terminator_ids,
+            closing_ids,
+            false,
+        )?;
+        self.action_array(py, flat)
+    }
+
+    #[pyo3(name = "_infer_preprocessed_timed", signature = (
+        pixel_values,
+        image_grid_thw,
+        token_ids,
+        attention_mask,
+        state,
+        embodiment_id,
+        noise,
+        *, num_steps=None, max_new_tokens=None, min_new_tokens=0,
+        terminator_ids=None, closing_ids=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn infer_preprocessed_timed<'py>(
+        &self,
+        py: Python<'py>,
+        pixel_values: PreprocessedFloatArray<'py>,
+        image_grid_thw: PyReadonlyArray2<'py, u32>,
+        token_ids: PyReadonlyArray1<'py, u32>,
+        attention_mask: PyReadonlyArray1<'py, u8>,
+        state: PreprocessedFloatArray<'py>,
+        embodiment_id: Option<usize>,
+        noise: PreprocessedFloatArray<'py>,
+        num_steps: Option<usize>,
+        max_new_tokens: Option<usize>,
+        min_new_tokens: usize,
+        terminator_ids: Option<Vec<u32>>,
+        closing_ids: Option<Vec<u32>>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, f64)> {
+        let input = self.preprocessed_vla_input(
+            "_infer_preprocessed_timed",
             pixel_values,
             image_grid_thw,
             token_ids,
@@ -1385,41 +1504,16 @@ impl ModelRunner {
             embodiment_id,
             noise,
         )?;
-        use apxinf_model::vla::{PlanningOptions, ReasoningOptions};
-        let reasoning = match max_new_tokens {
-            Some(max_new_tokens) => Some(ReasoningOptions {
-                max_new_tokens,
-                min_new_tokens,
-                terminator_ids: terminator_ids
-                    .ok_or_else(|| PyValueError::new_err("reasoning requires terminator_ids"))?,
-                closing_ids: closing_ids
-                    .ok_or_else(|| PyValueError::new_err("reasoning requires closing_ids"))?,
-            }),
-            None => {
-                if min_new_tokens != 0 || terminator_ids.is_some() || closing_ids.is_some() {
-                    return Err(PyValueError::new_err(
-                        "reasoning options require max_new_tokens",
-                    ));
-                }
-                None
-            }
-        };
-        let options = PlanningOptions {
+        let (flat, model_ms) = self.run_preprocessed(
+            input,
             num_steps,
-            reasoning,
-            raw_rgb_resize: None,
-        };
-        let metadata = VlaMetadata {
-            attention_mask: Some(&input.attention_mask),
-            image_grid_thw: Some(&input.image_grid_thw),
-            embodiment_id: input.embodiment_id,
-            planning: (options.num_steps.is_some() || options.reasoning.is_some())
-                .then_some(&options),
-        };
-        let request =
-            VlaRequest::provided_with_metadata(&input.observation, &input.latent, metadata);
-        let flat = self.model.infer_host_f32(&request).map_err(runtime_err)?;
-        self.action_array(py, flat)
+            max_new_tokens,
+            min_new_tokens,
+            terminator_ids,
+            closing_ids,
+            true,
+        )?;
+        Ok((self.action_array(py, flat)?, model_ms))
     }
 
     /// Snapshot contiguous uint8 frames at the old concatenate point. The
@@ -1567,13 +1661,13 @@ impl ModelRunner {
     ) -> PyResult<BTreeMap<String, f32>> {
         let input = self.preprocessed_vla_input(
             "_calibrate_preprocessed",
-            pixel_values,
+            PreprocessedFloatArray::F32(pixel_values.to_dyn().readonly()),
             image_grid_thw,
             token_ids,
             attention_mask,
-            state,
+            PreprocessedFloatArray::F32(state),
             Some(embodiment_id),
-            noise,
+            PreprocessedFloatArray::F32(noise),
         )?;
         let metadata = VlaMetadata {
             attention_mask: Some(&input.attention_mask),
@@ -1954,8 +2048,45 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(test)]
+mod preprocessed_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preprocessed_float_arrays_preserve_dtype_and_bits() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let bits = Array1::from_vec(vec![0x3f80_u16, 0xbf80, 0x8000, 0x0001])
+                .into_dyn()
+                .into_pyarray_bound(py);
+            let input = bits.extract::<PreprocessedFloatArray<'_>>().unwrap();
+            let tensor = input.tensor("pixels").unwrap();
+            assert_eq!(tensor.dtype(), DType::BF16);
+            assert_eq!(
+                tensor
+                    .as_bf16()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                vec![0x3f80, 0xbf80, 0x8000, 0x0001]
+            );
+            let floats = Array1::from_vec(vec![1.0_f32, -1.0, 1.0001])
+                .into_dyn()
+                .into_pyarray_bound(py);
+            let input = floats.extract::<PreprocessedFloatArray<'_>>().unwrap();
+            let tensor = input.tensor("pixels").unwrap();
+            assert_eq!(tensor.dtype(), DType::F32);
+            assert_eq!(tensor.to_f32_vec().unwrap(), vec![1.0, -1.0, 1.0001]);
+            let locals = PyDict::new_bound(py);
+            locals.set_item("bits", &bits).unwrap();
+            let strided = py.eval_bound("bits[::2]", None, Some(&locals)).unwrap();
+            let input = strided.extract::<PreprocessedFloatArray<'_>>().unwrap();
+            assert!(input.tensor("pixels").is_err());
+        });
+    }
 
     mod decision {
         use super::*;

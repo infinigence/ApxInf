@@ -13,6 +13,9 @@ pub(crate) struct Gr00tBf16LinearWeights {
 }
 
 impl Gr00tBf16LinearWeights {
+    pub(super) fn from_device(weights: Gr00tLinearWeights, calibration_name: String) -> Self {
+        Self { weights, calibration_name }
+    }
     pub(crate) fn from_host(
         weights: Gr00tLinearWeights,
         calibration_name: impl Into<String>,

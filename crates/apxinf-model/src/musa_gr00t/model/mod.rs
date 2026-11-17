@@ -4,6 +4,7 @@ pub(super) mod calibration;
 pub(super) mod executor;
 pub(super) mod linear;
 pub(super) mod precision;
+pub(super) mod fp8;
 
 // Keep the implementation modules shallow while the family remains fully
 // self-contained. These aliases are private to `musa_gr00t::model`.

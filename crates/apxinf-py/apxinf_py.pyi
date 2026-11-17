@@ -13,6 +13,7 @@ class HfTokenizer:
     @staticmethod
     def from_file(path: str) -> "HfTokenizer": ...
     def encode(self, text: str) -> list[int]: ...
+    def encode_with_special_tokens(self, text: str, add_special_tokens: bool) -> list[int]: ...
     def decode(self, token_ids: list[int]) -> str: ...
     def add_tokens(self, tokens: list[str]) -> int: ...
     def token_to_id(self, token: str) -> int | None: ...
@@ -97,6 +98,29 @@ class ModelRunner:
         closing_ids: list[int] | None = None,
     ) -> npt.NDArray[np.float32]:
         """Private L0 path for processor-produced typed VLA inputs."""
+        ...
+
+    def _infer_preprocessed_timed(
+        self,
+        pixel_values: npt.NDArray[np.float32] | npt.NDArray[np.uint16],
+        image_grid_thw: npt.NDArray[np.uint32],
+        token_ids: npt.NDArray[np.uint32],
+        attention_mask: npt.NDArray[np.uint8],
+        state: npt.NDArray[np.float32] | npt.NDArray[np.uint16],
+        embodiment_id: int | None,
+        noise: npt.NDArray[np.float32] | npt.NDArray[np.uint16],
+        *,
+        num_steps: int | None = None,
+        max_new_tokens: int | None = None,
+        min_new_tokens: int = 0,
+        terminator_ids: list[int] | None = None,
+        closing_ids: list[int] | None = None,
+    ) -> tuple[npt.NDArray[np.float32], float]:
+        """Diagnostic L0 path; uint16 means raw BF16 bits, not integer-valued data.
+
+        Returns actions and Rust model milliseconds, excluding binding conversion.
+        F32 callers still pay model-internal F32-to-BF16 conversion when required.
+        """
         ...
 
     @staticmethod

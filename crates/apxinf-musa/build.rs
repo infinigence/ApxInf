@@ -821,6 +821,9 @@ fn compile_kernels(
         if stream_device {
             command.arg("-DAPXINF_MUSA_HAS_STREAM_DEVICE");
         }
+        if arch.mcc_arch == "mp_31" {
+            command.arg("-DAPXINF_MUSA_MP31_FP8");
+        }
         if tree.vendor_flags {
             command.args(VENDOR_FMHA_FLAGS);
         } else {

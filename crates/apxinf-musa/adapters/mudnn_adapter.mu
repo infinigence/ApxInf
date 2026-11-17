@@ -95,6 +95,49 @@ struct Matmul {
     check(operation.SetDeterministic(true));
   }
 };
+#ifdef APXINF_MUSA_MP31_FP8
+struct Fp8Matmul {
+  struct FreeBuffer { void operator()(void* pointer) const { musaFree(pointer); } };
+  md::Tensor activation, weight, output, bias, scales[4];
+  md::BatchMatMul operation;
+  md::MatMulLtParam parameters;
+  Scratch scratch;
+  std::unique_ptr<void, FreeBuffer> constants;
+  Fp8Matmul(int rows, int cols, int inner, bool transpose, musaStream_t stream)
+      : scratch(stream) {
+    void* allocation = nullptr;
+    const size_t bytes = 4 * sizeof(float) + size_t(cols) * 2;
+    if (musaMalloc(&allocation, bytes) != musaSuccess)
+      throw StatusError{kStatusAllocationFailed};
+    constants.reset(allocation);
+    const float units[] = {1, 1, 1, 1};
+    if (musaMemset(allocation, 0, bytes) != musaSuccess ||
+        musaMemcpy(allocation, units, sizeof(units), musaMemcpyHostToDevice) != musaSuccess)
+      throw StatusError{kStatusUnknown};
+    check(activation.SetType(md::Tensor::Type::FP8_E4M3));
+    check(weight.SetType(md::Tensor::Type::FP8_E4M3));
+    check(output.SetType(md::Tensor::Type::BFLOAT16));
+    check(bias.SetType(md::Tensor::Type::BFLOAT16));
+    check(activation.SetNdInfo({1, rows, inner}));
+    if (transpose) check(weight.SetNdInfo({1, cols, inner}));
+    else check(weight.SetNdInfo({1, inner, cols}));
+    check(output.SetNdInfo({1, rows, cols}));
+    check(bias.SetNdInfo({cols}));
+    check(bias.SetAddr(static_cast<float*>(allocation) + 4));
+    for (int index = 0; index < 4; ++index) {
+      check(scales[index].SetType(md::Tensor::Type::FLOAT));
+      check(scales[index].SetNdInfo({1}));
+      check(scales[index].SetAddr(static_cast<float*>(allocation) + index));
+    }
+    check(parameters.SetScale(scales[0], scales[1], scales[2], scales[3]));
+    check(parameters.SetEpilogue(md::MatMulLtParam::MatMulLtEpilogueMode::MATMULLT_EPILOGUE_DEFAULT));
+    check(operation.SetTranspose(false, transpose));
+    check(operation.SetComputeMode(md::BatchMatMul::ComputeMode::TENSOR));
+    check(operation.SetBeta(0));
+    check(operation.SetGamma(0));
+  }
+};
+#endif
 struct Flash {
   md::Tensor q,k,v,y,lse,mask,dropout;
   md::ScaledDotProductAttention operation;
@@ -172,6 +215,9 @@ struct GeneralFlash {
 };
 struct Stream {
   md::Handle handle;
+#ifdef APXINF_MUSA_MP31_FP8
+  std::map<std::tuple<int,int,int,bool>,std::unique_ptr<Fp8Matmul>> fp8_matmuls;
+#endif
   std::map<std::tuple<int,int,int>,std::unique_ptr<Matmul>> matmuls;
   std::map<std::tuple<int,int,int,int>,std::unique_ptr<Flash>> flashes;
   std::map<std::tuple<int,int,int,int,int,int,bool,bool>,std::unique_ptr<GeneralFlash>> general_flashes;
@@ -235,6 +281,47 @@ void record_failure(int status, const char* what) {
       break;
   }
 }
+}
+
+extern "C" int apxinf_musa_mudnn_fp8_gemm(const void* activation, const void* weight,
+    void* output, int rows, int cols, int inner, int transpose, float scale,
+    musaStream_t stream) {
+#ifdef APXINF_MUSA_MP31_FP8
+  if (!activation || !weight || !output || rows <= 0 || cols <= 0 || inner <= 0 ||
+      (transpose != 0 && transpose != 1) || !std::isfinite(scale) || scale <= 0) {
+    record_failure(kStatusInvalidArgument, "muDNN FP8 GEMM");
+    return kStatusInvalidArgument;
+  }
+  try {
+    auto& current = state(stream);
+    const auto key = std::make_tuple(rows, cols, inner, bool(transpose));
+    auto found = current.fp8_matmuls.find(key);
+    if (found == current.fp8_matmuls.end()) {
+      if (capturing(stream)) throw StatusError{kStatusCaptureInProgress};
+      found = current.fp8_matmuls.emplace(key,
+          std::make_unique<Fp8Matmul>(rows, cols, inner, bool(transpose), stream)).first;
+    }
+    auto& plan = *found->second;
+    check(plan.activation.SetAddr(const_cast<void*>(activation)));
+    check(plan.weight.SetAddr(const_cast<void*>(weight)));
+    check(plan.output.SetAddr(output));
+    check(plan.operation.SetAlpha(scale));
+    plan.scratch.cursor = 0;
+    check(plan.operation.RunLt(current.handle, plan.output, plan.activation, plan.weight,
+        plan.output, plan.bias, plan.parameters,
+        [&](size_t bytes) { return plan.scratch.get(bytes); }));
+    return 0;
+  } catch (const StatusError& error) {
+    record_failure(error.status, "muDNN FP8 GEMM");
+    return error.status;
+  } catch (...) {
+    record_failure(kStatusUnknown, "muDNN FP8 GEMM");
+    return kStatusUnknown;
+  }
+#else
+  record_failure(kStatusInvalidArgument, "muDNN FP8 GEMM requires an MP31 build");
+  return kStatusInvalidArgument;
+#endif
 }
 
 extern "C" int apxinf_musa_mudnn_bf16_gemm(const void* a,const void* w,void* y,

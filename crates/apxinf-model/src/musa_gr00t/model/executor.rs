@@ -32,6 +32,7 @@ use super::geometry::{
 use super::math::{
     action_timestep_embedding, dit_timestep_projection, flow_schedule, Gr00tFlowStep,
 };
+use super::weights::fp8_switches;
 use super::weights::Gr00tWeights;
 use super::Gr00tConfig;
 
@@ -300,6 +301,24 @@ pub(crate) struct Gr00tCapturedGraph {
     inputs: Gr00tPreparedInputs,
 }
 
+impl Gr00tCapturedGraph {
+    /// Destroy the captured graph before handing its arena to a replacement
+    /// plan. Captured nodes retain raw addresses into the arena, so the graph
+    /// must be gone before the next capture reuses the same storage.
+    pub(crate) fn into_workspace(self) -> kernels::GraphWorkspace {
+        let Gr00tCapturedGraph {
+            graph,
+            _workspace,
+            output,
+            inputs,
+        } = self;
+        drop(graph);
+        drop(output);
+        drop(inputs);
+        _workspace
+    }
+}
+
 struct Gr00tBackboneOutput {
     non_image: Tensor,
     image: Tensor,
@@ -341,10 +360,10 @@ impl Gr00tPreparedInputs {
     }
 
     fn update(&self, observation: &Gr00tObservation) -> Result<()> {
-        // Every GR00T prepared run synchronizes before returning its host
-        // action. The copies below are synchronous as well, so another device
-        // barrier here only repeats an ordering guarantee already established
-        // at both ends of the previous/current request.
+        // Invariant: callers must not invoke `update` while a replay that
+        // reads these inputs is in flight. Every prepared run synchronizes
+        // before returning its host action; the copies below are synchronous
+        // as well, so the next update starts from a quiescent stream.
         transfers::copy_cpu_to_device(&observation.pixel_values, &self.pixel_values)?;
         transfers::copy_cpu_to_device(&observation.state, &self.state)?;
         transfers::copy_cpu_to_device(&observation.noise, &self.noise)?;
@@ -378,6 +397,9 @@ impl Gr00tCapturedGraph {
         self.inputs.update(observation)?;
         let mut tokens = previous_cache.map(|(tokens, _)| tokens).unwrap_or_default();
         tokens.clone_from(&observation.token_ids);
+        // The cached DeviceBuffer is a shallow clone of this plan's token
+        // buffer. It must not outlive the plan, and no eager path may reuse
+        // that buffer while the plan is live.
         *token_cache = Some((tokens, self.inputs.token_ids.clone()));
         self.graph.replay()?;
         backend.synchronize()?;
@@ -427,10 +449,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             backbone_vision,
             action_head,
         } = weights;
-        let backbone_linears =
-            execution.transfer_backbone_linears(&backbone_text, &backbone_vision, &*backend)?;
         let backbone_text = transfer_text_weights(&backbone_text, &*backend)?;
         let backbone_vision = transfer_vision_weights(&backbone_vision, &*backend)?;
+        let backbone_linears =
+            execution.transfer_backbone_linears(&backbone_text, &backbone_vision, &*backend)?;
         let (category_weights, action) =
             Gr00tDeviceActionWeights::from_host(&config, action_head, &execution, &*backend)?;
         Ok(Self {
@@ -806,8 +828,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         let schedule = &self.action.flow_schedule;
         let use_cross_attention_cache = true;
         let mut cross_attention = Vec::with_capacity(self.action.dit_blocks.len());
+        let mut quantized_key_value_inputs = Vec::new();
         for (layer_index, block) in self.action.dit_blocks.iter().enumerate() {
-            let source = match dit_attention_source(&self.config, layer_index)? {
+            let source_kind = dit_attention_source(&self.config, layer_index)?;
+            let source = match source_kind {
                 Gr00tDitAttentionSource::FullBackbone => {
                     return Err(Error::Other(
                         "GR00T phase-one runtime requires AlternateVLDiT".into(),
@@ -823,6 +847,8 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                         prepare_attention_key_value(
                             &*self.backend,
                             source,
+                            source_kind,
+                            &mut quantized_key_value_inputs,
                             &block.attention,
                             self.config.diffusion.num_attention_heads,
                             self.config.diffusion.attention_head_dim,
@@ -951,6 +977,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
     pub(crate) fn capture_prepared_graph(
         &mut self,
         observation: &Gr00tObservation,
+        reused: Option<kernels::GraphWorkspace>,
     ) -> Result<(Gr00tGraphKey, Gr00tCapturedGraph)> {
         let key = self.prepared_key(observation)?;
         if self.backend.context().tuning().mode() == TuningMode::AutoTune {
@@ -962,7 +989,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         let inputs = Gr00tPreparedInputs::new(observation, &self.backend)?;
         self.prepare_fixed_inputs(observation, Some(inputs.token_ids.clone()))?;
         let device_observation = inputs.observation(observation);
-        let workspace = self.allocate_prepared_workspace()?;
+        let workspace = match reused {
+            Some(workspace) => workspace,
+            None => self.allocate_prepared_workspace()?,
+        };
         // The current MUSA graph API records exactly one traversal. Prime all
         // provider handles and the session's shape ledger on this same stream
         // before capture; the older isolated-stream API performed this warmup
@@ -1090,11 +1120,14 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                                   norm_bias: &Tensor,
                                   eps: f32,
                                   weight: &Tensor| {
+            let inner = weight.shape().dims()[0];
+            let rows = input.shape().dims().iter().product::<usize>() / inner;
             if USE_FUSED_FP8_VISION_LAYER_NORM {
-                if let Some(linear) = self.backbone_linears.get(name) {
-                    let scale = linear
-                        .activation_scale()
-                        .ok_or_else(|| Error::Other(format!("{name} is not an FP8 linear")))?;
+                if let Some((linear, scale)) = self.backbone_linears.get(name).and_then(|linear| {
+                    linear
+                        .fp8_input_scale(rows, inner)
+                        .map(|scale| (linear, scale))
+                }) {
                     let quantized = kernels::norm::layer_quant_bf16_e4m3(
                         self.backend.context(),
                         input,
@@ -1103,7 +1136,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                         eps,
                         scale,
                     )?;
-                    return linear.forward_quantized_tensor(&quantized, &*self.backend);
+                    return linear.forward_quantized_tensor(
+                        &quantized.reshape(vec![rows, inner])?,
+                        &*self.backend,
+                    );
                 }
             }
             let normalized = layer_norm(&self.backend, input, norm_weight, norm_bias, eps)?;
@@ -1111,11 +1147,77 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 &*self.backend,
                 &self.backbone_linears,
                 name,
-                &normalized,
+                &normalized.reshape(vec![rows, inner])?,
                 weight,
             )
         };
-        let vision_bias_gelu = |_name: &str, input: &Tensor, bias: &Tensor| {
+        let vision_residual_norm_matmul =
+            |name: &str,
+             projection: &Tensor,
+             bias: &Tensor,
+             residual: &Tensor,
+             norm_weight: &Tensor,
+             norm_bias: &Tensor,
+             eps: f32,
+             weight: &Tensor| {
+                let dims = projection.shape().dims();
+                let scale = self
+                    .backbone_linears
+                    .get(name)
+                    .and_then(|linear| linear.fp8_input_scale(dims[0], dims[1]));
+                let (hidden, normalized) = if let Some(scale) = scale {
+                    residual_norm_fp8(
+                        &self.backend,
+                        projection,
+                        Some(bias),
+                        residual,
+                        kernels::norm::Fp8Norm::Layer {
+                            weight: norm_weight,
+                            bias: norm_bias,
+                        },
+                        false,
+                        eps,
+                        scale,
+                    )?
+                } else {
+                    let fused = kernels::fused::bias_residual_layer_bf16(
+                        self.backend.context(),
+                        projection,
+                        Some(bias),
+                        residual,
+                        norm_weight,
+                        norm_bias,
+                        eps,
+                    )?;
+                    (fused.hidden, fused.normalized)
+                };
+                let projected = qwen_matmul(
+                    &self.backend,
+                    &self.backbone_linears,
+                    name,
+                    &normalized,
+                    weight,
+                )?;
+                Ok((hidden, projected))
+            };
+        let fp8_vision_available = self.backbone_linears.values().any(|linear| {
+            linear
+                .fp8_input_scale(
+                    pixels.shape().dims()[0],
+                    self.backbone_config.vision.hidden_size,
+                )
+                .is_some()
+        });
+        let vision_bias_gelu = |name: &str, input: &Tensor, bias: &Tensor| {
+            if let Some(prefix) = name.strip_suffix(".fc1") {
+                if let Some(consumer) = self.backbone_linears.get(&format!("{prefix}.fc2")) {
+                    if let Some(output) =
+                        consumer.quantize_bias_gelu_tensor_input(input, bias, &self.backend)?
+                    {
+                        return Ok(output);
+                    }
+                }
+            }
             if E::USE_PACKED8_BF16_BIAS_ACTIVATION {
                 if let Some(output) =
                     super::backend::try_packed8_bias_activation(&self.backend, input, bias, 1)?
@@ -1151,7 +1253,11 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             Some(&vision_bias_gelu),
             None,
             None,
-            None,
+            if fp8_vision_available {
+                Some(&vision_residual_norm_matmul)
+            } else {
+                None
+            },
             use_fused_bf16_vision_mlp_residual_norm,
             Some(&vision_bias_residual),
             E::USE_CACHED_VISION_RESIDUAL_LAYER_NORM && !legacy_vision_residual_layer_norm,
@@ -1396,6 +1502,19 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 .reshape(vec![2 * self.config.input_embedding_dim])?;
                 &dynamic_modulation
             };
+            let attention_scale = if cross_attention
+                .get(layer_index)
+                .is_some_and(Option::is_none)
+            {
+                block.attention.fused_qkv.as_ref().and_then(|linear| {
+                    linear.fp8_input_scale(hidden.shape().dims()[0], hidden.shape().dims()[1])
+                })
+            } else {
+                block
+                    .attention
+                    .query
+                    .fp8_input_scale(hidden.shape().dims()[0], hidden.shape().dims()[1])
+            };
             let pending_normalized = if let Some((projection, residual)) =
                 pending_feed_forward.take()
             {
@@ -1409,7 +1528,19 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     .ok_or_else(|| Error::Other("missing previous GR00T DiT block".into()))?
                     .feed_forward
                     .output;
-                let (fused_hidden, fused_normalized) = previous_output
+                let (fused_hidden, fused_normalized) = if let Some(scale) = attention_scale {
+                    residual_norm_fp8(
+                        &self.backend,
+                        &projection,
+                        previous_output.bias(),
+                        &residual,
+                        kernels::norm::Fp8Norm::Adaptive { modulation },
+                        true,
+                        self.config.diffusion.norm_eps,
+                        scale,
+                    )?
+                } else {
+                    previous_output
                     .bias_residual_adaptive_layer_norm(
                         &projection,
                         &residual,
@@ -1422,7 +1553,8 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                             "GR00T BF16 bias-residual-adaptive-LayerNorm capability returned no output"
                                 .into(),
                         )
-                    })?;
+                    })?
+                };
                 hidden = fused_hidden;
                 Some(fused_normalized)
             } else {
@@ -1481,12 +1613,24 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     (normalized, Some(quantized), None)
                 } else {
                     (
-                        kernels::norm::adaptive_layer(
-                            self.backend.context(),
-                            &hidden,
-                            modulation,
-                            self.config.diffusion.norm_eps,
-                        )?,
+                        if let Some(scale) = attention_scale {
+                            kernels::norm::norm_quantized(
+                                self.backend.context(),
+                                &hidden,
+                                kernels::norm::Fp8Norm::Adaptive { modulation },
+                                None,
+                                self.config.diffusion.norm_eps,
+                                scale,
+                            )?
+                            .1
+                        } else {
+                            kernels::norm::adaptive_layer(
+                                self.backend.context(),
+                                &hidden,
+                                modulation,
+                                self.config.diffusion.norm_eps,
+                            )?
+                        },
                         None,
                         None,
                     )
@@ -1533,23 +1677,43 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 let normalized;
                 let residual;
                 if use_bias_residual_layer_norm {
-                    let (fused_hidden, fused_normalized) = block
-                        .attention
-                        .output
-                        .bias_residual_layer_norm(
-                            &attention,
-                            &hidden,
-                            &self.action.dit_norm_weight,
-                            &self.action.dit_norm_bias,
-                            self.config.diffusion.norm_eps,
+                    let (fused_hidden, fused_normalized) = if let Some(scale) = block
+                        .feed_forward
+                        .input
+                        .fp8_input_scale(hidden.shape().dims()[0], hidden.shape().dims()[1])
+                    {
+                        residual_norm_fp8(
                             &self.backend,
+                            &attention,
+                            block.attention.output.bias(),
+                            &hidden,
+                            kernels::norm::Fp8Norm::Layer {
+                                weight: &self.action.dit_norm_weight,
+                                bias: &self.action.dit_norm_bias,
+                            },
+                            true,
+                            self.config.diffusion.norm_eps,
+                            scale,
                         )?
-                        .ok_or_else(|| {
-                            Error::Other(
+                    } else {
+                        block
+                            .attention
+                            .output
+                            .bias_residual_layer_norm(
+                                &attention,
+                                &hidden,
+                                &self.action.dit_norm_weight,
+                                &self.action.dit_norm_bias,
+                                self.config.diffusion.norm_eps,
+                                &self.backend,
+                            )?
+                            .ok_or_else(|| {
+                                Error::Other(
                                 "GR00T BF16 bias-residual-LayerNorm capability returned no output"
                                     .into(),
                             )
-                        })?;
+                            })?
+                    };
                     residual = fused_hidden;
                     normalized = fused_normalized;
                     normalized_quantized = None;
@@ -1565,12 +1729,13 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                     normalized = if let Some((normalized, _)) = &normalized_quantized {
                         normalized.clone()
                     } else {
-                        layer_norm(
+                        layer_norm_for(
                             &self.backend,
                             &residual,
                             &self.action.dit_norm_weight,
                             &self.action.dit_norm_bias,
                             self.config.diffusion.norm_eps,
+                            &block.feed_forward.input,
                         )?
                     };
                 }
@@ -1623,6 +1788,10 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             .reshape(vec![2 * self.config.input_embedding_dim])?;
             &dynamic_output_modulation
         };
+        let output_scale = self
+            .action
+            .output_projection
+            .fp8_input_scale(hidden.shape().dims()[0], hidden.shape().dims()[1]);
         let hidden = if let Some((projection, residual)) = pending_feed_forward {
             let last_output = &self
                 .action
@@ -1631,21 +1800,48 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
                 .ok_or_else(|| Error::Other("missing final GR00T DiT block".into()))?
                 .feed_forward
                 .output;
-            let (_, normalized) = last_output
-                .bias_residual_adaptive_layer_norm(
-                    &projection,
-                    &residual,
-                    output_modulation,
-                    1e-6,
+            let (_, normalized) = if let Some(scale) = output_scale {
+                residual_norm_fp8(
                     &self.backend,
+                    &projection,
+                    last_output.bias(),
+                    &residual,
+                    kernels::norm::Fp8Norm::Adaptive {
+                        modulation: output_modulation,
+                    },
+                    true,
+                    1e-6,
+                    scale,
                 )?
-                .ok_or_else(|| {
-                    Error::Other(
-                        "GR00T BF16 final bias-residual-adaptive-LayerNorm capability returned no output"
-                            .into(),
-                    )
-                })?;
+            } else {
+                last_output
+                    .bias_residual_adaptive_layer_norm(
+                        &projection,
+                        &residual,
+                        output_modulation,
+                        1e-6,
+                        &self.backend,
+                    )?
+                    .ok_or_else(|| {
+                        Error::Other(
+                            "GR00T BF16 final bias-residual-adaptive-LayerNorm capability returned no output"
+                                .into(),
+                        )
+                    })?
+            };
             normalized
+        } else if let Some(scale) = output_scale {
+            kernels::norm::norm_quantized(
+                self.backend.context(),
+                &hidden,
+                kernels::norm::Fp8Norm::Adaptive {
+                    modulation: output_modulation,
+                },
+                None,
+                1e-6,
+                scale,
+            )?
+            .1
         } else {
             kernels::norm::adaptive_layer(self.backend.context(), &hidden, output_modulation, 1e-6)?
         };
@@ -2116,6 +2312,64 @@ fn layer_norm(
     kernels::norm::layer_bf16(backend.context(), input, weight, bias, eps)
 }
 
+fn layer_norm_for<L: DeviceLinearWeights>(
+    backend: &RuntimeBackend,
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f32,
+    consumer: &L,
+) -> Result<Tensor> {
+    let dims = input.shape().dims();
+    if let Some(scale) = consumer.fp8_input_scale(dims[0], dims[1]) {
+        kernels::norm::layer_quant_bf16_e4m3(backend.context(), input, weight, bias, eps, scale)
+    } else {
+        layer_norm(backend, input, weight, bias, eps)
+    }
+}
+
+fn shared_norm_scale<L: DeviceLinearWeights>(
+    linears: &[Option<&L>],
+    rows: usize,
+    inner: usize,
+) -> Option<f32> {
+    let scale = linears.first()?.as_ref()?.fp8_input_scale(rows, inner)?;
+    linears
+        .iter()
+        .all(|linear| {
+            linear.is_some_and(|linear| linear.fp8_input_scale(rows, inner) == Some(scale))
+        })
+        .then_some(scale)
+}
+
+fn residual_norm_fp8(
+    backend: &RuntimeBackend,
+    projection: &Tensor,
+    bias: Option<&Tensor>,
+    residual: &Tensor,
+    kind: kernels::norm::Fp8Norm<'_>,
+    round_bias: bool,
+    eps: f32,
+    scale: f32,
+) -> Result<(Tensor, Tensor)> {
+    let (hidden, normalized) = kernels::norm::norm_quantized(
+        backend.context(),
+        projection,
+        kind,
+        Some(kernels::norm::Fp8NormResidual {
+            residual,
+            bias,
+            round_bias,
+        }),
+        eps,
+        scale,
+    )?;
+    Ok((
+        hidden.ok_or_else(|| Error::Other("FP8 residual norm did not produce hidden".into()))?,
+        normalized,
+    ))
+}
+
 fn linear_quantized<L: DeviceLinearWeights>(
     backend: &RuntimeBackend,
     input: &L::ReusableInput,
@@ -2184,50 +2438,29 @@ fn forward_feed_forward_projection_with_quantized_input<E: Gr00tPrecisionExecuti
     quantized_input: Option<&<E::FeedForward as DeviceLinearWeights>::ReusableInput>,
     weights: &Gr00tDeviceFeedForwardWeights<E>,
 ) -> Result<Tensor> {
-    let fused_quantized_bias_gelu = USE_FUSED_FP8_BIAS_GELU_QUANT
-        && E::NAME != "int8"
-        && weights.output.supports_fused_bias_gelu_quantization();
-    if fused_quantized_bias_gelu {
+    let hidden = if let Some(quantized) = quantized_input {
+        weights
+            .input
+            .forward_reusable_quantized(quantized, backend)?
+    } else {
+        weights.input.forward(input, backend)?
+    };
+    if USE_FUSED_FP8_BIAS_GELU_QUANT && E::NAME != "int8" {
         let bias = weights.input.bias().ok_or_else(|| {
             Error::Other("GR00T fused quantized bias GELU requires input bias".into())
         })?;
-        if let Some(quantized) = quantized_input {
-            if let Some((activated, hidden)) = weights
-                .input
-                .forward_reusable_quantized_bias_gelu_quantized(quantized, bias, backend)?
-            {
-                let output = weights
-                    .output
-                    .forward_reusable_quantized(&hidden, backend)?;
-                drop(activated);
-                return Ok(output);
-            }
+        if let Some(output) = weights.output.fused_bias_gelu(&hidden, bias, backend)? {
+            return Ok(output);
         }
-        let hidden = if let Some(quantized) = quantized_input {
-            weights
-                .input
-                .forward_reusable_quantized(quantized, backend)?
-        } else {
-            weights.input.forward(input, backend)?
-        };
-        let hidden = weights
-            .output
-            .quantize_bias_gelu_reusable_input(&hidden, bias, backend)?
-            .ok_or_else(|| {
-                Error::Other("GR00T bias-GELU fusion did not produce quantized input".into())
-            })?;
-        let output = weights
-            .output
-            .forward_reusable_quantized(&hidden, backend)?;
-        return Ok(output);
     }
-    let hidden = if let Some(quantized) = quantized_input {
-        let hidden = weights
-            .input
-            .forward_reusable_quantized(quantized, backend)?;
+    let hidden = if quantized_input.is_some() {
         kernels::activation::bias_gelu_bf16(backend.context(), &hidden, weights.input.bias())?
     } else {
-        linear_gelu(backend, input, &weights.input)?
+        if let Some(output) = weights.input.packed8_bias_gelu(&hidden, backend)? {
+            output
+        } else {
+            kernels::activation::bias_gelu_bf16(backend.context(), &hidden, weights.input.bias())?
+        }
     };
     weights.output.forward(&hidden, backend)
 }
@@ -2440,9 +2673,17 @@ fn forward_attention<E: Gr00tPrecisionExecution>(
     }
 }
 
+struct Gr00tQuantizedKeyValueInput {
+    source: Gr00tDitAttentionSource,
+    scale: f32,
+    tensor: Tensor,
+}
+
 fn prepare_attention_key_value<E: Gr00tPrecisionExecution>(
     backend: &RuntimeBackend,
     key_value_input: &Tensor,
+    source: Gr00tDitAttentionSource,
+    quantized_inputs: &mut Vec<Gr00tQuantizedKeyValueInput>,
     weights: &Gr00tDeviceAttentionWeights<E>,
     heads: usize,
     head_dim: usize,
@@ -2458,6 +2699,45 @@ fn prepare_attention_key_value<E: Gr00tPrecisionExecution>(
     } else {
         None
     };
+    let shared_fp8_input = if key_value_quantized.is_none()
+        && shared_key_value
+        && fp8_switches::enabled("KV_REUSE")
+    {
+        let inner = key_value_input.shape().dims()[1];
+        let key_scale = weights.key.fp8_input_scale(key_value_len, inner);
+        let value_scale = weights.value.fp8_input_scale(key_value_len, inner);
+        if let Some(scale) = key_scale.filter(|_| key_scale == value_scale) {
+            let share_across_layers = fp8_switches::enabled("KV_CROSS_LAYER");
+            let cached = quantized_inputs.iter().find(|entry| {
+                share_across_layers
+                    && entry.source == source
+                    && entry.scale == scale
+                    && entry.tensor.shape() == key_value_input.shape()
+            });
+            if let Some(entry) = cached {
+                Some(entry.tensor.clone())
+            } else {
+                let quantized = weights
+                    .key
+                    .quantize_tensor_input(key_value_input, backend)?;
+                if share_across_layers {
+                    if let Some(tensor) = &quantized {
+                        quantized_inputs.push(Gr00tQuantizedKeyValueInput {
+                            source,
+                            scale,
+                            tensor: tensor.clone(),
+                        });
+                    }
+                }
+                quantized
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let key_value_input = shared_fp8_input.as_ref().unwrap_or(key_value_input);
     let key = if let Some(input) = key_value_quantized.as_ref() {
         linear_quantized(backend, input, &weights.key)?
     } else {
@@ -2513,13 +2793,24 @@ fn forward_standard_block<E: Gr00tPrecisionExecution>(
     head_dim: usize,
     eps: f32,
 ) -> Result<Tensor> {
-    let normalized = layer_norm(
-        backend,
-        hidden,
-        &weights.attention_norm.weight,
-        &weights.attention_norm.bias,
-        eps,
-    )?;
+    let normalized = if let Some(consumer) = &weights.attention.fused_qkv {
+        layer_norm_for(
+            backend,
+            hidden,
+            &weights.attention_norm.weight,
+            &weights.attention_norm.bias,
+            eps,
+            consumer,
+        )?
+    } else {
+        layer_norm(
+            backend,
+            hidden,
+            &weights.attention_norm.weight,
+            &weights.attention_norm.bias,
+            eps,
+        )?
+    };
     let attention = forward_attention(
         backend,
         &normalized,
@@ -2532,12 +2823,13 @@ fn forward_standard_block<E: Gr00tPrecisionExecution>(
         true,
     )?;
     let hidden = backend.add(hidden, &attention)?;
-    let normalized = layer_norm(
+    let normalized = layer_norm_for(
         backend,
         &hidden,
         &weights.feed_forward_norm.weight,
         &weights.feed_forward_norm.bias,
         eps,
+        &weights.feed_forward.input,
     )?;
     if USE_FUSED_FFN_BIAS_RESIDUAL && weights.feed_forward.output.uses_quantized_output() {
         forward_feed_forward_residual(backend, &normalized, &weights.feed_forward, &hidden)
@@ -2641,17 +2933,44 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         .zip(linears.get(&key_name))
         .zip(linears.get(&value_name))
         .filter(|((query, key), value)| {
-            query.activation_scale() == key.activation_scale()
+            query.activation_scale().is_some()
+                && query.activation_scale() == key.activation_scale()
                 && key.activation_scale() == value.activation_scale()
         });
-    let fused_qkv_norm = shared_qkv.is_some() && USE_FUSED_FP8_RMS_NORM;
+    let fused_qkv_norm = USE_FUSED_FP8_RMS_NORM
+        && shared_norm_scale(
+            &[
+                linears.get(&query_name),
+                linears.get(&key_name),
+                linears.get(&value_name),
+            ],
+            sequence_len,
+            text.hidden_size,
+        )
+        .is_some()
+        && shared_qkv.is_some();
     let normalized = if !fused_qkv_norm {
-        Some(rms_norm(
-            backend,
-            input,
-            &layer.attn_norm_weight,
-            text.rms_norm_eps,
-        )?)
+        Some(
+            if let Some(scale) = shared_norm_scale(
+                &[
+                    linears.get(&query_name),
+                    linears.get(&key_name),
+                    linears.get(&value_name),
+                ],
+                sequence_len,
+                text.hidden_size,
+            ) {
+                kernels::norm::rms_quant_bf16_e4m3(
+                    backend.context(),
+                    input,
+                    &layer.attn_norm_weight,
+                    text.rms_norm_eps,
+                    scale,
+                )?
+            } else {
+                rms_norm(backend, input, &layer.attn_norm_weight, text.rms_norm_eps)?
+            },
+        )
     } else {
         None
     };
@@ -2797,12 +3116,23 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         .is_some_and(|(gate, _)| gate.activation_scale().is_some())
         && USE_FUSED_FP8_RMS_NORM;
     let normalized = if !fused_gate_up_norm {
-        Some(rms_norm(
-            backend,
-            &hidden,
-            &layer.ffn_norm_weight,
-            text.rms_norm_eps,
-        )?)
+        Some(
+            if let Some(scale) = shared_norm_scale(
+                &[linears.get(&gate_name), linears.get(&up_name)],
+                sequence_len,
+                text.hidden_size,
+            ) {
+                kernels::norm::rms_quant_bf16_e4m3(
+                    backend.context(),
+                    &hidden,
+                    &layer.ffn_norm_weight,
+                    text.rms_norm_eps,
+                    scale,
+                )?
+            } else {
+                rms_norm(backend, &hidden, &layer.ffn_norm_weight, text.rms_norm_eps)?
+            },
+        )
     } else {
         None
     };
@@ -2860,37 +3190,22 @@ fn forward_qwen_layer<L: DeviceLinearWeights>(
         )?
     };
     let down_name = format!("{prefix}.down");
-    let feed_forward = if let Some(down) = linears
+    let feed_forward = if let Some(output) = linears
         .get(&down_name)
-        .filter(|down| down.activation_scale().is_some())
+        .filter(|_| USE_FUSED_W8A8_SILU_MUL_QUANT)
+        .map(|down| down.fused_silu_mul(&gate, &up, backend))
+        .transpose()?
+        .flatten()
     {
-        let gated = kernels::activation::silu_mul_quant_bf16_e4m3(
-            backend.context(),
-            &gate,
-            &up,
-            down.activation_scale().ok_or_else(|| {
-                Error::Other(format!("{down_name} is missing its FP8 activation scale"))
-            })?,
-        )?;
-        down.forward_quantized_tensor(&gated, backend)?
+        output
     } else {
-        if let Some(output) = linears
-            .get(&down_name)
-            .filter(|_| USE_FUSED_W8A8_SILU_MUL_QUANT)
-            .map(|down| down.fused_silu_mul(&gate, &up, backend))
-            .transpose()?
-            .flatten()
-        {
-            output
+        let gated = if USE_FUSED_BF16_SILU_MUL {
+            kernels::activation::silu_mul_bf16(backend.context(), &gate, &up)?
         } else {
-            let gated = if USE_FUSED_BF16_SILU_MUL {
-                kernels::activation::silu_mul_bf16(backend.context(), &gate, &up)?
-            } else {
-                let gate = backend.silu(&gate)?;
-                backend.mul(&gate, &up)?
-            };
-            qwen_matmul(backend, linears, &down_name, &gated, &layer.w_down)?
-        }
+            let gate = backend.silu(&gate)?;
+            backend.mul(&gate, &up)?
+        };
+        qwen_matmul(backend, linears, &down_name, &gated, &layer.w_down)?
     };
     backend.add(&hidden, &feed_forward)
 }

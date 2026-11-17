@@ -14,6 +14,22 @@ use std::ffi::c_void;
 use super::musa::musaError_t;
 
 extern "C" {
+    pub fn apxinf_musa_norm_e4m3(
+        input: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        residual: *const c_void,
+        projection_bias: *const c_void,
+        hidden: *mut c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        kind: i32,
+        round_bias: i32,
+        eps: f32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
     /// RMSNorm (norm_bias null, cols 2048) or LayerNorm (cols 1152), optional
     /// bias+residual producer, and row quantization. BF16 inputs/hidden; INT8
     /// output [rows,cols]; FP16 scales [rows+512]; optional F32 inv_c [cols].
@@ -32,7 +48,6 @@ extern "C" {
         inv_c: *const c_void,
         stream: *mut c_void,
     ) -> musaError_t;
-
 
     /// Adaptive RMSNorm + row quantization for 1024 columns. A non-null
     /// residual enables gated addition and writes BF16 hidden; otherwise
@@ -79,6 +94,24 @@ extern "C" {
         m: i32,
         n: i32,
         k: i32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn apxinf_musa_quantize_bf16_e4m3(
+        input: *const c_void,
+        output: *mut c_void,
+        count: usize,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn apxinf_musa_mudnn_fp8_gemm(
+        activation: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        inner: i32,
+        transpose: i32,
+        scale: f32,
         stream: *mut c_void,
     ) -> i32;
     /// muDNN flash attention. Same status convention as the GEMM above.
@@ -155,6 +188,25 @@ extern "C" {
         input: *const c_void,
         output: *mut c_void,
         count: i64,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    pub fn apxinf_musa_bias_gelu_quant_bf16_e4m3(
+        input: *const c_void,
+        bias: *const c_void,
+        output: *mut c_void,
+        rows: i32,
+        cols: i32,
+        scale: f32,
+        stream: *mut c_void,
+    ) -> musaError_t;
+
+    pub fn apxinf_musa_silu_mul_quant_bf16_e4m3(
+        gate: *const c_void,
+        up: *const c_void,
+        output: *mut c_void,
+        count: i64,
+        scale: f32,
         stream: *mut c_void,
     ) -> musaError_t;
 
@@ -756,5 +808,7 @@ fn mudnn_detail(status: i32) -> String {
 /// Turn a status into the adapter's message; `operation` runs only on failure,
 /// so a successful launch does not format a string it would throw away.
 pub fn check_mudnn(status: i32, operation: impl FnOnce() -> String) -> Result<(), String> {
-    crate::ffi::check_status(status, || format!("{}: {}", operation(), mudnn_detail(status)))
+    crate::ffi::check_status(status, || {
+        format!("{}: {}", operation(), mudnn_detail(status))
+    })
 }

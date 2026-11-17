@@ -28,6 +28,9 @@
 #include <cstring>
 #include <musa_bf16.h>
 #include <musa_fp16.h>
+#ifdef APXINF_MUSA_MP31_FP8
+#include <musa_fp8.h>
+#endif
 
 #include <cstdint>
 #include <map>
@@ -36,6 +39,10 @@
 #include "adapter_common.h"
 
 namespace {
+#ifdef APXINF_MUSA_MP31_FP8
+#include "../kernels/custom/fp8_quantization.cuh"
+#include "../kernels/custom/fp8_activation.cuh"
+#endif
 #include "../kernels/custom/graph.cuh"
 #include "../kernels/custom/math.cuh"
 #include "../kernels/custom/activation.cuh"
@@ -48,11 +55,72 @@ namespace {
 #include "../kernels/custom/preprocess.cuh"
 #include "../kernels/custom/quantization.cuh"
 #include "../kernels/custom/norm_quantization.cuh"
+#ifdef APXINF_MUSA_MP31_FP8
+#include "../kernels/custom/fp8_normalization.cuh"
+#endif
 }  // namespace
+
+extern "C" musaError_t apxinf_musa_norm_e4m3(
+    const void* input, const void* weight, const void* bias,
+    const void* residual, const void* projection_bias, void* hidden, void* output,
+    int rows, int cols, int kind, int round_bias, float eps, float scale,
+    musaStream_t stream) {
+#ifdef APXINF_MUSA_MP31_FP8
+  if (!input || !weight || !output || rows <= 0 || cols <= 0 ||
+      !(eps > 0.0f) || !std::isfinite(eps) || !(scale > 0.0f) ||
+      !std::isfinite(1.0f / scale) || !std::isfinite(scale) || kind < 0 || kind > 2 ||
+      (kind == 0 && !bias) || (residual && !hidden)) return musaErrorInvalidValue;
+  auto source = static_cast<const __mt_bfloat16*>(input);
+  auto weights = static_cast<const __mt_bfloat16*>(weight);
+  auto shifts = kind == 2 ? weights + cols : static_cast<const __mt_bfloat16*>(bias);
+  auto destination = static_cast<__mt_fp8_e4m3*>(output);
+  if (residual) {
+    auto skip = static_cast<const __mt_bfloat16*>(residual);
+    auto projection_shift = static_cast<const __mt_bfloat16*>(projection_bias);
+    auto hidden_output = static_cast<__mt_bfloat16*>(hidden);
+    if (cols == 1024 && !round_bias && kind == 0) {
+      residual_layer_norm_e4m3_kernel<1024, false, false><<<rows, 256, 0, stream>>>(
+          source, projection_shift, skip, weights, shifts, hidden_output, destination, eps, 1.0f / scale);
+    } else if (cols == 1536 && round_bias && projection_bias && kind != 1) {
+      if (kind == 2)
+        residual_layer_norm_e4m3_kernel<1536, true, true><<<rows, 256, 0, stream>>>(
+            source, projection_shift, skip, weights, shifts, hidden_output, destination, eps, 1.0f / scale);
+      else
+        residual_layer_norm_e4m3_kernel<1536, false, true><<<rows, 256, 0, stream>>>(
+            source, projection_shift, skip, weights, shifts, hidden_output, destination, eps, 1.0f / scale);
+    } else return musaErrorInvalidValue;
+  } else if (kind == 1) {
+    if (cols != 2048) return musaErrorInvalidValue;
+    rms_norm_e4m3_2048_kernel<<<rows, 256, 0, stream>>>(source, weights, destination, eps, 1.0f / scale);
+  } else if (kind == 2) {
+    layer_norm_e4m3_kernel<true><<<rows, 256, 0, stream>>>(source, weights, shifts, destination, cols, eps, 1.0f / scale);
+  } else {
+    layer_norm_e4m3_kernel<false><<<rows, 256, 0, stream>>>(source, weights, shifts, destination, cols, eps, 1.0f / scale);
+  }
+  return musaGetLastError();
+#else
+  return musaErrorNotSupported;
+#endif
+}
 
 extern "C" musaError_t apxinf_musa_capture_anchor(musaStream_t stream) {
   capture_anchor_kernel<<<1, 128, 0, stream>>>();
   return musaGetLastError();
+}
+
+extern "C" musaError_t apxinf_musa_quantize_bf16_e4m3(
+    const void* input, void* output, size_t count, float scale, musaStream_t stream) {
+#ifdef APXINF_MUSA_MP31_FP8
+  if (!input || !output || !count || !std::isfinite(scale) || scale <= 0)
+    return musaErrorInvalidValue;
+  const unsigned blocks = static_cast<unsigned>(std::min(size_t(4096), (count + 2047) / 2048));
+  quantize_bf16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input), static_cast<__mt_fp8_e4m3*>(output),
+      count, 1.0f / scale);
+  return musaGetLastError();
+#else
+  return musaErrorNotSupported;
+#endif
 }
 
 // Grid size for a grid-stride elementwise launch.
@@ -211,6 +279,67 @@ extern "C" musaError_t apxinf_musa_silu_bf16(
   return musaGetLastError();
 }
 
+extern "C" musaError_t apxinf_musa_bias_gelu_quant_bf16_e4m3(
+    const void* input, const void* bias, void* output, int rows, int cols,
+    float scale, musaStream_t stream) {
+#ifdef APXINF_MUSA_MP31_FP8
+  if (input == nullptr || bias == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0 || !std::isfinite(scale) || scale <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  const size_t count = size_t(rows) * size_t(cols);
+  if (cols % 8 == 0 && aligned_to(input, 16) && aligned_to(output, 8) &&
+      aligned_to(bias, 16)) {
+    const dim3 grid = row_grid(rows, cols / 8);
+    bias_gelu_quant_bf16_e4m3_vector8_kernel<true>
+        <<<grid, kThreads, 0, stream>>>(
+            static_cast<const __mt_bfloat16*>(input),
+            static_cast<const __mt_bfloat16*>(bias),
+            static_cast<__mt_fp8_e4m3*>(output), rows, cols, 1.0f / scale);
+    return musaGetLastError();
+  }
+  const unsigned blocks = static_cast<unsigned>(
+      std::min(size_t(4096), (count + 2047) / 2048));
+  bias_gelu_quant_bf16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(input),
+      static_cast<const __mt_bfloat16*>(bias),
+      static_cast<__mt_fp8_e4m3*>(output), count, cols, 1.0f / scale);
+  return musaGetLastError();
+#else
+  return musaErrorNotSupported;
+#endif
+}
+
+extern "C" musaError_t apxinf_musa_silu_mul_quant_bf16_e4m3(
+    const void* gate, const void* up, void* output, int64_t count,
+    float scale, musaStream_t stream) {
+#ifdef APXINF_MUSA_MP31_FP8
+  if (gate == nullptr || up == nullptr || output == nullptr || count <= 0 ||
+      !std::isfinite(scale) || scale <= 0.0f) {
+    return musaErrorInvalidValue;
+  }
+  if (count % 8 == 0 && aligned_to(gate, 16) && aligned_to(up, 16) &&
+      aligned_to(output, 8)) {
+    const unsigned blocks = static_cast<unsigned>(
+        std::min(size_t(4096), (size_t(count) / 8 + kThreads - 1) / kThreads));
+    silu_mul_quant_bf16_e4m3_vector8_kernel<<<blocks, kThreads, 0, stream>>>(
+        static_cast<const __mt_bfloat16*>(gate),
+        static_cast<const __mt_bfloat16*>(up),
+        static_cast<__mt_fp8_e4m3*>(output), count, 1.0f / scale);
+    return musaGetLastError();
+  }
+  const unsigned blocks = static_cast<unsigned>(
+      std::min(size_t(4096), (size_t(count) + 2047) / 2048));
+  silu_mul_quant_bf16_e4m3_kernel<<<blocks, 256, 0, stream>>>(
+      static_cast<const __mt_bfloat16*>(gate),
+      static_cast<const __mt_bfloat16*>(up),
+      static_cast<__mt_fp8_e4m3*>(output), size_t(count), 1.0f / scale);
+  return musaGetLastError();
+#else
+  return musaErrorNotSupported;
+#endif
+}
+
 // One block per row. `blockDim.x` must be a multiple of 32 (the reduction's
 // contract) and at most 8 * 32, because the kernel's `__shared__ float
 // scratch[8]` holds one partial per software warp.
@@ -220,7 +349,7 @@ extern "C" musaError_t apxinf_musa_ada_gate_residual_rms_norm_bf16(
     float eps, musaStream_t stream) {
   if (projection == nullptr || residual == nullptr || gate_style == nullptr ||
       norm_style == nullptr || hidden == nullptr || normalized == nullptr ||
-      rows <= 0 || cols <= 0) {
+      rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[10, 1024]` -- the action expert's recorded shape -- is exactly one block
@@ -288,7 +417,7 @@ extern "C" musaError_t apxinf_musa_rms_norm_bf16_scalar(
     const void* input, const void* weight, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
   if (input == nullptr || weight == nullptr || output == nullptr || rows <= 0 ||
-      cols <= 0) {
+      cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   rms_norm_bf16_kernel<<<rows, kThreads, 0, stream>>>(
@@ -302,7 +431,7 @@ extern "C" musaError_t apxinf_musa_ada_rms_norm_bf16(
     const void* input, const void* style, void* output, int rows, int cols,
     float eps, musaStream_t stream) {
   if (input == nullptr || style == nullptr || output == nullptr || rows <= 0 ||
-      cols <= 0) {
+      cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[10, 1024]` -- the action expert's recorded shape -- is exactly one block
@@ -427,7 +556,8 @@ extern "C" musaError_t apxinf_musa_bias_residual_rms_norm_bf16(
     const void* weight, void* hidden, void* normalized, int rows, int cols,
     float eps, musaStream_t stream) {
   if (projection == nullptr || residual == nullptr || weight == nullptr ||
-      hidden == nullptr || normalized == nullptr || rows <= 0 || cols <= 0) {
+      hidden == nullptr || normalized == nullptr || rows <= 0 || cols <= 0 ||
+      !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[522, 2048]` -- the recorded shape -- fits the register-cached kernel
@@ -806,7 +936,7 @@ extern "C" musaError_t apxinf_musa_layer_norm_bf16(
     const void* input, const void* weight, const void* bias, void* output,
     int rows, int cols, float eps, musaStream_t stream) {
   if (input == nullptr || weight == nullptr || bias == nullptr ||
-      output == nullptr || rows <= 0 || cols <= 0) {
+      output == nullptr || rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   // `[512, 1152]` -- the vision tower's width -- is `32 * 4 * 9`, so one warp
@@ -853,7 +983,7 @@ extern "C" musaError_t apxinf_musa_bias_residual_layer_norm_bf16(
     void* normalized, int rows, int cols, float eps, musaStream_t stream) {
   if (projection == nullptr || residual == nullptr || norm_weight == nullptr ||
       norm_bias == nullptr || hidden == nullptr || normalized == nullptr ||
-      rows <= 0 || cols <= 0) {
+      rows <= 0 || cols <= 0 || !(eps > 0.0f)) {
     return musaErrorInvalidValue;
   }
   if (cols == 1024) {

@@ -18,6 +18,10 @@ pub(crate) trait DeviceLinearWeights: Debug {
 
     fn bias(&self) -> Option<&Tensor>;
 
+    fn fp8_input_scale(&self, _rows: usize, _inner: usize) -> Option<f32> {
+        None
+    }
+
     /// Optional GR00T-private BF16 packed8 bias path. Implementations return
     /// `None` when the precision, device, or exact profiled shape is not
     /// eligible, preserving the ordinary public operator as the fallback.
@@ -94,6 +98,24 @@ pub(crate) trait DeviceLinearWeights: Debug {
         &self,
         _gate: &Tensor,
         _up: &Tensor,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    fn fused_bias_gelu(
+        &self,
+        _input: &Tensor,
+        _bias: &Tensor,
+        _backend: &RuntimeBackend,
+    ) -> Result<Option<Tensor>> {
+        Ok(None)
+    }
+
+    fn quantize_bias_gelu_tensor_input(
+        &self,
+        _input: &Tensor,
+        _bias: &Tensor,
         _backend: &RuntimeBackend,
     ) -> Result<Option<Tensor>> {
         Ok(None)

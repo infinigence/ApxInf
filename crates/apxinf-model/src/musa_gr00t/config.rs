@@ -331,6 +331,12 @@ impl Gr00tConfig {
                 self.backbone_model_type
             )));
         }
+        if !self.diffusion.norm_eps.is_finite() || self.diffusion.norm_eps <= 0.0 {
+            return Err(Error::Other(format!(
+                "GR00T diffusion.norm_eps must be positive and finite, got {}",
+                self.diffusion.norm_eps
+            )));
+        }
         let positive = [
             ("backbone_embedding_dim", self.backbone_embedding_dim),
             ("select_layer", self.select_layer),
@@ -593,5 +599,17 @@ mod tests {
 
         let wrong_dtype = RELEASED_3B_CONFIG.replace("bfloat16", "float16");
         assert!(Gr00tConfig::from_json_str(&wrong_dtype).is_err());
+    }
+
+    #[test]
+    fn rejects_non_positive_diffusion_norm_eps() {
+        let mut config = Gr00tConfig::from_json_str(RELEASED_3B_CONFIG).unwrap();
+        for eps in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            config.diffusion.norm_eps = eps;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("diffusion.norm_eps"), "{error}");
+        }
+        config.diffusion.norm_eps = 1e-6;
+        assert!(config.validate().is_ok());
     }
 }

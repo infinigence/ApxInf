@@ -15,9 +15,7 @@ use serde::Deserialize;
 const DEFAULT_SUBDIR: &str = "assets/cosmos";
 const MANIFEST: &str = "apxinf_assets.json";
 const SCHEMA: &str = "apxinf.gr00t-assets.v1";
-#[cfg(test)]
 const PROCESSOR_SCHEMA: &str = "apxinf.gr00t-processor.v1";
-#[cfg(test)]
 const PROCESSOR_NAMES: &[&str] = &[
     "config.json",
     "embodiment_id.json",
@@ -225,7 +223,6 @@ fn asset_identity(root: &Path) -> Result<String> {
 ///
 /// Both asset layouts bind the selected checkpoint processor metadata. Profiles
 /// from before the processor-v1 identity must be regenerated, not relabeled.
-#[cfg(test)]
 pub(super) fn checkpoint_identity(checkpoint: &Path, backbone: &Path) -> Result<String> {
     let primary = single_checkpoint_identity(checkpoint)?;
     let (name, backbone) =
@@ -251,7 +248,6 @@ pub(super) fn checkpoint_identity(checkpoint: &Path, backbone: &Path) -> Result<
 /// Mirror the public policy's root-first NVIDIA processor directory selection.
 /// Missing resources are recorded as well: native tensor-only callers may omit
 /// processor metadata, but adding it must invalidate a prior calibration.
-#[cfg(test)]
 fn processor_identity(checkpoint: &Path) -> Result<String> {
     let model_dir = if checkpoint.is_dir() {
         checkpoint
@@ -296,7 +292,6 @@ fn processor_identity(checkpoint: &Path) -> Result<String> {
     Ok(format!("sha256:{}", digest.finish_hex()))
 }
 
-#[cfg(test)]
 fn single_checkpoint_identity(path: &Path) -> Result<String> {
     let (root, files) = if path.is_dir() {
         let index = path.join("model.safetensors.index.json");
@@ -382,7 +377,6 @@ fn single_checkpoint_identity(path: &Path) -> Result<String> {
     Ok(format!("sha256:{}", digest.finish_hex()))
 }
 
-#[cfg(test)]
 fn checkpoint_index_files(index_path: &Path) -> Result<Vec<PathBuf>> {
     let raw = std::fs::read_to_string(index_path)
         .map_err(|error| Error::Other(format!("read {}: {error}", index_path.display())))?;
@@ -413,7 +407,6 @@ fn checkpoint_index_files(index_path: &Path) -> Result<Vec<PathBuf>> {
     Ok(names.into_iter().map(|name| root.join(name)).collect())
 }
 
-#[cfg(test)]
 fn collect_safetensors(directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(directory)
         .map_err(|error| Error::Other(format!("read {}: {error}", directory.display())))?

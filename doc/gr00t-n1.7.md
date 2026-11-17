@@ -19,6 +19,10 @@ graph lifetime, and the flow schedule.
 | --- | --- |
 | Jetson AGX Thor (SM110) | BF16, calibrated FP8 |
 | Jetson AGX Orin (SM87) | BF16, INT8/W8A8 |
+| MTT M1000 (MP22) | BF16 (preprocessed two-view); FP8/INT8 rejected at load |
+
+Not validated: S5000 (MP31), single-camera input, and sequence lengths other
+than the measured 145-token profile.
 
 `precision="auto"` selects BF16 on both platforms. Unsupported combinations
 fail at load time; they never silently fall back to another precision.
@@ -242,9 +246,47 @@ reference dumps, logs, tactic databases, and result JSON belong under
 
 The MUSA implementation is a self-contained backend-native port under
 `crates/apxinf-model/src/musa_gr00t/`; it does not import or modify the CUDA
-`gr00t/` implementation. The maintained MUSA scope is BF16, batch 1, two
+`gr00t/` implementation. The maintained MUSA scope includes BF16, batch 1, two
 camera grids, explicit processor-owned initial noise, and preprocessed tensors
-from NVIDIA's official processor. FP8 and INT8 are rejected at load time.
+from NVIDIA's official processor. MP31 also supports explicit selective FP8
+GEMM through muDNN, with BF16 output and BF16 fallback for shapes outside the
+model's benefit policy. MP22 FP8 and MUSA GR00T INT8 remain unsupported.
+
+For S5000, build with `APXINF_MUSA_ARCH=mp_31` and use `--precision fp8
+--calibration path/to/calibration.json` with either MUSA benchmark script.
+The activation calibration is static; runtime amax is not part of this path.
+Weights are quantized at load time, and NN/NT layout is selected in Rust.
+`auto` and `bf16` retain the existing execution. The initial policy selects
+17 shape classes; six variable-text rules use `128 < M <= 256`. Per-shape
+microbenchmark benefit is not an end-to-end speed or model-quality guarantee.
+
+MP31 Norm producers feeding admitted FP8 GEMMs can emit E4M3 directly. They
+retain FP32 statistics and the existing BF16 rounding before static-scale
+conversion; fused residual producers still emit BF16 hidden states. Vision
+block/merger norms, text RMSNorms, VL norms and eligible DiT norms use this
+path. Two additional consumer-scoped rules admit direct FP8 Norm inputs at
+`action_head.dit_blocks.<even-index>.attention.query` (`41x1536x1536`) and
+`action_head.output_projection` (`41x1024x1536`), both using muDNN NT. These
+rules do not enable standalone activation quantization: BF16 inputs at these
+shapes still fall back to BF16 GEMM. The same-shaped attention output
+projections remain BF16. The existing M=512 rule for N=1024/K=1536 is preserved.
+Text Q/K/V and gate/up reuse one quantized Norm output only when their
+calibrated scales agree.
+`APXINF_GR00T_DISABLE_FP8_NORM=1` at model load disables this producer fusion
+and sharing for A/B diagnostics; the two fusion-only consumers then return to
+BF16, while the original standalone FP8 GEMM shape rules remain unchanged.
+
+Compare BF16 and FP8 using the same newly built executable, fixture, GPU,
+execution policy and BF16 tactics. Native source changes invalidate old
+tactics by build fingerprint: regenerate them with a BF16 `--autotune` run
+before comparing. Report native model-core P50 and `1000/P50_ms` Hz first;
+this boundary includes preprocessed-input handling and synchronized action
+D2H, but excludes the external processor and action postprocessing. Keep
+Python-wheel API timings separate because they include NumPy/PyO3 conversion;
+v4 wheel reports provide Rust-internal model timing with matching BF16 host inputs.
+Fixed-input benchmark calibration requires the explicitly experimental
+`APXINF_GR00T_ALLOW_BENCHMARK_CALIBRATION=1`; do not treat it as representative
+production calibration or evidence of task accuracy.
 
 Build the native runner for the target MUSA generation, then use the Python
 script only as a launcher and report/parity wrapper:
@@ -275,12 +317,23 @@ fallback is acceptable. The timing boundary starts with the preprocessed host
 tensors and ends after action D2H, matching the native CUDA fixed-input
 benchmark.
 
+Library callers default to `prefer-graph`: a capture failure prints a warning
+to stderr and falls back to prepared eager execution. Benchmark entry points
+request `require-graph` explicitly. Setting `APXINF_GR00T_PREPARED_ARENA=0`
+makes the prepared path eager without a warning. The Python policy path uses
+the library default and does not expose an `execution` argument.
+
+Vision attention batching is enabled only for two `[256,256]` grids on MP22;
+single-camera and other grid shapes use the segmented path. No single-camera
+A/B measurement is included.
+
 MUSA fixed-profile plans use a single-active-plan contract per model instance.
 Building a replacement through `infer` or `prepare_for` synchronizes and
 invalidates the previous plan before allocating the replacement arena.
 Externally held old handles report `PreparationStatus::Invalidated` and reject
 `run`; retaining a handle does not retain its Graph or 4 GiB arena.
-`clear_prepared` also invalidates externally held fixed-profile plans.
+`clear_prepared` evicts the implicit cached plan only; explicitly held
+fixed-profile plans remain valid and runnable.
 If replacement construction fails after retirement, no active plan remains;
 prepare again or retry inference. Input validation failures before retirement
 leave the existing plan intact. This contract covers prepared Graph and Eager
@@ -364,18 +417,31 @@ python scripts/gr00t/bench_apxinf_musa_wheel.py \
 
 Use the wheel filename produced for your Python version and architecture.
 This script calls `apxinf_py.ModelRunner` in process, without a Rust executable.
-It preserves the fixture's BF16 values via exact float32 NumPy conversion.
-Timing includes the NumPy/PyO3 conversion and NumPy output allocation in
-addition to synchronized inference and action D2H. Official processor work
-and action decoding are excluded. The report records the installed extension
-path, all timing samples, repeatability and optional reference comparisons.
+It preserves the fixture's BF16 values via raw uint16 NumPy bit patterns.
+The v4 report's `latency_ms` times `infer_host_f32` inside Rust, after binding
+input conversion and before NumPy output allocation. It includes synchronized
+inference and action D2H; `model_hz` is `1000 / latency_ms.p50`.
+`api_latency_ms` separately includes NumPy/PyO3 conversion and output wrapping.
+Official processor work and action decoding are excluded from both. Historical
+v2 wheel reports measured the entire API call instead. Intermediate v3 wheel
+reports passed F32 host tensors, still charging model-internal F32-to-BF16
+conversion to model time. The v4 script passes exact BF16 fixture bits as uint16
+arrays, and the binding builds BF16 host tensors before timing, as the native
+runner does. Rebuild the wheel for the additive `_infer_preprocessed_timed`
+entry, which always returns `(actions, model_ms)` and accepts BF16 uint16 bits.
+The existing `_infer_preprocessed` and `_calibrate_preprocessed` signatures,
+return types, and policy-level timing boundaries remain unchanged.
+Both MUSA scripts accept `--prompt` to produce a verified, separate fixture
+before timing; see [prompt replacement](../scripts/gr00t/README.md#changing-the-prompt).
+The report records the installed extension path, all timing samples,
+repeatability and optional reference comparisons.
 
-The optimized text paths admit dynamic sequence lengths in
-`128 < sequence_length <= 256`. Shapes outside an exact optimization predicate
-remain on the model-neutral GEMM, attention, normalization, and RoPE fallbacks;
-145 is a measured profile, not a required constant. MUSA-specific assembly
-images are selected inside the backend dispatcher and never by model-layer
-kernel names.
+The kernel predicates cover 129/141/145/255/256 tokens; end-to-end validation
+is limited to the measured 145-token profile. Shapes outside an exact
+optimization predicate remain on the model-neutral GEMM, attention,
+normalization, and RoPE fallbacks; 145 is a measured profile, not a required
+constant. MUSA-specific assembly images are selected inside the backend
+dispatcher and never by model-layer kernel names.
 
 The repository's shared LIBERO evaluator selects the GR00T state adapter while
 leaving the existing OpenPI state wire format unchanged for other policies:
@@ -405,7 +471,15 @@ Minimum release gates are:
 - BF16: cosine similarity at least `0.999`, relative L2 at most `0.05`.
 - FP8: cosine similarity at least `0.997`, relative L2 at most `0.10`.
 - INT8: cosine similarity at least `0.995`, relative L2 at most `0.10`.
+- Each precision also requires maximum absolute error at most `0.125`.
+- The reference noise must be supplied and match bit-for-bit
+  (`--reference-noise`, for example the Orin `inputs.npz`);
+  `--allow-missing-noise` is an explicit exemption.
 - Every output must be finite and have the exact expected shape.
+
+The current Orin gold parity on the 145-token fixture is cosine
+`0.9999962154`, relative L2 `0.0027513`, and maximum absolute error
+`0.01953125`.
 
 One-view fixtures are used only for fixed-input numerical accuracy and
 performance; they are never used for LIBERO closed-loop task evaluation. The

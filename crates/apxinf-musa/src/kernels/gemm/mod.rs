@@ -18,6 +18,8 @@ use crate::tuning::{TuningDb, TuningMode, TuningPaths};
 #[cfg_attr(not(apxinf_musa_available), allow(dead_code))]
 mod qint8_tiles;
 mod bf16;
+mod fp8;
+pub use fp8::{gemm_fp8, Fp8Layout};
 pub(crate) mod assembly;
 mod w8a8;
 

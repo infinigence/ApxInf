@@ -42,7 +42,10 @@ returns `LoadedModel::{Text,Vla}`. PI0.5 inference goes through
 `ModelVariant` selects loaded precision implementations, not graph policy.
 `StepModulation` is computed conditioning data, not learned weights.
 WallOSS/GR00T still have runtime/executor files; do not relabel their types or
-claim PI0.5 preparation guarantees without inspecting the family.
+claim PI0.5 preparation guarantees without inspecting the family. The MUSA
+GR00T port (`musa_gr00t/`) uses the prepared arena/single-active-plan contract
+and falls back from general flash attention to the GEMM path when a launch
+fails.
 
 Useful starting locations relative to the selected checkout are:
 

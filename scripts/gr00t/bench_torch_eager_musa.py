@@ -103,8 +103,8 @@ def validate_repeat_outputs(measured: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
-    if args.warmup < 0 or args.repeat < 2:
-        raise ValueError("--warmup must be non-negative and --repeat must be at least 2")
+    if args.warmup < 1 or args.repeat < 2:
+        raise ValueError("--warmup must be at least 1 and --repeat must be at least 2")
     checkpoint = require_path(args.checkpoint, "checkpoint", directory=True)
     backbone = require_path(args.backbone, "backbone", directory=True)
     base_rgb = load_rgb(args.base_image, "base image")

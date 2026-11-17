@@ -6,8 +6,8 @@ use apxinf_core::{Error, Result, Tensor};
 use super::contracts::{checked_i32, optional_tensor_ptr, tensor_ptr};
 use super::contracts::{
     bf16_output, matrix_tensor, require_matching_bf16, require_matrix_bf16,
-    require_optional_vector_bf16, require_output_matrix, require_vector_at_least_bf16,
-    require_vector_bf16,
+    require_optional_vector_bf16, require_output_matrix, require_positive_eps,
+    require_vector_at_least_bf16, require_vector_bf16,
 };
 use crate::context::MusaContext;
 #[cfg(apxinf_musa_available)]
@@ -143,6 +143,7 @@ pub fn bias_residual_rms_bf16_into(
     normalized: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
+    require_positive_eps(eps, "bias residual rms")?;
     let (rows, cols) = require_matrix_bf16(ctx, projection, "bias residual rms", "projection")?;
     require_matching_bf16(ctx, "bias residual rms", "residual", projection, residual)?;
     require_vector_bf16(ctx, weight, cols, "bias residual rms", "weight")?;
@@ -261,6 +262,7 @@ pub fn bias_residual_layer_bf16_into(
     normalized: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
+    require_positive_eps(eps, "bias residual layer")?;
     let (rows, cols) = require_matrix_bf16(ctx, projection, "bias residual layer", "projection")?;
     require_matching_bf16(ctx, "bias residual layer", "residual", projection, residual)?;
     require_vector_bf16(ctx, norm_weight, cols, "bias residual layer", "norm_weight")?;
@@ -413,6 +415,7 @@ pub fn adaptive_gate_residual_rms_bf16_into(
     normalized: &mut Tensor,
     eps: f32,
 ) -> Result<()> {
+    require_positive_eps(eps, "ada gate residual")?;
     let (rows, cols) = require_matrix_bf16(ctx, projection, "ada gate residual", "projection")?;
     require_matching_bf16(ctx, "ada gate residual", "residual", projection, residual)?;
     require_vector_at_least_bf16(ctx, gate_style, 3 * cols, "ada gate residual", "gate_style")?;
@@ -737,11 +740,7 @@ pub fn bias_then_residual_layer_bf16(
         "bias then residual layer",
         "norm_bias",
     )?;
-    if !eps.is_finite() || eps <= 0.0 {
-        return Err(Error::Other(
-            "MUSA bias-then-residual LayerNorm needs positive finite epsilon".into(),
-        ));
-    }
+    require_positive_eps(eps, "bias-then-residual LayerNorm")?;
     if rows == 41 && cols == 1536 {
         let hidden = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
         let normalized = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
@@ -809,11 +808,7 @@ pub fn bias_then_residual_adaptive_layer_bf16(
         "bias then residual adaptive layer",
         "modulation",
     )?;
-    if !eps.is_finite() || eps <= 0.0 {
-        return Err(Error::Other(
-            "MUSA bias-then-residual adaptive LayerNorm needs positive finite epsilon".into(),
-        ));
-    }
+    require_positive_eps(eps, "bias-then-residual adaptive LayerNorm")?;
     if rows == 41 && cols == 1536 {
         let hidden = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);
         let normalized = matrix_tensor(ctx, rows, cols, bf16_output(ctx, rows, cols)?);

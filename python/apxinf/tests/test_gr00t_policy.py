@@ -151,6 +151,24 @@ def test_policy_contract_and_raw_observation_call():
     assert result["metadata"]["model_action_horizon"] == 4
 
 
+def test_policy_and_wire_keep_legacy_api_timing(monkeypatch):
+    from apxinf.policies.impls import gr00t
+    from apxinf.serving.websocket import wire_response
+
+    model = _FakeModel()
+    model._infer_preprocessed_timed = lambda *args, **kwargs: pytest.fail(
+        "policy must not replace API timing with diagnostic model time"
+    )
+    policy = Gr00tPolicy(model, processor=_FakeProcessor(), noise_mode="fixed", action_dim=3)
+    ticks = iter([1.0, 1.1, 1.3, 1.5])
+    monkeypatch.setattr(gr00t.time, "perf_counter", lambda: next(ticks))
+    result = policy.infer({})
+    assert result["timing"] == pytest.approx({"model_ms": 200.0, "total_ms": 500.0})
+    assert wire_response(result)["policy_timing"] == pytest.approx(
+        {"infer_ms": 200.0, "policy_ms": 500.0}
+    )
+
+
 def test_policy_metadata_tracks_custom_processor_input_contract():
     processor = _FakeProcessor()
     processor.image_keys = ("front", "wrist")

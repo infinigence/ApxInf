@@ -322,13 +322,16 @@ fn forward_impl(
     // the materialized BF16 residual. Keeping both tensors preserves the
     // legacy BF16 round-trip while removing one launch at each boundary.
     let mut prepared_norm1: Option<Tensor> = None;
+    let mut prepared_qkv: Option<Tensor> = None;
     for (i, blk) in w.blocks.iter().enumerate() {
         let _blk_range = crate::profiling::trace::range(&format!("vision_block_{i}"));
         // pre-attn LayerNorm
         let qkv_name = format!("backbone.vision.blocks.{i}.qkv");
         // QKV: [N, 1024] @ [1024, 3072] → [N, 3072]. Quantized runtimes may
         // fuse this single-use LayerNorm directly into their activation type.
-        let qkv = if let Some(normed) = prepared_norm1.take() {
+        let qkv = if let Some(qkv) = prepared_qkv.take() {
+            qkv
+        } else if let Some(normed) = prepared_norm1.take() {
             vision_matmul(matmul, b, &qkv_name, &normed, &blk.qkv_w).map_err(|error| {
                 Error::Other(format!(
                     "vision block {i} prepared norm/QKV failed: {error}"
@@ -498,22 +501,37 @@ fn forward_impl(
             // Block 23 intentionally retains the legacy residual path. Its
             // consumer is the primary merger, not another vision block.
             let next = &w.blocks[i + 1];
-            let (residual_hidden, normed) = apply_bias_residual_layer_norm(
-                b,
-                &h2,
-                &blk.fc2_b,
-                &x,
-                &next.norm1_w,
-                &next.norm1_b,
-                eps,
-            )
-            .map_err(|error| {
-                Error::Other(format!(
-                    "vision block {i} MLP residual/next norm failed: {error}"
-                ))
-            })?;
-            x = residual_hidden;
-            prepared_norm1 = Some(normed);
+            if let Some(residual_norm_matmul) = residual_norm_matmul {
+                let (hidden, qkv) = residual_norm_matmul(
+                    &format!("backbone.vision.blocks.{}.qkv", i + 1),
+                    &h2,
+                    &blk.fc2_b,
+                    &x,
+                    &next.norm1_w,
+                    &next.norm1_b,
+                    eps,
+                    &next.qkv_w,
+                )?;
+                x = hidden;
+                prepared_qkv = Some(qkv);
+            } else {
+                let (residual_hidden, normed) = apply_bias_residual_layer_norm(
+                    b,
+                    &h2,
+                    &blk.fc2_b,
+                    &x,
+                    &next.norm1_w,
+                    &next.norm1_b,
+                    eps,
+                )
+                .map_err(|error| {
+                    Error::Other(format!(
+                        "vision block {i} MLP residual/next norm failed: {error}"
+                    ))
+                })?;
+                x = residual_hidden;
+                prepared_norm1 = Some(normed);
+            }
         } else {
             x = vision_bias_residual(
                 bias_residual,
@@ -538,7 +556,16 @@ fn forward_impl(
     // use_postshuffle_norm=False: LayerNorm(1024) on x, then reshape
     // [N, 1024] → [N/4, 4096] (concatenate 4 consecutive patches).
     let primary = merge_primary(
-        b, &w.merger, &x, n_patches, hidden, merge, eps, matmul, bias_gelu,
+        b,
+        &w.merger,
+        &x,
+        n_patches,
+        hidden,
+        merge,
+        eps,
+        matmul,
+        bias_gelu,
+        norm_matmul,
     )?;
 
     // ── Deepstack mergers ───────────────────────────────────────────
@@ -552,7 +579,17 @@ fn forward_impl(
         .enumerate()
     {
         let out = merge_deepstack(
-            b, merger, hs, n_patches, hidden, merge, eps, index, matmul, bias_gelu,
+            b,
+            merger,
+            hs,
+            n_patches,
+            hidden,
+            merge,
+            eps,
+            index,
+            matmul,
+            bias_gelu,
+            norm_matmul,
         )?;
         deepstack.push(out);
     }
@@ -600,11 +637,23 @@ fn merge_primary(
     eps: f32,
     matmul: Option<&VisionMatmul<'_>>,
     bias_gelu: Option<&VisionBiasGelu<'_>>,
+    norm_matmul: Option<&VisionNormMatmul<'_>>,
 ) -> Result<Tensor> {
-    let normed = layer_norm(b, x, &m.norm_w, &m.norm_b, eps)?;
-    // Reshape [N, 1024] → [N/4, 4096]: concatenate 4 consecutive rows.
-    let merged = reshape_merge(&normed, n_patches, hidden, merge)?;
-    let h = vision_matmul(matmul, b, "backbone.vision.merger.fc1", &merged, &m.fc1_w)?;
+    let h = if let Some(norm_matmul) = norm_matmul {
+        norm_matmul(
+            "backbone.vision.merger.fc1",
+            x,
+            &m.norm_w,
+            &m.norm_b,
+            eps,
+            &m.fc1_w,
+        )?
+    } else {
+        let normed = layer_norm(b, x, &m.norm_w, &m.norm_b, eps)?;
+        // Reshape [N, 1024] → [N/4, 4096]: concatenate 4 consecutive rows.
+        let merged = reshape_merge(&normed, n_patches, hidden, merge)?;
+        vision_matmul(matmul, b, "backbone.vision.merger.fc1", &merged, &m.fc1_w)?
+    };
     let h = vision_bias_gelu(bias_gelu, b, "backbone.vision.merger.fc1", &h, &m.fc1_b)?;
     let out = vision_matmul(matmul, b, "backbone.vision.merger.fc2", &h, &m.fc2_w)?;
     add_bias(b, &out, &m.fc2_b)
@@ -622,16 +671,28 @@ fn merge_deepstack(
     index: usize,
     matmul: Option<&VisionMatmul<'_>>,
     bias_gelu: Option<&VisionBiasGelu<'_>>,
+    norm_matmul: Option<&VisionNormMatmul<'_>>,
 ) -> Result<Tensor> {
     let merged = reshape_merge(x, n_patches, hidden, merge)?;
-    let normed = layer_norm(b, &merged, &m.norm_w, &m.norm_b, eps)?;
-    let h = vision_matmul(
-        matmul,
-        b,
-        &format!("backbone.vision.deepstack.{index}.fc1"),
-        &normed,
-        &m.fc1_w,
-    )?;
+    let h = if let Some(norm_matmul) = norm_matmul {
+        norm_matmul(
+            &format!("backbone.vision.deepstack.{index}.fc1"),
+            &merged,
+            &m.norm_w,
+            &m.norm_b,
+            eps,
+            &m.fc1_w,
+        )?
+    } else {
+        let normed = layer_norm(b, &merged, &m.norm_w, &m.norm_b, eps)?;
+        vision_matmul(
+            matmul,
+            b,
+            &format!("backbone.vision.deepstack.{index}.fc1"),
+            &normed,
+            &m.fc1_w,
+        )?
+    };
     let h = vision_bias_gelu(
         bias_gelu,
         b,
@@ -955,7 +1016,14 @@ fn segmented_vision_sdpa(
             && std::env::var_os("APXINF_GR00T_LEGACY_VISION_BATCHED_ATTENTION").is_none()
         {
             if let Some(output) = kernels::attention::try_noncausal_batched_equal(
-                musa.context(), q, k, v, 2, 256, n_heads, head_dim,
+                musa.context(),
+                q,
+                k,
+                v,
+                2,
+                256,
+                n_heads,
+                head_dim,
             )? {
                 return Ok(output);
             }

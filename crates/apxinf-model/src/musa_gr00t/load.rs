@@ -39,6 +39,29 @@ pub(crate) fn load(path: &Path, device: Device, options: &LoadOptions) -> Result
     let (backbone_config, weights) = Gr00tWeights::from_safetensors(&config, &backbone_path, root)?;
     let backend = backend::create(device)?;
     install_tactics(&backend, root, options)?;
+    if options.precision == ModelPrecision::Fp8 {
+        let caps = backend.context().caps();
+        if apxinf_musa::MUSA_ARCH != "mp_31"
+            || (caps.compute_major, caps.compute_minor) != (3, 1)
+        {
+            return Err(Error::Other("MUSA GR00T FP8 requires MP31".into()));
+        }
+        let calibration = options.calibration_path.as_deref().ok_or_else(|| {
+            Error::Other("GR00T FP8 requires a calibration file".into())
+        })?;
+        let execution = super::model::fp8::Gr00tFp8Execution::from_file(
+            calibration, root, &backbone_path, &config, &backbone_config,
+        )?;
+        let executor = super::model::executor::Gr00tExecutor::from_backend(
+            config, backbone_config, weights, execution, backend,
+        )?;
+        let runner = Gr00tModelRunner::new(executor);
+        let runner = match options.execution_policy {
+            Some(policy) => runner.with_execution_policy(policy),
+            None => runner,
+        };
+        return Ok(LoadedModel::Vla(Box::new(runner)));
+    }
     let executor = precision::build(config, backbone_config, weights, backend)?;
     let runner = Gr00tModelRunner::new(executor);
     let runner = match options.execution_policy {
@@ -91,8 +114,10 @@ fn validate_options(options: &LoadOptions) -> Result<()> {
     }
     match options.precision {
         ModelPrecision::Auto | ModelPrecision::Bf16 => Ok(()),
+        ModelPrecision::Fp8 if options.calibration_path.is_some() => Ok(()),
+        ModelPrecision::Fp8 => Err(Error::Other("GR00T FP8 requires a calibration file".into())),
         precision => Err(Error::Other(format!(
-            "MUSA GR00T currently supports BF16, not {precision:?}"
+            "MUSA GR00T supports BF16 and calibrated MP31 FP8, not {precision:?}"
         ))),
     }
 }
@@ -120,6 +145,14 @@ mod tests {
             };
             validate_options(&options).unwrap();
         }
+    }
+
+    #[test]
+    fn fp8_requires_explicit_calibration() {
+        let mut options = LoadOptions { precision: ModelPrecision::Fp8, ..LoadOptions::default() };
+        assert!(validate_options(&options).is_err());
+        options.calibration_path = Some("calibration.json".into());
+        validate_options(&options).unwrap();
     }
 
     #[test]

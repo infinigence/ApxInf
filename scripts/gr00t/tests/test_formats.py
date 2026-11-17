@@ -22,6 +22,7 @@ import bench_apxinf_musa_wheel as wheel
 import bench_torch_eager_musa as torch_bench
 import compare_outputs
 import formats
+import prompt_fixture
 
 
 class FormatTests(unittest.TestCase):
@@ -94,8 +95,9 @@ class FormatTests(unittest.TestCase):
                 run.assert_not_called()
 
     def test_all_scripts_share_readers(self):
-        self.assertIs(wheel.load_fixture, formats.load_fixture)
-        self.assertIs(rust.load_fixture, formats.load_fixture)
+        self.assertIs(wheel.prepare_fixture, prompt_fixture.prepare_fixture)
+        self.assertIs(rust.prepare_fixture, prompt_fixture.prepare_fixture)
+        self.assertIs(prompt_fixture.load_fixture, formats.load_fixture)
         self.assertIs(torch_bench.load_noise, formats.load_noise)
         self.assertIs(compare_outputs.load_archive, formats.load_archive)
         self.assertIs(wheel.load_archive, formats.load_archive)
@@ -207,7 +209,7 @@ class FormatTests(unittest.TestCase):
 
     def test_fixture_decodes_only_floating_tensors(self):
         self.fixture()
-        _, arrays = wheel.load_fixture(self.root)
+        _, arrays = prompt_fixture.load_fixture(self.root)
         np.testing.assert_array_equal(arrays["pixel_values"], np.ones((4, 8)))
         np.testing.assert_array_equal(arrays["state"], -np.ones((1, 1, 132)))
         np.testing.assert_array_equal(arrays["noise"], np.full((1, 40, 132), 0.5))
@@ -243,11 +245,105 @@ class FormatTests(unittest.TestCase):
         reference = self.root / "reference.npz"
         np.savez(reference, normalized_actions=np.ones((40, 132)), noise=np.ones((40, 132)))
         args = SimpleNamespace(fixture=self.root, reference=reference, warmup=1, iterations=1,
-                               output=self.root / "output.json")
+                               output=self.root / "output.json", prompt=None,
+                               reference_noise=None, allow_missing_noise=False,
+                               expect_model="nvidia/GR00T-N1.7-LIBERO")
         for module in (rust, wheel):
             with patch.object(module, "parse_args", return_value=args):
                 with self.assertRaisesRegex(ValueError, "noise differ"):
                     module.main()
+
+    def prompt_args(self, prompt="new prompt"):
+        manifest = self.fixture()
+        manifest["prompt"] = "original prompt"
+        (self.root / "manifest.json").write_text(json.dumps(manifest))
+        return SimpleNamespace(fixture=self.root, prompt=prompt, checkpoint=self.root,
+                               backbone=self.root, reference=None,
+                               output=self.root / "result.json")
+
+    def test_prompt_fixture_preserves_non_language_bytes(self):
+        args = self.prompt_args()
+        original = (self.root / "manifest.json").read_bytes()
+        with patch.object(prompt_fixture, "encode_prompt", side_effect=[
+            np.array([1, 2, 3], dtype="<u4"), np.array([1, 2, 3, 4], dtype="<u4")
+        ]):
+            destination, manifest, arrays = prompt_fixture.prepare_fixture(args)
+        self.assertEqual(manifest["prompt"], "new prompt")
+        self.assertEqual(arrays["token_ids"].size, 4)
+        np.testing.assert_array_equal(arrays["attention_mask"], [1, 1, 1, 1])
+        self.assertEqual(original, (self.root / "manifest.json").read_bytes())
+        for name in ("pixel_values", "image_grid_thw", "state", "noise"):
+            self.assertEqual((self.root / f"{name}.bin").read_bytes(),
+                             (destination / f"{name}.bin").read_bytes())
+
+    def test_prompt_requires_exact_original_tokens(self):
+        args = self.prompt_args()
+        with patch.object(prompt_fixture, "encode_prompt", return_value=np.array([9])):
+            with self.assertRaisesRegex(ValueError, "does not reproduce"):
+                prompt_fixture.prepare_fixture(args)
+        self.assertFalse(args.output.with_suffix(".fixture").exists())
+
+    def test_changed_prompt_refuses_stale_reference(self):
+        args = self.prompt_args()
+        args.reference = self.root / "reference.npz"
+        with patch.object(prompt_fixture, "encode_prompt", side_effect=[
+            np.array([1, 2, 3]), np.array([1, 2, 3, 4])
+        ]):
+            with self.assertRaisesRegex(ValueError, "omit --reference"):
+                prompt_fixture.prepare_fixture(args)
+
+    def test_unchanged_prompt_reuses_fixture(self):
+        args = self.prompt_args("original prompt")
+        with patch.object(prompt_fixture, "encode_prompt", return_value=np.array([1, 2, 3])):
+            destination, _, _ = prompt_fixture.prepare_fixture(args)
+        self.assertEqual(destination, self.root)
+
+    def test_wheel_statistics_use_internal_not_api_time(self):
+        self.fixture()
+        args = SimpleNamespace(fixture=self.root, prompt=None, reference=None,
+                               reference_noise=None, allow_missing_noise=False,
+                               expect_model="nvidia/GR00T-N1.7-LIBERO",
+                               checkpoint=self.root, backbone=self.root, device=0,
+                               precision="bf16", calibration=None, tactics=None, autotune=False,
+                               execution="require-graph", warmup=1, iterations=2,
+                               output=self.root / "result.json")
+        output = np.ones((40, 132), dtype=np.float32)
+        calls = []
+
+        def infer(*inputs):
+            for index in (0, 4, 6):
+                self.assertEqual(inputs[index].dtype, np.uint16)
+            calls.append(True)
+            return output, 20.0
+
+        model = SimpleNamespace(_infer_preprocessed_timed=infer, execution_mode="musa-graph")
+        extension = SimpleNamespace(__file__="test-wheel", ModelRunner=SimpleNamespace(
+            load=lambda *arguments, **options: model))
+        with patch.object(wheel, "parse_args", return_value=args), \
+             patch.dict(sys.modules, {"apxinf_py": extension}), \
+             patch.object(wheel.time, "perf_counter", side_effect=[0, 1, 2, 2.1, 3, 3.1]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            wheel.main()
+        report = json.loads(args.output.read_text())
+        self.assertEqual(report["latency_ms"]["p50"], 20.0)
+        self.assertAlmostEqual(report["api_latency_ms"]["p50"], 100.0)
+        self.assertEqual(report["model_hz"], 50.0)
+        self.assertEqual(calls, [True, True, True])
+
+        extension.ModelRunner.load = lambda *arguments, **options: SimpleNamespace(
+            _infer_preprocessed=lambda *inputs: self.fail("must not fall back to legacy API timing"))
+        with patch.object(wheel, "parse_args", return_value=args), \
+             patch.dict(sys.modules, {"apxinf_py": extension}), \
+             self.assertRaisesRegex(RuntimeError, "rebuild the wheel"):
+            wheel.main()
+
+    def test_fixture_bf16_bits_roundtrip_without_quantization(self):
+        bits = np.array([0x0000, 0x8000, 0x3F80, 0xBF80, 0x0001, 0x7F7F], dtype=np.uint16)
+        values = formats.decode_float_array(bits, "test")
+        np.testing.assert_array_equal(formats.fixture_bf16_bits(values), bits)
+        np.testing.assert_array_equal(formats.fixture_bf16_bits(bits), bits)
+        with self.assertRaisesRegex(ValueError, "exactly representable"):
+            formats.fixture_bf16_bits(np.array([1.0001], dtype=np.float32))
 
     def test_comparison_cli_decodes_noise_and_normalized_actions(self):
         actual = self.root / "actual.npz"
@@ -257,7 +353,9 @@ class FormatTests(unittest.TestCase):
                  noise=np.full((1, 40, 132), 0.5, dtype=np.float32))
         np.savez(reference, normalized_actions=np.full((1, 40, 132), 0x3F80, dtype=np.uint16),
                  noise=np.full((40, 132), 0x3F00, dtype=np.uint16))
-        args = SimpleNamespace(apxinf=actual, reference=reference, output=output, precision="bf16")
+        args = SimpleNamespace(apxinf=actual, reference=reference, output=output, precision="bf16",
+                               reference_noise=None, allow_missing_noise=False,
+                               expect_model="nvidia/GR00T-N1.7-LIBERO")
         with patch.object(compare_outputs, "parse_args", return_value=args), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(compare_outputs.main(), 0)
         report = json.loads(output.read_text())
@@ -269,6 +367,94 @@ class FormatTests(unittest.TestCase):
         with patch.object(compare_outputs, "parse_args", return_value=args):
             with self.assertRaisesRegex(SystemExit, "noise differ"):
                 compare_outputs.main()
+
+    def test_json_archive_reads_noise_and_metadata(self):
+        document = {
+            "model": "nvidia/GR00T-N1.7-LIBERO",
+            "schema": "apxinf.gr00t-n1.7.benchmark.v2",
+            "output": {"shape": [40, 132], "values": np.zeros((40, 132), dtype=np.float32).tolist()},
+            "noise": {"shape": [1, 40, 132], "values": np.zeros((1, 40, 132), dtype=np.float32).tolist()},
+        }
+        path = self.root / "archive.json"
+        path.write_text(json.dumps(document))
+        archive = formats.load_archive(
+            path,
+            expect_model=document["model"],
+            expect_schema_prefix="apxinf.gr00t-n1.7.benchmark.",
+        )
+        self.assertEqual(archive["noise"].shape, (1, 40, 132))
+        self.assertEqual(
+            formats.load_metadata(path),
+            {"model": document["model"], "schema": document["schema"]},
+        )
+        with self.assertRaisesRegex(ValueError, "model"):
+            formats.load_archive(path, expect_model="other")
+        with self.assertRaisesRegex(ValueError, "schema"):
+            formats.load_archive(path, expect_schema_prefix="other")
+
+    def test_json_archive_rejects_bad_noise(self):
+        for noise in (
+            {"shape": [1, 40], "values": [0.0] * 40},
+            {"shape": [1, 40, 132], "values": [float("nan")] + [0.0] * 5279},
+            {"shape": [1, 40, 132], "values": [0.0] * 5279},
+        ):
+            with self.subTest(noise=noise):
+                document = {
+                    "output": {"shape": [40, 132], "values": [0.0] * 5280},
+                    "noise": noise,
+                }
+                path = self.root / "archive.json"
+                path.write_text(json.dumps(document))
+                with self.assertRaises(ValueError):
+                    formats.load_archive(path)
+
+    def test_comparison_cli_enforces_max_abs_and_noise_policy(self):
+        actual = self.root / "actual.json"
+        reference = self.root / "reference.json"
+        output = self.root / "parity.json"
+        base = np.ones((40, 132), dtype=np.float32)
+        noise = np.zeros((1, 40, 132), dtype=np.float32)
+
+        def write(path, values, model, schema=None, with_noise=True):
+            document = {
+                "model": model,
+                "output": {"shape": [40, 132], "values": values.tolist()},
+            }
+            if schema is not None:
+                document["schema"] = schema
+            if with_noise:
+                document["noise"] = {"shape": [1, 40, 132], "values": noise.tolist()}
+            path.write_text(json.dumps(document))
+
+        write(actual, base, "gr00t", "apxinf.gr00t-n1.7.benchmark.v2")
+        write(reference, base, "nvidia/GR00T-N1.7-LIBERO")
+        args = SimpleNamespace(
+            apxinf=actual,
+            reference=reference,
+            output=output,
+            precision="bf16",
+            reference_noise=None,
+            allow_missing_noise=False,
+            expect_model="nvidia/GR00T-N1.7-LIBERO",
+        )
+        with patch.object(compare_outputs, "parse_args", return_value=args), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(compare_outputs.main(), 0)
+
+        drifted = base.copy()
+        drifted[0, 0] += 0.126
+        write(actual, drifted, "gr00t", "apxinf.gr00t-n1.7.benchmark.v2")
+        with patch.object(compare_outputs, "parse_args", return_value=args):
+            with self.assertRaisesRegex(SystemExit, "max_abs"):
+                compare_outputs.main()
+
+        write(actual, base, "gr00t", "apxinf.gr00t-n1.7.benchmark.v2", with_noise=False)
+        write(reference, base, "nvidia/GR00T-N1.7-LIBERO", with_noise=False)
+        with patch.object(compare_outputs, "parse_args", return_value=args):
+            with self.assertRaisesRegex(SystemExit, "noise is required"):
+                compare_outputs.main()
+        args.allow_missing_noise = True
+        with patch.object(compare_outputs, "parse_args", return_value=args), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(compare_outputs.main(), 0)
 
 
 if __name__ == "__main__":
