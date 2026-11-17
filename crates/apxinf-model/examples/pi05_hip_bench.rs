@@ -1,5 +1,7 @@
-//! π0.5 on HIP against fixture inputs: accuracy against a reference, eager
-//! latency, and optionally every intermediate stage for comparison with CUDA.
+//! π0.5 on HIP against fixture inputs: accuracy against a reference, latency
+//! under the graph policy (with an eager fallback and a graph-vs-eager
+//! bit-identity check), and optionally every intermediate stage for comparison
+//! with CUDA.
 //!
 //! Inference goes through the same path AutoModel and Python use —
 //! `hip_pi05::load_runner`, a prepared plan, `run` — so what is measured and
@@ -26,7 +28,9 @@ use std::time::Instant;
 use apxinf_core::{DType, Tensor};
 use apxinf_hip::native::{self, HipArena, HipDeviceBytes};
 use apxinf_model::hip_pi05::{load_runner, Config, HipPi05Model};
-use apxinf_model::vla::{ImageLayout, Observation, VisionObservation, VlaRequest, VlaRuntime};
+use apxinf_model::vla::{
+    ExecutionPolicy, ImageLayout, Observation, PreparedInference, VisionObservation, VlaRequest,
+};
 use apxinf_model::LoadOptions;
 use fixtures::{
     latency_json, metrics, passes_bf16_gate, reference_actions, write_npy, AnyResult, Fixture,
@@ -131,20 +135,53 @@ fn main() -> AnyResult<()> {
     };
     let request = VlaRequest::provided(&observation, &noise);
 
-    let prepared = runner.prepare(&observation.inference_spec())?;
+    let prepared = runner.prepare_plan(&observation.inference_spec(), ExecutionPolicy::PreferGraph)?;
     let started = Instant::now();
     let first = ctx.to_cpu(prepared.run(&request)?.tensor())?.to_f32_vec()?;
     let first_ms = started.elapsed().as_secs_f64() * 1e3;
+
+    // Same-process, interleaved A/B against an eager plan: on this machine a
+    // cross-run comparison is worthless (compute-bound families drift with
+    // the core-clock state within a day), so each iteration runs the graph
+    // replay and the eager forward back to back in the same window.
+    let eager = runner.prepare_plan(&observation.inference_spec(), ExecutionPolicy::Eager)?;
     let mut samples = Vec::with_capacity(iterations);
+    let mut eager_samples = Vec::with_capacity(iterations);
     let mut actions = first.clone();
+    let mut eager_actions = Vec::new();
     for _ in 0..iterations {
         let started = Instant::now();
         let action = prepared.run(&request)?;
         ctx.synchronize()?;
         samples.push(started.elapsed().as_secs_f64() * 1e3);
         actions = ctx.to_cpu(action.tensor())?.to_f32_vec()?;
+        let started = Instant::now();
+        let action = eager.run(&request)?;
+        ctx.synchronize()?;
+        eager_samples.push(started.elapsed().as_secs_f64() * 1e3);
+        eager_actions = ctx.to_cpu(action.tensor())?.to_f32_vec()?;
     }
     let repeat = metrics(&actions, &first)?;
+
+    // Bit-identity between a graph replay and an eager forward on the same
+    // request: the graph records the kernels the eager path issues, so on this
+    // device the two must agree exactly. A mismatch means the replay read a
+    // buffer the upload did not fill -- the quiet failure mode of capture --
+    // so it is reported, loudly, next to the latency it would otherwise hide.
+    let graph_vs_eager_bit_identical = eager_actions == actions;
+
+    let (replays, nodes) = prepared.graph_usage();
+    if nodes > 0 {
+        eprintln!(
+            "HIP graph: {nodes} nodes, {replays} of the runs replayed from it, \
+             graph-vs-eager bit-identical: {graph_vs_eager_bit_identical}"
+        );
+    } else {
+        eprintln!(
+            "HIP graph: NOT captured; preparation fell back to eager. The forward is \
+             host-submission-bound; see the apxinf-hip message above."
+        );
+    }
 
     let reference = flag("--reference")
         .map(|path| reference_actions(&path, geometry))
@@ -172,7 +209,10 @@ fn main() -> AnyResult<()> {
             "passed": passed,
             "device": format!("{} ({})", ctx.caps().name, ctx.caps().arch),
             "model_variant": "bf16",
-            "execution": "eager",
+            "execution": if nodes > 0 { "graph" } else { "eager" },
+            "graph_nodes": nodes,
+            "graph_replays": replays,
+            "graph_vs_eager_bit_identical": graph_vs_eager_bit_identical,
             "views": config.num_views,
             "action_horizon": config.action_horizon,
             "token_count": token_count,
@@ -180,6 +220,7 @@ fn main() -> AnyResult<()> {
             "load_seconds": load_seconds,
             "first_run_ms": first_ms,
             "latency_ms": latency_json(&samples),
+            "latency_ms_eager": latency_json(&eager_samples),
             "repeat_vs_first": repeat,
             "reference": reference,
             "stages": stages,

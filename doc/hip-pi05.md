@@ -3,8 +3,10 @@
 `crates/apxinf-model/src/hip_pi05/` is a second PI0.5 implementation, written
 directly against `apxinf_hip::native` the way the CUDA one (`pi05/`) is written
 against `apxinf-cuda-new`. It targets **gfx1151** (Radeon 8060S, Strix Halo) and
-runs **BF16, eager**. Graph capture and kernel work are the next milestones; this
-one establishes a correct baseline reachable from every user entry point.
+runs **BF16**, eager or captured. It follows the family's module layout:
+`model/` (forward math), `model_runner/` (request validation, plan cache,
+execution policy and graph capture), `weights/` (checkpoint mapping and the
+device weight tree).
 
 ## Layout: a self-contained port
 
@@ -13,11 +15,13 @@ device as well as everything below it:
 
 | File | Owns |
 |---|---|
-| `config.rs` | checkpoint `config.json` parsing (LeRobot/OpenPI aliases), defaults, validation, time-embedding math |
-| `checkpoint.rs` | SafeTensors reading, `[out, in]` → `[in, out]` transposes, Gemma `1 + w`, norm folding, synthetic weights |
-| `weights.rs` | BF16 device weights, Q/K/V and gate/up packed into single GEMMs |
-| `model.rs` | layer computations and stage methods |
-| `runner.rs` | prepared plan and `VlaRuntime` |
+| `config.rs` | checkpoint `config.json` parsing (LeRobot/OpenPI aliases), defaults, validation |
+| `math.rs` | the fixed flow-timestep sinusoidal embedding |
+| `weights/host.rs` | SafeTensors reading, `[out, in]` → `[in, out]` transposes, Gemma `1 + w`, norm folding, synthetic weights |
+| `weights/bf16.rs` | BF16 device weights, Q/K/V and gate/up packed into single GEMMs |
+| `model/model.rs` | layer computations and stage methods |
+| `model_runner/runner.rs` | `VlaRuntime` surface and the implicit plan cache |
+| `model_runner/prepare.rs` | the prepared plan: fixed inputs, arena, warmup and graph capture |
 | `load.rs` | loader |
 
 The copies are deliberate: a change made for the CUDA implementation (its FP8
@@ -131,15 +135,70 @@ successes**, 162 ms model time per call (266 ms with apxinf's own attention
 kernel, also 10/10). This is a smoke check, not the published 500-episode
 protocol.
 
+## Graph capture (2026-11-16)
+
+A prepared plan under `PreferGraph`/`RequireGraph` warms up once eagerly (the
+libraries' first-touch work must not be recorded) and then captures the forward
+as one `HipGraph` launch — 2,311 nodes; input upload and `rgb_to_patches` stay
+outside the graph. Acceptance is `tests/hip_pi05_graph.rs`: a `RequireGraph`
+plan and an eager plan must agree bit for bit under the captured inputs *and*
+changed ones, replays are counted, and the implicit `infer` path must report
+`graph` and match. The bench interleaves graph and eager runs in the same
+window and checks bit-identity.
+
+Measured (same-process interleaved A/B): **no wall improvement** — graph P50
+170.4 ms against eager 170.1. The "host-bound" premise behind capture is
+falsified: the host's ~160 ms submission fully overlaps the GPU's ~160 ms busy
+span, so the wall was GPU-span-bound all along, and replay's own node
+scheduling replaces the 6.3 ms of device-side gaps it was meant to remove.
+Capture pays once the busy span drops below host submission (the autotune
+work below is the path there). The warmup also exposed and fixed a real
+correctness hole: it read the `token_ids` buffer before any upload, and the
+embedding kernel gathers `table[ids[i] * width]` unchecked, so the ids are
+zeroed at allocation.
+
+A machine-level caveat, not a code defect: this gfx1151 stack (amdgpu-dkms
+6.16.6 on kernel 6.8.0-138, ROCm 7.1) intermittently drops the device under
+dense kernel submission — kernel-mode page faults in runtime-internal memory,
+MES queue failures, MODE2 resets, latching `status 719` into the process. The
+pre-capture binary hits it too (~1 in 4 runs on a bad day); first-touch bursts
+and graph replays raise the odds. `HIP_LAUNCH_BLOCKING=1` never faults and is
+the escape hatch for acceptance runs; otherwise retry the run. Building the
+dkms module for 6.8.0-149 fails (`pci_resize_resource` signature change), so
+GRUB is pinned to 6.8.0-138 until the driver is updated.
+
+## GEMM recipe autotune (2026-11-17)
+
+`APXINF_HIP_GEMM_AUTOTUNE=1` measured every pi05 shape the GR00T-era recipe
+missed — all of them, since the recipe held only GR00T shapes — and wrote the
+winners back to `configs/tuning/amd/gfx1151/rocm7.1-hipblaslt100100/gemm.recipe`
+(now 51 entries). The M = 10 action-expert projections and the M = 1
+time-conditioning projections route to hipBLASLt with serialized tactics; the
+language and vision GEMMs stay on hipBLAS, which already runs them at the
+measured roof.
+
+Same-window interleaved A/B (one binary; the only variable is the routing —
+`APXINF_HIP_GEMM_PROVIDER=hipblas` forces the baseline):
+
+| window | recipe P50 | forced-hipBLAS P50 | recovered |
+|---|---|---|---|
+| 1 | 138.1 ms | 166.9 ms | −28.8 ms |
+| 2 | 141.5 ms | 172.5 ms | −31.0 ms |
+
+168 → ~140 ms (−17%), beyond the ~20 ms the roofline attributed to the action
+family alone: the M = 1 modulation projections (2.65x per call on
+`1x1024x1024`) also run 20 times per inference. Correctness against the
+forced-hipBLAS output on the same fixture: cosine 0.9999995, relative L2
+9.9e-4, max-abs 9.8e-4 — the BF16 gate passes with two orders of magnitude of
+margin (the difference is tile/reduction order, which is legitimate).
+Graph-vs-eager stays bit-identical. The wall is now below the host's eager
+submission cost, so graph replay and eager converge at ~140 ms; with the
+GEMM floor within reach, the remaining levers are the pointwise/attention
+residuals documented in the roofline.
+
 ## Next
 
-1. **Graph capture**: capture a whole prepared run as one HIP graph; the plan
-   already has fixed inputs and arena addresses, and the host now takes nearly
-   as long to submit a run as the GPU takes to execute it.
-2. **Action-expert GEMMs**: the M = 10 projections read weights at about a third
-   of the 243 GB/s the device sustains; per-shape hipBLASLt or a GEMV-style
-   kernel.
-3. **Language MLP and fusion**: the prefix gate/up and down GEMMs (55 ms), and
-   the CUDA path's fused epilogues (GeGLU into the GEMM, bias into residual
+1. **Language MLP and fusion**: the prefix gate/up and down GEMMs, and the
+   CUDA path's fused epilogues (GeGLU into the GEMM, bias into residual
    norms).
-4. **Full LIBERO-10** (500 episodes) as the regression gate for the above.
+2. **Full LIBERO-10** (500 episodes) as the regression gate for the above.
