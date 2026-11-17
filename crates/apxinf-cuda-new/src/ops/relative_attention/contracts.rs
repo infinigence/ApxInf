@@ -57,9 +57,11 @@ impl<'a> RelativeAttentionArgs<'a> {
     }
 }
 
-/// One FP32 score per key position has to fit the 48 KiB dynamic
-/// shared-memory window a launch may request.
-const MAX_LENGTH: usize = 48 * 1024 / std::mem::size_of::<f32>();
+/// One FP32 score per key position lives in dynamic shared memory next to the
+/// kernel's static `reduction[32]` scratch; both count against the same 48 KiB
+/// per-block limit. Must match `kMaxLength` in the native kernel header.
+const MAX_LENGTH: usize =
+    (48 * 1024 - 32 * std::mem::size_of::<f32>()) / std::mem::size_of::<f32>();
 
 pub(crate) struct Normalized {
     pub spec: abi::Spec,

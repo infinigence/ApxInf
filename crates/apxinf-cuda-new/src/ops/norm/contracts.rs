@@ -3,6 +3,13 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 use crate::ffi::abi::norm as abi;
 use crate::{CudaBuffer, CudaContext};
 
+/// Static shared-memory scratch the GRN kernel's block reduction uses
+/// (`shared_total[32]`, see `native/kernels/custom/norm.cuh`). CUDA counts
+/// static and dynamic shared memory against the same default 48 KiB
+/// per-block limit, so the dynamic `column_norm` allocation must reserve
+/// these bytes for it. Must stay in sync with `kGrnReductionSharedBytes`.
+const GRN_REDUCTION_SHARED_BYTES: usize = 32 * std::mem::size_of::<f32>();
+
 /// Public L3 operation selected by the call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Operation {
@@ -522,7 +529,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
     }
     if matches!(operation, Operation::Norm)
         && matches!(statistic, Statistic::Grn)
-        && cols * 4 > 48 * 1024
+        && cols * 4 + GRN_REDUCTION_SHARED_BYTES > 48 * 1024
     {
         return Err(invalid(
             "GRN activation width exceeds the kernel's shared-memory budget",

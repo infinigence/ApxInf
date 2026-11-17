@@ -7,6 +7,17 @@
 
 namespace apxinf::relative_attention::kernels {
 
+// Static shared-memory scratch used by the kernel's block reductions below;
+// `reduction[32]` must be sized to match. CUDA counts static and dynamic
+// shared memory against the same default 48 KiB per-block limit, so adapters
+// sizing the dynamic scores buffer must reserve these bytes for it.
+constexpr int64_t kReductionSharedBytes =
+    32 * static_cast<int64_t>(sizeof(float));
+// Largest `length` whose dynamic scores buffer (`length * sizeof(float)`)
+// still fits the default per-block limit alongside the static scratch.
+constexpr int64_t kMaxLength =
+    (48 * 1024 - kReductionSharedBytes) / static_cast<int64_t>(sizeof(float));
+
 template <class T>
 __device__ __forceinline__ float to_float(T value);
 template <>
@@ -75,7 +86,7 @@ __global__ void relative_attention_kernel(
     if (score > local_max) local_max = score;
   }
 
-  __shared__ float reduction[32];
+  __shared__ float reduction[32];  // sized by kReductionSharedBytes above
   float warp_max = local_max;
   for (int offset = 16; offset > 0; offset >>= 1) {
     warp_max = fmaxf(warp_max, __shfl_down_sync(0xFFFFFFFFu, warp_max, offset));

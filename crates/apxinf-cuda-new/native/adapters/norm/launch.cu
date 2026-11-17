@@ -372,6 +372,15 @@ void validate_spec(const apxinf_norm_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "Norm contract does not take a bias");
   }
+  // The GRN kernel's dynamic `column_norm` buffer and its static
+  // `shared_total` scratch share the same default 48 KiB per-block limit;
+  // kGrnMaxCols already reserves the static bytes. Mirrors the Rust-side
+  // guard in ops/norm/contracts.rs.
+  if (spec.statistic == APXINF_NORM_STATISTIC_GRN &&
+      spec.cols > kernels::kGrnMaxCols) {
+    throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                  "GRN activation width exceeds the kernel's shared-memory budget");
+  }
 }
 
 void validate_bindings(const apxinf_norm_spec_t& spec,

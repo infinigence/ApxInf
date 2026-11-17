@@ -160,7 +160,7 @@ pub fn write_kv_cache_token(
     meta: &crate::ops::KvCacheDecodeMeta,
 ) -> Result<()> {
     use crate::ffi::abi::cache as abi;
-    use crate::ops::validation::check_cuda;
+    use crate::ops::validation::{check_cuda, require_buffers};
     use apxinf_core::{DType, Error};
 
     let dims = cache.shape().dims().to_vec();
@@ -195,9 +195,14 @@ pub fn write_kv_cache_token(
         .checked_mul(row_elements)
         .and_then(|v| v.checked_mul(dtype.size_in_bytes()))
         .ok_or_else(|| Error::Other("dynamic KV token write size overflow".into()))?;
-    if input_buffer.len() < input_bytes || cache_buffer.len() < cache_bytes {
-        return Err(Error::Other("dynamic KV token write storage is too small".into()));
-    }
+    require_buffers(
+        ctx,
+        "dynamic KV token write",
+        &[
+            ("input", &input_buffer, input_bytes),
+            ("cache", &cache_buffer, cache_bytes),
+        ],
+    )?;
     meta.retain();
     crate::workspace::retain_buffer(&input_buffer);
     crate::workspace::retain_buffer(&cache_buffer);

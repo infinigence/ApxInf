@@ -29,9 +29,14 @@ void validate_spec(const apxinf_relative_attention_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "invalid RelativeAttention head sharing");
   }
-  // One FP32 score per key position lives in dynamic shared memory and the
-  // kernel never opts into the larger per-block limit.
-  constexpr int64_t kMaxLength = 48 * 1024 / static_cast<int64_t>(sizeof(float));
+  // One FP32 score per key position lives in dynamic shared memory, and the
+  // kernel's static `reduction` scratch shares the same default per-block
+  // limit with it; kMaxLength already reserves those bytes. The kernel never
+  // opts into the larger per-block limit.
+  constexpr int64_t kMaxLength = kernels::kMaxLength;
+  static_assert(kMaxLength == (48 * 1024 - 128) / static_cast<int64_t>(sizeof(float)),
+                "RelativeAttention length limit must reserve the kernel's "
+                "static reduction scratch");
   if (spec.length > kMaxLength) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "RelativeAttention length exceeds the shared score window");

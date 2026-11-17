@@ -1075,6 +1075,19 @@ __global__ void ada_gate_residual_rms_norm_quant_f16_e4m3_10x1024(
  * beta. Each intermediate is rounded to the input dtype, matching the
  * materialized reference tensor graph. The eps 1e-6f is part of the kernel's
  * arithmetic, not the spec eps binding. */
+
+// Static shared-memory scratch used by the GRN kernel's block reduction
+// below; `shared_total[32]` must be sized to match. CUDA counts static and
+// dynamic shared memory against the same default 48 KiB per-block limit, so
+// the dynamic `column_norm` allocation must reserve these bytes for it.
+constexpr int64_t kGrnReductionSharedBytes =
+    32 * static_cast<int64_t>(sizeof(float));
+// Largest activation width whose dynamic `column_norm` buffer
+// (`cols * sizeof(float)`) still fits the default per-block limit alongside
+// the static scratch. Host-side guards must match this value.
+constexpr int64_t kGrnMaxCols =
+    (48 * 1024 - kGrnReductionSharedBytes) / static_cast<int64_t>(sizeof(float));
+
 template <class T>
 __global__ void grn(const T* input, const T* style, T* output, int64_t rows,
                     int cols) {
@@ -1105,7 +1118,7 @@ __global__ void grn(const T* input, const T* style, T* output, int64_t rows,
     local_sum += norm;
   }
 
-  __shared__ float shared_total[32];
+  __shared__ float shared_total[32];  // sized by kGrnReductionSharedBytes above
   float warp_sum = local_sum;
   for (int offset = 16; offset > 0; offset >>= 1) {
     warp_sum += __shfl_down_sync(0xFFFFFFFFu, warp_sum, offset);

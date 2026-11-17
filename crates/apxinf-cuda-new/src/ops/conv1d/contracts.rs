@@ -162,7 +162,11 @@ fn conv_output_length(
     Some(numerator / stride + 1)
 }
 
-fn transpose_output_length(
+/// Expected `ConvTranspose1d` output length, matching PyTorch:
+/// `(in_length - 1) * stride - 2 * padding + dilation * (kernel - 1)
+/// + output_padding + 1`. `None` means the geometry yields a non-positive
+/// output length, the same case PyTorch rejects.
+pub fn transpose_output_length(
     in_length: usize,
     kernel: usize,
     stride: usize,
@@ -170,13 +174,26 @@ fn transpose_output_length(
     dilation: usize,
     output_padding: usize,
 ) -> Option<usize> {
+    // PyTorch: (in_length - 1) * stride - 2 * padding
+    //     + dilation * (kernel - 1) + output_padding + 1.
+    // The dilation term is added before the padding is subtracted: an
+    // intermediate value of (in_length - 1) * stride - 2 * padding may be
+    // negative for valid geometry (e.g. in_length = 1 with padding covering
+    // the kernel), while a negative total is rejected, as PyTorch does.
     let base = in_length
         .checked_sub(1)?
         .checked_mul(stride)?
-        .checked_sub(padding.checked_mul(2)?)?
         .checked_add(dilation.checked_mul(kernel.checked_sub(1)?)?)?
-        .checked_add(output_padding)?;
-    base.checked_add(1)
+        .checked_add(output_padding)?
+        .checked_add(1)?;
+    let length = base.checked_sub(padding.checked_mul(2)?)?;
+    if length == 0 {
+        // Zero is still a non-positive output length: callers reject `None`
+        // rather than allocating an empty tensor, and PyTorch likewise
+        // refuses a zero-size conv_transpose output.
+        return None;
+    }
+    Some(length)
 }
 
 pub(crate) fn normalize(ctx: &CudaContext, args: Conv1dArgs<'_>) -> Result<Normalized> {
@@ -351,4 +368,76 @@ fn abi_i64(value: usize, label: &str) -> Result<i64> {
 
 pub(crate) fn execute(ctx: &CudaContext, normalized: Normalized) -> Result<()> {
     super::execution::execute(ctx, normalized)
+}
+
+#[cfg(test)]
+mod transpose_output_length_tests {
+    use super::transpose_output_length;
+
+    /// PyTorch reference: `(in_length - 1) * stride - 2 * padding
+    /// + dilation * (kernel - 1) + output_padding + 1`. Raw formula value:
+    /// this keeps `Some(0)` for a zero total, while
+    /// `transpose_output_length` itself maps non-positive totals to `None`,
+    /// so the cross-checks below avoid zero-length cases.
+    fn expected(
+        in_length: usize,
+        kernel: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        output_padding: usize,
+    ) -> Option<usize> {
+        let total = (in_length as i64 - 1) * stride as i64 - 2 * padding as i64
+            + dilation as i64 * (kernel as i64 - 1)
+            + output_padding as i64
+            + 1;
+        usize::try_from(total).ok()
+    }
+
+    #[test]
+    fn matches_pytorch_formula() {
+        let cases = [
+            (1usize, 3usize, 1usize, 1usize, 1usize, 0usize),
+            (4, 3, 2, 1, 1, 0),
+            (5, 3, 2, 1, 1, 0),
+            (4, 3, 2, 1, 1, 1),
+            (8, 5, 3, 2, 1, 0),
+            (12, 4, 4, 2, 1, 3),
+        ];
+        for &(in_length, kernel, stride, padding, dilation, output_padding) in &cases {
+            assert_eq!(
+                transpose_output_length(
+                    in_length,
+                    kernel,
+                    stride,
+                    padding,
+                    dilation,
+                    output_padding
+                ),
+                expected(in_length, kernel, stride, padding, dilation, output_padding),
+                "in_length={in_length} kernel={kernel} stride={stride} padding={padding} \
+                 dilation={dilation} output_padding={output_padding}"
+            );
+        }
+    }
+
+    #[test]
+    fn padding_larger_than_the_strided_input_still_admits_valid_geometry() {
+        // (1 - 1) * 1 - 2 * 1 + 1 * (3 - 1) + 0 + 1 = 1. The intermediate
+        // (in_length - 1) * stride - 2 * padding is negative here; only the
+        // total decides.
+        assert_eq!(transpose_output_length(1, 3, 1, 1, 1, 0), Some(1));
+    }
+
+    #[test]
+    fn non_positive_output_length_is_rejected() {
+        // (1 - 1) * 1 - 2 * 3 + 1 * 2 + 0 + 1 = -3, which PyTorch rejects.
+        assert_eq!(transpose_output_length(1, 3, 1, 3, 1, 0), None);
+        // (1 - 1) * 4 - 2 * 4 + 1 * 1 + 0 + 1 = -6.
+        assert_eq!(transpose_output_length(1, 2, 4, 4, 1, 0), None);
+        // (1 - 1) * 1 - 2 * 1 + 1 * 1 + 0 + 1 = 0: a zero total is also
+        // non-positive, so callers refuse it instead of allocating an empty
+        // tensor.
+        assert_eq!(transpose_output_length(1, 2, 1, 1, 1, 0), None);
+    }
 }
