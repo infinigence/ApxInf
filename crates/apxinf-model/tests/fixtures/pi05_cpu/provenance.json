@@ -1,0 +1,15 @@
+{
+  "reference": "Independent PyTorch functional PI0.5 with unchanged OpenPI norm, RoPE and time helpers",
+  "openpi_revision": "215abfb217dbac7d5f1273282331b9b1866c0479",
+  "torch_version": "2.14.1",
+  "weight_seed": 195,
+  "case_seeds": [
+    90,
+    91
+  ],
+  "sha256": {
+    "model.safetensors": "9d7ea6a2ff459e4be9b9a35439f2580b071b403838afba07f731d099512662bb",
+    "config.json": "62f4f183cf3597ac44146eda5d12842abb7453bf77a5d1525a95eac82e28863a",
+    "cases.json": "fa88567b975665c44dd767c92f361c18437b40e63b4553582290f68e542e599f"
+  }
+}

@@ -291,6 +291,17 @@ pub trait VlaRuntime {
         self.contract().action_shape
     }
 
+    /// Shape of supplied standard-normal noise, independent of the action
+    /// readout. Joint video/action diffusion runtimes override this with their
+    /// complete latent geometry. Existing action-only runtimes retain their
+    /// two-dimensional noise contract.
+    ///
+    /// This is fixed for the loaded runtime. Prepared plans must validate this
+    /// geometry along with their family-local precision and sampling profile.
+    fn initial_latent_shape(&self) -> Vec<usize> {
+        self.action_shape().to_vec()
+    }
+
     fn infer(&self, request: &VlaRequest<'_>) -> Result<Action>;
     fn prepare(&self, spec: &InferenceSpec) -> Result<Box<dyn PreparedInference>>;
 
@@ -382,6 +393,22 @@ pub trait VlaRuntime {
         Err(Error::Other(
             "this VLA runtime does not produce discrete action tokens".into(),
         ))
+    }
+
+    /// Bound token generation per request without changing the model's cache capacity.
+    /// With no stop token, a supporting runtime emits exactly `max_new_tokens` ids.
+    fn infer_action_tokens_with_limit(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        if max_new_tokens.is_some() {
+            return Err(Error::Other(
+                "this VLA runtime does not support a token limit".into(),
+            ));
+        }
+        self.infer_action_tokens(request, stop_token)
     }
 
     /// Collect named BF16 activation maxima for an FP8 calibration profile.

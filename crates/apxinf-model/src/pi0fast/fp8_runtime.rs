@@ -255,8 +255,21 @@ impl Pi0FastFp8Runtime {
         token_count: usize,
         stop_token: Option<u32>,
     ) -> Result<Vec<u32>> {
+        self.infer_with_limit(patches, token_ids, token_count, stop_token, None)
+    }
+
+    /// Limit generation while retaining the checkpoint-sized workspace and KV cache.
+    pub fn infer_with_limit(
+        &self,
+        patches: &Tensor,
+        token_ids: &CudaBuffer,
+        token_count: usize,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Vec<u32>> {
+        let limit = self.config.decode_token_limit(max_new_tokens)?;
         self.with_arena(token_count, || {
-            self.infer_arena(patches, token_ids, token_count, stop_token)
+            self.infer_arena(patches, token_ids, token_count, stop_token, limit)
         })
     }
 
@@ -266,6 +279,7 @@ impl Pi0FastFp8Runtime {
         token_ids: &CudaBuffer,
         token_count: usize,
         stop_token: Option<u32>,
+        limit: usize,
     ) -> Result<Vec<u32>> {
         let config = &self.config;
         if token_count == 0 || token_count > config.max_token_len + 1 {
@@ -291,8 +305,8 @@ impl Pi0FastFp8Runtime {
         .map_err(Error::Cuda)?;
         let mut logits = self.lm_head(&hidden)?;
 
-        let mut produced = config.max_action_tokens;
-        for step in 0..config.max_action_tokens {
+        let mut produced = limit;
+        for step in 0..limit {
             let slot = tokens
                 .view(step * step_bytes, step_bytes)
                 .map_err(Error::Cuda)?;
@@ -314,7 +328,7 @@ impl Pi0FastFp8Runtime {
                     break;
                 }
             }
-            if step + 1 == config.max_action_tokens {
+            if step + 1 == limit {
                 break;
             }
             let mut step_hidden = self.embed_tokens(&slot, 1)?;

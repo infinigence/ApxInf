@@ -1,6 +1,6 @@
 # apxinf (Python frontend)
 
-Python-first (NumPy/Pillow plus native Rust tokenizers) processor library + the **L2** policy
+Python-first (NumPy/Pillow, optional CPU acceleration, and native Rust tokenizers) processor library + the **L2** policy
 layer for the ApxInf VLA runtime. The bare-model L1 inference binding lives in
 the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
 `apxinf.ModelRunner` so you never import `apxinf_py` directly.
@@ -9,7 +9,7 @@ the [`apxinf-py`](../../crates/apxinf-py) PyO3 crate; `apxinf` re-exports it as
 
 ```
 apxinf/
-├── processors/   pure-numpy pre/post steps + Pipeline (offline, no GPU/Rust)
+├── processors/   NumPy pre/post steps + optional CPU kernels (offline, no GPU)
 ├── policies/     the L2 layer — stable machinery + volatile per-model impls
 │   ├── base.py       Policy + ModelRunnerProtocol contracts (structural Protocols)
 │   ├── registry.py   model_type -> policy-class registry
@@ -129,8 +129,9 @@ PI0.5 selects its implementation with `model_variant`: `auto`, `bf16`,
 dynamic INT8 uses per-row activation scales and fixed per-channel weight scales.
 `ModelRunner.model_variant` and PI0.5 policy metadata report the resolved
 implementation, including when loading with `auto`.
-The previous PI0.5 `precision` keyword is no longer accepted. Other model families
-retain their own loading options until migrated.
+All six built-in VLA policies use `model_variant`; the public `precision` keyword
+is not accepted. WallOSS passes the variant directly to its Rust loader. GR00T
+and PI0-FAST adapt it to their legacy precision executors only inside Rust loading.
 
 Two entry points, both returning something that satisfies the `Policy` contract:
 
@@ -166,6 +167,15 @@ Any default step is replaceable at construction (`image_pipeline=`,
 `tokenizer=`, `unnormalizer=`, `noise=`) for a custom high-performance
 implementation.
 
+### Cosmos Policy direct mode
+
+`AutoPolicy` recognizes prepared `cosmos-policy` assets. The supported BF16
+LIBERO profile consumes wrist/primary RGB, an explicitly named 9-value state
+field and one of 40 cached task texts. It returns a 16×7 action chunk while the
+native model jointly denoises actions, future state, images and value. Supplied
+noise uses `ModelRunner.initial_latent_shape` (`[1,16,9,28,28]`), independently
+of action shape. See [checkpoint preparation, usage and measured validation](../../doc/cosmos-policy.md).
+
 ### GR00T local assets
 
 `AutoPolicy` dispatches GR00T by its checkpoint config and loads its local
@@ -188,7 +198,7 @@ copy Cosmos weights. Then load with the model directory alone:
 ```python
 policy = AutoPolicy.from_pretrained(
     "/models/GR00T-N1.7-LIBERO/libero_10",
-    precision="bf16",
+    model_variant="bf16",
 )
 ```
 
@@ -200,7 +210,7 @@ paths or checkpoint export paths, or download missing resources. See the
 and an FP8 calibration bound to the selected model/processor metadata. Profiles
 without the versioned GR00T processor identity require recalibration for both
 prepared resources and explicit `backbone=` snapshots.
-GR00T uses `precision=`, rather than PI0.5's `model_variant=`.
+GR00T uses `model_variant="bf16"`, `"fp8_static"` or `"int8_dynamic"`.
 
 ## Policy contract
 
@@ -287,3 +297,11 @@ a SentencePiece model (`APXINF_TOKENIZER` or `APXINF_PI05_MODEL_DIR`). Everythin
 else is checked against the definition or against itself — the π0-FAST inverse DCT
 is compared with the textbook term-by-term sum, not with scipy. The real-model
 layering test needs a CUDA `apxinf_py` build plus `APXINF_PI05_MODEL_DIR`.
+
+The package optionally builds a C++17 CPU resize primitive with setuptools.
+Cosmos Policy uses it for the reference 212→224 crop resize while preserving
+separate FP32 passes and final nearest-even uint8 rounding. JPEG encoding,
+cropping, camera order, and custom image transforms remain policy-owned. If
+the accelerator is unavailable, the existing NumPy implementation remains
+available without a compiler, GPU, or model runtime. No platform-specific
+CPU instruction set is required by the distributed extension.

@@ -67,7 +67,7 @@ APXINF_CUDA_ARCH=sm_110 \
 ```
 
 Install the resulting wheel and `python/apxinf` in the test environment. The
-checkpoint, planner, tokenizer and test fixtures are external assets.
+checkpoint, planner and tokenizer are external assets.
 
 ```python
 from pathlib import Path
@@ -77,66 +77,47 @@ model = Path("/path/to/Qwen-Drive-1.0-4B")
 policy = AutoPolicy.from_pretrained(
     model, model_type="qwen_drive", model_variant="bf16",
     planner=model / "planner-sft", mode="direct_planning", num_steps=10,
-    tactics="/path/to/empty-vendor.json",
+    tactics="/path/to/controlled-recipes",
 )
 ```
 
-Use the same explicit tactic store for both comparison arms. The empty vendor
-store in this acceptance exercises the operator defaults. `reasoning_planning`
+Use the same explicit recipe directory for both comparison arms. The historical
+acceptance above used an empty legacy vendor store; cuda-new does not import
+that JSON. Prepare compatible recipes or explicitly test native defaults. `reasoning_planning`
 is also supported, but is outside this direct-planning latency result.
 VQA and BEV perception are not exposed by this planning runtime.
 
 ## Latency procedure
 
-1. Check the GPU process list, machine load and shared GPU lock. Do not benchmark
-   alongside other GPU work or CPU compilation/scoring.
-2. Save clock configuration with `sudo jetson_clocks --store <file>` and set
-   `sudo jetson_clocks --fan`. Read back CPU, GPU, EMC and fan settings; restore
-   the saved configuration after testing.
-3. Use the same checkpoint, decoded frames, target sizes, prompt and initial
-   noise in both arms. The primary fixture has three cameras and four frames
-   per camera, 3385 real prompt tokens padded to 3387.
-4. Warm up ten calls; measure thirty calls per arm. Alternate reference,
-   candidate, candidate, reference. Keep all arms and report P50/P95 plus spread.
+The maintained benchmark constructs all RGB images, ego history and initial
+noise in memory. There are three cameras and four frames per camera. Historical
+images use `(384, 416)` and current images `(720, 799)` target sizes. These
+explicit performance shapes differ from official default-resolution accuracy
+inputs. Model and planner weights remain real checkpoint weights.
 
-For the pinned fixture format (`scenes.json`, image `.npy` files and
-`initial-noise.npy`), the core loop is:
-
-```python
-import json
-import time
-import numpy as np
-
-fixtures = Path("/path/to/public-inputs")
-scene = json.loads((fixtures / "scenes.json").read_text())[0]
-observation = dict(scene)
-observation["views"] = {
-    camera: [
-        {"image": np.load(fixtures / frame["image"]),
-         "target_size": frame["target_size"]}
-        for frame in frames
-    ]
-    for camera, frames in scene["views"].items()
-}
-noise = np.load(fixtures / "initial-noise.npy")
-for _ in range(10):
-    policy.infer(observation, noise=noise)
-samples, actions = [], []
-for _ in range(30):
-    start = time.perf_counter()
-    result = policy.infer(observation, noise=noise)
-    samples.append((time.perf_counter() - start) * 1000)
-    actions.append(np.asarray(result["actions"]).copy())
-assert all(np.array_equal(actions[0], x) for x in actions)
-ordered = sorted(samples)
-print({"p50_ms": ordered[int(.50 * (len(ordered) - 1))],
-       "p95_ms": ordered[int(.95 * (len(ordered) - 1))]})
-policy.close()
+```sh
+python scripts/bench_qwen_drive.py \
+  --model-dir /models/Qwen-Drive-1.0-4B --model-variant bf16 \
+  --warmup 10 --samples 30 --seed 0 \
+  --out devlocal/qwen-drive-bench/results/latency.json
 ```
 
-Capture native-library, model, tokenizer, artifact-manifest, tactic-store and
-input hashes with raw timings and clock readbacks. Acceptance evidence stays
-under `devlocal/qwen-drive-performance/`; it is not part of the source distribution.
+The same command in APXinf-robo delegates to this script and uses Robo's
+`load_policy`. Neither entry reads saved input tensors. The report includes
+raw request timings, P50/P95, output shape/hash and input profile. Fixed-input
+repetitions must return identical finite `[50, 3]` trajectories.
+
+Before measuring, exclude other GPU tasks and CPU compilation/scoring. Save and
+lock CPU/GPU/EMC clocks and fan, verify readbacks, and restore settings afterwards.
+Warm up ten requests and measure thirty requests in each of two runs. Keep both
+reports and pool their raw samples. Record source/native-binary, checkpoint,
+native recipe-directory hashes and library versions. Without `--tactics`, the
+engine uses its native default recipe cache and candidate selection. For a
+controlled comparison, pass an explicit `--tactics` directory; a legacy JSON
+filename instead selects its sibling `.recipes` directory.
+
+The table above retains the previously published recorded-input results. Use
+this maintained benchmark for new measurements.
 
 ## Accuracy procedure
 
@@ -233,24 +214,9 @@ with their current BF16 storage contracts. Their former FP32 test buffers
 produced invalid comparisons and have been corrected. Value-split coverage
 selects distinct legacy launch policies directly, without environment mutation.
 
-The whole-model test uses a checkpoint plus one canonical fixture directory:
-`meta.json` contains `grids` and `pixels_shape`; `tokens.bin` is u32,
-`attention_mask.bin` is u8, and `pixels.bin`, `conditioning.bin`, `noise.bin`
-contain f32 values in native little-endian order. The fixture retains the
-physical padded tokens and the real-prefix mask. Generate it from the same
-policy inputs as the benchmark, then run:
-
-```sh
-APXINF_QWEN_DRIVE_TEST_MODEL=/path/to/Qwen-Drive-1.0-4B \
-APXINF_QWEN_DRIVE_TEST_INPUTS=/path/to/canonical-fixture \
-  cargo test --release -p apxinf-model --features cuda --lib \
-  whole_direct_graph_rebinds_inputs_and_owns_its_lifetime -- --ignored
-```
-
-This checks explicit eager versus required-graph execution, changed image/text/
-conditioning/noise inputs, generated-noise keys, incompatible requests and
-resource lifetime after dropping the runner. `Action` may alias prepared output
-storage; transfer/copy its data before the next call when retaining results.
+Retained actions must be copied before the next inference because prepared
+output storage may be reused. The benchmark copies each returned trajectory
+before its repeatability comparison.
 
 ### Maintained runtime controls and ownership
 
@@ -258,8 +224,7 @@ Qwen-Drive has no production `APXINF_QWEN_*` or GDN experiment environment
 switches. Direct planning uses its maintained prepared path; reasoning retains
 eager execution. Diagnostic branches that changed fusion/capture were removed.
 `OnceLock` remains valid for immutable data caches such as the position table.
-The two checkpoint/fixture variables above are test inputs. Generic
-device/recipe infrastructure is shared with other model families.
+Generic device/recipe infrastructure is shared with other model families.
 
 Canonical conditioning packs, in order: flattened historical pose (excluding
 the final/current entry), flattened historical velocity, flattened historical

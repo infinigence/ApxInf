@@ -23,7 +23,7 @@ Returns `float32` `[action_horizon, action_dim]` in the **normalized** domain.
 
 ## Build
 
-The VLA runtimes are CUDA-only, so real inference needs the `cuda` feature and a
+GPU VLA inference needs the `cuda` feature and a
 CUDA machine (e.g. Thor). Without CUDA the module still imports and reports its
 shape contract, but model loading errors.
 
@@ -61,11 +61,17 @@ model = apxinf_py.ModelRunner.load("pi05", "/path/to/checkpoint", device="cuda:0
 rgb = np.zeros((model.num_views, model.image_size, model.image_size, 3), np.uint8)
 tokens = np.zeros(16, np.uint32)
 noise = np.random.default_rng(0).standard_normal(
-    (model.action_horizon, model.action_dim), dtype=np.float32
+    model.initial_latent_shape, dtype=np.float32
 )
 
 action = model.infer_rgb(rgb, "nhwc", tokens, noise)  # -> [horizon, dim] float32
 ```
+
+Supplied noise must be finite, C-contiguous `float32` with the runtime's
+`initial_latent_shape`. This defaults to `[action_horizon, action_dim]`; a joint
+diffusion family can declare a higher-rank latent while keeping the action output
+unchanged. Processor bridges retain their existing optional leading batch
+dimension for action-matrix noise.
 
 ## Decision requests
 
@@ -130,3 +136,18 @@ pip install pytest numpy
 APXINF_PI05_CHECKPOINT=/path/to/checkpoint APXINF_PI05_MODEL_VARIANT=bf16 \
   pytest crates/apxinf-py/tests
 ```
+
+Rust-side unit tests (device/precision/layout parsing, config fallback) need no
+CUDA:
+
+```sh
+cargo test -p apxinf-py
+```
+
+## PI0.5 CPU reference
+
+Build with `maturin develop --features openblas` on Linux or macOS with
+OpenBLAS installed, and load PI0.5 with `device="cpu"`,
+`model_variant="fp32_reference"`. This FP32 path is eager-only and requires no
+CUDA toolkit. See the [CPU contract](../../doc/pi05-cpu-reference.md) for input
+limitations, threading, and verification scope.

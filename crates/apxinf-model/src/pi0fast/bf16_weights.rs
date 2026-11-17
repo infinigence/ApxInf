@@ -96,7 +96,7 @@ pub(super) fn concat_biases_bf16(tensors: &[&Tensor], backend: &dyn Backend) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apxinf_core::CpuBackend;
+    use apxinf_cpu::CpuBackend;
 
     #[test]
     fn packs_qkv_as_native_bf16() {

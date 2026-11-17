@@ -7,7 +7,7 @@
 //! The public inference tier is numpy-in / numpy-out (host):
 //!
 //! * **L1** [`ModelRunner::infer_rgb`] — caller supplies resized RGB `uint8` images;
-//!   vision→patches runs inside the Rust CUDA graph.
+//!   the selected Rust runtime converts RGB to patches.
 //!
 //! **L0** [`ModelRunner::infer_patches`] (caller supplies pre-computed `patches`,
 //! equivalent to a Rust `Observation(Patches)`) is exposed under the private
@@ -18,13 +18,13 @@
 //! Both return the **normalized-domain** action as a `float32` numpy array of
 //! shape `[action_horizon, action_dim]`. Inference accepts optional exact
 //! caller-provided noise. When it is omitted, a model-owned counter-based stream
-//! generates the initial latent directly in the runtime's device buffer. The
+//! generates the initial latent through the selected runtime. The
 //! `*_seeded` variants remain available for explicitly keyed replay. No processor
 //! lives here.
 //!
-//! The VLA runtimes are only registered on CUDA devices, so real inference
-//! requires the `cuda` feature and a CUDA machine; without it the module still
-//! imports and reports shape contracts, but model loading errors.
+//! PI0.5 supports CPU inference with its FP32 reference variant and optional
+//! OpenBLAS GEMM. CUDA model variants require the `cuda` feature
+//! and a CUDA device.
 //!
 
 use std::cell::Cell;
@@ -177,6 +177,38 @@ fn parse_layout(spec: &str) -> PyResult<ImageLayout> {
             "apxinf_py.infer_rgb: layout must be nhwc|nchw, got `{other}`"
         ))),
     }
+}
+
+/// Keep legacy processor bridges' optional leading batch dimension, while
+/// requiring joint latents to match the runtime's complete declared geometry.
+fn supplied_latent_tensor(
+    noise: PyReadonlyArrayDyn<'_, f32>,
+    expected: &[usize],
+    allow_legacy_batch: bool,
+) -> PyResult<Tensor> {
+    let shape = noise.shape();
+    let legacy_batch = allow_legacy_batch
+        && expected.len() == 2
+        && shape.len() == 3
+        && shape[0] == 1
+        && &shape[1..] == expected;
+    if shape != expected && !legacy_batch {
+        return Err(PyValueError::new_err(format!(
+            "apxinf_py.infer: noise expected shape {expected:?}, got {shape:?}"
+        )));
+    }
+    if !noise.is_c_contiguous() {
+        return Err(PyValueError::new_err(
+            "apxinf_py.infer: noise must be C-contiguous float32",
+        ));
+    }
+    let data = noise.as_slice().map_err(|_| {
+        PyValueError::new_err("apxinf_py.infer: noise must be C-contiguous float32")
+    })?;
+    if data.iter().any(|value| !value.is_finite()) {
+        return Err(PyValueError::new_err("apxinf_py.infer: noise must be finite"));
+    }
+    Tensor::from_f32(Shape::new(shape.to_vec()), data).map_err(runtime_err)
 }
 
 /// Resolve the pi05 config the same way the loader does, so shape-contract
@@ -563,19 +595,17 @@ impl ModelRunner {
 
     /// Validate `noise` shape and build a CPU f32 tensor. The runtime normalizes
     /// f32 CPU tensors to its input dtype, so numpy f32 is accepted directly.
-    fn noise_tensor(&self, noise: PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
-        let expected = self.action_shape();
-        let shape = noise.shape();
-        if shape.len() != 2 || shape[0] != expected[0] || shape[1] != expected[1] {
-            return Err(PyValueError::new_err(format!(
-                "apxinf_py.infer: noise expected shape [{}, {}], got {:?}",
-                expected[0], expected[1], shape
-            )));
-        }
-        let data = noise.as_slice().map_err(|_| {
-            PyValueError::new_err("apxinf_py.infer: noise must be C-contiguous float32")
-        })?;
-        Tensor::from_f32(Shape::new(vec![expected[0], expected[1]]), data).map_err(runtime_err)
+    fn noise_tensor(&self, noise: PyReadonlyArrayDyn<'_, f32>) -> PyResult<Tensor> {
+        self.latent_tensor(noise, false)
+    }
+
+    fn latent_tensor(
+        &self,
+        noise: PyReadonlyArrayDyn<'_, f32>,
+        allow_legacy_batch: bool,
+    ) -> PyResult<Tensor> {
+        let expected = self.model.vla().map_err(runtime_err)?.initial_latent_shape();
+        supplied_latent_tensor(noise, &expected, allow_legacy_batch)
     }
 
     fn action_mask_tensor(&self, mask: PyReadonlyArray2<'_, f32>) -> PyResult<Tensor> {
@@ -718,22 +748,7 @@ impl ModelRunner {
             })?,
         )
         .map_err(runtime_err)?;
-        let [horizon, action_dim] = self.action_shape();
-        let noise_shape = noise.shape();
-        if noise_shape != [horizon, action_dim] && noise_shape != [1, horizon, action_dim] {
-            return Err(PyValueError::new_err(format!(
-                "apxinf_py.{method}: noise expected [{horizon}, {action_dim}] or [1, {horizon}, {action_dim}], got {noise_shape:?}"
-            )));
-        }
-        let latent = Tensor::from_f32(
-            Shape::new(noise_shape.to_vec()),
-            noise.as_slice().map_err(|_| {
-                PyValueError::new_err(format!(
-                    "apxinf_py.{method}: noise must be C-contiguous float32"
-                ))
-            })?,
-        )
-        .map_err(runtime_err)?;
+        let latent = self.latent_tensor(noise, true)?;
         Ok(PreprocessedVlaInput {
             observation: Observation {
                 vision: VisionObservation::Patches(pixels),
@@ -830,19 +845,7 @@ impl ModelRunner {
             })?,
         )
         .map_err(runtime_err)?;
-        let [horizon, dim] = self.action_shape();
-        if noise.shape() != [horizon, dim] && noise.shape() != [1, horizon, dim] {
-            return Err(PyValueError::new_err(
-                "_infer_resized_rgb: noise shape mismatch",
-            ));
-        }
-        let latent = Tensor::from_f32(
-            Shape::new(noise.shape().to_vec()),
-            noise.as_slice().map_err(|_| {
-                PyValueError::new_err("_infer_resized_rgb: noise must be contiguous float32")
-            })?,
-        )
-        .map_err(runtime_err)?;
+        let latent = self.latent_tensor(noise, true)?;
         Ok(PreprocessedVlaInput {
             observation: Observation {
                 vision: VisionObservation::RgbU8 {
@@ -1009,8 +1012,7 @@ impl ModelRunner {
         self.action_array(py, flat)
     }
 
-    /// Run with a standard-normal latent generated into the prepared device
-    /// buffer, avoiding a host allocation and H2D latent copy.
+    /// Run with a standard-normal latent generated by the selected runtime.
     fn run_generated<'py>(
         &self,
         py: Python<'py>,
@@ -1065,8 +1067,9 @@ impl ModelRunner {
     /// * `path` — checkpoint directory or index file.
     /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
     ///   The selected family and compiled features must support that backend.
-    /// * `model_variant` — PI0.5: auto, bf16, fp8_static, int8_dynamic.
-    /// * `precision` — legacy selection for other model families; leave auto for PI0.5.
+    /// * `model_variant` — family-owned implementation selection for every VLA policy;
+    ///   PI0.5 CPU accepts auto/fp32_reference.
+    /// * `precision` — legacy runtime compatibility; leave auto when using model_variant.
     /// * `calibration` — optional FP8 calibration json.
     /// * `tactics` — optional hardware-wide GEMM tactics json.
     /// * `autotune` — tune missing exact GEMM keys from the first real request.
@@ -1189,7 +1192,8 @@ impl ModelRunner {
     /// * `model` — model name, e.g. `"pi05"`.
     /// * `device` — `cuda:N` (default), `metal:N` (`mlx:N` alias), or `cpu`.
     ///   The selected family and compiled features must support that backend.
-    /// * `model_variant` — `bf16` (default), `fp8_static`, or `int8_dynamic`.
+    /// * `model_variant` — CUDA: `bf16` (default), `fp8_static`, or `int8_dynamic`;
+    ///   CPU: explicitly select `auto` or `fp32_reference`.
     /// * `calibration` — for FP8: `"uniform:<scale>"` for a uniform activation
     ///   scale (no calibration file), or a path to a calibration json.
     /// * `tactics` - optional hardware-wide GEMM tactics json.
@@ -1290,7 +1294,7 @@ impl ModelRunner {
     ///
     /// * `patches` - `float32` `[num_views * patches_per_view, 3 * patch_size^2]`.
     /// * `token_ids` - `uint32` `[token_count]` (1..=max_token_len).
-    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
+    /// * `noise` - optional `float32` with `initial_latent_shape`; omission
     ///   uses the model's internal device-side sampling stream.
     ///
     /// Returns the normalized-domain action, `float32` `[action_horizon, action_dim]`.
@@ -1300,7 +1304,7 @@ impl ModelRunner {
         py: Python<'py>,
         patches: PyReadonlyArray2<'py, f32>,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: Option<PyReadonlyArray2<'py, f32>>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let expected = [self.patch_rows(), self.patch_width()];
@@ -1635,14 +1639,14 @@ impl ModelRunner {
         self.run_generated(py, observation, RngKey::new(seed, sequence, draw), None)
     }
 
-    /// **L1** - infer from resized RGB `uint8` images; vision->patches runs in the
-    /// Rust CUDA graph.
+    /// **L1** - infer from resized RGB `uint8` images; the selected Rust runtime
+    /// converts RGB to patches.
     ///
     /// * `rgb_u8` - `uint8` images, `num_views * image_size * image_size * 3`
     ///   bytes total, in `layout` order.
     /// * `layout` - `"nhwc"` or `"nchw"`.
     /// * `token_ids` - `uint32` `[token_count]`.
-    /// * `noise` - optional `float32` `[action_horizon, action_dim]`; omission
+    /// * `noise` - optional `float32` with `initial_latent_shape`; omission
     ///   uses the model's internal device-side sampling stream.
     /// * `image_grid_thw` - optional `uint32` `[views, 3]` patch grids for models
     ///   that accept per-request image sizes; `rgb_u8` then packs each view at
@@ -1657,7 +1661,7 @@ impl ModelRunner {
         rgb_u8: PyReadonlyArrayDyn<'py, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: Option<PyReadonlyArray2<'py, f32>>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
         state: Option<PyReadonlyArray1<'py, f32>>,
         image_grid_thw: Option<PyReadonlyArray2<'py, u32>>,
@@ -1692,7 +1696,7 @@ impl ModelRunner {
         rgb_u8: PyReadonlyArrayDyn<'py, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
-        noise: Option<PyReadonlyArray2<'py, f32>>,
+        noise: Option<PyReadonlyArrayDyn<'py, f32>>,
         action_mask: Option<PyReadonlyArray2<'py, f32>>,
         state: Option<PyReadonlyArray1<'py, f32>>,
         image_grid_thw: Option<PyReadonlyArray2<'py, u32>>,
@@ -1737,9 +1741,13 @@ impl ModelRunner {
     ///   and stops, returning a shorter array. Pass the FAST `|` terminator to
     ///   skip the ~90% of `max_action_tokens` that the detokenizer discards.
     ///
+    /// * `max_new_tokens` — optional per-call limit in `1..=max_action_tokens`.
+    ///   With `stop_token=None`, emit exactly this many ids (including any `|`).
+    ///   This bounds the actual decode loop, not a slice of a longer result.
+    ///
     /// Returns `uint32` `[1..=max_action_tokens]`, including `stop_token` when
     /// it was hit.
-    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None))]
+    #[pyo3(name = "infer_action_tokens_rgb", signature = (rgb_u8, layout, token_ids, stop_token=None, *, max_new_tokens=None))]
     fn infer_action_tokens_rgb<'py>(
         &self,
         py: Python<'py>,
@@ -1747,6 +1755,7 @@ impl ModelRunner {
         layout: &str,
         token_ids: PyReadonlyArray1<'py, u32>,
         stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray1<u32>>> {
         let token_shape = self.action_tokens.ok_or_else(|| {
             PyValueError::new_err(
@@ -1754,6 +1763,13 @@ impl ModelRunner {
                  discrete action tokens (it is a continuous-action runtime)",
             )
         })?;
+        if let Some(limit) = max_new_tokens {
+            if limit == 0 || limit > token_shape[1] {
+                return Err(PyValueError::new_err(format!(
+                    "max_new_tokens must be in 1..={}, got {limit}", token_shape[1]
+                )));
+            }
+        }
         let (observation, _) =
             self.rgb_observation("infer_action_tokens_rgb", rgb_u8, layout, token_ids, None)?;
         // Token VLAs condition on the observation alone; the request still
@@ -1762,7 +1778,7 @@ impl ModelRunner {
         let request = VlaRequest::provided(&observation, &unused_latent);
         let decoded = self
             .model
-            .infer_action_tokens(&request, stop_token)
+            .infer_action_tokens_with_limit(&request, stop_token, max_new_tokens)
             .map_err(runtime_err)?;
         let values = decoded.to_f32_vec().map_err(runtime_err)?;
         if values.is_empty() || values.len() > token_shape[1] {
@@ -1786,7 +1802,7 @@ impl ModelRunner {
         rgb_u8: PyReadonlyArrayDyn<'_, u8>,
         layout: &str,
         token_ids: PyReadonlyArray1<'_, u32>,
-        noise: PyReadonlyArray2<'_, f32>,
+        noise: PyReadonlyArrayDyn<'_, f32>,
     ) -> PyResult<BTreeMap<String, f32>> {
         let (observation, _) =
             self.rgb_observation("_calibrate_rgb", rgb_u8, layout, token_ids, None)?;
@@ -1870,6 +1886,12 @@ impl ModelRunner {
     #[getter]
     fn model_variant(&self) -> PyResult<Option<&'static str>> {
         Ok(self.model.vla().map_err(runtime_err)?.model_variant())
+    }
+
+    /// Complete supplied-noise shape; it may differ from the action readout.
+    #[getter]
+    fn initial_latent_shape(&self) -> PyResult<Vec<usize>> {
+        Ok(self.model.vla().map_err(runtime_err)?.initial_latent_shape())
     }
 
     /// Execution path the runtime is actually on: `"unprepared"`, `"eager"`,
@@ -1956,6 +1978,42 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use numpy::PyArrayMethods;
+
+    #[test]
+    fn supplied_noise_preserves_joint_geometry_and_legacy_batches() {
+        use numpy::ndarray::{ArrayD, IxDyn};
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let joint_shape = [1, 16, 9, 28, 28];
+            let joint = ArrayD::<f32>::zeros(IxDyn(&joint_shape)).into_pyarray_bound(py);
+            let tensor = supplied_latent_tensor(joint.readonly(), &joint_shape, false).unwrap();
+            assert_eq!(tensor.shape().dims(), &joint_shape);
+            assert!(supplied_latent_tensor(joint.readonly(), &[16, 7], true).is_err());
+
+            let action = ArrayD::<f32>::zeros(IxDyn(&[16, 7])).into_pyarray_bound(py);
+            assert!(supplied_latent_tensor(action.readonly(), &[16, 7], false).is_ok());
+            assert!(supplied_latent_tensor(action.readonly(), &joint_shape, true).is_err());
+            let batch = ArrayD::<f32>::zeros(IxDyn(&[1, 16, 7])).into_pyarray_bound(py);
+            assert!(supplied_latent_tensor(batch.readonly(), &[16, 7], true).is_ok());
+            assert!(supplied_latent_tensor(batch.readonly(), &[16, 7], false).is_err());
+        });
+    }
+
+    #[test]
+    fn supplied_noise_rejects_nonfinite_and_noncontiguous_arrays() {
+        use numpy::ndarray::{ArrayD, IxDyn};
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let invalid = ArrayD::<f32>::from_elem(IxDyn(&[16, 7]), f32::NAN)
+                .into_pyarray_bound(py);
+            assert!(supplied_latent_tensor(invalid.readonly(), &[16, 7], false).is_err());
+            let strided = ArrayD::<f32>::zeros(IxDyn(&[7, 16]))
+                .reversed_axes()
+                .into_pyarray_bound(py);
+            assert!(supplied_latent_tensor(strided.readonly(), &[16, 7], false).is_err());
+        });
+    }
 
     mod decision {
         use super::*;

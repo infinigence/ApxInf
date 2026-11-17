@@ -59,6 +59,8 @@ fn kind(model: &LoadedModel) -> &'static str {
         LoadedModel::Text { .. } => "text",
         LoadedModel::Vla(_) => "vla",
         LoadedModel::Decision(_) => "decision",
+        LoadedModel::Image(_) => "image",
+        LoadedModel::Speech(_) => "speech",
     }
 }
 

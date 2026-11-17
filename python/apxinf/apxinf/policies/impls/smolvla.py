@@ -219,7 +219,6 @@ class SmolVlaPolicy:
                 "smolvla_libero",
                 checkpoint,
                 device=device,
-                precision="auto",
                 sampling_seed=int(seed),
                 num_views=num_views,
                 tactics=str(tactics) if tactics is not None else None,

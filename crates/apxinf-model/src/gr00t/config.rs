@@ -595,3 +595,77 @@ mod tests {
         assert!(Gr00tConfig::from_json_str(&wrong_dtype).is_err());
     }
 }
+
+/// Compatibility boundary for the legacy precision-based executor.
+pub(super) fn load_precision(
+    options: &crate::auto::LoadOptions,
+) -> apxinf_core::Result<crate::auto::ModelPrecision> {
+    use crate::auto::ModelPrecision;
+    let Some(name) = options.model_variant.as_deref() else {
+        return Ok(options.precision);
+    };
+    if options.precision != ModelPrecision::Auto {
+        return Err(apxinf_core::Error::Other(
+            "use model_variant without legacy precision".into(),
+        ));
+    }
+    match name {
+        "auto" => Ok(ModelPrecision::Auto),
+        "bf16" => Ok(ModelPrecision::Bf16),
+        "fp8_static" => Ok(ModelPrecision::Fp8),
+        "int8_dynamic" => Ok(ModelPrecision::W8A8),
+        value => Err(apxinf_core::Error::Other(format!("unsupported gr00t model_variant {value:?}; expected auto, bf16, fp8_static, int8_dynamic"))),
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::load_precision;
+    use crate::auto::{LoadOptions, ModelPrecision};
+    #[test]
+    fn variants_adapt_only_at_legacy_loader_boundary() {
+        assert_eq!(
+            load_precision(&LoadOptions {
+                model_variant: Some("auto".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+            ModelPrecision::Auto
+        );
+        assert_eq!(
+            load_precision(&LoadOptions {
+                model_variant: Some("bf16".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+            ModelPrecision::Bf16
+        );
+        assert_eq!(
+            load_precision(&LoadOptions {
+                model_variant: Some("fp8_static".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+            ModelPrecision::Fp8
+        );
+        assert_eq!(
+            load_precision(&LoadOptions {
+                model_variant: Some("int8_dynamic".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+            ModelPrecision::W8A8
+        );
+        assert!(load_precision(&LoadOptions {
+            model_variant: Some("fp8_dynamic".into()),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(load_precision(&LoadOptions {
+            model_variant: Some("bf16".into()),
+            precision: ModelPrecision::Bf16,
+            ..Default::default()
+        })
+        .is_err());
+    }
+}

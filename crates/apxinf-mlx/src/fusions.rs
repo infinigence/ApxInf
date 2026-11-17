@@ -3,11 +3,14 @@ pub use crate::causal_conv::CausalDepthwiseConv;
 pub use crate::gate_swiglu::F16GateSwiglu;
 pub use crate::gated_delta::{GatedDeltaLayout, GatedDeltaRecurrence};
 pub use crate::half_split_rope::HalfSplitRope;
+pub use crate::interleaved_qk_norm_rope::InterleavedQkNormRope;
+pub use crate::mpp_gemm::MppBf16GemmNt;
 pub use crate::q4_f16::{
     padded_rows, F16Gemm, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16, Q4TransposeDecode,
     SplitF16Gemm,
 };
 pub use crate::qk_norm_rope::QkNormRope;
+pub use crate::swiglu_gemv::{SwigluMlpGemv, SwigluWeights};
 use crate::{Array, MetalKernel, MlxDType, Stream, TemplateArg};
 use apxinf_core::{Error, Result};
 

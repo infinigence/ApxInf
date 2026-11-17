@@ -16,6 +16,7 @@ The first version of ApxInf ships with highly optimized PI-0.5 VLA model on Jets
 Orin devices, and supports BF16, FP8 and INT8 precisions.
 
 ## What's NEW!
+- [2026/11] 🔥 ApxInf supports Moore Threads MUSA as Backend.
 - [2026/10] 🔥 ApxInf supports Decision 3.0 mini and Qwen3.8-27B with image inference.
 - [2026/10] 🔥 ApxInf supoorts SmolVLA, deployable on Jetson Xavier / Thor / Orin / RTX 4090.
 - [2026/09] 🔥 ApxInf supports PI0-FAST, GR00T-N1.7, Qwen-Drive, Qwen3.8-27B.
@@ -58,7 +59,9 @@ Orin devices, and supports BF16, FP8 and INT8 precisions.
         <ul style="margin-left: 0; padding-left: 16px;">
           <li>NVIDIA CUDA ✅
           </li>
-          <li>AMD ROCm
+          <li>Moore Threads MUSA ✅
+          </li>
+          <li>AMD HIP/ROCm
           </li>
           <li>Apple Metal
           </li>
@@ -242,6 +245,12 @@ Two views, 224x224 NHWC `uint8`, batch 1.
 | Jetson AGX Orin | BF16 | 117.3 ms | 25.34 ms |
 | RTX 4090 | BF16 | 20.9 ms | 5.24 ms |
 
+[Benchmark and task evaluation commands](doc/pi0-fast-benchmark.md).
+For a benchmark without recorded inputs, use `--layer l1 --mode fixed` with the
+survey-derived 12/16/20/28/32/40-token grid described there. It measures controlled
+decode lengths; the historical table above uses the natural-stop measurement
+and has not been replaced by results from this new mode.
+
 ### GR00T N1.7
 
 One or two views, batch 1. Best recorded P50.
@@ -343,8 +352,10 @@ pip install -e "python/apxinf[serving]"
 Activate a venv or conda env before installing. The `serving` extra adds msgpack/websockets.
 
 `--features cuda` is a Cargo feature, not a CUDA installation: it compiles the
-CUDA backend into the binding, and it is required — the PI0.5 runtime is only
-registered on CUDA devices, as is WallOSS.
+CUDA backend into the binding for GPU inference. WallOSS requires CUDA.
+PI0.5 also supports an eager [FP32 CPU reference](doc/pi05-cpu-reference.md):
+build with `openblas` on Linux or macOS, then select `device="cpu"`
+and `model_variant="fp32_reference"`.
 
 The build queries the visible GPU for its compute capability and compiles the
 kernels for exactly that architecture, so build on the machine you deploy to;
@@ -596,9 +607,7 @@ entry point — the raw tokens — and L2 turns them into actions:
 from apxinf import AutoPolicy
 
 policy = AutoPolicy.from_pretrained(
-    "<path-to-model>",
-    precision="bf16",
-    state_key="observation/state",
+    "<path-to-model>", model_variant="bf16", state_key="observation/state",
 )
 
 # L1: raw FAST action tokens, uint32 [max_action_tokens]
@@ -660,15 +669,26 @@ python scripts/bench_pi05.py --model-dir <path-to-model> --model-variant bf16 --
   select the synthetic workload.
 - `--calibration` is FP8-only and synthetic-only; a checkpoint reads
   `calibration.json` from its own directory.
-- `--action-horizon` also applies to a checkpoint — the horizon is a sequence
+- `--action-horizon` also applies to a PI0.5 checkpoint — the horizon is a sequence
   length, not a weight dimension — which is what makes a real checkpoint
   comparable to a synthetic run.
 - `--warmup` / `--samples` set the sampling protocol (default 10 and 30);
   `--out` writes the report as JSON.
 
-Any registered model type works: `AutoPolicy` dispatches on the checkpoint's
-`config.json`, so the same command benchmarks the next model without a flag
-change.
+The command above supports PI0.5 and WallOSS through `AutoPolicy` checkpoint
+selection. `l1` measures `ModelRunner.infer_rgb`; `l2` measures `policy.infer`,
+including preprocessing and postprocessing. These are benchmark labels, not
+separate inference APIs. Both policies expose `prepare_rgb_inputs` so the
+benchmark uses their normal preprocessing, including WallOSS grids and masks.
+The legacy `l0` patch diagnostic remains PI0.5-only.
+
+Use `--model-variant bf16` for either model, or `--model-variant fp8_dynamic`
+for WallOSS dynamic FP8. All built-in policy loaders use `model_variant`;
+unsupported variants fail explicitly. Its specialized shape/stage benchmark is
+`scripts/bench_walloss.py --model-dir <path> --model-variant bf16`.
+Other families' maintained benchmark commands are linked in their model docs;
+registration alone does not guarantee compatibility with this script's
+synthetic observation or measurement layers.
 
 For one-step evaluation, please refer to `doc/run_warmstart_with_onestep.md`
 
@@ -705,6 +725,15 @@ Built with Rust 1.95 and 1.96; no minimum supported version is declared.
 
 ## Acknowledgement
 
+<div align="left">
+  <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/vendor/MTLOGO-PNG/horizontal-color1.png" alt="moorethreads-logo" width="128"/>
+  <p>
+  We sincerely thank Moore Threads for providing the hardware platform, software ecosystem, and engineering support for adapting APXInf to the MTT E300. This effort focuses on the deployment and inference of the PI 0.5 model, further extending APXInf’s capabilities across diverse computing platforms and contributing valuable practical experience to the efficient on-device deployment of embodied AI models. We look forward to deeper collaboration with Moore Threads across cloud, edge, and on-device computing, jointly exploring new possibilities for efficient on-device AI deployment and applications at scale.
+  </p>
+</div>
+
+
+
 The development of APXInf has been inspired by, and benefits from, the ideas and tooling of the broader open-source community.
 In particular, we would like to thank the teams and contributors behind
 [FasterTransformer](https://github.com/NVIDIA/FasterTransformer),
@@ -730,4 +759,5 @@ Scan the QR Code to join our Wechat Group
 
 <div align="left">
   <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/wechat.jpg" alt="wechat-group" width="256"/>
+  <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/qrcode.xhs.jpg" alt="xhs-account" width="256"/>
 </div>

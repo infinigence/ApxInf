@@ -16,3 +16,11 @@ pub fn gemm_bias_gelu(ctx: &CudaContext, args: GemmBiasGeluArgs<'_>) -> Result<(
         normalize(ctx, args.gemm, Semantic::GemmBiasGelu, Some(args.bias))?,
     )
 }
+
+/// BF16 GEMM followed by exact erf GELU. The FP32 accumulator is rounded to
+/// BF16 before GELU; its FP32 result is rounded to BF16 again. No bias or
+/// quantization is admitted, and alpha/output_scale must both be one.
+pub fn gemm_gelu_exact(ctx: &CudaContext, args: GemmArgs<'_>) -> Result<()> {
+    super::observer::observe(&args)?;
+    execution::execute(ctx, normalize(ctx, args, Semantic::GemmGeluExact, None)?)
+}

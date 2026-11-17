@@ -20,6 +20,10 @@ pub fn register_builtin_models() {
     registry::register("metal_minicpm5", crate::metal_minicpm5::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_qwen3", crate::metal_qwen3::load);
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    registry::register("metal_qwen_image", crate::metal_qwen_image::load);
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    registry::register("metal_qwen3_tts", crate::metal_qwen3_tts::load);
     registry::register("llama", load_llama);
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);
@@ -44,6 +48,8 @@ pub fn register_builtin_models() {
     crate::gr00t::register_builtin();
     #[cfg(feature = "cuda")]
     crate::smolvla::register_builtin();
+    #[cfg(feature = "cuda")]
+    crate::cuda_cosmos_policy::register_builtin();
 }
 fn load_llama(
     path: &Path,

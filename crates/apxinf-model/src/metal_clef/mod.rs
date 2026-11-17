@@ -229,7 +229,10 @@ mod tests {
         #[cfg(feature = "coreml")]
         {
             assert_eq!(admit(&options).unwrap(), Some(Composition::GpuAneColumns));
-            assert_eq!(select(admit(&options).unwrap(), ""), Composition::GpuAneColumns);
+            assert_eq!(
+                select(admit(&options).unwrap(), ""),
+                Composition::GpuAneColumns
+            );
         }
         #[cfg(not(feature = "coreml"))]
         assert!(admit(&options).is_err());

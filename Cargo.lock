@@ -72,6 +72,7 @@ name = "apxinf"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-cpu",
  "apxinf-cuda-new",
  "apxinf-hip",
  "apxinf-loader",
@@ -89,9 +90,7 @@ name = "apxinf-core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "cblas",
  "half",
- "libc",
  "thiserror 1.0.69",
 ]
 
@@ -108,10 +107,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "apxinf-cpu"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "cblas",
+ "half",
+]
+
+[[package]]
 name = "apxinf-cuda-new"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-cpu",
  "apxinf-loader",
  "apxinf-tokenizer",
  "cc",
@@ -124,6 +133,7 @@ name = "apxinf-hip"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-cpu",
  "half",
 ]
 
@@ -157,6 +167,7 @@ version = "0.1.0"
 dependencies = [
  "apxinf-core",
  "apxinf-coreml",
+ "apxinf-cpu",
  "apxinf-cuda-new",
  "apxinf-hip",
  "apxinf-loader",

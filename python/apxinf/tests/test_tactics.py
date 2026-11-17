@@ -10,6 +10,16 @@ from apxinf.policies.impls import pi05
 
 
 class Pi05TacticSelectionTest(unittest.TestCase):
+    def test_cpu_does_not_discover_cuda_assets(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = pathlib.Path(root)
+            (root / "tactics.json").touch()
+            with mock.patch.object(_tactics, "cuda_sm") as cuda_sm:
+                self.assertIsNone(_tactics.resolve_pi05_tactics("cpu", "fp32_reference", model_dir=root))
+                cuda_sm.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "does not use CUDA tactics"):
+                _tactics.resolve_pi05_tactics("cpu", "fp32_reference", override=root / "tactics.json")
+
     def test_selects_validated_source_tactics(self):
         cases = [
             (87, "bf16", "orin-sm87"),

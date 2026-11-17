@@ -33,6 +33,11 @@ class _PackedRgbU8:
 class ModelRunner:
     """A loaded VLA model handle exposing its bare-model inference contract."""
 
+    @property
+    def initial_latent_shape(self) -> list[int]:
+        """Complete noise geometry declared by the runtime, including batch if required."""
+        ...
+
     @staticmethod
     def load(
         model: str,
@@ -59,6 +64,9 @@ class ModelRunner:
         ``musa:N``, ``metal:N`` (alias ``mlx:N``), or ``cpu``. Model support
         depends on the selected backend.
         ``precision`` is ``auto`` (default), ``fp8``, ``bf16``, or ``int8``.
+        PI0.5 uses ``model_variant``: CUDA accepts ``auto``, ``bf16``,
+        ``fp8_static``, ``int8_dynamic``; CPU accepts ``auto``/``fp32_reference``.
+        Leave legacy ``precision`` at ``auto`` for PI0.5.
         ``config_json`` supplies architecture JSON when it is stored outside the
         checkpoint's ``config.json``. ``None`` leaves loading to AutoModel.
         ``action_horizon`` overrides the checkpoint's chunk length (a sequence
@@ -168,8 +176,10 @@ class ModelRunner:
         token_ids: npt.NDArray[np.uint32],
         noise: npt.NDArray[np.float32] | None = ...,
         action_mask: npt.NDArray[np.float32] | None = ...,
+        state: npt.NDArray[np.float32] | None = ...,
+        image_grid_thw: npt.NDArray[np.uint32] | None = ...,
     ) -> npt.NDArray[np.float32]:
-        """L1: infer from resized RGB uint8. Returns normalized-domain action."""
+        """L1: RGB inference; supplied noise must match ``initial_latent_shape``."""
         ...
 
     def _calibrate_rgb(

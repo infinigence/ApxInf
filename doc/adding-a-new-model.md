@@ -20,6 +20,18 @@ Every model implementation starts in its own directory:
 crates/apxinf-model/src/<model>/
 ```
 
+A new implementation that directly composes one backend's native APIs uses
+`<backend>_<family>/`, for example `cuda_cosmos_policy/`. Preserve existing
+public model names as loader aliases when renaming a native module.
+
+For a single BF16 VLA, follow the PI0.5 responsibility boundaries with one
+`model/blocks/bf16.rs` and one `weights/bf16.rs`, plus host checkpoint storage in
+`weights/host.rs`. A concrete `Bf16Blocks` encapsulates operator calls and
+intermediate representations; the model owns connectivity and the sampling
+schedule. Keep runtime validation/cache and preparation/resource ownership in
+`model_runner/{runner,prepare}.rs`. Split a precision file only for a demonstrated
+maintenance need; subnetwork count alone does not require extra files or traits.
+
 Do not add the new architecture to `llama/`, `qwen3vl/`, or `pi05/`, even when
 most code looks similar. Register the new directory from `lib.rs` and
 `builtin.rs`; keep model detection in the existing registry/`AutoModel` path.
@@ -110,6 +122,12 @@ HF tokenizer, state/action normalization, two-camera resize-with-padding, and
 action unnormalization. Its maintained latency and LIBERO entry points are
 `scripts/bench_smolvla.py` and `scripts/eval_smolvla_libero.py`.
 
+The [PI0.5 CPU reference](pi05-cpu-reference.md) is an independent
+`cpu_pi05/` port with its own config, weights, concrete model and eager runner.
+It shares public contracts and reference fixtures with other ports. CPU operator
+implementation and BLAS linking belong to `apxinf-cpu`; see the
+[CPU backend contract](../crates/apxinf-cpu/README.md).
+
 Inspect or copy PI0.5's model/Blocks and runner
 structure when semantics fit; use `<Family>Model` and `<Family>ModelRunner` for
 those roles. Preserve static precision specialization and keep one owner of
@@ -190,7 +208,7 @@ not belong on the portable trait. Trait is the floor; concrete types are the
 ceiling.
 
 A port written directly against one backend's native API goes in a
-self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`) that
+self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`, `cpu_`) that
 copies, rather than imports, any config, checkpoint or math code it shares with
 another backend's port; see
 [where backend-native model code lives](model-layer-architecture.md#where-backend-native-model-code-lives).
@@ -276,6 +294,9 @@ Complete these steps in the new family's own code and the existing registries:
    `infer`, `prepare` and `infer_host_f32`; add preparation/calibration support
    deliberately instead of inheriting unsupported defaults unknowingly.
 3. Declare the VLA input/output shape and RGB capability in `VlaContract`.
+   Override `VlaRuntime::initial_latent_shape()` when supplied noise has a
+   different geometry from the action output; see the
+   [runtime contract](model-layer-architecture.md#runtime-contracts).
    Use `VlaRequest` for observation, provided latent or RNG key, and applicable
    metadata. Keep family config parsing in the loader. Check the
    [current option limits](model-layer-architecture.md#current-coverage-and-port-decisions)

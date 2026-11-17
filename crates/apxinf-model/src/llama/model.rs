@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 
+use apxinf_core::Backend;
 use apxinf_core::{Device, Error, Result, Tensor};
 use apxinf_loader::ModelConfig;
 
@@ -16,7 +17,7 @@ use std::sync::Arc;
 #[cfg(feature = "cuda")]
 use apxinf_cuda_new::{transfers as cuda_ops, CudaNewBackend};
 #[cfg(feature = "cuda")]
-use apxinf_core::{Backend, KvCache};
+use apxinf_core::KvCache;
 
 use super::weights::{LlamaWeights, TransformerLayer};
 
@@ -916,7 +917,7 @@ impl LlamaModel {
 
     fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
         match a.device() {
-            Device::Cpu => a.matmul_cpu(b),
+            Device::Cpu => apxinf_cpu::CpuBackend.matmul(a, b),
             #[cfg(feature = "cuda")]
             Device::Cuda(_) => {
                 let backend = self.cuda_backend.as_ref()
