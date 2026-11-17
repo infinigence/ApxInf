@@ -185,9 +185,11 @@ Same-window interleaved A/B (one binary; the only variable is the routing —
 | 1 | 138.1 ms | 166.9 ms | −28.8 ms |
 | 2 | 141.5 ms | 172.5 ms | −31.0 ms |
 
-168 → ~140 ms (−17%), beyond the ~20 ms the roofline attributed to the action
-family alone: the M = 1 modulation projections (2.65x per call on
-`1x1024x1024`) also run 20 times per inference. Correctness against the
+168 → ~140 ms (−17%). The 2026-11-17 kernel trace puts all of it in the
+action expert's M = 10 family: 58.1 → 31.6 ms of GPU time, now 79–86% of
+memory bandwidth on `MT64x16` hipBLASLt tiles. (The M = 1 entries are the
+time-conditioning projections, which run once at load, not per inference.)
+Correctness against the
 forced-hipBLAS output on the same fixture: cosine 0.9999995, relative L2
 9.9e-4, max-abs 9.8e-4 — the BF16 gate passes with two orders of magnitude of
 margin (the difference is tile/reduction order, which is legitimate).
@@ -201,20 +203,44 @@ residuals documented in the roofline.
 The geglu kernel carried the same disease the GR00T campaign cured in
 `norm.hip`: scalar 2-byte loads plus a per-element div/mod. A uint4
 variant (8 output elements per thread, the per-element F32 expression
-unchanged — probe `devlocal/pi05-hip/perf/pointwise_probe.cpp`, cold ring)
-measures language 522×8192 at 150.6 → 79.9 µs (1.89×) and action 10×4096
-at 4.21 → 3.06 µs (1.38×), bit-identical on both. Shipped behind
-`inner % 8 == 0` + 16-byte alignment; the scalar kernel stays as fallback.
-Interleaved binary A/B (three clean windows per arm): 136.4 → 134.8 ms
-P50 (−1.6 ms). A shared-frequency-table variant of `split_qkv_rope` probed
+unchanged), bit-identical. Shipped behind `inner % 8 == 0` + 16-byte
+alignment; the scalar kernel stays as fallback. Interleaved binary A/B
+(three clean windows per arm): 136.4 → 134.8 ms P50 (−1.6 ms). In the model
+the gain is all on the action side (180 calls, 16.2 → 4.7 µs); the language
+call (522 × 16384 out, 51 MB moved) was already at the bandwidth wall and
+stays at 223 µs. A shared-frequency-table variant of `split_qkv_rope` probed
 *slower* (0.87× at the language shape — the per-block `powf` table build
 costs more than it saves at 128 pairs) and was discarded. The other action
 pointwise (`ada_gate_residual_rms_norm`) was already vectorized by the
 GR00T campaign's norm work.
 
+## Where the time goes (2026-11-17)
+
+rocprofv3, eager, steady state: GPU busy 131.8 ms per forward (GEMM 112.7,
+attention 8.9, pointwise 10.2) plus 5.7 ms of device-side gaps; the
+per-operator floor is ~115 ms. Language and vision GEMMs and the language
+GeGLU run at the roof. The residuals, largest first:
+
+- **Action attention, ~4.5 ms over its floor.** 180 split-KV + combine
+  pairs at 27.5 µs, each reading 545 KB of K/V (~2.3 µs at bandwidth). The
+  8 query heads share one KV head but are not folded into one head of 80
+  rows the way the prefix path folds them.
+- **Split-K GEMMs, ~4–6 ms, closed at the library level.** `lang_down`
+  (K = 16384) runs 80 workgroups at 25.6 TF/s; `act_down`/`act_out` run 16.
+  hipBLASLt's tuner was offering zero workspace
+  (`HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES = 0`), so split-K candidates
+  were never measured; it now gets a 32 MiB buffer per handle and enumerates
+  32 candidates. The 2026-11-17 re-tune of every pi05 shape found the
+  workspace-using candidates do exist and all lose — `lang_down`'s best
+  split-K runs 1.67x slower than its best plain tactic — and the re-tuned
+  winners regress the end-to-end wall by ~1.2 ms against the committed
+  tactics (same-process interleaved A/B, three windows), so the recipe keeps
+  the tactics recorded before the change. The tuner now measures the full
+  candidate set for whatever tunes next.
+- **Language GeGLU into the gate/up GEMM, ~3.5 ms.** hipBLASLt has no
+  epilogue that multiplies across halves; this needs a custom epilogue.
+
 ## Next
 
-1. **Language MLP and fusion**: the prefix gate/up and down GEMMs, and the
-   CUDA path's fused epilogues (GeGLU into the GEMM, bias into residual
-   norms).
+1. An action-expert attention kernel: folded heads, no separate combine.
 2. **Full LIBERO-10** (500 episodes) as the regression gate for the above.

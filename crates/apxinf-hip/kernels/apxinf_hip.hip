@@ -568,11 +568,15 @@ extern "C" int apxinf_hip_gemm(void* handle, int dtype, int m, int n, int k, con
 //     ("Could not initialize Tensile host"). So `problem_for` always queries,
 //     then overrides with the recorded tactic.
 //
-//  3. No workspace is needed. The fastest tactic for every one of those 26
-//     shapes wants zero bytes, and offering none costs 0.00 ms, so the
-//     preference is 0 and `hipblasLtMatmul` gets a null workspace. Tactics
-//     must be *recorded* under the same preference, or the heuristic offers a
-//     different candidate set.
+//  3. A 32 MiB workspace is offered, so split-K candidates compete. The
+//     GR00T-era finding was that no winner wanted any workspace; the pi05
+//     shapes (K = 16384, or M = 10 shapes that tile to 16 workgroups) are
+//     exactly the ones that do. One buffer per handle, allocated at handle
+//     creation -- never inside a capture, where hipMalloc is illegal -- and
+//     shared by every call on the handle's stream: stream order serializes
+//     the transient use. The same size goes into the heuristic preference
+//     at dispatch time and in the tuner, because a tactic is only valid
+//     recorded and replayed under the preference it was offered.
 
 #if APXINF_HIP_HAS_BLASLT
 
@@ -595,6 +599,9 @@ constexpr int kEpilogueNone = 0;
 constexpr int kEpilogueBias = 1;
 constexpr int kEpilogueBiasGeluTanh = 2;
 constexpr int kEpilogueBiasRelu = 3;
+
+// The workspace every Lt call may use; see note 3 in the block comment.
+constexpr uint64_t kLtWorkspaceBytes = 32ull << 20;
 
 // Descriptors for one problem, built once and kept for the handle's lifetime.
 // Creating them per call costs more than the kernel saves: the dominant DiT
@@ -627,6 +634,11 @@ struct LtProblem {
 struct LtContext {
   hipblasLtHandle_t handle = nullptr;
   hipStream_t stream = nullptr;
+  // One workspace shared by every Lt call on `stream` (see note 3 above).
+  // Null when the allocation failed, in which case the preference stays 0
+  // and the behavior is the old no-workspace one.
+  void* workspace = nullptr;
+  uint64_t workspace_bytes = 0;
   std::map<LtKey, LtProblem> problems;
   std::map<LtKey, hipblasLtMatmulAlgo_t> tactics;
 };
@@ -697,7 +709,7 @@ LtProblem* problem_for(LtContext* lt, int dtype, int m, int n, int k, int epilog
     lt->problems.erase(key);
     return nullptr;
   }
-  const uint64_t workspace = 0;
+  const uint64_t workspace = lt->workspace_bytes;
   hipblasLtMatmulPreferenceSetAttribute(preference,
                                         HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                                         &workspace, sizeof(workspace));
@@ -770,8 +782,8 @@ void promote_tactic(LtContext* lt, LtProblem* problem, const void* a, const void
   const float alpha = 1.0f, beta = 0.0f;
   hipblasLtMatmulAlgo_t trial = candidate;
   if (hipblasLtMatmul(lt->handle, problem->desc, &alpha, b, problem->b, a, problem->a,
-                      &beta, c, problem->c, c, problem->c, &trial, nullptr, 0,
-                      lt->stream) != HIPBLAS_STATUS_SUCCESS) {
+                      &beta, c, problem->c, c, problem->c, &trial, lt->workspace,
+                      lt->workspace_bytes, lt->stream) != HIPBLAS_STATUS_SUCCESS) {
     return;
   }
   if (hipStreamSynchronize(lt->stream) != hipSuccess) return;
@@ -789,6 +801,15 @@ extern "C" int apxinf_hip_blaslt_create(void** handle, void* stream) {
     return kBlasStatusBase + static_cast<int>(status);
   }
   lt->stream = as_stream(stream);
+  // Allocated here, at handle creation, because a later lazy allocation could
+  // land inside a graph capture where hipMalloc is illegal. A failure is not
+  // fatal: the preference falls back to 0 and the no-workspace tactics that
+  // the GR00T-era measurements preferred are still offered.
+  if (hipMalloc(&lt->workspace, kLtWorkspaceBytes) == hipSuccess) {
+    lt->workspace_bytes = kLtWorkspaceBytes;
+  } else {
+    lt->workspace = nullptr;
+  }
   *handle = lt;
   return 0;
 }
@@ -797,6 +818,7 @@ extern "C" int apxinf_hip_blaslt_destroy(void* handle) {
   if (!handle) return 0;
   LtContext* lt = static_cast<LtContext*>(handle);
   lt->problems.clear();  // descriptors before the handle they belong to
+  if (lt->workspace) hipFree(lt->workspace);
   const hipblasStatus_t status = hipblasLtDestroy(lt->handle);
   delete lt;
   return status == HIPBLAS_STATUS_SUCCESS ? 0 : kBlasStatusBase + static_cast<int>(status);
@@ -870,8 +892,8 @@ extern "C" int apxinf_hip_gemm_lt(void* handle, int dtype, int m, int n, int k,
   const float alpha = 1.0f, beta = 0.0f;
   const hipblasStatus_t status =
       hipblasLtMatmul(lt->handle, problem->desc, &alpha, b, problem->b, a, problem->a,
-                      &beta, c, problem->c, c, problem->c, &problem->algo, nullptr, 0,
-                      lt->stream);
+                      &beta, c, problem->c, c, problem->c, &problem->algo, lt->workspace,
+                      lt->workspace_bytes, lt->stream);
   return status == HIPBLAS_STATUS_SUCCESS ? 0 : kBlasStatusBase + static_cast<int>(status);
 }
 
@@ -1229,10 +1251,15 @@ extern "C" int apxinf_hip_gemm_tune(void* lt_handle, void* blas_handle, int dtyp
 
   hipblasLtMatmulPreference_t preference = nullptr;
   hipblasLtMatmulPreferenceCreate(&preference);
-  const uint64_t workspace = 0;
+  // The same size the dispatch-time heuristic offers (note 3): a tactic is
+  // only valid recorded under the preference it will be replayed with.
+  const uint64_t workspace = lt->workspace_bytes;
   hipblasLtMatmulPreferenceSetAttribute(
       preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace, sizeof(workspace));
-  constexpr int kMaxCandidates = 16;
+  // 32, not 16: with a workspace the heuristic offers a larger set, and the
+  // split-K candidates this whole change exists to reach sit at the tail of
+  // its ordering.
+  constexpr int kMaxCandidates = 32;
   hipblasLtMatmulHeuristicResult_t candidates[kMaxCandidates];
   int found = 0;
   hipblasLtMatmulAlgoGetHeuristic(lt->handle, problem->desc, problem->b, problem->a,
@@ -1246,7 +1273,8 @@ extern "C" int apxinf_hip_gemm_tune(void* lt_handle, void* blas_handle, int dtyp
     auto run_lt = [&] {
       return hipblasLtMatmul(lt->handle, problem->desc, &alpha, rotate(), problem->b, a,
                              problem->a, &beta, out, problem->c, out, problem->c,
-                             &candidates[i].algo, nullptr, 0, lt->stream);
+                             &candidates[i].algo, lt->workspace, lt->workspace_bytes,
+                             lt->stream);
     };
     if (run_lt() != HIPBLAS_STATUS_SUCCESS) continue;
     if (hipStreamSynchronize(lt->stream) != hipSuccess) continue;
