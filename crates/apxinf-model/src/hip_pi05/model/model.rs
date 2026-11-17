@@ -20,9 +20,10 @@ use apxinf_hip::native::{self, Activation, AttentionGeometry, HipArena, HipDevic
 use apxinf_hip::HipContext;
 use half::bf16;
 
-use super::checkpoint::Checkpoint;
-use super::config::{sinusoidal_time_embedding, Config};
-use super::weights::{ActionLayer, HipPi05Weights, LanguageLayer, Linear, VisionLayer};
+use super::super::config::Config;
+use super::super::math::sinusoidal_time_embedding;
+use super::super::weights::Checkpoint;
+use super::super::weights::{ActionLayer, HipPi05Weights, LanguageLayer, Linear, VisionLayer};
 
 /// Per-layer K and V of the prefix, `[prefix + action_horizon, kv_heads, head_dim]`.
 /// Rows `[0, tokens)` hold the prefix; each denoise step overwrites the rest

@@ -1,15 +1,15 @@
 //! π0.5 weights on a HIP device, in BF16.
 //!
-//! Built from this port's [`Checkpoint`]: Q/K/V and gate/up are concatenated
-//! along the output dimension so each stays one GEMM, the packing the CUDA BF16
-//! path also uses, and every matrix keeps the row-major `[in, out]` the
-//! checkpoint reader produced.
+//! Built from this port's [`host::Checkpoint`]: Q/K/V and gate/up are
+//! concatenated along the output dimension so each stays one GEMM, the packing
+//! the CUDA BF16 path also uses, and every matrix keeps the row-major
+//! `[in, out]` the checkpoint reader produced.
 
 use apxinf_core::{Error, Result, Tensor};
 use apxinf_hip::HipContext;
 use half::bf16;
 
-use super::checkpoint::{self as host, Checkpoint};
+use super::host::{self, Checkpoint};
 
 /// A row-major `[in, out]` projection and its optional bias.
 pub struct Linear {

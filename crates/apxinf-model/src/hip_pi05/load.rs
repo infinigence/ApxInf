@@ -7,10 +7,10 @@ use std::sync::Arc;
 use apxinf_core::{Device, Error, Result};
 use apxinf_hip::HipContext;
 
-use super::checkpoint::Checkpoint;
 use super::config::Config;
 use super::model::HipPi05Model;
-use super::runner::HipPi05Runner;
+use super::model_runner::HipPi05Runner;
+use super::weights::Checkpoint;
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 
 pub(crate) fn load(
