@@ -196,6 +196,22 @@ submission cost, so graph replay and eager converge at ~140 ms; with the
 GEMM floor within reach, the remaining levers are the pointwise/attention
 residuals documented in the roofline.
 
+## Pointwise vectorization: geglu (2026-11-17)
+
+The geglu kernel carried the same disease the GR00T campaign cured in
+`norm.hip`: scalar 2-byte loads plus a per-element div/mod. A uint4
+variant (8 output elements per thread, the per-element F32 expression
+unchanged — probe `devlocal/pi05-hip/perf/pointwise_probe.cpp`, cold ring)
+measures language 522×8192 at 150.6 → 79.9 µs (1.89×) and action 10×4096
+at 4.21 → 3.06 µs (1.38×), bit-identical on both. Shipped behind
+`inner % 8 == 0` + 16-byte alignment; the scalar kernel stays as fallback.
+Interleaved binary A/B (three clean windows per arm): 136.4 → 134.8 ms
+P50 (−1.6 ms). A shared-frequency-table variant of `split_qkv_rope` probed
+*slower* (0.87× at the language shape — the per-block `powf` table build
+costs more than it saves at 128 pairs) and was discarded. The other action
+pointwise (`ada_gate_residual_rms_norm`) was already vectorized by the
+GR00T campaign's norm work.
+
 ## Next
 
 1. **Language MLP and fusion**: the prefix gate/up and down GEMMs, and the

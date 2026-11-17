@@ -112,6 +112,38 @@ __global__ void geglu_kernel(const bf16* gate_up, bf16* y, int64_t rows, int inn
   }
 }
 
+// Vectorized geglu: uint4, eight output elements per thread. The gate and up
+// halves live `inner` elements apart in the same row, so the two uint4 loads
+// are strided by half a row and the store is contiguous; the per-element F32
+// expression (and its evaluation order) is unchanged, so the output is
+// bit-identical to the scalar kernel. That kernel stays as the fallback for
+// `inner % 8 != 0` or tensors that are not 16-byte aligned.
+// Probe (devlocal/pi05-hip/perf/pointwise_probe.cpp, cold ring): language
+// 522x8192 150.6 -> 79.9 us (1.89x), action 10x4096 4.21 -> 3.06 us (1.38x),
+// diffs 0 on both.
+__global__ void geglu_vec_kernel(const bf16* gate_up, bf16* y, int64_t rows, int inner) {
+  const int64_t row_v = inner / 8;  // uint4 units per output row
+  const int64_t vcount = rows * row_v;
+  for (int64_t v = global_index(); v < vcount; v += grid_stride()) {
+    const int64_t row = v / row_v;
+    const int64_t vcol = v - row * row_v;
+    const uint4* gate = reinterpret_cast<const uint4*>(gate_up + row * 2 * inner);
+    const uint4* up = reinterpret_cast<const uint4*>(gate_up + row * 2 * inner + inner);
+    const uint4 gq = gate[vcol], uq = up[vcol];
+    const uint32_t gw[4] = {gq.x, gq.y, gq.z, gq.w};
+    const uint32_t uw[4] = {uq.x, uq.y, uq.z, uq.w};
+    uint32_t r[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int sh = (j & 1) * 16;
+      const float g = bf16_to_f32(static_cast<uint16_t>(gw[j >> 1] >> sh));
+      const float u = bf16_to_f32(static_cast<uint16_t>(uw[j >> 1] >> sh));
+      r[j >> 1] |= static_cast<uint32_t>(f32_to_bf16(gelu_tanh(g) * u)) << sh;
+    }
+    reinterpret_cast<uint4*>(y)[v] = uint4{r[0], r[1], r[2], r[3]};
+  }
+}
+
 // y = silu(gate) * up over separate operands -- GR00T's SwiGLU MLP, where the
 // two projections are distinct tensors rather than the packed `gate_up` that
 // `geglu` splits.
@@ -483,6 +515,16 @@ extern "C" int apxinf_hip_native_bias_activation(const void* x, const void* bias
 extern "C" int apxinf_hip_native_geglu(const void* gate_up, void* y, int64_t rows, int inner,
                                        void* stream) {
   if (rows <= 0 || inner <= 0) return kInvalidArgument;
+  // The vectorized kernel's per-row unit count requires `inner % 8 == 0`, and
+  // uint4 requires 16-byte alignment of both halves of every row, which the
+  // base pointer and an even `inner` together provide (`inner` is a multiple
+  // of 8, so the up half starts at a multiple of 16 bytes into the row).
+  if (inner % 8 == 0 && (reinterpret_cast<uintptr_t>(gate_up) & 15u) == 0 &&
+      (reinterpret_cast<uintptr_t>(y) & 15u) == 0) {
+    geglu_vec_kernel<<<elementwise_grid(rows * (inner / 8)), kElementwiseBlock, 0,
+                       as_stream(stream)>>>(in(gate_up), out(y), rows, inner);
+    return last_launch_status();
+  }
   geglu_kernel<<<elementwise_grid(rows * inner), kElementwiseBlock, 0, as_stream(stream)>>>(
       in(gate_up), out(y), rows, inner);
   return last_launch_status();
