@@ -243,9 +243,25 @@ GeGLU run at the roof. The residuals, largest first:
   tactics (same-process interleaved A/B, three windows), so the recipe keeps
   the tactics recorded before the change. The tuner now measures the full
   candidate set for whatever tunes next.
-- **Language GeGLU into the gate/up GEMM, ~3.5 ms.** hipBLASLt has no
-  epilogue that multiplies across halves; this needs a custom epilogue.
+- **Language GeGLU into the gate/up GEMM, closed 2026-11-17 by measurement.**
+  hipBLASLt has no epilogue that multiplies across halves, so the candidate
+  was a hand-written WMMA kernel with the gate and up chains sharing A
+  fragments and a half-compressing epilogue
+  (`devlocal/pi05-hip/perf/geglu_fused_probe.cpp`). Its ablation arm —
+  staging and barriers with the wmma chains stripped — runs 2256 µs, which
+  is what hipBLAS charges for the entire GEMM *plus* the separate geglu
+  kernel (2489 µs budget): on this RDNA3.5 part the feed-and-synchronize
+  cost of an LDS-staged custom GEMM consumes the whole saving before a
+  single unit of compute is paid for. Best full variant 3251 µs (31% over
+  budget); it does beat hipBLASLt's best tactic (4594 µs cold) but not
+  hipBLAS. Converges with the GR00T tall-skinny verdict: custom GEMM on
+  gfx1151 cannot reach Tensile's 68% WMMA-peak utilization, in either the
+  bandwidth-bound or the compute-bound form.
 
 ## Next
 
 1. **Full LIBERO-10** (500 episodes) as the regression gate for the above.
+   With the roofline's kernel-layer levers all closed (action attention
+   shipped, split-K and language-GeGLU-fusion closed by measurement), this
+   baseline (~132.7 ms) is the ceiling of BF16 on this part; anything below
+   ~118 ms needs a precision project.
