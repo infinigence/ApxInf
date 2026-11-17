@@ -11,7 +11,9 @@ use apxinf_cuda_new::{ops as cuda_ops, transfers, CudaContext as Context, Prepar
 
 use super::bert::Bert;
 use super::cache::{ConditioningCache, ReferenceFeatures, ReferenceKey, TextKey};
-use super::cfm::{Cfm, StepModulation};
+use super::cfm::{
+    run_chunked, Cfm, StepModulation, MAX_TARGET_CHUNK, REFERENCE_FRAMES, TOTAL_CHUNK,
+};
 use super::config::GptSovitsConfig;
 use super::gpt::Gpt;
 use super::hubert::Hubert;
@@ -48,7 +50,6 @@ fn sampling_of(request: &TtsRequest<'_>) -> (usize, f32, f32, f32, f32) {
 const SPEC_MIN: f32 = -12.0;
 const SPEC_MAX: f32 = 2.0;
 const OUTPUT_SAMPLE_RATE: u32 = 48000;
-const CFM_REFERENCE_FRAMES: usize = 500;
 /// Semantic tokens per second and the hard cap on one request's generation.
 const SEMANTIC_TOKENS_PER_SECOND: f32 = 25.0;
 const MAX_SEMANTIC_TOKENS: usize = 1500;
@@ -87,9 +88,6 @@ fn reference_feature_window(
     let offset = limit.saturating_sub(reference_frames);
     (offset + reference_frames <= decoded_frames).then_some(offset)
 }
-const CFM_MAX_TARGET_CHUNK: usize = 640;
-const CFM_TOTAL_CHUNK: usize = 1000;
-const CFM_ROLLING_TAIL: usize = 32;
 const MIB: usize = 1024 * 1024;
 
 // Upstream evaluates (x + 1) / 2 * 14 - 12 in FP16. The addition before
@@ -148,6 +146,18 @@ pub struct GptSovitsModel {
     vocoder: Arc<Vocoder>,
     config: GptSovitsConfig,
     cache: Rc<RefCell<ConditioningCache>>,
+    mel_denorm: RefCell<Option<MelDenormConstants>>,
+}
+
+/// The four mel-denormalization affine constants (see `denormalize_mel`),
+/// uploaded once per model and shared by every eager synthesis request.
+/// The prepared path captures its own copies during `prepare()`.
+#[derive(Clone)]
+struct MelDenormConstants {
+    one: Tensor,
+    scale: Tensor,
+    zero: Tensor,
+    shift: Tensor,
 }
 
 struct CfmChunkGraph {
@@ -499,6 +509,10 @@ pub struct PreparedGptSovitsTts {
     _bert: Arc<Bert>,
     _hubert: Arc<Hubert>,
     _sovits: Arc<Sovits>,
+    // Captured vocoder nodes reference the deferred conv biases owned by the
+    // `Vocoder`, and pointwise launches do not retain their operands, so the
+    // plan must keep the vocoder alive for as long as it can be replayed.
+    _vocoder: Arc<Vocoder>,
     spec: TtsSpec,
     cache: Rc<RefCell<ConditioningCache>>,
     ctx: Arc<Context>,
@@ -538,6 +552,7 @@ impl GptSovitsModel {
             vocoder: Arc::new(vocoder),
             config,
             cache: Rc::new(RefCell::new(ConditioningCache::default())),
+            mel_denorm: RefCell::new(None),
         })
     }
 
@@ -643,6 +658,27 @@ impl GptSovitsModel {
         Ok(value)
     }
 
+    /// Lazily uploads the four mel-denormalization affine constants once per
+    /// model. The eager path previously re-uploaded them on every synthesis
+    /// request; the prepared path builds its own copies during `prepare()`.
+    fn mel_denorm_constants(&self) -> Result<MelDenormConstants> {
+        if let Some(constants) = self.mel_denorm.borrow().as_ref() {
+            return Ok(constants.clone());
+        }
+        let constants = MelDenormConstants {
+            one: super::weights::fp16_tensor(&self.ctx, &[100], &[1.; 100])?,
+            scale: super::weights::fp16_tensor(
+                &self.ctx,
+                &[100],
+                &vec![(SPEC_MAX - SPEC_MIN) / 2.0; 100],
+            )?,
+            zero: super::weights::fp16_tensor(&self.ctx, &[100], &[0.; 100])?,
+            shift: super::weights::fp16_tensor(&self.ctx, &[100], &vec![SPEC_MIN; 100])?,
+        };
+        *self.mel_denorm.borrow_mut() = Some(constants.clone());
+        Ok(constants)
+    }
+
     pub fn synthesize(&self, request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
         let inputs = gpt_sovits_inputs(request)?;
         let (top_k, top_p, temperature, repetition_penalty, max_seconds) = sampling_of(request);
@@ -740,15 +776,15 @@ impl GptSovitsModel {
                 request.seed,
             )
             .map_err(|error| Error::Other(format!("cfm: {error}")))?;
-        let scale = super::weights::fp16_tensor(
+        let constants = self.mel_denorm_constants()?;
+        let mel = denormalize_mel(
             &self.ctx,
-            &[100],
-            &vec![(SPEC_MAX - SPEC_MIN) / 2.0; 100],
+            &mel,
+            &constants.one,
+            &constants.scale,
+            &constants.zero,
+            &constants.shift,
         )?;
-        let shift = super::weights::fp16_tensor(&self.ctx, &[100], &vec![SPEC_MIN; 100])?;
-        let one = super::weights::fp16_tensor(&self.ctx, &[100], &[1.; 100])?;
-        let zero = super::weights::fp16_tensor(&self.ctx, &[100], &[0.; 100])?;
-        let mel = denormalize_mel(&self.ctx, &mel, &one, &scale, &zero, &shift)?;
         let samples = self
             .vocoder
             .synth(&self.ctx, &mel)
@@ -757,6 +793,105 @@ impl GptSovitsModel {
         // `fragment_interval` silence after every text fragment, matching the
         // official `audio_postprocess`.
         Ok(mono_audio(samples, generated.len(), max_new_tokens))
+    }
+
+    /// Build the fixed-shape plan for `spec`. [`TtsTrait::prepare`] wraps the
+    /// result in the model-neutral [`PreparedTts`] object; the vocoder
+    /// lifecycle test calls this directly for the concrete type.
+    fn prepare_plan(&self, spec: &TtsSpec) -> Result<PreparedGptSovitsTts> {
+        if spec.phone_count == 0
+            || spec.bert_token_count < 3
+            || spec.reference_phone_count == 0
+            || spec.reference_bert_token_count < 3
+            || spec.reference_audio_samples < 400
+            || spec.reference_frames == 0
+            || spec.reference_spec_frames == 0
+            || spec.target_frames == 0
+            || super::cfm::validate_sample_steps(spec.sample_steps).is_err()
+            || spec.target_frames % 4 != 0
+        {
+            return Err(Error::Other(format!(
+                "invalid GPT-SoVITS prepared profile: {spec:?}"
+            )));
+        }
+        let prompt_len = spec.reference_frames.min(REFERENCE_FRAMES);
+        let chunk = (TOTAL_CHUNK - prompt_len).min(MAX_TARGET_CHUNK);
+        let mut lengths = Vec::new();
+        let mut start = 0usize;
+        while start < spec.target_frames {
+            let length = chunk.min(spec.target_frames - start);
+            if !lengths.contains(&length) {
+                lengths.push(length);
+            }
+            start += length;
+        }
+        let mut cfm_graphs = HashMap::new();
+        for length in lengths {
+            cfm_graphs.insert(
+                length,
+                CfmChunkGraph::prepare(&self.ctx, &self.cfm, prompt_len, length, spec.sample_steps)
+                    .map_err(|error| {
+                        Error::Other(format!("prepare CFM chunk {prompt_len}+{length}: {error}"))
+                    })?,
+            );
+        }
+        let vocoder_graph = VocoderGraph::prepare(&self.ctx, &self.vocoder, spec.target_frames)
+            .map_err(|error| Error::Other(format!("prepare vocoder: {error}")))?;
+        let mel_scale = super::weights::fp16_tensor(
+            &self.ctx,
+            &[100],
+            &vec![(SPEC_MAX - SPEC_MIN) / 2.0; 100],
+        )?;
+        let mel_shift = super::weights::fp16_tensor(&self.ctx, &[100], &vec![SPEC_MIN; 100])?;
+        let mel_one = super::weights::fp16_tensor(&self.ctx, &[100], &[1.; 100])?;
+        let mel_zero = super::weights::fp16_tensor(&self.ctx, &[100], &[0.; 100])?;
+        Ok(PreparedGptSovitsTts {
+            _bert: Arc::clone(&self.bert),
+            _hubert: Arc::clone(&self.hubert),
+            _sovits: Arc::clone(&self.sovits),
+            _vocoder: Arc::clone(&self.vocoder),
+            spec: *spec,
+            cache: Rc::clone(&self.cache),
+            ctx: Arc::clone(&self.ctx),
+            reference_bert: BertGraph::prepare(
+                &self.ctx,
+                &self.bert,
+                spec.reference_bert_token_count,
+            )
+            .map_err(|e| Error::Other(format!("prepare reference BERT: {e}")))?,
+            target_bert: BertGraph::prepare(&self.ctx, &self.bert, spec.bert_token_count)
+                .map_err(|e| Error::Other(format!("prepare target BERT: {e}")))?,
+            hubert_graph: HubertGraph::prepare(
+                &self.ctx,
+                &self.hubert,
+                spec.reference_audio_samples,
+            )
+            .map_err(|e| Error::Other(format!("prepare HuBERT: {e}")))?,
+            style_graph: StyleGraph::prepare(&self.ctx, &self.sovits, spec.reference_spec_frames)
+                .map_err(|e| Error::Other(format!("prepare style: {e}")))?,
+            reference_sovits: SovitsGraph::prepare(
+                &self.ctx,
+                &self.sovits,
+                self.hubert
+                    .semantic_frames(spec.reference_audio_samples)
+                    .map_err(|e| Error::Other(format!("prepare reference SoVITS: {e}")))?,
+                spec.reference_phone_count,
+            )?,
+            target_sovits: SovitsGraph::prepare(
+                &self.ctx,
+                &self.sovits,
+                spec.target_frames / 4,
+                spec.phone_count,
+            )
+            .map_err(|e| Error::Other(format!("prepare target SoVITS: {e}")))?,
+            gpt: Arc::clone(&self.gpt),
+            cfm_graphs,
+            vocoder_graph,
+            mel_scale,
+            mel_shift,
+            mel_one,
+            mel_zero,
+        })
     }
 }
 
@@ -968,7 +1103,7 @@ impl PreparedGptSovitsTts {
             .spec
             .reference_frames
             .min(reference_features.shape().dims()[0])
-            .min(CFM_REFERENCE_FRAMES);
+            .min(REFERENCE_FRAMES);
         let original_mel = ops::slice_rows(
             &self.ctx,
             &reference_mel,
@@ -981,78 +1116,34 @@ impl PreparedGptSovitsTts {
             reference_features.shape().dims()[0] - reference_frames,
             reference_frames,
         )?;
-        let chunk = (CFM_TOTAL_CHUNK - reference_frames).min(CFM_MAX_TARGET_CHUNK);
-        let mut rolling_mel = original_mel.clone();
-        let mut rolling_features = original_features.clone();
-        let mut results = Vec::new();
-        let mut start = 0usize;
-        let mut chunk_index = 0usize;
-        while start < self.spec.target_frames {
-            let length = chunk.min(self.spec.target_frames - start);
-            let target = ops::slice_rows(&self.ctx, &target_features, start, length)?;
-            let (prompt_mel, prompt_features) = if chunk_index == 0 {
-                (original_mel.clone(), original_features.clone())
-            } else {
-                let tail = CFM_ROLLING_TAIL
-                    .min(reference_frames)
-                    .min(rolling_mel.shape().dims()[0])
-                    .min(rolling_features.shape().dims()[0]);
-                let prefix = reference_frames - tail;
-                (
-                    ops::concat_rows(
-                        &self.ctx,
-                        &ops::slice_rows(&self.ctx, &original_mel, 0, prefix)?,
-                        &ops::slice_rows(
-                            &self.ctx,
-                            &rolling_mel,
-                            rolling_mel.shape().dims()[0] - tail,
-                            tail,
-                        )?,
-                    )?,
-                    ops::concat_rows(
-                        &self.ctx,
-                        &ops::slice_rows(&self.ctx, &original_features, 0, prefix)?,
-                        &ops::slice_rows(
-                            &self.ctx,
-                            &rolling_features,
-                            rolling_features.shape().dims()[0] - tail,
-                            tail,
-                        )?,
-                    )?,
-                )
-            };
-            let graph = self.cfm_graphs.get(&length).ok_or_else(|| {
-                Error::Other(format!("missing prepared CFM chunk profile {length}"))
-            })?;
-            let _tts_cfm_range = crate::profiling::trace::range("tts.cfm.chunk");
-            let generated = graph.replay(
-                &self.ctx,
-                &prompt_features,
-                &target,
-                &prompt_mel,
-                request.seed.wrapping_add(chunk_index as u64),
-            )?;
-            drop(_tts_cfm_range);
-            rolling_mel = ops::slice_rows(
-                &self.ctx,
-                &generated,
-                generated.shape().dims()[0].saturating_sub(reference_frames),
-                reference_frames.min(generated.shape().dims()[0]),
-            )?;
-            rolling_features = ops::slice_rows(
-                &self.ctx,
-                &target,
-                length.saturating_sub(reference_frames),
-                reference_frames.min(length),
-            )?;
-            results.push(generated);
-            start += length;
-            chunk_index += 1;
-        }
-        let mut mel = results.remove(0);
-        for result in results {
-            mel = ops::concat_rows(&self.ctx, &mel, &result)?;
-        }
+        // The `[target_frames, 512]` check above already pinned the row count
+        // to `self.spec.target_frames`, so chunking on `target_features` rows
+        // reproduces the previous `self.spec.target_frames` loop exactly.
+        let mel = run_chunked(
+            &self.ctx,
+            &original_mel,
+            &original_features,
+            &target_features,
+            reference_frames,
+            |args| {
+                let graph = self.cfm_graphs.get(&args.length).ok_or_else(|| {
+                    Error::Other(format!(
+                        "missing prepared CFM chunk profile {}",
+                        args.length
+                    ))
+                })?;
+                let _tts_cfm_range = crate::profiling::trace::range("tts.cfm.chunk");
+                let generated = graph.replay(
+                    &self.ctx,
+                    args.prompt_features,
+                    args.target,
+                    args.prompt_mel,
+                    request.seed.wrapping_add(args.chunk_index as u64),
+                )?;
+                drop(_tts_cfm_range);
+                Ok(generated)
+            },
+        )?;
         let mel = denormalize_mel(
             &self.ctx,
             &mel,
@@ -1106,98 +1197,7 @@ impl TtsTrait for GptSovitsModel {
     }
 
     fn prepare(&self, spec: &TtsSpec) -> Result<Box<dyn PreparedTts>> {
-        if spec.phone_count == 0
-            || spec.bert_token_count < 3
-            || spec.reference_phone_count == 0
-            || spec.reference_bert_token_count < 3
-            || spec.reference_audio_samples < 400
-            || spec.reference_frames == 0
-            || spec.reference_spec_frames == 0
-            || spec.target_frames == 0
-            || super::cfm::validate_sample_steps(spec.sample_steps).is_err()
-            || spec.target_frames % 4 != 0
-        {
-            return Err(Error::Other(format!(
-                "invalid GPT-SoVITS prepared profile: {spec:?}"
-            )));
-        }
-        let prompt_len = spec.reference_frames.min(CFM_REFERENCE_FRAMES);
-        let chunk = (CFM_TOTAL_CHUNK - prompt_len).min(CFM_MAX_TARGET_CHUNK);
-        let mut lengths = Vec::new();
-        let mut start = 0usize;
-        while start < spec.target_frames {
-            let length = chunk.min(spec.target_frames - start);
-            if !lengths.contains(&length) {
-                lengths.push(length);
-            }
-            start += length;
-        }
-        let mut cfm_graphs = HashMap::new();
-        for length in lengths {
-            cfm_graphs.insert(
-                length,
-                CfmChunkGraph::prepare(&self.ctx, &self.cfm, prompt_len, length, spec.sample_steps)
-                    .map_err(|error| {
-                        Error::Other(format!("prepare CFM chunk {prompt_len}+{length}: {error}"))
-                    })?,
-            );
-        }
-        let vocoder_graph = VocoderGraph::prepare(&self.ctx, &self.vocoder, spec.target_frames)
-            .map_err(|error| Error::Other(format!("prepare vocoder: {error}")))?;
-        let mel_scale = super::weights::fp16_tensor(
-            &self.ctx,
-            &[100],
-            &vec![(SPEC_MAX - SPEC_MIN) / 2.0; 100],
-        )?;
-        let mel_shift = super::weights::fp16_tensor(&self.ctx, &[100], &vec![SPEC_MIN; 100])?;
-        let mel_one = super::weights::fp16_tensor(&self.ctx, &[100], &[1.; 100])?;
-        let mel_zero = super::weights::fp16_tensor(&self.ctx, &[100], &[0.; 100])?;
-        Ok(Box::new(PreparedGptSovitsTts {
-            _bert: Arc::clone(&self.bert),
-            _hubert: Arc::clone(&self.hubert),
-            _sovits: Arc::clone(&self.sovits),
-            spec: *spec,
-            cache: Rc::clone(&self.cache),
-            ctx: Arc::clone(&self.ctx),
-            reference_bert: BertGraph::prepare(
-                &self.ctx,
-                &self.bert,
-                spec.reference_bert_token_count,
-            )
-            .map_err(|e| Error::Other(format!("prepare reference BERT: {e}")))?,
-            target_bert: BertGraph::prepare(&self.ctx, &self.bert, spec.bert_token_count)
-                .map_err(|e| Error::Other(format!("prepare target BERT: {e}")))?,
-            hubert_graph: HubertGraph::prepare(
-                &self.ctx,
-                &self.hubert,
-                spec.reference_audio_samples,
-            )
-            .map_err(|e| Error::Other(format!("prepare HuBERT: {e}")))?,
-            style_graph: StyleGraph::prepare(&self.ctx, &self.sovits, spec.reference_spec_frames)
-                .map_err(|e| Error::Other(format!("prepare style: {e}")))?,
-            reference_sovits: SovitsGraph::prepare(
-                &self.ctx,
-                &self.sovits,
-                self.hubert
-                    .semantic_frames(spec.reference_audio_samples)
-                    .map_err(|e| Error::Other(format!("prepare reference SoVITS: {e}")))?,
-                spec.reference_phone_count,
-            )?,
-            target_sovits: SovitsGraph::prepare(
-                &self.ctx,
-                &self.sovits,
-                spec.target_frames / 4,
-                spec.phone_count,
-            )
-            .map_err(|e| Error::Other(format!("prepare target SoVITS: {e}")))?,
-            gpt: Arc::clone(&self.gpt),
-            cfm_graphs,
-            vocoder_graph,
-            mel_scale,
-            mel_shift,
-            mel_one,
-            mel_zero,
-        }))
+        Ok(Box::new(self.prepare_plan(spec)?))
     }
 }
 
@@ -1244,5 +1244,47 @@ mod output_tests {
         assert_eq!(audio.samples.len(), 8);
         assert!(audio.complete, "stopping before the budget means EOS");
         assert!(!mono_audio(vec![0.0; 8], 750, 750).complete);
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod vocoder_lifecycle_tests {
+    use super::*;
+
+    /// The captured vocoder graph reads the deferred conv biases owned by the
+    /// `Vocoder` weights; replaying it after the model has been dropped must
+    /// still be well-defined, which only holds while the plan retains the
+    /// vocoder. Requires a real checkpoint because the capture runs the full
+    /// forward once.
+    #[test]
+    #[ignore = "requires CUDA and APXINF_GSV_V5_CHECKPOINT with a real GPT-SoVITS V5 checkpoint"]
+    fn vocoder_replay_survives_dropping_the_model() {
+        let directory = std::path::PathBuf::from(
+            std::env::var_os("APXINF_GSV_V5_CHECKPOINT")
+                .expect("set APXINF_GSV_V5_CHECKPOINT to the GPT-SoVITS V5 checkpoint"),
+        );
+        let frames = 128; // prepare() admits multiples of four
+        let model =
+            GptSovitsModel::load_with_autotune(&directory, 0, false).expect("load checkpoint");
+        let spec = TtsSpec {
+            phone_count: 8,
+            bert_token_count: 8,
+            reference_phone_count: 8,
+            reference_bert_token_count: 8,
+            reference_audio_samples: 16_000,
+            reference_frames: 500,
+            reference_spec_frames: 500,
+            target_frames: frames,
+            sample_steps: 4,
+        };
+        let prepared = model.prepare_plan(&spec).expect("prepare");
+        drop(model);
+        let mel = ops::alloc(&prepared.ctx, &[frames, 100]).expect("device mel");
+        ops::fill_zero(&prepared.ctx, &mel).expect("zero mel");
+        let samples = prepared
+            .vocoder_graph
+            .replay(&prepared.ctx, &mel)
+            .expect("replay after the model was dropped");
+        assert_eq!(samples.len(), frames * 480);
     }
 }

@@ -2,9 +2,9 @@
 
 use apxinf_core::{DType, Error, Result, Tensor};
 use apxinf_cuda_new::ops::{
-    self, rope, AttentionArgs, BiasOrder, Conv1dAccumulation, Conv1dArgs, Conv1dSemantic, GemmArgs,
-    NormArgs, PointwiseArgs, PointwiseSemantic, RelativeAttentionArgs, ResidualAddArgs,
-    WeightVersion,
+    self, conv1d::transpose_output_length, rope, AttentionArgs, BiasOrder, Conv1dAccumulation,
+    Conv1dArgs, Conv1dSemantic, GemmArgs, NormArgs, PointwiseArgs, PointwiseSemantic,
+    RelativeAttentionArgs, ResidualAddArgs, WeightVersion,
 };
 use apxinf_cuda_new::CudaContext as Context;
 use half::{bf16, f16};
@@ -798,7 +798,8 @@ pub(crate) fn conv_transpose1d_direct(
     }
     let out_channels = weight.shape().dims()[1];
     let kernel = weight.shape().dims()[2];
-    let out_length = (dims[1] - 1) * stride - 2 * padding + (kernel - 1) + 1;
+    let out_length = transpose_output_length(dims[1], kernel, stride, padding, 1, 0)
+        .ok_or_else(|| Error::Other("conv_transpose1d output length is not positive".into()))?;
     let mut out = alloc(ctx, &[dims[0], out_length, out_channels])?;
     let mut args = Conv1dArgs::new(Conv1dSemantic::ConvTranspose1d, input, weight, &mut out)
         .with_direct_channel_last();

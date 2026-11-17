@@ -11,10 +11,10 @@ use super::weights::{fp16_tensor, Linear, Weights};
 
 const MAX_POSITIONS: usize = 4096;
 const NOISE_TEMPERATURE: f32 = 0.875;
-const REFERENCE_FRAMES: usize = 500;
-const MAX_TARGET_CHUNK: usize = 640;
-const TOTAL_CHUNK: usize = 1000;
-const ROLLING_TAIL: usize = 32;
+pub(super) const REFERENCE_FRAMES: usize = 500;
+pub(super) const MAX_TARGET_CHUNK: usize = 640;
+pub(super) const TOTAL_CHUNK: usize = 1000;
+pub(super) const ROLLING_TAIL: usize = 32;
 
 struct TextBlock {
     dw_w: Tensor,
@@ -799,81 +799,25 @@ impl Cfm {
             reference_features.shape().dims()[0] - reference_frames,
             reference_frames,
         )?;
-        let target_len = target_features.shape().dims()[0];
-        let chunk = (TOTAL_CHUNK - reference_frames).min(MAX_TARGET_CHUNK);
         let original_mel = prompt_mel;
         let original_features = prompt_features;
-        let mut rolling_mel = original_mel.clone();
-        let mut rolling_features = original_features.clone();
-        let mut results: Vec<Tensor> = Vec::new();
-        let mut start = 0usize;
-        let mut chunk_index = 0usize;
-        while start < target_len {
-            let length = chunk.min(target_len - start);
-            let target = ops::slice_rows(ctx, target_features, start, length)?;
-            let (prompt, features) = if chunk_index == 0 {
-                (original_mel.clone(), original_features.clone())
-            } else {
-                let tail = ROLLING_TAIL
-                    .min(reference_frames)
-                    .min(rolling_mel.shape().dims()[0])
-                    .min(rolling_features.shape().dims()[0]);
-                let prefix = reference_frames - tail;
-                let prompt = ops::concat_rows(
+        run_chunked(
+            ctx,
+            &original_mel,
+            &original_features,
+            target_features,
+            reference_frames,
+            |args| {
+                self.run_chunk(
                     ctx,
-                    &ops::slice_rows(ctx, &original_mel, 0, prefix)?,
-                    &ops::slice_rows(
-                        ctx,
-                        &rolling_mel,
-                        rolling_mel.shape().dims()[0] - tail,
-                        tail,
-                    )?,
-                )?;
-                let features = ops::concat_rows(
-                    ctx,
-                    &ops::slice_rows(ctx, &original_features, 0, prefix)?,
-                    &ops::slice_rows(
-                        ctx,
-                        &rolling_features,
-                        rolling_features.shape().dims()[0] - tail,
-                        tail,
-                    )?,
-                )?;
-                (prompt, features)
-            };
-            let generated = self.run_chunk(
-                ctx,
-                &features,
-                &target,
-                &prompt,
-                steps,
-                seed.wrapping_add(chunk_index as u64),
-            )?;
-            let generated_frames = generated.shape().dims()[0];
-            rolling_mel = ops::slice_rows(
-                ctx,
-                &generated,
-                generated_frames.saturating_sub(reference_frames),
-                reference_frames.min(generated_frames),
-            )?;
-            rolling_features = ops::slice_rows(
-                ctx,
-                &target,
-                length.saturating_sub(reference_frames),
-                reference_frames.min(length),
-            )?;
-            results.push(generated);
-            start += length;
-            chunk_index += 1;
-        }
-        let mut chunks = results.into_iter();
-        let mut combined = chunks.next().ok_or_else(|| {
-            Error::Other("cfm synthesis requires at least one target frame".into())
-        })?;
-        for tensor in chunks {
-            combined = ops::concat_rows(ctx, &combined, &tensor)?;
-        }
-        Ok(combined)
+                    args.prompt_features,
+                    args.target,
+                    args.prompt_mel,
+                    steps,
+                    seed.wrapping_add(args.chunk_index as u64),
+                )
+            },
+        )
     }
 }
 
@@ -892,6 +836,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plan_chunks_matches_the_rolling_prompt_schedule() {
+        // chunk = min(TOTAL_CHUNK - reference_frames, MAX_TARGET_CHUNK)
+        //       = min(1000 - 500, 640) = 500, so 1488 frames split as
+        // 500 + 500 + 488.
+        assert_eq!(
+            plan_chunks(1488, 500).unwrap(),
+            vec![(0, 500), (500, 500), (1000, 488)]
+        );
+    }
+
+    #[test]
+    fn plan_chunks_rejects_empty_target() {
+        assert!(plan_chunks(0, 500).is_err());
+    }
+
+    #[test]
+    fn plan_chunks_keeps_short_targets_in_one_piece() {
+        assert_eq!(plan_chunks(300, 500).unwrap(), vec![(0, 300)]);
+    }
+
+    #[test]
+    fn plan_chunks_caps_short_references_at_max_target_chunk() {
+        // chunk = min(1000 - 200, 640) = 640, so 1500 frames split as
+        // 640 + 640 + 220.
+        assert_eq!(
+            plan_chunks(1500, 200).unwrap(),
+            vec![(0, 640), (640, 640), (1280, 220)]
+        );
+    }
+
+    #[test]
     #[ignore = "requires APXINF_GPT_CHECKPOINT and CUDA"]
     fn cached_time_modulations_match_original_projection_rounding() {
         let directory = std::path::PathBuf::from(std::env::var("APXINF_GPT_CHECKPOINT").unwrap());
@@ -901,6 +876,124 @@ mod tests {
         cfm.validate_step_modulations(&ctx, &mut weights).unwrap();
         println!("all cached block/final modulations match original bytes");
     }
+}
+
+/// Per-chunk inputs handed to the [`run_chunked`] driver's callback.
+pub(super) struct ChunkArgs<'a> {
+    pub(super) prompt_features: &'a Tensor,
+    pub(super) target: &'a Tensor,
+    pub(super) prompt_mel: &'a Tensor,
+    pub(super) chunk_index: usize,
+    pub(super) length: usize,
+}
+
+/// Split a target stream into rolling-prompt chunks and run each one.
+///
+/// This is the shared chunk orchestration of the eager and prepared paths:
+/// the chunk length is `(TOTAL_CHUNK - reference_frames).min(MAX_TARGET_CHUNK)`,
+/// the first chunk conditions on the original reference prompt and every later
+/// chunk on the original prefix spliced with the previous chunk's rolling
+/// tail. `chunk_fn` only decides how one chunk is executed (eager CFM loop vs
+/// CUDA-graph replay); its `chunk_index` seeds the noise stream, so callers
+/// must fold it into their seed exactly as both existing paths did.
+pub(super) fn run_chunked(
+    ctx: &Context,
+    original_mel: &Tensor,
+    original_features: &Tensor,
+    target_features: &Tensor,
+    reference_frames: usize,
+    mut chunk_fn: impl FnMut(ChunkArgs<'_>) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let plans = plan_chunks(target_features.shape().dims()[0], reference_frames)?;
+    let mut rolling_mel = original_mel.clone();
+    let mut rolling_features = original_features.clone();
+    let mut results: Vec<Tensor> = Vec::new();
+    for (chunk_index, (start, length)) in plans.into_iter().enumerate() {
+        let target = ops::slice_rows(ctx, target_features, start, length)?;
+        let (prompt_mel, prompt_features) = if chunk_index == 0 {
+            (original_mel.clone(), original_features.clone())
+        } else {
+            let tail = ROLLING_TAIL
+                .min(reference_frames)
+                .min(rolling_mel.shape().dims()[0])
+                .min(rolling_features.shape().dims()[0]);
+            let prefix = reference_frames - tail;
+            let prompt_mel = ops::concat_rows(
+                ctx,
+                &ops::slice_rows(ctx, original_mel, 0, prefix)?,
+                &ops::slice_rows(
+                    ctx,
+                    &rolling_mel,
+                    rolling_mel.shape().dims()[0] - tail,
+                    tail,
+                )?,
+            )?;
+            let prompt_features = ops::concat_rows(
+                ctx,
+                &ops::slice_rows(ctx, original_features, 0, prefix)?,
+                &ops::slice_rows(
+                    ctx,
+                    &rolling_features,
+                    rolling_features.shape().dims()[0] - tail,
+                    tail,
+                )?,
+            )?;
+            (prompt_mel, prompt_features)
+        };
+        let generated = chunk_fn(ChunkArgs {
+            prompt_features: &prompt_features,
+            target: &target,
+            prompt_mel: &prompt_mel,
+            chunk_index,
+            length,
+        })?;
+        let generated_frames = generated.shape().dims()[0];
+        rolling_mel = ops::slice_rows(
+            ctx,
+            &generated,
+            generated_frames.saturating_sub(reference_frames),
+            reference_frames.min(generated_frames),
+        )?;
+        rolling_features = ops::slice_rows(
+            ctx,
+            &target,
+            length.saturating_sub(reference_frames),
+            reference_frames.min(length),
+        )?;
+        results.push(generated);
+    }
+    let mut chunks = results.into_iter();
+    let mut combined = chunks
+        .next()
+        .ok_or_else(|| Error::Other("cfm synthesis requires at least one target frame".into()))?;
+    for tensor in chunks {
+        combined = ops::concat_rows(ctx, &combined, &tensor)?;
+    }
+    Ok(combined)
+}
+
+/// Chunk plan for a target stream: `(start, length)` pairs covering every
+/// target frame exactly once. Empty targets are rejected here so both paths
+/// fail with the same error instead of differing (eager errored on the result
+/// concat, prepared panicked on `results.remove(0)`).
+pub(super) fn plan_chunks(
+    target_len: usize,
+    reference_frames: usize,
+) -> Result<Vec<(usize, usize)>> {
+    if target_len == 0 {
+        return Err(Error::Other(
+            "cfm synthesis requires at least one target frame".into(),
+        ));
+    }
+    let chunk = (TOTAL_CHUNK - reference_frames).min(MAX_TARGET_CHUNK);
+    let mut plans = Vec::new();
+    let mut start = 0usize;
+    while start < target_len {
+        let length = chunk.min(target_len - start);
+        plans.push((start, length));
+        start += length;
+    }
+    Ok(plans)
 }
 
 /// The step modulation table holds the 32 timesteps `i / 32`; a step count
