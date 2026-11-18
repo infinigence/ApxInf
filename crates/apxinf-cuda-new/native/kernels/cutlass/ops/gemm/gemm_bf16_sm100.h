@@ -4,6 +4,14 @@
 #include <cuda_runtime_api.h>
 
 namespace apxinf::cuda_new::cutlass_ops {
+struct ExactGeluExecution;
+size_t exact_gelu_workspace();
+size_t exact_gelu_lut_workspace();
+ExactGeluExecution* prepare_exact_gelu_lut(const void*, const void*, void*, int, size_t, cudaStream_t);
+ExactGeluExecution* prepare_exact_gelu(const void*, const void*, void*, int, size_t, cudaStream_t);
+int enqueue_exact_gelu(ExactGeluExecution*, cudaStream_t);
+void destroy_exact_gelu(ExactGeluExecution*);
+
 
 int bf16_gemm_geglu(
     const void* activation, const void* packed_weight, const void* gate,

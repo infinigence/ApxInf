@@ -50,6 +50,8 @@ pub fn register_builtin_models() {
     crate::hip_gr00t::register_builtin();
     #[cfg(feature = "cuda")]
     crate::smolvla::register_builtin();
+    #[cfg(feature = "cuda")]
+    crate::cuda_cosmos_policy::register_builtin();
 }
 fn load_llama(
     path: &Path,

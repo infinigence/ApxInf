@@ -7,6 +7,10 @@ nsys/
 .DS_Store
 __pycache__/
 *.py[cod]
+# Native Python extension / in-tree build products
+*.so
+build/
+*.egg-info/
 
 # Local model-port worktrees
 experiment/

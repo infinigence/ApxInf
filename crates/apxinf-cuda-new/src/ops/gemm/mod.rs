@@ -21,7 +21,7 @@ pub use gemm::gemm;
 pub use gemm_bias::{gemm_bias, GemmBiasArgs};
 pub use gemm_bias_residual::{gemm_bias_residual, GemmBiasResidualArgs};
 pub use gemm_geglu::{gemm_geglu, GemmGegluArgs};
-pub use gemm_gelu::{gemm_bias_gelu, GemmBiasGeluArgs};
+pub use gemm_gelu::{gemm_bias_gelu, gemm_gelu_exact, GemmBiasGeluArgs};
 pub use gemm_swiglu::{
     gemm_swiglu, pack_swiglu_weight_host, BlockQuantizedSwiGluArgs, GemmSwiGluArgs,
 };

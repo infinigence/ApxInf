@@ -12,6 +12,8 @@ use crate::CudaContext;
 pub enum NormKind {
     Rms,
     Layer,
+    /// Staged BF16 L2 clamp/divide/sqrt(cols)/weight normalization.
+    ChannelL2,
 }
 
 /// Affine transform applied after the normalization statistic.
@@ -24,6 +26,14 @@ pub enum Affine<'a> {
         weight: &'a Tensor,
         bias: Option<&'a Tensor>,
         offset: bool,
+    },
+    /// Contiguous `[groups, parts, cols]` conditioning; groups evenly partition
+    /// activation rows. `parts` is 2 or 3 (the third part is ignored here).
+    /// `shift_first` chooses [shift, scale] instead of [scale, shift].
+    /// Currently requires LayerNorm with explicit StagedBf16 numerics.
+    GroupedAdaptive {
+        style: &'a Tensor,
+        shift_first: bool,
     },
     /// Per-call `[scale; shift]` conditioning vector.
     Adaptive { style: &'a Tensor },
@@ -42,6 +52,13 @@ pub enum ResidualGate<'a> {
     /// Packed modulation `[scale; shift; gate]`; the third segment is the
     /// direct multiplier used by the existing adaptive Norm contract.
     PackedStyle(&'a Tensor),
+    /// `[groups, 3, cols]` style shared over equal consecutive row groups.
+    /// Uses the third segment as gate. StagedBf16 rounds the product before
+    /// adding the residual; no other numerical mode is currently supported.
+    GroupedStyle {
+        style: &'a Tensor,
+        numerics: NormNumerics,
+    },
     /// Per-column gate whose effective multiplier is BF16-rounded `1 + gate`.
     UnitOffset(&'a Tensor),
 }
@@ -120,7 +137,9 @@ impl<'a> NormArgs<'a> {
     pub fn with_weight_offset(mut self) -> Self {
         match &mut self.affine {
             Affine::Weight { offset, .. } => *offset = true,
-            Affine::Adaptive { .. } | Affine::WeightedAdaptive { .. } => {}
+            Affine::Adaptive { .. }
+            | Affine::GroupedAdaptive { .. }
+            | Affine::WeightedAdaptive { .. } => {}
         }
         self
     }
@@ -161,6 +180,7 @@ fn statistic(kind: NormKind) -> Statistic {
     match kind {
         NormKind::Rms => Statistic::Rms,
         NormKind::Layer => Statistic::Layer,
+        NormKind::ChannelL2 => Statistic::ChannelL2,
     }
 }
 
@@ -224,6 +244,8 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
             execute(
                 ctx,
                 RawArgs {
+                    grouped_style: false,
+                    shift_first: false,
                     operation: Operation::Norm,
                     statistic: Statistic::Rms,
                     affine: AffineKind::Weight,
@@ -254,9 +276,9 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
             offset: false,
         } => {
             match args.kind {
-                NormKind::Rms if bias.is_none() => {}
+                NormKind::Rms | NormKind::ChannelL2 if bias.is_none() => {}
                 NormKind::Layer if bias.is_some() => {}
-                NormKind::Rms => {
+                NormKind::Rms | NormKind::ChannelL2 => {
                     return Err(super::contracts::invalid(
                         "RMSNorm does not take an affine bias",
                     ))
@@ -270,6 +292,8 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
             execute(
                 ctx,
                 RawArgs {
+                    grouped_style: false,
+                    shift_first: false,
                     operation: Operation::Norm,
                     statistic: statistic(args.kind),
                     affine: AffineKind::Weight,
@@ -294,9 +318,39 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
                 },
             )
         }
+        Affine::GroupedAdaptive { style, shift_first } => execute(
+            ctx,
+            RawArgs {
+                grouped_style: true,
+                shift_first,
+                operation: Operation::Norm,
+                statistic: statistic(args.kind),
+                affine: AffineKind::Adaptive,
+                gate: GateKind::None,
+                quantization: quantization(args.quantized),
+                numerics: args.numerics,
+                bias_order: BiasOrder::SingleRound,
+                weight_offset: false,
+                input: args.input,
+                bias: None,
+                residual: None,
+                weight: None,
+                norm_bias: None,
+                norm_style: Some(style),
+                gate_style: None,
+                hidden: None,
+                normalized: args.output,
+                quantized_output: quantized_output(args.quantized),
+                quantized_scales: quantized_scales(args.quantized),
+                eps: args.eps,
+                output_scale,
+            },
+        ),
         Affine::Adaptive { style } => execute(
             ctx,
             RawArgs {
+                grouped_style: false,
+                shift_first: false,
                 operation: Operation::Norm,
                 statistic: statistic(args.kind),
                 affine: AffineKind::Adaptive,
@@ -346,6 +400,50 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
 /// Execute a residual prologue followed by RMSNorm/LayerNorm.
 pub fn fused_add_norm(ctx: &CudaContext, args: FusedAddNormArgs<'_>) -> Result<()> {
     if let (
+        NormKind::Layer,
+        Affine::GroupedAdaptive { style, shift_first },
+        Some(ResidualGate::GroupedStyle {
+            style: gate,
+            numerics,
+        }),
+    ) = (args.kind, args.affine, args.gate)
+    {
+        if numerics != args.numerics {
+            return Err(super::contracts::invalid(
+                "grouped gate and norm must use the same staged BF16 numerics",
+            ));
+        }
+        return execute(
+            ctx,
+            RawArgs {
+                grouped_style: true,
+                shift_first,
+                operation: Operation::FusedAddNorm,
+                statistic: Statistic::Layer,
+                affine: AffineKind::Adaptive,
+                gate: GateKind::Style,
+                quantization: quantization(args.quantized),
+                numerics: args.numerics,
+                bias_order: args.bias_order,
+                weight_offset: false,
+                input: args.input,
+                bias: args.bias,
+                residual: Some(args.residual),
+                weight: None,
+                norm_bias: None,
+                norm_style: Some(style),
+                gate_style: Some(gate),
+                hidden: Some(args.hidden),
+                normalized: args.normalized,
+                quantized_output: quantized_output(args.quantized),
+                quantized_scales: quantized_scales(args.quantized),
+                eps: args.eps,
+                output_scale: output_scale(args.quantized),
+            },
+        );
+    }
+
+    if let (
         NormKind::Rms,
         Affine::Weight {
             weight,
@@ -370,6 +468,8 @@ pub fn fused_add_norm(ctx: &CudaContext, args: FusedAddNormArgs<'_>) -> Result<(
         return execute(
             ctx,
             RawArgs {
+                grouped_style: false,
+                shift_first: false,
                 operation: Operation::FusedAddNorm,
                 statistic: Statistic::Rms,
                 affine: AffineKind::Weight,
@@ -491,6 +591,8 @@ pub fn fused_add_norm(ctx: &CudaContext, args: FusedAddNormArgs<'_>) -> Result<(
     execute(
         ctx,
         RawArgs {
+            grouped_style: false,
+            shift_first: false,
             operation: Operation::FusedAddNorm,
             statistic: statistic(args.kind),
             affine,
@@ -531,8 +633,13 @@ pub fn residual_add(ctx: &CudaContext, args: ResidualAddArgs<'_>) -> Result<()> 
             args.hidden,
         );
     }
+    let (grouped_style, numerics) = match args.gate {
+        Some(ResidualGate::GroupedStyle { numerics, .. }) => (true, numerics),
+        _ => (false, NormNumerics::Flexible),
+    };
     let (gate, gate_style) = match args.gate {
-        Some(ResidualGate::PackedStyle(gate)) => {
+        Some(ResidualGate::PackedStyle(gate))
+        | Some(ResidualGate::GroupedStyle { style: gate, .. }) => {
             if args.bias.is_some() || args.bias_order != BiasOrder::SingleRound {
                 return Err(super::contracts::invalid(
                     "gated residual add does not take bias or BiasThenResidual",
@@ -546,12 +653,14 @@ pub fn residual_add(ctx: &CudaContext, args: ResidualAddArgs<'_>) -> Result<()> 
     execute(
         ctx,
         RawArgs {
+            grouped_style,
+            shift_first: false,
             operation: Operation::ResidualAdd,
             statistic: Statistic::None,
             affine: AffineKind::None,
             gate,
             quantization: Quantization::None,
-            numerics: NormNumerics::Flexible,
+            numerics,
             bias_order: args.bias_order,
             weight_offset: false,
             input: args.input,
@@ -566,6 +675,108 @@ pub fn residual_add(ctx: &CudaContext, args: ResidualAddArgs<'_>) -> Result<()> 
             quantized_output: None,
             quantized_scales: None,
             eps: 1e-6,
+            output_scale: 1.0,
+        },
+    )
+}
+
+/// Staged BF16 channel L2 normalization (epsilon clamps the norm).
+pub struct ChannelL2NormArgs<'a> {
+    pub input: &'a Tensor,
+    pub weight: &'a Tensor,
+    pub out: &'a mut Tensor,
+    pub eps: f32,
+}
+pub fn channel_l2_norm(ctx: &CudaContext, args: ChannelL2NormArgs<'_>) -> Result<()> {
+    let mut call = NormArgs::rms(args.input, args.weight, args.out, args.eps);
+    call.kind = NormKind::ChannelL2;
+    norm(ctx, call)
+}
+
+/// Staged BF16 channel-L2 normalization followed by SiLU of the BF16-rounded result.
+/// Shares the storage and epsilon contract of `channel_l2_norm`.
+pub fn channel_l2_norm_silu(ctx: &CudaContext, args: ChannelL2NormArgs<'_>) -> Result<()> {
+    execute(
+        ctx,
+        RawArgs {
+            grouped_style: false,
+            shift_first: false,
+            operation: Operation::NormSilu,
+            statistic: Statistic::ChannelL2,
+            affine: AffineKind::Weight,
+            gate: GateKind::None,
+            quantization: Quantization::None,
+            numerics: NormNumerics::Flexible,
+            bias_order: BiasOrder::SingleRound,
+            weight_offset: false,
+            input: args.input,
+            weight: Some(args.weight),
+            normalized: Some(args.out),
+            bias: None,
+            residual: None,
+            norm_bias: None,
+            norm_style: None,
+            gate_style: None,
+            hidden: None,
+            quantized_output: None,
+            quantized_scales: None,
+            eps: args.eps,
+            output_scale: 1.,
+        },
+    )
+}
+
+/// BF16 bias/residual update followed by staged channel-L2 normalization and SiLU.
+/// `hidden = bf16(bf16(input + bias) + residual)`, omitting absent additions.
+/// The channel norm, clamped denominator, division, sqrt(cols) scaling, learned
+/// weight product, and SiLU input each retain the existing BF16 boundaries.
+/// Both outputs are materialized. They must be disjoint, but either may exactly
+/// alias input or residual. Partial activation overlap and output overlap with
+/// weight/bias are rejected. Inputs are contiguous BF16 matrices; vectors have
+/// one value per column. Epsilon must be positive and finite.
+pub struct FusedAddChannelL2NormArgs<'a> {
+    pub input: &'a Tensor,
+    pub bias: Option<&'a Tensor>,
+    pub residual: Option<&'a Tensor>,
+    pub hidden: &'a Tensor,
+    pub weight: &'a Tensor,
+    pub normalized: &'a mut Tensor,
+    pub eps: f32,
+}
+
+pub fn fused_add_channel_l2_norm_silu(
+    ctx: &CudaContext,
+    args: FusedAddChannelL2NormArgs<'_>,
+) -> Result<()> {
+    execute(
+        ctx,
+        RawArgs {
+            grouped_style: false,
+            shift_first: false,
+            operation: if args.residual.is_some() {
+                Operation::FusedAddNormSilu
+            } else {
+                Operation::BiasNormSilu
+            },
+            statistic: Statistic::ChannelL2,
+            affine: AffineKind::Weight,
+            gate: GateKind::None,
+            quantization: Quantization::None,
+            numerics: NormNumerics::Flexible,
+            bias_order: BiasOrder::BiasThenResidual,
+            weight_offset: false,
+            input: args.input,
+            bias: args.bias,
+            residual: args.residual,
+            weight: Some(args.weight),
+            norm_bias: None,
+            norm_style: None,
+            gate_style: None,
+            hidden: Some(args.hidden),
+            normalized: Some(args.normalized),
+            quantized_output: None,
+            quantized_scales: None,
+            eps: args.eps,
             output_scale: 1.0,
         },
     )
