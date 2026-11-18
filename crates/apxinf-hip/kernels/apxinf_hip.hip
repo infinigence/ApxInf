@@ -541,6 +541,43 @@ extern "C" int apxinf_hip_gemm(void* handle, int dtype, int m, int n, int k, con
   return status == HIPBLAS_STATUS_SUCCESS ? 0 : kBlasStatusBase + static_cast<int>(status);
 }
 
+// Row-major C[m,n] = A^T[k,m] @ B[k,n] in BF16 with F32 accumulation: the
+// same product as `apxinf_hip_gemm` with the activation stored k-major
+// instead of m-major. A is column-major [m, k] (row-major [k, m]) with
+// leading dimension m, served with opB=T; the weight keeps its [k, n]
+// row-major layout.
+//
+// Why a shape this narrow exists: for pi05's language `down` projection
+// (522x16384x2048) hipBLAS's NN pick runs a 128x128-tiled Tensile kernel
+// at 80 blocks -- exactly 2 waves on gfx1151's 40 CUs -- and pays a 4 ms
+// per-forward tail for it. With the activation k-major the library picks
+// an `Alik`-family kernel that tiles the problem differently and runs the
+// same shape at 1086 vs 1330 us (32.3 vs 26.3 TF/s, full op-matrix census
+// in devlocal/pi05-hip/perf/langdown_{census,tn,nt}.{cpp,log}; the Lt
+// enumeration never beat either, so this is plain hipBLAS, no recipe).
+// The k-major copy is produced by the caller's own producer kernel, which
+// pays no extra bandwidth over writing m-major.
+extern "C" int apxinf_hip_gemm_nt(void* handle, int dtype, int m, int n, int k, const void* a,
+                                  const void* b, void* c) {
+  hipDataType type;
+  if (dtype == kDTypeF32) {
+    type = HIP_R_32F;
+  } else if (dtype == kDTypeBF16) {
+    type = HIP_R_16BF;
+  } else {
+    return kInvalidArgument;
+  }
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  // Column-major C^T[n,m] = B^T[n,k] @ A[k,m]: opB=T reads the k-major
+  // activation as column-major [m, k] with leading dimension m.
+  const hipblasStatus_t status =
+      hipblasGemmEx(static_cast<hipblasHandle_t>(handle), HIPBLAS_OP_N, HIPBLAS_OP_T, n, m, k,
+                    &alpha, b, type, n, a, type, m, &beta, c, type, n, HIPBLAS_COMPUTE_32F,
+                    HIPBLAS_GEMM_DEFAULT);
+  return status == HIPBLAS_STATUS_SUCCESS ? 0 : kBlasStatusBase + static_cast<int>(status);
+}
+
 // ── hipBLASLt ───────────────────────────────────────────────────────
 //
 // A second GEMM provider, selected per shape by `apxinf_hip::native::gemm`.

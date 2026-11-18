@@ -276,6 +276,38 @@ GeGLU run at the roof. The residuals, largest first:
   gfx1151 cannot reach Tensile's 68% WMMA-peak utilization, in either the
   bandwidth-bound or the compute-bound form.
 
+## Language MLP: k-major GeGLU and op(B)=T down projection (2026-11-18)
+
+`lang_down` (522x16384x2048) ran at 25.6 TF/s on hipBLAS's NN pick — the same
+128x128 Tensile kernel as `lang_gate_up`, but 80 workgroups: exactly two waves
+on 40 CUs, and the wave tail is what the 4 ms "excess" against the language
+roofline was. A full op-matrix census (`hipblaslt_ext::getAllAlgos`, 118
+unique kernels per combination rather than the heuristic's top-32;
+`devlocal/pi05-hip/perf/langdown_{census,tn,nt}.{cpp,log}`) found no
+hipBLASLt tactic that beats hipBLAS on any of the four transpose
+combinations — but with the activation stored k-major, hipBLAS's own op(B)=T
+pick runs the same shape at 1086 vs 1330 us (32.3 vs 26.3 TF/s): a
+differently-tiled `Alik`-family kernel that never sees the two-wave shape.
+
+The activation comes from geglu, so k-major means the producer transposes. A
+naive transposed store (each thread's eight results landing in eight
+different rows) measured 2.4x slower than the m-major kernel; the shipped
+`geglu_vec_transposed_kernel` stages a [64 col x 32 row] tile in LDS and
+writes each column's 32 rows as one contiguous 64-byte store per warp,
+keeping both sides coalesced (probe: 118.4 vs 112.6 us, ~5%). The language
+layer now writes its geglu output k-major and projects down through
+`apxinf_hip_gemm_nt` (plain hipBLAS, op(B)=T, no recipe — the census put
+every Lt candidate slower). The action expert keeps the m-major path: its
+10x4096x1024 down projection did not win on NT in the same census.
+
+Interleaved binary A/B, three windows, plus a stage differential
+(prefix_forward delta minus denoise delta, which cancels machine state on
+the fault-heavy evenings): **−1.3 ms per forward** (window graph P50s
+132.79/143.41/135.55 against 131.96/134.56/134.23; stage differential
+−1.29 ms). Output checksum unchanged; graph capture still 2,311 nodes and
+bit-identical to eager. The LT axis for this shape is closed with evidence:
+all four transpose combinations enumerated, no winner.
+
 ## Next
 
 The full LIBERO-10 regression above is the gate for the campaign's changes

@@ -144,6 +144,78 @@ __global__ void geglu_vec_kernel(const bf16* gate_up, bf16* y, int64_t rows, int
   }
 }
 
+// GeGLU writing k-major: yt[inner, rows] (the transpose of `geglu_vec_kernel`'s
+// y), so the down projection runs as op(B)=T over a column-major [rows, inner]
+// activation -- see `apxinf_hip_gemm_nt`. A naive transposed store scatters one
+// thread's eight results across eight rows and measured 2.4x slower than the
+// m-major kernel (pointwise_probe V2T, 272 vs 113 us); this version stages a
+// [64 col x 32 row] tile in LDS and writes each column's 32 rows as one
+// 64-byte contiguous store per warp, keeping both sides coalesced. The reads
+// are the same uint4 pattern as `geglu_vec_kernel`, the per-element F32
+// expression (and its evaluation order) is unchanged, so the element values
+// are bit-identical -- only their address changes.
+//
+// Probe (2026-11-18): language 522x8192 V1 112.6 us, V3T 118.4 us (1.05x) --
+// the k-major store now costs ~5%, not 2.4x, and the down GEMM it feeds gains
+// 244 us per call on the same shape.
+__global__ void geglu_vec_transposed_kernel(const bf16* gate_up, bf16* yt, int64_t rows,
+                                            int inner) {
+  constexpr int kTileRows = 32;  // one warp writes one column's 32 rows: 64 B
+  constexpr int kTileCols = 64;  // eight uint4 column groups per tile row
+  constexpr int kLdsCols = kTileCols;
+  constexpr int kLdsRows = kTileRows + 1;  // +1: odd stride, 2-B banks de-conflict
+  __shared__ bf16 tile[kLdsCols][kLdsRows];
+  const int64_t col_blocks = inner / kTileCols;
+  const int64_t row_blocks = (rows + kTileRows - 1) / kTileRows;
+  const int64_t tiles = row_blocks * col_blocks;
+  // One tile per block per iteration: the tile is block-shared state, so
+  // unlike the other kernels here the grid-stride loop strides by blocks,
+  // not by threads.
+  for (int64_t t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const int64_t rb = t / col_blocks;
+    const int64_t cb = t - rb * col_blocks;
+    const int64_t r0 = rb * kTileRows;
+    const int c0 = (int)(cb * kTileCols);
+    const int r_valid = (int)min((int64_t)kTileRows, rows - r0);
+    // Read: thread = (row_in_tile = tid >> 3, col_group = tid & 7); each
+    // thread loads one gate uint4 and one up uint4 -- eight columns of one
+    // row. A warp covers four rows' worth of 128-B lines.
+    const int r_in = (int)(threadIdx.x >> 3);
+    const int cg = (int)(threadIdx.x & 7);
+    const int64_t rrow = r0 + (r_in < r_valid ? r_in : 0);  // clamp: never OOB
+    const uint4* gate = reinterpret_cast<const uint4*>(gate_up + rrow * 2 * inner) + c0 / 8;
+    const uint4* up = reinterpret_cast<const uint4*>(gate_up + rrow * 2 * inner + inner) + c0 / 8;
+    const uint4 gq = gate[cg];
+    const uint4 uq = up[cg];
+    const uint32_t gw[4] = {gq.x, gq.y, gq.z, gq.w};
+    const uint32_t uw[4] = {uq.x, uq.y, uq.z, uq.w};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int sh = (j & 1) * 16;
+      const float g = bf16_to_f32(static_cast<uint16_t>(gw[j >> 1] >> sh));
+      const float u = bf16_to_f32(static_cast<uint16_t>(uw[j >> 1] >> sh));
+      // Rows past r_valid hold garbage here (their reads were clamped to a
+      // valid row); the write phase masks those lanes out, so it never escapes.
+      tile[cg * 8 + j][r_in] = f32_to_bf16(gelu_tanh(g) * u);
+    }
+    __syncthreads();
+    // Write: warp w owns columns c0 + w*8 .. +7; each of its eight store
+    // instructions writes one column's 32 rows -- lanes = consecutive rows,
+    // 64 B contiguous. Threads whose row is past r_valid read tile[..][0]
+    // but do not store.
+    const int w = (int)(threadIdx.x >> 5);
+    const int lane = (int)(threadIdx.x & 31);
+    const int r_out = (int)(r0 + lane);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int col = c0 + w * 8 + j;
+      const bf16 v = tile[w * 8 + j][lane];
+      if (lane < r_valid) yt[(int64_t)col * rows + r_out] = v;
+    }
+    __syncthreads();
+  }
+}
+
 // y = silu(gate) * up over separate operands -- GR00T's SwiGLU MLP, where the
 // two projections are distinct tensors rather than the packed `gate_up` that
 // `geglu` splits.
@@ -527,6 +599,30 @@ extern "C" int apxinf_hip_native_geglu(const void* gate_up, void* y, int64_t row
   }
   geglu_kernel<<<elementwise_grid(rows * inner), kElementwiseBlock, 0, as_stream(stream)>>>(
       in(gate_up), out(y), rows, inner);
+  return last_launch_status();
+}
+
+// `apxinf_hip_native_geglu` with the output stored k-major: y^T[inner, rows]
+// instead of y[rows, inner]. Feeds `apxinf_hip_gemm_nt`; see the kernels'
+// comments for why one shape wants the pair.
+extern "C" int apxinf_hip_native_geglu_transposed(const void* gate_up, void* yt, int64_t rows,
+                                                  int inner, void* stream) {
+  if (rows <= 0 || inner <= 0) return kInvalidArgument;
+  if (rows > (1 << 30)) return kInvalidArgument;
+  // The tiled kernel's contracts: `inner % 64 == 0` for whole column tiles,
+  // `rows <= 4096` for the int row arithmetic, and 16-byte alignment for the
+  // uint4 loads. Every geglu width in π0.5 is a multiple of 64 (language
+  // 16384, action 4096), so the m-major kernel stays the general fallback.
+  if (inner % 64 != 0 || (reinterpret_cast<uintptr_t>(gate_up) & 15u) != 0) {
+    return kInvalidArgument;
+  }
+  const int64_t tiles = ((rows + 31) / 32) * (inner / 64);
+  // `tiles * kElementwiseBlock` asks for one block per tile;
+  // `elementwise_grid` caps it at kMaxGrid and the kernel's per-block loop
+  // covers the rest.
+  geglu_vec_transposed_kernel<<<elementwise_grid(tiles * kElementwiseBlock),
+                                kElementwiseBlock, 0, as_stream(stream)>>>(
+      in(gate_up), out(yt), rows, inner);
   return last_launch_status();
 }
 

@@ -117,6 +117,23 @@ impl Ops<'_> {
         native::geglu(self.ctx, &packed, &out)?;
         Ok(out)
     }
+
+    /// [`Ops::geglu`](Self::geglu) writing its output k-major
+    /// (`[inner, rows]`), so the down projection runs as
+    /// [`native::gemm_nt`]: on gfx1151 the language down GEMM
+    /// (522x16384x2048) picks a better-tiled Tensile kernel from the
+    /// op(B)=T family -- 1086 vs 1330 us per call, the census in
+    /// devlocal/pi05-hip/perf/langdown_* -- and the tiled-transpose store
+    /// in the producer costs ~5% of that kernel, not the 2.4x a naive
+    /// transposed store pays. The action expert keeps the m-major path:
+    /// its down shape (10x4096x1024) did not win on NT in the same census.
+    fn geglu_transposed(&self, x: &Tensor, gate_up: &Linear) -> Result<Tensor> {
+        let packed = self.linear(x, gate_up)?;
+        let dims = packed.shape().dims();
+        let out = self.tensor(&[dims[1] / 2, dims[0]])?;
+        native::geglu_transposed(self.ctx, &packed, &out)?;
+        Ok(out)
+    }
 }
 
 impl HipPi05Model {
@@ -528,9 +545,9 @@ impl HipPi05Model {
             &hidden,
             &normalized,
         )?;
-        let activated = ops.geglu(&normalized, &layer.gate_up)?;
+        let activated = ops.geglu_transposed(&normalized, &layer.gate_up)?;
         let projected = ops.tensor(&[tokens, lang.width])?;
-        native::gemm(&self.ctx, &activated, &layer.down.weight, &projected)?;
+        native::gemm_nt(&self.ctx, &activated, &layer.down.weight, &projected)?;
         let out = ops.tensor(&[tokens, lang.width])?;
         native::bias_residual(
             &self.ctx,

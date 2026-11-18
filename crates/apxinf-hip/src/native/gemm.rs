@@ -806,6 +806,32 @@ pub fn gemm(ctx: &HipContext, a: &Tensor, b: &Tensor, out: &Tensor) -> Result<()
     dispatch(ctx, a, b, out, None, Activation::None).map(|_| ())
 }
 
+/// [`gemm`](self::gemm) with the activation stored k-major: `a` holds
+/// `a^T[K, M]` (the transpose of what `gemm` expects), `b` and `out` are
+/// unchanged. Plain hipBLAS with op(B)=T -- no recipe, no Lt, because the
+/// full op-matrix census on the shape this exists for (522x16384x2048,
+/// devlocal/pi05-hip/perf/langdown_*) put every hipBLASLt candidate slower
+/// than this call. The model reaches it through a producer that writes the
+/// k-major copy directly, so the transpose costs no extra pass.
+pub fn gemm_nt(ctx: &HipContext, a_t: &Tensor, b: &Tensor, out: &Tensor) -> Result<()> {
+    let (k, m) = rows_cols(a_t)?;
+    let weight = b.shape().dims();
+    let (out_rows, n) = rows_cols(out)?;
+    if weight.len() != 2 || weight[0] != k || weight[1] != n || out_rows != m {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[{m}, {k}]^T @ [{k}, {n}] -> [{m}, {n}]"),
+            got: format!("{} @ {} -> {}", a_t.shape(), b.shape(), out.shape()),
+        });
+    }
+    let (pa, pb, pc) = (bf16_ptr(ctx, a_t)?, bf16_ptr(ctx, b)?, bf16_ptr(ctx, out)?);
+    check(
+        "gemm_nt",
+        unsafe {
+            ffi::apxinf_hip_gemm_nt(ctx.blas(), DTYPE_BF16, int(m)?, int(n)?, int(k)?, pa, pb, pc)
+        },
+    )
+}
+
 /// `out[M, N] = activation(a[M, K] @ b[K, N] + bias[N])`, fused where the
 /// provider can do it.
 ///

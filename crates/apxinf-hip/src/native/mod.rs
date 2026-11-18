@@ -37,12 +37,12 @@ pub use attention::{
 };
 pub use elementwise::{
     add_position, bias_activation, copy_columns, copy_row_range, copy_rows, embedding,
-    euler_update, gather_rows, geglu, rgb_to_patches, scatter_rows, silu_mul, split_qkv_axial_rope,
-    split_qkv_bias, split_qkv_rope, Activation, EmbeddingScale, HipDeviceBytes, ImageLayout,
-    PreparedRowIndices, QkvRope,
+    euler_update, gather_rows, geglu, geglu_transposed, rgb_to_patches, scatter_rows, silu_mul,
+    split_qkv_axial_rope, split_qkv_bias, split_qkv_rope, Activation, EmbeddingScale,
+    HipDeviceBytes, ImageLayout, PreparedRowIndices, QkvRope,
 };
 pub use gemm::{
-    dispatch_counts, gemm, gemm_bias_activation, recorded_shapes, reset_dispatch_counts,
+    dispatch_counts, gemm, gemm_bias_activation, gemm_nt, recorded_shapes, reset_dispatch_counts,
     reset_recorded_shapes, routed_shapes, Provider,
 };
 pub use norm::{

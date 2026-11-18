@@ -166,6 +166,25 @@ pub fn geglu(ctx: &HipContext, gate_up: &Tensor, out: &Tensor) -> Result<()> {
     })
 }
 
+/// [`geglu`](self::geglu) with the output stored k-major:
+/// `out^T[inner, rows]`, for the GEMM that [`crate::native::gemm_nt`]
+/// consumes. Same math, same rounding, element order unchanged -- only the
+/// store layout moves.
+pub fn geglu_transposed(ctx: &HipContext, gate_up: &Tensor, out_t: &Tensor) -> Result<()> {
+    let (rows, packed) = rows_cols(gate_up)?;
+    let (inner, out_rows) = rows_cols(out_t)?;
+    if packed != 2 * inner || out_rows != rows {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[{inner}, {rows}]^T from [{rows}, {packed}]"),
+            got: out_t.shape().to_string(),
+        });
+    }
+    let (pg, py) = (bf16_ptr(ctx, gate_up)?, bf16_ptr(ctx, out_t)?);
+    check("geglu_transposed", unsafe {
+        ffi::apxinf_hip_native_geglu_transposed(pg, py, long(rows)?, int(inner)?, ctx.stream())
+    })
+}
+
 /// One explicit-Euler flow step: `out = state + dt * velocity`.
 pub fn euler_update(
     ctx: &HipContext,

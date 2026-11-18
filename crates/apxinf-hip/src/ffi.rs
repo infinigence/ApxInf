@@ -79,6 +79,19 @@ hip_abi! {
         b: *const c_void,
         c: *mut c_void,
     );
+    // `apxinf_hip_gemm` with the activation stored k-major (column-major
+    // [m, k], leading dimension m) instead of m-major; see the C++ comment
+    // for why one shape wants it.
+    fn apxinf_hip_gemm_nt(
+        handle: *mut c_void,
+        dtype: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const c_void,
+        b: *const c_void,
+        c: *mut c_void,
+    );
 
     fn apxinf_hip_blaslt_create(handle: *mut *mut c_void, stream: *mut c_void);
     fn apxinf_hip_blaslt_destroy(handle: *mut c_void);
@@ -298,6 +311,15 @@ hip_abi! {
     fn apxinf_hip_native_geglu(
         gate_up: *const c_void,
         y: *mut c_void,
+        rows: i64,
+        inner: i32,
+        stream: *mut c_void,
+    );
+    // `apxinf_hip_native_geglu` with the output stored k-major
+    // (`y^T[inner, rows]`), for `apxinf_hip_gemm_nt`.
+    fn apxinf_hip_native_geglu_transposed(
+        gate_up: *const c_void,
+        yt: *mut c_void,
         rows: i64,
         inner: i32,
         stream: *mut c_void,
