@@ -514,12 +514,18 @@ impl AutoModel {
                 return crate::musa_pi05::load(path, device, options, config);
             }
 
+            #[cfg(feature = "ascend")]
+            if matches!(device, Device::Npu(_)) {
+                let config = options.config.as_ref().map(ascend_pi05_config);
+                return crate::ascend_pi05::load(path, device, options, config);
+            }
+
             #[cfg(feature = "cuda")]
             return crate::pi05::load_with_cuda_new(path, device, options);
 
             #[cfg(not(feature = "cuda"))]
             return Err(Error::Other(
-                "PI0.5 requires CPU, CUDA, HIP or MUSA support".into(),
+                "PI0.5 requires CPU, CUDA, HIP, MUSA or Ascend support".into(),
             ));
         }
 
@@ -549,6 +555,10 @@ impl AutoModel {
             // same way a CUDA or HIP family registers its own suffix. None does
             // yet: PI0.5 resolves through its seam above.
             Device::Musa(_) => Some("musa"),
+            // Ascend brings its own concrete seam above; a family that wants a
+            // registry suffix registers `<family>-npu` like its CUDA/HIP/MUSA
+            // counterparts.
+            Device::Npu(_) => Some("npu"),
             // Metal owns its own admission below; CPU has no registry suffix.
             Device::Metal(_) | Device::Cpu => None,
         };
@@ -787,6 +797,44 @@ fn musa_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::musa_pi05::Pi0
     }
 }
 
+/// The same frontend contract as `hip_pi05_config`, for the Ascend port. Kept
+/// here with its siblings so no family imports another.
+#[cfg(feature = "ascend")]
+fn ascend_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::ascend_pi05::Pi05Config {
+    let gemma = |g: &crate::pi05::GemmaVariantConfig| crate::ascend_pi05::GemmaVariantConfig {
+        width: g.width,
+        depth: g.depth,
+        mlp_dim: g.mlp_dim,
+        num_heads: g.num_heads,
+        num_kv_heads: g.num_kv_heads,
+        head_dim: g.head_dim,
+    };
+    crate::ascend_pi05::Pi05Config {
+        action_dim: frontend.action_dim,
+        action_horizon: frontend.action_horizon,
+        max_token_len: frontend.max_token_len,
+        num_flow_steps: frontend.num_flow_steps,
+        flow_start_time: frontend.flow_start_time,
+        num_views: frontend.num_views,
+        image_size: frontend.image_size,
+        patch_size: frontend.patch_size,
+        vision_width: frontend.vision_width,
+        vision_depth: frontend.vision_depth,
+        vision_mlp_dim: frontend.vision_mlp_dim,
+        vision_heads: frontend.vision_heads,
+        vision_head_dim: frontend.vision_head_dim,
+        vocab_size: frontend.vocab_size,
+        rms_norm_eps: frontend.rms_norm_eps,
+        layer_norm_eps: frontend.layer_norm_eps,
+        rope_theta: frontend.rope_theta,
+        time_min_period: frontend.time_min_period,
+        time_max_period: frontend.time_max_period,
+        discrete_state_input: frontend.discrete_state_input,
+        language: gemma(&frontend.language),
+        action_expert: gemma(&frontend.action_expert),
+    }
+}
+
 /// The family a backend-qualified name refers to: `pi05-hip` is `pi05`.
 ///
 /// The qualifier says which backend the caller had in mind; `device` is what
@@ -795,7 +843,7 @@ fn musa_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::musa_pi05::Pi0
 /// `<family>-cuda`, `<family>-hip`, `<family>-musa` and `<family>-mlx`, so a
 /// family that grows a port on another backend needs no entry — or edit — here.
 fn family_name(model_name: &str) -> &str {
-    ["-cuda", "-hip", "-musa", "-mlx"]
+    ["-cuda", "-hip", "-musa", "-npu", "-mlx"]
         .iter()
         .find_map(|suffix| model_name.strip_suffix(suffix))
         .unwrap_or(model_name)

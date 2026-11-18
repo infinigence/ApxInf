@@ -36,6 +36,14 @@ pub enum Device {
     /// A Moore Threads GPU addressed through MUSA.
     Musa(usize),
     Metal(usize),
+    /// A Huawei Ascend NPU addressed through CANN/ACL.
+    ///
+    /// Separate from the GPU variants for the same reason `Hip` and `Musa`
+    /// are: a tensor records which runtime owns its allocation, and every
+    /// other backend rejects the device through the fallback arm it already
+    /// has. PI0.5 reaches Ascend through `ascend_pi05/`; no `dyn Backend`
+    /// family is ported to it.
+    Npu(usize),
 }
 
 impl Device {
@@ -55,6 +63,7 @@ impl std::fmt::Display for Device {
             Device::Hip(id) => write!(f, "hip:{id}"),
             Device::Musa(id) => write!(f, "musa:{id}"),
             Device::Metal(id) => write!(f, "metal:{id}"),
+            Device::Npu(id) => write!(f, "npu:{id}"),
         }
     }
 }
