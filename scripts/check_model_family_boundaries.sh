@@ -55,5 +55,6 @@ python3 "$repo_root/scripts/check_walloss_module_boundaries.py"
 
 python3 "$repo_root/scripts/check_cosmos_policy_module_boundaries.py"
 python3 "$repo_root/scripts/check_minimax_h3_image_module_boundaries.py"
+python3 "$repo_root/scripts/check_minimax_h3_module_boundaries.py"
 
 echo 'model-family boundary checks passed'

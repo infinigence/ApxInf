@@ -63,5 +63,6 @@ ignored `devlocal/<feat-name>/` according to [AGENTS.md](../AGENTS.md).
 - [PI0.5 one-step warm-start evaluation](run_warmstart_with_onestep.md)
 - [GR00T N1.7](gr00t-n1.7.md)
 - [MiniMax-H3-Image (INT8 ConvRot, CUDA)](minimax-h3-image.md)
+- [MiniMax-H3 video and audio (INT8 ConvRot, CUDA)](minimax-h3.md)
 - [Python API and policies](../python/apxinf/README.md)
 - [Native binding](../crates/apxinf-py/README.md)

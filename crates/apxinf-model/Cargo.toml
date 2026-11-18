@@ -118,5 +118,9 @@ name = "minimax_h3_image_generate"
 required-features = ["cuda"]
 
 [[example]]
+name = "minimax_h3_generate"
+required-features = ["cuda"]
+
+[[example]]
 name = "clef_decision_index"
 required-features = ["mlx"]
