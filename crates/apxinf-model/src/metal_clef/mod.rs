@@ -1,6 +1,10 @@
 //! Native Clef Flash on Apple Metal: Qwen3.5 hybrid backbone (affine Q4) in
 //! the stock MLX-VLM composition or the optimized GPU composition, and the
 //! BF16 joint schema head. No Python model execution.
+#[cfg(feature = "coreml")]
+mod ane;
+#[cfg(feature = "coreml")]
+mod ane_admission;
 mod config;
 mod encode;
 mod model;
@@ -38,9 +42,11 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
     let requested = match options.model_variant.as_deref() {
         None | Some("auto") => None,
         Some("reference") => Some(Composition::Reference),
+        #[cfg(feature = "coreml")]
+        Some("gpu-ane-columns") => Some(Composition::GpuAneColumns),
         Some(_) => {
             return Err(Error::Contract(
-                "Clef MLX supports the auto and reference variants",
+                "Clef MLX variant is unavailable in this build",
             ))
         }
     };
@@ -215,7 +221,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_runs_the_gpu_composition_only_on_qualified_architectures() {
+    fn coreml_requires_an_explicit_available_variant() {
+        let options = LoadOptions {
+            model_variant: Some("gpu-ane-columns".into()),
+            ..LoadOptions::default()
+        };
+        #[cfg(feature = "coreml")]
+        {
+            assert_eq!(admit(&options).unwrap(), Some(Composition::GpuAneColumns));
+            assert_eq!(
+                select(admit(&options).unwrap(), ""),
+                Composition::GpuAneColumns
+            );
+        }
+        #[cfg(not(feature = "coreml"))]
+        assert!(admit(&options).is_err());
+    }
+
+    #[test]
+    fn auto_runs_each_composition_only_on_its_qualified_architectures() {
         assert_eq!(select(None, "applegpu_g13s"), Composition::Gpu);
         for other in ["applegpu_g16g", "applegpu_g14g", "applegpu_g13g", ""] {
             assert_eq!(select(None, other), Composition::Reference, "{other}");
