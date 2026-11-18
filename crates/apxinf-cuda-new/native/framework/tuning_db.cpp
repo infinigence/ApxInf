@@ -11,7 +11,12 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 namespace apxinf::framework {
 namespace {
