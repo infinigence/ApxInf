@@ -157,8 +157,12 @@ impl ProgramBuilder {
         }
     }
 
-    /// An FP16 function input.
+    /// An FP16 function input. Inputs need rank >= 1: Core ML's
+    /// `ArrayFeatureType` cannot express a rank-0 feature shape.
     pub fn input(&mut self, name: &str, shape: &[usize]) -> Result<Var> {
+        if shape.is_empty() {
+            return Err(contract("ML Program function inputs need rank >= 1"));
+        }
         shape_elements(shape)?;
         self.reserve_symbols(&[name.to_owned()])?;
         let var = Var {
@@ -292,7 +296,8 @@ impl ProgramBuilder {
     }
 
     /// `constexpr_blockwise_shift_scale(data, scale)`: INT8 `data` times FP16
-    /// `scale` broadcast over its unit dimensions, materialized at load.
+    /// `scale` broadcast over its unit dimensions, materialized at load. Both
+    /// parameters need equal rank >= 1; Core ML rejects rank-0 parameters.
     pub fn constexpr_blockwise_shift_scale(
         &mut self,
         data: &[i8],
@@ -300,6 +305,11 @@ impl ProgramBuilder {
         scale: &[f16],
         scale_shape: &[usize],
     ) -> Result<Var> {
+        if shape.is_empty() || scale_shape.len() != shape.len() {
+            return Err(contract(
+                "blockwise shift/scale data and scale need equal rank >= 1",
+            ));
+        }
         if data.len() != shape_elements(shape)?
             || scale.len() != shape_elements(scale_shape)?
             || broadcast(shape, scale_shape)? != shape
@@ -494,14 +504,22 @@ impl ProgramBuilder {
         self.unary("identity", x, name)
     }
 
-    /// `reduce_max` over `axes` (non-negative).
+    /// `reduce_max` over `axes`: non-empty, unique, non-negative indices of `x`.
     pub fn reduce_max(&mut self, x: &Var, axes: &[i32], keep_dims: bool) -> Result<Var> {
         self.require_value(x)?;
-        if axes
-            .iter()
-            .any(|&a| usize::try_from(a).map_or(true, |a| a >= x.shape.len()))
-        {
-            return Err(contract("reduce_max axes must index the input"));
+        if axes.is_empty() {
+            return Err(contract("reduce_max axes must not be empty"));
+        }
+        let mut unique = BTreeSet::new();
+        for &axis in axes {
+            let axis = usize::try_from(axis)
+                .map_err(|_| contract("reduce_max axes must index the input"))?;
+            if axis >= x.shape.len() {
+                return Err(contract("reduce_max axes must index the input"));
+            }
+            if !unique.insert(axis) {
+                return Err(contract("reduce_max axes must be unique"));
+            }
         }
         let name = self.op_name("reduce_max", None);
         self.reserve_symbols(&[
@@ -593,16 +611,31 @@ impl ProgramBuilder {
         Ok(outs)
     }
 
-    /// The package: one `main` function returning `outputs`, all FP16.
+    /// The package: one `main` function returning `outputs`, all FP16 with
+    /// rank >= 1. At least one operation is required, and every output must be
+    /// a computed value rather than a function input.
     pub fn finish(self, outputs: &[&Var]) -> Result<Package> {
         if outputs.is_empty() {
             return Err(contract("ML Program needs at least one output"));
+        }
+        if self.operations.is_empty() {
+            return Err(contract(
+                "ML Program needs at least one operation; use identity to return an input",
+            ));
         }
         let mut names = BTreeSet::new();
         for output in outputs {
             self.require_value(output)?;
             if output.dtype != data_type::FLOAT16 {
                 return Err(contract("ML Program outputs must be FP16 values"));
+            }
+            if output.shape.is_empty() {
+                return Err(contract("ML Program function outputs need rank >= 1"));
+            }
+            if self.inputs.iter().any(|input| input.name == output.name) {
+                return Err(contract(
+                    "ML Program outputs must be computed values, not function inputs",
+                ));
             }
             if !names.insert(output.name.as_str()) {
                 return Err(contract("ML Program output names must be unique"));
@@ -846,6 +879,7 @@ mod tests {
         assert_eq!(second.counts, before.2);
         assert_eq!(second.symbols, before.3);
 
+        let _ = second.identity(&local, None).unwrap();
         assert!(second
             .finish(&[&foreign])
             .err()
@@ -855,8 +889,9 @@ mod tests {
 
         let mut third = ProgramBuilder::new();
         let local = third.input("x", &[1]).unwrap();
+        let y = third.identity(&local, None).unwrap();
         assert!(third
-            .finish(&[&local, &local])
+            .finish(&[&y, &y])
             .err()
             .unwrap()
             .to_string()
@@ -921,23 +956,19 @@ mod tests {
     #[test]
     fn invalid_input_shapes_leave_the_builder_unchanged() {
         let mut b = ProgramBuilder::new();
-        for shape in [&[0][..], &[2, 0], &[usize::MAX, 2], &[i64::MAX as usize, 3]] {
+        let empty: &[usize] = &[];
+        for shape in [
+            empty,
+            &[0][..],
+            &[2, 0],
+            &[usize::MAX, 2],
+            &[i64::MAX as usize, 3],
+        ] {
             assert!(b.input("invalid", shape).is_err());
             assert!(b.inputs.is_empty());
             assert!(b.operations.is_empty());
             assert!(b.counts.is_empty());
         }
-        let scalar = b.input("scalar", &[]).unwrap();
-        let package = b.finish(&[&scalar]).unwrap();
-        assert!(package.model.description.unwrap().input[0]
-            .r#type
-            .as_ref()
-            .unwrap()
-            .multi_array_type
-            .as_ref()
-            .unwrap()
-            .shape
-            .is_empty());
     }
 
     #[test]
@@ -954,10 +985,12 @@ mod tests {
             .is_err());
         assert!(b.operations.is_empty());
         assert!(b.counts.is_empty());
-        let actual = b.finish(&[&x]).unwrap();
+        let y = b.identity(&x, None).unwrap();
+        let actual = b.finish(&[&y]).unwrap();
         let mut clean = ProgramBuilder::new();
         let x = clean.input("x", &[1]).unwrap();
-        let expected = clean.finish(&[&x]).unwrap();
+        let y = clean.identity(&x, None).unwrap();
+        let expected = clean.finish(&[&y]).unwrap();
         assert_eq!(actual.model_bytes(), expected.model_bytes());
         assert_eq!(actual.weights, expected.weights);
     }
@@ -989,7 +1022,7 @@ mod tests {
         assert!(b.operations.is_empty());
         let x = b.input("image", &[i64::MAX as usize, 1, 1, 1]).unwrap();
         let w = b
-            .constexpr_blockwise_shift_scale(&[1; 3], &[3, 1, 1, 1], &[f16::ONE], &[])
+            .constexpr_blockwise_shift_scale(&[1; 3], &[3, 1, 1, 1], &[f16::ONE], &[1, 1, 1, 1])
             .unwrap();
         let before = b.operations.clone();
         let counts = b.counts.clone();
@@ -999,20 +1032,31 @@ mod tests {
     }
 
     #[test]
-    fn scalar_and_int32_boundary_shapes_remain_supported() {
+    fn rank0_weight_and_io_shapes_are_rejected_but_int32_boundaries_are_not() {
         let mut b = ProgramBuilder::new();
-        let scalar = b
-            .constexpr_blockwise_shift_scale(&[2], &[], &[f16::ONE], &[])
-            .unwrap();
-        let scalar = b.mul(&scalar, Operand::Scalar(f16::ONE), None).unwrap();
-        assert!(scalar.shape().is_empty());
+        let empty: &[usize] = &[];
+        for (shape, scale_shape) in [
+            (empty, empty),
+            (&[1][..], empty),
+            (empty, &[1][..]),
+            (&[1, 1][..], &[1][..]),
+        ] {
+            assert!(b
+                .constexpr_blockwise_shift_scale(&[2], shape, &[f16::ONE], scale_shape)
+                .unwrap_err()
+                .to_string()
+                .contains("equal rank >= 1"));
+        }
+        assert!(b.input("scalar", &[]).is_err());
+        assert!(b.operations.is_empty());
+        assert!(b.counts.is_empty());
         let large = b.input("large", &[i32::MAX as usize]).unwrap();
         let parts = b.split(&large, &[i32::MAX as usize], 0).unwrap();
         assert_eq!(parts[0].shape(), &[i32::MAX as usize]);
-        let package = b.finish(&[&scalar, &parts[0]]).unwrap();
+        let package = b.finish(&[&parts[0]]).unwrap();
         let description = package.model.description.unwrap();
         assert_eq!(
-            description.output[1]
+            description.output[0]
                 .r#type
                 .as_ref()
                 .unwrap()
@@ -1022,5 +1066,63 @@ mod tests {
                 .shape,
             &[i64::from(i32::MAX)]
         );
+    }
+
+    #[test]
+    fn empty_programs_and_passthrough_outputs_are_rejected() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[2, 4]).unwrap();
+        assert!(b
+            .reduce_max(&x, &[], true)
+            .unwrap_err()
+            .to_string()
+            .contains("reduce_max axes must not be empty"));
+        assert!(b
+            .reduce_max(&x, &[1, 1], true)
+            .unwrap_err()
+            .to_string()
+            .contains("reduce_max axes must be unique"));
+        assert!(b
+            .reduce_max(&x, &[2], true)
+            .unwrap_err()
+            .to_string()
+            .contains("reduce_max axes must index the input"));
+        assert!(b.operations.is_empty());
+        assert!(b.counts.is_empty());
+
+        let mut empty = ProgramBuilder::new();
+        let input = empty.input("x", &[1]).unwrap();
+        assert!(empty
+            .finish(&[&input])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("at least one operation"));
+
+        let mut rank0_output = ProgramBuilder::new();
+        let input = rank0_output.input("x", &[2, 4]).unwrap();
+        let reduced = rank0_output.reduce_max(&input, &[0, 1], false).unwrap();
+        assert!(reduced.shape().is_empty());
+        assert!(rank0_output
+            .finish(&[&reduced])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("outputs need rank >= 1"));
+
+        let mut passthrough = ProgramBuilder::new();
+        let input = passthrough.input("x", &[1]).unwrap();
+        let _ = passthrough.identity(&input, None).unwrap();
+        assert!(passthrough
+            .finish(&[&input])
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("computed values, not function inputs"));
+        let mut ok = ProgramBuilder::new();
+        let input = ok.input("x", &[1]).unwrap();
+        let output = ok.identity(&input, None).unwrap();
+        ok.finish(&[&output]).unwrap();
+        assert_eq!(output.shape(), &[1]);
     }
 }
