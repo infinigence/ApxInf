@@ -420,6 +420,10 @@ impl AutoModel {
         if model_dir.join("joint_head_config.json").is_file() {
             return Ok("clef".to_owned());
         }
+        // MiniMax-H3-Image ships as three Comfy-Org checkpoints with no config.json; its manifest names the package.
+        if crate::cuda_minimax_h3_image::is_package(model_dir) {
+            return Ok("minimax-h3-image".to_owned());
+        }
         let decision_path = model_dir.join("decision_config.json");
         if decision_path.is_file() {
             let raw = std::fs::read_to_string(&decision_path).map_err(|error| {
@@ -539,6 +543,16 @@ impl AutoModel {
             return crate::cuda_cosmos_policy::load::load_with_cuda_new(path, device, options);
             #[cfg(not(feature = "cuda"))]
             return Err(Error::Other("Cosmos Policy requires CUDA support".into()));
+        }
+
+        if matches!(
+            model_name,
+            "minimax-h3-image" | "minimax-h3-image-cuda" | "cuda_minimax_h3_image"
+        ) {
+            #[cfg(feature = "cuda")]
+            return crate::cuda_minimax_h3_image::load::load_with_cuda_new(path, device, options);
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("MiniMax-H3-Image requires CUDA support".into()));
         }
 
         register_builtin_models();
@@ -822,6 +836,8 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "smolvla_libero"
             | "cosmos-policy"
             | "cuda_cosmos_policy"
+            | "minimax-h3-image"
+            | "cuda_minimax_h3_image"
     ) || matches!(device, Device::Metal(_))
 }
 #[cfg(test)]
@@ -964,6 +980,18 @@ mod tests {
         );
         assert_eq!(config.vocab_size, frontend.vocab_size);
         config.validate().unwrap();
+    }
+
+    /// The MiniMax-H3-Image loader accepts `model_variant` `auto` and `int8_convrot`; admission must let those reach it.
+    #[test]
+    fn minimax_h3_image_admits_its_model_variants() {
+        for name in [
+            "minimax-h3-image",
+            "minimax-h3-image-cuda",
+            "cuda_minimax_h3_image",
+        ] {
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
     }
 
     #[test]
@@ -1136,6 +1164,21 @@ mod tests {
         assert_eq!(
             AutoModel::detect_model_name(&directory).unwrap(),
             "qwen_image"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn minimax_h3_image_package_is_detected_by_its_manifest() {
+        let directory = temporary_directory("h3-image-detection");
+        assert!(
+            AutoModel::detect_model_name(&directory).is_err(),
+            "no manifest and no config.json"
+        );
+        std::fs::write(directory.join(crate::cuda_minimax_h3_image::MANIFEST), "{}").unwrap();
+        assert_eq!(
+            AutoModel::detect_model_name(&directory).unwrap(),
+            "minimax-h3-image"
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
