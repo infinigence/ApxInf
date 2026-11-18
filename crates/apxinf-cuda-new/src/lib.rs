@@ -19,7 +19,7 @@ mod workspace;
 pub(crate) static CUDA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use backend::CudaNewBackend;
-pub use buffer::{CudaBuffer, CudaDeviceAddress, HostMappedBuffer};
+pub use buffer::{CudaBuffer, CudaDeviceAddress, HostMappedBuffer, PinnedRegion};
 pub use context::CudaContext;
 pub use cublas::{CublasHandle, CublasTranspose};
 pub use device_caps::{CudaArchFamily, CudaDeviceCaps};
@@ -41,7 +41,7 @@ pub use ops::{
     ResidualAddArgs, RopeArgs, RopeSemantic, SegmentedAttentionArgs, VisionPositionArgs,
 };
 pub use phase::PreparedPhase;
-pub use stream::CudaStream;
+pub use stream::{CudaEvent, CudaStream};
 
 pub mod ops;
 pub use ops::{Conv3dArgs, Conv3dPolicy, PreparedConv3d, Unfold3dGeometry};

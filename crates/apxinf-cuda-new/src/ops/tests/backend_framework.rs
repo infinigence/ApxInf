@@ -13,6 +13,12 @@ use std::os::raw::{c_char, c_int};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Devices whose build includes the CUTLASS W8A8 output-major candidates
+/// (`DEVICE_FEATURE_CUTLASS_SM87_W8A8` in `build_support/cuda_arch.rs`).
+fn has_cutlass_w8a8(ctx: &CudaContext) -> bool {
+    matches!(ctx.caps().sm, 87 | 89)
+}
+
 unsafe extern "C" {
     fn apxinf_gemm_test_hardware_fingerprint(
         uuid: *const u8,
@@ -1187,18 +1193,18 @@ fn w8a8_output_major_orin_shape_uses_family_cutlass_candidate() {
         .with_output_major_weight()
         .with_immutable_weight(WeightVersion::new(1));
     args.policy.online_tune = false;
-    args.policy.allow_fallback = ctx.caps().sm != 87;
+    args.policy.allow_fallback = !has_cutlass_w8a8(&ctx);
     let cache_dir = scratch_cache_dir("w8a8-sm87-cutlass");
     args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
     let normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
     assert_eq!(normalized.spec.b_layout, 1);
-    if ctx.caps().sm == 87 {
+    if has_cutlass_w8a8(&ctx) {
         super::execution::seed_recipe(&ctx, &normalized, 3, 8, 1, 0).unwrap();
     }
     let execution = super::execution::prepare(&ctx, normalized).unwrap();
-    if ctx.caps().sm == 87 {
+    if has_cutlass_w8a8(&ctx) {
         assert!(execution
             .summary()
             .starts_with("cutlass-w8a8-m41-n6144-k1536-sm87 config=0 "));
@@ -1249,7 +1255,7 @@ fn w8a8_output_major_bias_shape_uses_family_cutlass_candidate() {
         .with_output_major_weight()
         .with_immutable_weight(WeightVersion::new(1));
     args.policy.online_tune = false;
-    args.policy.allow_fallback = ctx.caps().sm != 87;
+    args.policy.allow_fallback = !has_cutlass_w8a8(&ctx);
     let cache_dir = scratch_cache_dir("w8a8-bias-sm87-cutlass");
     args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
@@ -1260,11 +1266,11 @@ fn w8a8_output_major_bias_shape_uses_family_cutlass_candidate() {
         Some(&bias),
     )
     .unwrap();
-    if ctx.caps().sm == 87 {
+    if has_cutlass_w8a8(&ctx) {
         super::execution::seed_recipe(&ctx, &normalized, 3, 9, 1, 0).unwrap();
     }
     let execution = super::execution::prepare(&ctx, normalized).unwrap();
-    if ctx.caps().sm == 87 {
+    if has_cutlass_w8a8(&ctx) {
         assert!(execution
             .summary()
             .starts_with("cutlass-w8a8-bias-m41-n4608-k1536-sm87 config=0 "));
@@ -1312,7 +1318,7 @@ fn w8a8_output_major_bias_gelu_shape_uses_family_cutlass_candidate() {
         .with_output_major_weight()
         .with_immutable_weight(WeightVersion::new(1));
     args.policy.online_tune = false;
-    args.policy.allow_fallback = ctx.caps().sm != 87;
+    args.policy.allow_fallback = !has_cutlass_w8a8(&ctx);
     let cache_dir = scratch_cache_dir("w8a8-bias-gelu-sm87-cutlass");
     args.policy.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
@@ -1323,11 +1329,11 @@ fn w8a8_output_major_bias_gelu_shape_uses_family_cutlass_candidate() {
         Some(&bias),
     )
     .unwrap();
-    if ctx.caps().sm == 87 {
+    if has_cutlass_w8a8(&ctx) {
         super::execution::seed_recipe(&ctx, &normalized, 3, 10, 1, 0).unwrap();
     }
     let execution = super::execution::prepare(&ctx, normalized).unwrap();
-    if ctx.caps().sm == 87 {
+    if has_cutlass_w8a8(&ctx) {
         assert!(execution
             .summary()
             .starts_with("cutlass-w8a8-bias-gelu-m41-n6144-k1536-sm87 config=0 "));
@@ -2265,7 +2271,7 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
         let physical_layout = layout.state.lock().unwrap().layout;
         assert_eq!(
             physical_layout,
-            if ctx.caps().sm == 87 && k % 16 == 0 && n % 8 == 0 {
+            if has_cutlass_w8a8(&ctx) && k % 16 == 0 && n % 8 == 0 {
                 1
             } else {
                 4
@@ -2300,6 +2306,9 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
                 if native && physical_layout != 1 {
                     continue;
                 }
+                // A RepackedWeight keeps the first choice it made for a spec, so
+                // each pass needs its own weight or the seeded recipe is ignored.
+                let (b, layout) = RepackedWeight::upload_row_channel(&ctx, &host).unwrap();
                 let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
                 let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut out)
                     .with_repacked_weight(&layout);
@@ -2314,9 +2323,13 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
                 }
                 let execution = super::execution::prepare(&ctx, normalized).unwrap();
                 if native {
-                    assert!(execution
-                        .summary()
-                        .starts_with("cutlass-w8a8-sm87 config=0 "));
+                    assert!(
+                        execution
+                            .summary()
+                            .starts_with("cutlass-w8a8-sm87 config=0 "),
+                        "m={m} k={k} n={n} layout={physical_layout}: got {}",
+                        execution.summary()
+                    );
                 }
                 execution.enqueue().unwrap();
                 ctx.synchronize().unwrap();
@@ -2340,9 +2353,420 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
 }
 
 #[test]
+fn gpu_w8a8_output_major_large_m_matches_integer_reference() {
+    // Large-M row/channel W8A8 through the model upload path. The Orin tests
+    // above only reach the M<=64 tiles, so this pins the 128x128x64 branch and
+    // the model-upload layout choice on every device that compiles the kernel.
+    let ctx = CudaContext::new(0).unwrap();
+    if !has_cutlass_w8a8(&ctx) {
+        eprintln!("CUTLASS W8A8 is not compiled for this device");
+        return;
+    }
+    // (m, k, n): a wide-N/mid-K, a narrow-N/large-K and an unaligned-M case.
+    for (m, k, n) in [(320, 1344, 2688), (257, 3584, 1344), (1280, 5376, 1024)] {
+        let mut state = 0x2545_f491u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8 as i8
+        };
+        let weight: Vec<i8> = (0..k * n).map(|_| next()).collect();
+        let activation: Vec<i8> = (0..m * k).map(|_| next()).collect();
+        let row_scale: Vec<f32> = (0..m).map(|r| 0.001 * (1 + r % 7) as f32).collect();
+        let channel_scale: Vec<f32> = (0..n).map(|c| 0.002 * (1 + c % 5) as f32).collect();
+
+        let host = Tensor::from_i8(vec![k, n], &weight).unwrap();
+        let (b, layout) = RepackedWeight::upload_row_channel(&ctx, &host).unwrap();
+        assert_eq!(
+            layout.state.lock().unwrap().layout,
+            1,
+            "model upload must commit the output-major layout"
+        );
+        let a = bytes_tensor(
+            0,
+            vec![m, k],
+            DType::I8,
+            &activation.iter().map(|v| *v as u8).collect::<Vec<_>>(),
+        );
+        let rows = scales(0, &row_scale);
+        let channels = scales(0, &channel_scale);
+        let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+        let cache = scratch_cache_dir("w8a8-large-m");
+        let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut out)
+            .with_repacked_weight(&layout);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+        let mut normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        normalized.spec.b_layout = 1;
+        // Candidate 6 is the generic output-major CUTLASS kernel (its M-dependent
+        // tile choice lives inside it); seed it so the test never depends on
+        // which candidate the untuned fallback prefers.
+        super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        assert!(
+            execution
+                .summary()
+                .starts_with("cutlass-w8a8-sm87 config=0 "),
+            "got {}",
+            execution.summary()
+        );
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        let actual = values(&out);
+        // Integer accumulation is exact, so the only rounding is the final
+        // scale product and the BF16 store.
+        let mut checked = 0usize;
+        for row in (0..m).filter(|r| *r < 8 || r % 61 == 0 || *r + 3 >= m) {
+            for col in (0..n).filter(|c| *c < 8 || c % 97 == 0 || *c + 3 >= n) {
+                let mut acc = 0i64;
+                for kk in 0..k {
+                    acc += activation[row * k + kk] as i64 * weight[kk * n + col] as i64;
+                }
+                let expected = bf16::from_f32(acc as f32 * row_scale[row] * channel_scale[col]);
+                assert_eq!(
+                    actual[row * n + col],
+                    expected.to_f32(),
+                    "m={m} k={k} n={n} row={row} col={col}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 100);
+        let graph = crate::capture(&ctx, || execution.enqueue()).unwrap();
+        graph.replay().unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(values(&out), actual, "graph replay must match eager");
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+}
+
+#[test]
+fn gpu_w8a8_output_major_upload_matches_integer_reference_without_host_transpose() {
+    // A checkpoint-native [N, K] matrix must give the same product as the canonical
+    // [K, N] upload, on devices with an output-major candidate (layout 1, bytes uploaded
+    // as they are) and on devices without one (host transpose to canonical layout 4).
+    let ctx = CudaContext::new(0).unwrap();
+    for (m, k, n) in [(24, 512, 384), (5, 256, 128), (9, 272, 136)] {
+        let mut state = 0x9e37_79b9u32;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8 as i8
+        };
+        let weight_nk: Vec<i8> = (0..n * k).map(|_| next()).collect();
+        let activation: Vec<i8> = (0..m * k).map(|_| next()).collect();
+        // Powers of two keep acc * row * channel exact in FP32 in any multiplication order,
+        // so the only rounding left is the single BF16 store and the comparison can be exact.
+        let row_scale: Vec<f32> = (0..m).map(|r| [0.0625, 0.03125, 0.015625][r % 3]).collect();
+        let channel_scale: Vec<f32> = (0..n).map(|c| [0.125, 0.0625, 0.25, 0.5][c % 4]).collect();
+        let bytes: Vec<u8> = weight_nk.iter().map(|v| *v as u8).collect();
+
+        let (b, layout) =
+            RepackedWeight::upload_row_channel_output_major(&ctx, &bytes, n, k).unwrap();
+        assert_eq!(
+            b.shape().dims(),
+            [k, n],
+            "logical shape is [K, N] for every consumer"
+        );
+        let physical = layout.state.lock().unwrap().layout;
+        let expected_layout = if has_cutlass_w8a8(&ctx) && k % 16 == 0 && n % 8 == 0 {
+            1
+        } else {
+            4
+        };
+        assert_eq!(physical, expected_layout, "m={m} k={k} n={n}");
+        let mut stored = vec![0u8; bytes.len()];
+        CudaBuffer::from_tensor(&b)
+            .unwrap()
+            .copy_to_host(&mut stored)
+            .unwrap();
+        if physical == 1 {
+            assert_eq!(
+                stored, bytes,
+                "output-major bytes must be uploaded unchanged"
+            );
+        }
+
+        let a = bytes_tensor(0, vec![m, k], DType::I8, &activation.iter().map(|v| *v as u8).collect::<Vec<_>>());
+        let rows = scales(0, &row_scale);
+        let channels = scales(0, &channel_scale);
+        let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+        let cache = scratch_cache_dir("w8a8-nk-upload");
+        let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut out)
+            .with_repacked_weight(&layout);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+        let normalized =
+            super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
+                .unwrap();
+        let execution = super::execution::prepare(&ctx, normalized).unwrap();
+        execution.enqueue().unwrap();
+        ctx.synchronize().unwrap();
+        let actual = values(&out);
+        for row in 0..m {
+            for col in 0..n {
+                let acc: i64 = (0..k)
+                    .map(|kk| activation[row * k + kk] as i64 * weight_nk[col * k + kk] as i64)
+                    .sum();
+                let expected = bf16::from_f32(acc as f32 * row_scale[row] * channel_scale[col]);
+                assert_eq!(
+                    actual[row * n + col],
+                    expected.to_f32(),
+                    "m={m} row={row} col={col}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+}
+
+#[test]
+fn gpu_w8a8_slot_streams_successive_weights_through_one_address_from_a_pinned_region() {
+    // One slot, two different [N, K] weights filled in turn from a page-locked region on a copy stream, each ordered
+    // before its GEMM by an event. The product must match the integer reference for BOTH weights: a prepared
+    // execution binds the slot's address, so the second fill has to be read fresh, not served from a stale packed copy.
+    use crate::{CudaEvent, CudaStream, PinnedRegion};
+    use std::sync::Arc;
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (24usize, 512usize, 384usize);
+    let mut state = 0x5eed_1234u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 24) as u8 as i8
+    };
+    let weights: Vec<Vec<i8>> = (0..2)
+        .map(|_| (0..n * k).map(|_| next()).collect())
+        .collect();
+    let activation: Vec<i8> = (0..m * k).map(|_| next()).collect();
+    // both weights live back to back in one region, like consecutive layers of a checkpoint file
+    let mut file: Vec<u8> = vec![0xAB; 5]; // a misaligned start, as in a real file
+    for w in &weights {
+        file.extend(w.iter().map(|v| *v as u8));
+    }
+    let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(file);
+    let region = match PinnedRegion::register(Arc::clone(&owner), 0) {
+        Ok(region) => region,
+        Err(_) => PinnedRegion::unregistered(owner, 0),
+    };
+    let copy = CudaStream::new_on(0).unwrap();
+    let filled = CudaEvent::new(0).unwrap();
+    let read = CudaEvent::new(0).unwrap();
+    let slot = OutputMajorSlot::new(&ctx, n, k).unwrap();
+    assert_eq!(slot.weight.shape().dims(), [k, n]);
+
+    let row_scale: Vec<f32> = (0..m).map(|r| [0.0625, 0.03125, 0.015625][r % 3]).collect();
+    let channel_scale: Vec<f32> = (0..n).map(|c| [0.125, 0.0625, 0.25, 0.5][c % 4]).collect();
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &activation.iter().map(|v| *v as u8).collect::<Vec<_>>());
+    let rows = scales(0, &row_scale);
+    let channels = scales(0, &channel_scale);
+    let cache = scratch_cache_dir("w8a8-slot");
+    let mut outputs = Vec::new();
+    for (index, weight) in weights.iter().enumerate() {
+        copy.wait_for(&read).unwrap(); // never overwrite what the previous GEMM may still be reading
+        slot.fill(&region, 5 + index * n * k, &copy).unwrap();
+        copy.record(&filled).unwrap();
+        ctx.stream().wait_for(&filled).unwrap();
+        let mut out = zeros_tensor(0, vec![m, n], DType::BF16);
+        let mut args =
+            GemmArgs::row_channel_quantized(&a, &rows, &slot.weight, &channels, &mut out)
+                .with_repacked_weight(&slot.layout);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
+        gemm(&ctx, args).unwrap();
+        ctx.stream().record(&read).unwrap();
+        ctx.synchronize().unwrap();
+        let actual = values(&out);
+        for row in 0..m {
+            for col in 0..n {
+                let acc: i64 = (0..k)
+                    .map(|kk| activation[row * k + kk] as i64 * weight[col * k + kk] as i64)
+                    .sum();
+                let expected = bf16::from_f32(acc as f32 * row_scale[row] * channel_scale[col]);
+                assert_eq!(
+                    actual[row * n + col],
+                    expected.to_f32(),
+                    "fill {index} row={row} col={col}"
+                );
+            }
+        }
+        outputs.push(actual);
+    }
+    assert_ne!(
+        outputs[0], outputs[1],
+        "the two fills must produce different products"
+    );
+    std::fs::remove_dir_all(cache).unwrap();
+}
+
+#[test]
+fn gpu_w8a8_slot_refill_is_read_by_the_already_prepared_execution_in_a_session_and_graph() {
+    // The GEMM execution cache keys on the weight's address. A slot is refilled in place, so a prepared execution
+    // (session cache, captured graph) must read the NEW bytes, not a packed copy made at preparation time.
+    use crate::{CudaEvent, CudaStream, ExecutionSession, PinnedRegion};
+    use std::sync::Arc;
+    let ctx = CudaContext::new(0).unwrap();
+    let (m, k, n) = (24usize, 512usize, 384usize);
+    let mut state = 0xfeed_0042u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 24) as u8 as i8
+    };
+    let weights: Vec<Vec<i8>> = (0..3)
+        .map(|_| (0..n * k).map(|_| next()).collect())
+        .collect();
+    let activation: Vec<i8> = (0..m * k).map(|_| next()).collect();
+    let file: Vec<u8> = weights
+        .iter()
+        .flat_map(|w| w.iter().map(|v| *v as u8))
+        .collect();
+    let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(file);
+    let region = PinnedRegion::register(Arc::clone(&owner), 0)
+        .unwrap_or_else(|_| PinnedRegion::unregistered(owner, 0));
+    let copy = CudaStream::new_on(0).unwrap();
+    let (filled, read) = (CudaEvent::new(0).unwrap(), CudaEvent::new(0).unwrap());
+    let slot = OutputMajorSlot::new(&ctx, n, k).unwrap();
+    if !slot.is_direct() {
+        return; // canonical devices re-transpose into the same address; the layout state is the same object
+    }
+    let row_scale: Vec<f32> = (0..m).map(|r| [0.0625, 0.03125, 0.015625][r % 3]).collect();
+    let channel_scale: Vec<f32> = (0..n).map(|c| [0.125, 0.0625, 0.25, 0.5][c % 4]).collect();
+    let a = bytes_tensor(0, vec![m, k], DType::I8, &activation.iter().map(|v| *v as u8).collect::<Vec<_>>());
+    let rows = scales(0, &row_scale);
+    let channels = scales(0, &channel_scale);
+    let reference = |w: &[i8]| -> Vec<f32> {
+        let mut out = vec![0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let acc: i64 = (0..k)
+                    .map(|kk| activation[row * k + kk] as i64 * w[col * k + kk] as i64)
+                    .sum();
+                out[row * n + col] =
+                    bf16::from_f32(acc as f32 * row_scale[row] * channel_scale[col]).to_f32();
+            }
+        }
+        out
+    };
+    let fill = |index: usize| {
+        copy.wait_for(&read).unwrap();
+        slot.fill(&region, index * n * k, &copy).unwrap();
+        copy.record(&filled).unwrap();
+        ctx.stream().wait_for(&filled).unwrap();
+    };
+    let cache = scratch_cache_dir("w8a8-slot-session");
+    let out = zeros_tensor(0, vec![m, n], DType::BF16);
+    let policy_cache = cache.to_string_lossy().into_owned();
+    // a clone shares the device allocation, so `out` can be read while the closure writes through its own handle
+    let mut written = out.clone();
+    let mut run = |ctx: &CudaContext| {
+        let mut args =
+            GemmArgs::row_channel_quantized(&a, &rows, &slot.weight, &channels, &mut written)
+                .with_repacked_weight(&slot.layout);
+        args.policy.online_tune = false;
+        args.policy.cache_dir = Some(policy_cache.clone());
+        gemm(ctx, args)
+    };
+
+    let session = ExecutionSession::with_capacity(64 << 20, 0).unwrap();
+    fill(0);
+    session.prepare(|| run(&ctx)).unwrap();
+    ctx.stream().record(&read).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        values(&out),
+        reference(&weights[0]),
+        "prepare traversal, weight 0"
+    );
+
+    // refill the same address and run the PREPARED execution: no new execution may be created, and it must see weight 1
+    super::execution::reset_execution_create_count();
+    fill(1);
+    session.run(|| run(&ctx)).unwrap();
+    ctx.stream().record(&read).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        super::execution::execution_create_count(),
+        0,
+        "the session must reuse its prepared execution"
+    );
+    assert_eq!(
+        values(&out),
+        reference(&weights[1]),
+        "prepared execution after refill, weight 1"
+    );
+
+    // and a captured graph replayed after a refill
+    let graph = {
+        fill(0);
+        let graph =
+            crate::ops::with_session(&session, || crate::capture(&ctx, || run(&ctx))).unwrap();
+        graph.replay().unwrap();
+        ctx.stream().record(&read).unwrap();
+        ctx.synchronize().unwrap();
+        assert_eq!(
+            values(&out),
+            reference(&weights[0]),
+            "captured graph, weight 0"
+        );
+        graph
+    };
+    fill(2);
+    graph.replay().unwrap();
+    ctx.stream().record(&read).unwrap();
+    ctx.synchronize().unwrap();
+    assert_eq!(
+        values(&out),
+        reference(&weights[2]),
+        "graph replay after refill, weight 2"
+    );
+    std::fs::remove_dir_all(cache).unwrap();
+}
+
+#[test]
+fn gpu_region_copy_rejects_out_of_range_requests() {
+    use crate::{CudaStream, PinnedRegion};
+    use std::sync::Arc;
+    let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(vec![1u8; 64]);
+    let region = PinnedRegion::unregistered(owner, 0);
+    let stream = CudaStream::new_on(0).unwrap();
+    let buffer = CudaBuffer::alloc(32, 0).unwrap();
+    assert!(
+        buffer
+            .copy_from_region_async(0, &region, 40, 32, &stream)
+            .is_err(),
+        "source overrun"
+    );
+    assert!(
+        buffer
+            .copy_from_region_async(8, &region, 0, 32, &stream)
+            .is_err(),
+        "destination overrun"
+    );
+    assert!(
+        buffer
+            .copy_from_region_async(usize::MAX, &region, 0, 2, &stream)
+            .is_err(),
+        "offset overflow"
+    );
+    buffer
+        .copy_from_region_async(0, &region, 16, 32, &stream)
+        .unwrap();
+    stream.synchronize().unwrap();
+    let mut got = vec![0u8; 32];
+    buffer.copy_to_host(&mut got).unwrap();
+    assert_eq!(got, vec![1u8; 32]);
+}
+
+#[test]
+fn gpu_w8a8_output_major_upload_rejects_wrong_sizes() {
+    let ctx = CudaContext::new(0).unwrap();
+    assert!(RepackedWeight::upload_row_channel_output_major(&ctx, &[0u8; 10], 3, 4).is_err());
+    assert!(RepackedWeight::upload_row_channel_output_major(&ctx, &[], 0, 4).is_err());
+}
+
+#[test]
 fn gpu_repacked_weight_survives_new_io_shape_and_graph() {
     let ctx = CudaContext::new(0).unwrap();
-    if ctx.caps().sm != 87 {
+    if !has_cutlass_w8a8(&ctx) {
         eprintln!("W8A8 inplace lifecycle regression requires SM87");
         return;
     }

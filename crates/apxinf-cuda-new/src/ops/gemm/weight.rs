@@ -152,7 +152,185 @@ impl std::fmt::Debug for RepackedWeight {
     }
 }
 
+/// A reusable device allocation for W8A8 weights that arrive as checkpoint bytes, row-major `[N, K]`, one weight after
+/// another through the same address (layer streaming).
+///
+/// Where the device has an output-major candidate for this K/N the slot's physical layout is the checkpoint's own, so
+/// filling it is a plain DMA from the source bytes; otherwise the slot is canonical `[K, N]` and each fill transposes on
+/// the host first. Consumers see the same logical `[K, N]` tensor and shared [`RepackedWeight`] state either way.
+///
+/// A slot may be refilled only while no execution that reads it is queued ahead of the fill on a stream the consumer does
+/// not wait for: order the fill (on any stream) before its readers with a [`crate::CudaEvent`], and do not refill until
+/// the readers' work has completed. Executions bind the slot's address, not a packed copy, so a refilled slot is read
+/// fresh. Its contents are undefined until the first fill completes.
+pub struct OutputMajorSlot {
+    pub weight: Tensor,
+    pub layout: RepackedWeight,
+    n: usize,
+    k: usize,
+    direct: bool,
+}
+
+impl OutputMajorSlot {
+    pub fn new(ctx: &crate::CudaContext, n: usize, k: usize) -> Result<Self> {
+        if n == 0 || k == 0 {
+            return Err(Error::Other("W8A8 slot dimensions must be positive".into()));
+        }
+        let bytes = n
+            .checked_mul(k)
+            .ok_or_else(|| Error::Other("W8A8 slot size overflow".into()))?;
+        let direct = RepackedWeight::w8a8_candidate_layouts(ctx, n, k)? & (1 << 1) != 0;
+        let buffer = CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)?;
+        let weight =
+            buffer.into_tensor(apxinf_core::Shape::new(vec![k, n]), apxinf_core::DType::I8);
+        let layout = RepackedWeight::new(&weight)?;
+        layout
+            .state
+            .lock()
+            .map_err(|_| Error::Cuda("weight state lock poisoned".into()))?
+            .layout = if direct { 1 } else { 4 };
+        Ok(Self { weight, layout, n, k, direct })
+    }
+
+    /// Whether a fill is a plain copy of the source bytes (no host work).
+    pub fn is_direct(&self) -> bool {
+        self.direct
+    }
+
+    /// Enqueue the fill of this slot with the `[N, K]` bytes at `region[offset..offset + N * K]` on `stream`.
+    /// A direct slot returns without waiting; a canonical slot transposes on the host and waits for the copy.
+    pub fn fill(
+        &self,
+        region: &crate::PinnedRegion,
+        offset: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<()> {
+        let len = self.n * self.k;
+        let buffer = CudaBuffer::from_tensor(&self.weight).map_err(Error::Cuda)?;
+        if self.direct {
+            return buffer
+                .copy_from_region_async(0, region, offset, len, stream)
+                .map_err(Error::Cuda);
+        }
+        let source = region
+            .bytes()
+            .get(offset..offset + len)
+            .ok_or_else(|| Error::Other("W8A8 slot fill is outside the source region".into()))?;
+        buffer
+            .copy_from_host_on(&transpose_to_canonical(source, self.n, self.k), stream)
+            .map_err(Error::Cuda)
+    }
+}
+
+/// `[N, K]` row-major bytes to canonical `[K, N]`, tiled to bound strided cache traffic.
+fn transpose_to_canonical(source: &[u8], n: usize, k: usize) -> Vec<u8> {
+    let mut canonical = vec![0u8; source.len()];
+    for kb in (0..k).step_by(64) {
+        for nb in (0..n).step_by(64) {
+            for col in nb..(nb + 64).min(n) {
+                for row in kb..(kb + 64).min(k) {
+                    canonical[row * n + col] = source[col * k + row];
+                }
+            }
+        }
+    }
+    canonical
+}
+
 impl RepackedWeight {
+    /// Upload a W8A8 weight that is already stored output-major, physically `[N, K]`
+    /// (the layout of checkpoint files), for row/channel GEMM.
+    ///
+    /// The tensor's logical shape stays `[K, N]` for every consumer, as with
+    /// [`Self::upload_row_channel`]. When the device has an output-major candidate for
+    /// this K/N the bytes are uploaded as they are, with no host transpose; otherwise they
+    /// are transposed to canonical `[K, N]` first, so a caller never sees a layout the
+    /// device cannot execute. `source` is the row-major `[N, K]` byte matrix.
+    pub fn upload_row_channel_output_major(
+        ctx: &crate::CudaContext,
+        source: &[u8],
+        n: usize,
+        k: usize,
+    ) -> Result<(Tensor, Self)> {
+        if n == 0 || k == 0 || n.checked_mul(k) != Some(source.len()) {
+            return Err(Error::Other(
+                "W8A8 output-major upload needs a non-empty [N, K] INT8 matrix".into(),
+            ));
+        }
+        let layouts = Self::w8a8_candidate_layouts(ctx, n, k)?;
+        let (bytes, layout): (std::borrow::Cow<'_, [u8]>, u32) = if layouts & (1 << 1) != 0 {
+            (std::borrow::Cow::Borrowed(source), 1)
+        } else {
+            (std::borrow::Cow::Owned(transpose_to_canonical(source, n, k)), 4)
+        };
+        let buffer = CudaBuffer::alloc(bytes.len(), ctx.device_id()).map_err(Error::Cuda)?;
+        buffer
+            .copy_from_host_on(&bytes, ctx.stream())
+            .map_err(Error::Cuda)?;
+        let tensor =
+            buffer.into_tensor(apxinf_core::Shape::new(vec![k, n]), apxinf_core::DType::I8);
+        let state = Self::new(&tensor)?;
+        state
+            .state
+            .lock()
+            .map_err(|_| Error::Cuda("weight state lock poisoned".into()))?
+            .layout = layout;
+        Ok((tensor, state))
+    }
+
+    /// Bit set of physical layouts some compiled candidate can execute for a W8A8 `[K, N]`
+    /// weight on this device. A capability query, not a tactic; independent of M.
+    fn w8a8_candidate_layouts(ctx: &crate::CudaContext, n: usize, k: usize) -> Result<u32> {
+        use crate::ffi::abi::{gemm as abi, status};
+        let n64 = i64::try_from(n).map_err(|_| Error::Other("W8A8 N overflow".into()))?;
+        let k64 = i64::try_from(k).map_err(|_| Error::Other("W8A8 K overflow".into()))?;
+        let spec = abi::Spec {
+            version: 9,
+            semantic: super::contracts::Semantic::Gemm as u32,
+            a_dtype: 4,
+            b_dtype: 4,
+            accumulation_dtype: 5,
+            output_dtype: 2,
+            quantization: 3,
+            b_layout: 0,
+            numerics: 0,
+            b_is_immutable: 1,
+            a_alignment: 16,
+            b_alignment: 16,
+            output_alignment: 16,
+            a_scales_alignment: 4,
+            b_scales_alignment: 4,
+            bias_alignment: 0,
+            residual_alignment: 0,
+            a_block_scales_alignment: 0,
+            b_block_scales_alignment: 0,
+            sf_vec_size: 0,
+            m: 1,
+            n: n64,
+            k: k64,
+            alpha_is_unit: 1,
+            output_scale_is_unit: 1,
+        };
+        let policy = abi::Policy {
+            workspace_limit: u64::MAX,
+            online_tune: 0,
+            allow_fallback: 1,
+            graph_safe: 1,
+            deterministic: 0,
+            cache_dir: std::ptr::null(),
+        };
+        let mut layouts = 0;
+        unsafe {
+            status::check(abi::apxinf_gemm_candidate_layouts(
+                ctx.runtime(),
+                &spec,
+                &policy,
+                &mut layouts,
+            ))?;
+        }
+        Ok(layouts)
+    }
+
     /// Upload canonical CPU `[K, N]` INT8 weights for row/channel W8A8 GEMM.
     /// The compiled device backend fixes NK or canonical layout at load time,
     /// independently of activation rows. Only the final representation is
