@@ -388,6 +388,7 @@ fn main() {
         "sampling/argmax.cpp",
         "sampling/suppress_bf16.cu",
         "sampling/launch.cu",
+        "conv1d/fixed_f32.cu",
         "norm/launch.cu",
         "pointwise/launch.cu",
         "rope/launch.cu",

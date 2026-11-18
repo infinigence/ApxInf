@@ -339,6 +339,40 @@ retain the input, index map, output and execution; enqueue has no allocation,
 host transfer or tuning. Noncontiguous selection and graph lifetime are tested
 in `tests/mixed_precision_ops.rs`.
 
+## FP32 one-dimensional convolution family
+
+`ops::conv1d`, `ops::conv_transpose1d` and `ops::snake_beta` are the waveform-decoder operators of a BigVGAN-style vocoder. All tensors are
+contiguous FP32 `[batch, channels, time]` on the context's device; accumulation is FP32 in input-channel-then-tap order with exact FP32
+arithmetic (no TF32, no fast math), so a strict-FP32 reference agrees up to summation order. They are direct kernels, not GEMM lowerings, and
+none uses a recipe, tuning or workspace. All three are enqueued on the context stream, allocate nothing and are graph-safe given stable
+bindings. Output storage must not overlap an input, except that `snake_beta` may write its input in place.
+
+<!-- l3-operator:Conv1d -->
+### Conv1d
+
+`Conv1dArgs { input, weight, bias, out, stride, dilation, padding, depthwise }`. `weight` is `[out_channels, in_channels, kernel]`, or
+`[channels, 1, kernel]` with `depthwise` (one filter per channel, `in_channels == out_channels`). The result is
+`out[b, co, t] = bias[co] + sum_{ci, k} weight[co, ci, k] * x[b, ci, t * stride + k * dilation - before]`. `Conv1dPadding::Zeros { before }`
+reads zero outside the input; `Replicate { before }` reads the first or last column (`F.pad(mode="replicate")` followed by a valid
+convolution). The output length is the caller's `out.shape[2]`; the operator performs no padding arithmetic of its own beyond `before`, so
+"same", causal and anti-aliasing filters are all expressed by the caller's `before` and `out_len`.
+
+<!-- l3-operator:ConvTranspose1d -->
+### ConvTranspose1d
+
+`ConvTranspose1dArgs { input, weight, bias, out, stride, replicate_pad, crop_left, groups, scale }`. The input is first padded with
+`replicate_pad` copies of its first and last columns on both sides, the transposed convolution
+`full[co, tf] = sum_{ci, k, p: p * stride + k = tf} x_padded[ci, p] * weight[ci, co, k]` is formed (`weight` is
+`[in_channels, out_channels / groups, kernel]`, the `F.conv_transpose1d` layout, `groups` is 1 or depthwise), and
+`out[co, j] = scale * full[co, j + crop_left] + bias[co]`. This covers a plain transposed convolution (`replicate_pad = 0`, `scale = 1`) and
+the anti-aliased upsampler (`replicate_pad`, crop and `scale = ratio`) with one entry point.
+
+<!-- l3-operator:SnakeBeta -->
+### SnakeBeta
+
+`SnakeBetaArgs { input, alpha, beta, out }`: `out = x + sin(alpha[c] * x)^2 / (beta[c] + 1e-9)` per channel, with `alpha` and `beta` the
+already exponentiated `[channels]` parameters (the checkpoint stores them in log scale). `out` may be `input`.
+
 ## Precomputed RMSNorm + rotary embedding
 
 `ops::rope::rms_norm_apply_precomputed(ctx, input, weight, table, epsilon, output)`

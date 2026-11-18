@@ -64,6 +64,11 @@ pub use ops::{F64RecurrenceState, PreparedRecurrence, RecurrenceCoefficients};
 
 pub use ops::PreparedIndexedMean;
 
+pub use ops::{
+    conv1d, conv_transpose1d, snake_beta, Conv1dArgs, Conv1dPadding, ConvTranspose1dArgs,
+    SnakeBetaArgs,
+};
+
 pub use ops::rms_norm_apply_precomputed;
 
 /// BF16 staged exact-erf GELU GEMM.

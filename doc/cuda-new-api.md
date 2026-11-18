@@ -499,6 +499,20 @@ Note: `key_tokens` is a scalar argument and **gets frozen into a captured graph*
 path meant for CUDA Graph should use `kv_cache_attention + with_decode_meta` instead
 (design doc §5.6). Availability: §6 `FA2_DECODE`.
 
+### 4.9 FP32 one-dimensional convolution (`conv1d/`)
+
+```rust
+ops::conv1d(ctx, Conv1dArgs { input, weight, bias, out, stride, dilation,
+    padding: Conv1dPadding::Zeros { before } | Replicate { before }, depthwise })
+ops::conv_transpose1d(ctx, ConvTranspose1dArgs { input, weight, bias, out, stride,
+    replicate_pad, crop_left, groups, scale })
+ops::snake_beta(ctx, SnakeBetaArgs { input, alpha, beta, out })           // `out` may alias `input`
+```
+
+Contiguous `[batch, channels, time]` FP32 tensors, exact FP32 arithmetic (no TF32), direct
+kernels. They exist for waveform decoders (MiniMax-H3's BigVGAN); contracts and the reference
+checks are in `cuda-operator.md` ("FP32 one-dimensional convolution family").
+
 ---
 
 ## 5. Sessions and Graph Capture
