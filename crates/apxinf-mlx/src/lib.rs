@@ -1,5 +1,7 @@
 //! Native MLX arrays and backend. Enable `native` with a pinned MLX_ROOT SDK.
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod ane_tiles;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod array;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod backend;
@@ -28,6 +30,8 @@ mod gated_delta;
 mod half_split_rope;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod interleaved_qk_norm_rope;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod mpp_f16_gemm;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod mpp_gemm;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]

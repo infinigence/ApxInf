@@ -28,6 +28,53 @@ mod ffi {
             output_ranks: *const usize,
             output_count: usize,
         ) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        pub fn apx_coreml_predict_batch(
+            model: *mut c_void,
+            batch: usize,
+            input_names: *const *const c_char,
+            inputs: *const *const u16,
+            input_shapes: *const *const i64,
+            input_ranks: *const usize,
+            input_count: usize,
+            output_names: *const *const c_char,
+            outputs: *const *mut u16,
+            output_shapes: *const *const i64,
+            output_ranks: *const usize,
+            output_count: usize,
+        ) -> i32;
+    }
+}
+
+/// Names and static shapes of a program's inputs or outputs, as C arrays.
+struct Specs {
+    names: Vec<CString>,
+    shapes: Vec<Vec<i64>>,
+}
+
+impl Specs {
+    fn new<'a>(specs: impl Iterator<Item = (&'a str, &'a [usize])>) -> Result<Self> {
+        let (mut names, mut shapes) = (Vec::new(), Vec::new());
+        for (name, shape) in specs {
+            checked_fp16_count(shape)?;
+            names.push(
+                CString::new(name).map_err(|_| Error::Contract("Core ML name contains NUL"))?,
+            );
+            shapes.push(shape.iter().map(|&x| x as i64).collect());
+        }
+        Ok(Self { names, shapes })
+    }
+    fn name_ptrs(&self) -> Vec<*const c_char> {
+        self.names.iter().map(|s| s.as_ptr()).collect()
+    }
+    fn shape_ptrs(&self) -> Vec<*const i64> {
+        self.shapes.iter().map(|s| s.as_ptr()).collect()
+    }
+    fn ranks(&self) -> Vec<usize> {
+        self.shapes.iter().map(Vec::len).collect()
+    }
+    fn len(&self, i: usize) -> usize {
+        self.shapes[i].iter().product::<i64>() as usize
     }
 }
 
@@ -113,67 +160,98 @@ impl Model {
         inputs: &[(&str, &[f16], &[usize])],
         outputs: &[(&str, &[usize])],
     ) -> Result<Vec<Vec<f16>>> {
-        let names = |n: &[&str]| -> Result<Vec<CString>> {
-            n.iter()
-                .map(|s| CString::new(*s).map_err(|_| Error::Contract("Core ML name contains NUL")))
-                .collect()
-        };
-        let shapes = |s: &[&[usize]]| -> Vec<Vec<i64>> {
-            s.iter()
-                .map(|d| d.iter().map(|&x| x as i64).collect())
-                .collect()
-        };
-        let input_counts: Vec<usize> = inputs
-            .iter()
-            .map(|input| checked_fp16_count(input.2))
-            .collect::<Result<_>>()?;
-        let output_counts: Vec<usize> = outputs
-            .iter()
-            .map(|output| checked_fp16_count(output.1))
-            .collect::<Result<_>>()?;
-        if inputs
-            .iter()
-            .zip(&input_counts)
-            .any(|((_, data, _), &count)| data.len() != count)
-        {
+        let specs: Vec<(&str, &[usize])> = inputs.iter().map(|i| (i.0, i.2)).collect();
+        let data: Vec<&[f16]> = inputs.iter().map(|i| i.1).collect();
+        Ok(self.run(&specs, &[data], outputs, false)?.remove(0))
+    }
+
+    /// Runs one Core ML batch prediction (`predictionsFromBatch`): item `b`
+    /// of `batch` holds one buffer per entry of `inputs`, and the result's
+    /// item `b` holds one buffer per entry of `outputs`.
+    pub fn predict_batch(
+        &self,
+        inputs: &[(&str, &[usize])],
+        batch: &[Vec<&[f16]>],
+        outputs: &[(&str, &[usize])],
+    ) -> Result<Vec<Vec<Vec<f16>>>> {
+        if batch.is_empty() {
+            return Err(Error::Contract("Core ML batch prediction needs an item"));
+        }
+        self.run(inputs, batch, outputs, true)
+    }
+
+    fn run(
+        &self,
+        inputs: &[(&str, &[usize])],
+        batch: &[Vec<&[f16]>],
+        outputs: &[(&str, &[usize])],
+        as_batch: bool,
+    ) -> Result<Vec<Vec<Vec<f16>>>> {
+        let (ins, outs) = (
+            Specs::new(inputs.iter().copied())?,
+            Specs::new(outputs.iter().copied())?,
+        );
+        if batch.iter().any(|item| {
+            item.len() != inputs.len()
+                || item.iter().enumerate().any(|(i, d)| d.len() != ins.len(i))
+        }) {
             return Err(Error::Contract(
                 "Core ML input length differs from its shape",
             ));
         }
-        let in_names = names(&inputs.iter().map(|i| i.0).collect::<Vec<_>>())?;
-        let in_shapes = shapes(&inputs.iter().map(|i| i.2).collect::<Vec<_>>());
-        let out_names = names(&outputs.iter().map(|o| o.0).collect::<Vec<_>>())?;
-        let out_shapes = shapes(&outputs.iter().map(|o| o.1).collect::<Vec<_>>());
-        let mut results: Vec<Vec<f16>> = output_counts
+        let mut results: Vec<Vec<Vec<f16>>> = batch
             .iter()
-            .map(|&count| vec![f16::ZERO; count])
+            .map(|_| {
+                (0..outputs.len())
+                    .map(|o| vec![f16::ZERO; outs.len(o)])
+                    .collect()
+            })
             .collect();
-        let ptrs = |v: &[CString]| v.iter().map(|s| s.as_ptr()).collect::<Vec<*const c_char>>();
-        let (in_name_ptrs, out_name_ptrs) = (ptrs(&in_names), ptrs(&out_names));
-        let in_data: Vec<*const u16> = inputs.iter().map(|i| i.1.as_ptr().cast()).collect();
-        let in_shape_ptrs: Vec<*const i64> = in_shapes.iter().map(|s| s.as_ptr()).collect();
-        let in_ranks: Vec<usize> = in_shapes.iter().map(Vec::len).collect();
-        let out_data: Vec<*mut u16> = results.iter_mut().map(|r| r.as_mut_ptr().cast()).collect();
-        let out_shape_ptrs: Vec<*const i64> = out_shapes.iter().map(|s| s.as_ptr()).collect();
-        let out_ranks: Vec<usize> = out_shapes.iter().map(Vec::len).collect();
-        // SAFETY: every pointer array has the stated count; each input buffer
-        // holds the product of its shape, checked above, and each output
-        // buffer was allocated with the product of its shape. The bridge
-        // reads inputs and writes outputs only during this call.
+        let in_data: Vec<*const u16> = batch.iter().flatten().map(|d| d.as_ptr().cast()).collect();
+        let out_data: Vec<*mut u16> = results
+            .iter_mut()
+            .flatten()
+            .map(|r| r.as_mut_ptr().cast())
+            .collect();
+        let (in_names, in_shapes, in_ranks) = (ins.name_ptrs(), ins.shape_ptrs(), ins.ranks());
+        let (out_names, out_shapes, out_ranks) =
+            (outs.name_ptrs(), outs.shape_ptrs(), outs.ranks());
+        // SAFETY: every pointer array has the stated count (per item for the
+        // data arrays); each input buffer holds the product of its shape,
+        // checked above, and each output buffer was allocated with the product
+        // of its shape. The bridge reads inputs and writes outputs only during
+        // this call.
         check(unsafe {
-            ffi::apx_coreml_predict(
-                self.raw.as_ptr(),
-                in_name_ptrs.as_ptr(),
-                in_data.as_ptr(),
-                in_shape_ptrs.as_ptr(),
-                in_ranks.as_ptr(),
-                inputs.len(),
-                out_name_ptrs.as_ptr(),
-                out_data.as_ptr(),
-                out_shape_ptrs.as_ptr(),
-                out_ranks.as_ptr(),
-                outputs.len(),
-            )
+            if as_batch {
+                ffi::apx_coreml_predict_batch(
+                    self.raw.as_ptr(),
+                    batch.len(),
+                    in_names.as_ptr(),
+                    in_data.as_ptr(),
+                    in_shapes.as_ptr(),
+                    in_ranks.as_ptr(),
+                    inputs.len(),
+                    out_names.as_ptr(),
+                    out_data.as_ptr(),
+                    out_shapes.as_ptr(),
+                    out_ranks.as_ptr(),
+                    outputs.len(),
+                )
+            } else {
+                ffi::apx_coreml_predict(
+                    self.raw.as_ptr(),
+                    in_names.as_ptr(),
+                    in_data.as_ptr(),
+                    in_shapes.as_ptr(),
+                    in_ranks.as_ptr(),
+                    inputs.len(),
+                    out_names.as_ptr(),
+                    out_data.as_ptr(),
+                    out_shapes.as_ptr(),
+                    out_ranks.as_ptr(),
+                    outputs.len(),
+                )
+            }
         })?;
         Ok(results)
     }
@@ -264,12 +342,7 @@ impl ProgramCache {
             .compiled(package)?
             .canonicalize()
             .map_err(|error| Error::Other(format!("Core ML compiled path: {error}")))?;
-        let facts = crate::placement::inspect(&compiled, units, timeout_ms).map_err(|error| {
-            Error::Other(format!(
-                "Core ML placement inspection at {}: {error}",
-                compiled.display()
-            ))
-        })?;
+        let facts = crate::placement::inspect(&compiled, units, timeout_ms)?;
         let model = Model::load(&compiled, units)?;
         admit(&facts)?;
         Ok(model)
@@ -416,5 +489,18 @@ mod tests {
             raw: NonNull::dangling(),
         });
         assert!(model.predict(&[], &[("y", &[usize::MAX, 2])]).is_err());
+    }
+
+    #[test]
+    fn invalid_batch_extents_return_errors_before_native_prediction() {
+        let model = ManuallyDrop::new(Model {
+            raw: NonNull::dangling(),
+        });
+        assert!(model
+            .predict_batch(&[("x", &[usize::MAX, 2])], &[vec![&[]]], &[])
+            .is_err());
+        assert!(model
+            .predict_batch(&[], &[vec![]], &[("y", &[usize::MAX, 2])])
+            .is_err());
     }
 }

@@ -193,6 +193,136 @@ fn one_pass_f16_gemm_matches_fp32_reference_rounded_to_bf16() -> Result<()> {
     Ok(())
 }
 
+/// The Neural Engine boundary kernels: the handoff writes padded FP16
+/// rows and zero-padded channel-first tiles; the merge restores the tiles with
+/// both per-token scales and adds the GPU share (exact values here, so any
+/// FMA contraction gives the same bits).
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn ane_tile_handoff_and_merge_match_host_references() -> Result<()> {
+    use apxinf_mlx::fusions::{AneTileHandoff, AneTileMerge};
+    let s = Stream::metal(0)?;
+    let (tokens, channels, tile) = (150, 64, 128);
+    let values = data(tokens * channels, 17, 0.25);
+    let h = Array::from_f32(&s, &[1, tokens, channels], &values)?.cast(D::BF16)?;
+    let host = h.to_f32_vec()?;
+    let (x, packed) = AneTileHandoff::new(&s)?.call(&h, tile)?;
+    assert_eq!((x.shape(), x.dtype()), (&[1, 192, channels][..], D::F16));
+    assert_eq!(packed.shape(), [2, channels, tile]);
+    let (xs, ps) = (x.to_f32_vec()?, packed.to_f32_vec()?);
+    for t in 0..2 * tile {
+        for c in 0..channels {
+            let v = if t < tokens {
+                host[t * channels + c]
+            } else {
+                0.
+            };
+            if t < 192 {
+                assert_eq!(xs[t * channels + c], v, "row {t} channel {c}");
+            }
+            assert_eq!(
+                ps[((t / tile) * channels + c) * tile + t % tile],
+                v,
+                "tile token {t} channel {c}"
+            );
+        }
+    }
+
+    let gpu: Vec<f32> = (0..tokens * channels)
+        .map(|i| (i % 13) as f32 - 6.)
+        .collect();
+    let ane: Vec<f32> = (0..2 * channels * tile)
+        .map(|i| (i % 7) as f32 - 3.)
+        .collect();
+    let gate: Vec<f32> = (0..2 * tile).map(|i| [0.5, 2., 0.25][i % 3]).collect();
+    let up: Vec<f32> = (0..2 * tile).map(|i| [4., 0.125][i % 2]).collect();
+    let f16 = |v: &[f32], shape: &[usize]| -> Result<Array> {
+        Array::from_f32(&s, shape, v)?.cast(D::F16)
+    };
+    let out = AneTileMerge::new(&s)?.call(
+        &f16(&gpu, &[1, tokens, channels])?,
+        &f16(&ane, &[2, channels, tile])?,
+        &f16(&gate, &[2 * tile])?,
+        &f16(&up, &[2 * tile])?,
+    )?;
+    assert_eq!(
+        (out.shape(), out.dtype()),
+        (&[1, tokens, channels][..], D::BF16)
+    );
+    let os = out.to_f32_vec()?;
+    for t in 0..tokens {
+        for c in 0..channels {
+            let restored = ane[((t / tile) * channels + c) * tile + t % tile] * gate[t] * up[t];
+            assert_eq!(
+                os[t * channels + c],
+                gpu[t * channels + c] + restored,
+                "token {t} channel {c}"
+            );
+        }
+    }
+    let merge = AneTileMerge::new(&s)?;
+    assert!(merge
+        .call(
+            &f16(&gpu, &[1, tokens, channels])?,
+            &f16(&ane[..channels * tile], &[1, channels, tile])?,
+            &f16(&gate, &[2 * tile])?,
+            &f16(&up, &[2 * tile])?
+        )
+        .is_err());
+    assert!(AneTileHandoff::new(&s)?.call(&h, 96).is_err());
+    assert!(AneTileHandoff::new(&s)?
+        .call(&h.cast(D::F16)?, tile)
+        .is_err());
+    Ok(())
+}
+
+/// The Metal 4 MPP projections: the split pair equals the one-pass
+/// GEMM on each half bit for bit, and both match an FP32 reference.
+#[test]
+#[ignore = "requires shared Metal qualification lock and Metal 4 tensors"]
+fn mpp_f16_gemms_split_into_bitwise_halves_and_match_fp32_reference() -> Result<()> {
+    use apxinf_mlx::fusions::{MppF16Gemm, PadRowsF16, SplitMppF16Gemm};
+    let s = Stream::metal(0)?;
+    let (tokens, k, half) = (70, 128, 64);
+    let h = Array::from_f32(&s, &[1, tokens, k], &data(tokens * k, 13, 0.125))?.cast(D::BF16)?;
+    let x = PadRowsF16::new(&s)?.call(&h)?;
+    let w = Array::from_f32(&s, &[k, 2 * half], &data(k * 2 * half, 11, 0.03125))?.cast(D::F16)?;
+    let (w_lo, w_hi) = (
+        w.slice(&[0, 0], &[k, half])?.contiguous()?,
+        w.slice(&[0, half], &[k, 2 * half])?.contiguous()?,
+    );
+    let split = SplitMppF16Gemm::new(&s)?;
+    let low = split.low(&x, tokens, &w_lo)?;
+    let out = split.high(&w_hi, &low, &x, tokens)?;
+    assert_eq!(
+        (out.shape(), out.dtype()),
+        (&[1, tokens, 2 * half][..], D::BF16)
+    );
+    let reference = h
+        .cast(D::F32)?
+        .matmul(&w.cast(D::F32)?)?
+        .cast(D::BF16)?
+        .to_f32_vec()?;
+    assert_within(&out.to_f32_vec()?, &reference, 1. / 128., 1e-3);
+    let one = MppF16Gemm::new(&s)?;
+    let (lo, hi) = (
+        one.call(&x, tokens, &w_lo)?.to_f32_vec()?,
+        one.call(&x, tokens, &w_hi)?.to_f32_vec()?,
+    );
+    let out_values = out.to_f32_vec()?;
+    for t in 0..tokens {
+        let row = &out_values[t * 2 * half..(t + 1) * 2 * half];
+        assert_eq!(&row[..half], &lo[t * half..(t + 1) * half]);
+        assert_eq!(&row[half..], &hi[t * half..(t + 1) * half]);
+    }
+    let narrow = Array::zeros(&s, &[1, 128, 80], D::F16)?;
+    assert!(one
+        .call(&narrow, tokens, &Array::zeros(&s, &[80, 64], D::F16)?)
+        .is_err());
+    assert!(split.high(&w_hi, &out, &x, tokens).is_err());
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires shared Metal qualification lock"]
 fn q4_row_decode_matches_mlx_dequantize_with_f16_scales() -> Result<()> {

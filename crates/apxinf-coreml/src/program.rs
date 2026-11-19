@@ -174,13 +174,28 @@ impl ProgramBuilder {
     fn op_name(&self, kind: &'static str, name: Option<&str>) -> String {
         match name {
             Some(name) => name.to_owned(),
-            None => format!("{kind}_{}", self.counts.get(kind).copied().unwrap_or(0)),
+            None => self.op_name_after(kind, self.counts.get(kind).copied().unwrap_or(0)),
         }
     }
 
-    fn commit_op_name(&mut self, kind: &'static str, name: Option<&str>) {
-        if name.is_none() {
-            *self.counts.entry(kind).or_default() += 1;
+    fn op_name_after(&self, kind: &'static str, mut count: usize) -> String {
+        loop {
+            let name = format!("{kind}_{count}");
+            if !self.symbols.contains(&name) {
+                return name;
+            }
+            count += 1;
+        }
+    }
+
+    fn commit_op_name(&mut self, kind: &'static str, requested: Option<&str>, name: &str) {
+        if requested.is_none() {
+            let prefix = format!("{kind}_");
+            let index = name
+                .strip_prefix(&prefix)
+                .and_then(|index| index.parse::<usize>().ok())
+                .expect("auto-generated operation name");
+            self.counts.insert(kind, index + 1);
         }
     }
 
@@ -310,7 +325,7 @@ impl ProgramBuilder {
         }
         let name = self.op_name("constexpr_blockwise_shift_scale", None);
         self.reserve_symbols(std::slice::from_ref(&name))?;
-        self.commit_op_name("constexpr_blockwise_shift_scale", None);
+        self.commit_op_name("constexpr_blockwise_shift_scale", None, &name);
         let bytes: Vec<u8> = data.iter().map(|&v| v as u8).collect();
         let data = self.blob_value(data_type::INT8, shape, BlobDataType::Int8, &bytes);
         let bytes: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -345,11 +360,16 @@ impl ProgramBuilder {
         Ok(out)
     }
 
-    /// 2-D convolution, stride 1, `valid` padding, dilation 1, one group.
-    pub fn conv(&mut self, x: &Var, weight: &Var) -> Result<Var> {
-        self.require_value(x)?;
-        self.require_value(weight)?;
-        let (&[n, cin, h, w], &[cout, wcin, kh, kw]) = (&x.shape[..], &weight.shape[..]) else {
+    /// A `const` FP16 tensor stored in the weight file, named `{op}_{param}_0`.
+    fn fp16_blob(&mut self, op: &str, param: &str, values: &[f16], shape: &[usize]) -> Var {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let value = self.blob_value(data_type::FLOAT16, shape, BlobDataType::Float16, &bytes);
+        self.constant(op, param, value, data_type::FLOAT16, shape)
+    }
+
+    /// The output shape of a conv of `x` with a `weight_shape` kernel.
+    fn conv_shape(x: &Var, weight_shape: &[usize]) -> Result<Vec<usize>> {
+        let (&[n, cin, h, w], &[cout, wcin, kh, kw]) = (&x.shape[..], weight_shape) else {
             return Err(contract("conv needs rank-4 input and weight"));
         };
         if cin != wcin || kh > h || kw > w {
@@ -357,16 +377,12 @@ impl ProgramBuilder {
         }
         let shape = vec![n, cout, h - kh + 1, w - kw + 1];
         shape_elements(&shape)?;
-        let name = self.op_name("conv", None);
-        let names = ["strides", "pad_type", "pad", "dilations", "groups"]
-            .map(|param| format!("{name}_{param}_0"));
-        self.reserve_symbols(
-            &std::iter::once(name.clone())
-                .chain(names)
-                .collect::<Vec<_>>(),
-        )?;
-        self.commit_op_name("conv", None);
-        let strides = self.ints(&name, "strides", &[1, 1], false);
+        Ok(shape)
+    }
+
+    /// The stride, padding, dilation and group constants of conv `conv`.
+    fn conv_params(&mut self, conv: &str) -> [(&'static str, Var); 5] {
+        let strides = self.ints(conv, "strides", &[1, 1], false);
         let pad_type = immediate(
             data_type::STRING,
             &[],
@@ -374,30 +390,145 @@ impl ProgramBuilder {
                 values: vec!["valid".to_owned()],
             }),
         );
-        let pad_type = self.constant(&name, "pad_type", pad_type, data_type::STRING, &[]);
-        let pad = self.ints(&name, "pad", &[0, 0, 0, 0], false);
-        let dilations = self.ints(&name, "dilations", &[1, 1], false);
-        let groups = self.ints(&name, "groups", &[1], true);
+        let pad_type = self.constant(conv, "pad_type", pad_type, data_type::STRING, &[]);
+        let pad = self.ints(conv, "pad", &[0, 0, 0, 0], false);
+        let dilations = self.ints(conv, "dilations", &[1, 1], false);
+        let groups = self.ints(conv, "groups", &[1], true);
+        [
+            ("strides", strides),
+            ("pad_type", pad_type),
+            ("pad", pad),
+            ("dilations", dilations),
+            ("groups", groups),
+        ]
+    }
+
+    fn conv_op(
+        &mut self,
+        name: &str,
+        shape: Vec<usize>,
+        tensors: &[(&str, &Var)],
+        params: &[(&'static str, Var)],
+    ) -> Var {
         let out = Var {
             builder: self.id,
-            name: name.clone(),
+            name: name.to_owned(),
             dtype: data_type::FLOAT16,
             shape,
         };
-        let inputs = [
-            ("x", x),
-            ("weight", weight),
-            ("strides", &strides),
-            ("pad_type", &pad_type),
-            ("pad", &pad),
-            ("dilations", &dilations),
-            ("groups", &groups),
+        let inputs = tensors
+            .iter()
+            .map(|&(k, v)| (k, v))
+            .chain(params.iter().map(|(k, v)| (*k, v)))
+            .map(|(k, v)| (k.to_owned(), by_name(v)))
+            .collect();
+        self.push("conv", name, inputs, std::slice::from_ref(&out));
+        out
+    }
+
+    /// 2-D convolution, stride 1, `valid` padding, dilation 1, one group.
+    pub fn conv(&mut self, x: &Var, weight: &Var) -> Result<Var> {
+        self.require_value(x)?;
+        self.require_value(weight)?;
+        let shape = Self::conv_shape(x, &weight.shape)?;
+        let name = self.op_name("conv", None);
+        let names = std::iter::once(name.clone())
+            .chain(
+                ["strides", "pad_type", "pad", "dilations", "groups"]
+                    .map(|param| format!("{name}_{param}_0")),
+            )
+            .collect::<Vec<_>>();
+        self.reserve_symbols(&names)?;
+        self.commit_op_name("conv", None, &name);
+        let params = self.conv_params(&name);
+        Ok(self.conv_op(&name, shape, &[("x", x), ("weight", weight)], &params))
+    }
+
+    /// [`conv`](Self::conv) with FP16 weights in the weight file, as
+    /// coremltools stores a NumPy FP16 weight: `{conv}_weight_0` comes first.
+    pub fn conv_fp16(&mut self, x: &Var, weight: &[f16], weight_shape: &[usize]) -> Result<Var> {
+        self.require_value(x)?;
+        if weight.len() != shape_elements(weight_shape)? {
+            return Err(contract("FP16 constant values must match their shape"));
+        }
+        let shape = Self::conv_shape(x, weight_shape)?;
+        let name = self.op_name("conv", None);
+        let names = std::iter::once(name.clone())
+            .chain(std::iter::once(format!("{name}_weight_0")))
+            .chain(
+                ["strides", "pad_type", "pad", "dilations", "groups"]
+                    .map(|param| format!("{name}_{param}_0")),
+            )
+            .collect::<Vec<_>>();
+        self.reserve_symbols(&names)?;
+        self.commit_op_name("conv", None, &name);
+        let w = self.fp16_blob(&name, "weight", weight, weight_shape);
+        let params = self.conv_params(&name);
+        Ok(self.conv_op(&name, shape, &[("x", x), ("weight", &w)], &params))
+    }
+
+    /// `mul(conv_fp16(x, weight), scale)` after coremltools 9.0's
+    /// `fuse_conv_scale` pass: one conv named `name` (the absorbed `mul`'s
+    /// name) with weight `weight * scale` and a zero bias, both FP16. Reserving
+    /// that symbol makes the conv counter skip it; parameter constants keep
+    /// the counter-derived conv name.
+    pub fn conv_fp16_scaled(
+        &mut self,
+        x: &Var,
+        weight: &[f16],
+        weight_shape: &[usize],
+        scale: f16,
+        name: &str,
+    ) -> Result<Var> {
+        self.require_value(x)?;
+        if weight.len() != shape_elements(weight_shape)? {
+            return Err(contract("FP16 constant values must match their shape"));
+        }
+        let shape = Self::conv_shape(x, weight_shape)?;
+        let conv = self.op_name_after("conv", self.counts.get("conv").copied().unwrap_or(0));
+        let conv = if conv == name {
+            self.op_name_after(
+                "conv",
+                conv.strip_prefix("conv_")
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    + 1,
+            )
+        } else {
+            conv
+        };
+        let names = [
+            name.to_owned(),
+            format!("{name}_weight_0"),
+            format!("{name}_bias_0"),
         ]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), by_name(v)))
-        .collect();
-        self.push("conv", &name, inputs, std::slice::from_ref(&out));
-        Ok(out)
+        .chain(std::iter::once(conv.clone()))
+        .chain(
+            ["strides", "pad_type", "pad", "dilations", "groups"]
+                .map(|param| format!("{conv}_{param}_0")),
+        )
+        .collect::<Vec<_>>();
+        self.reserve_symbols(&names)?;
+        self.commit_op_name("conv", None, &conv);
+        let params = self.conv_params(&conv);
+        let scaled: Vec<f16> = weight
+            .iter()
+            .map(|w| f16::from_f32(w.to_f32() * scale.to_f32()))
+            .collect();
+        let w = self.fp16_blob(name, "weight", &scaled, weight_shape);
+        let b = self.fp16_blob(
+            name,
+            "bias",
+            &vec![f16::ZERO; weight_shape[0]],
+            &weight_shape[..1],
+        );
+        Ok(self.conv_op(
+            name,
+            shape,
+            &[("x", x), ("weight", &w), ("bias", &b)],
+            &params,
+        ))
     }
 
     fn binary(
@@ -426,7 +557,7 @@ impl ProgramBuilder {
             Operand::Scalar(_) => vec![name.clone(), format!("{name}_y_0")],
         };
         self.reserve_symbols(&names)?;
-        self.commit_op_name(kind, requested_name);
+        self.commit_op_name(kind, requested_name, &name);
         let y = match y {
             Operand::Var(v) => v.clone(),
             Operand::Scalar(s) => {
@@ -469,7 +600,7 @@ impl ProgramBuilder {
         let requested_name = name;
         let name = self.op_name(kind, requested_name);
         self.reserve_symbols(std::slice::from_ref(&name))?;
-        self.commit_op_name(kind, requested_name);
+        self.commit_op_name(kind, requested_name, &name);
         let out = Var {
             builder: self.id,
             name: name.clone(),
@@ -509,7 +640,7 @@ impl ProgramBuilder {
             format!("{name}_axes_0"),
             format!("{name}_keep_dims_0"),
         ])?;
-        self.commit_op_name("reduce_max", None);
+        self.commit_op_name("reduce_max", None, &name);
         let axes_var = self.ints(&name, "axes", axes, false);
         let keep = immediate(
             data_type::BOOL,
@@ -568,7 +699,7 @@ impl ProgramBuilder {
             .chain((0..sizes.len()).map(|index| format!("{name}_{index}")))
             .collect::<Vec<_>>();
         self.reserve_symbols(&names)?;
-        self.commit_op_name("split", None);
+        self.commit_op_name("split", None, &name);
         let sizes_var = self.ints(&name, "split_sizes", &sizes_i32, false);
         let axis_var = self.ints(&name, "axis", &[axis_i32], true);
         let outs: Vec<Var> = sizes
@@ -785,6 +916,71 @@ mod tests {
         assert_eq!(decoded, package.model);
     }
 
+    /// The order and names of coremltools 9.0's FP16 conv programs: a NumPy FP16
+    /// conv stores its weight first; a fused `conv * 0.5` keeps the conv's
+    /// parameter names, takes the mul's name and adds a zero bias.
+    #[test]
+    fn fp16_convs_follow_coremltools_storage_and_fusion() {
+        let mut b = ProgramBuilder::new();
+        let x = b.input("x", &[1, 4, 1, 8]).unwrap();
+        let w = [f16::from_f32(3.0); 8];
+        let fused = b
+            .conv_fp16_scaled(&x, &w, &[2, 4, 1, 1], f16::from_f32(0.5), "mul_0")
+            .unwrap();
+        let plain = b.conv_fp16(&x, &w, &[2, 4, 1, 1]).unwrap();
+        let m = b.mul(&fused, Operand::Var(&plain), None).unwrap();
+        assert_eq!(
+            (fused.name(), plain.name(), m.name()),
+            ("mul_0", "conv_1", "mul_1")
+        );
+        let names: Vec<&str> = b
+            .operations
+            .iter()
+            .map(|op| op.outputs[0].name.as_str())
+            .collect();
+        assert_eq!(
+            &names[..14],
+            [
+                "conv_0_strides_0",
+                "conv_0_pad_type_0",
+                "conv_0_pad_0",
+                "conv_0_dilations_0",
+                "conv_0_groups_0",
+                "mul_0_weight_0",
+                "mul_0_bias_0",
+                "mul_0",
+                "conv_1_weight_0",
+                "conv_1_strides_0",
+                "conv_1_pad_type_0",
+                "conv_1_pad_0",
+                "conv_1_dilations_0",
+                "conv_1_groups_0",
+            ]
+        );
+        assert!(b.operations[7].inputs.contains_key("bias"));
+        let offsets: Vec<u64> = [5, 6, 8]
+            .iter()
+            .map(|&i| match &b.operations[i].attributes["val"].value {
+                Some(value::Value::BlobFileValue(blob)) => blob.offset,
+                _ => panic!("{} is not stored in the weight file", names[i]),
+            })
+            .collect();
+        let package = b.finish(&[&m]).unwrap();
+        // In operation order: the scaled weight (1.5), the zero bias, the plain weight (3.0).
+        let halves = |offset: u64| -> Vec<f32> {
+            let (dtype, bytes) = crate::blob::read(&package.weights, offset).unwrap();
+            assert_eq!(dtype, BlobDataType::Float16 as u32);
+            bytes
+                .chunks_exact(2)
+                .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()
+        };
+        assert!(offsets[0] < offsets[1] && offsets[1] < offsets[2]);
+        assert_eq!(halves(offsets[0]), [1.5; 8]);
+        assert_eq!(halves(offsets[1]), [0.0; 2]);
+        assert_eq!(halves(offsets[2]), [3.0; 8]);
+    }
+
     #[test]
     fn invalid_programs_are_rejected() {
         let mut b = ProgramBuilder::new();
@@ -908,14 +1104,12 @@ mod tests {
 
         b.input("mul_0", &[1]).unwrap();
         let before = (b.operations.clone(), b.counts.clone(), b.symbols.clone());
-        assert!(b
-            .mul(&x, Operand::Scalar(f16::ONE), None)
-            .unwrap_err()
-            .to_string()
-            .contains("ML Program value names must be unique"));
-        assert_eq!(b.operations, before.0);
-        assert_eq!(b.counts, before.1);
-        assert_eq!(b.symbols, before.2);
+        let y = b.mul(&x, Operand::Scalar(f16::ONE), None).unwrap();
+        assert_ne!(y.name(), "mul_0");
+        assert_eq!(b.operations.len(), before.0.len() + 2);
+        assert_eq!(b.counts["mul"], 2);
+        assert!(b.symbols.contains("mul_0"));
+        assert!(b.symbols.contains("mul_1"));
     }
 
     #[test]
@@ -1022,5 +1216,53 @@ mod tests {
                 .shape,
             &[i64::from(i32::MAX)]
         );
+    }
+
+    #[test]
+    fn invalid_fp16_weights_leave_the_builder_unchanged() {
+        for scaled in [false, true] {
+            let mut b = ProgramBuilder::new();
+            let x = b.input("x", &[1, 4, 1, 8]).unwrap();
+            let symbols = b.symbols.clone();
+            for (weight, shape) in [
+                (&[][..], &[2, 4, 1, 1][..]),
+                (&[][..], &[0, 4, 1, 1][..]),
+                (&[][..], &[usize::MAX, 4, 1, 1][..]),
+                (&[f16::ONE; 16][..], &[2, 4, 2, 1][..]),
+            ] {
+                let result = if scaled {
+                    b.conv_fp16_scaled(&x, weight, shape, f16::ONE, "mul_0")
+                } else {
+                    b.conv_fp16(&x, weight, shape)
+                };
+                assert!(result.is_err());
+                assert!(b.operations.is_empty());
+                assert!(b.counts.is_empty());
+                assert_eq!(b.symbols, symbols);
+            }
+            let package = b.finish(&[&x]).unwrap();
+            assert_eq!(package.weights.len(), 64);
+            assert_eq!(&package.weights[0..4], &0u32.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn fp16_output_shape_overflow_precedes_names_and_constants() {
+        for scaled in [false, true] {
+            let mut b = ProgramBuilder::new();
+            let x = b.input("x", &[i64::MAX as usize, 1, 1, 1]).unwrap();
+            let symbols = b.symbols.clone();
+            let result = if scaled {
+                b.conv_fp16_scaled(&x, &[f16::ONE; 3], &[3, 1, 1, 1], f16::ONE, "mul_0")
+            } else {
+                b.conv_fp16(&x, &[f16::ONE; 3], &[3, 1, 1, 1])
+            };
+            assert!(result.is_err());
+            assert!(b.operations.is_empty());
+            assert!(b.counts.is_empty());
+            assert_eq!(b.symbols, symbols);
+            let package = b.finish(&[&x]).unwrap();
+            assert_eq!(package.weights.len(), 64);
+        }
     }
 }
