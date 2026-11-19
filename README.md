@@ -479,6 +479,9 @@ policy = AutoPolicy.from_pretrained("<path-to-model>", model_variant="bf16")
 | `fp8_static` | Thor only, where it is the fastest path — Orin has no FP8 Tensor Cores | per-tensor activation scales |
 | `int8_dynamic` | W8A8, optimized for Orin (SM87) and Ada (SM89) | the checkpoint alone |
 
+`int8_dynamic` also fits an 8 GB GPU once the static workspace is sized with
+`APXINF_PI05_ARENA_MIB`; see [PI0.5 INT8 on an 8 GB GPU](doc/pi05-8gb-int8.md).
+
 ### FP8 calibration
 
 Pass the calibration generated for the deployment data explicitly; when omitted,

@@ -371,7 +371,9 @@ impl Pi05ModelRunner {
         raw_images: Option<DeviceBuffer>,
     ) -> Result<EagerInputs> {
         let session = ExecutionSession::with_capacity(
-            self.model.workspace_requirements(spec.token_count)?.bytes,
+            super::prepare::arena_capacity(
+                self.model.workspace_requirements(spec.token_count)?.bytes,
+            )?,
             self.backend.device_id(),
         )?;
         let inputs = EagerInputs {

@@ -60,6 +60,7 @@ ignored `devlocal/<feat-name>/` according to [AGENTS.md](../AGENTS.md).
 ## Model operation
 
 - [PI0.5 CUDA regression](pi05-cuda-regression.md)
+- [PI0.5 INT8 on an 8 GB GPU](pi05-8gb-int8.md)
 - [PI0.5 one-step warm-start evaluation](run_warmstart_with_onestep.md)
 - [GR00T N1.7](gr00t-n1.7.md)
 - [MiniMax-H3-Image (INT8 ConvRot, CUDA)](minimax-h3-image.md)
