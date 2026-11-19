@@ -52,6 +52,8 @@ pub fn register_builtin_models() {
     crate::cuda_cosmos_policy::register_builtin();
     #[cfg(feature = "cuda")]
     registry::register("gpt_sovits", crate::cuda_gpt_sovits::load::load);
+    #[cfg(feature = "cuda")]
+    registry::register("qwen3_asr", crate::qwen3_asr::load::load);
 }
 fn load_llama(
     path: &Path,
