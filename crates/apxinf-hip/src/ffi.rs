@@ -80,14 +80,15 @@ hip_abi! {
         c: *mut c_void,
     );
     // `apxinf_hip_gemm` with the activation stored k-major (column-major
-    // [m, k], leading dimension m) instead of m-major; see the C++ comment
-    // for why one shape wants it.
+    // [m, k], leading dimension `lda >= m`) instead of m-major; see the C++
+    // comment for why one shape wants it.
     fn apxinf_hip_gemm_nt(
         handle: *mut c_void,
         dtype: i32,
         m: i32,
         n: i32,
         k: i32,
+        lda: i32,
         a: *const c_void,
         b: *const c_void,
         c: *mut c_void,
@@ -316,12 +317,16 @@ hip_abi! {
         stream: *mut c_void,
     );
     // `apxinf_hip_native_geglu` with the output stored k-major
-    // (`y^T[inner, rows]`), for `apxinf_hip_gemm_nt`.
+    // (`y^T[inner, stride]`, first `rows` entries of each strip), for
+    // `apxinf_hip_gemm_nt`. `stride` must be a multiple of 16 and >= rows:
+    // 32-B-aligned strips keep the transposed stores off misaligned-sector
+    // read-modify-write.
     fn apxinf_hip_native_geglu_transposed(
         gate_up: *const c_void,
         yt: *mut c_void,
         rows: i64,
         inner: i32,
+        stride: i32,
         stream: *mut c_void,
     );
     fn apxinf_hip_native_euler_update(

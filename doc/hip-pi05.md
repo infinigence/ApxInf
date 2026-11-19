@@ -335,6 +335,45 @@ separate bias_activation path on (512,1152,4304) by 27 us and on
 there, which the ~37 us the fusion saves cannot cover (probe
 `devlocal/pi05-hip/perf/epilogue_probe.cpp`, cold-ring weights).
 
+
+## k-major GeGLU: 32-B-aligned strips (2026-11-19)
+
+A re-profile of the full forward caught the transposed store's real cost:
+the shipped kernel ran 484 us on the language shape (522x16384) — 106 GB/s
+against the 232 GB/s streaming wall — where the 11-18 probe had measured
+"~5% over m-major". Two stacked causes, found with a full-size cold-output
+probe (`devlocal/pi05-hip/perf/geglu_t_probe.cpp`; a 16 x 17.1 MB output
+ring cycled per iteration, so no output line is ever L2-resident):
+
+1. **Sector misalignment (the main term)**. 522 rows x 2 B = 1044 B per
+   column strip; 1044 mod 32 = 20, so every strip starts mid-sector and each
+   64-B store straddles misaligned 32-B sectors. Write-allocate then turns
+   every eviction of a partially-written line into a read-modify-write.
+2. **Half-line writes (a secondary term, −80 us alone)**. One warp store
+   covers 64 B = half a 128-B line; the other half is written by a different
+   block later. Padding the stride makes this term vanish (the whole-line
+   variant measured equal once aligned).
+
+The fix is the row count padded to a multiple of 16 elements (522 -> 528,
++1.1% memory) with the strip stride passed to both the kernel and the down
+GEMM's leading dimension, plus a wider [128 col x 64 row] tile. Probe:
+484 -> 314 us (164 GB/s; the m-major kernel's 230 us is the remaining gap,
+paid in the k-major tile reads' row-strided access). The half-size probe
+that greenlit the 11-18 kernel was blind to both effects: at 522x8192 the
+whole output lives in L2, so the RMW never happens. Lesson recorded:
+a store-pattern probe must run the full size with an output ring whose
+footprint dwarfs L2.
+
+Model A/B, three interleaved windows: prefix_forward (the changed stage)
+-1.85/-2.04/-2.15 ms with the denoise and vision control stages flat in
+all three; graph P50 deltas -2.13/+10.54/-4.75 (the +10 window's gt arm
+had its tail samples environment-polluted — its min was still the fastest
+of the window) and min deltas -2.10 to -2.52. Output checksum unchanged at
+19.138827 in all six arms; graph capture still 2,311 nodes, bit-identical
+to eager. The padded stride rides through `Ops::geglu_transposed`
+(`[inner, rows.next_multiple_of(16)]`), `apxinf_hip_gemm_nt`'s new `lda`
+parameter, and the arena budget (+1.1% on the language mlp_dim line).
+
 ## Next
 
 The full LIBERO-10 regression above is the gate for the campaign's changes

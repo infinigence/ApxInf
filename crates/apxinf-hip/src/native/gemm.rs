@@ -807,19 +807,23 @@ pub fn gemm(ctx: &HipContext, a: &Tensor, b: &Tensor, out: &Tensor) -> Result<()
 }
 
 /// [`gemm`](self::gemm) with the activation stored k-major: `a` holds
-/// `a^T[K, M]` (the transpose of what `gemm` expects), `b` and `out` are
+/// `a^T[K, M_padded]` (the transpose of what `gemm` expects, with each
+/// column strip padded to `M_padded >= M` rows), `b` and `out` are
 /// unchanged. Plain hipBLAS with op(B)=T -- no recipe, no Lt, because the
 /// full op-matrix census on the shape this exists for (522x16384x2048,
 /// devlocal/pi05-hip/perf/langdown_*) put every hipBLASLt candidate slower
 /// than this call. The model reaches it through a producer that writes the
-/// k-major copy directly, so the transpose costs no extra pass.
+/// k-major copy directly, so the transpose costs no extra pass. The padding
+/// exists for the producer's stores (see `geglu_transposed`); the GEMM just
+/// sees it as the leading dimension.
 pub fn gemm_nt(ctx: &HipContext, a_t: &Tensor, b: &Tensor, out: &Tensor) -> Result<()> {
-    let (k, m) = rows_cols(a_t)?;
+    let (k, m_padded) = rows_cols(a_t)?;
     let weight = b.shape().dims();
     let (out_rows, n) = rows_cols(out)?;
-    if weight.len() != 2 || weight[0] != k || weight[1] != n || out_rows != m {
+    let m = out_rows;
+    if weight.len() != 2 || weight[0] != k || weight[1] != n || m_padded < m {
         return Err(Error::ShapeMismatch {
-            expected: format!("[{m}, {k}]^T @ [{k}, {n}] -> [{m}, {n}]"),
+            expected: format!("[{m}, {k}]^T (padded to {m_padded}) @ [{k}, {n}] -> [{m}, {n}]"),
             got: format!("{} @ {} -> {}", a_t.shape(), b.shape(), out.shape()),
         });
     }
@@ -827,7 +831,17 @@ pub fn gemm_nt(ctx: &HipContext, a_t: &Tensor, b: &Tensor, out: &Tensor) -> Resu
     check(
         "gemm_nt",
         unsafe {
-            ffi::apxinf_hip_gemm_nt(ctx.blas(), DTYPE_BF16, int(m)?, int(n)?, int(k)?, pa, pb, pc)
+            ffi::apxinf_hip_gemm_nt(
+                ctx.blas(),
+                DTYPE_BF16,
+                int(m)?,
+                int(n)?,
+                int(k)?,
+                int(m_padded)?,
+                pa,
+                pb,
+                pc,
+            )
         },
     )
 }

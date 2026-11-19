@@ -144,24 +144,32 @@ __global__ void geglu_vec_kernel(const bf16* gate_up, bf16* y, int64_t rows, int
   }
 }
 
-// GeGLU writing k-major: yt[inner, rows] (the transpose of `geglu_vec_kernel`'s
-// y), so the down projection runs as op(B)=T over a column-major [rows, inner]
-// activation -- see `apxinf_hip_gemm_nt`. A naive transposed store scatters one
-// thread's eight results across eight rows and measured 2.4x slower than the
-// m-major kernel (pointwise_probe V2T, 272 vs 113 us); this version stages a
-// [64 col x 32 row] tile in LDS and writes each column's 32 rows as one
-// 64-byte contiguous store per warp, keeping both sides coalesced. The reads
-// are the same uint4 pattern as `geglu_vec_kernel`, the per-element F32
-// expression (and its evaluation order) is unchanged, so the element values
-// are bit-identical -- only their address changes.
+// GeGLU writing k-major: yt[inner, stride] where the first `rows` entries of
+// each column strip hold that column's activation (the transpose of
+// `geglu_vec_kernel`'s y), so the down projection runs as op(B)=T over a
+// column-major [rows, inner] activation -- see `apxinf_hip_gemm_nt`. A naive
+// transposed store scatters one thread's eight results across eight rows and
+// measured 2.4x slower than the m-major kernel (pointwise_probe V2T, 272 vs
+// 113 us); this version stages a [128 col x 64 row] tile in LDS and writes
+// each column's rows through 32-B-aligned strips. The reads are the same
+// uint4 pattern, the per-element F32 expression (and its evaluation order)
+// is unchanged, so the element values are bit-identical -- only their
+// address changes.
 //
-// Probe (2026-11-18): language 522x8192 V1 112.6 us, V3T 118.4 us (1.05x) --
-// the k-major store now costs ~5%, not 2.4x, and the down GEMM it feeds gains
-// 244 us per call on the same shape.
+// `stride` MUST be a multiple of 16 elements (32 B): with rows=522 the
+// natural stride 522 leaves every strip start at 1044 mod 32 = 20 B, so each
+// 64-B store straddles misaligned 32-B sectors and the partial lines force
+// read-modify-write on eviction -- the full-size cold-output probe
+// (perf/geglu_t_probe.cpp, 2026-11-19) measured the 32-row/64-B variant at
+// 484 us = 106 GB/s on 522x16384 while the m-major kernel runs 230 us.
+// Padding the stride to a multiple of 16 (528, +1.1% memory) plus the wider
+// tile takes the same shape to 314 us = 164 GB/s. The half-size probe that
+// greenlit the 11-18 kernel (522x8192, fixed output buffer) was blind to
+// both effects: its 8.5-MB output lived entirely in L2.
 __global__ void geglu_vec_transposed_kernel(const bf16* gate_up, bf16* yt, int64_t rows,
-                                            int inner) {
-  constexpr int kTileRows = 32;  // one warp writes one column's 32 rows: 64 B
-  constexpr int kTileCols = 64;  // eight uint4 column groups per tile row
+                                            int inner, int stride) {
+  constexpr int kTileRows = 64;   // two 32-row halves per read pass
+  constexpr int kTileCols = 128;  // 16 uint4 column groups per tile row
   constexpr int kLdsCols = kTileCols;
   constexpr int kLdsRows = kTileRows + 1;  // +1: odd stride, 2-B banks de-conflict
   __shared__ bf16 tile[kLdsCols][kLdsRows];
@@ -177,40 +185,62 @@ __global__ void geglu_vec_transposed_kernel(const bf16* gate_up, bf16* yt, int64
     const int64_t r0 = rb * kTileRows;
     const int c0 = (int)(cb * kTileCols);
     const int r_valid = (int)min((int64_t)kTileRows, rows - r0);
-    // Read: thread = (row_in_tile = tid >> 3, col_group = tid & 7); each
-    // thread loads one gate uint4 and one up uint4 -- eight columns of one
-    // row. A warp covers four rows' worth of 128-B lines.
+    // Read: 256 threads cover 64 rows x 16 uint4 column groups in four
+    // passes of (row = (tid>>3) + 32*(half&1), colgroup = (half>>1)*8 +
+    // (tid&7)); each pass loads one gate uint4 and one up uint4 -- eight
+    // columns of one row. A warp covers one row's 128-B lines per pass.
     const int r_in = (int)(threadIdx.x >> 3);
     const int cg = (int)(threadIdx.x & 7);
-    const int64_t rrow = r0 + (r_in < r_valid ? r_in : 0);  // clamp: never OOB
-    const uint4* gate = reinterpret_cast<const uint4*>(gate_up + rrow * 2 * inner) + c0 / 8;
-    const uint4* up = reinterpret_cast<const uint4*>(gate_up + rrow * 2 * inner + inner) + c0 / 8;
-    const uint4 gq = gate[cg];
-    const uint4 uq = up[cg];
-    const uint32_t gw[4] = {gq.x, gq.y, gq.z, gq.w};
-    const uint32_t uw[4] = {uq.x, uq.y, uq.z, uq.w};
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const int sh = (j & 1) * 16;
-      const float g = bf16_to_f32(static_cast<uint16_t>(gw[j >> 1] >> sh));
-      const float u = bf16_to_f32(static_cast<uint16_t>(uw[j >> 1] >> sh));
-      // Rows past r_valid hold garbage here (their reads were clamped to a
-      // valid row); the write phase masks those lanes out, so it never escapes.
-      tile[cg * 8 + j][r_in] = f32_to_bf16(gelu_tanh(g) * u);
+    for (int half = 0; half < 4; ++half) {
+      const int rr = (half & 1) * 32 + r_in;
+      const int cc = (half >> 1) * 8 + cg;  // col group 0..15
+      const int64_t rrow = r0 + (rr < r_valid ? rr : 0);  // clamp: never OOB
+      const uint4* gate =
+          reinterpret_cast<const uint4*>(gate_up + rrow * 2 * inner) + c0 / 8 + cc;
+      const uint4* up =
+          reinterpret_cast<const uint4*>(gate_up + rrow * 2 * inner + inner) + c0 / 8 + cc;
+      const uint4 gq = *gate;
+      const uint4 uq = *up;
+      const uint32_t gw[4] = {gq.x, gq.y, gq.z, gq.w};
+      const uint32_t uw[4] = {uq.x, uq.y, uq.z, uq.w};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int sh = (j & 1) * 16;
+        const float g = bf16_to_f32(static_cast<uint16_t>(gw[j >> 1] >> sh));
+        const float u = bf16_to_f32(static_cast<uint16_t>(uw[j >> 1] >> sh));
+        // Rows past r_valid hold garbage here (their reads were clamped to a
+        // valid row); the write phase masks those lanes out, so it never
+        // escapes.
+        tile[cc * 8 + j][rr] = f32_to_bf16(gelu_tanh(g) * u);
+      }
     }
     __syncthreads();
-    // Write: warp w owns columns c0 + w*8 .. +7; each of its eight store
-    // instructions writes one column's 32 rows -- lanes = consecutive rows,
-    // 64 B contiguous. Threads whose row is past r_valid read tile[..][0]
-    // but do not store.
+    // Write: warp w owns columns c0 + w*16 .. +15; each of its sixteen
+    // store instructions writes one column's 64 rows -- lanes = consecutive
+    // ROW PAIRS packed into uint32, 128 B contiguous, starting at a 32-B
+    // aligned strip head. Threads in the tail row block (rows not a
+    // multiple of 64) fall back to scalar row stores.
     const int w = (int)(threadIdx.x >> 5);
     const int lane = (int)(threadIdx.x & 31);
-    const int r_out = (int)(r0 + lane);
+    const bool full = (r_valid == kTileRows) && ((r0 + kTileRows) <= rows);
+    if (full) {
+      const int r_lo = (int)(r0 + 2 * lane);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      const int col = c0 + w * 8 + j;
-      const bf16 v = tile[w * 8 + j][lane];
-      if (lane < r_valid) yt[(int64_t)col * rows + r_out] = v;
+      for (int j = 0; j < 16; ++j) {
+        const uint32_t lo = tile[w * 16 + j][2 * lane];
+        const uint32_t hi = tile[w * 16 + j][2 * lane + 1];
+        uint32_t* dst =
+            reinterpret_cast<uint32_t*>(yt + (int64_t)(c0 + w * 16 + j) * stride + r_lo);
+        *dst = lo | (hi << 16);
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const int col = c0 + w * 16 + j;
+        const bf16 v = tile[w * 16 + j][lane];
+        if (lane < r_valid) yt[(int64_t)col * stride + r0 + lane] = v;
+      }
     }
     __syncthreads();
   }
@@ -623,27 +653,30 @@ extern "C" int apxinf_hip_native_geglu(const void* gate_up, void* y, int64_t row
   return last_launch_status();
 }
 
-// `apxinf_hip_native_geglu` with the output stored k-major: y^T[inner, rows]
-// instead of y[rows, inner]. Feeds `apxinf_hip_gemm_nt`; see the kernels'
-// comments for why one shape wants the pair.
+// `apxinf_hip_native_geglu` with the output stored k-major: y^T[inner, stride]
+// with `stride >= rows` the caller's padded row count (see the kernel's
+// comment for why the padding exists). Feeds `apxinf_hip_gemm_nt`; see the
+// kernels' comments for why one shape wants the pair.
 extern "C" int apxinf_hip_native_geglu_transposed(const void* gate_up, void* yt, int64_t rows,
-                                                  int inner, void* stream) {
+                                                  int inner, int stride, void* stream) {
   if (rows <= 0 || inner <= 0) return kInvalidArgument;
   if (rows > (1 << 30)) return kInvalidArgument;
-  // The tiled kernel's contracts: `inner % 64 == 0` for whole column tiles,
+  // The tiled kernel's contracts: `inner % 128 == 0` for whole column tiles,
+  // `stride % 16 == 0 && stride >= rows` for the 32-B-aligned strips,
   // `rows <= 4096` for the int row arithmetic, and 16-byte alignment for the
-  // uint4 loads. Every geglu width in π0.5 is a multiple of 64 (language
-  // 16384, action 4096), so the m-major kernel stays the general fallback.
-  if (inner % 64 != 0 || (reinterpret_cast<uintptr_t>(gate_up) & 15u) != 0) {
+  // uint4 loads. Every geglu width in π0.5 is a multiple of 128 (language
+  // 16384), so the m-major kernel stays the general fallback.
+  if (inner % 128 != 0 || stride % 16 != 0 || stride < rows ||
+      (reinterpret_cast<uintptr_t>(gate_up) & 15u) != 0) {
     return kInvalidArgument;
   }
-  const int64_t tiles = ((rows + 31) / 32) * (inner / 64);
+  const int64_t tiles = ((rows + 63) / 64) * (inner / 128);
   // `tiles * kElementwiseBlock` asks for one block per tile;
   // `elementwise_grid` caps it at kMaxGrid and the kernel's per-block loop
   // covers the rest.
   geglu_vec_transposed_kernel<<<elementwise_grid(tiles * kElementwiseBlock),
                                 kElementwiseBlock, 0, as_stream(stream)>>>(
-      in(gate_up), out(yt), rows, inner);
+      in(gate_up), out(yt), rows, inner, stride);
   return last_launch_status();
 }
 

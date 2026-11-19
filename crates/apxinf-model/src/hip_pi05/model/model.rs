@@ -119,18 +119,22 @@ impl Ops<'_> {
     }
 
     /// [`Ops::geglu`](Self::geglu) writing its output k-major
-    /// (`[inner, rows]`), so the down projection runs as
-    /// [`native::gemm_nt`]: on gfx1151 the language down GEMM
-    /// (522x16384x2048) picks a better-tiled Tensile kernel from the
-    /// op(B)=T family -- 1086 vs 1330 us per call, the census in
-    /// devlocal/pi05-hip/perf/langdown_* -- and the tiled-transpose store
-    /// in the producer costs ~5% of that kernel, not the 2.4x a naive
-    /// transposed store pays. The action expert keeps the m-major path:
-    /// its down shape (10x4096x1024) did not win on NT in the same census.
+    /// (`[inner, stride]` with the row count padded up to a multiple of
+    /// 16), so the down projection runs as [`native::gemm_nt`]: on gfx1151
+    /// the language down GEMM (522x16384x2048) picks a better-tiled Tensile
+    /// kernel from the op(B)=T family -- 1086 vs 1330 us per call, the
+    /// census in devlocal/pi05-hip/perf/langdown_* -- and the padded
+    /// 32-B-aligned strips keep the transposed stores off misaligned-sector
+    /// read-modify-write (the unpadded 522-row layout measured 2.2x the
+    /// m-major kernel's time on the full-size cold-output probe,
+    /// perf/geglu_t_probe.cpp; padding brings it to 1.37x). The action
+    /// expert keeps the m-major path: its down shape (10x4096x1024) did not
+    /// win on NT in the same census.
     fn geglu_transposed(&self, x: &Tensor, gate_up: &Linear) -> Result<Tensor> {
         let packed = self.linear(x, gate_up)?;
         let dims = packed.shape().dims();
-        let out = self.tensor(&[dims[1] / 2, dims[0]])?;
+        let stride = dims[0].next_multiple_of(16);
+        let out = self.tensor(&[dims[1] / 2, stride])?;
         native::geglu_transposed(self.ctx, &packed, &out)?;
         Ok(out)
     }
@@ -218,9 +222,14 @@ impl HipPi05Model {
             ] {
                 add(prefix * width);
             }
-            for width in [2 * lang.mlp_dim, lang.mlp_dim, lang.width, lang.width] {
-                add(prefix * width);
-            }
+            // The k-major geglu output pads its row count up to a multiple
+            // of 16 (see `Ops::geglu_transposed`); the packed input and the
+            // down-projection intermediates stay at the true prefix.
+            let mlp_rows = prefix.next_multiple_of(16);
+            add(prefix * 2 * lang.mlp_dim);
+            add(mlp_rows * lang.mlp_dim);
+            add(prefix * lang.width);
+            add(prefix * lang.width);
         }
         // Flow steps.
         let h = config.action_horizon;
