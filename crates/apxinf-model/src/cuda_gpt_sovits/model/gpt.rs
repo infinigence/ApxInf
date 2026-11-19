@@ -8,13 +8,18 @@ use apxinf_cuda_new::ops::{
 };
 use apxinf_cuda_new::{transfers, CudaBuffer, CudaContext as Context};
 
-use super::config::{GPT_AUDIO_VOCAB, GPT_BERT_DIM, GPT_EOS, GPT_HEADS, GPT_HIDDEN, GPT_LAYERS};
-use super::ops;
-use super::weights::{fp16_tensor, ids_tensor, Linear, Weights};
+use crate::cuda_gpt_sovits::config::{
+    GPT_AUDIO_VOCAB, GPT_BERT_DIM, GPT_EOS, GPT_HEADS, GPT_HIDDEN, GPT_LAYERS,
+};
+use crate::cuda_gpt_sovits::model_runner::gpt_decode::{
+    DecodeEmbedScratch, DecodeResources, PrefillResources,
+};
+use crate::cuda_gpt_sovits::ops;
+use crate::cuda_gpt_sovits::weights::{fp16_tensor, ids_tensor, Linear, Weights};
 
 const MAX_POSITIONS: usize = 4000;
-const MIN_GENERATED_BEFORE_EOS: usize = 11;
-const DECODE_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MIN_GENERATED_BEFORE_EOS: usize = 11;
+pub(crate) const DECODE_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
 // Prefill keeps one whole eager traversal of intermediates in the session
 // arena. Measured peak is ~51 MB; the rest is headroom for longer prompts.
 const PREFILL_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
@@ -32,80 +37,21 @@ struct Layer {
     ln2_b: Tensor,
 }
 
-struct LayerCache {
+pub(crate) struct LayerCache {
     key: Tensor,
     value: Tensor,
 }
 
-struct DecodeCache {
-    layers: Vec<LayerCache>,
-    text_len: usize,
-    audio_len: usize,
-    capacity: usize,
-}
-
-// Keep the executable before its referenced storage so it is destroyed first.
-// One latest capacity is retained; requests never retain another request's KV values.
-struct DecodeResources {
-    graph: Option<apxinf_cuda_new::CapturedGraph>,
-    graph_logits: Option<Tensor>,
-    session: cuda_ops::ExecutionSession,
-    meta: KvCacheDecodeMeta,
-    input: Tensor,
-    cache: DecodeCache,
-    embed: DecodeEmbedScratch,
-    /// Repetition-penalty flags for the device sampler: `seen[token] != 0`
-    /// marks scores the penalty has already been applied to, matching the
-    /// host sampler's first-occurrence dedup over the token history.
-    seen: Tensor,
-    /// Device sampler output words: `[sampled, adjusted_argmax, status, 0]`.
-    sample_out: Tensor,
-}
-
-/// Fixed buffers for the one-token decode embedding.
-///
-/// `embed_audio` allocates five tensors per call: two 4-byte id vectors, two
-/// 2 KB gathered rows and the 2 KB sum, and the decode loop dropped all five
-/// as soon as they had been copied into `decode_input`. Each free synchronizes
-/// the device, so the step paid five allocator round trips and five drains for
-/// 6 KB of scratch. Keeping them for the life of the decode resources removes
-/// the allocation entirely and writes the sum straight into the graph input.
-struct DecodeEmbedScratch {
-    ids: Tensor,
-    positions: Tensor,
-    table_row: Tensor,
-    position_row: Tensor,
-}
-
-impl DecodeEmbedScratch {
-    fn new(ctx: &Context) -> Result<Self> {
-        Ok(Self {
-            ids: transfers::to_cuda(&Tensor::from_i32(vec![1], &[0])?, ctx.device_id())?,
-            positions: transfers::to_cuda(&Tensor::from_i32(vec![1], &[0])?, ctx.device_id())?,
-            table_row: ops::alloc(ctx, &[1, GPT_HIDDEN])?,
-            position_row: ops::alloc(ctx, &[1, GPT_HIDDEN])?,
-        })
-    }
-}
-
-// Prepared prefill operators are keyed by operand address, so the two
-// embedded inputs are staged into fixed storage and the whole traversal runs
-// inside one session: the first pass prepares and caches native resources,
-// every later pass with the same lengths replays the prepared sequence
-// without allocating or synchronizing per operator.
-struct PrefillResources {
-    session: cuda_ops::ExecutionSession,
-    text: Tensor,
-    audio: Tensor,
-    text_len: usize,
-    audio_len: usize,
-    capacity: usize,
-    prepared: bool,
+pub(crate) struct DecodeCache {
+    pub(crate) layers: Vec<LayerCache>,
+    pub(crate) text_len: usize,
+    pub(crate) audio_len: usize,
+    pub(crate) capacity: usize,
 }
 
 pub struct Gpt {
-    decode_resources: RefCell<Option<DecodeResources>>,
-    prefill_resources: RefCell<Option<PrefillResources>>,
+    pub(crate) decode_resources: RefCell<Option<DecodeResources>>,
+    pub(crate) prefill_resources: RefCell<Option<PrefillResources>>,
     text_emb: Tensor,
     audio_emb: Tensor,
     bert_proj: Linear,
@@ -155,7 +101,7 @@ fn cache_rows(cache: &Tensor, row_offset: usize, rows: usize) -> Result<Tensor> 
     )
 }
 
-fn logits_prefix(logits: &Tensor, vocab_size: usize) -> Result<Tensor> {
+pub(crate) fn logits_prefix(logits: &Tensor, vocab_size: usize) -> Result<Tensor> {
     cuda_view(logits, 0, &[1, vocab_size])
 }
 
@@ -319,7 +265,7 @@ fn logits_to_probs_fp16(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sample_fp16_exponential_race(
+pub(crate) fn sample_fp16_exponential_race(
     logits: &Tensor,
     history: &[u32],
     seed: u64,
@@ -347,7 +293,7 @@ fn sample_fp16_exponential_race(
 
 /// Largest `top_k` the device sampler resolves with its masked pivot passes;
 /// larger requests keep the host sampler.
-const DEVICE_SAMPLING_MAX_TOP_K: usize = 128;
+pub(crate) const DEVICE_SAMPLING_MAX_TOP_K: usize = 128;
 
 /// Device-side sampling for one decode step. Returns `Ok(None)` when the
 /// request falls outside the device kernel's exact-match envelope (nucleus
@@ -355,7 +301,7 @@ const DEVICE_SAMPLING_MAX_TOP_K: usize = 128;
 /// caller then uses the reference host sampler. When it samples, `seen` is
 /// updated for the next step and only the four output words cross PCIe.
 #[allow(clippy::too_many_arguments)]
-fn device_sample_fp16_exponential_race(
+pub(crate) fn device_sample_fp16_exponential_race(
     ctx: &Context,
     logits: &Tensor,
     seen: &Tensor,
@@ -454,7 +400,12 @@ impl Gpt {
         })
     }
 
-    fn embed_text(&self, ctx: &Context, phones: &[u32], bert: &Tensor) -> Result<Tensor> {
+    pub(crate) fn embed_text(
+        &self,
+        ctx: &Context,
+        phones: &[u32],
+        bert: &Tensor,
+    ) -> Result<Tensor> {
         // The device lookups turn out-of-range ids into zero rows; reject them
         // here so a bad request fails instead of synthesizing from padding.
         if phones.len() > MAX_POSITIONS {
@@ -490,7 +441,12 @@ impl Gpt {
         ops::residual_add(ctx, &text, &position)
     }
 
-    fn embed_audio(&self, ctx: &Context, tokens: &[u32], position_start: usize) -> Result<Tensor> {
+    pub(crate) fn embed_audio(
+        &self,
+        ctx: &Context,
+        tokens: &[u32],
+        position_start: usize,
+    ) -> Result<Tensor> {
         let ids = ids_tensor(ctx, tokens)?;
         let audio = ops::embedding(ctx, &self.audio_emb, &ids)?;
         let end = position_start
@@ -510,7 +466,7 @@ impl Gpt {
     }
 
     /// One-token embedding for the decode loop, written into `destination`.
-    fn embed_audio_step(
+    pub(crate) fn embed_audio_step(
         &self,
         ctx: &Context,
         token: u32,
@@ -540,7 +496,7 @@ impl Gpt {
         ops::residual_add_into(ctx, &scratch.table_row, &scratch.position_row, destination)
     }
 
-    fn allocate_cache(&self, ctx: &Context, capacity: usize) -> Result<Vec<LayerCache>> {
+    pub(crate) fn allocate_cache(&self, ctx: &Context, capacity: usize) -> Result<Vec<LayerCache>> {
         let head_dim = GPT_HIDDEN / GPT_HEADS;
         (0..self.layers.len())
             .map(|_| {
@@ -683,7 +639,7 @@ impl Gpt {
     /// are prepared once per (text_len, audio_len, cache capacity) instead of
     /// once per operator per request; a replay pass allocates from the session
     /// arena and launches the prepared executions directly.
-    fn prefill_session_cached(
+    pub(crate) fn prefill_session_cached(
         &self,
         ctx: &Context,
         text: &Tensor,
@@ -806,7 +762,7 @@ impl Gpt {
         Ok(logits)
     }
 
-    fn decode_cached(
+    pub(crate) fn decode_cached(
         &self,
         ctx: &Context,
         input_hidden: &Tensor,
@@ -841,237 +797,6 @@ impl Gpt {
         }
         cache.audio_len += 1;
         self.output_logits(ctx, &hidden)
-    }
-
-    /// Generate semantic tokens. Text positions attend bidirectionally; audio
-    /// positions attend all text and causal audio, matching the upstream mask.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate(
-        &self,
-        ctx: &Context,
-        phones: &[u32],
-        bert: &Tensor,
-        prompt: &[u32],
-        seed: u64,
-        top_k: usize,
-        top_p: f32,
-        temperature: f32,
-        repetition_penalty: f32,
-        max_new_tokens: usize,
-    ) -> Result<Vec<u32>> {
-        if prompt.is_empty() {
-            return Err(Error::Other("GPT semantic prompt is empty".into()));
-        }
-        let text = self
-            .embed_text(ctx, phones, bert)
-            .map_err(|error| Error::Other(format!("GPT embed text: {error}")))?;
-        let audio = self
-            .embed_audio(ctx, prompt, 0)
-            .map_err(|error| Error::Other(format!("GPT embed prompt audio: {error}")))?;
-        let capacity = phones
-            .len()
-            .checked_add(prompt.len())
-            .and_then(|value| value.checked_add(max_new_tokens))
-            .ok_or_else(|| Error::Other("GPT cache capacity overflow".into()))?;
-        let saved = self.decode_resources.borrow_mut().take();
-        let resources = match saved {
-            Some(resources) if resources.cache.capacity == capacity => {
-                // Mapped metadata and graph storage may only be rebound after
-                // the previous invocation has completed.
-                ctx.synchronize().map_err(Error::Cuda)?;
-                resources
-            }
-            _ => DecodeResources {
-                graph: None,
-                graph_logits: None,
-                session: cuda_ops::ExecutionSession::with_capacity_pinning_prepared_buffers(
-                    DECODE_WORKSPACE_BYTES,
-                    ctx.device_id(),
-                )?,
-                meta: KvCacheDecodeMeta::new(ctx.device_id(), capacity)?,
-                input: ops::alloc(ctx, &[1, GPT_HIDDEN])?,
-                embed: DecodeEmbedScratch::new(ctx)?,
-                cache: DecodeCache {
-                    layers: self.allocate_cache(ctx, capacity)?,
-                    text_len: 0,
-                    audio_len: 0,
-                    capacity,
-                },
-                seen: ctx.allocate_output(Shape::new(vec![GPT_AUDIO_VOCAB]), DType::I8)?,
-                sample_out: ctx.allocate_output(Shape::new(vec![4]), DType::I32)?,
-            },
-        };
-        let DecodeResources {
-            graph: mut decode_graph,
-            mut graph_logits,
-            session: decode_session,
-            meta: decode_meta,
-            input: decode_input,
-            mut cache,
-            embed: mut embed_scratch,
-            seen: decode_seen,
-            sample_out: decode_sample_out,
-        } = resources;
-        let _gpt_prefill_range = crate::profiling::trace::range("tts.gpt.prefill");
-        let mut logits = self
-            .prefill_session_cached(ctx, &text, &audio, &mut cache)
-            .map_err(|error| Error::Other(format!("GPT cached prefill: {error}")))?;
-        drop(_gpt_prefill_range);
-        let mut audio_tokens = prompt.to_vec();
-
-        // The device sampler reproduces the host pipeline bit for bit inside
-        // its envelope (top_p >= 1.0, bounded top_k); outside it the decode
-        // loop keeps the reference host sampler.
-        let device_sampling = top_p >= 1.0
-            && top_k <= u32::MAX as usize
-            && (top_k == 0
-                || top_k >= GPT_AUDIO_VOCAB
-                || top_k <= DEVICE_SAMPLING_MAX_TOP_K);
-        if device_sampling {
-            // The flags vector below defines the entire buffer state (zeros
-            // except the prompt entries), and the synchronous copy lands
-            // before any later kernel launch. Do NOT prepend a stream-level
-            // fill_zero: on the non-blocking context stream it can trail the
-            // default-stream copy — on the second and later calls it queues
-            // behind the prefill replay and wipes the prompt flags, silently
-            // dropping the repetition penalty.
-            // First-occurrence dedup of the prompt history, matching the host
-            // sampler's seen marking; generated tokens are flagged by the
-            // kernel itself as they are sampled.
-            let mut flags = vec![0i8; GPT_AUDIO_VOCAB];
-            for &token in prompt {
-                let token = token as usize;
-                if token < GPT_AUDIO_VOCAB {
-                    flags[token] = 1;
-                }
-            }
-            let host = Tensor::from_i8(Shape::new(vec![GPT_AUDIO_VOCAB]), &flags)?;
-            transfers::copy_cpu_to_cuda(&host, &decode_seen)
-                .map_err(|error| Error::Other(format!("GPT sampler flag upload: {error}")))?;
-        }
-
-        for index in 0..max_new_tokens {
-            let _gpt_step_range = crate::profiling::trace::range("tts.gpt.step");
-            let active_vocab = if index < MIN_GENERATED_BEFORE_EOS {
-                GPT_AUDIO_VOCAB - 1
-            } else {
-                GPT_AUDIO_VOCAB
-            };
-            let active_logits = logits_prefix(&logits, active_vocab)
-                .map_err(|error| Error::Other(format!("GPT logits view step {index}: {error}")))?;
-            let _gpt_sample_range = crate::profiling::trace::range("tts.gpt.sample");
-            let (sample, argmax) = if device_sampling {
-                match device_sample_fp16_exponential_race(
-                    ctx,
-                    &active_logits,
-                    &decode_seen,
-                    &decode_sample_out,
-                    seed,
-                    index,
-                    top_k,
-                    top_p,
-                    temperature,
-                    repetition_penalty,
-                )
-                .map_err(|error| {
-                    Error::Other(format!("GPT device sample step {index}: {error}"))
-                })? {
-                    Some(sampled) => sampled,
-                    None => sample_fp16_exponential_race(
-                        &active_logits,
-                        &audio_tokens,
-                        seed,
-                        index,
-                        top_k,
-                        top_p,
-                        temperature,
-                        repetition_penalty,
-                    )
-                    .map_err(|error| {
-                        Error::Other(format!("GPT sample step {index}: {error}"))
-                    })?,
-                }
-            } else {
-                sample_fp16_exponential_race(
-                    &active_logits,
-                    &audio_tokens,
-                    seed,
-                    index,
-                    top_k,
-                    top_p,
-                    temperature,
-                    repetition_penalty,
-                )
-                .map_err(|error| Error::Other(format!("GPT sample step {index}: {error}")))?
-            };
-            drop(_gpt_sample_range);
-            if sample == GPT_EOS || argmax == GPT_EOS {
-                break;
-            }
-            audio_tokens.push(sample);
-            if index + 1 < max_new_tokens {
-                let cache_position = cache
-                    .text_len
-                    .checked_add(cache.audio_len)
-                    .ok_or_else(|| Error::Other("GPT cache position overflow".into()))?;
-                decode_meta.update(cache_position + 1, cache_position)?;
-                self.embed_audio_step(
-                    ctx,
-                    sample,
-                    cache.audio_len,
-                    &decode_input,
-                    &mut embed_scratch,
-                )?;
-                if let Some(graph) = &decode_graph {
-                    let _gpt_replay_range = crate::profiling::trace::range("tts.gpt.replay");
-                    graph.replay().map_err(|error| {
-                        Error::Other(format!("GPT decode replay step {index}: {error}"))
-                    })?;
-                    drop(_gpt_replay_range);
-                    cache.audio_len += 1;
-                    // `graph` and `graph_logits` are only ever assigned
-                    // together, so holding the graph implies its output tensor.
-                    logits = graph_logits.as_ref().expect("prepared GPT logits").clone();
-                } else {
-                    let original_audio_len = cache.audio_len;
-                    logits = cuda_ops::prepare_with_session(&decode_session, || {
-                        self.decode_cached(ctx, &decode_input, &mut cache, &decode_meta)
-                    })
-                    .map_err(|error| {
-                        Error::Other(format!("GPT prepare decode step {index}: {error}"))
-                    })?;
-                    ctx.synchronize().map_err(Error::Cuda)?;
-                    // Capture traverses the same resources without executing the
-                    // nodes. Restore the host position so the captured traversal
-                    // uses the prepared semantic; device writes read live metadata.
-                    cache.audio_len = original_audio_len;
-                    let graph = apxinf_cuda_new::capture(ctx, || {
-                        cuda_ops::with_session(&decode_session, || {
-                            self.decode_cached(ctx, &decode_input, &mut cache, &decode_meta)
-                        })?;
-                        Ok(())
-                    })
-                    .map_err(|error| {
-                        Error::Other(format!("GPT capture decode step {index}: {error}"))
-                    })?;
-                    graph_logits = Some(logits.clone());
-                    decode_graph = Some(graph);
-                }
-            }
-        }
-        let generated = audio_tokens[prompt.len()..].to_vec();
-        *self.decode_resources.borrow_mut() = Some(DecodeResources {
-            graph: decode_graph,
-            graph_logits,
-            session: decode_session,
-            meta: decode_meta,
-            input: decode_input,
-            cache,
-            embed: embed_scratch,
-            seen: decode_seen,
-            sample_out: decode_sample_out,
-        });
-        Ok(generated)
     }
 }
 
@@ -1200,8 +925,7 @@ mod sampling_tests {
             let host_logits: Vec<f32> = (0..GPT_AUDIO_VOCAB)
                 .map(|index| lcg((seed as usize).wrapping_add(index) as u64))
                 .collect::<Vec<f32>>();
-            let device_logits =
-                fp16_tensor(&ctx, &[GPT_AUDIO_VOCAB], &host_logits).unwrap();
+            let device_logits = fp16_tensor(&ctx, &[GPT_AUDIO_VOCAB], &host_logits).unwrap();
             // A short repeated history exercises the penalty-dedup path.
             let initial_history: Vec<u32> =
                 [3, 7, 3, 1024, 12, 7, 0, 500].iter().copied().collect();
@@ -1210,7 +934,9 @@ mod sampling_tests {
             let seen = ctx
                 .allocate_output(Shape::new(vec![GPT_AUDIO_VOCAB]), DType::I8)
                 .unwrap();
-            let sample_out = ctx.allocate_output(Shape::new(vec![4]), DType::I32).unwrap();
+            let sample_out = ctx
+                .allocate_output(Shape::new(vec![4]), DType::I32)
+                .unwrap();
             let mut flags = vec![0i8; GPT_AUDIO_VOCAB];
             for &token in &history_flags {
                 flags[token as usize] = 1;
@@ -1248,10 +974,7 @@ mod sampling_tests {
                 let device = device.unwrap_or_else(|| {
                     panic!("{name}: device sampler declined its envelope at step {step}")
                 });
-                assert_eq!(
-                    device, host,
-                    "{name}: step {step} token sequence diverged"
-                );
+                assert_eq!(device, host, "{name}: step {step} token sequence diverged");
                 host_history.push(host.0);
                 device_history.push(device.0);
                 assert_eq!(host_history, device_history);

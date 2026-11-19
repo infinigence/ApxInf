@@ -7,7 +7,7 @@ use std::rc::Rc;
 const TEXT_DEVICE_BUDGET: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct TextKey {
+pub(crate) struct TextKey {
     ids: Vec<u32>,
     word2ph: Vec<u32>,
     phones: usize,
@@ -28,7 +28,7 @@ impl TextKey {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct ReferenceKey {
+pub(crate) struct ReferenceKey {
     phones: Vec<u32>,
     text: TextKey,
     audio: Vec<u32>,
@@ -59,7 +59,7 @@ impl ReferenceKey {
             + self.text.bytes()
     }
 }
-pub(super) struct ReferenceFeatures {
+pub(crate) struct ReferenceFeatures {
     pub bert: Tensor,
     pub prompt: Vec<u32>,
     pub style: Tensor,
@@ -77,7 +77,7 @@ impl ReferenceFeatures {
             .sum()
     }
 }
-pub(super) struct ConditioningCache {
+pub(crate) struct ConditioningCache {
     config: TtsCacheConfig,
     reference: Option<(ReferenceKey, Rc<ReferenceFeatures>)>,
     texts: VecDeque<(TextKey, Tensor)>,

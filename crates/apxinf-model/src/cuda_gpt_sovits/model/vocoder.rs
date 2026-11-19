@@ -3,9 +3,11 @@
 use apxinf_core::{Error, Result, Tensor};
 use apxinf_cuda_new::CudaContext as Context;
 
-use super::config::{VOC_RESBLOCK_KERNELS, VOC_UPSAMPLE_KERNELS, VOC_UPSAMPLE_RATES};
-use super::ops;
-use super::weights::{Conv, Weights};
+use crate::cuda_gpt_sovits::config::{
+    VOC_RESBLOCK_KERNELS, VOC_UPSAMPLE_KERNELS, VOC_UPSAMPLE_RATES,
+};
+use crate::cuda_gpt_sovits::ops;
+use crate::cuda_gpt_sovits::weights::{Conv, Weights};
 
 struct ResBlock {
     convs1: Vec<Conv>,
@@ -50,12 +52,18 @@ impl Vocoder {
         let resblock_scales = resblock_channels
             .iter()
             .map(|&channels| {
-                super::weights::fp16_tensor(ctx, &[channels], &vec![1.0 / 3.0; channels])
+                crate::cuda_gpt_sovits::weights::fp16_tensor(
+                    ctx,
+                    &[channels],
+                    &vec![1.0 / 3.0; channels],
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         let resblock_zeros = resblock_channels
             .iter()
-            .map(|&channels| super::weights::fp16_tensor(ctx, &[channels], &vec![0.0; channels]))
+            .map(|&channels| {
+                crate::cuda_gpt_sovits::weights::fp16_tensor(ctx, &[channels], &vec![0.0; channels])
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             conv_pre,

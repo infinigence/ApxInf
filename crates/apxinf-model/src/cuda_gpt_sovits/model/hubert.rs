@@ -3,9 +3,9 @@
 use apxinf_core::{Error, Result, Tensor};
 use apxinf_cuda_new::CudaContext as Context;
 
-use super::config::{HUBERT_CONV_DIM, HUBERT_HEADS, HUBERT_HIDDEN, HUBERT_LAYERS};
-use super::ops;
-use super::weights::{fp16_tensor, Linear, Weights};
+use crate::cuda_gpt_sovits::config::{HUBERT_CONV_DIM, HUBERT_HEADS, HUBERT_HIDDEN, HUBERT_LAYERS};
+use crate::cuda_gpt_sovits::ops;
+use crate::cuda_gpt_sovits::weights::{fp16_tensor, Linear, Weights};
 
 const CONV_KERNEL: [usize; 7] = [10, 3, 3, 3, 3, 2, 2];
 const CONV_STRIDE: [usize; 7] = [5, 2, 2, 2, 2, 2, 2];
