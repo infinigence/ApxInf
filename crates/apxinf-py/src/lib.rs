@@ -44,6 +44,7 @@ use apxinf_core::{DType, Device, RngKey, Shape, Tensor};
 use apxinf_model::tts_trait::{
     GptSovitsInputs, PreparedTts, TtsCacheConfig, TtsExtension, TtsRequest, TtsSampling, TtsSpec,
 };
+use apxinf_model::asr_trait::{AsrRequest, AsrStopReason};
 use apxinf_model::{
     AutoModel, DecisionInput, DecisionOutput, DecisionSchema, ExecutionPolicy, ImageLayout,
     LoadOptions, LoadedModel, ModelPrecision, Observation, Pi05Config, SchemaDecisionAnswer,
@@ -739,6 +740,160 @@ impl SpeechRunner {
         ))
     }
 }
+/// ASR model runner (qwen3-asr, etc.). Loads via `AutoModel` and exposes
+/// `transcribe(waveform, language, task, max_new_tokens)` returning generated
+/// token ids plus stop metadata. Tokenizer loading and text decoding stay in
+/// the policy layer.
+#[pyclass(unsendable)]
+pub struct AsrRunner {
+    model: LoadedModel,
+    device: Device,
+    model_path: PathBuf,
+}
+
+#[pymethods]
+impl AsrRunner {
+    /// Load an ASR model checkpoint (the family's converted `-apxinf`
+    /// directory).
+    ///
+    /// * `model_path` — checkpoint directory (config.json + safetensors).
+    /// * `device` — `cuda:N` (default `cuda:0`); the native ASR family is
+    ///   CUDA-only.
+    /// * `autotune` — tune missing GEMM recipes from the first request.
+    /// * `tuning_dir` — directory to persist tuning recipes.
+    #[staticmethod]
+    #[pyo3(signature = (model_path, device="cuda:0", autotune=false, tuning_dir=None))]
+    fn load(
+        model_path: PathBuf,
+        device: &str,
+        autotune: bool,
+        tuning_dir: Option<PathBuf>,
+    ) -> PyResult<Self> {
+        let device = parse_device(device)?;
+        let options = LoadOptions {
+            autotune,
+            tuning_path: tuning_dir,
+            ..LoadOptions::default()
+        };
+        let model = AutoModel::load_model(device, &model_path, &options).map_err(runtime_err)?;
+        model.asr().map_err(|_| {
+            PyValueError::new_err(format!(
+                "apxinf_py.AsrRunner.load: {:?} is not an ASR model",
+                model_path
+            ))
+        })?;
+        Ok(Self {
+            model,
+            device,
+            model_path,
+        })
+    }
+
+    /// Run one transcription request.
+    ///
+    /// * `waveform` — 1-D float32 numpy array, mono, already at the
+    ///   contract's sample rate (16 kHz). Shorter inputs are zero-padded to
+    ///   the 30 s window; longer inputs are rejected.
+    /// * `language` — explicit language code (e.g. `"Chinese"`); required by
+    ///   families without detection.
+    /// * `task` — `"transcribe"` (default).
+    /// * `max_new_tokens` — upper bound on generated tokens (default 224).
+    ///
+    /// Returns a dict with:
+    /// * `token_ids` — list[int] of generated ids (prefix excluded, EOS
+    ///   included when produced).
+    /// * `stopped_reason` — `"eos"` or `"max_tokens"`.
+    /// * `valid_tokens` — number of generated tokens.
+    #[pyo3(signature = (waveform, language, task="transcribe", max_new_tokens=224))]
+    fn transcribe(
+        &self,
+        py: Python<'_>,
+        waveform: PyReadonlyArray1<'_, f32>,
+        language: &str,
+        task: &str,
+        max_new_tokens: usize,
+    ) -> PyResult<PyObject> {
+        let wave = waveform.as_slice().map_err(|_| {
+            PyValueError::new_err(
+                "apxinf_py.AsrRunner.transcribe: waveform must be a 1-D float32 contiguous array",
+            )
+        })?;
+        let asr = self.model.asr().map_err(runtime_err)?;
+        let request = AsrRequest {
+            waveform: wave,
+            language: Some(language),
+            task: Some(task),
+            prompt_token_ids: &[],
+            max_new_tokens,
+        };
+        let output = asr.transcribe(&request).map_err(runtime_err)?;
+        let reason = match output.stopped_reason {
+            AsrStopReason::Eos => "eos",
+            AsrStopReason::MaxTokens => "max_tokens",
+            AsrStopReason::PositionCap => "position_cap",
+        };
+        let result = PyDict::new_bound(py);
+        result.set_item("token_ids", output.token_ids)?;
+        result.set_item("stopped_reason", reason)?;
+        result.set_item("valid_tokens", output.valid_tokens)?;
+        Ok(result.into())
+    }
+
+    /// Sample rate the runtime's canonical waveform input uses (16 kHz).
+    #[getter]
+    fn sample_rate(&self) -> PyResult<u32> {
+        Ok(self.model.asr().map_err(runtime_err)?.contract().sample_rate)
+    }
+
+    /// Maximum waveform samples accepted by one request (30 s window).
+    #[getter]
+    fn max_audio_samples(&self) -> PyResult<usize> {
+        Ok(self
+            .model
+            .asr()
+            .map_err(runtime_err)?
+            .contract()
+            .max_audio_samples)
+    }
+
+    /// Maximum decoder positions.
+    #[getter]
+    fn max_decoder_positions(&self) -> PyResult<usize> {
+        Ok(self
+            .model
+            .asr()
+            .map_err(runtime_err)?
+            .contract()
+            .max_decoder_positions)
+    }
+
+    /// Language codes accepted by `transcribe`.
+    #[getter]
+    fn languages(&self) -> PyResult<Vec<String>> {
+        Ok(self.model.asr().map_err(runtime_err)?.contract().languages)
+    }
+
+    #[getter]
+    fn device(&self) -> String {
+        self.device.to_string()
+    }
+
+    #[getter]
+    fn model_path(&self) -> String {
+        self.model_path.display().to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        let languages = self.languages().map(|l| l.len()).unwrap_or(0);
+        format!(
+            "AsrRunner(device={}, languages={}, path={:?})",
+            self.device(),
+            languages,
+            self.model_path
+        )
+    }
+}
+
 /// Decision model runner (d3-mini, Clef, etc.). Loads via `AutoModel` and exposes
 /// encoded-prompt and schema requests through the same model handle.
 #[pyclass(unsendable)]
@@ -2382,6 +2537,7 @@ fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     module.add_class::<ModelRunner>()?;
     module.add_class::<SpeechRunner>()?;
+    module.add_class::<AsrRunner>()?;
     module.add_class::<DecisionRunner>()?;
     module.add_class::<PackedRgbU8>()?;
     module.add_class::<HfTokenizer>()?;
