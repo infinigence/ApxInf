@@ -125,10 +125,9 @@ class Qwen3AsrPolicy:
                 f"{sorted(self._languages)}"
             )
         # The runtime builds the full prompt (chat template + audio pads +
-        # language suffix) internally; the policy must pass an empty prefix.
-        prompt = np.asarray([], dtype=np.uint32)
+        # language suffix) internally; no prefix is passed here.
         result = self.model_runner.transcribe(
-            values, prompt, language=language, task="transcribe",
+            values, language=language, task="transcribe",
             max_new_tokens=int(max_new_tokens),
         )
         token_ids = [int(token) for token in result["token_ids"]]
