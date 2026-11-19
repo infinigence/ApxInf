@@ -64,6 +64,9 @@ pub(crate) fn nvfp4_pack_block_scales(
         )));
     }
 
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_gemm_nvfp4_pack_block_scales(
             source_buffer.ptr(),
@@ -137,6 +140,9 @@ pub(crate) fn nvfp4_quantize_activation(
         )));
     }
 
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_gemm_nvfp4_quantize_activation(
             source.ptr(),
@@ -193,6 +199,9 @@ pub(crate) fn nvfp4_quantize_rms_norm(
             scale_buffer.len()
         )));
     }
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_gemm_nvfp4_quantize_rms_norm(
             source.ptr(),
@@ -245,6 +254,9 @@ pub(crate) fn nvfp4_quantize_swiglu(
             "NVFP4 scale destination holds {} bytes, needs {required}",
             scale_buffer.len()
         )));
+    }
+    if crate::workspace::is_measurement() {
+        return Ok(());
     }
     unsafe {
         status::check(abi::apxinf_gemm_nvfp4_quantize_swiglu(
@@ -330,6 +342,9 @@ pub(crate) fn nvfp4_gemm_swiglu(
     let input_scale_buffer = scalar(input_global_scale)?;
     let down_scale_buffer = scalar(down_inverse_global_scale)?;
 
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_gemm_nvfp4_swiglu(
             activation_buffer.ptr(),

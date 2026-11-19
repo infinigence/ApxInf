@@ -22,6 +22,9 @@ pub fn quantize_per_tensor(
     }
     let source = tensor_storage(ctx, input, DType::BF16, &dims)?;
     let destination = tensor_storage(ctx, output, DType::F8E4M3, &dims)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_quantization_fp8_per_tensor(
             source.ptr(),

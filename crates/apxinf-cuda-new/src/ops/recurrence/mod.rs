@@ -31,6 +31,11 @@ impl F64RecurrenceState {
             .checked_mul(8)
             .filter(|&n| n > 0 && n <= i64::MAX as usize)
             .ok_or_else(|| invalid("invalid recurrence extent"))?;
+        if crate::workspace::is_measurement() {
+            return Err(invalid(
+                "recurrence state must be allocated before measurement",
+            ));
+        }
         if !crate::workspace::may_prepare_native_resources() {
             return Err(invalid("recurrence allocation during capture"));
         }
@@ -152,6 +157,9 @@ impl Drop for Execution {
 pub struct PreparedRecurrence(Rc<Execution>);
 impl PreparedRecurrence {
     pub fn enqueue(&self) -> Result<()> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         crate::workspace::validate_capture_target(
             self.0.stream.device(),
             self.0.stream.handle() as usize,

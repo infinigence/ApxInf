@@ -90,6 +90,14 @@ pub(super) fn try_causal_conv_gdn_prefill_bf16(
         let state = output_buffer(ctx, 32 * 128 * 128 * 4)?;
         let output = output_buffer(ctx, PAD * 32 * 128 * 2)?;
         let offsets = output_buffer(ctx, 2 * 4)?;
+        if crate::workspace::is_measurement() {
+            return output
+                .view(0, 3387 * 4096 * 2)
+                .map_err(Error::Cuda)?
+                .as_tensor(Shape::new(vec![3387, 4096]), DType::BF16)
+                .map(Some)
+                .map_err(Error::Cuda);
+        }
         let status = unsafe {
             gdn_abi::apxinf_gdn_bf16_prefill_sm110(
                 z.ptr(),
@@ -185,6 +193,9 @@ pub(super) fn causal_conv1d_silu_bf16(
     if let Some(state) = state {
         expect_bf16(state, "causal conv1d")?;
     }
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_causal_conv1d_silu_bf16(
             gpu_ptr(x)?,
@@ -263,6 +274,9 @@ pub(super) fn gdn_qk_prep(
         ],
     )?;
     let scale = (1.0f64 / (head_k_dim as f64).sqrt()) as f32;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_qk_prep_bf16(
             gpu_ptr(conv_out)?,
@@ -323,6 +337,9 @@ pub(super) fn gdn_qk_prep_qk_bf16(
         ],
     )?;
     let scale = (1.0f64 / (head_k_dim as f64).sqrt()) as f32;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_qk_prep_qk_bf16(
             gpu_ptr(conv_out)?,
@@ -400,6 +417,9 @@ pub(super) fn gdn_vb_prep(
         .cast::<u8>()
         .wrapping_add(a_col * element)
         .cast();
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_vb_prep_bf16(
             gpu_ptr(conv_out)?,
@@ -480,6 +500,9 @@ pub(super) fn gdn_gate_prep(
         .ok_or_else(|| Error::Other("GDN gate prep byte offset overflow".into()))?;
     let b_ptr = gpu_ptr(zba)?.cast::<u8>().wrapping_add(b_offset).cast();
     let a_ptr = gpu_ptr(zba)?.cast::<u8>().wrapping_add(a_offset).cast();
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_gate_prep_bf16(
             b_ptr,
@@ -517,6 +540,9 @@ pub(super) fn gdn_cumsum(
             ("g_cum", g_cum, f32_bytes(num_v_heads * seq_pad)?),
         ],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_cumsum_f32(
             g.ptr(),
@@ -562,6 +588,9 @@ pub(super) fn gdn_attn_raw(
             ("t", t, bf16_bytes(num_v_heads * chunks * matrix)?),
         ],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_attn_raw_f32(
             q.ptr(),
@@ -620,6 +649,9 @@ pub(super) fn gdn_attn_raw_solve_f1_qk_bf16(
             ),
         ],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_attn_raw_solve_f1_qk_bf16(
             q.ptr(),
@@ -654,6 +686,9 @@ pub(super) fn gdn_tri_solve(
         "GDN triangular solve",
         &[("a", a, f32_bytes(matrices * chunk_size * chunk_size)?)],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_tri_solve_f32(
             a.ptr(),
@@ -709,6 +744,9 @@ pub(super) fn gdn_chunk_gemm(
             ),
         ],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_chunk_gemm_f32(
             a.ptr(),
@@ -803,6 +841,9 @@ pub(super) fn gdn_chunk_gemm_tri_k_bf16_direct_v(
     let head_k_dim_i32 = ffi_i32(head_k_dim)?;
     let head_v_dim_i32 = ffi_i32(head_v_dim)?;
     let chunk_size_i32 = ffi_i32(chunk_size)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_chunk_gemm_tri_k_bf16_direct_v(
             a.ptr(),
@@ -885,6 +926,9 @@ pub(super) fn gdn_chunk_state(
             ),
         ],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_chunk_state_f32(
             q.ptr(),
@@ -971,6 +1015,9 @@ pub(super) fn gdn_chunk_state_qk_bf16(
             ),
         ],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_chunk_state_qk_bf16(
             q.ptr(),
@@ -1031,6 +1078,9 @@ pub(super) fn gdn_recurrent(
             ),
         ],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(gdn_abi::apxinf_gdn_recurrent_f32(
             q.ptr(),

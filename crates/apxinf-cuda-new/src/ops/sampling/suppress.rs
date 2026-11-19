@@ -25,6 +25,9 @@ pub fn suppress_logits(
         .cast::<u8>()
         .wrapping_add(row * cols * DType::BF16.size_in_bytes())
         .cast();
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(sampling_abi::apxinf_sampling_suppress_logits_bf16(
             row_ptr,

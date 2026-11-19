@@ -203,19 +203,23 @@ see the [ownership contract](model-layer-architecture.md#repacked-gemm-weight-ow
 This contract is cuda-new-specific; other backends own their workspace
 preparation and lease APIs.
 
-Right-size the activation arena to its measured peak. The arena reservation is
-an upper bound, not a prediction: seed `ExecutionSession` with a generous
-capacity (a hard-coded reservation or a conservative shape formula), then call
-`ExecutionSession::prepare_right_sized(device, margin, operation)` before
-capture. It runs `operation` once to measure the arena's high-water mark,
-rebuilds the arena to that mark plus `margin`, and runs `operation` again. The
-traversal must be shape-deterministic (the measured peak is independent of the
-arena's base address, which 256-byte alignment preserves) and idempotent with
-respect to persistent device state it mutates — reset such state at the start of
-`operation`, since it runs twice. Qwen-Drive's
-[`model_runner/prepare.rs`](../crates/apxinf-model/src/qwen_drive/model_runner/prepare.rs)
-right-sizes a former 32 GiB reservation to the measured peak; because a captured
-graph cannot be re-pointed at a different arena, this happens before capture.
+Plan activation storage before allocating it. Create a virtual `GraphWorkspace`
+(or `ExecutionSession::with_virtual_capacity`) with a logical capacity bound,
+then call `prepare_right_sized(device, margin, operation)` before capture.
+The first traversal allocates synthetic-address views and skips device execution
+and GEMM/Attention/Conv3d native selection. It records allocation sizes and offsets, using lease lifetimes
+to measure the high-water mark; it cannot read device results back to the host. The final
+arena is allocated once at the aligned high-water mark plus margin. Its prepare
+and capture traversals reuse the recorded offsets and reject changed allocation
+sizes/order or reuse of a region still held by a live lease.
+
+PI0.5 (graph and eager), WallOSS, GR00T, Qwen-Drive and Cosmos Policy use this
+flow. Model precision/fusion paths must be fixed before measurement; provider
+scratch is separate and selected on the real arena. Online tuning runs only on
+real inputs/outputs during native preparation. Persistent model state must be
+reset at the start of each traversal. The real prepare remains necessary for
+pointer-bound native resources, followed by capture; sizing does not establish
+GPU correctness. Validate replay, changed inputs and retained-output ownership.
 Capture and eager call the same model semantics. Update captured input contents
 in place and replay through the prepared object.
 

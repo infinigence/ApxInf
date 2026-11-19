@@ -161,6 +161,9 @@ pub fn apply_vision_2d_pair(
     let shape = Shape::new(vec![seq_len, n_heads, head_dim]);
     let q_out = ctx.allocate_output(shape.clone(), DType::BF16)?;
     let k_out = ctx.allocate_output(shape, DType::BF16)?;
+    if crate::workspace::is_measurement() {
+        return Ok((q_out, k_out));
+    }
     let q_out_buffer = CudaBuffer::from_tensor(&q_out).map_err(Error::Cuda)?;
     let k_out_buffer = CudaBuffer::from_tensor(&k_out).map_err(Error::Cuda)?;
     unsafe {
@@ -263,6 +266,9 @@ pub fn rms_norm_apply_mrope_qk(
     let k_shape = Shape::new(vec![seq_len, key_heads, head_dim]);
     let q_out = ctx.allocate_output(q_shape, DType::BF16)?;
     let k_out = ctx.allocate_output(k_shape, DType::BF16)?;
+    if crate::workspace::is_measurement() {
+        return Ok((q_out, k_out));
+    }
     let q_out_buffer = CudaBuffer::from_tensor(&q_out).map_err(Error::Cuda)?;
     let k_out_buffer = CudaBuffer::from_tensor(&k_out).map_err(Error::Cuda)?;
     unsafe {
@@ -561,6 +567,9 @@ pub(super) fn apply_into(
         &[("input", input, bytes), ("output", output, bytes)],
     )?;
     require_address(ctx, "RoPE", "position", position, 4)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     let status = unsafe {
         match dtype {
             DType::F32 => abi::apxinf_rope_fixed_decode_decode_f32(
@@ -622,6 +631,9 @@ pub(super) fn apply_mrope_into(
         &[("input", input, bytes), ("output", output, bytes)],
     )?;
     require_address(ctx, "MRoPE", "positions", positions, 12)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     check_cuda(unsafe {
         abi::apxinf_rope_fixed_decode_mrope_decode_bf16(
             input.ptr(),

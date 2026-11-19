@@ -376,9 +376,8 @@ impl Pi05ModelRunner {
         raw_images: Option<DeviceBuffer>,
     ) -> Result<EagerInputs> {
         let mut session = ExecutionSession::with_provider_workspace(
-            GraphWorkspace::new(
+            GraphWorkspace::new_virtual(
                 self.model.workspace_requirements(spec.token_count)?.bytes,
-                self.backend.device_id(),
             )?,
             self.provider_workspace.clone(),
         );

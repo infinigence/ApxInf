@@ -53,6 +53,9 @@ pub fn append(
             ),
         ],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     let status = unsafe {
         match dtype {
             DType::F32 => abi::apxinf_cache_fixed_decode_append_f32(
@@ -116,6 +119,9 @@ pub fn append_at(
         ],
     )?;
     require_address(ctx, "KV append", "position", position, 4)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     let status = unsafe {
         match dtype {
             DType::F32 => abi::apxinf_cache_fixed_decode_append_decode_f32(

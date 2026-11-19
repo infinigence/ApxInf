@@ -375,6 +375,9 @@ pub fn decode_attention(
             "FA2 decode workspace has {workspace_bytes} bytes, need {required}"
         )));
     }
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_decode_attention(
             ctx.runtime(),

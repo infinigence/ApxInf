@@ -25,6 +25,9 @@ pub fn copy_tensor(ctx: &CudaContext, source: &Tensor, destination: &Tensor) -> 
             "tensor copy exceeds the backing CUDA buffer".into(),
         ));
     }
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         ffi::check_cuda(ffi::cudaMemcpyAsync(
             destination_buffer.ptr(),
@@ -64,6 +67,9 @@ pub fn reserve_prefix(ctx: &CudaContext, prefix: &Tensor, total_rows: usize) -> 
     let output_tensor = ctx.allocate_output(shape, prefix.dtype())?;
     let output = CudaBuffer::from_tensor(&output_tensor).map_err(Error::Cuda)?;
     let source = CudaBuffer::from_tensor(prefix).map_err(Error::Cuda)?;
+    if crate::workspace::is_measurement() {
+        return Ok(output_tensor);
+    }
     unsafe {
         ffi::check_cuda(ffi::cudaMemsetAsync(
             output.ptr(),
@@ -111,6 +117,9 @@ pub fn concat_rows(ctx: &CudaContext, first: &Tensor, second: &Tensor) -> Result
     let first_buffer = CudaBuffer::from_tensor(first).map_err(Error::Cuda)?;
     let second_buffer = CudaBuffer::from_tensor(second).map_err(Error::Cuda)?;
     let output_buffer = CudaBuffer::from_tensor(&output).map_err(Error::Cuda)?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     unsafe {
         ffi::check_cuda(ffi::cudaMemcpyAsync(
             output_buffer.ptr(),
@@ -181,6 +190,9 @@ pub fn append(
     let to_i32 = |value: usize, what: &str| {
         i32::try_from(value).map_err(|_| Error::Other(format!("{what} exceeds i32")))
     };
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_cache_append_bf16(
             data_buffer.ptr(),

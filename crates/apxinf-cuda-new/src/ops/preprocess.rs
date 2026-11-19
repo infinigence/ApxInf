@@ -308,6 +308,9 @@ fn normalized_temporal_merged_patches(
         )));
     }
     let patches_buffer = CudaBuffer::from_tensor(patches).map_err(Error::Cuda)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_preprocess_temporal_merged_patches_bf16(
             images.ptr(),
@@ -433,6 +436,9 @@ fn temporal_merged_rect_patches(
     let output_ptr = output.ptr() as *mut u16;
     for frame in frames {
         let frame_rows = frame.grid_h * frame.grid_w;
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         unsafe {
             raw::check_cuda(abi::apxinf_preprocess_rgb_u8_to_temporal2_merge2_rect_bf16(
                 (rgb.ptr() as *const u8).add(byte_offset).cast(),
@@ -501,6 +507,14 @@ fn pixel_shuffle_4_bf16(
         .ok_or_else(|| Error::Other("BF16 pixel-shuffle output size overflow".into()))?;
     let output =
         crate::workspace::output_buffer(ctx, output_elements * DType::BF16.size_in_bytes())?;
+    if crate::workspace::is_measurement() {
+        return Ok(make_gpu_tensor(
+            apxinf_core::Shape::new(vec![output_rows, output_columns]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        ));
+    }
     unsafe {
         check_cuda(abi::apxinf_preprocess_pixel_shuffle_4_bf16(
             gpu_ptr(input)?,
@@ -548,6 +562,14 @@ fn pixel_shuffle_4_f16(
         .ok_or_else(|| Error::Other("FP16 pixel-shuffle output size overflow".into()))?;
     let output =
         crate::workspace::output_buffer(ctx, output_elements * DType::F16.size_in_bytes())?;
+    if crate::workspace::is_measurement() {
+        return Ok(make_gpu_tensor(
+            apxinf_core::Shape::new(vec![output_rows, output_columns]),
+            DType::F16,
+            ctx.device_id(),
+            output,
+        ));
+    }
     unsafe {
         check_cuda(abi::apxinf_preprocess_pixel_shuffle_4_f16(
             gpu_ptr(input)?,
