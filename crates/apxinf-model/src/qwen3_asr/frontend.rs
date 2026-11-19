@@ -90,6 +90,24 @@ impl Frontend {
     /// zero-padded by the caller) with `valid_frames` leading mel frames
     /// kept; the rest are zeroed. Returns the `[3000, 128]` BF16 mel.
     pub fn run(&self, ctx: &Context, waveform: &Tensor, valid_frames: usize) -> Result<Tensor> {
+        let mut out = ctx.allocate_output(Shape::new(vec![FRAMES, MEL_BINS]), DType::BF16)?;
+        self.run_into(ctx, waveform, valid_frames, &mut out)?;
+        Ok(out)
+    }
+
+    /// Like [`Self::run`], but writes the mel into the caller-owned `out`
+    /// buffer instead of returning a fresh allocation. `out` must be the
+    /// `[3000, 128]` BF16 mel on the context device. The caller keeps the
+    /// buffer across transcriptions: the conv2d execution cache is keyed by
+    /// the input pointer, so a stable mel address is what makes the stage
+    /// session's prepared executions replay instead of missing the cache.
+    pub fn run_into(
+        &self,
+        ctx: &Context,
+        waveform: &Tensor,
+        valid_frames: usize,
+        out: &mut Tensor,
+    ) -> Result<()> {
         if waveform.dtype() != DType::F32 {
             return Err(Error::Other(format!(
                 "qwen3-asr frontend expects an F32 waveform, got {:?}",
@@ -139,21 +157,21 @@ impl Frontend {
                 .map_err(|e| Error::Other(format!("mel readback: {e}")))?;
             bytes
         };
-        let mut out = Vec::with_capacity(FRAMES * MEL_BINS);
+        let mut mel_host = Vec::with_capacity(FRAMES * MEL_BINS);
         for (frame, chunk) in bytes.chunks_exact(MEL_BINS * 2).enumerate() {
             let keep = frame < valid_frames;
             for b in chunk.chunks_exact(2) {
                 if keep {
                     let bits = u16::from_le_bytes([b[0], b[1]]);
                     let value = half::f16::from_bits(bits).to_f32();
-                    out.push(half::bf16::from_f32(value));
+                    mel_host.push(half::bf16::from_f32(value));
                 } else {
-                    out.push(half::bf16::from_f32(0.0));
+                    mel_host.push(half::bf16::from_f32(0.0));
                 }
             }
         }
-        let host = Tensor::from_bf16(vec![FRAMES, MEL_BINS], &out)?;
-        transfers::to_cuda_on(ctx, &host)
+        let host = Tensor::from_bf16(vec![FRAMES, MEL_BINS], &mel_host)?;
+        transfers::copy_cpu_to_cuda(&host, out)
     }
 
     fn gemm_f32(&self, ctx: &Context, a: &Tensor, b: &Tensor) -> Result<Tensor> {

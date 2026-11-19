@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use apxinf_core::{Device, Error, Result, Tensor};
+use apxinf_core::{Device, Error, Result, Shape, Tensor};
 
 use super::config::*;
 use super::decode_graph::DecodeState;
@@ -57,6 +57,12 @@ pub struct Qwen3AsrModel {
     /// transcriptions and remove thousands of per-transcription
     /// `cudaMalloc`/`cudaFree` calls.
     encode_ws: RefCell<Option<encoder::EncodeWorkspace>>,
+    /// Persistent `[FRAMES, MEL_BINS]` BF16 mel buffer, allocated once at
+    /// load. The frontend re-uploads into this fixed address so the conv2d
+    /// execution cache (keyed by the input pointer) recurs across
+    /// transcriptions; a fresh per-call allocation would miss the cache and
+    /// abort the stage session's replay.
+    mel: RefCell<Tensor>,
     /// Frontend + audio tower + prefill session, see [`StageSession`].
     stage: RefCell<Option<StageSession>>,
 }
@@ -68,12 +74,17 @@ impl Qwen3AsrModel {
         let mut weights = Weights::load(directory)?;
         let frontend = Frontend::load(&mut weights, &ctx)?;
         let decode_state = RefCell::new(DecodeState::alloc(&ctx)?);
+        let mel = RefCell::new(ctx.allocate_output(
+            Shape::new(vec![FRAMES, MEL_BINS]),
+            super::weights::DTYPE,
+        )?);
         Ok(Self {
             ctx: Arc::new(ctx),
             frontend,
             weights: RefCell::new(weights),
             decode_state,
             encode_ws: RefCell::new(None),
+            mel,
             stage: RefCell::new(None),
         })
     }
@@ -215,7 +226,9 @@ impl Qwen3AsrModel {
     /// the decode loop, and the traversal a [`StageSession`] prepares.
     fn run_stage(&self, wave_dev: &Tensor, valid: usize, suffix: &[u32]) -> Result<(i32, usize)> {
         let t0 = std::time::Instant::now();
-        let mel = self.frontend.run(&self.ctx, wave_dev, valid)?;
+        let mut mel = self.mel.borrow_mut();
+        self.frontend
+            .run_into(&self.ctx, wave_dev, valid, &mut mel)?;
         let t_frontend = t0.elapsed();
 
         let mut weights = self.weights.borrow_mut();
