@@ -1,6 +1,7 @@
 //! LLM model architectures and abstractions.
 
 mod accelerator;
+pub mod asr_trait;
 pub mod auto;
 pub mod builtin;
 pub mod cuda_cosmos_policy;
@@ -32,6 +33,8 @@ pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
 #[cfg(feature = "cuda")]
+pub mod qwen3_asr;
+#[cfg(feature = "cuda")]
 pub mod qwen38;
 pub mod qwen3vl;
 pub mod qwen_drive;
@@ -42,6 +45,7 @@ pub mod tts_trait;
 pub mod vla;
 mod walloss;
 
+pub use asr_trait::{AsrContract, AsrRequest, AsrSpec, AsrStopReason, AsrTrait, AsrTranscription};
 pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWeights};
 pub use builtin::register_builtin_models;
 pub use d3::{

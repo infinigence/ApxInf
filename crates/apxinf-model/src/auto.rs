@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use apxinf_core::{DType, Device, Error, Result, Tensor};
 
 use crate::accelerator::create_backend_with_recipe_options;
+use crate::asr_trait::{AsrRequest, AsrTrait, AsrTranscription};
 use crate::builtin::register_builtin_models;
 use crate::decision::{
     CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionSchema,
@@ -112,6 +113,7 @@ pub enum LoadedModel {
     Decision(DecisionModel),
     Image(Box<dyn ImageRuntime>),
     Tts(Box<dyn TtsTrait>),
+    Asr(Box<dyn AsrTrait>),
 }
 
 impl LoadedModel {
@@ -129,6 +131,7 @@ impl LoadedModel {
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
             Self::Tts(_) => Err(Error::Other("loaded model is tts, not text".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not text".into())),
         }
     }
 
@@ -139,6 +142,7 @@ impl LoadedModel {
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not VLA".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not VLA".into())),
             Self::Tts(_) => Err(Error::Other("loaded model is tts, not VLA".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not VLA".into())),
         }
     }
 
@@ -149,6 +153,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not decision".into())),
         }
     }
 
@@ -175,6 +180,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not decision".into())),
         }
     }
 
@@ -185,6 +191,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not decision".into())),
         }
     }
 
@@ -195,6 +202,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
             Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not decision".into())),
         }
     }
 
@@ -209,6 +217,7 @@ impl LoadedModel {
             Self::Decision(model) => Ok(model.capabilities()),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
             Self::Tts(_) => Err(Error::Other("loaded model is tts, not text".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not text".into())),
         }
     }
 
@@ -230,6 +239,9 @@ impl LoadedModel {
             )),
             Self::Tts(_) => Err(Error::Other(
                 "tts models do not use autoregressive generation defaults".into(),
+            )),
+            Self::Asr(_) => Err(Error::Other(
+                "asr models do not use autoregressive generation defaults".into(),
             )),
         }
     }
@@ -275,6 +287,7 @@ impl LoadedModel {
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
             Self::Tts(_) => Err(Error::Other("loaded model is tts, not text".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not text".into())),
         }
     }
 
@@ -285,6 +298,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not image".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not image".into())),
             Self::Tts(_) => Err(Error::Other("loaded model is tts, not image".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not image".into())),
         }
     }
 
@@ -299,11 +313,27 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not tts".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not tts".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not tts".into())),
+            Self::Asr(_) => Err(Error::Other("loaded model is asr, not tts".into())),
         }
     }
 
     pub fn synthesize(&mut self, request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
         self.tts_mut()?.synthesize(request)
+    }
+
+    pub fn asr(&self) -> Result<&dyn AsrTrait> {
+        match self {
+            Self::Asr(model) => Ok(&**model),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not asr".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not asr".into())),
+            Self::Decision(_) => Err(Error::Other("loaded model is decision, not asr".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not asr".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not asr".into())),
+        }
+    }
+
+    pub fn transcribe(&self, request: &AsrRequest<'_>) -> Result<AsrTranscription> {
+        self.asr()?.transcribe(request)
     }
 
     pub fn reset(&mut self) -> Result<()> {
