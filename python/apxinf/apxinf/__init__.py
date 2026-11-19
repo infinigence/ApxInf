@@ -69,6 +69,7 @@ from .policies import (
     Pi05Policy,
     Pi0FastPolicy,
     Policy,
+    Qwen3AsrPolicy,
     WallossPolicy,
 )
 from .processors import (
@@ -92,6 +93,7 @@ __all__ = [
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",
+    "Qwen3AsrPolicy",
     "WallossPolicy",
     "AutoPolicy",
     # offline calibration framework
@@ -138,4 +140,8 @@ def __getattr__(name: str):
         from apxinf_py import SpeechRunner
 
         return SpeechRunner
+    if name == "AsrRunner":
+        from apxinf_py import AsrRunner
+
+        return AsrRunner
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
