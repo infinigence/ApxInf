@@ -9,6 +9,14 @@ use crate::workspace::output_buffer;
 pub fn gelu_exact(ctx: &CudaContext, input: &Tensor) -> Result<Tensor> {
     expect_bf16(input, "gelu exact")?;
     let output = output_buffer(ctx, input.size_in_bytes())?;
+    if crate::workspace::is_measurement() {
+        return Ok(make_gpu_tensor(
+            input.shape().clone(),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        ));
+    }
     unsafe {
         check_cuda(activation_abi::apxinf_activation_gelu_exact_bf16(
             gpu_ptr(input)?,

@@ -2,7 +2,7 @@
 //! the explicit preparation contract.
 //!
 //! Preparation allocates every graph-visible input at a stable address, runs
-//! one eager pass on placeholder inputs to resolve GEMM plans and size the
+//! a virtual traversal followed by a real prepare on placeholder inputs to size the
 //! workspace, and captures the CUDA graph unless the policy is `Eager`.
 //! `run` neither captures nor tunes: it binds per-call inputs in place and
 //! replays (or runs eagerly).
@@ -164,7 +164,7 @@ impl WallossPreparedInference {
         let requirements = model
             .model()
             .workspace_requirements(patch_rows, prefix_tokens)?;
-        let workspace = ops::ExecutionSession::with_capacity(requirements.bytes, device)?;
+        let workspace = ops::ExecutionSession::with_virtual_capacity(requirements.bytes)?;
         let mut plan = Self {
             spec,
             shape,
@@ -188,8 +188,8 @@ impl WallossPreparedInference {
         Ok(plan)
     }
 
-    /// One eager pass before capture resolves every GEMM plan and right-sizes
-    /// the workspace to its measured peak. With the request that created the
+    /// A virtual traversal sizes the workspace, then a real prepare resolves
+    /// GEMM plans against its final addresses. With the request that created the
     /// plan, it runs on real inputs so missing GEMM keys can be autotuned;
     /// explicit preparation runs on placeholders.
     fn warm_up(&mut self, request: Option<&VlaRequest<'_>>) -> Result<()> {

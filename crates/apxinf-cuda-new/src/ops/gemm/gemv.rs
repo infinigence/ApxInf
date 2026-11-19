@@ -121,6 +121,9 @@ fn gemv_unit_scale(ctx: &CudaContext, args: &GemvArgs<'_>) -> Result<()> {
         return Err(invalid("FP8 GEMV output must hold N elements"));
     }
     let output_buffer = tensor_storage(ctx, args.output, DType::BF16, &output_dims)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_gemm_fp8_gemv(
             weight_buffer.ptr(),
@@ -179,6 +182,9 @@ fn gemv_block_quantized(
         return Err(invalid("NVFP4 GEMV output must hold N elements"));
     }
     let output_buffer = tensor_storage(ctx, args.output, DType::BF16, &output_dims)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_gemm_nvfp4_gemv(
             weight_buffer.ptr(),

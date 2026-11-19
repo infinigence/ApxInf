@@ -61,6 +61,9 @@ pub fn activation(
     let dtype = input.dtype();
     let input_buffer = tensor_storage(ctx, input, dtype, &dims)?;
     let output_buffer = tensor_storage(ctx, output, dtype, &dims)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     match dtype {
         DType::BF16 => unsafe {
             status::check(abi::apxinf_elementwise_activation_bf16(
@@ -104,6 +107,9 @@ pub fn mul(ctx: &CudaContext, a: &Tensor, b: &Tensor, output: &Tensor) -> Result
     let a_buffer = tensor_storage(ctx, a, dtype, &dims)?;
     let b_buffer = tensor_storage(ctx, b, dtype, &dims)?;
     let output_buffer = tensor_storage(ctx, output, dtype, &dims)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     match dtype {
         DType::BF16 => unsafe {
             status::check(abi::apxinf_elementwise_mul_bf16(
@@ -144,6 +150,9 @@ pub fn add(ctx: &CudaContext, a: &Tensor, b: &Tensor, output: &Tensor) -> Result
     let a_buffer = tensor_storage(ctx, a, dtype, &dims)?;
     let b_buffer = tensor_storage(ctx, b, dtype, &dims)?;
     let output_buffer = tensor_storage(ctx, output, dtype, &dims)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     match dtype {
         DType::BF16 => unsafe {
             status::check(abi::apxinf_elementwise_add_bf16(
@@ -189,6 +198,9 @@ pub fn scale(ctx: &CudaContext, input: &Tensor, output: &Tensor, factor: f32) ->
     let count = element_count(input, "scale")?;
     let input_buffer = tensor_storage(ctx, input, dtype, &dims)?;
     let output_buffer = tensor_storage(ctx, output, dtype, &dims)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     match dtype {
         DType::BF16 => unsafe {
             status::check(abi::apxinf_elementwise_scale_bf16(
@@ -237,6 +249,9 @@ pub fn add_bias(ctx: &CudaContext, input: &Tensor, bias: &Tensor, output: &Tenso
     let input_buffer = tensor_storage(ctx, input, DType::BF16, &dims)?;
     let bias_buffer = tensor_storage(ctx, bias, DType::BF16, &[cols])?;
     let output_buffer = tensor_storage(ctx, output, DType::BF16, &dims)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_elementwise_add_bias_bf16(
             input_buffer.ptr(),

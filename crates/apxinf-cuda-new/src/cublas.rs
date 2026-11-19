@@ -70,6 +70,9 @@ impl CublasHandle {
         beta: f32,
         c: &CudaBuffer, // [m, n] row-major
     ) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         // cuBLAS is column-major. For row-major C = A @ B, we compute
         // C^T = B^T @ A^T in column-major, which means:
         //   cublasSgemm(N, N, n, m, k, alpha, B, n, A, k, beta, C, n)
@@ -161,6 +164,9 @@ impl CublasHandle {
         stride_c: i64,
         batch_count: i32,
     ) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         // Same row-major trick: C = A @ B becomes C^T = B^T @ A^T in column-major
         let m_i = m as i32;
         let n_i = n as i32;
@@ -268,6 +274,9 @@ impl CublasHandle {
         c: &CudaBuffer,
         ldc: i32, // row stride of C in row-major (= n)
     ) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         // Row-major C = op(A) @ op(B) becomes column-major:
         //   C^T_col = op(B)_col^T @ op(A)_col^T
         // But using the identity M_row = (M_col)^T:
@@ -387,6 +396,9 @@ impl CublasHandle {
         c: &CudaBuffer,
         ldc: i32,
     ) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         let (m_i, n_i, k_i) = (m as i32, n as i32, k as i32);
         let transa = transa.raw();
         let transb = transb.raw();
@@ -435,6 +447,9 @@ impl CublasHandle {
         weight_output_major: &CudaBuffer,
         output: &CudaBuffer,
     ) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         if activation.len() < m * k
             || weight_output_major.len() < n * k
             || output.len() < m * n * std::mem::size_of::<i32>()

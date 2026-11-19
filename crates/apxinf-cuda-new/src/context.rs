@@ -147,8 +147,8 @@ impl CudaContext {
     }
 
     /// Whether this context may online-tune operators. A measurement traversal
-    /// that launches tuning kernels writes into its output arena, so a
-    /// virtual (null-backed) arena is only safe when this is `false`.
+    /// that launches tuning kernels needs real inputs/outputs. Activation
+    /// measurement skips native selection; tuning runs after real binding.
     pub fn allow_online_tune(&self) -> bool {
         self.allow_online_tune
     }

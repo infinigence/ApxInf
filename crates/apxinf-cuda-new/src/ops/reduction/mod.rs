@@ -16,6 +16,11 @@ struct Execution {
 }
 impl PreparedIndexedMean {
     pub fn new(ctx: &CudaContext, input: &Tensor, out: &Tensor, indices: &[u32]) -> Result<Self> {
+        if crate::workspace::is_measurement() {
+            return Err(invalid(
+                "indexed mean needs prebuilt indices during measurement",
+            ));
+        }
         if !crate::workspace::may_prepare_native_resources() {
             return Err(invalid("indexed mean preparation during capture"));
         }
@@ -78,6 +83,9 @@ impl PreparedIndexedMean {
         })))
     }
     pub fn enqueue(&self) -> Result<()> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         crate::workspace::validate_capture_target(
             self.0.stream.device(),
             self.0.stream.handle() as usize,

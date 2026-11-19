@@ -11,11 +11,11 @@ use std::sync::Arc;
 
 fn allocate_session(
     requirements: &WorkspaceRequirements,
-    device: usize,
+    _device: usize,
     scratch: &ProviderWorkspace,
 ) -> Result<ExecutionSession> {
     Ok(ExecutionSession::with_provider_workspace(
-        GraphWorkspace::new(requirements.bytes, device)?,
+        GraphWorkspace::new_virtual(requirements.bytes)?,
         scratch.clone(),
     ))
 }

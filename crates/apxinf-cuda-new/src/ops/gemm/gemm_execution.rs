@@ -608,6 +608,9 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
 }
 
 pub(crate) fn execute(ctx: &CudaContext, normalized: Normalized) -> Result<()> {
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     let execution = prepare(ctx, normalized)?;
     crate::workspace::validate_capture_target(
         execution.stream.device(),

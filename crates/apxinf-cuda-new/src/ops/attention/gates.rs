@@ -22,6 +22,9 @@ fn gate_elements(tokens: usize, heads: usize, head_dim: usize) -> Result<usize> 
 }
 
 fn launch_gate(ctx: &CudaContext, spec: abi::GateSpec, bindings: abi::GateBindings) -> Result<()> {
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_attention_gate_launch(
             ctx.runtime(),
