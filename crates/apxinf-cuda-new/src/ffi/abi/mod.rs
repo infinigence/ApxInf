@@ -2,6 +2,7 @@ pub(crate) mod activation;
 pub(crate) mod attention;
 pub(crate) mod cache;
 pub(crate) mod conv1d;
+pub(crate) mod conv2d;
 pub(crate) mod elementwise;
 pub(crate) mod embedding;
 pub(crate) mod gather;
@@ -10,6 +11,7 @@ pub(crate) mod gemm;
 pub(crate) mod norm;
 pub(crate) mod pointwise;
 pub(crate) mod preprocess;
+pub(crate) mod qk_norm_rope;
 pub(crate) mod quantization;
 pub(crate) mod relative_attention;
 pub(crate) mod rope;
@@ -18,6 +20,8 @@ pub(crate) mod sampling;
 pub(crate) mod status;
 pub(crate) mod types;
 pub(crate) mod volume;
+
+pub(crate) mod whisper_frontend;
 
 pub(crate) mod recurrence;
 

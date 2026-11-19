@@ -446,6 +446,9 @@ fn main() {
         "quantization/launch.cu",
         "volume.cu",
         "conv3d.cu",
+        "conv2d.cu",
+        "whisper_frontend.cu",
+        "qk_norm_rope.cu",
         "recurrence.cu",
         "reduction.cu",
     ]
