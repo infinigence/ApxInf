@@ -112,10 +112,11 @@ pub(crate) fn step_body(
             &mut ws.v,
         )?; // [1, 1024]
 
-        // Per-head q_norm / k_norm into fixed buffers (Qwen3's RMSNorm
-        // multiplies the weight directly, `head_rms_norm`'s (1 + w) form is
-        // wrong here — see the prefill path). Fixed addresses so the
-        // captured graph's rms_norm launch stays valid.
+        // Per-head q_norm / k_norm into fixed buffers. Qwen3's RMSNorm
+        // multiplies the weight directly (plain-weight semantics, same as
+        // the prefill path's rank-2 norm); the fused kernel below is
+        // bit-identical to that. Fixed addresses so the captured graph's
+        // fused launch stays valid.
         let q_flat = ws.q.reshape(Shape::new(vec![TXT_HEADS, TXT_HEAD_DIM]))?;
         let k_flat = ws.k.reshape(Shape::new(vec![TXT_KV_HEADS, TXT_HEAD_DIM]))?;
         let q_norm_w = weights.get(ctx, &format!("{p}.self_attn.q_norm.w"))?;

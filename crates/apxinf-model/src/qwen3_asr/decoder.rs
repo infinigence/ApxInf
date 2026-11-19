@@ -781,9 +781,9 @@ impl Decoder {
             }
 
             // Per-head q_norm / k_norm. Qwen3's RMSNorm multiplies the weight
-            // directly, but `head_rms_norm` applies (1 + w), so the plain
-            // rank-2 RMSNorm over the flattened heads is used instead.
-            // The numerical path matches the fresh-allocation version: rank-2
+            // directly (plain-weight semantics), so the rank-2 RMSNorm over
+            // the flattened heads applies here. The numerical path matches
+            // the fresh-allocation version: rank-2
             // q/k views -> rms_norm into ws.q_normed/k_normed -> reshape to
             // [T, H, D].
             let q_flat = ws

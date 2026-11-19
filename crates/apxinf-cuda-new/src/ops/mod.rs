@@ -14,7 +14,7 @@ pub mod pillow_bicubic;
 pub mod pointwise;
 pub mod preprocess;
 pub mod qk_norm_rope;
-pub use qk_norm_rope::{cache_append_row, head_rms_norm, qk_norm_rope};
+pub use qk_norm_rope::{cache_append_row, qk_norm_rope};
 pub mod quantization;
 pub mod relative_attention;
 pub mod rope;

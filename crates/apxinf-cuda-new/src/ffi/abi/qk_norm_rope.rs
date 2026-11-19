@@ -3,15 +3,6 @@ use std::ffi::c_void;
 pub(crate) use super::types::CudaStream;
 
 unsafe extern "C" {
-    pub(crate) fn apxinf_qk_norm_rope_head_rms_norm(
-        data: *mut c_void,
-        weight: *const c_void,
-        rows: i64,
-        head_dim: i64,
-        epsilon: f32,
-        stream: CudaStream,
-    ) -> i32;
-
     pub(crate) fn apxinf_qk_norm_rope_fused(
         input: *const c_void,
         weight: *const c_void,
