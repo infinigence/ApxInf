@@ -3,11 +3,11 @@
 use apxinf_core::{Error, Result, Tensor};
 use apxinf_cuda_new::CudaContext as Context;
 
-use super::config::{
+use crate::cuda_gpt_sovits::config::{
     SOVITS_DECODER, SOVITS_HEADS, SOVITS_HIDDEN, SOVITS_INTER, SOVITS_WINDOW, SOVITS_WN_LAYERS,
 };
-use super::ops;
-use super::weights::{ids_tensor, Linear, Weights};
+use crate::cuda_gpt_sovits::ops;
+use crate::cuda_gpt_sovits::weights::{ids_tensor, Linear, Weights};
 
 // The MRTE cross-attention lives in the decoder-width style space, not in the
 // 192-wide `SOVITS_INTER` space of the surrounding convolutions.
@@ -318,12 +318,12 @@ impl RefEncoder {
             // The reference MelStyleEncoder scales attention logits by
             // sqrt(d_model=128), while the shared attention operator scales by
             // sqrt(head_dim=64). Pre-scale q by sqrt(64 / 128).
-            attn_q_scale: super::weights::fp16_tensor(
+            attn_q_scale: crate::cuda_gpt_sovits::weights::fp16_tensor(
                 ctx,
                 &[128],
                 &vec![std::f32::consts::FRAC_1_SQRT_2; 128],
             )?,
-            attn_q_shift: super::weights::fp16_tensor(ctx, &[128], &[0.0; 128])?,
+            attn_q_shift: crate::cuda_gpt_sovits::weights::fp16_tensor(ctx, &[128], &[0.0; 128])?,
             out: Linear::load(weights, ctx, "sovits.refenc.out")?,
         })
     }

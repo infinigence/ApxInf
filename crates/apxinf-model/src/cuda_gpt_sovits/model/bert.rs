@@ -3,9 +3,9 @@
 use apxinf_core::{Error, Result, Tensor};
 use apxinf_cuda_new::CudaContext as Context;
 
-use super::config::{BERT_HEADS, BERT_HIDDEN, BERT_LAYERS, BERT_OUTPUT_LAYER};
-use super::ops;
-use super::weights::{ids_tensor, Linear, Weights};
+use crate::cuda_gpt_sovits::config::{BERT_HEADS, BERT_HIDDEN, BERT_LAYERS, BERT_OUTPUT_LAYER};
+use crate::cuda_gpt_sovits::ops;
+use crate::cuda_gpt_sovits::weights::{ids_tensor, Linear, Weights};
 
 struct Layer {
     q: Linear,

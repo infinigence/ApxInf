@@ -3,17 +3,17 @@
 use apxinf_core::{Error, Result, RngKey, Tensor};
 use apxinf_cuda_new::CudaContext as Context;
 
-use super::config::{
+use crate::cuda_gpt_sovits::config::{
     CFM_DEPTH, CFM_DIM, CFM_HEADS, CFM_HEAD_DIM, CFM_MEL, CFM_TEXT, CFM_TEXT_BLOCKS,
 };
-use super::ops;
-use super::weights::{fp16_tensor, Linear, Weights};
+use crate::cuda_gpt_sovits::ops;
+use crate::cuda_gpt_sovits::weights::{fp16_tensor, Linear, Weights};
 
 const MAX_POSITIONS: usize = 4096;
 const NOISE_TEMPERATURE: f32 = 0.875;
-pub(super) const REFERENCE_FRAMES: usize = 500;
-pub(super) const MAX_TARGET_CHUNK: usize = 640;
-pub(super) const TOTAL_CHUNK: usize = 1000;
+pub(crate) const REFERENCE_FRAMES: usize = 500;
+pub(crate) const MAX_TARGET_CHUNK: usize = 640;
+pub(crate) const TOTAL_CHUNK: usize = 1000;
 pub(super) const ROLLING_TAIL: usize = 32;
 
 struct TextBlock {
@@ -879,12 +879,12 @@ mod tests {
 }
 
 /// Per-chunk inputs handed to the [`run_chunked`] driver's callback.
-pub(super) struct ChunkArgs<'a> {
-    pub(super) prompt_features: &'a Tensor,
-    pub(super) target: &'a Tensor,
-    pub(super) prompt_mel: &'a Tensor,
-    pub(super) chunk_index: usize,
-    pub(super) length: usize,
+pub(crate) struct ChunkArgs<'a> {
+    pub(crate) prompt_features: &'a Tensor,
+    pub(crate) target: &'a Tensor,
+    pub(crate) prompt_mel: &'a Tensor,
+    pub(crate) chunk_index: usize,
+    pub(crate) length: usize,
 }
 
 /// Split a target stream into rolling-prompt chunks and run each one.
@@ -896,7 +896,7 @@ pub(super) struct ChunkArgs<'a> {
 /// tail. `chunk_fn` only decides how one chunk is executed (eager CFM loop vs
 /// CUDA-graph replay); its `chunk_index` seeds the noise stream, so callers
 /// must fold it into their seed exactly as both existing paths did.
-pub(super) fn run_chunked(
+pub(crate) fn run_chunked(
     ctx: &Context,
     original_mel: &Tensor,
     original_features: &Tensor,
@@ -998,7 +998,7 @@ pub(super) fn plan_chunks(
 
 /// The step modulation table holds the 32 timesteps `i / 32`; a step count
 /// that does not divide 32 would silently read rows that are not `index / steps`.
-pub(super) fn validate_sample_steps(steps: usize) -> Result<()> {
+pub(crate) fn validate_sample_steps(steps: usize) -> Result<()> {
     if steps == 0 || steps > 32 || 32 % steps != 0 {
         return Err(Error::Other(format!(
             "gpt_sovits sample_steps must be 1, 2, 4, 8, 16 or 32, got {steps}"
