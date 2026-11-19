@@ -25,6 +25,14 @@ experiment/
 # interrupted tune can leave the temporary behind.
 *.recipe.*.tmp
 
+# cuda-new autotune writes exact-key `.recipe` caches into
+# configs/tuning/nvidia/** on the tuning machine. They are keyed to one
+# machine and one library build and are never committed; the AMD measured
+# recipes (version-gated, safe-degrading defaults) are the one exception —
+# see configs/tuning/README.md.
+configs/tuning/**/*.recipe
+!configs/tuning/amd/**/*.recipe
+
 # Local development artifacts (see AGENTS.md)
 /devlocal/
 crates/.gemm-pilot-link.lock

@@ -53,6 +53,15 @@ APXINF_HIP_GEMM_PROVIDER=hipblas cargo test -p apxinf-hip   # forced-baseline ar
 APXINF_HIP_GEMM_PROVIDER=lt cargo test -p apxinf-hip        # hipBLASLt arm
 ```
 
+GEMM provider routing is measured, not derived: the gfx1151 recipe ships with
+the checkout, a matching host reuses it with no flags, and a mismatched host
+refuses the file whole and stays on hipBLAS. The recipe format, its version
+gates and the `APXINF_HIP_GEMM_*` A/B overrides are documented in
+[configs/tuning/README.md](../configs/tuning/README.md) — that file is also
+where the committed AMD recipe is called out as the one deliberate exception
+to the "`.recipe` caches are machine-local and git-ignored" policy the NVIDIA
+side follows.
+
 Python: `AutoPolicy` → GR00T policy → `apxinf.ModelRunner` with a
 `Device.Hip` device; the loader is the same registered `Gr00tN1d7-hip` entry.
 

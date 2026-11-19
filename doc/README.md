@@ -18,6 +18,7 @@ model-specific examples and historical evidence link back to it.
 | Running PI0.5 on AMD (HIP), comparing it with CUDA, or extending it | [PI0.5 on HIP](hip-pi05.md) — layout, entry points, validation and status |
 | Running GR00T on AMD (HIP), or extending that port | [GR00T on HIP](hip-gr00t.md) — layout, acceptance gate, known limits, fixture provenance |
 | Building, tuning or measuring the Moore Threads backend | [MUSA Backend](musa-backend.md) — build, generations, INT8 routes, capture, tactics database and the accuracy gate |
+| Choosing, generating or shipping GEMM/attention tuning recipes | [Tuning Databases](../configs/tuning/README.md) — cache layout, recipe formats, the committed AMD exception and the git-ignored machine-local caches |
 | Profiling PI0.5 on MUSA with msys | [Profiling PI0.5 on MUSA](pi05-mttx.md) — markers, recordings and the two known reading defects |
 | Running the PI0.5 FP32 reference on CPU | [PI0.5 CPU reference](pi05-cpu-reference.md) — build, input and execution contracts, numerical validation |
 | Proposing Apple Neural Engine execution through Core ML | [Core ML and ANE](coreml-ane.md) — proposal under upstream review |
