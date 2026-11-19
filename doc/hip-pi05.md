@@ -308,6 +308,33 @@ the fault-heavy evenings): **−1.3 ms per forward** (window graph P50s
 bit-identical to eager. The LT axis for this shape is closed with evidence:
 all four transpose combinations enumerated, no winner.
 
+
+## split_qkv_rope: LDS trig table, one block per token (2026-11-19)
+
+The split's (cosine, sine) pair depends only on (pair, position) — not on the
+head — but the per-(token, head)-block form recomputed every token's 128 pairs
+once per rotating head: the language side (522 tokens, 8 q + 1 kv heads)
+paid for 601K trig evaluations per call, ~10 us of a 36.6 us kernel whose
+traffic floor is 23.5 us. The restructured kernel launches one block per
+token, builds the table in LDS once (the expressions verbatim, so every
+value is bit-identical), and strides threads over the (head, pair) slots.
+Measured on the language call, interleaved same-process: 37.6 -> 24.4 us,
+essentially the traffic floor.
+
+Model A/B, three interleaved windows: graph P50 132.94/132.76/144.79 against
+131.69/131.24/132.52 (the third window's control arm fault-polluted; the two
+clean windows give -1.25/-1.52 ms); output checksum unchanged at 19.138827 in
+all six arms, graph capture still 2,311 nodes, bit-identical to eager. The
+action expert's 180 split calls run the same kernel (10-token grids, too small
+for the table to matter; denoise stage flat).
+
+The same probe session closed the Lt-epilogue axis for the vision shapes:
+hipBLASLt's BIAS(+GELU-tanh) epilogue loses to the model's hipBLAS-plain +
+separate bias_activation path on (512,1152,4304) by 27 us and on
+(512,1152,3456) by 20 us — Lt's plain GEMM is 22-30% slower than hipBLAS
+there, which the ~37 us the fusion saves cannot cover (probe
+`devlocal/pi05-hip/perf/epilogue_probe.cpp`, cold-ring weights).
+
 ## Next
 
 The full LIBERO-10 regression above is the gate for the campaign's changes

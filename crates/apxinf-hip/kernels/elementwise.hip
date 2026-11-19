@@ -328,34 +328,56 @@ __global__ void rgb_to_patches_kernel(const uint8_t* images, bf16* patches, int 
 // theta^(-pair / half), position = position_offset + token) and copy V.
 // K and V land at row `kv_row_offset + token` of [rows, kv_heads, head_dim]
 // buffers, so the same kernel fills a fresh prefix cache or appends to one.
-// Grid (tokens, q_heads + 2 kv_heads); threads loop over the head's pairs.
+//
+// Grid (tokens); one block covers every head of the token. The (cosine,
+// sine) pair depends only on (pair, position), not on the head, so the
+// per-(token, head)-block form computed each token's 128 pairs once per
+// rotating head — q_heads + kv_heads times — while pi05's language side
+// pays 9x for 601K trig evaluations per call (~10 us of a 36.6 us kernel).
+// The block builds the table in LDS once (the expressions verbatim, so the
+// values are bit-identical), then threads stride the (head, pair) slots.
+// Dynamic LDS: half * 2 floats.
 __global__ void split_qkv_rope_kernel(const bf16* qkv, const bf16* bias, bf16* q, bf16* k,
                                       bf16* v, int q_heads, int kv_heads, int head_dim,
                                       float theta, int position_offset, int kv_row_offset) {
   const int token = blockIdx.x;
-  const int head = blockIdx.y;
   const int half = head_dim / 2;
+  const int heads = q_heads + 2 * kv_heads;
   const int64_t q_width = static_cast<int64_t>(q_heads) * head_dim;
   const int64_t kv_width = static_cast<int64_t>(kv_heads) * head_dim;
   const int64_t row = static_cast<int64_t>(token) * (q_width + 2 * kv_width);
   const int position = position_offset + token;
-  int64_t column;  // offset of this head inside the packed projection
-  bf16* destination;
-  bool rotate = true;
-  if (head < q_heads) {
-    column = static_cast<int64_t>(head) * head_dim;
-    destination = q + (static_cast<int64_t>(token) * q_heads + head) * head_dim;
-  } else if (head < q_heads + kv_heads) {
-    const int h = head - q_heads;
-    column = q_width + static_cast<int64_t>(h) * head_dim;
-    destination = k + (static_cast<int64_t>(kv_row_offset + token) * kv_heads + h) * head_dim;
-  } else {
-    const int h = head - q_heads - kv_heads;
-    column = q_width + kv_width + static_cast<int64_t>(h) * head_dim;
-    destination = v + (static_cast<int64_t>(kv_row_offset + token) * kv_heads + h) * head_dim;
-    rotate = false;
-  }
+
+  extern __shared__ float trig[];  // [2 * half]: cosine then sine.
   for (int pair = threadIdx.x; pair < half; pair += blockDim.x) {
+    const float frequency = powf(theta, -static_cast<float>(pair) / half);
+    float sine, cosine;
+    sincosf(position * frequency, &sine, &cosine);
+    trig[pair] = cosine;
+    trig[half + pair] = sine;
+  }
+  __syncthreads();
+
+  const int slots = heads * half;
+  for (int slot = threadIdx.x; slot < slots; slot += blockDim.x) {
+    const int head = slot / half;
+    const int pair = slot - head * half;
+    int64_t column;  // offset of this head inside the packed projection
+    bf16* destination;
+    bool rotate = true;
+    if (head < q_heads) {
+      column = static_cast<int64_t>(head) * head_dim;
+      destination = q + (static_cast<int64_t>(token) * q_heads + head) * head_dim;
+    } else if (head < q_heads + kv_heads) {
+      const int h = head - q_heads;
+      column = q_width + static_cast<int64_t>(h) * head_dim;
+      destination = k + (static_cast<int64_t>(kv_row_offset + token) * kv_heads + h) * head_dim;
+    } else {
+      const int h = head - q_heads - kv_heads;
+      column = q_width + kv_width + static_cast<int64_t>(h) * head_dim;
+      destination = v + (static_cast<int64_t>(kv_row_offset + token) * kv_heads + h) * head_dim;
+      rotate = false;
+    }
     float first = ld(qkv, row + column + pair);
     float second = ld(qkv, row + column + half + pair);
     if (bias != nullptr) {
@@ -363,9 +385,8 @@ __global__ void split_qkv_rope_kernel(const bf16* qkv, const bf16* bias, bf16* q
       second += ld(bias, column + half + pair);
     }
     if (rotate) {
-      const float frequency = powf(theta, -static_cast<float>(pair) / half);
-      float sine, cosine;
-      sincosf(position * frequency, &sine, &cosine);
+      const float cosine = trig[pair];
+      const float sine = trig[half + pair];
       destination[pair] = f32_to_bf16(first * cosine - second * sine);
       destination[half + pair] = f32_to_bf16(second * cosine + first * sine);
     } else {
@@ -728,8 +749,8 @@ extern "C" int apxinf_hip_native_split_qkv_rope(const void* qkv, const void* bia
     return kInvalidArgument;
   }
   const int half = head_dim / 2;
-  const int block = half >= kAttentionBlock ? kAttentionBlock : ((half + 31) / 32) * 32;
-  split_qkv_rope_kernel<<<dim3(tokens, q_heads + 2 * kv_heads), block, 0, as_stream(stream)>>>(
+  const int block = 512;
+  split_qkv_rope_kernel<<<tokens, block, half * 2 * sizeof(float), as_stream(stream)>>>(
       in(qkv), in(bias), out(q), out(k), out(v), q_heads, kv_heads, head_dim, theta,
       position_offset, kv_row_offset);
   return last_launch_status();
