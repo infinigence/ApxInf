@@ -19,9 +19,16 @@ graph lifetime, and the flow schedule.
 | --- | --- |
 | Jetson AGX Thor (SM110) | BF16, calibrated FP8 |
 | Jetson AGX Orin (SM87) | BF16, INT8/W8A8 |
+| AMD gfx1151 (HIP) | BF16 |
 
 `model_variant="auto"` selects BF16 on both platforms. Unsupported combinations
 fail at load time; they never silently fall back to another precision.
+
+AMD GPUs run the independent HIP port `hip_gr00t/` (registered as
+`Gr00tN1d7-hip`), not the CUDA executor pair below — the same accuracy
+fixtures gate both; see [the HIP port notes](hip-gr00t.md). It is BF16 only:
+gfx1151 has no FP8 tensor cores, so quantization requests are refused with
+the hardware reason rather than silently falling back.
 
 The loader selects the precision exactly once and constructs a concrete
 runtime/executor pair:
@@ -200,6 +207,7 @@ not copied into the read-only checkpoint and is not committed to this tree.
 | Thor | FP8 | 32.557 ms | 35.436 ms |
 | Orin | BF16 | 75.778 ms | 84.864 ms |
 | Orin | W8A8 | 56.711 ms | 64.924 ms |
+| gfx1151 (HIP, BF16, graph) | BF16 | — | 73.1 ms |
 
 ## LIBERO-10 task accuracy
 
