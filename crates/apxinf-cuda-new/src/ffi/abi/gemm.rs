@@ -123,6 +123,12 @@ unsafe extern "C" {
         target_layout: u32,
         stream: CudaStream,
     ) -> i32;
+    pub(crate) fn apxinf_gemm_scratch_bytes(execution: Execution) -> u64;
+    pub(crate) fn apxinf_gemm_bind_scratch(
+        execution: Execution,
+        buffer: *mut c_void,
+        bytes: u64,
+    ) -> i32;
     pub(crate) fn apxinf_gemm_destroy(execution: Execution);
     pub(crate) fn apxinf_gemm_nvfp4_scale_buffer_bytes(rows: i64, k: i64, sf_vec_size: u32) -> u64;
     pub(crate) fn apxinf_gemm_nvfp4_pack_block_scales(
