@@ -331,6 +331,173 @@ __global__ void single_token_attention_hd32(
         from_float<T>(partial[0][threadIdx.x] + partial[1][threadIdx.x]);
 }
 
+// Single-token decode (batch 1, query_tokens 1) for 128-channel heads. One
+// block per query head, eight warps: warp w owns one contiguous slice of the
+// valid keys and each lane owns four consecutive channels, so a
+// warp reads one 256 B key row as 32 aligned 8 B loads and reduces the dot
+// product with a shuffle tree. Softmax is a block-wide max/sum over the score
+// copy in shared memory; the value pass accumulates four channels per lane and
+// combines the eight warp partials in shared memory.
+//
+// Accuracy contract. The dot product, the softmax sums and the value pass
+// reduce as trees rather than the reference's sequential scan, so FP32
+// rounding differs; the path therefore serves only Flexible numerics, and the
+// operator reference tests plus the audio-level token gate decide it.
+template <class T>
+__device__ inline float decode_dot4(const int2& raw, const float* values) {
+  const T* head = reinterpret_cast<const T*>(&raw);
+  return values[0] * to_float(head[0]) + values[1] * to_float(head[1]) +
+         values[2] * to_float(head[2]) + values[3] * to_float(head[3]);
+}
+
+template <class T>
+__global__ void single_token_attention_hd128(
+    const T* query, const T* key, const T* value, T* output, int key_tokens,
+    int query_heads, int kv_heads, bool causal, int query_start,
+    const uint32_t* meta, float scale) {
+  constexpr int head_dim = 128;
+  constexpr int warps = 8;
+  __shared__ float scores[1024];
+  __shared__ float partial[warps][head_dim];
+  __shared__ float scratch[warps];
+
+  const int head = blockIdx.x;
+  const int kv_head = head / (query_heads / kv_heads);
+  const int valid = runtime_valid_keys(key_tokens, causal, query_start, 0, meta);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int channel = lane * 4;
+  const int64_t row_stride = static_cast<int64_t>(kv_heads) * head_dim;
+
+  float query_values[4];
+  {
+    const int2 raw = *reinterpret_cast<const int2*>(
+        query + static_cast<int64_t>(head) * head_dim + channel);
+    const T* head_values = reinterpret_cast<const T*>(&raw);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) query_values[i] = to_float(head_values[i]);
+  }
+
+  const int chunk = (valid + warps - 1) / warps;
+  const int begin = warp * chunk;
+  const int end = min(valid, begin + chunk);
+  const T* key_base = key + static_cast<int64_t>(kv_head) * head_dim + channel;
+  int token = begin;
+  for (; token + 3 < end; token += 4) {
+    const int2 r0 = *reinterpret_cast<const int2*>(
+        key_base + static_cast<int64_t>(token + 0) * row_stride);
+    const int2 r1 = *reinterpret_cast<const int2*>(
+        key_base + static_cast<int64_t>(token + 1) * row_stride);
+    const int2 r2 = *reinterpret_cast<const int2*>(
+        key_base + static_cast<int64_t>(token + 2) * row_stride);
+    const int2 r3 = *reinterpret_cast<const int2*>(
+        key_base + static_cast<int64_t>(token + 3) * row_stride);
+    float d0 = decode_dot4<T>(r0, query_values);
+    float d1 = decode_dot4<T>(r1, query_values);
+    float d2 = decode_dot4<T>(r2, query_values);
+    float d3 = decode_dot4<T>(r3, query_values);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      d0 += __shfl_down_sync(0xffffffffu, d0, offset);
+      d1 += __shfl_down_sync(0xffffffffu, d1, offset);
+      d2 += __shfl_down_sync(0xffffffffu, d2, offset);
+      d3 += __shfl_down_sync(0xffffffffu, d3, offset);
+    }
+    if (lane == 0) {
+      scores[token + 0] = d0 * scale;
+      scores[token + 1] = d1 * scale;
+      scores[token + 2] = d2 * scale;
+      scores[token + 3] = d3 * scale;
+    }
+  }
+  for (; token < end; ++token) {
+    const int2 raw = *reinterpret_cast<const int2*>(
+        key_base + static_cast<int64_t>(token) * row_stride);
+    float dot = decode_dot4<T>(raw, query_values);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+      dot += __shfl_down_sync(0xffffffffu, dot, offset);
+    if (lane == 0) scores[token] = dot * scale;
+  }
+  __syncthreads();
+
+  float local_max = -CUDART_INF_F;
+  for (int index = threadIdx.x; index < valid; index += blockDim.x)
+    local_max = fmaxf(local_max, scores[index]);
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    local_max =
+        fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, offset));
+  if (lane == 0) scratch[warp] = local_max;
+  __syncthreads();
+  float maximum = scratch[0];
+  #pragma unroll
+  for (int w = 1; w < warps; ++w) maximum = fmaxf(maximum, scratch[w]);
+  __syncthreads();
+
+  float local_sum = 0.0F;
+  for (int index = threadIdx.x; index < valid; index += blockDim.x) {
+    const float weight = expf(scores[index] - maximum);
+    scores[index] = weight;
+    local_sum += weight;
+  }
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
+  if (lane == 0) scratch[warp] = local_sum;
+  __syncthreads();
+  float total = 0.0F;
+  #pragma unroll
+  for (int w = 0; w < warps; ++w) total += scratch[w];
+  const float inverse = 1.0F / total;
+
+  float accumulated[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+  const T* value_base =
+      value + static_cast<int64_t>(kv_head) * head_dim + channel;
+  token = begin;
+  for (; token + 3 < end; token += 4) {
+    const int2 r0 = *reinterpret_cast<const int2*>(
+        value_base + static_cast<int64_t>(token + 0) * row_stride);
+    const int2 r1 = *reinterpret_cast<const int2*>(
+        value_base + static_cast<int64_t>(token + 1) * row_stride);
+    const int2 r2 = *reinterpret_cast<const int2*>(
+        value_base + static_cast<int64_t>(token + 2) * row_stride);
+    const int2 r3 = *reinterpret_cast<const int2*>(
+        value_base + static_cast<int64_t>(token + 3) * row_stride);
+    const float w0 = scores[token + 0] * inverse;
+    const float w1 = scores[token + 1] * inverse;
+    const float w2 = scores[token + 2] * inverse;
+    const float w3 = scores[token + 3] * inverse;
+    const T* h0 = reinterpret_cast<const T*>(&r0);
+    const T* h1 = reinterpret_cast<const T*>(&r1);
+    const T* h2 = reinterpret_cast<const T*>(&r2);
+    const T* h3 = reinterpret_cast<const T*>(&r3);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+      accumulated[i] += w0 * to_float(h0[i]) + w1 * to_float(h1[i]) +
+                        w2 * to_float(h2[i]) + w3 * to_float(h3[i]);
+  }
+  for (; token < end; ++token) {
+    const int2 raw = *reinterpret_cast<const int2*>(
+        value_base + static_cast<int64_t>(token) * row_stride);
+    const T* head_values = reinterpret_cast<const T*>(&raw);
+    const float weight = scores[token] * inverse;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i)
+      accumulated[i] += weight * to_float(head_values[i]);
+  }
+  #pragma unroll
+  for (int i = 0; i < 4; ++i) partial[warp][channel + i] = accumulated[i];
+  __syncthreads();
+  for (int index = threadIdx.x; index < head_dim; index += blockDim.x) {
+    float result = partial[0][index];
+    #pragma unroll
+    for (int w = 1; w < warps; ++w) result += partial[w][index];
+    output[static_cast<int64_t>(head) * head_dim + index] =
+        from_float<T>(result);
+  }
+}
+
 template <class T>
 cudaError_t launch_attention(const void* query, const void* key,
                              const void* value, void* output,
@@ -354,6 +521,15 @@ cudaError_t launch_attention(const void* query, const void* key,
     single_token_attention_hd32<T><<<query_heads,256,key_tokens*sizeof(float),stream>>>(
         static_cast<const T*>(query),static_cast<const T*>(key),static_cast<const T*>(value),
         static_cast<T*>(output),key_tokens,key_stride,query_heads,kv_heads,
+        causal,query_start,decode_meta,scale);
+    return cudaGetLastError();
+  }
+  if (fast_single_token && vector_aligned && batch == 1 && query_tokens == 1 &&
+      decode_meta != nullptr && head_dim == 128 && query_heads % kv_heads == 0 &&
+      key_tokens <= 1024) {
+    single_token_attention_hd128<T><<<query_heads,256,0,stream>>>(
+        static_cast<const T*>(query),static_cast<const T*>(key),static_cast<const T*>(value),
+        static_cast<T*>(output),key_tokens,query_heads,kv_heads,
         causal,query_start,decode_meta,scale);
     return cudaGetLastError();
   }
