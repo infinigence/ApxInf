@@ -27,6 +27,7 @@ namespace {
 #include "../../kernels/primitives/reduction.cuh"
 #include "../../kernels/primitives/quantization.cuh"
 #include "../../kernels/quantization/casts.cuh"
+#include "../../kernels/quantization/rotate_rows.cuh"
 
 using apxinf::framework::Failure;
 
@@ -167,6 +168,19 @@ cudaError_t launch_quantize_rows_bf16_int8(
   return cudaGetLastError();
 }
 
+cudaError_t launch_rotate_quantize_rows_bf16_int8(
+    const void* input, void* output, void* scales,
+    int rows, int cols, cudaStream_t stream) {
+  if (input == nullptr || output == nullptr || scales == nullptr ||
+      rows <= 0 || cols <= 0 || cols % kRotateGroup != 0) {
+    return cudaErrorInvalidValue;
+  }
+  rotate_quantize_rows_bf16_int8_kernel<<<rows, kRotateThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(input), static_cast<int8_t*>(output),
+      static_cast<float*>(scales), rows, cols);
+  return cudaGetLastError();
+}
+
 bool valid_alignment(uint32_t alignment) {
   return alignment <= 256 && alignment != 0 &&
          (alignment & (alignment - 1)) == 0;
@@ -175,6 +189,7 @@ bool valid_alignment(uint32_t alignment) {
 bool has_row_scales(uint32_t semantic) {
   return semantic == APXINF_QUANTIZATION_SEMANTIC_ROWWISE_E4M3 ||
          semantic == APXINF_QUANTIZATION_SEMANTIC_ROWWISE_I8 ||
+         semantic == APXINF_QUANTIZATION_SEMANTIC_ROTATE_ROWWISE_I8 ||
          semantic == APXINF_QUANTIZATION_SEMANTIC_SILU_MUL_ROWWISE_I8;
 }
 
@@ -208,7 +223,7 @@ void validate_recorded_alignment(const void* pointer, uint32_t alignment,
 
 void validate_spec(const apxinf_quantization_spec_t& spec) {
   if (spec.version != APXINF_QUANTIZATION_SPEC_VERSION ||
-      spec.semantic > APXINF_QUANTIZATION_SEMANTIC_SILU_MUL_ROWWISE_I8 ||
+      spec.semantic > APXINF_QUANTIZATION_SEMANTIC_ROTATE_ROWWISE_I8 ||
       spec.scale_dtype != APXINF_DTYPE_F32 || spec.rows <= 0 ||
       spec.input_cols <= 0 || spec.output_cols <= 0 ||
       spec.rows > INT32_MAX || spec.input_cols > INT32_MAX ||
@@ -286,6 +301,16 @@ void validate_spec(const apxinf_quantization_spec_t& spec) {
           spec.input_cols != spec.output_cols) {
         throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                       "invalid rowwise INT8 Spec");
+      }
+      break;
+    case APXINF_QUANTIZATION_SEMANTIC_ROTATE_ROWWISE_I8:
+      if (spec.input_dtype != APXINF_DTYPE_BF16 ||
+          spec.output_dtype != APXINF_DTYPE_I8 ||
+          spec.input_cols != spec.output_cols ||
+          spec.input_cols % kRotateGroup != 0 || spec.input_alignment < 16 ||
+          spec.output_alignment < 8) {
+        throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
+                      "invalid rotated rowwise INT8 Spec");
       }
       break;
     default:
@@ -368,6 +393,10 @@ cudaError_t launch(const apxinf_runtime& runtime,
                                        input_cols, output_cols, stream);
     case APXINF_QUANTIZATION_SEMANTIC_ROWWISE_I8:
       return launch_quantize_rows_bf16_int8(
+          bindings.input, bindings.output, bindings.scales, rows, input_cols,
+          stream);
+    case APXINF_QUANTIZATION_SEMANTIC_ROTATE_ROWWISE_I8:
+      return launch_rotate_quantize_rows_bf16_int8(
           bindings.input, bindings.output, bindings.scales, rows, input_cols,
           stream);
     case APXINF_QUANTIZATION_SEMANTIC_SILU_MUL_ROWWISE_I8: {

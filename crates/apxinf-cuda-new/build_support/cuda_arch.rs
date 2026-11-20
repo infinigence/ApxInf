@@ -107,7 +107,7 @@ pub fn target_features(target: &ArchTarget) -> u64 {
     if target.cutlass_arch == "sm_89" {
         features |= DEVICE_FEATURE_CUTLASS_SM89_BF16_GEGLU;
     }
-    if target.cutlass_arch == "sm_87" {
+    if matches!(target.cutlass_arch.as_str(), "sm_87" | "sm_89") {
         features |= DEVICE_FEATURE_CUTLASS_SM87_W8A8;
     }
     if target.sm() == 110 {
