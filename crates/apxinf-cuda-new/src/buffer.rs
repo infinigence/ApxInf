@@ -149,6 +149,51 @@ impl CudaBuffer {
         })
     }
 
+    /// Enqueue a copy of `region[src_offset..src_offset + len]` to `self[dst_offset..]` on `stream` and return without
+    /// waiting for it (a region that is not page-locked may block this thread while the driver stages the bytes). The
+    /// region stays valid until the copy completes: dropping it waits for the device. Order later work on the copy with
+    /// a [`crate::CudaEvent`] recorded on `stream`.
+    pub fn copy_from_region_async(
+        &self,
+        dst_offset: usize,
+        region: &PinnedRegion,
+        src_offset: usize,
+        len: usize,
+        stream: &crate::CudaStream,
+    ) -> Result<(), String> {
+        if src_offset
+            .checked_add(len)
+            .is_none_or(|end| end > region.len())
+        {
+            return Err(format!(
+                "region copy [{src_offset}..+{len}] exceeds {} bytes",
+                region.len()
+            ));
+        }
+        if dst_offset.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(format!(
+                "region copy of {len} bytes at {dst_offset} exceeds the {}-byte buffer",
+                self.len
+            ));
+        }
+        if stream.device() != self.device {
+            return Err(format!(
+                "CUDA buffer is on device {}, but copy stream targets device {}",
+                self.device,
+                stream.device()
+            ));
+        }
+        stream.with_current_device(|| unsafe {
+            ffi::check_cuda(ffi::cudaMemcpyAsync(
+                (self.ptr as *mut u8).add(dst_offset) as *mut c_void,
+                region.bytes().as_ptr().add(src_offset) as *const c_void,
+                len,
+                ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream.handle(),
+            ))
+        })
+    }
+
     /// Copy data from this device buffer to host.
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<(), String> {
         assert!(dst.len() <= self.len, "destination exceeds buffer size");
@@ -455,6 +500,82 @@ impl CudaBuffer {
     }
 }
 
+/// Host bytes that device copies read directly, optionally page-locked for DMA.
+///
+/// `owner` keeps the bytes alive (for example a read-only file map). [`Self::register`] page-locks them with
+/// `cudaHostRegister`, so [`CudaBuffer::copy_from_region_async`] becomes a DMA with no CPU copy and no staging buffer.
+/// An unregistered region is copied through the driver's pageable path, which is correct but slower and may block the
+/// calling thread while it stages. Registration pins host memory until the region is dropped; dropping waits for the
+/// device to finish every copy issued from it, then unregisters.
+pub struct PinnedRegion {
+    owner: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    device: usize,
+    pinned: bool,
+}
+
+impl PinnedRegion {
+    /// A region whose copies use the pageable path.
+    pub fn unregistered(owner: Arc<dyn AsRef<[u8]> + Send + Sync>, device: usize) -> Self {
+        Self { owner, device, pinned: false }
+    }
+
+    /// Page-lock the bytes. On failure nothing is registered; callers that can live without DMA fall back to
+    /// [`Self::unregistered`] (the driver or file system may refuse, or host memory limits may be exceeded).
+    pub fn register(owner: Arc<dyn AsRef<[u8]> + Send + Sync>, device: usize) -> Result<Self, String> {
+        let bytes: &[u8] = (*owner).as_ref();
+        if bytes.is_empty() {
+            return Ok(Self::unregistered(owner, device));
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
+            // read-only: the device never writes through this registration, so read-only file maps are accepted
+            let status = ffi::cudaHostRegister(
+                bytes.as_ptr() as *mut c_void,
+                bytes.len(),
+                ffi::cudaHostRegisterPortable | ffi::cudaHostRegisterReadOnly,
+            );
+            if status != ffi::CUDA_SUCCESS {
+                // A refused registration is recoverable (callers fall back to the pageable path), but the runtime
+                // keeps the error pending and the next native call that checks `cudaGetLastError` would report it.
+                let _ = ffi::cudaGetLastError();
+            }
+            ffi::check_cuda(status)?;
+        }
+        Ok(Self { owner, device, pinned: true })
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        (*self.owner).as_ref()
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes().is_empty()
+    }
+
+    /// Whether copies from this region are DMA transfers.
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+}
+
+impl Drop for PinnedRegion {
+    fn drop(&mut self) {
+        if !self.pinned {
+            return;
+        }
+        unsafe {
+            // copies issued from this region may still be in flight
+            let _ = ffi::cudaSetDevice(self.device as i32);
+            let _ = ffi::cudaDeviceSynchronize();
+            let _ = ffi::cudaHostUnregister(self.bytes().as_ptr() as *mut c_void);
+        }
+    }
+}
+
 /// Page-locked host memory mapped into the CUDA device address space.
 ///
 /// This is used for small graph inputs (for example token and position IDs)
@@ -589,5 +710,21 @@ mod tests {
         let mut output = vec![0xff; buffer.len()];
         buffer.copy_to_host_on(&mut output, ctx.stream()).unwrap();
         assert_eq!(output, vec![0; buffer.len()]);
+    }
+
+    /// A failed registration is an expected outcome (the driver may refuse, or the device may lack read-only
+    /// registration), and callers continue on the pageable path. It must not leave the runtime's pending error behind:
+    /// the next native call that checks `cudaGetLastError` would report it as its own failure.
+    #[test]
+    fn failed_registration_leaves_no_pending_error() {
+        let _guard = crate::CUDA_TEST_LOCK.lock().unwrap();
+        let _ = unsafe { ffi::cudaGetLastError() };
+        let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(vec![0u8; 1 << 20]);
+        // Registering the same bytes twice fails the second time on every device; a device without read-only
+        // registration already fails the first.
+        let first = PinnedRegion::register(Arc::clone(&owner), 0);
+        let second = PinnedRegion::register(Arc::clone(&owner), 0);
+        assert!(first.is_err() || second.is_err(), "no registration failed");
+        assert_eq!(unsafe { ffi::cudaPeekAtLastError() }, ffi::CUDA_SUCCESS);
     }
 }
