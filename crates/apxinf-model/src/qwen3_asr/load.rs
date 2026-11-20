@@ -25,6 +25,12 @@ pub fn load(
         Device::Cuda(device_id) => device_id,
         other => return Err(Error::UnsupportedDevice(other)),
     };
-    let model = Qwen3AsrModel::load(path, device_id, options.autotune)?;
+    let recipe = crate::auto::cuda_recipe_options(options)?;
+    let model = Qwen3AsrModel::load_with_recipe_options(
+        path,
+        device_id,
+        recipe.online_tune,
+        recipe.cache_dir,
+    )?;
     Ok(LoadedModel::Asr(Box::new(model)))
 }

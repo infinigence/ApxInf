@@ -70,7 +70,23 @@ pub struct Qwen3AsrModel {
 impl Qwen3AsrModel {
     /// Load a converted checkpoint directory (single `weights.safetensors`).
     pub fn load(directory: &Path, device_id: usize, autotune: bool) -> Result<Self> {
-        let ctx = Context::new_with_autotune(device_id, autotune).map_err(Error::Cuda)?;
+        Self::load_with_recipe_options(directory, device_id, autotune, None)
+    }
+
+    /// Load with an explicit recipe cache directory.
+    ///
+    /// The context created here is the model's own, so it must carry the load
+    /// options the caller resolved (online-tune permission and the recipe
+    /// directory); otherwise recipes resolve against the process working
+    /// directory instead of the caller's tuning directory.
+    pub fn load_with_recipe_options(
+        directory: &Path,
+        device_id: usize,
+        autotune: bool,
+        recipe_cache_dir: Option<String>,
+    ) -> Result<Self> {
+        let ctx = Context::new_with_recipe_options(device_id, autotune, recipe_cache_dir)
+            .map_err(Error::Cuda)?;
         let mut weights = Weights::load(directory)?;
         let frontend = Frontend::load(&mut weights, &ctx)?;
         let decode_state = RefCell::new(DecodeState::alloc(&ctx)?);
