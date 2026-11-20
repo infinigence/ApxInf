@@ -2,6 +2,8 @@
 
 pub mod config;
 pub mod gguf;
+pub mod mapped;
 pub mod safetensors;
 
 pub use config::ModelConfig;
+pub use mapped::MappedFile;

@@ -42,6 +42,7 @@ fn every_l3_operator_appears_once_in_cuda_operator_doc() {
         )
         .chain(crate::ops::volume::DOC_IDS.iter().copied())
         .chain(crate::ops::rope::DOC_IDS.iter().copied())
+        .chain(crate::ops::conv1d::DOC_IDS.iter().copied())
         .chain([
             "ChannelL2Norm",
             "ChannelL2NormSilu",

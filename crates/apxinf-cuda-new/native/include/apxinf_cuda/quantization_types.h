@@ -19,6 +19,12 @@
  * SILU_MUL_ROWWISE_I8
  *                  two BF16 inputs -> I8 output plus F32 scales [rows],
  *                  preserving the rounded SiLU-multiply contract.
+ * ROTATE_ROWWISE_I8
+ *                  BF16 input [rows, cols] -> I8 output plus F32 scales [rows].
+ *                  Every 256-column group is first multiplied by the
+ *                  normalized regular Hadamard matrix H (H == H^T, H*H == I)
+ *                  in FP32, then each row is quantized as ROWWISE_I8.
+ *                  cols must be a multiple of 256.
  */
 typedef enum {
   APXINF_QUANTIZATION_SEMANTIC_FIXED_E4M3 = 0,
@@ -29,9 +35,10 @@ typedef enum {
   APXINF_QUANTIZATION_SEMANTIC_CAST_BF16_F32 = 5,
   APXINF_QUANTIZATION_SEMANTIC_CAST_F32_BF16 = 6,
   APXINF_QUANTIZATION_SEMANTIC_SILU_MUL_ROWWISE_I8 = 7,
+  APXINF_QUANTIZATION_SEMANTIC_ROTATE_ROWWISE_I8 = 8,
 } apxinf_quantization_semantic_t;
 
-#define APXINF_QUANTIZATION_SPEC_VERSION 2u
+#define APXINF_QUANTIZATION_SPEC_VERSION 3u
 
 typedef struct {
   uint32_t version;

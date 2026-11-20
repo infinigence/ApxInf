@@ -30,7 +30,7 @@ sha2 = "0.10"
 default = []
 openblas = ["apxinf-cpu/openblas"]
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
-cuda = ["dep:apxinf-cuda-new"]
+cuda = ["dep:apxinf-cuda-new", "dep:apxinf-tokenizer"]
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
 # Core ML (Apple Neural Engine) stages in Metal families; implies `mlx`.
 coreml = ["mlx", "dep:apxinf-coreml", "apxinf-coreml/native"]
@@ -111,6 +111,14 @@ required-features = ["cuda"]
 
 [[example]]
 name = "cosmos_policy_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "minimax_h3_image_generate"
+required-features = ["cuda"]
+
+[[example]]
+name = "minimax_h3_generate"
 required-features = ["cuda"]
 
 [[example]]
