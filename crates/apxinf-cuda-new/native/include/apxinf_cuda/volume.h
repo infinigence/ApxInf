@@ -21,6 +21,10 @@ apxinf_status_t apxinf_conv3d_prepare(apxinf_runtime_t runtime,
 apxinf_status_t apxinf_conv3d_enqueue(void* execution);
 void apxinf_conv3d_destroy(void* execution);
 const char* apxinf_conv3d_summary(void* execution);
+// NHWC RGB u8 -> THWC BF16 2x2 patches, channels ordered (c, x, y).
+apxinf_status_t apxinf_rgb_patch2x2(apxinf_runtime_t runtime,
+    const void* input, void* output, int64_t frames, int64_t height,
+    int64_t width, apxinf_cuda_stream_t stream);
 #ifdef __cplusplus
 }
 #endif

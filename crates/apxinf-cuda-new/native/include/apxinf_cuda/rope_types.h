@@ -64,6 +64,8 @@ typedef enum {
   APXINF_ROPE_ROTATION_AXIAL_IDS = 3,
   APXINF_ROPE_ROTATION_MULTIMODAL_IDS = 4,
   APXINF_ROPE_ROTATION_PRECOMPUTED_TABLE = 5,
+  /* Same layout as MULTIMODAL_IDS, but positions are f32 (fps-modulated). */
+  APXINF_ROPE_ROTATION_MULTIMODAL_F32_IDS = 6,
 } apxinf_rope_rotation_source_t;
 
 typedef enum {
@@ -115,7 +117,8 @@ typedef struct {
   /* DECODE_QKV_CACHE-only K/V source rows. */
   const void* key_input;
   const void* value_input;
-  /* Stable device u32 read at enqueue/replay time. */
+  /* Stable device position ids read at enqueue/replay time. u32 for the ID
+     rotation sources; MULTIMODAL_F32_IDS reinterprets it as f32. */
   const uint32_t* position;
   /* PRECOMPUTED_TABLE: vision split uses its float2 axial table; standalone
      APPLY uses FP32 [tokens, 2, head_dim/2] cosine then sine, broadcast across

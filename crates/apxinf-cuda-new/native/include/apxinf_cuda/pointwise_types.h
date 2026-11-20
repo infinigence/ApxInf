@@ -39,6 +39,8 @@ typedef enum {
   APXINF_POINTWISE_ACTIVATION_SILU = 2,
   APXINF_POINTWISE_ACTIVATION_GELU_EXACT = 3,
   APXINF_POINTWISE_ACTIVATION_RELU = 4,
+  /* relu(x)^2, one FP32 square of the clamped value, rounded once. */
+  APXINF_POINTWISE_ACTIVATION_RELU_SQUARED = 5,
 } apxinf_pointwise_activation_t;
 
 #define APXINF_POINTWISE_SPEC_VERSION 2u

@@ -63,6 +63,7 @@ from .policies import (
     CANONICAL_STATE_KEY,
     VIEW_SLOTS,
     AutoPolicy,
+    Cosmos3EdgePolicy,
     ComposablePolicy,
     Gr00tPolicy,
     Pi05Policy,
@@ -92,6 +93,7 @@ __all__ = [
     "Gr00tPolicy",
     "WallossPolicy",
     "AutoPolicy",
+    "Cosmos3EdgePolicy",
     # offline calibration framework
     "CalibrationContext",
     "CalibrationPlan",

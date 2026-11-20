@@ -47,6 +47,8 @@ pub enum PointwiseActivation {
     Silu,
     GeluExact,
     Relu,
+    /// `relu(x)^2` (Primer / Nemotron squared-ReLU MLP).
+    ReluSquared,
 }
 
 impl PointwiseActivation {
@@ -57,6 +59,7 @@ impl PointwiseActivation {
             Self::Silu => 2,
             Self::GeluExact => 3,
             Self::Relu => 4,
+            Self::ReluSquared => 5,
         }
     }
 }

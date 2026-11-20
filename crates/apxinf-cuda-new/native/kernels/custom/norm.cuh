@@ -266,6 +266,100 @@ __global__ void channel_bias_packed_bf16(const ChannelL2Pack8* input,const Chann
  }
 }
 
+// One warp per row for the Wan2.2 VAE widths (160/320/640 channels), 16-byte
+// packs held in registers across the reduction. With Update, the optional bias
+// and residual are applied as `bf16(bf16(input + bias) + residual)` and
+// published to `hidden` in the same pass. Normalization keeps every BF16
+// rounding boundary of channel_l2_norm; only the FP32 sum order differs.
+template <int Cols, bool Update, bool Residual, bool Silu>
+__global__ void channel_l2_warp_packed_bf16(
+    const __nv_bfloat16* input, const __nv_bfloat16* bias,
+    const __nv_bfloat16* residual, __nv_bfloat16* hidden,
+    const __nv_bfloat16* weight, __nv_bfloat16* output, int rows, float eps) {
+  static_assert(Cols % 8 == 0, "16-byte packs");
+  constexpr int P = Cols / 8;
+  constexpr int N = (P + 31) / 32;
+  const int64_t row = int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  if (row >= rows) return;  // uniform per warp
+  const auto* in = reinterpret_cast<const ChannelL2Pack8*>(input) + row * P;
+  float x[N][8];
+  float sum = 0.0f;
+#pragma unroll
+  for (int n = 0; n < N; ++n) {
+    const int p = lane + n * 32;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) x[n][j] = 0.0f;
+    if (p < P) {
+      ChannelL2Pack8 a = in[p];
+      if constexpr (Update) {
+        ChannelL2Pack8 b{}, r{};
+        if (bias) b = reinterpret_cast<const ChannelL2Pack8*>(bias)[p];
+        if constexpr (Residual) r = reinterpret_cast<const ChannelL2Pack8*>(residual)[row * P + p];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          float v = __bfloat162float(a.x[j]);
+          if (bias) v = __bfloat162float(__float2bfloat16_rn(__fadd_rn(v, __bfloat162float(b.x[j]))));
+          if constexpr (Residual) v = __fadd_rn(v, __bfloat162float(r.x[j]));
+          a.x[j] = __float2bfloat16_rn(v);
+        }
+        reinterpret_cast<ChannelL2Pack8*>(hidden)[row * P + p] = a;
+      }
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        x[n][j] = __bfloat162float(a.x[j]);
+        sum = __fadd_rn(sum, __fmul_rn(x[n][j], x[n][j]));
+      }
+    }
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    sum += __shfl_xor_sync(0xffffffff, sum, offset);
+  const float norm = __bfloat162float(__float2bfloat16(__fsqrt_rn(sum)));
+  const float denominator = __bfloat162float(__float2bfloat16(fmaxf(norm, eps)));
+  const float scale = __fsqrt_rn(static_cast<float>(Cols));
+  auto* out = reinterpret_cast<ChannelL2Pack8*>(output) + row * P;
+  const auto* w = reinterpret_cast<const ChannelL2Pack8*>(weight);
+#pragma unroll
+  for (int n = 0; n < N; ++n) {
+    const int p = lane + n * 32;
+    if (p >= P) continue;
+    const ChannelL2Pack8 g = w[p];
+    ChannelL2Pack8 o;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float divided = __bfloat162float(__float2bfloat16(__fdiv_rn(x[n][j], denominator)));
+      const float scaled = __bfloat162float(__float2bfloat16(__fmul_rn(divided, scale)));
+      float value = __bfloat162float(__float2bfloat16(__fmul_rn(scaled, __bfloat162float(g.x[j]))));
+      if constexpr (Silu) value = value / (1.0f + expf(-value));
+      o.x[j] = __float2bfloat16(value);
+    }
+    out[p] = o;
+  }
+}
+
+template <bool Update, bool Residual, bool Silu>
+inline bool launch_channel_l2_warp_packed_bf16(
+    const __nv_bfloat16* input, const __nv_bfloat16* bias,
+    const __nv_bfloat16* residual, __nv_bfloat16* hidden,
+    const __nv_bfloat16* weight, __nv_bfloat16* output, int rows, int cols,
+    float eps, cudaStream_t stream) {
+  const int blocks = (rows - 1) / 8 + 1;
+#define APXINF_CHANNEL_L2_WARP(C)                                                   \
+  case C:                                                                           \
+    channel_l2_warp_packed_bf16<C, Update, Residual, Silu><<<blocks, 256, 0, stream>>>( \
+        input, bias, residual, hidden, weight, output, rows, eps);                  \
+    return true;
+  switch (cols) {
+    APXINF_CHANNEL_L2_WARP(160)
+    APXINF_CHANNEL_L2_WARP(320)
+    APXINF_CHANNEL_L2_WARP(640)
+    default:
+      return false;
+  }
+#undef APXINF_CHANNEL_L2_WARP
+}
+
 template <class T>
 __global__ void rms_norm(const T* input, const T* weight, T* output, int rows,
                          int cols, float eps) {
@@ -762,6 +856,86 @@ __global__ void bias_residual_rms_norm(const T* projection, const T* bias,
     normalized[index] = from_float<T>(to_float(hidden[index]) * inverse_rms *
                                       to_float(weight[col]));
   }
+}
+
+// BF16-only fast path for the 2048-wide fused residual-add + RMSNorm the
+// Cosmos towers run twice per layer. One 16-byte (8-value) vector per thread:
+// 16B vector loads/stores replace scalar BF16 accesses, and the rounded
+// residual is kept in registers for the normalization pass instead of being
+// re-read from `hidden`. The reduction reads a shared-memory copy of the row
+// with the legacy thread->column assignment, so both `hidden` and `normalized`
+// are bitwise identical to the generic kernel.
+union Bf16Pack8 {
+  uint4 vector;
+  __nv_bfloat162 pair[4];
+};
+
+__global__ void bias_residual_rms_norm_bf16_packed8(
+    const __nv_bfloat16* projection, const __nv_bfloat16* bias,
+    const __nv_bfloat16* residual, const __nv_bfloat16* weight,
+    __nv_bfloat16* hidden, __nv_bfloat16* normalized, int rows, int cols,
+    float eps) {
+  __shared__ float scratch[32];
+  // Staging the rounded row in shared memory lets the reduction keep the
+  // legacy thread->column assignment (and therefore the exact FP32 sum tree)
+  // while the global traffic stays 16-byte vectorized.
+  __shared__ __nv_bfloat16 staged[2048];
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const int vec = threadIdx.x;
+  const int64_t base = static_cast<int64_t>(row) * cols + vec * 8;
+
+  Bf16Pack8 packed_projection;
+  Bf16Pack8 packed_residual;
+  Bf16Pack8 packed_weight;
+  Bf16Pack8 packed_bias;
+  packed_projection.vector = *reinterpret_cast<const uint4*>(projection + base);
+  packed_residual.vector = *reinterpret_cast<const uint4*>(residual + base);
+  packed_weight.vector = *reinterpret_cast<const uint4*>(weight + vec * 8);
+  if (bias != nullptr) {
+    packed_bias.vector = *reinterpret_cast<const uint4*>(bias + vec * 8);
+  }
+
+  Bf16Pack8 rounded;
+#pragma unroll
+  for (int pair = 0; pair < 4; ++pair) {
+    const float2 p = __bfloat1622float2(packed_projection.pair[pair]);
+    const float2 r = __bfloat1622float2(packed_residual.pair[pair]);
+    float x = p.x + r.x;
+    float y = p.y + r.y;
+    if (bias != nullptr) {
+      const float2 b = __bfloat1622float2(packed_bias.pair[pair]);
+      x += b.x;
+      y += b.y;
+    }
+    rounded.pair[pair] = __floats2bfloat162_rn(x, y);
+  }
+  *reinterpret_cast<uint4*>(hidden + base) = rounded.vector;
+  const __nv_bfloat16* rounded_values =
+      reinterpret_cast<const __nv_bfloat16*>(&rounded);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) staged[vec * 8 + i] = rounded_values[i];
+  __syncthreads();
+
+  // Same thread->column order as the scalar kernel, so the FP32 partials and
+  // the block reduction tree are bitwise identical.
+  float square_sum = 0.0f;
+#pragma unroll
+  for (int round = 0; round < 8; ++round) {
+    const float stored =
+        __bfloat162float(staged[threadIdx.x + round * blockDim.x]);
+    square_sum += stored * stored;
+  }
+  const float inverse_rms =
+      rsqrtf(block_sum_parallel_unsafe(square_sum, scratch) / cols + eps);
+#pragma unroll
+  for (int pair = 0; pair < 4; ++pair) {
+    const float2 stored = __bfloat1622float2(rounded.pair[pair]);
+    const float2 w = __bfloat1622float2(packed_weight.pair[pair]);
+    rounded.pair[pair] = __floats2bfloat162_rn(
+        stored.x * inverse_rms * w.x, stored.y * inverse_rms * w.y);
+  }
+  *reinterpret_cast<uint4*>(normalized + base) = rounded.vector;
 }
 
 template <class T>

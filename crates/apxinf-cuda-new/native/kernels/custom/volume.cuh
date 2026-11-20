@@ -3,6 +3,22 @@
 #include "../../include/apxinf_cuda/volume_types.h"
 
 namespace apxinf::volume::kernels {
+__global__ void rgb_patch2x2(const uint8_t* input, __nv_bfloat16* output,
+    int64_t frames, int64_t height, int64_t width) {
+  const int64_t count = frames * height * width * 3;
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < count; i += int64_t(gridDim.x) * blockDim.x) {
+    const int c = i % 3;
+    const int64_t pixel = i / 3;
+    const int64_t x = pixel % width;
+    const int64_t y = pixel / width % height;
+    const int64_t frame = pixel / (width * height);
+    const int64_t cell = (frame * (height / 2) + y / 2) * (width / 2) + x / 2;
+    // Preserve FP32 division/subtraction and one final BF16 rounding.
+    const float value = __fsub_rn(__fdiv_rn(float(input[i]), 127.5f), 1.0f);
+    output[cell * 12 + c * 4 + (x % 2) * 2 + y % 2] = __float2bfloat16_rn(value);
+  }
+}
 // Eight BF16 values share one neighborhood address calculation. Constant
 // channel/kernel extents turn the flattened-column divisions into multiply/
 // shift sequences. The launcher checks alignment and all 32-bit index bounds;

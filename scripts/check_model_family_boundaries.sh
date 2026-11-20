@@ -56,3 +56,5 @@ python3 "$repo_root/scripts/check_walloss_module_boundaries.py"
 python3 "$repo_root/scripts/check_cosmos_policy_module_boundaries.py"
 
 echo 'model-family boundary checks passed'
+
+python3 "$repo_root/scripts/check_cosmos3_edge_module_boundaries.py"

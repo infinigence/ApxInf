@@ -24,6 +24,9 @@ pub(crate) const ROTATION_DEVICE_SCALAR: u32 = 2;
 pub(crate) const ROTATION_AXIAL_IDS: u32 = 3;
 pub(crate) const ROTATION_MULTIMODAL_IDS: u32 = 4;
 pub(crate) const ROTATION_PRECOMPUTED_TABLE: u32 = 5;
+/// `position` holds `[tokens, 3]` f32 ids instead of u32, for streams whose
+/// temporal positions are fps-modulated and therefore fractional.
+pub(crate) const ROTATION_MULTIMODAL_F32_IDS: u32 = 6;
 
 pub(crate) const CONVENTION_NONE: u32 = 0;
 pub(crate) const CONVENTION_HALF_SPLIT: u32 = 1;

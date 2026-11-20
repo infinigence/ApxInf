@@ -4,6 +4,7 @@ mod accelerator;
 pub mod auto;
 pub mod builtin;
 pub mod cuda_cosmos_policy;
+pub mod cuda_cosmos3_edge;
 pub mod d3;
 pub mod decision;
 pub mod debug;

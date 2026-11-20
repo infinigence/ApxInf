@@ -267,6 +267,37 @@ __global__ void rope_mrope_bf16_kernel(
     output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
 }
 
+// Fps-modulated streams keep fractional temporal positions, so the same
+// three-section mRoPE reads them as f32 instead of ids.
+__global__ void rope_mrope_f32_bf16_kernel(
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    uint32_t head_dim, uint32_t n_heads, uint32_t seq_len,
+    float theta, const float* pos_ids,
+    uint32_t sec_h, uint32_t sec_w)
+{
+    uint32_t pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t head_idx = blockIdx.y;
+    uint32_t seq_idx  = blockIdx.z;
+    if (pair_idx >= head_dim / 2) return;
+
+    uint32_t axis = mrope_axis_for_pair(pair_idx, sec_h, sec_w);
+    float pos  = pos_ids[seq_idx * 3 + axis];
+
+    float freq    = 1.0f / powf(theta, 2.0f * (float)pair_idx / (float)head_dim);
+    float angle   = pos * freq;
+    float cos_val = cosf(angle);
+    float sin_val = sinf(angle);
+
+    uint32_t base = seq_idx * n_heads * head_dim + head_idx * head_dim;
+    uint32_t half = head_dim / 2;
+    uint32_t idx0 = base + pair_idx;
+    uint32_t idx1 = base + half + pair_idx;
+    float x0 = __bfloat162float(input[idx0]);
+    float x1 = __bfloat162float(input[idx1]);
+    output[idx0] = __float2bfloat16(x0 * cos_val - x1 * sin_val);
+    output[idx1] = __float2bfloat16(x0 * sin_val + x1 * cos_val);
+}
+
 
 
 // Decode-position variant: seq_len is always 1, pos_ids is a [3] u32 buffer

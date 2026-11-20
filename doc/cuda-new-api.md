@@ -134,7 +134,7 @@ pub struct GemmPolicy {
 }
 ```
 
-### 3.2 GEMM family (6 semantics)
+### 3.2 GEMM family (8 semantics)
 
 ```rust
 ops::gemm(ctx, GemmArgs) -> Result<()>                      // Y = alpha·A@B / output_scale
@@ -143,6 +143,8 @@ ops::gemm_bias_gelu(ctx, GemmBiasGeluArgs { gemm, bias }) -> Result<()>
 ops::gemm_bias_residual(ctx, GemmBiasResidualArgs { gemm, bias, residual }) -> Result<()>
 ops::gemm_geglu(ctx, GemmGegluArgs { gemm }) -> Result<()>  // B=[K,2N], gate/up halves
 ops::gemm_swiglu(ctx, GemmSwiGluArgs { gemm }) -> Result<()> // paired gate/up layout
+ops::gemm_gelu_exact(ctx, GemmArgs) -> Result<()>          // staged BF16 exact GELU
+ops::gemm_relu_squared(ctx, GemmArgs) -> Result<()>        // staged BF16 squared ReLU
 ```
 
 `GemmArgs` fields and constructors:
@@ -562,3 +564,33 @@ Hidden and normalized outputs must be disjoint; each may exactly alias an
 activation input. The backend preserves the two-stage BF16 gate/residual
 rounding and grouped normalization semantics, with an aligned 2048-column
 vectorized path and a general two-kernel fallback.
+
+
+### Cosmos3-Edge operator coverage
+
+`ops::gemm_relu_squared(ctx, GemmArgs)` computes an unquantized BF16
+projection, rounds it to BF16, then computes squared ReLU and rounds again.
+It admits unit alpha/output scale and no bias. An exact-shape SM110 CUTLASS
+epilogue is offered to autotuning for `[1971,2048] @ [2048,9216]`; the baseline
+cuBLAS plus staged activation remains available for other admitted shapes.
+`PointwiseActivation::ReluSquared` provides the separate activation contract.
+
+`ops::rope_apply_fractional_mrope_into` accepts caller-owned FP32 `[tokens,3]`
+position storage and BF16 input/output, preserving fractional temporal IDs
+without changing integer mRoPE callers. It performs no host upload or output
+allocation. `ops::rgb_patch2x2` converts rectangular NHWC u8 RGB to BF16
+`[frames,height/2,width/2,12]`, ordered `(color,patch-x,patch-y)`, with one final
+BF16 rounding after FP32 normalization. Both are Graph-capturable with retained
+input/output storage.
+
+Attention offers the joint BF16 GQA geometry Q=1971/KV=2097, heads16/8,
+dim128 to CUTLASS, and wide single-head dim640 to the existing BF16 provider.
+Causal volume lowering vectorizes 160/320/640 channels; channel-L2 normalization
+uses aligned warp kernels at these widths while retaining staged BF16 rounding
+(the FP32 reduction order differs). Aligned 2048-column fused residual/RMSNorm
+uses packed eight-element loads/stores while retaining the original reduction
+tree. Geometry and alignment misses continue through existing generic paths.
+
+The BF16 plain `1971x2048x9216` GEMM offers CUDA13 cuBLASLt split-K2/4/8
+configurations during autotuning. These additions offer candidates; they do not
+replace a persisted recipe or establish an end-to-end latency claim.
