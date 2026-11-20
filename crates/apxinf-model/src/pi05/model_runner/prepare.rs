@@ -1,7 +1,7 @@
 //! Shared PI0.5 preparation and captured resource ownership.
 use crate::pi05::backend::{
     self, capture as capture_cuda_graph, ops, transfers, Context, DeviceBuffer as CudaBuffer,
-    ExecutionSession,
+    ExecutionSession, GraphWorkspace, ProviderWorkspace,
 };
 use crate::pi05::model::Pi05Model;
 use crate::pi05::model::{ModelOperation, ModelVariant, PrepareBlocks, WorkspaceRequirements};
@@ -11,10 +11,16 @@ use std::sync::Arc;
 
 fn allocate_session(
     requirements: &WorkspaceRequirements,
-    device: usize,
+    _device: usize,
+    scratch: &ProviderWorkspace,
 ) -> Result<ExecutionSession> {
-    ExecutionSession::with_capacity(requirements.bytes, device)
+    Ok(ExecutionSession::with_provider_workspace(
+        GraphWorkspace::new_virtual(requirements.bytes)?,
+        scratch.clone(),
+    ))
 }
+/// Headroom added to the measured arena peak by `prepare_right_sized`.
+pub(super) const WORKSPACE_MARGIN: usize = 1 << 20;
 pub struct CapturedGraph {
     graph: Box<dyn Graph>,
     output: Tensor,
@@ -129,6 +135,7 @@ struct CaptureBuilder<'a, B: PrepareBlocks> {
     model: &'a Arc<Pi05Model<B>>,
     backend: &'a Arc<Context>,
     config: &'a Pi05Config,
+    scratch: &'a ProviderWorkspace,
 }
 impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
     fn ctx(&self) -> &Context {
@@ -185,23 +192,32 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
         }
         let modulation = self.model.prepare_all_modulation(time_embeddings)?;
         backend::synchronize(backend)?;
-        let session = allocate_session(
+        let mut session = allocate_session(
             &self.model.workspace_requirements(token_count)?,
             self.ctx().device_id(),
+            self.scratch,
         )?;
-        let eager_output = ops::prepare_with_session(&session, || {
-            self.infer_captured_inputs(
-                &patches,
-                raw_images.as_ref(),
-                raw_image_layout,
-                token_ids,
-                token_count,
-                noise,
-                &modulation,
-            )
-        })?;
+        let eager_output =
+            session.prepare_right_sized(self.ctx().device_id(), WORKSPACE_MARGIN, |session| {
+                ops::prepare_with_session(session, || {
+                    self.infer_captured_inputs(
+                        &patches,
+                        raw_images.as_ref(),
+                        raw_image_layout,
+                        token_ids,
+                        token_count,
+                        noise,
+                        &modulation,
+                    )
+                })
+            })?;
         backend::synchronize(backend)?;
         drop(eager_output);
+        eprintln!(
+            "π0.5 prepared workspace: reserved={} bytes, peak={} bytes",
+            session.capacity(),
+            session.used(),
+        );
 
         let captured_output = std::cell::RefCell::new(None);
         let graph = capture_cuda_graph(self.ctx(), || {
@@ -276,10 +292,10 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
             .map_err(Error::Cuda)?;
         let patch_rows = self.config.num_views * self.config.patches_per_view();
         let patch_width = 3 * self.config.patch_size * self.config.patch_size;
-        let patches = backend::to_device(backend, &Tensor::zeros(
-            vec![patch_rows, patch_width],
-            self.model.raw_patch_dtype(),
-        ))?;
+        let patches = backend::to_device(
+            backend,
+            &Tensor::zeros(vec![patch_rows, patch_width], self.model.raw_patch_dtype()),
+        )?;
         self.capture_infer_impl(
             patches,
             Some(raw_images),
@@ -303,11 +319,13 @@ pub(super) fn capture<B: PrepareBlocks>(
     count: usize,
     noise: &Tensor,
     embeddings: &[Tensor],
+    scratch: &ProviderWorkspace,
 ) -> Result<CapturedGraph> {
     let builder = CaptureBuilder {
         model,
         backend: model.backend(),
         config: model.config(),
+        scratch,
     };
     match input {
         CaptureInput::Rgb(layout) => {
@@ -320,6 +338,10 @@ pub(super) fn capture<B: PrepareBlocks>(
 }
 /// Prepare a low-level graph with caller-owned stable patch/token/noise tensors.
 /// Their storage is retained; sizes and addresses cannot change between replays.
+/// These standalone entry points use a fresh [`ProviderWorkspace`], so operator
+/// scratch is not shared across separately captured graphs; use
+/// [`Pi05ModelRunner`](super::Pi05ModelRunner) to share one workspace across
+/// profiles.
 pub fn capture_patches<B: PrepareBlocks>(
     model: &Arc<Pi05Model<B>>,
     patches: &Tensor,
@@ -335,6 +357,7 @@ pub fn capture_patches<B: PrepareBlocks>(
         count,
         noise,
         embeddings,
+        &ProviderWorkspace::default(),
     )
 }
 /// Prepare a graph that owns RGB input storage and device preprocessing.
@@ -353,11 +376,13 @@ pub fn capture_rgb<B: PrepareBlocks>(
         count,
         noise,
         embeddings,
+        &ProviderWorkspace::default(),
     )
 }
 
 pub(super) fn capture_loaded(
     model: &ModelVariant,
+    scratch: &ProviderWorkspace,
     spec: &crate::vla::InferenceSpec,
     patches: &Tensor,
     tokens: &CudaBuffer,
@@ -365,6 +390,7 @@ pub(super) fn capture_loaded(
 ) -> Result<CapturedGraph> {
     struct CaptureOperation<'a> {
         input: CaptureInput<'a>,
+        scratch: &'a ProviderWorkspace,
         tokens: &'a CudaBuffer,
         count: usize,
         noise: &'a Tensor,
@@ -383,6 +409,7 @@ pub(super) fn capture_loaded(
                 self.count,
                 self.noise,
                 embeddings,
+                self.scratch,
             )
         }
     }
@@ -392,6 +419,7 @@ pub(super) fn capture_loaded(
     };
     model.with_model(CaptureOperation {
         input,
+        scratch,
         tokens,
         count: spec.token_count,
         noise,

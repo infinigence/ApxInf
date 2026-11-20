@@ -18,6 +18,9 @@ const FIRST_PREFILL_CHUNK: usize = 64;
 const CONTINUATION_CHUNK: usize = 64;
 
 fn launch(ctx: &CudaContext, spec: &abi::Spec, bindings: &abi::Bindings) -> Result<()> {
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe { status::check(abi::apxinf_gdn_launch(ctx.runtime(), spec, bindings)) }
 }
 

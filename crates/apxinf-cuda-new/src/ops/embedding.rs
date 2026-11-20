@@ -41,6 +41,9 @@ pub fn add_position_projected(
         .map_err(|_| Error::Other("position embedding cols exceed i32".into()))?;
     let tokens_i32 = i32::try_from(tokens_per_view)
         .map_err(|_| Error::Other("tokens_per_view exceeds i32".into()))?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     unsafe {
         status::check(abi::apxinf_elementwise_bias_position_f32_bf16(
             projection_buffer.ptr(),
@@ -88,6 +91,9 @@ pub fn sinusoidal(
     let output = ctx.allocate_output(Shape::new(vec![shape[0], dim]), DType::BF16)?;
     let positions_buffer = CudaBuffer::from_tensor(positions).map_err(Error::Cuda)?;
     let output_buffer = CudaBuffer::from_tensor(&output).map_err(Error::Cuda)?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     unsafe {
         raw::check_cuda(abi::apxinf_embedding_sinusoidal_embedding_bf16(
             positions_buffer.ptr(),
@@ -116,6 +122,9 @@ pub fn lookup_into(
     embed_dim: usize,
     seq_len: usize,
 ) -> Result<()> {
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     use super::validation::{check_cuda, checked_bytes, require_address, require_buffers};
     use crate::ffi::abi::embedding as llmdec;
     require_buffers(

@@ -64,6 +64,9 @@ pub(crate) fn weighted_adaptive(
         &[input, weight, scale, shift, output],
         "weighted adaptive RMSNorm",
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(abi::apxinf_norm_adaln_rms_norm_bf16(
             gpu_ptr(input)?,
@@ -98,6 +101,9 @@ pub(crate) fn unit_offset_residual(
         &[input, residual, gate, hidden],
         "unit-offset gated residual",
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(abi::apxinf_norm_adaln_gate_residual_bf16(
             gpu_ptr(input)?,
@@ -146,6 +152,9 @@ pub(crate) fn unit_offset_residual_norm(
         ],
         "unit-offset gated residual RMSNorm",
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(abi::apxinf_norm_adaln_gate_residual_rms_bf16(
             gpu_ptr(input)?,

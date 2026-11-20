@@ -71,6 +71,7 @@ pub struct CudaContext {
     cublas: crate::cublas::CublasHandle,
     library_versions: CudaLibraryVersions,
     recipe_cache_dir: Option<String>,
+    allow_online_tune: bool,
 }
 
 impl CudaContext {
@@ -137,11 +138,19 @@ impl CudaContext {
             library_versions,
             cublas,
             recipe_cache_dir,
+            allow_online_tune,
         })
     }
 
     pub fn device_id(&self) -> usize {
         self.device_id
+    }
+
+    /// Whether this context may online-tune operators. A measurement traversal
+    /// that launches tuning kernels needs real inputs/outputs. Activation
+    /// measurement skips native selection; tuning runs after real binding.
+    pub fn allow_online_tune(&self) -> bool {
+        self.allow_online_tune
     }
     /// Default recipe directory, relative to the process working directory.
     /// An explicit operator `cache_dir` overrides this hardware/toolkit path.
@@ -203,6 +212,29 @@ impl CudaContext {
             unsafe { ffi::check_cuda(ffi::cudaMemGetInfo(&mut free, &mut total))? };
             Ok((free, total))
         })
+    }
+
+    /// Memory-aware bounds for operator workspace during online tuning.
+    ///
+    /// Returns `(workspace_limit, allow_tune)`. `workspace_limit` is clamped to
+    /// the free device memory minus a reserve; when that budget falls below a
+    /// floor, online tuning is disabled entirely so autotune never tips a
+    /// nearly-exhausted device over. On unified-memory parts (Tegra/Thor) the
+    /// figure is a system-memory estimate, so the clamp is advisory there.
+    pub fn memory_aware_tuning_budget(&self) -> (usize, bool) {
+        const RESERVE: usize = 1 << 30;
+        const FLOOR: usize = 16 << 20;
+        const DEFAULT_LIMIT: usize = 256 << 20;
+        let free = self
+            .memory_info()
+            .map(|(free, _)| free)
+            .unwrap_or(usize::MAX);
+        let budget = free.saturating_sub(RESERVE);
+        if budget < FLOOR {
+            (0, false)
+        } else {
+            (budget.min(DEFAULT_LIMIT), true)
+        }
     }
 
     /// Allocate caller-owned output storage for an L3 semantic operation.

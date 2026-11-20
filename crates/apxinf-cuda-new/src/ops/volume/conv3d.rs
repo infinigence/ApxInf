@@ -47,7 +47,7 @@ impl Default for Conv3dPolicy {
 /// Enqueue allocates nothing and graphs retain the execution and all storage.
 pub struct PreparedConv3d(Rc<Execution>);
 struct Execution {
-    raw: NonNull<std::ffi::c_void>,
+    raw: Option<NonNull<std::ffi::c_void>>,
     _storage: Vec<CudaBuffer>,
     stream: Arc<CudaStream>,
 }
@@ -195,6 +195,15 @@ impl PreparedConv3d {
             allow_fallback: selection.allow_fallback,
             cache_dir: selection.cache_dir.clone(),
         };
+        if crate::workspace::is_measurement() {
+            let mut storage = vec![input, weight, out];
+            storage.extend(history);
+            return Ok(Self(Rc::new(Execution {
+                raw: None,
+                _storage: storage,
+                stream: ctx.shared_stream(),
+            })));
+        }
         if let Some(execution) = crate::workspace::lookup_execution(&key) {
             crate::workspace::use_execution(&execution)?;
             return Ok(Self(execution));
@@ -217,12 +226,15 @@ impl PreparedConv3d {
         let mut storage = vec![input, weight, out];
         storage.extend(history);
         let execution = Rc::new(Execution {
-            raw: NonNull::new(raw).ok_or_else(|| invalid("null Conv3d execution"))?,
+            raw: Some(NonNull::new(raw).ok_or_else(|| invalid("null Conv3d execution"))?),
             // Retain only the graph-owned arena storage, not the per-tensor
             // leases: a pooled output must be reusable after its producer is
             // dead, and pinning the lease would make prepare/capture bindings
             // asymmetric. Matches GEMM's `retained_for_execution`.
-            _storage: storage.iter().map(CudaBuffer::retained_for_execution).collect(),
+            _storage: storage
+                .iter()
+                .map(CudaBuffer::retained_for_execution)
+                .collect(),
             stream: ctx.shared_stream(),
         });
         crate::workspace::store_execution(key, Rc::clone(&execution));
@@ -230,17 +242,30 @@ impl PreparedConv3d {
         Ok(Self(execution))
     }
     pub fn enqueue(&self) -> Result<()> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         crate::workspace::validate_capture_target(
             self.0.stream.device(),
             self.0.stream.handle() as usize,
         )?;
         crate::workspace::use_execution(&self.0)?;
-        unsafe { status::check(abi::apxinf_conv3d_enqueue(self.0.raw.as_ptr())) }
+        unsafe {
+            status::check(abi::apxinf_conv3d_enqueue(
+                self.0
+                    .raw
+                    .ok_or_else(|| invalid("measurement Conv3d cannot execute"))?
+                    .as_ptr(),
+            ))
+        }
     }
     /// Diagnostic implementation summary; it is not a provider-selection API.
     pub fn summary(&self) -> String {
+        let Some(raw) = self.0.raw else {
+            return "activation measurement".into();
+        };
         unsafe {
-            CStr::from_ptr(abi::apxinf_conv3d_summary(self.0.raw.as_ptr()))
+            CStr::from_ptr(abi::apxinf_conv3d_summary(raw.as_ptr()))
                 .to_string_lossy()
                 .into_owned()
         }
@@ -248,8 +273,10 @@ impl PreparedConv3d {
 }
 impl Drop for Execution {
     fn drop(&mut self) {
-        unsafe {
-            abi::apxinf_conv3d_destroy(self.raw.as_ptr());
+        if let Some(raw) = self.raw {
+            unsafe {
+                abi::apxinf_conv3d_destroy(raw.as_ptr());
+            }
         }
     }
 }

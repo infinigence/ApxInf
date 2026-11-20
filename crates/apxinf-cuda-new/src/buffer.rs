@@ -74,6 +74,9 @@ impl CudaBuffer {
 
     /// Allocate `num_bytes` of device memory.
     pub fn alloc(num_bytes: usize, device: usize) -> Result<Self, String> {
+        if crate::workspace::is_measurement() {
+            return Err("device allocation during activation measurement".into());
+        }
         unsafe {
             ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
         }
@@ -81,14 +84,62 @@ impl CudaBuffer {
         unsafe {
             ffi::check_cuda(ffi::cudaMalloc(&mut ptr, num_bytes))?;
         }
+        Ok(Self::from_allocation(ptr, num_bytes, device))
+    }
+
+    /// Like [`alloc`](Self::alloc), but reports device out-of-memory as
+    /// `Ok(None)` for callers that have a working fallback. The runtime records
+    /// the failed `cudaMalloc` as the last error; it is cleared so a later
+    /// launch check does not misattribute it. Other failures are returned.
+    pub(crate) fn try_alloc(num_bytes: usize, device: usize) -> Result<Option<Self>, String> {
+        if crate::workspace::is_measurement() {
+            return Err("allocation during activation measurement".into());
+        }
+        unsafe {
+            ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
+        }
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let status = unsafe { ffi::cudaMalloc(&mut ptr, num_bytes) };
+        if status == ffi::CUDA_ERROR_MEMORY_ALLOCATION {
+            let _ = unsafe { ffi::cudaGetLastError() };
+            return Ok(None);
+        }
+        ffi::check_cuda(status)?;
+        Ok(Some(Self::from_allocation(ptr, num_bytes, device)))
+    }
+
+    fn from_allocation(ptr: *mut c_void, num_bytes: usize, device: usize) -> Self {
         let owner: Arc<dyn std::any::Any + Send + Sync> = Arc::new(CudaAllocation { ptr });
-        Ok(Self {
+        Self {
             ptr,
             len: num_bytes,
             device,
             owner: Arc::clone(&owner),
             retained_owner: owner,
-        })
+        }
+    }
+
+    /// A synthetic-address buffer used only by a virtual measurement pass.
+    ///
+    /// The logical offset is tracked by the workspace state, not by this
+    /// synthetic pointer, which must never be dereferenced. `owner` keeps
+    /// the workspace lease alive so the block is returned to the free list on
+    /// drop; `retained_owner` is a no-op because there is no device allocation
+    /// to retain.
+    pub(crate) fn dummy(
+        len: usize,
+        device: usize,
+        offset: usize,
+        owner: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        let noop: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+        Self {
+            ptr: (crate::workspace::VIRTUAL_ADDRESS_BASE + offset) as *mut c_void,
+            len,
+            device,
+            owner,
+            retained_owner: noop,
+        }
     }
 
     /// Allocate and zero-fill.
@@ -115,6 +166,9 @@ impl CudaBuffer {
 
     /// Copy data from host to this device buffer.
     pub fn copy_from_host(&self, src: &[u8]) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         assert!(src.len() <= self.len, "source exceeds buffer size");
         unsafe {
             ffi::check_cuda(ffi::cudaMemcpy(
@@ -129,6 +183,9 @@ impl CudaBuffer {
     /// Copy host data after earlier work on `stream`, and do not return until
     /// the pageable host slice is no longer needed by CUDA.
     pub fn copy_from_host_on(&self, src: &[u8], stream: &crate::CudaStream) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         assert!(src.len() <= self.len, "source exceeds buffer size");
         if stream.device() != self.device {
             return Err(format!(
@@ -151,6 +208,9 @@ impl CudaBuffer {
 
     /// Copy data from this device buffer to host.
     pub fn copy_to_host(&self, dst: &mut [u8]) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Err("device readback during activation measurement".into());
+        }
         assert!(dst.len() <= self.len, "destination exceeds buffer size");
         unsafe {
             ffi::check_cuda(ffi::cudaMemcpy(
@@ -169,6 +229,9 @@ impl CudaBuffer {
         dst: &mut [u8],
         stream: &crate::CudaStream,
     ) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Err("device readback during activation measurement".into());
+        }
         assert!(dst.len() <= self.len, "destination exceeds buffer size");
         if stream.device() != self.device {
             return Err(format!(
@@ -191,6 +254,9 @@ impl CudaBuffer {
 
     /// Zero-fill the buffer on device, without a host staging allocation.
     pub fn zero(&self) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         unsafe { ffi::check_cuda(ffi::cudaMemset(self.ptr, 0, self.len)) }
     }
 
@@ -201,6 +267,9 @@ impl CudaBuffer {
         num_bytes: usize,
         stream: &crate::CudaStream,
     ) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         if num_bytes > self.len || num_bytes > source.len {
             return Err(format!(
                 "device copy of {num_bytes} bytes exceeds {} or {}",
@@ -226,6 +295,9 @@ impl CudaBuffer {
         num_bytes: usize,
         stream: &crate::CudaStream,
     ) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         if num_bytes > self.len {
             return Err(format!(
                 "memset of {num_bytes} bytes exceeds the {} byte buffer",
@@ -254,6 +326,9 @@ impl CudaBuffer {
         height: usize,
         stream: &crate::CudaStream,
     ) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         if width > pitch {
             return Err(format!("memset2d width {width} exceeds pitch {pitch}"));
         }
@@ -293,6 +368,9 @@ impl CudaBuffer {
     /// Unlike [`Self::zero`], this operation participates in CUDA Graph
     /// capture and preserves ordering with kernels submitted to the stream.
     pub fn zero_async(&self, stream: &crate::CudaStream) -> Result<(), String> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         if stream.device() != self.device {
             return Err(format!(
                 "CUDA buffer is on device {}, but zero stream targets device {}",
@@ -342,7 +420,7 @@ impl CudaBuffer {
                 self.len
             ));
         }
-        let ptr = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut c_void };
+        let ptr = (self.ptr as *mut u8).wrapping_add(byte_offset) as *mut c_void;
         Ok(Self {
             ptr,
             len,
@@ -370,7 +448,7 @@ impl CudaBuffer {
                 self.len
             ));
         }
-        let ptr = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut c_void };
+        let ptr = (self.ptr as *mut u8).wrapping_add(byte_offset) as *mut c_void;
         Ok(Self {
             ptr,
             len,
@@ -473,6 +551,9 @@ unsafe impl Send for HostMappedBuffer {}
 
 impl HostMappedBuffer {
     pub fn alloc(len: usize, device: usize) -> Result<Self, String> {
+        if crate::workspace::is_measurement() {
+            return Err("allocation during activation measurement".into());
+        }
         if len == 0 {
             return Err("mapped CUDA allocation must be non-empty".into());
         }

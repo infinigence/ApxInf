@@ -131,6 +131,9 @@ pub fn concat_rows_quantize_fixed_scale(
     let first_buffer = crate::CudaBuffer::from_tensor(first).map_err(Error::Cuda)?;
     let second_buffer = crate::CudaBuffer::from_tensor(second).map_err(Error::Cuda)?;
     let output_buffer = crate::CudaBuffer::from_tensor(&output).map_err(Error::Cuda)?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     unsafe {
         raw::check_cuda(abi::apxinf_quantization_concat_rows_quantize_bf16_e4m3(
             first_buffer.ptr(),

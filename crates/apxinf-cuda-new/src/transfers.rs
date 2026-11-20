@@ -66,6 +66,9 @@ pub fn copy_cuda_to_cuda(
     }
     let source = CudaBuffer::from_tensor(source).map_err(Error::Cuda)?;
     let destination = CudaBuffer::from_tensor(destination).map_err(Error::Cuda)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         ffi::check_cuda(ffi::cudaMemcpyAsync(
             destination.ptr(),
@@ -153,6 +156,9 @@ pub(crate) fn copy_tensor_2d_to_buffer(
             destination.len()
         )));
     }
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         ffi::check_cuda(ffi::cudaMemcpy2DAsync(
             destination
@@ -179,6 +185,9 @@ pub(crate) fn copy_host_to_device(
 ) -> std::result::Result<(), String> {
     let device = i32::try_from(device_id)
         .map_err(|_| format!("CUDA device id {device_id} does not fit in i32"))?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         ffi::check_cuda(ffi::cudaSetDevice(device))?;
         ffi::check_cuda(ffi::cudaMemcpy(
@@ -198,6 +207,9 @@ pub(crate) fn copy_device_to_host(
     let device = i32::try_from(device_id)
         .map_err(|_| format!("CUDA device id {device_id} does not fit in i32"))?;
     let mut destination = vec![0u8; len];
+    if crate::workspace::is_measurement() {
+        return Err("readback during activation measurement".into());
+    }
     unsafe {
         ffi::check_cuda(ffi::cudaSetDevice(device))?;
         ffi::check_cuda(ffi::cudaDeviceSynchronize())?;

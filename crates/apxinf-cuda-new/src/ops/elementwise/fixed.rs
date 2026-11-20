@@ -34,6 +34,9 @@ pub fn gather_rows(
         i64::try_from(rows).map_err(|_| Error::Other("gather rows exceed i64".into()))?;
     let cols_i64 =
         i64::try_from(cols).map_err(|_| Error::Other("gather cols exceed i64".into()))?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     unsafe {
         status::check(abi::apxinf_elementwise_gather_rows_bf16(
             input_buffer.ptr(),
@@ -73,6 +76,9 @@ pub fn replace_rows(
     let output_buffer = CudaBuffer::from_tensor(&output).map_err(apxinf_core::Error::Cuda)?;
     let rows_i64 = i64::try_from(rows).map_err(|_| invalid("row replacement rows exceed i64"))?;
     let cols_i64 = i64::try_from(cols).map_err(|_| invalid("row replacement cols exceed i64"))?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     unsafe {
         status::check(abi::apxinf_elementwise_replace_rows_bf16(
             base_buffer.ptr(),
@@ -234,6 +240,9 @@ pub fn scatter_rows_prepared(
     let output = bf16_output(ctx, destination_rows, columns)?;
     let destination_buffer = CudaBuffer::from_tensor(destination).map_err(Error::Cuda)?;
     let source_buffer = CudaBuffer::from_tensor(source).map_err(Error::Cuda)?;
+    if crate::workspace::is_measurement() {
+        return Ok(matrix_tensor(ctx, destination_rows, columns, output));
+    }
     unsafe {
         raw::check_cuda(raw::cudaMemcpyAsync(
             output.ptr(),
@@ -420,6 +429,9 @@ pub fn bias_qkv_in_place(
     let query_bias_buffer = CudaBuffer::from_tensor(query_bias).map_err(Error::Cuda)?;
     let key_bias_buffer = CudaBuffer::from_tensor(key_bias).map_err(Error::Cuda)?;
     let value_bias_buffer = CudaBuffer::from_tensor(value_bias).map_err(Error::Cuda)?;
+    if crate::workspace::is_measurement() {
+        return Ok((query, key, value));
+    }
     unsafe {
         raw::check_cuda(elementwise::apxinf_elementwise_bias_qkv_in_place_bf16(
             query_buffer.ptr(),

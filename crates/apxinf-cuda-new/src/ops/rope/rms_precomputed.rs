@@ -76,6 +76,9 @@ pub fn rms_norm_apply_precomputed(
     // storage referenced by their captured kernels even after caller tensors drop.
     let storage = Rc::new(vec![input, output, weight, table]);
     crate::workspace::retain_resource(&storage);
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_rope_rms_precomputed_launch(
             ctx.runtime(),
