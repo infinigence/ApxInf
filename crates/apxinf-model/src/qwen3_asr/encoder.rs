@@ -108,10 +108,14 @@ fn gelu_exact_into(ctx: &Context, input: &Tensor, out: &mut Tensor) -> Result<()
 }
 
 fn read_bf16(ctx: &Context, tensor: &Tensor) -> Result<Vec<f32>> {
-    ctx.synchronize().map_err(|e| Error::Other(format!("sync: {e}")))?;
     if tensor.dtype() != DType::BF16 {
         return Err(Error::Other("encoder readback expects BF16".into()));
     }
+    // Device-wide barrier: a legacy-default-stream memcpy has no ordering
+    // against the crate's non-blocking context stream (see tests.rs).
+    let _ = ctx;
+    apxinf_cuda_new::transfers::synchronize_device()
+        .map_err(|e| Error::Other(format!("readback sync: {e}")))?;
     let mut bytes = vec![0u8; tensor.numel() * 2];
     CudaBuffer::from_tensor(tensor)
         .map_err(Error::Cuda)?

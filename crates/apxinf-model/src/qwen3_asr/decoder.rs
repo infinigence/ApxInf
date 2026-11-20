@@ -110,8 +110,15 @@ pub(crate) fn add_rms_norm_into(
 }
 
 /// Device I32 `[1]` -> host value.
+///
+/// The readback is preceded by a device-wide barrier: the context stream is
+/// non-blocking, so a legacy-default-stream `cudaMemcpy` after
+/// `ctx.synchronize()` has no ordering against it and can observe a stale
+/// value (the same hazard `tests.rs` documents for the mel readback).
 pub(crate) fn id_to_host(ctx: &Context, tensor: &Tensor) -> Result<i32> {
-    ctx.synchronize().map_err(|e| Error::Other(format!("sync: {e}")))?;
+    let _ = ctx;
+    apxinf_cuda_new::transfers::synchronize_device()
+        .map_err(|e| Error::Other(format!("id read sync: {e}")))?;
     let buffer = CudaBuffer::from_tensor(tensor).map_err(Error::Cuda)?;
     let mut bytes = [0u8; 4];
     buffer
@@ -130,7 +137,7 @@ pub(crate) fn id_to_host(ctx: &Context, tensor: &Tensor) -> Result<i32> {
 /// no captured graph, no change to any numerical path. Both switches are
 /// cached in a `OnceLock`, so the disabled case costs two atomic loads per
 /// step.
-pub(crate) fn dump_logits_step(ctx: &Context, ws: &StepWorkspace) -> Result<()> {
+pub(crate) fn dump_logits_step(_ctx: &Context, ws: &StepWorkspace) -> Result<()> {
     use std::sync::OnceLock;
     static LOGITS_PATH: OnceLock<Option<String>> = OnceLock::new();
     let logits_path: Option<String> = LOGITS_PATH
@@ -143,8 +150,10 @@ pub(crate) fn dump_logits_step(ctx: &Context, ws: &StepWorkspace) -> Result<()> 
     if logits_path.is_none() && hidden_path.is_none() {
         return Ok(());
     }
-    ctx.synchronize()
-        .map_err(|e| Error::Other(format!("dump logits sync: {e}")))?;
+    // Device-wide barrier: the legacy memcpy below has no ordering against
+    // the crate's non-blocking context stream (see tests.rs).
+    apxinf_cuda_new::transfers::synchronize_device()
+        .map_err(|e| Error::Other(format!("dump sync: {e}")))?;
     use std::io::Write;
     if let Some(path) = logits_path {
         let buffer = CudaBuffer::from_tensor(&ws.logits).map_err(Error::Cuda)?;

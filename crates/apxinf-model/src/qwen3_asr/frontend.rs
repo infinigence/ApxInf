@@ -147,7 +147,12 @@ impl Frontend {
         whisper_log_mel(ctx, &mel_spec, &mut mel_f16, &mut scratch)?;
 
         // 6. Host roundtrip: read F16, zero padding frames, upload BF16.
-        ctx.synchronize().map_err(|e| Error::Other(format!("sync: {e}")))?;
+        // Device-wide barrier before the readback: a legacy-default-stream
+        // memcpy has no ordering against this crate's non-blocking context
+        // stream, so draining only that stream can read a buffer still being
+        // written (same hazard the tests' mel readback documents and fixed).
+        apxinf_cuda_new::transfers::synchronize_device()
+            .map_err(|e| Error::Other(format!("mel readback sync: {e}")))?;
         let bytes = {
             use apxinf_cuda_new::CudaBuffer;
             let buffer = CudaBuffer::from_tensor(&mel_f16).map_err(Error::Cuda)?;
