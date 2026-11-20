@@ -178,7 +178,7 @@ Omitting it or using `--model-variant auto` preserves the optimization target.
 ### Implemented speech selection
 
 [`metal_qwen3_tts`](../crates/apxinf-model/src/metal_qwen3_tts/README.md) runs
-Qwen3-TTS-12Hz-1.7B-CustomVoice through `SpeechRuntime`: batch one,
+Qwen3-TTS-12Hz-1.7B-CustomVoice through `TtsTrait`: batch one,
 non-streaming, the checkpoint's voices and languages, an optional style
 instruction and a seed. AutoModel detects it from `model_type` `qwen3_tts`.
 It follows the EngineTailor MLX parity path (mlx-audio 70f4add with reference
