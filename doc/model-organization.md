@@ -11,9 +11,10 @@ Under `crates/apxinf-model/src/`:
 | Location | Responsibility |
 | --- | --- |
 | `lib.rs`, `builtin.rs`, `registry.rs` | Exports, built-in registrations and loader lookup |
-| `auto.rs` | `AutoModel` factory, `LoadOptions`, `LoadedModel::{Text,Vla}` result |
+| `auto.rs` | `AutoModel` factory, `LoadOptions`, `LoadedModel::{Text,Vla,Decision,Image,Tts}` result |
 | `llm_trait.rs`, `generation_config.rs` | Autoregressive LLM/VLM input, generation, sampling options and output contracts |
 | `vla/mod.rs` | `VlaRuntime`, observation/request/action, prepared inference, execution policy/status |
+| `tts_trait.rs` | `TtsTrait`, the single text-to-speech contract for every TTS family: shared request core, optional sampling knobs, typed per-family extension, `GeneratedAudio`, conditioning cache and fixed-profile preparation |
 | `accelerator.rs` | Backend creation for shared loading |
 | `profiling.rs`, `debug.rs`, `nvtx.rs` | Timing and diagnostic mechanisms |
 

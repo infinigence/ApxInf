@@ -20,6 +20,7 @@ model-specific examples and historical evidence link back to it.
 | Profiling PI0.5 on MUSA with msys | [Profiling PI0.5 on MUSA](pi05-mttx.md) — markers, recordings and the two known reading defects |
 | Running the PI0.5 FP32 reference on CPU | [PI0.5 CPU reference](pi05-cpu-reference.md) — build, input and execution contracts, numerical validation |
 | Proposing Apple Neural Engine execution through Core ML | [Core ML and ANE](coreml-ane.md) — proposal under upstream review |
+| Converting, running or measuring GPT-SoVITS V5 speech synthesis | [GPT-SoVITS V5](gpt-sovits-v5.md) — checkpoint conversion, `TtsTrait` wiring, precision gate and audio-quality acceptance |
 
 PI0.5 currently separates `model/`, `model_runner/` and `weights/`. Its
 [component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)
@@ -35,6 +36,13 @@ records measured performance, accuracy, reproduction steps and runtime limits.
 Qwen3.8-27B-NVFP4 is a text LLM behind `LlmTrait` with the same
 `weights`/`model`/`model_runner` owners as single files.
 [CLI inference, benchmarking and limits](qwen38-nvfp4.md) cover Jetson Thor.
+
+GPT-SoVITS V5 is a TTS model behind `TtsTrait`, the single contract shared by
+every TTS family (Qwen3-TTS uses it too), with its phone/BERT/reference inputs
+carried in a typed extension. Its
+[conversion, wiring and quality acceptance](gpt-sovits-v5.md) cover the
+checkpoint converter, the Python text frontend boundary and the quality gates
+run against the official eager backend.
 
 ## Agent workflows
 
