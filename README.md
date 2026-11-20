@@ -725,34 +725,13 @@ Built with Rust 1.95 and 1.96; no minimum supported version is declared.
 
 ## Acknowledgement
 
-<table width="100%">
-  <colgroup>
-    <col width="25%"/>
-    <col width="75%"/>
-  </colgroup>
-  <tr>
-    <td valign="middle">
-      <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/vendor/MTLOGO-PNG/horizontal-color1.png" alt="Moore Threads logo" width="128"/>
-    </td>
-    <td valign="top">
-      <p>
-        We sincerely thank Moore Threads for providing the hardware platform, software ecosystem, and engineering support for adapting APXInf to the MTT E300. This effort focuses on the deployment and inference of the PI 0.5 model, further extending APXInf’s capabilities across diverse computing platforms and contributing valuable practical experience to the efficient on-device deployment of embodied AI models. We look forward to deeper collaboration with Moore Threads across cloud, edge, and on-device computing, jointly exploring new possibilities for efficient on-device AI deployment and applications at scale.
-      </p>
-    </td>
-  </tr>
-  <tr>
-    <td valign="middle">
-      <img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/vendor/drobotics/logo.png" alt="D-Robotics logo" width="128"/>
-    </td>
-    <td valign="top">
-      <p>
-        We sincerely thank D-Robotics for its support and collaboration during the adaptation of APXInf-robo to the RDK S600. We look forward to jointly exploring further opportunities for efficient on-device AI deployment and applications at scale.
-      </p>
-    </td>
-  </tr>
-</table>
+<img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/vendor/MTLOGO-PNG/horizontal-color1.png" alt="Moore Threads logo" width="128px" />
 
+We sincerely thank **Moore Threads** for providing the hardware platform, software ecosystem, and engineering support for adapting APXInf to the MTT E300. This effort focuses on the deployment and inference of the PI 0.5 model, further extending APXInf’s capabilities across diverse computing platforms and contributing valuable practical experience to the efficient on-device deployment of embodied AI models. We look forward to deeper collaboration with Moore Threads across cloud, edge, and on-device computing, jointly exploring new possibilities for efficient on-device AI deployment and applications at scale.
 
+<img src="https://media.githubusercontent.com/media/apxinf/apxinf.brand/refs/heads/main/vendor/drobotics/logo.png" alt="D-Robotics logo" width="128px" />
+
+We sincerely thank **D-Robotics** for its support and collaboration during the adaptation of APXInf-robo to the RDK S600. We look forward to jointly exploring further opportunities for efficient on-device AI deployment and applications at scale.
 
 The development of APXInf has been inspired by, and benefits from, the ideas and tooling of the broader open-source community.
 In particular, we would like to thank the teams and contributors behind
