@@ -835,6 +835,7 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "smolvla"
             | "smolvla_libero"
             | "cosmos-policy"
+            | "lingbot_vla2"
             | "cuda_cosmos_policy"
             | "minimax-h3-image"
             | "cuda_minimax_h3_image"

@@ -345,6 +345,21 @@ policy when a model requires it. `MropeCacheArgs` carries Q/KV head geometry,
 three rotary sections, and the cache offset; the model does not call a fused
 attention ABI or select the underlying fixed kernel.
 
+### 4.2a Fixed-shape MoE helpers
+
+```rust
+ops::moe_route(ctx, x: &Tensor /*BF16 [T,D]*/, gate: &Tensor /*BF16 [E,D]*/,
+               bias: &Tensor /*F32 [E]*/, top_k: usize, routed_scale: f32) -> Result<Tensor> // F32 [T,E]
+ops::moe_swiglu_scaled(ctx, gate: &Tensor /*BF16 [T,N]*/, up: &Tensor /*BF16 [T,N]*/,
+                       weights: &Tensor /*F32 [T,E]*/) -> Result<Tensor>                       // BF16 [T,N]
+```
+
+`moe_route` is the sigmoid token-choice router (top-k of `score + bias`, lower index
+wins ties, selected scores renormalised and scaled by `routed_scale`, dense F32
+output). `moe_swiglu_scaled` applies `silu(gate) * up * weights[t, c / (N/E)]` in one
+pass. Both allocate only their output, so they are capture-safe. Contracts and limits:
+[`cuda-operator.md`](../crates/apxinf-cuda-new/cuda-operator.md#fixed-shape-moe-helpers).
+
 ### 4.3 Norm and related fixed building blocks
 
 ```rust

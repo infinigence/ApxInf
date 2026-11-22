@@ -5,6 +5,8 @@ pub mod auto;
 pub mod builtin;
 pub mod cuda_cosmos_policy;
 pub mod cuda_minimax_h3_image;
+#[cfg(feature = "cuda")]
+pub mod cuda_lingbot_vla2;
 pub mod d3;
 pub mod decision;
 pub mod debug;

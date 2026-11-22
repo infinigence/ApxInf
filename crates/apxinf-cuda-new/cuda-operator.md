@@ -339,6 +339,36 @@ retain the input, index map, output and execution; enqueue has no allocation,
 host transfer or tuning. Noncontiguous selection and graph lifetime are tested
 in `tests/mixed_precision_ops.rs`.
 
+## Fixed-shape MoE helpers
+
+Two direct-launch helpers in `ops::moe` compose a dense-masked mixture-of-experts
+layer from ordinary GEMMs. They have no recipe, tuning or persistent state; enqueue
+allocates only the output through `CudaContext::allocate_output`, so they run
+eagerly, inside an `ExecutionSession`, and under Graph capture (tests replay with
+changed input contents). Like `silu_mul`, they are not L3 semantics with an
+`l3-operator` marker.
+
+`moe_route(ctx, x, gate, bias, top_k, routed_scale) -> F32 [T, E]` is a
+token-choice router with sigmoid scores. `x` is BF16 `[T, D]`, `gate` BF16
+`[E, D]`, `bias` F32 `[E]`. Per token, `logit[e] = dot(x[t], gate[e])` (FP32
+accumulation over BF16 products, fixed butterfly order, so repeated runs are
+bit-identical), `score = sigmoid(logit)`, and the `top_k` experts with the largest
+`score + bias` are selected, ties going to the lower index. The bias steers
+selection only. The result holds `score / (sum(selected scores) + 1e-20) *
+routed_scale` at selected experts and 0 elsewhere. Limits: `E <= 64`,
+`top_k <= min(8, E)`, `D % 8 == 0`, `T <= 4096`, 16-byte aligned `x`/`gate`, and
+`routed_scale` not NaN. One block per token.
+
+`moe_swiglu_scaled(ctx, gate, up, weights) -> BF16 [T, N]` multiplies each expert's
+SwiGLU block by its routing weight: `out[t,c] = bf16(silu(g) * u * w[t, c / (N/E)])`
+with `gate`/`up` BF16 `[T, N]`, `weights` F32 `[T, E]` and `N % E == 0`. All
+arithmetic is FP32 with one final rounding. Experts with weight 0 produce exact
+zeros, so one `K = N` down projection over the concatenated expert weights sums
+only the selected experts and equals sparse dispatch. An 8-element vector path is
+used when `N`, `N/E` and the three pointers are 8-element/16-byte aligned,
+otherwise a scalar path with identical numerics. The output must not overlap the
+inputs.
+
 ## Precomputed RMSNorm + rotary embedding
 
 `ops::rope::rms_norm_apply_precomputed(ctx, input, weight, table, epsilon, output)`

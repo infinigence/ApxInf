@@ -7,6 +7,7 @@ pub mod embedding;
 pub mod gather;
 pub mod gdn;
 pub mod gemm;
+pub mod moe;
 pub mod norm;
 pub mod pillow_bicubic;
 pub mod pointwise;
@@ -62,6 +63,7 @@ pub use gemm::{
     GemmQuantization, GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales,
     OutputMajorSlot, RepackedWeight, WeightVersion,
 };
+pub use moe::{moe_route, moe_swiglu_scaled};
 pub use norm::{
     channel_l2_norm, channel_l2_norm_silu, fused_add_channel_l2_norm_silu, fused_add_norm,
     residual_add, Affine, BiasOrder, ChannelL2NormArgs, FusedAddChannelL2NormArgs,

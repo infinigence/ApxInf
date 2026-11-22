@@ -368,6 +368,7 @@ fn main() {
         "embedding/fixed_decode.cu",
         "gemm/gemv.cpp",
         "gdn/fixed.cu",
+        "moe/fixed_bf16.cu",
         "norm/fixed_bf16.cu",
         "norm/fixed_decode.cu",
         "norm/fixed_f16.cu",

@@ -1,7 +1,8 @@
 """Concrete per-model L2 policies - the volatile part of the policy layer.
 
 One module per model family (:mod:`~apxinf.policies.impls.pi05`,
-:mod:`~apxinf.policies.impls.pi0fast`, :mod:`~apxinf.policies.impls.qwen_drive`,
+:mod:`~apxinf.policies.impls.pi0fast`, :mod:`~apxinf.policies.impls.lingbot_vla2`,
+:mod:`~apxinf.policies.impls.qwen_drive`,
 :mod:`~apxinf.policies.impls.smolvla`,
 :mod:`~apxinf.policies.impls.walloss`, and future ``groot``, ...). The stable
 machinery — contracts, registry, dispatch — lives one level up in
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 from .cosmos_policy import CosmosPolicy
 from .gr00t import Gr00tPolicy
+from .lingbot_vla2 import LingbotVla2Policy
 from .pi05 import Pi05Policy
 from .pi0fast import Pi0FastPolicy
 from .qwen_drive import QwenDrivePolicy
@@ -33,6 +35,7 @@ __all__ = [
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",
+    "LingbotVla2Policy",
     "QwenDrivePolicy",
     "SmolVlaPolicy",
     "WallossPolicy",
