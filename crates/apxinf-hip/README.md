@@ -42,8 +42,18 @@ backend was built without ROCm. With ROCm:
 export ROCM_PATH=/opt/rocm             # default
 export APXINF_HIP_ARCH=gfx1151         # default: the first GPU rocm_agent_enumerator reports
 cargo test -p apxinf-hip               # needs device hip:0
+APXINF_HIP_GEMM_PROVIDER=lt cargo test -p apxinf-hip       # second run: the hipBLASLt arm
+APXINF_HIP_GEMM_PROVIDER=hipblas cargo test -p apxinf-hip  # third run: the forced-hipBLAS arm
 cargo build --features hip             # the workspace, with Device::Hip routed here
 ```
+
+The provider is process-wide and read once, so the hipBLASLt numeric test and
+the forced-hipBLAS dispatch test in `tests/native.rs` skip themselves in a
+default run; the extra invocations above are what exercise them. An explicitly
+requested `hipblas` is the A/B baseline and never consults the recipe, unlike
+the unset provider, which a found recipe promotes to per-shape routing.
+
+All arms need to run before a GEMM-path change is called tested.
 
 Use `device="hip:0"` from Python, or `Device::Hip(0)` from Rust.
 

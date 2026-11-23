@@ -226,6 +226,7 @@ impl HipPi05Model {
             kv_heads: config.vision_heads,
             head_dim: config.vision_head_dim,
             kv_tokens: config.patches_per_view(),
+       causal_query_start: None,
         };
         let prefix_attention = AttentionGeometry {
             batch: 1,
@@ -234,6 +235,7 @@ impl HipPi05Model {
             kv_heads: lang.num_kv_heads,
             head_dim: lang.head_dim,
             kv_tokens: prefix,
+       causal_query_start: None,
         };
         let action_attention = AttentionGeometry {
             batch: 1,
@@ -242,6 +244,7 @@ impl HipPi05Model {
             kv_heads: act.num_kv_heads,
             head_dim: act.head_dim,
             kv_tokens: prefix + h,
+       causal_query_start: None,
         };
         let attention_scratch = config.vision_depth * scratch(vision_attention)
             + lang.depth.saturating_sub(1) * scratch(prefix_attention)
@@ -361,6 +364,7 @@ impl HipPi05Model {
                 kv_heads: c.vision_heads,
                 head_dim: c.vision_head_dim,
                 kv_tokens: per_view,
+                causal_query_start: None,
             },
             &attention,
         )?;
@@ -414,6 +418,7 @@ impl HipPi05Model {
             &self.ctx,
             &self.weights.token_embedding,
             token_ids,
+            native::EmbeddingScale::SqrtWidth,
             &language,
         )?;
         let vision_rows = vision.shape().dims()[0];
@@ -502,6 +507,7 @@ impl HipPi05Model {
                 kv_heads: lang.num_kv_heads,
                 head_dim: lang.head_dim,
                 kv_tokens: tokens,
+                causal_query_start: None,
             },
             &attention,
         )?;
@@ -691,6 +697,7 @@ impl HipPi05Model {
                 kv_heads: act.num_kv_heads,
                 head_dim: act.head_dim,
                 kv_tokens: prefix_tokens + tokens,
+                causal_query_start: None,
             },
             &attention,
         )?;
