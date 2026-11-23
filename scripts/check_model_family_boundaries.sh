@@ -52,5 +52,8 @@ fi
 python3 "$repo_root/scripts/check_pi05_module_boundaries.py"
 python3 "$repo_root/scripts/check_qwen_drive_module_boundaries.py"
 python3 "$repo_root/scripts/check_walloss_module_boundaries.py"
+python3 "$repo_root/scripts/check_hip_gr00t_module_boundaries.py"
+
+python3 "$repo_root/scripts/check_cosmos_policy_module_boundaries.py"
 
 echo 'model-family boundary checks passed'

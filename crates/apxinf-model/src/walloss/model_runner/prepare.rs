@@ -19,7 +19,7 @@ use crate::vla::{
     PreparedInference, VlaRequest,
 };
 
-use super::super::backend::{kernels, transfers, CudaEventTimer, DeviceBuffer, RuntimeBackend};
+use super::super::backend::{ops, transfers, CudaEventTimer, DeviceBuffer, RuntimeBackend};
 use super::super::geometry::{upload_u32, DeviceVisionGeometry};
 use super::super::model::{
     ModelVariant, WallossDeviceInputs, WallossDeviceVision, WallossSchedule,
@@ -51,7 +51,7 @@ pub struct WallossPreparedInference {
     geometry: DeviceVisionGeometry,
     inputs: WallossDeviceInputs,
     normal_generator: RefCell<Box<dyn NormalGenerator>>,
-    workspace: kernels::GraphWorkspace,
+    workspace: ops::ExecutionSession,
     graph: Option<CapturedGraph>,
     fallback_reason: Option<String>,
 }
@@ -161,7 +161,7 @@ impl WallossPreparedInference {
         let requirements = model
             .model()
             .workspace_requirements(patch_rows, prefix_tokens)?;
-        let workspace = kernels::GraphWorkspace::new(requirements.bytes, device)?;
+        let workspace = ops::ExecutionSession::with_capacity(requirements.bytes, device)?;
         let mut plan = Self {
             spec,
             shape,
@@ -204,9 +204,9 @@ impl WallossPreparedInference {
                     request,
                 )?;
                 self.bind(&host, request)?;
-                kernels::with_workspace_eager(&self.workspace, forward)?
+                ops::prepare_with_session(&self.workspace, forward)?
             }
-            None => kernels::prepare_with_workspace(&self.workspace, forward)?,
+            None => ops::prepare_with_session(&self.workspace, forward)?,
         };
         self.backend.synchronize()?;
         drop(output);
@@ -215,7 +215,7 @@ impl WallossPreparedInference {
 
     fn capture(&self) -> Result<CapturedGraph> {
         self.backend.begin_capture()?;
-        let output = match kernels::with_workspace(&self.workspace, || {
+        let output = match ops::with_session(&self.workspace, || {
             self.model
                 .model()
                 .infer(&self.schedule, &self.inputs, &self.geometry)
@@ -245,7 +245,7 @@ impl WallossPreparedInference {
             request,
         )?;
         self.bind(&host, request)?;
-        let (eager, mut profile) = kernels::prepare_with_workspace(&self.workspace, || {
+        let (eager, mut profile) = ops::prepare_with_session(&self.workspace, || {
             self.model
                 .model()
                 .infer_profiled(&self.schedule, &self.inputs, &self.geometry)
@@ -253,7 +253,7 @@ impl WallossPreparedInference {
         let mib = |bytes: usize| bytes as f64 / f64::from(1u32 << 20);
         profile.insert(
             "workspace_peak_live_mib".to_string(),
-            mib(self.workspace.peak_used()),
+            mib(self.workspace.used()),
         );
         profile.insert(
             "workspace_capacity_mib".to_string(),
@@ -335,7 +335,7 @@ impl PreparedInference for WallossPreparedInference {
                 captured.graph.replay()?;
                 captured.output.clone()
             }
-            None => kernels::prepare_with_workspace(&self.workspace, || {
+            None => ops::prepare_with_session(&self.workspace, || {
                 self.model
                     .model()
                     .infer(&self.schedule, &self.inputs, &self.geometry)

@@ -3,7 +3,7 @@
 // Bit-level transcription of the patched dense_swiglu epilogue.
 //
 // Derived from the AOT object's SASS and cross-checked against
-// `crates/apxinf-cuda/aot/exporters/export_qwen38_nvfp4_swiglu.py`. ApxInf code;
+// the former Qwen3.8 offline exporter. ApxInf code;
 // it only includes CUTLASS/CuTe headers, which keep their own NVIDIA
 // BSD-3-Clause notices (see `kernels/cutlass/README.md`).
 // Per element the AOT does, in this exact order:

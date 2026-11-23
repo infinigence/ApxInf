@@ -15,9 +15,15 @@ use crate::registry;
 /// harmless and keeps `AutoModel::load_model` self-contained for users.
 pub fn register_builtin_models() {
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    registry::register("metal_clef", crate::metal_clef::load);
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_minicpm5", crate::metal_minicpm5::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_qwen3", crate::metal_qwen3::load);
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    registry::register("metal_qwen_image", crate::metal_qwen_image::load);
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    registry::register("metal_qwen3_tts", crate::metal_qwen3_tts::load);
     registry::register("llama", load_llama);
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);
@@ -40,8 +46,12 @@ pub fn register_builtin_models() {
     crate::pi0fast::register_builtin();
     #[cfg(feature = "cuda")]
     crate::gr00t::register_builtin();
+    #[cfg(feature = "hip")]
+    crate::hip_gr00t::register_builtin();
     #[cfg(feature = "cuda")]
     crate::smolvla::register_builtin();
+    #[cfg(feature = "cuda")]
+    crate::cuda_cosmos_policy::register_builtin();
 }
 fn load_llama(
     path: &Path,
@@ -116,7 +126,6 @@ fn upcast_bf16_weights(tensors: &mut HashMap<String, Tensor>) -> Result<()> {
     Ok(())
 }
 
-
 /// Qwen3.8-27B-NVFP4 on CUDA: safetensors shards in the checkpoint directory,
 /// validated default execution (FlashInfer-GDN prefill, CUDA-graph decode,
 /// split-KV attention).
@@ -125,12 +134,18 @@ fn load_qwen38(
     path: &Path,
     device: Device,
     _backend: Arc<dyn Backend>,
-    _options: &LoadOptions,
+    options: &LoadOptions,
 ) -> Result<LoadedModel> {
-    use crate::llm_trait::LlmTrait;
     let (tensors, metadata) = apxinf_loader::safetensors::load_native_path(path)
         .map_err(|error| Error::Other(format!("load {}: {error}", path.display())))?;
     let config = apxinf_loader::safetensors::config_from_metadata(&metadata);
-    let model = crate::qwen38::Qwen38::load(config, tensors, device)?;
+    let recipe = crate::auto::cuda_recipe_options(options)?;
+    let model = crate::qwen38::Qwen38::load_with_recipe_options(
+        config,
+        tensors,
+        device,
+        recipe.online_tune,
+        recipe.cache_dir,
+    )?;
     Ok(LoadedModel::text(Box::new(model)))
 }

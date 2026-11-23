@@ -11,7 +11,7 @@
 //! ```text
 //! APXINF_QWEN38_CHECKPOINT=/path/to/Qwen3.8-27B-NVFP4 \
 //!   bash crates/apxinf-cuda-new/test-new.sh \
-//!     test -p apxinf-cuda --test qwen38_mlp_layer -- --ignored --nocapture
+//!     test -p apxinf-cuda-new --test qwen38_mlp_layer -- --ignored --nocapture
 //! ```
 
 use std::collections::HashMap;
@@ -159,9 +159,19 @@ impl Projection {
 }
 
 fn relayout(ctx: &CudaContext, checkpoint_scales: &Tensor, rows: usize, k: usize) -> Tensor {
-    let bytes = ops::nvfp4_scale_buffer_bytes(rows, k, BLOCK).unwrap();
+    let bytes = ops::block_scale_buffer_bytes(rows, k, BLOCK).unwrap();
     let destination = device_zeros(ctx, vec![bytes], DType::F8E4M3);
-    ops::nvfp4_pack_block_scales(ctx, checkpoint_scales, &destination, rows, k, BLOCK).unwrap();
+    ops::pack_block_scales(
+        ctx,
+        ops::PackBlockScalesArgs {
+            source: checkpoint_scales,
+            output: &destination,
+            rows,
+            k,
+            block_size: BLOCK,
+        },
+    )
+    .unwrap();
     destination
 }
 
@@ -184,19 +194,15 @@ impl Scratch {
             quantized: device_zeros(ctx, vec![tokens, HIDDEN / 2], DType::E2M1Pair),
             quantized_scales: device_zeros(
                 ctx,
-                vec![ops::nvfp4_scale_buffer_bytes(tokens, HIDDEN, BLOCK).unwrap()],
+                vec![ops::block_scale_buffer_bytes(tokens, HIDDEN, BLOCK).unwrap()],
                 DType::F8E4M3,
             ),
             fused: device_zeros(ctx, vec![tokens, 2 * INTERMEDIATE], DType::BF16),
             activated: device_zeros(ctx, vec![tokens, INTERMEDIATE], DType::BF16),
-            activated_quantized: device_zeros(
-                ctx,
-                vec![tokens, INTERMEDIATE / 2],
-                DType::E2M1Pair,
-            ),
+            activated_quantized: device_zeros(ctx, vec![tokens, INTERMEDIATE / 2], DType::E2M1Pair),
             activated_scales: device_zeros(
                 ctx,
-                vec![ops::nvfp4_scale_buffer_bytes(tokens, INTERMEDIATE, BLOCK).unwrap()],
+                vec![ops::block_scale_buffer_bytes(tokens, INTERMEDIATE, BLOCK).unwrap()],
                 DType::F8E4M3,
             ),
             projected: device_zeros(ctx, vec![tokens, HIDDEN], DType::BF16),
@@ -221,32 +227,40 @@ fn mlp_block(
     fused: bool,
 ) -> apxinf_core::Result<()> {
     if fused {
-        ops::nvfp4_quantize_rms_norm(
+        ops::block_quantize(
             ctx,
-            residual,
-            norm_weight,
-            &scratch.quantized,
-            &scratch.quantized_scales,
-            1e-6,
-            gate_up.input_scale,
-            BLOCK,
-            ops::ScaleLayout::GemmAtom,
+            ops::BlockQuantizationArgs::rms_norm(
+                residual,
+                norm_weight,
+                &scratch.quantized,
+                &scratch.quantized_scales,
+                1e-6,
+                gate_up.input_scale,
+                BLOCK,
+                ops::ScaleLayout::GemmAtom,
+            ),
         )?;
     } else {
-        ops::mlp::rms_norm(ctx, residual, norm_weight, &scratch.normalized, 1e-6)?;
-        ops::nvfp4_quantize_activation(
+        ops::norm::norm(
             ctx,
-            &scratch.normalized,
-            &scratch.quantized,
-            &scratch.quantized_scales,
-            gate_up.input_scale,
-            BLOCK,
-            ops::ScaleLayout::GemmAtom,
+            ops::NormArgs::rms(residual, norm_weight, &scratch.normalized, 1e-6)
+                .with_weight_offset(),
+        )?;
+        ops::block_quantize(
+            ctx,
+            ops::BlockQuantizationArgs::activation(
+                &scratch.normalized,
+                &scratch.quantized,
+                &scratch.quantized_scales,
+                gate_up.input_scale,
+                BLOCK,
+                ops::ScaleLayout::GemmAtom,
+            ),
         )?;
     }
     ops::gemm(
         ctx,
-        ops::GemmArgs::nvfp4(
+        ops::GemmArgs::block_quantized(
             &scratch.quantized,
             &scratch.quantized_scales,
             &gate_up.weight,
@@ -258,30 +272,34 @@ fn mlp_block(
     )?;
 
     if fused {
-        ops::nvfp4_quantize_swiglu(
+        ops::block_quantize(
             ctx,
-            &scratch.fused,
-            &scratch.activated_quantized,
-            &scratch.activated_scales,
-            down.input_scale,
-            BLOCK,
-            ops::ScaleLayout::GemmAtom,
+            ops::BlockQuantizationArgs::swiglu(
+                &scratch.fused,
+                &scratch.activated_quantized,
+                &scratch.activated_scales,
+                down.input_scale,
+                BLOCK,
+                ops::ScaleLayout::GemmAtom,
+            ),
         )?;
     } else {
-        ops::swiglu(ctx, &scratch.fused, &scratch.activated)?;
-        ops::nvfp4_quantize_activation(
+        ops::swiglu_into(ctx, &scratch.fused, &scratch.activated)?;
+        ops::block_quantize(
             ctx,
-            &scratch.activated,
-            &scratch.activated_quantized,
-            &scratch.activated_scales,
-            down.input_scale,
-            BLOCK,
-            ops::ScaleLayout::GemmAtom,
+            ops::BlockQuantizationArgs::activation(
+                &scratch.activated,
+                &scratch.activated_quantized,
+                &scratch.activated_scales,
+                down.input_scale,
+                BLOCK,
+                ops::ScaleLayout::GemmAtom,
+            ),
         )?;
     }
     ops::gemm(
         ctx,
-        ops::GemmArgs::nvfp4(
+        ops::GemmArgs::block_quantized(
             &scratch.activated_quantized,
             &scratch.activated_scales,
             &down.weight,
@@ -293,7 +311,13 @@ fn mlp_block(
     )?;
 
     ops::add_into(ctx, &scratch.projected, residual)?;
-    let _ = (tokens, gate_up.out_features, gate_up.in_features, down.out_features, down.in_features);
+    let _ = (
+        tokens,
+        gate_up.out_features,
+        gate_up.in_features,
+        down.out_features,
+        down.in_features,
+    );
     Ok(())
 }
 
@@ -303,7 +327,10 @@ fn nvfp4_mlp_block_runs_and_is_timed() {
     let ctx = CudaContext::new(0).unwrap();
     let load_start = Instant::now();
     let tensors = checkpoint();
-    println!("checkpoint load: {:.2}s", load_start.elapsed().as_secs_f64());
+    println!(
+        "checkpoint load: {:.2}s",
+        load_start.elapsed().as_secs_f64()
+    );
 
     let build_start = Instant::now();
     let gate_up = Projection::fused_gate_up(&ctx, &tensors, 0);
@@ -338,7 +365,14 @@ fn nvfp4_mlp_block_runs_and_is_timed() {
         for fused in [false, true] {
             let residual = upload_bytes(&ctx, &seed, vec![tokens, HIDDEN], DType::BF16);
             mlp_block(
-                &ctx, &residual, &norm_weight, &gate_up, &down, &mut scratch, tokens, fused,
+                &ctx,
+                &residual,
+                &norm_weight,
+                &gate_up,
+                &down,
+                &mut scratch,
+                tokens,
+                fused,
             )
             .unwrap();
             ctx.synchronize().unwrap();
@@ -374,14 +408,21 @@ fn nvfp4_mlp_block_runs_and_is_timed() {
         let weight_bytes = (2.0 * INTERMEDIATE as f64 * HIDDEN as f64
             + HIDDEN as f64 * INTERMEDIATE as f64)
             * (0.5 + 1.0 / 16.0);
-        let flops = 2.0 * tokens as f64
-            * (2 * INTERMEDIATE * HIDDEN + HIDDEN * INTERMEDIATE) as f64;
+        let flops =
+            2.0 * tokens as f64 * (2 * INTERMEDIATE * HIDDEN + HIDDEN * INTERMEDIATE) as f64;
 
         let mut timings = [0.0f64; 2];
         for (slot, fused) in [(0usize, false), (1usize, true)] {
             // Warm up: the first call tunes and prepares native executions.
             mlp_block(
-                &ctx, &residual, &norm_weight, &gate_up, &down, &mut scratch, tokens, fused,
+                &ctx,
+                &residual,
+                &norm_weight,
+                &gate_up,
+                &down,
+                &mut scratch,
+                tokens,
+                fused,
             )
             .unwrap();
             ctx.synchronize().unwrap();
@@ -390,7 +431,14 @@ fn nvfp4_mlp_block_runs_and_is_timed() {
             let start = Instant::now();
             for _ in 0..iterations {
                 mlp_block(
-                    &ctx, &residual, &norm_weight, &gate_up, &down, &mut scratch, tokens, fused,
+                    &ctx,
+                    &residual,
+                    &norm_weight,
+                    &gate_up,
+                    &down,
+                    &mut scratch,
+                    tokens,
+                    fused,
                 )
                 .unwrap();
             }

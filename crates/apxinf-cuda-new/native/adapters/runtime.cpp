@@ -83,6 +83,9 @@ extern "C" apxinf_status_t apxinf_runtime_create_with_autotune(
     }
     auto runtime = std::make_unique<apxinf_runtime>();
     runtime->device = device;
+    runtime->compute_major = properties.major;
+    runtime->compute_minor = properties.minor;
+    runtime->multiprocessor_count = properties.multiProcessorCount;
     runtime->default_cache_dir = default_cache_directory(properties);
     runtime->allow_online_tune = allow_online_tune != 0;
     *output = runtime.release();

@@ -63,7 +63,7 @@ fn dtype_code(dtype: DType) -> Result<u32> {
     }
 }
 
-fn alignment_of(pointer: usize) -> u32 {
+pub(crate) fn alignment_of(pointer: usize) -> u32 {
     if pointer == 0 {
         return 256;
     }
@@ -205,6 +205,18 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<Normali
         semantic: semantic.code(),
         dtype: dtype_code(dtype)?,
         has_bias: u32::from(!bias.is_null()),
+        layout: abi::LAYOUT_PACKED_QKV,
+        cache_write: abi::CACHE_WRITE_TOKEN_MAJOR,
+        rotation_source: if semantic.applies_rope() {
+            abi::ROTATION_POSITION_OFFSET
+        } else {
+            abi::ROTATION_NONE
+        },
+        rotary_convention: if semantic.applies_rope() {
+            abi::CONVENTION_HALF_SPLIT
+        } else {
+            abi::CONVENTION_NONE
+        },
         q_heads: u32::try_from(args.q_heads)
             .map_err(|_| invalid("RoPE Q head count exceeds the ABI range"))?,
         kv_heads: u32::try_from(args.kv_heads)
@@ -222,7 +234,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<Normali
         // No position pointer is bound for split/prefill semantics. The ABI
         // uses the maximum guaranteed alignment as the canonical null value,
         // matching the other optional bindings.
-        position_alignment: 256,
+        rotation_alignment: 256,
         tokens: i64::from(tokens_abi),
         cache_capacity: 0,
     };
@@ -236,6 +248,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RopeArgs<'_>) -> Result<Normali
         key_input: std::ptr::null(),
         value_input: std::ptr::null(),
         position: std::ptr::null(),
+        rotation_table: std::ptr::null(),
         stream: ctx.stream().handle() as abi::CudaStream,
         theta: args.theta,
         position_offset: i32::try_from(args.position_offset)

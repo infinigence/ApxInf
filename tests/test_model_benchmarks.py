@@ -1,0 +1,309 @@
+"""Benchmark measurements preserve their recorded-frame and synthetic paths."""
+import importlib.util
+from pathlib import Path
+import sys
+
+import numpy as np
+import pytest
+
+SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
+sys.path.insert(0, str(SCRIPTS))
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, SCRIPTS / f'{name}.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_ar_fit_uses_distinct_observed_frame_lengths(monkeypatch):
+    bench = load('bench_pi0_fast')
+    clock = [0.0]
+    observed = []
+
+    def call(steps):
+        observed.append(steps)
+        clock[0] += (30 + 10 * steps) / 1000
+        return np.arange(steps, dtype=np.uint32)
+
+    monkeypatch.setattr(bench.time, 'perf_counter', lambda: clock[0])
+    result = bench._run_ar(call, [2, 4, 4], survey=3, repeats=3)
+    assert observed == [2, 4, 4, 2, 2, 2, 4, 4, 4]
+    assert result['fit']['fixed_ms'] == pytest.approx(30)
+    assert result['fit']['per_step_ms'] == pytest.approx(10)
+    assert [point['steps'] for point in result['fit']['points']] == [2, 4]
+
+
+def test_ar_fit_with_one_decode_length_has_no_split():
+    bench = load('bench_pi0_fast')
+    result = bench._run_ar(lambda _: np.ones(8, dtype=np.uint32), [0, 1], 2, 1)
+    assert result['fit'] is None
+
+
+def test_recorded_frames_load_with_requested_limit(tmp_path):
+    bench = load('bench_pi0_fast')
+    path = tmp_path / 'frames.npz'
+    images = np.zeros((2, 2, 2, 3), dtype=np.uint8)
+    states = np.zeros((2, 8), dtype=np.float32)
+    np.savez(path, base_raw=images, wrist_raw=images, state=states, task=['a', 'b'])
+    frames = bench._load_frames(path, 'raw', 1)
+    assert len(frames) == 1
+    assert frames[0]['state'].shape == (8,)
+    assert frames[0]['task'] == 'a'
+
+
+def test_warmup_matches_original_input_count_limit():
+    bench = load('bench_pi0_fast')
+    calls = []
+    bench._time_stream(lambda item: calls.append(item) or [1], ['a'], 3, 10)
+    assert calls == ['a'] * 4
+
+
+def test_drive_constructs_complete_deterministic_observation():
+    bench = load('bench_qwen_drive')
+    first, noise = bench.synthetic_observation(7)
+    second, repeated = bench.synthetic_observation(7)
+    assert len(first['views']) == 3
+    for camera, frames in first['views'].items():
+        assert len(frames) == 4
+        for index, frame in enumerate(frames):
+            assert frame['image'].shape == (900, 1600, 3)
+            assert frame['image'].dtype == np.uint8
+            assert np.array_equal(frame['image'], second['views'][camera][index]['image'])
+    assert first['history'].shape == (16, 3)
+    assert first['history_velocity'].shape == (16, 2)
+    assert noise.shape == (1, 50, 3)
+    assert np.array_equal(noise, repeated)
+
+
+def test_checkpoint_local_tokenizers_do_not_need_environment(tmp_path, monkeypatch):
+    from apxinf.policies.impls.pi0fast import _checkpoint_tokenizer, _resolve_asset
+    local = tmp_path / 'assets/fast-tokenizer'
+    local.mkdir(parents=True)
+    (local / 'tokenizer.json').write_text('{}')
+    monkeypatch.setenv('APXINF_FAST_TOKENIZER', '/missing/old-machine-path')
+    selected = _checkpoint_tokenizer(tmp_path, None, 'remote/tokenizer', 'fast-tokenizer')
+    assert _resolve_asset(selected, 'tokenizer.json', env='APXINF_FAST_TOKENIZER', what='FAST') == local / 'tokenizer.json'
+    assert _checkpoint_tokenizer(tmp_path, '/explicit/tokenizer', 'remote/tokenizer', 'fast-tokenizer') == '/explicit/tokenizer'
+
+
+def test_pi0fast_forwards_tactics_and_autotune_to_native(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from apxinf.policies.impls.pi0fast import Pi0FastPolicy
+    (tmp_path / 'config.json').write_text('{}')
+    captured = {}
+    class Loaded(Exception):
+        pass
+    class Native:
+        @staticmethod
+        def load(*args, **kwargs):
+            captured.update(kwargs)
+            raise Loaded()
+    monkeypatch.setitem(sys.modules, 'apxinf_py', SimpleNamespace(ModelRunner=Native))
+    with pytest.raises(Loaded):
+        Pi0FastPolicy.from_pretrained(tmp_path, tactics=tmp_path/'tactics.json', autotune=True,
+                                     calibration=tmp_path/'calibration.json')
+    assert captured['tactics'] == str(tmp_path/'tactics.json')
+    assert captured['calibration'] == str(tmp_path/'calibration.json')
+    assert captured['autotune'] is True
+
+
+@pytest.mark.parametrize('variant', ['bf16', 'fp8_static', 'int8_dynamic'])
+def test_gr00t_cli_passes_variant_unchanged_to_rust(tmp_path, monkeypatch, variant):
+    bench = load('bench_gr00t')
+    output = tmp_path / 'report.json'
+    binary = tmp_path / 'gr00t_bench'
+    monkeypatch.setattr(sys, 'argv', ['bench_gr00t', '--model-dir', str(tmp_path),
+                        '--model-variant', variant, '--binary', str(binary), '--out', str(output)])
+    def run(command, **kwargs):
+        assert command[3] == variant
+        output.write_text('{}')
+    monkeypatch.setattr(bench.subprocess, 'run', run)
+    monkeypatch.setattr(bench, 'provenance', lambda *a, **kw: {})
+    bench.main()
+
+
+def test_fixed_decode_times_requested_prefixes_and_interleaves(monkeypatch):
+    bench = load('bench_pi0_fast')
+    clock = [0.0]
+    calls = []
+    def call(payload, length):
+        assert payload == 'same-input'
+        calls.append(length)
+        clock[0] += (25 + 7 * length) / 1000
+        return np.arange(length, dtype=np.uint32)
+    monkeypatch.setattr(bench.time, 'perf_counter', lambda: clock[0])
+    result = bench._run_fixed(call, 'same-input', [12, 20, 40], samples=2, warmup=1)
+    assert calls == [40, 12, 20, 40, 12, 20, 40, 40, 20, 12]
+    assert result['fit']['fixed_ms'] == pytest.approx(25)
+    assert result['fit']['per_step_ms'] == pytest.approx(7)
+    assert result['prefix_equal'] is True
+    assert all(len(values) == 2 for values in result['raw_ms'].values())
+
+
+@pytest.mark.parametrize('failure', ['length', 'prefix'])
+def test_fixed_decode_rejects_early_stop_or_changed_tokens(failure):
+    bench = load('bench_pi0_fast')
+    def call(_, length):
+        if length == 40:
+            return np.arange(length, dtype=np.uint32)
+        return np.arange(length - (failure == 'length'), dtype=np.uint32) + (failure == 'prefix')
+    with pytest.raises(RuntimeError, match='requested|changed'):
+        bench._run_fixed(call, None, [12, 40], samples=1, warmup=0)
+
+
+@pytest.mark.parametrize('lengths', [['0','12'], ['12','12']])
+def test_fixed_decode_rejects_invalid_cli_counts(monkeypatch, capsys, lengths):
+    bench = load('bench_pi0_fast')
+    monkeypatch.setattr(sys, 'argv', ['bench', '--model-dir', '/unused', '--layer', 'l1',
+                                   '--state-key', 'observation/state',
+                                   '--mode', 'fixed', '--decode-lengths', *lengths])
+    with pytest.raises(SystemExit) as error:
+        bench.parse_args()
+    assert error.value.code == 2
+    assert '--decode-lengths needs at least two distinct positive counts' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('legacy_json_exists', [False, True])
+def test_provenance_records_native_recipe_sidecar(tmp_path, monkeypatch, legacy_json_exists):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    requested = tmp_path / 'tactics.json'
+    if legacy_json_exists:
+        requested.write_text('{"legacy": true}')
+    recipes = tmp_path / 'tactics.recipes'
+    recipes.mkdir()
+    (recipes / 'gemm.json').write_text('{"candidate": 3}')
+    result = bench.provenance(tmp_path, tmp_path, tactics=requested)['tactics']
+    assert result['path'] == str(recipes)
+    assert result['sha256'] == bench.artifact(recipes)['sha256']
+    assert result['file_count'] == 1
+
+
+def test_provenance_accepts_recipe_directory_and_detects_recipe_changes(tmp_path, monkeypatch):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    recipes = tmp_path / 'recipes'
+    recipes.mkdir()
+    recipe = recipes / 'gemm.json'
+    recipe.write_text('{"candidate": 3}')
+    before = bench.provenance(tmp_path, tmp_path, tactics=recipes)['tactics']
+    assert before['path'] == str(recipes)
+    assert before == bench.provenance(tmp_path, tmp_path, tactics=recipes)['tactics']
+    recipe.write_text('{"candidate": 4}')
+    assert before['sha256'] != bench.provenance(tmp_path, tmp_path, tactics=recipes)['tactics']['sha256']
+
+
+def test_provenance_records_missing_cache_without_claiming_a_hash(tmp_path, monkeypatch):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    result = bench.provenance(tmp_path, tmp_path, tactics=tmp_path / 'empty.json')['tactics']
+    assert result == {'path': str(tmp_path / 'empty.recipes'), 'exists': False}
+
+
+def test_provenance_does_not_label_ignored_source_tactics_as_active(tmp_path, monkeypatch):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    requested = tmp_path / 'configs/tuning/nvidia/thor-sm110/tactics.json'
+    requested.parent.mkdir(parents=True)
+    requested.write_text('{"legacy": true}')
+    result = bench.provenance(tmp_path, tmp_path, tactics=requested)['tactics']
+    assert result == {'requested_path': str(requested), 'selection': 'native_default'}
+
+
+def test_provenance_resolves_recipe_sidecar_before_following_json_symlinks(tmp_path, monkeypatch):
+    bench = load('_benchmark')
+    monkeypatch.setattr(bench.subprocess, 'check_output', lambda *a, **kw: '')
+    (tmp_path / 'config.json').write_text('{}')
+    old = tmp_path / 'archived.json'
+    old.write_text('{}')
+    requested = tmp_path / 'active.json'
+    requested.symlink_to(old)
+    recipes = tmp_path / 'active.recipes'
+    recipes.mkdir()
+    (recipes / 'gemm.json').write_text('{"candidate": 3}')
+    result = bench.provenance(tmp_path, tmp_path, tactics=requested)['tactics']
+    assert result['path'] == str(recipes)
+    assert result['file_count'] == 1
+
+
+@pytest.mark.parametrize('lengths', [[], ['--decode-lengths', '1', '8', '32']])
+def test_fixed_cli_accepts_valid_counts_without_frames(monkeypatch, lengths):
+    bench = load('bench_pi0_fast')
+    monkeypatch.setattr(sys, 'argv', ['bench', '--model-dir', '/unused',
+                        '--state-key', 'observation/state', '--layer', 'l1',
+                        '--mode', 'fixed', *lengths])
+    args = bench.parse_args()
+    assert args.frames is None
+    assert args.seed == 0
+    assert args.decode_lengths == ([1, 8, 32] if lengths else [12, 16, 20, 28, 32, 40])
+
+
+def test_fixed_main_uses_seeded_input_and_forwards_token_limits(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from apxinf.processors.transforms import OBSERVATION, RGB
+
+    bench = load('bench_pi0_fast')
+    calls = []
+    closed = []
+
+    class Native:
+        image_size = 4
+
+        def infer_action_tokens_rgb(self, rgb, layout, token_ids, stop_token=None,
+                                    *, max_new_tokens=None):
+            assert layout == 'nhwc'
+            assert stop_token is None
+            assert max_new_tokens in (1, 8, 32)
+            calls.append((rgb.copy(), token_ids.copy(), max_new_tokens))
+            # Include the policy terminator so fixed timing must ignore EOS.
+            return np.arange(max_new_tokens, dtype=np.uint32)
+
+    def pipeline(payload):
+        obs = payload[OBSERVATION]
+        np.testing.assert_array_equal(obs['observation/state'], np.zeros(8))
+        assert obs['prompt'] == bench.DEFAULT_PROMPT
+        return {RGB: np.stack([obs['image'], obs['wrist']])}
+
+    policy = SimpleNamespace(
+        model=Native(), tokenizer=SimpleNamespace(pipe_token_id=2),
+        metadata={'state_dim': 8, 'max_action_tokens': 256, 'num_views': 2, 'image_size': 4},
+        image_keys=('image', 'wrist'), state_key='observation/state', prompt_key='prompt',
+        action_dim=7, action_horizon=10, input_pipeline=pipeline,
+        _prompt_ids=lambda obs, prompt: [1, 5, 1], close=lambda: closed.append(True),
+    )
+    output = tmp_path / 'report.json'
+    monkeypatch.setattr(sys, 'argv', ['bench', '--model-dir', str(tmp_path),
+                        '--state-key', 'observation/state', '--layer', 'l1',
+                        '--mode', 'fixed', '--decode-lengths', '1', '8', '32',
+                        '--samples', '2', '--warmup', '1', '--out', str(output)])
+    monkeypatch.setattr(bench, 'provenance', lambda *args, **kwargs: {})
+    monkeypatch.setattr(bench, '_git_commit', lambda: 'test')
+    def no_frames(*args):
+        pytest.fail('synthetic benchmark must not load a frame fixture')
+    monkeypatch.setattr(bench, '_load_frames', no_frames)
+
+    reports = []
+    for _ in range(2):
+        bench.main(policy_loader=lambda *args, **kwargs: policy)
+        reports.append(json.loads(output.read_text()))
+    assert closed == [True, True]
+    expected_lengths = [32, 1, 8, 32, 1, 8, 32, 32, 8, 1]
+    assert [length for _, _, length in calls] == expected_lengths * 2
+    for rgb, ids, _ in calls:
+        assert rgb.shape == (2, 4, 4, 3)
+        assert rgb.dtype == np.uint8
+        np.testing.assert_array_equal(rgb, calls[0][0])
+        np.testing.assert_array_equal(ids, [1, 5, 1])
+    for report in reports:
+        assert report['input_source'] == 'synthetic'
+        assert report['seed'] == 0
+        assert report['fixed_decode']['decode_lengths'] == [1, 8, 32]
+        assert report['fixed_decode']['prefix_equal'] is True
+    assert reports[0]['fixed_decode']['prepared_input'] == reports[1]['fixed_decode']['prepared_input']

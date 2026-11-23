@@ -5,19 +5,26 @@ use std::path::{Path, PathBuf};
 
 use apxinf_core::{DType, Device, Error, Result, Tensor};
 
-use crate::accelerator::create_backend;
+use crate::accelerator::create_backend_with_recipe_options;
 use crate::builtin::register_builtin_models;
-use crate::d3::{DecisionInput, DecisionOutput, DecisionRuntime};
+use crate::decision::{
+    CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionSchema,
+    SchemaDecisionOutput,
+};
 use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
+use crate::image::{GeneratedImage, ImageRequest, ImageRuntime};
 use crate::llm_trait::{
     GeneratedToken, GenerationOutput, GenerationRequest, LlmCapabilities, LlmInput, LlmTrait,
 };
 use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
-use crate::vla::{Action, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime};
+use crate::speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
+use crate::vla::{
+    Action, ExecutionPolicy, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime,
+};
 
 /// User-level precision policy. Hardware/tactic dispatch remains in kernels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -43,11 +50,15 @@ pub struct LoadOptions {
     /// `config.json:model_type`.
     pub model_name: Option<String>,
     /// Model-local compute implementation identifier. PI0.5 accepts
-    /// auto, bf16, fp8_static and int8_dynamic. Native Metal families parse
-    /// their own variants. Other families migrate separately.
+    /// auto, bf16, fp8_static and int8_dynamic on CUDA; auto/fp32_reference on CPU.
+    /// Native Metal families parse their own variants. Every VLA family accepts
+    /// this option; legacy executors adapt it inside their own loader.
     pub model_variant: Option<String>,
     /// Legacy selection for model families not yet migrated to model_variant.
     pub precision: ModelPrecision,
+    /// How a VLA runtime that owns implicit plans should build them. `None`
+    /// keeps the family's own default (PI0.5 runs `PreferGraph`).
+    pub execution_policy: Option<ExecutionPolicy>,
     /// Optional text-model weight dtype. `None` preserves checkpoint dtype
     /// (except CPU backends, which currently require f32).
     pub text_weight_dtype: Option<DType>,
@@ -55,6 +66,11 @@ pub struct LoadOptions {
     /// For cuda-new, override the recipe directory. None uses the shared
     /// hardware/toolkit tuning directory; legacy JSON records are not loaded.
     pub tuning_path: Option<PathBuf>,
+    /// CUDA PI0.5 BF16/FP8: maximum extra bytes for language gate/up layout copies.
+    /// None permits one extra live layout per weight for concurrent consumers.
+    /// Copies die with their last execution/graph; retired bases can transition
+    /// in place. Some(0) fixes canonical without additional copies.
+    pub weight_layout_budget_bytes: Option<usize>,
     /// Additional named model artifacts that are not embedded in the primary
     /// checkpoint. Model loaders must reject missing or unknown required
     /// assets instead of discovering them through process-global state.
@@ -93,7 +109,9 @@ pub enum LoadedModel {
         generation_defaults: GenerationOptions,
     },
     Vla(Box<dyn VlaRuntime>),
-    Decision(Box<dyn DecisionRuntime>),
+    Decision(DecisionModel),
+    Image(Box<dyn ImageRuntime>),
+    Speech(Box<dyn SpeechRuntime>),
 }
 
 impl LoadedModel {
@@ -109,6 +127,8 @@ impl LoadedModel {
             Self::Text { model, .. } => Ok(&mut **model),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
 
@@ -117,34 +137,64 @@ impl LoadedModel {
             Self::Vla(model) => Ok(&**model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not VLA".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not VLA".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not VLA".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not VLA".into())),
         }
     }
 
-    pub fn decision_mut(&mut self) -> Result<&mut dyn DecisionRuntime> {
+    pub fn decision_model_mut(&mut self) -> Result<&mut DecisionModel> {
         match self {
-            Self::Decision(model) => Ok(&mut **model),
+            Self::Decision(model) => Ok(model),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
+    }
+
+    /// The encoded-prompt runtime of a code decision model.
+    pub fn decision_mut(&mut self) -> Result<&mut dyn CodeDecisionRuntime> {
+        self.decision_model_mut()?.code_mut()
     }
 
     pub fn decide(&mut self, input: DecisionInput<'_>) -> Result<DecisionOutput> {
         self.decision_mut()?.decide(input)
     }
 
+    /// Score named schema questions on a schema decision model.
+    pub fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput> {
+        self.decision_model_mut()?
+            .schema_mut()?
+            .decide_schema(request)
+    }
+
     pub fn decision_code_names(&self) -> Result<&[String]> {
         match self {
-            Self::Decision(model) => Ok(model.code_names()),
+            Self::Decision(model) => Ok(model.code()?.code_names()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+        }
+    }
+
+    pub fn decision_capabilities(&self) -> Result<LlmCapabilities> {
+        match self {
+            Self::Decision(model) => Ok(model.capabilities()),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
 
     pub fn decision_token_ids(&self) -> Result<&[u32]> {
         match self {
-            Self::Decision(model) => Ok(model.token_ids()),
+            Self::Decision(model) => Ok(model.code()?.token_ids()),
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
 
@@ -157,6 +207,8 @@ impl LoadedModel {
             Self::Text { model, .. } => Ok(model.capabilities()),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(model) => Ok(model.capabilities()),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
 
@@ -172,6 +224,12 @@ impl LoadedModel {
             )),
             Self::Decision(_) => Err(Error::Other(
                 "decision models do not use autoregressive generation defaults".into(),
+            )),
+            Self::Image(_) => Err(Error::Other(
+                "image models do not use autoregressive generation defaults".into(),
+            )),
+            Self::Speech(_) => Err(Error::Other(
+                "speech models do not use autoregressive generation defaults".into(),
             )),
         }
     }
@@ -215,7 +273,37 @@ impl LoadedModel {
             }
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
+    }
+
+    pub fn image_mut(&mut self) -> Result<&mut dyn ImageRuntime> {
+        match self {
+            Self::Image(model) => Ok(&mut **model),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not image".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not image".into())),
+            Self::Decision(_) => Err(Error::Other("loaded model is decision, not image".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not image".into())),
+        }
+    }
+
+    pub fn generate_image(&mut self, request: &ImageRequest<'_>) -> Result<GeneratedImage> {
+        self.image_mut()?.generate(request)
+    }
+
+    pub fn speech_mut(&mut self) -> Result<&mut dyn SpeechRuntime> {
+        match self {
+            Self::Speech(model) => Ok(&mut **model),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not speech".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not speech".into())),
+            Self::Decision(_) => Err(Error::Other("loaded model is decision, not speech".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not speech".into())),
+        }
+    }
+
+    pub fn synthesize(&mut self, request: &SpeechRequest<'_>) -> Result<GeneratedAudio> {
+        self.speech_mut()?.synthesize(request)
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -257,6 +345,17 @@ impl LoadedModel {
         stop_token: Option<u32>,
     ) -> Result<Tensor> {
         self.vla()?.infer_action_tokens(request, stop_token)
+    }
+
+    /// Token-only inference with a request limit bounded by model capacity.
+    pub fn infer_action_tokens_with_limit(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        self.vla()?
+            .infer_action_tokens_with_limit(request, stop_token, max_new_tokens)
     }
 
     pub fn calibration_amax(&self, request: &VlaRequest<'_>) -> Result<BTreeMap<String, f32>> {
@@ -317,6 +416,10 @@ impl AutoModel {
         // Decision 3.0 deliberately preserves the base Qwen3.5 model_type in
         // config.json. Its package-level format is the discriminator; without
         // this check it is incorrectly routed to the Qwen3.8 NVFP4 loader.
+        // Clef keeps the Qwen3.5 model_type; its joint schema head identifies it.
+        if model_dir.join("joint_head_config.json").is_file() {
+            return Ok("clef".to_owned());
+        }
         let decision_path = model_dir.join("decision_config.json");
         if decision_path.is_file() {
             let raw = std::fs::read_to_string(&decision_path).map_err(|error| {
@@ -334,6 +437,24 @@ impl AutoModel {
             }
         }
         let config_path = model_dir.join("config.json");
+        // mflux image exports have no top-level config.json; the single-stream
+        // text projection in the transformer index identifies Qwen-Image-2.1.
+        let transformer_index = model_dir.join("transformer/model.safetensors.index.json");
+        if !config_path.is_file() && transformer_index.is_file() {
+            let raw = std::fs::read_to_string(&transformer_index).map_err(|error| {
+                Error::Other(format!("read {}: {error}", transformer_index.display()))
+            })?;
+            let index: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
+                Error::Other(format!("parse {}: {error}", transformer_index.display()))
+            })?;
+            let weights = index.get("weight_map");
+            if ["txt_in.text_norm.weight", "modulation.layers.1.weight"]
+                .iter()
+                .all(|name| weights.and_then(|map| map.get(name)).is_some())
+            {
+                return Ok("qwen_image".to_owned());
+            }
+        }
         let raw = std::fs::read_to_string(&config_path)
             .map_err(|error| Error::Other(format!("read {}: {error}", config_path.display())))?;
         let config: serde_json::Value = serde_json::from_str(&raw)
@@ -376,18 +497,30 @@ impl AutoModel {
             )));
         }
 
-        if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip") {
+        if matches!(model_name, "pi05" | "pi05-cuda" | "pi05-hip" | "pi05-musa") {
+            if device == Device::Cpu && model_name == "pi05" {
+                let config = options.config.as_ref().map(cpu_pi05_config);
+                return crate::cpu_pi05::load(path, options, config);
+            }
             #[cfg(feature = "hip")]
             if matches!(device, Device::Hip(_)) {
                 let config = options.config.as_ref().map(hip_pi05_config);
                 return crate::hip_pi05::load(path, device, options, config);
             }
 
+            #[cfg(feature = "musa")]
+            if matches!(device, Device::Musa(_)) {
+                let config = options.config.as_ref().map(musa_pi05_config);
+                return crate::musa_pi05::load(path, device, options, config);
+            }
+
             #[cfg(feature = "cuda")]
             return crate::pi05::load_with_cuda_new(path, device, options);
 
             #[cfg(not(feature = "cuda"))]
-            return Err(Error::Other("PI0.5 requires CUDA or HIP support".into()));
+            return Err(Error::Other(
+                "PI0.5 requires CPU, CUDA, HIP or MUSA support".into(),
+            ));
         }
 
         if matches!(model_name, "d3" | "d3-cuda") {
@@ -398,10 +531,25 @@ impl AutoModel {
             return Err(Error::Other("d3-mini requires CUDA support".into()));
         }
 
+        if matches!(
+            model_name,
+            "cosmos-policy" | "cosmos-policy-cuda" | "cuda_cosmos_policy"
+        ) {
+            #[cfg(feature = "cuda")]
+            return crate::cuda_cosmos_policy::load::load_with_cuda_new(path, device, options);
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("Cosmos Policy requires CUDA support".into()));
+        }
+
         register_builtin_models();
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
             Device::Hip(_) => Some("hip"),
+            // A family that brings a MUSA port registers `<family>-musa`, the
+            // same way a CUDA or HIP family registers its own suffix. None does
+            // yet: PI0.5 resolves through its seam above.
+            Device::Musa(_) => Some("musa"),
+            // Metal owns its own admission below; CPU has no registry suffix.
             Device::Metal(_) | Device::Cpu => None,
         };
 
@@ -423,11 +571,13 @@ impl AutoModel {
                 })?
         };
         // Resolve admission before touching a device or loading checkpoint data.
-        let backend = create_backend(device)?;
         #[cfg(feature = "cuda")]
-        if let Some(cuda) = crate::accelerator::cuda::downcast(&*backend) {
-            configure_cuda_tuning(cuda, path, options)?;
-        }
+        let backend = {
+            let recipe = cuda_recipe_options(options)?;
+            create_backend_with_recipe_options(device, recipe.online_tune, recipe.cache_dir)?
+        };
+        #[cfg(not(feature = "cuda"))]
+        let backend = create_backend_with_recipe_options(device, options.autotune, None)?;
         let mut loaded = factory(path, device, backend, options)?;
         if let LoadedModel::Text {
             generation_defaults,
@@ -457,7 +607,7 @@ pub(crate) fn cuda_recipe_options(options: &LoadOptions) -> Result<CudaRecipeOpt
     let cache_dir = options
         .tuning_path
         .as_deref()
-        .map(exact_recipe_directory)
+        .and_then(|path| (!is_source_hardware_tactics(path)).then(|| exact_recipe_directory(path)))
         .map(|path| {
             path.to_str().map(str::to_owned).ok_or_else(|| {
                 Error::Other(format!(
@@ -471,6 +621,28 @@ pub(crate) fn cuda_recipe_options(options: &LoadOptions) -> Result<CudaRecipeOpt
         cache_dir,
         online_tune: options.autotune,
     })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn is_source_hardware_tactics(path: &Path) -> bool {
+    if path.file_name().and_then(|name| name.to_str()) != Some("tactics.json") {
+        return false;
+    }
+    let Some(device_directory) = path.parent() else {
+        return false;
+    };
+    let Some(vendor_directory) = device_directory.parent() else {
+        return false;
+    };
+    let Some(tuning_directory) = vendor_directory.parent() else {
+        return false;
+    };
+    let Some(configs_directory) = tuning_directory.parent() else {
+        return false;
+    };
+    vendor_directory.file_name().and_then(|name| name.to_str()) == Some("nvidia")
+        && tuning_directory.file_name().and_then(|name| name.to_str()) == Some("tuning")
+        && configs_directory.file_name().and_then(|name| name.to_str()) == Some("configs")
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -499,6 +671,43 @@ fn metal_registry_name(model_name: &str) -> String {
             "metal_{}",
             model_name.strip_suffix("-mlx").unwrap_or(model_name)
         )
+    }
+}
+
+/// A frontend's PI0.5 overrides (`LoadOptions::config`, the CUDA family's
+/// type) as the CPU port's own config. Lives here, outside both families, so
+/// neither imports the other.
+fn cpu_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::cpu_pi05::Config {
+    let gemma = |g: &crate::pi05::GemmaVariantConfig| crate::cpu_pi05::config::GemmaConfig {
+        width: g.width,
+        depth: g.depth,
+        mlp_dim: g.mlp_dim,
+        num_heads: g.num_heads,
+        num_kv_heads: g.num_kv_heads,
+        head_dim: g.head_dim,
+    };
+    crate::cpu_pi05::Config {
+        action_dim: frontend.action_dim,
+        action_horizon: frontend.action_horizon,
+        max_token_len: frontend.max_token_len,
+        num_flow_steps: frontend.num_flow_steps,
+        flow_start_time: frontend.flow_start_time,
+        num_views: frontend.num_views,
+        image_size: frontend.image_size,
+        patch_size: frontend.patch_size,
+        vision_width: frontend.vision_width,
+        vision_depth: frontend.vision_depth,
+        vision_mlp_dim: frontend.vision_mlp_dim,
+        vision_heads: frontend.vision_heads,
+        vision_head_dim: frontend.vision_head_dim,
+        vocab_size: frontend.vocab_size,
+        rms_norm_eps: frontend.rms_norm_eps,
+        layer_norm_eps: frontend.layer_norm_eps,
+        rope_theta: frontend.rope_theta,
+        time_min_period: frontend.time_min_period,
+        time_max_period: frontend.time_max_period,
+        language: gemma(&frontend.language),
+        action_expert: gemma(&frontend.action_expert),
     }
 }
 
@@ -540,89 +749,112 @@ fn hip_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::hip_pi05::Confi
     }
 }
 
+/// The same frontend contract as `hip_pi05_config`, for the MUSA port. Both
+/// conversions live here, outside the families, so neither imports the other.
+#[cfg(feature = "musa")]
+fn musa_pi05_config(frontend: &crate::pi05::Pi05Config) -> crate::musa_pi05::Pi05Config {
+    let gemma = |g: &crate::pi05::GemmaVariantConfig| crate::musa_pi05::GemmaVariantConfig {
+        width: g.width,
+        depth: g.depth,
+        mlp_dim: g.mlp_dim,
+        num_heads: g.num_heads,
+        num_kv_heads: g.num_kv_heads,
+        head_dim: g.head_dim,
+    };
+    crate::musa_pi05::Pi05Config {
+        action_dim: frontend.action_dim,
+        action_horizon: frontend.action_horizon,
+        max_token_len: frontend.max_token_len,
+        num_flow_steps: frontend.num_flow_steps,
+        flow_start_time: frontend.flow_start_time,
+        num_views: frontend.num_views,
+        image_size: frontend.image_size,
+        patch_size: frontend.patch_size,
+        vision_width: frontend.vision_width,
+        vision_depth: frontend.vision_depth,
+        vision_mlp_dim: frontend.vision_mlp_dim,
+        vision_heads: frontend.vision_heads,
+        vision_head_dim: frontend.vision_head_dim,
+        vocab_size: frontend.vocab_size,
+        rms_norm_eps: frontend.rms_norm_eps,
+        layer_norm_eps: frontend.layer_norm_eps,
+        rope_theta: frontend.rope_theta,
+        time_min_period: frontend.time_min_period,
+        time_max_period: frontend.time_max_period,
+        discrete_state_input: frontend.discrete_state_input,
+        language: gemma(&frontend.language),
+        action_expert: gemma(&frontend.action_expert),
+    }
+}
+
+/// The family a backend-qualified name refers to: `pi05-hip` is `pi05`.
+///
+/// The qualifier says which backend the caller had in mind; `device` is what
+/// decides, and admission is only asked whether the *family* supports variants.
+/// Stripping it here is what lets a family listed once admit `<family>`,
+/// `<family>-cuda`, `<family>-hip`, `<family>-musa` and `<family>-mlx`, so a
+/// family that grows a port on another backend needs no entry — or edit — here.
+fn family_name(model_name: &str) -> &str {
+    ["-cuda", "-hip", "-musa", "-mlx"]
+        .iter()
+        .find_map(|suffix| model_name.strip_suffix(suffix))
+        .unwrap_or(model_name)
+}
+
 // Admission only: supported variant names and precision semantics are owned by
 // each family loader, not a second central implementation registry. A Metal
 // request reaches only a registered `metal_` factory, which parses its variant.
 fn supports_model_variant(model_name: &str, device: Device) -> bool {
     matches!(
-        model_name,
+        family_name(model_name),
         "pi05"
-            | "pi05-cuda"
-            | "pi05-hip"
             | "qwen_drive"
-            | "qwen_drive-cuda"
             | "d3"
-            | "d3-cuda"
+            | "walloss"
+            | "wall-oss"
+            | "wall_oss_05"
+            | "gr00t"
+            | "gr00t_n1_7"
+            | "Gr00tN1d7"
+            | "pi0_fast"
+            | "pi0fast"
             | "smolvla"
             | "smolvla_libero"
+            | "Gr00tN1d7-hip"
+            | "gr00t-hip"
+            | "gr00t_n1_7-hip"
+            | "cosmos-policy"
+            | "cuda_cosmos_policy"
     ) || matches!(device, Device::Metal(_))
 }
-
-#[cfg(feature = "cuda")]
-fn configure_cuda_tuning(
-    cuda: &apxinf_cuda::CudaBackend,
-    model_path: &Path,
-    options: &LoadOptions,
-) -> Result<()> {
-    use apxinf_cuda::tuning::{TuningDb, TuningMode, TuningPaths};
-
-    let default_paths = TuningPaths::resolve_for_cuda(
-        "configs/tuning",
-        cuda.context().caps(),
-        cuda.context().library_versions(),
-    );
-    let model_root = if model_path.is_dir() {
-        model_path
-    } else {
-        model_path.parent().unwrap_or_else(|| Path::new("."))
-    };
-    let legacy_path = model_root.join("tactics.json");
-    let selected = select_cuda_tuning_database_path(&default_paths.tactics, &legacy_path, options);
-    let database = selected
-        .as_deref()
-        .map(TuningDb::from_json_file)
-        .transpose()?;
-    let paths = options
-        .tuning_path
-        .clone()
-        .map(TuningPaths::from_tactics)
-        .unwrap_or(default_paths);
-    let mode = if options.autotune {
-        TuningMode::AutoTune
-    } else {
-        TuningMode::Inference
-    };
-    apxinf_cuda::kernels::gemm::configure_tuning(
-        cuda.context(),
-        mode,
-        database.as_ref().map(std::slice::from_ref).unwrap_or(&[]),
-        Some(paths),
-    )
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn select_cuda_tuning_database_path(
-    default_path: &Path,
-    legacy_path: &Path,
-    options: &LoadOptions,
-) -> Option<PathBuf> {
-    match options.tuning_path.as_ref() {
-        Some(path) if path.is_file() => Some(path.clone()),
-        Some(_) if options.autotune => None,
-        Some(path) => Some(path.clone()),
-        None => default_path
-            .is_file()
-            .then(|| default_path.to_path_buf())
-            .or_else(|| {
-                (options.synthetic.is_none() && legacy_path.is_file())
-                    .then(|| legacy_path.to_path_buf())
-            }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "mlx"))]
+    #[test]
+    fn image_variants_reach_device_admission_without_mlx() {
+        for family in ["qwen_image", "metal_qwen_image", "qwen_image-mlx"] {
+            for variant in ["auto", "reference"] {
+                let options = LoadOptions {
+                    model_name: Some(family.into()),
+                    model_variant: Some(variant.into()),
+                    ..LoadOptions::default()
+                };
+                let error = AutoModel::load_model(
+                    Device::Metal(0),
+                    Path::new("checkpoint-must-not-be-opened"),
+                    &options,
+                )
+                .err()
+                .expect("MLX is unavailable");
+                assert!(
+                    matches!(error, Error::UnsupportedDevice(Device::Metal(0))),
+                    "{family}/{variant}: {error}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn cuda_recipe_tuning_is_explicit_and_independent_of_directory() {
@@ -638,6 +870,26 @@ mod tests {
         assert!(recipe.online_tune);
         options.autotune = false;
         assert!(!cuda_recipe_options(&options).unwrap().online_tune);
+    }
+
+    #[test]
+    fn source_hardware_tactics_defer_to_the_native_toolkit_directory() {
+        let options = LoadOptions {
+            tuning_path: Some(PathBuf::from(
+                "/checkout/configs/tuning/nvidia/thor-sm110/tactics.json",
+            )),
+            ..LoadOptions::default()
+        };
+        assert_eq!(cuda_recipe_options(&options).unwrap().cache_dir, None);
+
+        let options = LoadOptions {
+            tuning_path: Some(PathBuf::from("/checkpoint/tactics.json")),
+            ..LoadOptions::default()
+        };
+        assert_eq!(
+            cuda_recipe_options(&options).unwrap().cache_dir.as_deref(),
+            Some("/checkpoint/tactics.recipes")
+        );
     }
 
     #[test]
@@ -718,8 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn metal_variant_admission_is_family_and_device_specific() {
-        // Metal defers to the registered family factory; other devices keep the list.
+    fn metal_admission_defers_to_the_registered_factory() {
         for name in [
             "qwen3",
             "metal_qwen3",
@@ -729,6 +980,9 @@ mod tests {
             "minicpm5-mlx",
             "llama",
             "qwen3_vl",
+            "qwen_image",
+            "metal_qwen_image",
+            "qwen_image-mlx",
         ] {
             assert!(supports_model_variant(name, Device::Metal(0)));
             assert!(!supports_model_variant(name, Device::Cpu));
@@ -736,34 +990,142 @@ mod tests {
         }
         assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
         assert!(supports_model_variant("pi05-hip", Device::Hip(0)));
+        assert!(supports_model_variant("pi05-musa", Device::Musa(0)));
         assert!(supports_model_variant("qwen_drive", Device::Cpu));
         assert!(supports_model_variant("smolvla", Device::Cuda(0)));
         assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
+        for name in [
+            "walloss",
+            "walloss-cuda",
+            "wall-oss",
+            "wall_oss_05-cuda",
+            "gr00t",
+            "gr00t-cuda",
+            "Gr00tN1d7",
+            "gr00t_n1_7-cuda",
+            "pi0_fast",
+            "pi0_fast-cuda",
+            "pi0fast",
+            "pi0fast-cuda",
+        ] {
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
     }
 
-    /// `Pi05Policy.from_pretrained(model_name="pi05-hip")` always sends a
-    /// model_variant (`"auto"` by default). Both must pass admission and reach
-    /// the PI0.5 loader; here that loader then fails for lack of a device or a
-    /// checkpoint, which is fine — only the admission rejection is the bug.
+    /// A backend qualifier names the backend the caller meant, not a different
+    /// family: admission answers for the family, on every device it can name.
     #[test]
-    fn pi05_hip_alias_admits_auto_and_bf16_model_variants() {
-        let path = temporary_directory("pi05-hip-admission");
-        for variant in ["auto", "bf16"] {
-            let options = LoadOptions {
-                model_name: Some("pi05-hip".into()),
-                model_variant: Some(variant.into()),
-                ..LoadOptions::default()
-            };
-            let error = match AutoModel::load_model(Device::Hip(0), &path, &options) {
-                Ok(_) => panic!("an empty directory cannot load as PI0.5"),
-                Err(error) => error.to_string(),
-            };
-            assert!(
-                !error.contains("does not yet support model_variant"),
-                "model_variant={variant} was rejected before the PI0.5 loader: {error}"
-            );
+    fn a_backend_qualifier_does_not_decide_admission() {
+        for name in ["pi05", "pi05-cuda", "pi05-hip", "pi05-musa"] {
+            assert!(supports_model_variant(name, Device::Musa(0)), "{name}");
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
+        // The qualifier does not invent a family that has no variants either.
+        assert!(!supports_model_variant("llama-musa", Device::Musa(0)));
+    }
+
+    /// Cosmos Policy answers under both the family name and the name it
+    /// registers its factory as, and `cosmos-policy-cuda` reaches it through
+    /// the stripped qualifier rather than an entry of its own.
+    #[test]
+    fn cosmos_policy_admits_every_spelling_of_its_family() {
+        for name in ["cosmos-policy", "cosmos-policy-cuda", "cuda_cosmos_policy"] {
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
+    }
+
+    /// `Pi05Policy.from_pretrained(model_name="pi05-hip")` — and the same call
+    /// with `pi05-musa` — always sends a model_variant (`"auto"` by default).
+    /// Both must pass admission and reach the PI0.5 loader; here that loader
+    /// then fails for lack of a device or a checkpoint, which is fine — only
+    /// the admission rejection is the bug.
+    #[test]
+    fn pi05_backend_aliases_admit_auto_and_bf16_model_variants() {
+        let path = temporary_directory("pi05-alias-admission");
+        for (alias, device) in [("pi05-hip", Device::Hip(0)), ("pi05-musa", Device::Musa(0))] {
+            for variant in ["auto", "bf16"] {
+                let options = LoadOptions {
+                    model_name: Some(alias.into()),
+                    model_variant: Some(variant.into()),
+                    ..LoadOptions::default()
+                };
+                let error = match AutoModel::load_model(device, &path, &options) {
+                    Ok(_) => panic!("an empty directory cannot load as PI0.5"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    !error.contains("does not yet support model_variant"),
+                    "model_name={alias} model_variant={variant} was rejected before the PI0.5 \
+                     loader: {error}"
+                );
+            }
         }
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// `Gr00tN1d7` on HIP must resolve through the registry: detection reads
+    /// `config.json:model_type`, the device suffix picks `Gr00tN1d7-hip`, and
+    /// an `auto` or `bf16` model_variant passes admission so the request
+    /// reaches this port's loader, which then rejects the empty directory --
+    /// a rejection from routing instead is the bug this test catches.
+    #[test]
+    fn gr00t_hip_resolves_from_config_json_through_the_registry() {
+        let path = temporary_directory("gr00t-hip-routing");
+        std::fs::write(
+            path.join("config.json"),
+            r#"{"model_type": "Gr00tN1d7"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            AutoModel::detect_model_name(&path).unwrap(),
+            "Gr00tN1d7",
+            "detection must name the family from config.json"
+        );
+        #[cfg(feature = "hip")]
+        {
+            register_builtin_models();
+            for name in ["Gr00tN1d7-hip", "gr00t-hip", "gr00t_n1_7-hip"] {
+                assert!(registry::get(name).is_some(), "{name} is not registered");
+            }
+            for variant in ["auto", "bf16"] {
+                let options = LoadOptions {
+                    model_variant: Some(variant.into()),
+                    ..LoadOptions::default()
+                };
+                let error = match AutoModel::load_model(Device::Hip(0), &path, &options) {
+                    Ok(_) => panic!("an empty directory cannot load as GR00T"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    !error.contains("does not yet support model_variant"),
+                    "model_variant={variant} was rejected before the GR00T loader: {error}"
+                );
+                assert!(
+                    !error.contains("no model implementation"),
+                    "Gr00tN1d7 on HIP did not resolve to the registered factory: {error}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn metal_variants_do_not_bypass_family_registration() {
+        for family in ["llama", "qwen3_vl", "test_missing_metal_family"] {
+            let options = LoadOptions {
+                model_name: Some(family.into()),
+                model_variant: Some("auto".into()),
+                ..LoadOptions::default()
+            };
+            assert!(matches!(
+                AutoModel::load_model(
+                    Device::Metal(0),
+                    Path::new("checkpoint-must-not-be-opened"),
+                    &options,
+                ),
+                Err(Error::UnsupportedDevice(Device::Metal(0)))
+            ));
+        }
     }
 
     #[test]
@@ -796,54 +1158,6 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_load_ignores_model_local_legacy_tactics() {
-        let directory = temporary_directory("synthetic-tactics");
-        let default_path = directory.join("missing-hardware-tactics.json");
-        let legacy_path = directory.join("tactics.json");
-        std::fs::write(&legacy_path, "{}").unwrap();
-        let options = LoadOptions {
-            synthetic: Some(SyntheticWeights { seed: 0 }),
-            ..LoadOptions::default()
-        };
-
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            None
-        );
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &LoadOptions::default()),
-            Some(legacy_path)
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn synthetic_load_still_uses_hardware_or_explicit_tactics() {
-        let directory = temporary_directory("explicit-tactics");
-        let default_path = directory.join("hardware.json");
-        let legacy_path = directory.join("tactics.json");
-        let explicit_path = directory.join("explicit.json");
-        std::fs::write(&default_path, "{}").unwrap();
-        std::fs::write(&legacy_path, "{}").unwrap();
-        std::fs::write(&explicit_path, "{}").unwrap();
-        let mut options = LoadOptions {
-            synthetic: Some(SyntheticWeights { seed: 0 }),
-            ..LoadOptions::default()
-        };
-
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            Some(default_path.clone())
-        );
-        options.tuning_path = Some(explicit_path.clone());
-        assert_eq!(
-            select_cuda_tuning_database_path(&default_path, &legacy_path, &options),
-            Some(explicit_path)
-        );
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
     fn d3_package_is_not_misdetected_as_generic_qwen3_5() {
         let directory = temporary_directory("d3-detection");
         std::fs::write(directory.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
@@ -854,6 +1168,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(AutoModel::detect_model_name(&directory).unwrap(), "d3");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn mflux_qwen_image_export_is_detected_without_config_json() {
+        let directory = temporary_directory("qwen-image-detection");
+        std::fs::create_dir(directory.join("transformer")).unwrap();
+        std::fs::write(
+            directory.join("transformer/model.safetensors.index.json"),
+            r#"{"weight_map":{"txt_in.text_norm.weight":"0.safetensors",
+                "modulation.layers.1.weight":"1.safetensors"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            AutoModel::detect_model_name(&directory).unwrap(),
+            "qwen_image"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 

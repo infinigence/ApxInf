@@ -43,8 +43,21 @@ that do not change a value:
 
 `apxinf_hip::native` holds the operators (GEMM via hipBLAS; the norms and fused
 residual norms, GeGLU, Euler step, gathers, QKV split with RoPE into a cache,
-and one non-causal attention kernel). Each is tested against an F32 host
-reference at pi05's shapes in `crates/apxinf-hip/tests/native.rs`.
+and non-causal attention). Each is tested against an F32 host reference at
+pi05's shapes in `crates/apxinf-hip/tests/native.rs`.
+
+Attention runs on Composable Kernel's flash-attention, vendored in
+`crates/apxinf-hip/kernels/ck/`: CK forward for vision and the prefix (whose 8
+query heads share one KV head and are folded into one head of 8x the rows), and
+CK split-KV with 4 key splits for the action expert's 10 queries over the
+prefix. `native::attention_kernel` makes that choice from the device architecture and
+the geometry: the vendored CK dispatchers resolve on `gfx115*` only (split-KV on
+`gfx11*`), so every other architecture, and any head dim CK does not cover, runs
+apxinf's own kernel — which also remains the test reference. A CK call that
+still finds no instance falls back to that kernel at run time instead of
+failing. CK rounds
+the attention probabilities to BF16 before the value product; apxinf's kernel
+keeps them in F32.
 
 ## Use it
 
@@ -86,7 +99,7 @@ python scripts/compare_pi05_stages.py <cuda-dump> <hip-dump>
 prints cosine / relative L2 / max abs per stage in pipeline order; the first
 stage whose agreement drops is where two implementations diverge.
 
-## Status (2026-10-21)
+## Status (2026-10-27)
 
 Fixtures: the cross-backend bundle (`cross-backend-accuracy-20260922`), 2 views,
 H = 10, 10 flow steps. Gate: `doc/pi05-cuda-regression.md` BF16 — cosine >= 0.999,
@@ -94,33 +107,39 @@ relative L2 <= 0.05 against the bundle's `reference.json`.
 
 | | vs reference: cosine / rel. L2 | eager latency P50 |
 |---|---|---|
-| HIP BF16, T=10 | 0.999992 / 0.0042 | 265 ms |
-| HIP BF16, T=21 | 0.999992 / 0.0042 | 267 ms |
+| HIP BF16, T=10 | 0.999991 / 0.0050 | 159 ms |
+| HIP BF16, T=21 | 0.999991 / 0.0046 | 161 ms |
+| HIP BF16, T=10, apxinf's own attention kernel (2026-10-21) | 0.999992 / 0.0042 | 265 ms |
 | CUDA BF16 (Thor), T=10, same fixtures | 0.999994 / 0.0034 | — |
 
-Against the CUDA stage dumps: patches bit-exact; vision and prefix cosine
-0.99999; all 36 language K/V tensors >= 0.9997, drifting smoothly with depth;
-final actions 0.999997. Repeat runs are bit-identical.
+Against the CUDA stage dumps: patches bit-exact; every later stage >= 0.9994
+(the worst is a language layer's V, 0.99947). That is slightly further from CUDA
+than apxinf's own attention kernel was (0.99968): CK's BF16 rounding of the
+probabilities does not match CUDA's attention any more closely. Repeat runs are
+bit-identical.
 
-Where the 265 ms goes (stages synchronized individually): vision 43 ms, prefix
-(18 language layers) 101 ms, ten flow steps 122 ms. The flow steps are about
-3x the GEMM-bound estimate — 180 small kernels per step, unfused, plus the
-correctness attention kernel — which is what graph capture and fusion target.
+Where the 159 ms goes (rocprofv3, one steady-state run): the GPU is busy 152 ms.
+GEMMs take 132 ms of that — the language MLP 55 ms, the action expert's M = 10
+GEMMs 58 ms at a third of memory bandwidth, vision 13 ms — and attention 7 ms.
+Submitting the run's 2,310 launches takes the host 150 ms, nearly as long as the
+GPU runs, so further GPU speed-ups need graph capture to show.
 
 Python: `crates/apxinf-py/tests/test_smoke_pi05.py` passes on `hip:0` (7 tests).
 LIBERO: in-process `eval_libero.py --device hip:0` runs through `AutoPolicy`.
 LIBERO-10 tasks 0 and 1, 5 trials each (seed 7, H = 10, replan 5): **10/10
-successes**, 266 ms model time per call. This is a smoke check, not the
-published 500-episode protocol, which waits for a faster runtime.
+successes**, 162 ms model time per call (266 ms with apxinf's own attention
+kernel, also 10/10). This is a smoke check, not the published 500-episode
+protocol.
 
 ## Next
 
 1. **Graph capture**: capture a whole prepared run as one HIP graph; the plan
-   already has fixed inputs and arena addresses.
-2. **GEMM selection**: per-shape choice between hipBLAS and hipBLASLt (neither
-   wins everywhere on gfx1151), then CK or hand-written kernels for the
-   language MLP, which is half the GEMM time.
-3. **Attention and fusion**: a tiled attention kernel and the CUDA path's fused
-   epilogues (GeGLU into the GEMM, bias into residual norms).
-4. **Full LIBERO-10** (500 episodes) once a run is fast enough to make it
-   practical, as the regression gate for the above.
+   already has fixed inputs and arena addresses, and the host now takes nearly
+   as long to submit a run as the GPU takes to execute it.
+2. **Action-expert GEMMs**: the M = 10 projections read weights at about a third
+   of the 243 GB/s the device sustains; per-shape hipBLASLt or a GEMV-style
+   kernel.
+3. **Language MLP and fusion**: the prefix gate/up and down GEMMs (55 ms), and
+   the CUDA path's fused epilogues (GeGLU into the GEMM, bias into residual
+   norms).
+4. **Full LIBERO-10** (500 episodes) as the regression gate for the above.

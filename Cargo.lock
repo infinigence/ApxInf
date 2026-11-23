@@ -72,11 +72,13 @@ name = "apxinf"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
- "apxinf-cuda",
+ "apxinf-cpu",
+ "apxinf-cuda-new",
  "apxinf-hip",
  "apxinf-loader",
  "apxinf-mlx",
  "apxinf-model",
+ "apxinf-musa",
  "apxinf-tokenizer",
  "clap",
  "half",
@@ -88,22 +90,29 @@ name = "apxinf-core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "cblas",
  "half",
- "libc",
  "thiserror 1.0.69",
 ]
 
 [[package]]
-name = "apxinf-cuda"
+name = "apxinf-coreml"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
- "bytemuck",
  "cc",
  "half",
- "serde_json",
- "thiserror 1.0.69",
+ "prost",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "apxinf-cpu"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "cblas",
+ "half",
 ]
 
 [[package]]
@@ -111,8 +120,10 @@ name = "apxinf-cuda-new"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-cpu",
  "apxinf-loader",
  "apxinf-tokenizer",
+ "cc",
  "half",
  "serde_json",
 ]
@@ -122,6 +133,7 @@ name = "apxinf-hip"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-cpu",
  "half",
 ]
 
@@ -154,17 +166,32 @@ name = "apxinf-model"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
- "apxinf-cuda",
+ "apxinf-coreml",
+ "apxinf-cpu",
  "apxinf-cuda-new",
  "apxinf-hip",
  "apxinf-loader",
  "apxinf-mlx",
+ "apxinf-musa",
+ "apxinf-tokenizer",
  "half",
  "once_cell",
+ "prost",
  "serde",
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "apxinf-musa"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "bytemuck",
+ "half",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@ use crate::d3::model::D3Policies;
 use crate::d3::runner::D3Runner;
 use crate::d3::weights::bf16::D3DeviceWeights;
 use crate::d3::{D3CheckpointWeights, D3PackageConfig, D3ReadoutWeights};
+use crate::decision::DecisionModel;
 
 pub(crate) fn load_with_cuda_new(
     path: &Path,
@@ -58,12 +59,14 @@ pub(crate) fn load_with_cuda_new(
     let policies = D3Policies::for_recipe(recipe.cache_dir, recipe.online_tune);
     let weights = D3DeviceWeights::from_host(&config, checkpoint, readout, &ctx)?;
     ctx.synchronize().map_err(Error::Cuda)?;
-    Ok(LoadedModel::Decision(Box::new(D3Runner::new(
-        ctx,
-        config,
-        weights,
-        policies,
-        options.d3_text_profile_limit,
-        options.d3_text_profile_token_budget,
-    )?)))
+    Ok(LoadedModel::Decision(DecisionModel::Code(Box::new(
+        D3Runner::new(
+            ctx,
+            config,
+            weights,
+            policies,
+            options.d3_text_profile_limit,
+            options.d3_text_profile_token_budget,
+        )?,
+    ))))
 }

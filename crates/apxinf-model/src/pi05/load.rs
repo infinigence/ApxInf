@@ -5,8 +5,8 @@ use super::model::{
 };
 use super::*;
 use crate::auto::{cuda_recipe_options, LoadOptions, LoadedModel, ModelPrecision};
-use apxinf_core::{Device, Error};
 use apxinf_core::Result;
+use apxinf_core::{Device, Error};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -98,9 +98,10 @@ fn load_model_runner_with_policies(
                     &calibration,
                 )?)
             };
-            let weights = Arc::new(Fp8StaticWeights::from_host(
+            let weights = Arc::new(Fp8StaticWeights::from_host_with_layout_budget(
                 &host_weights,
                 &*backend,
+                options.weight_layout_budget_bytes.unwrap_or(usize::MAX),
             )?);
             let time_embeddings = Arc::new(upload_time_embeddings_fp8_static(&config, &*backend)?);
             ModelVariant::Fp8Static {
@@ -115,9 +116,10 @@ fn load_model_runner_with_policies(
             }
         }
         ModelVariantChoice::Bf16 => {
-            let weights = Arc::new(Bf16Weights::from_host(
+            let weights = Arc::new(Bf16Weights::from_host_with_layout_budget(
                 &host_weights,
                 &*backend,
+                options.weight_layout_budget_bytes.unwrap_or(usize::MAX),
             )?);
             let time_embeddings = Arc::new(upload_time_embeddings_bf16(&config, &*backend)?);
             ModelVariant::Bf16 {

@@ -9,7 +9,7 @@
 //! ```text
 //! APXINF_QWEN38_CHECKPOINT=/path/to/Qwen3.8-27B-NVFP4 \
 //!   bash crates/apxinf-cuda-new/test-new.sh \
-//!     test -p apxinf-cuda --test qwen38_nvfp4_gemm -- --ignored --nocapture
+//!     test -p apxinf-cuda-new --test qwen38_nvfp4_gemm -- --ignored --nocapture
 //! ```
 
 use std::collections::HashMap;
@@ -23,7 +23,11 @@ const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
 fn e2m1_value(code: u8) -> f64 {
     let magnitude = E2M1[(code & 0x7) as usize] as f64;
-    if code & 0x8 != 0 { -magnitude } else { magnitude }
+    if code & 0x8 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
 }
 
 /// Decode E4M3 (bias 7). Scale tensors are non-negative, where the unsigned
@@ -36,7 +40,11 @@ fn e4m3_value(code: u8) -> f64 {
         return mantissa / 8.0 * (-6.0f64).exp2();
     }
     let magnitude = (1.0 + mantissa / 8.0) * ((exponent - 7) as f64).exp2();
-    if code & 0x80 != 0 { -magnitude } else { magnitude }
+    if code & 0x80 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
 }
 
 fn bf16_to_f64(raw: u16) -> f64 {
@@ -97,25 +105,26 @@ fn real_gate_proj_weight_runs_through_the_nvfp4_gemm() {
     let weight_slice = &weight_bytes[..rows * k / 2];
     let scale_slice = &scale_bytes[..rows * blocks];
 
-    let weight_cpu =
-        Tensor::from_e2m1_pairs(Shape::new(vec![rows, k / 2]), weight_slice).unwrap();
+    let weight_cpu = Tensor::from_e2m1_pairs(Shape::new(vec![rows, k / 2]), weight_slice).unwrap();
     let scale_cpu = Tensor::from_f8_e4m3(Shape::new(vec![rows, blocks]), scale_slice).unwrap();
     let weight = upload(&ctx, &weight_cpu);
     let checkpoint_scales = upload(&ctx, &scale_cpu);
 
     // Relayout the weight scales once, exactly as a loader would.
-    let scale_bytes_needed = ops::nvfp4_scale_buffer_bytes(rows, k, block as u32).unwrap();
+    let scale_bytes_needed = ops::block_scale_buffer_bytes(rows, k, block as u32).unwrap();
     let weight_scales = CudaBuffer::alloc(scale_bytes_needed, ctx.device_id())
         .unwrap()
         .as_tensor(Shape::new(vec![scale_bytes_needed]), DType::F8E4M3)
         .unwrap();
-    ops::nvfp4_pack_block_scales(
+    ops::pack_block_scales(
         &ctx,
-        &checkpoint_scales,
-        &weight_scales,
-        rows,
-        k,
-        block as u32,
+        ops::PackBlockScalesArgs {
+            source: &checkpoint_scales,
+            output: &weight_scales,
+            rows,
+            k,
+            block_size: block as u32,
+        },
     )
     .unwrap();
 
@@ -134,18 +143,20 @@ fn real_gate_proj_weight_runs_through_the_nvfp4_gemm() {
     let activation_scales_cpu =
         Tensor::from_f8_e4m3(Shape::new(vec![m, blocks]), &vec![unit; m * blocks]).unwrap();
     let activation_checkpoint_scales = upload(&ctx, &activation_scales_cpu);
-    let activation_scale_bytes = ops::nvfp4_scale_buffer_bytes(m, k, block as u32).unwrap();
+    let activation_scale_bytes = ops::block_scale_buffer_bytes(m, k, block as u32).unwrap();
     let activation_scales = CudaBuffer::alloc(activation_scale_bytes, ctx.device_id())
         .unwrap()
         .as_tensor(Shape::new(vec![activation_scale_bytes]), DType::F8E4M3)
         .unwrap();
-    ops::nvfp4_pack_block_scales(
+    ops::pack_block_scales(
         &ctx,
-        &activation_checkpoint_scales,
-        &activation_scales,
-        m,
-        k,
-        block as u32,
+        ops::PackBlockScalesArgs {
+            source: &activation_checkpoint_scales,
+            output: &activation_scales,
+            rows: m,
+            k,
+            block_size: block as u32,
+        },
     )
     .unwrap();
 
@@ -156,7 +167,7 @@ fn real_gate_proj_weight_runs_through_the_nvfp4_gemm() {
         .unwrap()
         .as_tensor(Shape::new(vec![m, rows]), DType::BF16)
         .unwrap();
-    let args = ops::GemmArgs::nvfp4(
+    let mut args = ops::GemmArgs::block_quantized(
         &activation,
         &activation_scales,
         &weight,
@@ -165,6 +176,11 @@ fn real_gate_proj_weight_runs_through_the_nvfp4_gemm() {
         alpha,
         &mut out,
     );
+    // The public Qwen3.8 CLI does not enable online tuning. A packed NVFP4
+    // recipe miss must therefore use a supported format-specific baseline
+    // rather than failing because the generic cuBLAS fallback rejects FP4.
+    args.policy.online_tune = false;
+    args.policy.cache_dir = Some(String::new());
     ops::gemm(&ctx, args).unwrap();
     ctx.synchronize().unwrap();
 
@@ -181,9 +197,17 @@ fn real_gate_proj_weight_runs_through_the_nvfp4_gemm() {
             let mut accumulator = 0.0f64;
             for index in 0..k {
                 let a_byte = activation_bytes[row * (k / 2) + index / 2];
-                let a_code = if index % 2 == 0 { a_byte & 0x0F } else { a_byte >> 4 };
+                let a_code = if index % 2 == 0 {
+                    a_byte & 0x0F
+                } else {
+                    a_byte >> 4
+                };
                 let b_byte = weight_slice[column * (k / 2) + index / 2];
-                let b_code = if index % 2 == 0 { b_byte & 0x0F } else { b_byte >> 4 };
+                let b_code = if index % 2 == 0 {
+                    b_byte & 0x0F
+                } else {
+                    b_byte >> 4
+                };
                 let b_scale = e4m3_value(scale_slice[column * blocks + index / block]);
                 accumulator += e2m1_value(a_code) * e2m1_value(b_code) * b_scale;
             }

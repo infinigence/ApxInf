@@ -20,6 +20,18 @@ Every model implementation starts in its own directory:
 crates/apxinf-model/src/<model>/
 ```
 
+A new implementation that directly composes one backend's native APIs uses
+`<backend>_<family>/`, for example `cuda_cosmos_policy/`. Preserve existing
+public model names as loader aliases when renaming a native module.
+
+For a single BF16 VLA, follow the PI0.5 responsibility boundaries with one
+`model/blocks/bf16.rs` and one `weights/bf16.rs`, plus host checkpoint storage in
+`weights/host.rs`. A concrete `Bf16Blocks` encapsulates operator calls and
+intermediate representations; the model owns connectivity and the sampling
+schedule. Keep runtime validation/cache and preparation/resource ownership in
+`model_runner/{runner,prepare}.rs`. Split a precision file only for a demonstrated
+maintenance need; subnetwork count alone does not require extra files or traits.
+
 Do not add the new architecture to `llama/`, `qwen3vl/`, or `pi05/`, even when
 most code looks similar. Register the new directory from `lib.rs` and
 `builtin.rs`; keep model detection in the existing registry/`AutoModel` path.
@@ -48,8 +60,11 @@ Keep `forward(token_ids, start_pos)` full: its result is
 `[seq_len, vocab_size]`. A generation-oriented `prefill(LlmInput)` may consume
 the complete prompt into state and return only `[1, vocab_size]`; the shared
 sampler takes the last row. Qwen3's native prefill evaluates cache-only chunks
-before its final token, and MiniCPM5 applies its head only to the final prompt
-row. Specialized speculative generation belongs to the request-level hook.
+before its final token. MiniCPM5 applies its head to the final row of each
+prefill chunk and returns the last chunk's result. Long generation preparation
+may admit bounded chunk shapes without admitting a full prompt-sized forward;
+report those actual shapes in `preparation_status`. Specialized speculative
+generation belongs to the request-level hook.
 
 A small model commonly starts with:
 
@@ -110,6 +125,12 @@ HF tokenizer, state/action normalization, two-camera resize-with-padding, and
 action unnormalization. Its maintained latency and LIBERO entry points are
 `scripts/bench_smolvla.py` and `scripts/eval_smolvla_libero.py`.
 
+The [PI0.5 CPU reference](pi05-cpu-reference.md) is an independent
+`cpu_pi05/` port with its own config, weights, concrete model and eager runner.
+It shares public contracts and reference fixtures with other ports. CPU operator
+implementation and BLAS linking belong to `apxinf-cpu`; see the
+[CPU backend contract](../crates/apxinf-cpu/README.md).
+
 Inspect or copy PI0.5's model/Blocks and runner
 structure when semantics fit; use `<Family>Model` and `<Family>ModelRunner` for
 those roles. Preserve static precision specialization and keep one owner of
@@ -152,6 +173,29 @@ higher-rank convolutional weights require semantics-aware flattening.
 Keep source weights, device weights, and precision-specific packed weights as
 separate concepts when their lifecycles differ. Perform stable transformations
 once during load, not in every inference.
+For cuda-new GEMMs that may repack, retain `RepackedWeight` beside the model's
+weight allocation and attach it to every GEMM consumer. The first preparation
+selects a kernel, repacks through a local temporary, writes back to the same
+allocation, and releases the temporary; later executions reuse that layout across
+IO addresses and shapes. Do not read committed bytes as a canonical tensor or
+create independent layout states for aliases of the same allocation. Reload
+weights after a failed layout commit, and retire old graph readers before
+replacing storage.
+cuda-new rejects independent states for the same allocation and ordinary
+canonical GEMM bindings to adopted storage, including views. Dropping the state
+does not make its surviving tensor aliases canonical again. This enforcement
+does not make raw tensor readback/export layout-aware.
+For weights shared across shapes or semantics, use `with_layout_cache` with an
+explicit extra-weight budget when their optimal implementations require different
+physical layouts. It caches CPU selection metadata separately; executions own
+physical-storage leases and the model retains weak extra-layout entries. When
+all readers of the base retire, prepare may transition that allocation in place.
+Concurrent incompatible consumers share extra layouts, reclaimed with their
+last execution/graph. Preparation never overwrites a live reader's bytes. A zero budget fixes canonical before
+any execution. Benchmark every consumer and both preparation orders, including
+prepare time, live/peak allocations and steady replay; a layout-aware fallback
+establishes correctness but not performance parity.
+
 
 ### Model mathematics
 
@@ -167,7 +211,7 @@ not belong on the portable trait. Trait is the floor; concrete types are the
 ceiling.
 
 A port written directly against one backend's native API goes in a
-self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`) that
+self-contained `<backend>_<family>/` module (`metal_`, `cuda_`, `hip_`, `cpu_`) that
 copies, rather than imports, any config, checkpoint or math code it shares with
 another backend's port; see
 [where backend-native model code lives](model-layer-architecture.md#where-backend-native-model-code-lives).
@@ -253,6 +297,9 @@ Complete these steps in the new family's own code and the existing registries:
    `infer`, `prepare` and `infer_host_f32`; add preparation/calibration support
    deliberately instead of inheriting unsupported defaults unknowingly.
 3. Declare the VLA input/output shape and RGB capability in `VlaContract`.
+   Override `VlaRuntime::initial_latent_shape()` when supplied noise has a
+   different geometry from the action output; see the
+   [runtime contract](model-layer-architecture.md#runtime-contracts).
    Use `VlaRequest` for observation, provided latent or RNG key, and applicable
    metadata. Keep family config parsing in the loader. Check the
    [current option limits](model-layer-architecture.md#current-coverage-and-port-decisions)

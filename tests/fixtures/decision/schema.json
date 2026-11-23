@@ -1,0 +1,15 @@
+{
+  "state": {"signal": "red", "speed": 0},
+  "questions": {
+    "zeta": {
+      "type": "choice",
+      "instructions": "Choose an action",
+      "criteria": {"go": "Proceed", "stay": "Wait"}
+    },
+    "alpha": {
+      "type": "score",
+      "instructions": "Rate the risk",
+      "criteria": ["low", "medium", "high"]
+    }
+  }
+}

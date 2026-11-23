@@ -73,6 +73,13 @@ its explicit `dspark` variant adds the compiled draft chain and target
 verification schedule. Use the exact scope/profile table in `doc/mlx-backend.md`.
 None of these is CUDA Graph replay or evidence for an unrelated model family.
 
+Long-context preparation distinguishes total request capacity from active
+attention width. Qwen3 admits 40960 total positions, ordinary MiniCPM5 65792,
+and DSpark retains 4096. Keep short BF16 shapes and rounding boundaries intact;
+warm decode buckets before use and test crossing a bucket without retracing.
+Long generation may prepare chunk shapes without preparing full prompt logits.
+Report physical process peaks as well as tensor-size budgets.
+
 ## Workflow
 
 1. During preflight, reuse the task's confirmed inputs and execution mode; use
@@ -88,17 +95,28 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
 2. Run the reference privately and capture deterministic inputs, outputs, and
    diagnostic tensors. Completion: the reference loads and repeated captures
    are attributable to the same source, environment, weights, and stochastic
-   inputs.
+   inputs. Record dtype, shape, strides and memory format at diagnostic
+   boundaries; replaying the same values in another layout can select a
+   numerically different kernel. Record the instantiated reference configuration,
+   including inherited overrides, instead of inferring it from a base config.
 3. Inventory semantics and weight transformations. Completion: every required
    computation is understood independently of its framework operator name.
 4. Create an execution ledger from reference semantics through safe device calls.
    Inspect maintained model/Blocks implementations and fused interfaces before the
    portable backend trait. Account for tensor lifetime, reusable KV/state,
-   workspace, host traffic, and graph eligibility. Define the intended whole
+   activation workspace, persistent KV/state, provider scratch, host traffic,
+   and graph eligibility. For cuda-new, let the runner own `ProviderWorkspace`
+   and pass it to profile sessions; follow the sharing and lifetime contract in
+   [Model Layer Architecture](../../doc/model-layer-architecture.md#repacked-gemm-weight-ownership).
+   Define the intended whole
    graph or Vision/Language/Action graph boundaries, stable buffers,
    input-update mechanism, and capture blockers. Completion: every graph row
    resolves to an ApxInf-native implementation, a private scaffold with a
    named device exit criterion, or a concrete blocker.
+   For joint diffusion, trace all predicted modalities and declare the complete
+   supplied-noise geometry through `VlaRuntime::initial_latent_shape()`. Verify
+   native and Python validation, noise scaling, and prepared-profile identity
+   against the reference; action output shape alone does not define the latent.
    For MLX, record local, decoder-block and whole-step compile scopes separately;
    identify explicit dynamic state, prepared shapes and bounded lazy outputs.
    Inspect the safe array/fusion seam in `apxinf-mlx`; keep raw FFI and unsafe
@@ -106,6 +124,9 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    `metal_<family>` for native Metal composition and registration. The evolving
    cross-backend contract is not a prerequisite: preserve the model's numerical
    recipe and measured performance without introducing per-op trait wrappers.
+   For an explicitly requested CPU reference target, compose the model in
+   `cpu_<family>` using [apxinf-cpu](../../crates/apxinf-cpu/README.md); keep
+   CPU operators and BLAS linking in that backend and shared contracts in core.
 5. Classify fused and primitive coverage. If a real gap exists, follow
    `adding-new-kernels.md`, then replay the returned implementation against the
    original references. A CPU layer implementation is a named correctness
@@ -113,7 +134,12 @@ None of these is CUDA Graph replay or evidence for an unrelated model family.
    repeated hot-path scaffold with a safe device path; build cost and passing
    end-to-end values do not turn host round trips into deliverable performance
    debt.
-6. Create `crates/apxinf-model/src/<model>/`. Start with a self-contained
+6. Choose the native family name and single-precision layout from
+   `adding-a-new-model.md#start-with-a-separate-model-directory`. Verify that
+   `Bf16Blocks` encapsulates tensor representations and operator composition,
+   rather than only moving subnetwork files underneath a new directory. Keep
+   host/device weights separate from forward computation, and preparation
+   separate from runtime validation. Start with a self-contained
    implementation. Inspect and copy a close model when useful, but do not import
    or modify another model-family directory for the new architecture. Defer
    shared extraction to a separate review after repeated maintained

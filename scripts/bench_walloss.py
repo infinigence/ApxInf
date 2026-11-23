@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
 import hashlib
 import json
 import os
@@ -21,11 +23,36 @@ if _APXINF_PKG.is_dir() and str(_APXINF_PKG) not in sys.path:
     sys.path.insert(0, str(_APXINF_PKG))
 
 
+@contextlib.contextmanager
+def _cuda_profiler_capture():
+    """Optionally delimit steady-state CUDA work for Nsight Systems."""
+    if os.environ.get("APXINF_BENCH_CUDA_PROFILER_API") != "1":
+        yield
+        return
+
+    cudart = ctypes.CDLL("libcudart.so")
+    start = cudart.cudaProfilerStart
+    stop = cudart.cudaProfilerStop
+    start.argtypes = []
+    start.restype = ctypes.c_int
+    stop.argtypes = []
+    stop.restype = ctypes.c_int
+    status = start()
+    if status != 0:
+        raise RuntimeError(f"cudaProfilerStart failed with status {status}")
+    try:
+        yield
+    finally:
+        status = stop()
+        if status != 0:
+            raise RuntimeError(f"cudaProfilerStop failed with status {status}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, type=pathlib.Path)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--precision", choices=("bf16", "fp8"), default="bf16")
+    parser.add_argument("--model-variant", choices=("bf16", "fp8_dynamic"), default="bf16")
     parser.add_argument("--views", type=int, default=2)
     parser.add_argument("--height", type=int, default=256, help="raw camera height")
     parser.add_argument("--width", type=int, default=256, help="raw camera width")
@@ -88,7 +115,7 @@ def main() -> None:
     policy = WallossPolicy.from_pretrained(
         args.model_dir,
         device=args.device,
-        precision=args.precision,
+        model_variant=args.model_variant,
         tactics=args.tactics,
         image_keys=image_keys,
         camera_names=names[: args.views],
@@ -121,15 +148,16 @@ def main() -> None:
     for _ in range(args.warmup):
         policy.infer(observation, noise=noise)
     latencies = []
-    for _ in range(args.iterations):
-        started = time.perf_counter()
-        policy.infer(observation, noise=noise)
-        latencies.append((time.perf_counter() - started) * 1e3)
+    with _cuda_profiler_capture():
+        for _ in range(args.iterations):
+            started = time.perf_counter()
+            policy.infer(observation, noise=noise)
+            latencies.append((time.perf_counter() - started) * 1e3)
 
     report = {
         "commit": git_commit(),
         "model_dir": str(args.model_dir),
-        "precision": args.precision,
+        "model_variant": args.model_variant,
         "raw_image": [args.views, args.height, args.width],
         "image_grid_thw": np.asarray(grids).tolist(),
         "vision_tokens": int(sum(t * h * w for t, h, w in grids) // (merge * merge)),

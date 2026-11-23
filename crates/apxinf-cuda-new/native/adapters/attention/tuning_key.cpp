@@ -1,6 +1,7 @@
 #include "internal.h"
 
 #include <algorithm>
+#include <cublas_v2.h>
 
 #ifndef APXINF_ATTENTION_BUILD_ID
 #define APXINF_ATTENTION_BUILD_ID "attention-development"
@@ -25,25 +26,38 @@ TuningKeys tuning_keys(const Spec& spec,
   int driver_version = 0;
   check_cuda(cudaRuntimeGetVersion(&runtime_version));
   check_cuda(cudaDriverGetVersion(&driver_version));
+  int blas_major = 0, blas_minor = 0, blas_patch = 0;
+  if (cublasGetProperty(MAJOR_VERSION, &blas_major) != CUBLAS_STATUS_SUCCESS ||
+      cublasGetProperty(MINOR_VERSION, &blas_minor) != CUBLAS_STATUS_SUCCESS ||
+      cublasGetProperty(PATCH_LEVEL, &blas_patch) != CUBLAS_STATUS_SUCCESS)
+    throw Failure(APXINF_STATUS_PROVIDER_ERROR, "cannot query cuBLAS Attention version");
   cudaDeviceProp properties{};
   check_cuda(cudaGetDeviceProperties(&properties, device));
 
   // One exact key: the namespace prefix captures the candidate/toolchain/GPU
   // identity and the suffix captures the normalized operation and policy.
   // There is no compatible fallback key; a miss runs the full autotuner.
+  const bool stable =
+      spec.numerics == APXINF_ATTENTION_NUMERICS_STABLE;
   std::ostringstream key;
-  key << "attention-recipe-v5|ns|" << APXINF_ATTENTION_BUILD_ID << '|'
+  key << (stable ? "attention-recipe-v8|ns|" : "attention-recipe-v7|ns|")
+      << APXINF_ATTENTION_BUILD_ID << '|'
       << "toolkit=" << CUDART_VERSION << '|'
       << "cc=" << properties.major * 10 + properties.minor
       << "|sms=" << properties.multiProcessorCount
       << "|cuda=" << cuda_compat_version(runtime_version)
       << "|driver=" << cuda_compat_version(driver_version)
+      << "|cublas=" << blas_major << '.' << blas_minor << '.' << blas_patch
+      // Flexible numerics retains the pre-v5 normalized suffix. The build
+      // fingerprint still invalidates recipes when candidate code changes.
       << "|op|" << spec.version << '|' << spec.semantic << '|'
-      << spec.dtype << '|' << spec.output_dtype << '|' << spec.mask << '|'
+      << spec.qkv_layout << '|' << spec.dtype << '|' << spec.output_dtype << '|'
+      << spec.mask << '|'
       << spec.batch << '|' << spec.query_tokens << '|' << spec.key_tokens << '|'
       << spec.key_capacity << '|' << spec.query_heads << '|' << spec.kv_heads
       << '|' << spec.head_dim << '|';
   key << spec.dynamic_decode << '|';
+  if (stable) key << spec.numerics << '|';
   if (spec.semantic == APXINF_ATTENTION_SEMANTIC_KV_CACHE &&
       spec.dynamic_decode != 0) {
     key << "decode-meta|";

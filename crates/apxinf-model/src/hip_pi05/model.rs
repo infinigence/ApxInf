@@ -90,6 +90,24 @@ impl Ops<'_> {
         Ok(out)
     }
 
+    /// Attention with the default kernel for its geometry; split-KV scratch
+    /// comes from the arena, so its address is as fixed as any activation's.
+    fn attention(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        geometry: &AttentionGeometry,
+        out: &Tensor,
+    ) -> Result<()> {
+        let kernel = native::attention_kernel(self.ctx.caps().base_arch(), geometry);
+        let elements = native::attention_scratch_elements(geometry, kernel);
+        let scratch = (elements > 0)
+            .then(|| self.arena.tensor(vec![elements], DType::F32))
+            .transpose()?;
+        native::attention(self.ctx, q, k, v, geometry, kernel, scratch.as_ref(), out)
+    }
+
     /// Packed gate/up GEMM followed by GeGLU.
     fn geglu(&self, x: &Tensor, gate_up: &Linear) -> Result<Tensor> {
         let packed = self.linear(x, gate_up)?;
@@ -188,6 +206,49 @@ impl HipPi05Model {
         }
         // Flow steps.
         let h = config.action_horizon;
+        // Attention scratch (split-KV partials, F32) for every attention call:
+        // 27 vision, 17 language (the last layer stops before attention), and
+        // one per action layer per flow step. Sized for the scratch-maximal
+        // kernel choice (gfx1151); other architectures use none of it.
+        let scratch = |g: AttentionGeometry| {
+            let elements =
+                native::attention_scratch_elements(&g, native::attention_kernel("gfx1151", &g));
+            if elements == 0 {
+                0
+            } else {
+                (elements * 4).next_multiple_of(256)
+            }
+        };
+        let vision_attention = AttentionGeometry {
+            batch: config.num_views,
+            q_tokens: config.patches_per_view(),
+            q_heads: config.vision_heads,
+            kv_heads: config.vision_heads,
+            head_dim: config.vision_head_dim,
+            kv_tokens: config.patches_per_view(),
+       causal_query_start: None,
+        };
+        let prefix_attention = AttentionGeometry {
+            batch: 1,
+            q_tokens: prefix,
+            q_heads: lang.num_heads,
+            kv_heads: lang.num_kv_heads,
+            head_dim: lang.head_dim,
+            kv_tokens: prefix,
+       causal_query_start: None,
+        };
+        let action_attention = AttentionGeometry {
+            batch: 1,
+            q_tokens: h,
+            q_heads: act.num_heads,
+            kv_heads: act.num_kv_heads,
+            head_dim: act.head_dim,
+            kv_tokens: prefix + h,
+       causal_query_start: None,
+        };
+        let attention_scratch = config.vision_depth * scratch(vision_attention)
+            + lang.depth.saturating_sub(1) * scratch(prefix_attention)
+            + config.num_flow_steps * act.depth * scratch(action_attention);
         for _ in 0..config.num_flow_steps {
             add(h * act.width);
             add(h * act.width);
@@ -218,6 +279,7 @@ impl HipPi05Model {
                 add(h * config.action_dim);
             }
         }
+        let total = total + attention_scratch;
         total + total / 8 + (32 << 20)
     }
 
@@ -291,8 +353,7 @@ impl HipPi05Model {
         native::split_qkv_bias(&self.ctx, &qkv, layer.qkv.bias.as_ref(), &q, &k, &v)?;
         let attention = ops.tensor(&[rows, width])?;
         let per_view = c.patches_per_view();
-        native::attention(
-            &self.ctx,
+        ops.attention(
             &q,
             &k,
             &v,
@@ -303,6 +364,7 @@ impl HipPi05Model {
                 kv_heads: c.vision_heads,
                 head_dim: c.vision_head_dim,
                 kv_tokens: per_view,
+                causal_query_start: None,
             },
             &attention,
         )?;
@@ -356,6 +418,7 @@ impl HipPi05Model {
             &self.ctx,
             &self.weights.token_embedding,
             token_ids,
+            native::EmbeddingScale::SqrtWidth,
             &language,
         )?;
         let vision_rows = vision.shape().dims()[0];
@@ -433,8 +496,7 @@ impl HipPi05Model {
             return Ok(input.clone());
         }
         let attention = ops.tensor(&[tokens, lang.num_heads * lang.head_dim])?;
-        native::attention(
-            &self.ctx,
+        ops.attention(
             &q,
             key,
             value,
@@ -445,6 +507,7 @@ impl HipPi05Model {
                 kv_heads: lang.num_kv_heads,
                 head_dim: lang.head_dim,
                 kv_tokens: tokens,
+                causal_query_start: None,
             },
             &attention,
         )?;
@@ -623,8 +686,7 @@ impl HipPi05Model {
             prefix_tokens,
         )?;
         let attention = ops.tensor(&[tokens, act.num_heads * act.head_dim])?;
-        native::attention(
-            &self.ctx,
+        ops.attention(
             &q,
             key,
             value,
@@ -635,6 +697,7 @@ impl HipPi05Model {
                 kv_heads: act.num_kv_heads,
                 head_dim: act.head_dim,
                 kv_tokens: prefix_tokens + tokens,
+                causal_query_start: None,
             },
             &attention,
         )?;

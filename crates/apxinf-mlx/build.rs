@@ -15,7 +15,7 @@ fn main() {
     }
     let root = PathBuf::from(
         env::var_os("MLX_ROOT")
-            .expect("set MLX_ROOT to the MLX 0.31.2 C++ SDK root (include/ and lib/)"),
+            .expect("set MLX_ROOT to the MLX 0.32.3 C++ SDK root (include/ and lib/)"),
     );
     println!("cargo:rerun-if-changed={}", root.join("include/mlx/version.h").display());
     let version = fs::read_to_string(root.join("include/mlx/version.h"))
@@ -30,9 +30,9 @@ fn main() {
     };
     assert!(
         macro_value("MLX_VERSION_MAJOR") == Some("0")
-            && macro_value("MLX_VERSION_MINOR") == Some("31")
-            && macro_value("MLX_VERSION_PATCH") == Some("2"),
-        "apxinf-mlx pins MLX 0.31.2 headers and library"
+            && macro_value("MLX_VERSION_MINOR") == Some("32")
+            && macro_value("MLX_VERSION_PATCH") == Some("3"),
+        "apxinf-mlx pins MLX 0.32.3 headers and library"
     );
     assert!(
         root.join("lib/libmlx.dylib").is_file(),

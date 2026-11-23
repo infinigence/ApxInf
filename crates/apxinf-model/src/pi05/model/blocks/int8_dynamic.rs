@@ -32,17 +32,9 @@ struct ResidualNormTensors {
 
 pub(in crate::pi05) type Int8DynamicL3Policies = super::L3Policies;
 
-fn l3_rms_bf16(
-    ctx: &Context,
-    input: &Tensor,
-    weight: &Tensor,
-    eps: f32,
-) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    ops::rms_norm(
-        ctx,
-        ops::RmsNormArgs::new(input, weight, &mut output, eps),
-    )?;
+fn l3_rms_bf16(ctx: &Context, input: &Tensor, weight: &Tensor, eps: f32) -> Result<Tensor> {
+    let output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    ops::norm::norm(ctx, ops::NormArgs::rms(input, weight, &output, eps))?;
     Ok(output)
 }
 
@@ -53,11 +45,8 @@ fn l3_layer_bf16(
     bias: &Tensor,
     eps: f32,
 ) -> Result<Tensor> {
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    ops::layer_norm(
-        ctx,
-        ops::LayerNormArgs::new(input, weight, bias, &mut output, eps),
-    )?;
+    let output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    ops::norm::norm(ctx, ops::NormArgs::layer(input, weight, bias, &output, eps))?;
     Ok(output)
 }
 
@@ -71,12 +60,7 @@ fn bf16_vector_prefix(tensor: &Tensor, elements: usize) -> Result<Tensor> {
         .map_err(Error::Cuda)
 }
 
-fn l3_adaptive_rms_bf16(
-    ctx: &Context,
-    input: &Tensor,
-    style: &Tensor,
-    eps: f32,
-) -> Result<Tensor> {
+fn l3_adaptive_rms_bf16(ctx: &Context, input: &Tensor, style: &Tensor, eps: f32) -> Result<Tensor> {
     let cols = input
         .shape()
         .dims()
@@ -84,10 +68,18 @@ fn l3_adaptive_rms_bf16(
         .copied()
         .ok_or_else(|| Error::Other("PI0.5 INT8 adaptive RMS input has no columns".into()))?;
     let style = bf16_vector_prefix(style, 2 * cols)?;
-    let mut output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
-    ops::adaptive_rms_norm(
+    let output = ctx.allocate_output(input.shape().clone(), DType::BF16)?;
+    ops::norm::norm(
         ctx,
-        ops::AdaptiveRmsNormArgs::new(input, &style, &mut output, eps),
+        ops::NormArgs {
+            input,
+            output: Some(&output),
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Adaptive { style: &style },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            eps,
+        },
     )?;
     Ok(output)
 }
@@ -114,8 +106,7 @@ fn l3_geglu_bf16(ctx: &Context, input: &Tensor) -> Result<Tensor> {
             "PI0.5 INT8 GeGLU expects BF16 [rows,2*cols]".into(),
         ));
     }
-    let mut output =
-        ctx.allocate_output(Shape::new(vec![shape[0], shape[1] / 2]), DType::BF16)?;
+    let mut output = ctx.allocate_output(Shape::new(vec![shape[0], shape[1] / 2]), DType::BF16)?;
     let args = ops::PointwiseArgs::new(ops::PointwiseSemantic::Geglu, input, &mut output);
     ops::pointwise(ctx, args)?;
     Ok(output)
@@ -128,8 +119,7 @@ fn l3_euler_update_bf16(
     dt: f32,
 ) -> Result<Tensor> {
     let mut output = ctx.allocate_output(state.shape().clone(), DType::BF16)?;
-    let mut args =
-        ops::PointwiseArgs::new(ops::PointwiseSemantic::EulerUpdate, state, &mut output);
+    let mut args = ops::PointwiseArgs::new(ops::PointwiseSemantic::EulerUpdate, state, &mut output);
     args.secondary = Some(velocity);
     args.dt = dt;
     ops::pointwise(ctx, args)?;
@@ -172,19 +162,13 @@ fn l3_mqa_bf16(
     let key = DeviceBuffer::from_tensor(key)
         .and_then(|buffer| buffer.view(0, kv_bytes))
         .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
+            buffer.as_tensor(Shape::new(vec![1, key_tokens, kv_heads, q[2]]), DType::BF16)
         })
         .map_err(Error::Cuda)?;
     let value = DeviceBuffer::from_tensor(value)
         .and_then(|buffer| buffer.view(0, kv_bytes))
         .and_then(|buffer| {
-            buffer.as_tensor(
-                Shape::new(vec![1, key_tokens, kv_heads, q[2]]),
-                DType::BF16,
-            )
+            buffer.as_tensor(Shape::new(vec![1, key_tokens, kv_heads, q[2]]), DType::BF16)
         })
         .map_err(Error::Cuda)?;
     let query_shape = Shape::new(vec![1, q[0], q[1], q[2]]);
@@ -238,10 +222,7 @@ fn l3_split_qkv_bias_bf16(
     head_dim: usize,
 ) -> Result<QkvTensors> {
     let shape = qkv.shape().dims();
-    if qkv.dtype() != DType::BF16
-        || shape.len() != 2
-        || shape[1] != 3 * heads * head_dim
-    {
+    if qkv.dtype() != DType::BF16 || shape.len() != 2 || shape[1] != 3 * heads * head_dim {
         return Err(Error::Other(
             "PI0.5 INT8 vision QKV shape/dtype mismatch".into(),
         ));
@@ -290,10 +271,7 @@ fn l3_split_qkv_rope_bf16(
             "PI0.5 INT8 rotary QKV shape/dtype mismatch".into(),
         ));
     }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
+    let mut q = ctx.allocate_output(Shape::new(vec![shape[0], q_heads, head_dim]), DType::BF16)?;
     let kv_shape = Shape::new(vec![shape[0], kv_heads, head_dim]);
     let mut k = ctx.allocate_output(kv_shape.clone(), DType::BF16)?;
     let mut v = ctx.allocate_output(kv_shape, DType::BF16)?;
@@ -340,10 +318,7 @@ fn l3_split_qkv_rope_into_cache_bf16(
             "PI0.5 INT8 cached rotary QKV shape/dtype mismatch".into(),
         ));
     }
-    let mut q = ctx.allocate_output(
-        Shape::new(vec![shape[0], q_heads, head_dim]),
-        DType::BF16,
-    )?;
+    let mut q = ctx.allocate_output(Shape::new(vec![shape[0], q_heads, head_dim]), DType::BF16)?;
     let mut key_cache = key_cache.clone();
     let mut value_cache = value_cache.clone();
     ops::rope(
@@ -372,10 +347,17 @@ fn l3_bias_residual_bf16(
     bias: Option<&Tensor>,
     residual: &Tensor,
 ) -> Result<Tensor> {
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    ops::bias_residual(
+    let hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    ops::residual_add(
         ctx,
-        ops::BiasResidualArgs::new(projection, bias, residual, &mut hidden),
+        ops::ResidualAddArgs {
+            input: projection,
+            bias,
+            residual,
+            gate: None,
+            hidden: &hidden,
+            bias_order: ops::BiasOrder::SingleRound,
+        },
     )?;
     Ok(hidden)
 }
@@ -388,19 +370,28 @@ fn l3_bias_residual_rms_bf16(
     weight: &Tensor,
     eps: f32,
 ) -> Result<ResidualNormTensors> {
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    ops::bias_residual_rms_norm(
+    let hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    let normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    ops::fused_add_norm(
         ctx,
-        ops::BiasResidualRmsNormArgs::new(
-            projection,
+        ops::FusedAddNormArgs {
+            input: projection,
             bias,
             residual,
-            weight,
-            &mut hidden,
-            &mut normalized,
+            gate: None,
+            hidden: &hidden,
+            normalized: Some(&normalized),
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Weight {
+                weight,
+                bias: None,
+                offset: false,
+            },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
             eps,
-        ),
+        },
     )?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
@@ -415,20 +406,28 @@ fn l3_bias_residual_layer_bf16(
     norm_bias: &Tensor,
     eps: f32,
 ) -> Result<ResidualNormTensors> {
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    ops::bias_residual_layer_norm(
+    let hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    let normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    ops::fused_add_norm(
         ctx,
-        ops::BiasResidualLayerNormArgs::new(
-            projection,
-            projection_bias,
+        ops::FusedAddNormArgs {
+            input: projection,
+            bias: projection_bias,
             residual,
-            norm_weight,
-            norm_bias,
-            &mut hidden,
-            &mut normalized,
+            gate: None,
+            hidden: &hidden,
+            normalized: Some(&normalized),
+            kind: ops::NormKind::Layer,
+            affine: ops::Affine::Weight {
+                weight: norm_weight,
+                bias: Some(norm_bias),
+                offset: false,
+            },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
             eps,
-        ),
+        },
     )?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
@@ -448,19 +447,24 @@ fn l3_adaptive_gate_residual_rms_bf16(
         .copied()
         .ok_or_else(|| Error::Other("PI0.5 INT8 AdaRMS input has no columns".into()))?;
     let norm_style = bf16_vector_prefix(norm_style, 2 * cols)?;
-    let mut hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    ops::ada_gate_residual_rms_norm(
+    let hidden = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    let normalized = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
+    ops::fused_add_norm(
         ctx,
-        ops::AdaGateResidualRmsNormArgs::new(
-            projection,
+        ops::FusedAddNormArgs {
+            input: projection,
+            bias: None,
             residual,
-            &norm_style,
-            gate_style,
-            &mut hidden,
-            &mut normalized,
+            gate: Some(ops::ResidualGate::PackedStyle(gate_style)),
+            hidden: &hidden,
+            normalized: Some(&normalized),
+            kind: ops::NormKind::Rms,
+            affine: ops::Affine::Adaptive { style: &norm_style },
+            quantized: None,
+            numerics: ops::NormNumerics::Flexible,
+            bias_order: ops::BiasOrder::SingleRound,
             eps,
-        ),
+        },
     )?;
     Ok(ResidualNormTensors { hidden, normalized })
 }
@@ -473,8 +477,7 @@ fn l3_bias_position_bf16(
     tokens_per_view: usize,
 ) -> Result<Tensor> {
     let mut output = ctx.allocate_output(projection.shape().clone(), DType::BF16)?;
-    let mut args =
-        ops::GatherArgs::new(ops::GatherSemantic::BiasPosition, projection, &mut output);
+    let mut args = ops::GatherArgs::new(ops::GatherSemantic::BiasPosition, projection, &mut output);
     args.bias = bias;
     args.position = Some(position);
     args.tokens_per_view = tokens_per_view;
@@ -498,6 +501,7 @@ fn l3_embedding_lookup_bf16(
     let mut args = ops::GatherArgs::new(ops::GatherSemantic::EmbeddingLookup, table, &mut output);
     args.ids = Some(ids);
     args.vocab_size = shape[0];
+    args.embedding_scale = ops::EmbeddingScale::SqrtWidth;
     ops::gather(ctx, args)?;
     Ok(output)
 }
@@ -549,21 +553,14 @@ fn language_layer_int8_dynamic_with_policies(
         &weights.post_attention_norm_scale,
         rms_eps,
     )?;
-    let gate_up = weights.gate_up.gemm_with_policies(
-        ctx,
-        &fused.normalized,
-        &policies.gemm,
-    )?;
+    let gate_up = weights
+        .gate_up
+        .gemm_with_policies(ctx, &fused.normalized, &policies.gemm)?;
     let activated = l3_geglu_bf16(ctx, &gate_up)?;
     let projected = weights
         .down
         .gemm_with_policies(ctx, &activated, &policies.gemm)?;
-    let hidden = l3_bias_residual_bf16(
-        ctx,
-        &projected,
-        weights.down.bias.as_ref(),
-        &fused.hidden,
-    )?;
+    let hidden = l3_bias_residual_bf16(ctx, &projected, weights.down.bias.as_ref(), &fused.hidden)?;
     Ok(Int8DynamicLanguageLayerOutput {
         hidden,
         key: qkv.key_2d(tokens, config.head_dim)?,
@@ -614,12 +611,7 @@ fn action_layer_int8_dynamic_with_policies(
 ) -> Result<Int8DynamicActionLayerOutput> {
     let normalized = match attention_normalized {
         Some(value) => value.clone(),
-        None => l3_adaptive_rms_bf16(
-            ctx,
-            input,
-            attention_modulation,
-            rms_eps,
-        )?,
+        None => l3_adaptive_rms_bf16(ctx, input, attention_modulation, rms_eps)?,
     };
     let qkv = weights
         .qkv
@@ -660,11 +652,9 @@ fn action_layer_int8_dynamic_with_policies(
         mlp_modulation,
         rms_eps,
     )?;
-    let gate_up = weights.gate_up.gemm_with_policies(
-        ctx,
-        &fused.normalized,
-        &policies.gemm,
-    )?;
+    let gate_up = weights
+        .gate_up
+        .gemm_with_policies(ctx, &fused.normalized, &policies.gemm)?;
     let activated = l3_geglu_bf16(ctx, &gate_up)?;
     let projected = weights
         .down
@@ -773,13 +763,7 @@ fn vision_layer_int8_dynamic_with_policies(
     let qkv = weights
         .qkv
         .gemm_with_policies(ctx, &normalized, &policies.gemm)?;
-    let qkv = l3_split_qkv_bias_bf16(
-        ctx,
-        &qkv,
-        weights.qkv.bias.as_ref(),
-        heads,
-        head_dim,
-    )?;
+    let qkv = l3_split_qkv_bias_bf16(ctx, &qkv, weights.qkv.bias.as_ref(), heads, head_dim)?;
     let attention = l3_mha_bf16(
         ctx,
         &qkv.q,
@@ -788,7 +772,7 @@ fn vision_layer_int8_dynamic_with_policies(
         patches_per_view,
         &policies.attention,
     )?
-        .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
+    .reshape(vec![input.shape().dims()[0], heads * head_dim])?;
     let projection = weights
         .output
         .gemm_with_policies(ctx, &attention, &policies.gemm)?;
@@ -801,11 +785,9 @@ fn vision_layer_int8_dynamic_with_policies(
         &weights.norm2.bias,
         layer_norm_eps,
     )?;
-    let activation = weights.fc1.gemm_with_policies(
-        ctx,
-        &fused.normalized,
-        &policies.gemm,
-    )?;
+    let activation = weights
+        .fc1
+        .gemm_with_policies(ctx, &fused.normalized, &policies.gemm)?;
     let activation = l3_bias_activation_bf16(
         ctx,
         &activation,
@@ -815,12 +797,7 @@ fn vision_layer_int8_dynamic_with_policies(
     let projection = weights
         .fc2
         .gemm_with_policies(ctx, &activation, &policies.gemm)?;
-    l3_bias_residual_bf16(
-        ctx,
-        &projection,
-        weights.fc2.bias.as_ref(),
-        &fused.hidden,
-    )
+    l3_bias_residual_bf16(ctx, &projection, weights.fc2.bias.as_ref(), &fused.hidden)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -947,14 +924,11 @@ pub(in crate::pi05::model) mod backbone {
                 &self.weights.vision_post_norm.bias,
                 self.config.layer_norm_eps,
             )?;
-            let projected = self
-                .weights
-                .multimodal_projector
-                .gemm_with_policies(
-                    self.ctx(),
-                    &hidden,
-                    &self.policies.gemm,
-                )?;
+            let projected = self.weights.multimodal_projector.gemm_with_policies(
+                self.ctx(),
+                &hidden,
+                &self.policies.gemm,
+            )?;
             l3_bias_activation_bf16(
                 self.ctx(),
                 &projected,
@@ -1042,11 +1016,8 @@ pub(in crate::pi05::model) mod backbone {
             conditioning: &Tensor,
             weights: &Int8DynamicLinearWeights,
         ) -> Result<Tensor> {
-            let projected = weights.gemm_with_policies(
-                self.ctx(),
-                conditioning,
-                &self.policies.gemm,
-            )?;
+            let projected =
+                weights.gemm_with_policies(self.ctx(), conditioning, &self.policies.gemm)?;
             let modulation = l3_bias_activation_bf16(
                 self.ctx(),
                 &projected,

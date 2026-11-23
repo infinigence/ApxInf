@@ -16,6 +16,12 @@ model-specific examples and historical evidence link back to it.
 | A required safe device operation is missing | [Adding New Kernels](adding-new-kernels.md) |
 | Designing the native MLX backend or migrating a qualified Mac model | [MLX Backend](mlx-backend.md) — ownership, supported selections and execution contracts |
 | Running PI0.5 on AMD (HIP), comparing it with CUDA, or extending it | [PI0.5 on HIP](hip-pi05.md) — layout, entry points, validation and status |
+| Running GR00T on AMD (HIP), or extending that port | [GR00T on HIP](hip-gr00t.md) — layout, acceptance gate, known limits, fixture provenance |
+| Building, tuning or measuring the Moore Threads backend | [MUSA Backend](musa-backend.md) — build, generations, INT8 routes, capture, tactics database and the accuracy gate |
+| Choosing, generating or shipping GEMM/attention tuning recipes | [Tuning Databases](../configs/tuning/README.md) — cache layout, recipe formats, the committed AMD exception and the git-ignored machine-local caches |
+| Profiling PI0.5 on MUSA with msys | [Profiling PI0.5 on MUSA](pi05-mttx.md) — markers, recordings and the two known reading defects |
+| Running the PI0.5 FP32 reference on CPU | [PI0.5 CPU reference](pi05-cpu-reference.md) — build, input and execution contracts, numerical validation |
+| Proposing Apple Neural Engine execution through Core ML | [Core ML and ANE](coreml-ane.md) — proposal under upstream review |
 
 PI0.5 currently separates `model/`, `model_runner/` and `weights/`. Its
 [component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)
@@ -51,6 +57,7 @@ mkdir -p ~/.agents/skills && ln -s "$(pwd)/skills/finish-work-session" ~/.agents
 
 Then say "finish this session", or invoke `/finish-work-session` (Claude Code) or `$finish-work-session` (Codex). The helper also runs directly with
 `python3 skills/finish-work-session/scripts/session_usage.py --agent claude-code` (or `--agent codex`). Reports are snapshots of locally recorded usage; running requests and the final reporting response are not included. Save reports under `devlocal/<feat-name>/reports/`.
+- [copy-drift-audit](../skills/copy-drift-audit/SKILL.md): audit a backend-native port's copied files against the family source they came from, with one import watermark per file; upstream changes are adjudicated, not treated as defects.
 
 Skills resolve these documents from the checkout/worktree being modified,
 even when installed globally through a symlink to another branch. Repository

@@ -14,7 +14,7 @@
 //! ```text
 //! APXINF_QWEN38_CHECKPOINT=/path/to/Qwen3.8-27B-NVFP4 \
 //!   bash crates/apxinf-cuda-new/test-new.sh \
-//!     test -p apxinf-cuda --test qwen38_fp8_projection -- --ignored --nocapture
+//!     test -p apxinf-cuda-new --test qwen38_fp8_projection -- --ignored --nocapture
 //! ```
 
 use std::collections::HashMap;
@@ -61,7 +61,11 @@ fn e4m3_value(code: u8) -> f64 {
     } else {
         (1.0 + mantissa / 8.0) * ((exponent - 7) as f64).exp2()
     };
-    if code & 0x80 != 0 { -magnitude } else { magnitude }
+    if code & 0x80 != 0 {
+        -magnitude
+    } else {
+        magnitude
+    }
 }
 
 fn bf16_to_f64(raw: u16) -> f64 {
@@ -98,9 +102,7 @@ fn per_tensor_fp8_projection_needs_no_new_contract() {
 
     let n_full = weight_host.shape().dims()[0];
     let k = weight_host.shape().dims()[1];
-    println!(
-        "q_proj [{n_full}, {k}]  weight_scale={weight_scale:e}  input_scale={input_scale:e}"
-    );
+    println!("q_proj [{n_full}, {k}]  weight_scale={weight_scale:e}  input_scale={input_scale:e}");
     assert_eq!(k, 5120);
     // 12288 = 2 * (24 heads * 256): q and its output gate share one projection.
     assert_eq!(n_full, 12288);
@@ -135,7 +137,7 @@ fn per_tensor_fp8_projection_needs_no_new_contract() {
     let activation = upload(&ctx, &activation_bytes, vec![m, k], DType::BF16);
 
     let quantized = zeros(&ctx, vec![m, k], DType::F8E4M3);
-    ops::quantize_fp8_per_tensor(&ctx, &activation, &quantized, input_scale).unwrap();
+    ops::quantize_per_tensor(&ctx, &activation, &quantized, input_scale).unwrap();
 
     // The whole point: unit-scale FP8 with both per-tensor scales in alpha.
     let mut out = zeros(&ctx, vec![m, n], DType::BF16);

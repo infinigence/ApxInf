@@ -412,3 +412,15 @@ def test_policy_reports_resolved_model_variant_over_requested_auto():
     model.model_variant = "bf16"
     policy = Pi05Policy.from_random(model, token_count=10, metadata={"model_variant": "auto"})
     assert policy.metadata["model_variant"] == "bf16"
+
+
+def test_prepared_rgb_inputs_match_policy_inference():
+    policy = build_policy()
+    observation = make_obs()
+    noise = np.ones((HORIZON, MODEL_DIM), np.float32)
+    inputs = policy.prepare_rgb_inputs(observation, noise=noise)
+    direct = policy.model_runner.infer_rgb(**inputs).copy()
+    result = policy.infer(observation, noise=noise)
+    np.testing.assert_array_equal(direct, result['normalized_actions'])
+    np.testing.assert_array_equal(inputs['rgb_u8'], policy.model_runner.last_rgb)
+    np.testing.assert_array_equal(inputs['token_ids'], policy.model_runner.last_tokens)

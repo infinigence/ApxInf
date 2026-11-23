@@ -2,16 +2,14 @@
 //!
 //! Only the linear projections are quantized. Norms, the FP32 SigLIP patch
 //! embedding and the tied token-embedding table keep the BF16 module's dtypes,
-//! because `gemm::fp8_bf16` returns BF16 and the surrounding pipeline is
-//! therefore reused unchanged.
+//! because the formal FP8 GEMM contract returns BF16 and the surrounding
+//! pipeline is therefore reused unchanged.
 
 use apxinf_core::{Backend, Result, Tensor};
 
+use super::static_bf16_weights::{Bf16DeviceLayerNorm, LinearView, VisionPatchEmbeddingF32};
 use super::{
     bf16_to_device, Fp8LinearWeights, LanguageLayerWeights, Pi0FastWeights, VisionBlockWeights,
-};
-use super::static_bf16_weights::{
-    Bf16DeviceLayerNorm, LinearView, VisionPatchEmbeddingF32,
 };
 
 #[derive(Debug)]
@@ -87,10 +85,7 @@ impl StaticFp8Pi0FastWeights {
                 .iter()
                 .map(|layer| Fp8DeviceLanguageLayer::from_host(layer, backend))
                 .collect::<Result<Vec<_>>>()?,
-            language_final_norm_scale: bf16_to_device(
-                &weights.language_final_norm_scale,
-                backend,
-            )?,
+            language_final_norm_scale: bf16_to_device(&weights.language_final_norm_scale, backend)?,
         })
     }
 }
@@ -121,10 +116,7 @@ impl Fp8DeviceLanguageLayer {
                 backend,
             )?,
             output: Fp8LinearWeights::from_host(&weights.attention.output, backend)?,
-            post_attention_norm_scale: bf16_to_device(
-                &weights.post_attention_norm_scale,
-                backend,
-            )?,
+            post_attention_norm_scale: bf16_to_device(&weights.post_attention_norm_scale, backend)?,
             gate_up: Fp8LinearWeights::from_host_parts(
                 &[&weights.mlp.gate, &weights.mlp.up],
                 backend,

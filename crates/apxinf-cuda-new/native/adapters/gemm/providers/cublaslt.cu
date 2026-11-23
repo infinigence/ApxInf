@@ -38,9 +38,7 @@ struct CublasLtState {
   }
 
   void release_resources() noexcept {
-    if (workspace != nullptr) cudaFree(workspace);
     if (zero_bias != nullptr) cudaFree(zero_bias);
-    if (c_buffer != nullptr) cudaFree(c_buffer);
     if (output_scale != nullptr) cudaFree(output_scale);
     workspace = nullptr;
     zero_bias = nullptr;
@@ -65,12 +63,22 @@ cudaDataType_t projection_cuda_dtype(const vendor::CommonResources& common) {
   return CUDA_R_16BF;
 }
 
+bool supports_native_bf16_bias(const Spec& spec) {
+  return spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+         spec.a_dtype == APXINF_DTYPE_BF16 &&
+         spec.b_dtype == APXINF_DTYPE_BF16 &&
+         spec.output_dtype == APXINF_DTYPE_BF16 &&
+         spec.quantization == APXINF_GEMM_QUANT_NONE &&
+         spec.output_scale_is_unit != 0;
+}
+
 size_t common_requirement(const Spec& spec, bool native_fp8) {
   const bool needs_zero_bias =
       native_fp8 &&
       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS_RESIDUAL &&
       spec.bias_alignment == 0;
-  return vendor::common_resource_requirements(spec, native_fp8) +
+  return vendor::common_resource_requirements(
+             spec, native_fp8, supports_native_bf16_bias(spec)) +
          (needs_zero_bias
               ? static_cast<size_t>(spec.n) * dtype_bytes(APXINF_DTYPE_F16)
               : 0);
@@ -84,10 +92,32 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   resources->native_fp4 = native_fp4;
   const int64_t projection_columns = split_geglu ? spec.n / 2 : spec.n;
   const int64_t projection_stride = spec.n;
-  const int heuristic_rank =
-      split_geglu ? state.configuration / 3 : state.configuration;
+  const bool custom_option = !split_geglu && state.configuration >= 8;
+  const bool explicit_tile = !split_geglu && state.configuration >= 72;
+#if CUDART_VERSION < 13000
+  if (explicit_tile) {
+    throw Failure(APXINF_STATUS_UNSUPPORTED,
+                  "cuBLASLt explicit tile requires CUDA 13 or newer");
+  }
+#endif
+  if (state.configuration < 0 ||
+      (custom_option &&
+       (state.configuration >= 80 || native_fp8 || native_fp4 ||
+        direct_fp8_gelu || spec.semantic != APXINF_GEMM_SEMANTIC_GEMM ||
+        spec.a_dtype != APXINF_DTYPE_BF16 ||
+        spec.b_dtype != APXINF_DTYPE_BF16 ||
+        spec.output_dtype != APXINF_DTYPE_BF16 ||
+        spec.accumulation_dtype != APXINF_DTYPE_F32 ||
+        spec.quantization != APXINF_GEMM_QUANT_NONE))) {
+    throw Failure(APXINF_STATUS_UNSUPPORTED,
+                  "cuBLASLt configuration outside its contract");
+  }
+  const int heuristic_rank = split_geglu ? state.configuration / 3
+      : custom_option ? (state.configuration - 8) / 8 : state.configuration;
   resources->common.projection_dtype =
-      native_fp4 ? APXINF_DTYPE_BF16 : vendor::common_projection_dtype(spec);
+      (native_fp4 || supports_native_bf16_bias(spec))
+          ? spec.output_dtype
+          : vendor::common_projection_dtype(spec);
   const size_t c_buffer_bytes =
       (direct_fp8_gelu || split_geglu)
           ? static_cast<size_t>(spec.m * projection_stride) * sizeof(half)
@@ -151,10 +181,11 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
       spec.output_scale_is_unit != 0;
   const bool native_bias =
-      native_fp8 &&
-      spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
-      spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
-      spec.output_scale_is_unit != 0;
+      (native_fp8 &&
+       spec.semantic == APXINF_GEMM_SEMANTIC_GEMM_BIAS &&
+       spec.quantization == APXINF_GEMM_QUANT_FP8_UNIT_SCALE &&
+       spec.output_scale_is_unit != 0) ||
+      supports_native_bf16_bias(spec);
   if (native_bias_residual && state.bindings.bias == nullptr) {
     check_cuda(cudaMalloc(&resources->zero_bias,
                           static_cast<size_t>(spec.n) *
@@ -205,32 +236,109 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
       &resources->d_layout, output_type, projection_columns, spec.m,
       projection_stride));
 
-  cublasLtMatmulPreference_t preference = nullptr;
-  check_cublas(cublasLtMatmulPreferenceCreate(&preference));
-  const size_t workspace_limit = available_workspace;
-  cublasStatus_t status = cublasLtMatmulPreferenceSetAttribute(
-      preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-      &workspace_limit, sizeof(workspace_limit));
-  if (status != CUBLAS_STATUS_SUCCESS) {
+  if (explicit_tile) {
+#if CUDART_VERSION >= 13000
+    // Stable configurations 72..79: algorithm 66, 128x224 tile,
+    // 64xAUTO stages, 2x1x1 cluster, custom options 0..7. No shape dispatch
+    // or heuristic-rank dependency; AlgoCheck determines legality.
+    check_cublas(cublasLtMatmulAlgoInit(
+        resources->handle, compute_type, scale_type, input_type, input_type,
+        projection_type, output_type, 66, &resources->algorithm));
+    const uint32_t tile = CUBLASLT_MATMUL_TILE_128x224;
+    const uint32_t stages = CUBLASLT_MATMUL_STAGES_64xAUTO;
+    const uint16_t cluster = CUBLASLT_CLUSTER_SHAPE_2x1x1;
+    const uint32_t split_k = 1, reduction = 0, swizzle = 0;
+    const uint16_t inner_shape = 0;
+    auto set = [&](cublasLtMatmulAlgoConfigAttributes_t attribute,
+                   const void* value, size_t bytes) {
+      check_cublas(cublasLtMatmulAlgoConfigSetAttribute(
+          &resources->algorithm, attribute, value, bytes));
+    };
+    set(CUBLASLT_ALGO_CONFIG_TILE_ID, &tile, sizeof(tile));
+    set(CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages, sizeof(stages));
+    set(CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &cluster, sizeof(cluster));
+    set(CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &split_k, sizeof(split_k));
+    set(CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction, sizeof(reduction));
+    set(CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &swizzle, sizeof(swizzle));
+    set(CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, &inner_shape, sizeof(inner_shape));
+    resources->has_algorithm = true;
+#endif
+  } else {
+    cublasLtMatmulPreference_t preference = nullptr;
+    check_cublas(cublasLtMatmulPreferenceCreate(&preference));
+    const size_t workspace_limit = available_workspace;
+    cublasStatus_t status = cublasLtMatmulPreferenceSetAttribute(
+        preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &workspace_limit, sizeof(workspace_limit));
+    if (status != CUBLAS_STATUS_SUCCESS) {
+      cublasLtMatmulPreferenceDestroy(preference);
+      check_cublas(status);
+    }
+    cublasLtMatmulHeuristicResult_t candidates[8]{};
+    int candidate_count = 0;
+    status = cublasLtMatmulAlgoGetHeuristic(
+        resources->handle, resources->operation, resources->a_layout,
+        resources->b_layout, resources->c_layout,
+        resources->d_layout, preference, 8, candidates, &candidate_count);
     cublasLtMatmulPreferenceDestroy(preference);
     check_cublas(status);
+    if (heuristic_rank >= candidate_count ||
+        candidates[heuristic_rank].state != CUBLAS_STATUS_SUCCESS) {
+      throw Failure(APXINF_STATUS_UNSUPPORTED,
+                    "cuBLASLt heuristic is unavailable");
+    }
+    resources->algorithm = candidates[heuristic_rank].algo;
+    resources->has_algorithm = true;
+    resources->workspace_bytes = candidates[heuristic_rank].workspaceSize;
   }
-  cublasLtMatmulHeuristicResult_t candidates[8]{};
-  int candidate_count = 0;
-  status = cublasLtMatmulAlgoGetHeuristic(
-      resources->handle, resources->operation, resources->a_layout,
-      resources->b_layout, resources->c_layout,
-      resources->d_layout, preference, 8, candidates, &candidate_count);
-  cublasLtMatmulPreferenceDestroy(preference);
-  check_cublas(status);
-  if (heuristic_rank >= candidate_count ||
-      candidates[heuristic_rank].state != CUBLAS_STATUS_SUCCESS) {
-    throw Failure(APXINF_STATUS_UNSUPPORTED,
-                  "cuBLASLt heuristic is unavailable");
+
+  if (custom_option) {
+    const uint32_t option = explicit_tile ? state.configuration - 72
+                                          : (state.configuration - 8) % 8;
+    uint32_t maximum = 0;
+    size_t written = 0;
+    check_cublas(cublasLtMatmulAlgoCapGetAttribute(
+        &resources->algorithm, CUBLASLT_ALGO_CAP_CUSTOM_OPTION_MAX,
+        &maximum, sizeof(maximum), &written));
+    if (written != sizeof(maximum) || option > maximum) {
+      throw Failure(APXINF_STATUS_UNSUPPORTED,
+                    "cuBLASLt custom option unavailable");
+    }
+    check_cublas(cublasLtMatmulAlgoConfigSetAttribute(
+        &resources->algorithm, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
+        &option, sizeof(option)));
+    cublasLtMatmulHeuristicResult_t checked{};
+    check_cublas(cublasLtMatmulAlgoCheck(
+        resources->handle, resources->operation, resources->a_layout,
+        resources->b_layout, resources->c_layout, resources->d_layout,
+        &resources->algorithm, &checked));
+    if (checked.state != CUBLAS_STATUS_SUCCESS) {
+      throw Failure(APXINF_STATUS_UNSUPPORTED,
+                    "cuBLASLt custom option does not support this problem");
+    }
+    resources->workspace_bytes = checked.workspaceSize;
   }
-  resources->algorithm = candidates[heuristic_rank].algo;
-  resources->has_algorithm = true;
-  resources->workspace_bytes = candidates[heuristic_rank].workspaceSize;
+
+  if (explicit_tile) {
+    // Lt operand A is the public weight B; operand B is activation A.
+    const cublasLtMatmulAlgoCapAttributes_t attrs[] = {
+        CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_A_BYTES,
+        CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_B_BYTES,
+        CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_C_BYTES,
+        CUBLASLT_ALGO_CAP_MIN_ALIGNMENT_D_BYTES};
+    const uint32_t alignments[] = {spec.b_alignment, spec.a_alignment,
+                                  spec.output_alignment, spec.output_alignment};
+    for (int i = 0; i < 4; ++i) {
+      uint32_t required = 0;
+      size_t written = 0;
+      check_cublas(cublasLtMatmulAlgoCapGetAttribute(
+          &resources->algorithm, attrs[i], &required, sizeof(required), &written));
+      if (written != sizeof(required) || alignments[i] < required) {
+        throw Failure(APXINF_STATUS_UNSUPPORTED,
+                      "cuBLASLt explicit tile alignment unavailable");
+      }
+    }
+  }
 
   if (resources->workspace_bytes > available_workspace) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
@@ -241,7 +349,7 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   // scratch. Allocate common buffers only after the full requirement is
   // known to fit the caller's policy.
   if (direct_fp8_gelu) {
-    check_cuda(cudaMalloc(&resources->c_buffer, c_buffer_bytes));
+    state.scratch.allocate(&resources->c_buffer, c_buffer_bytes);
     check_cuda(cudaMalloc(&resources->output_scale, sizeof(float)));
     const float inverse_output_scale = 1.0F / state.bindings.output_scale;
     check_cuda(cudaMemcpy(resources->output_scale, &inverse_output_scale,
@@ -252,14 +360,15 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     resources->direct_fp8_gelu = true;
     resources->common.resource_bytes = fixed_bytes;
   } else if (split_geglu) {
-    check_cuda(cudaMalloc(&resources->c_buffer, c_buffer_bytes));
+    state.scratch.allocate(&resources->c_buffer, c_buffer_bytes);
     resources->split_geglu = true;
     resources->common.resource_bytes = fixed_bytes;
   } else if (!native_fp4) {
-    vendor::allocate_common_resources(spec, resources->common, native_fp8);
+    vendor::allocate_common_resources(state, spec, resources->common, native_fp8,
+                                      supports_native_bf16_bias(spec));
   }
   if (resources->workspace_bytes != 0) {
-    check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
+    state.scratch.allocate(&resources->workspace, resources->workspace_bytes);
   }
   state.resource_bytes =
       resources->common.resource_bytes + resources->workspace_bytes +

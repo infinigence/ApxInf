@@ -32,11 +32,8 @@ impl Gr00tPrecisionExecution for Gr00tInt8Execution {
     const QK_RMS_MROPE_LEGACY_ENV: Option<&'static str> =
         Some("APXINF_GR00T_W8A8_LEGACY_QK_RMS_MROPE");
     const USE_PACKED_ATTENTION_BIAS_RESIDUAL: bool = true;
-    const USE_PACKED_VISION_FC2_RESIDUAL: bool = true;
     const USE_VISION_POINTWISE_PACK: bool = true;
     const USE_BATCHED_VISION_ATTENTION: bool = true;
-    const VISION_POINTWISE_LEGACY_ENV: Option<&'static str> =
-        Some("APXINF_GR00T_W8A8_LEGACY_VISION_POINTWISE_PACK");
 
     fn transfer_dense(
         &self,

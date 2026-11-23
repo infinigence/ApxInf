@@ -15,17 +15,17 @@ use apxinf_core::{Backend, DType, Device, Error, Result, Tensor};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 use crate::vla::{
-    Action, InferenceSpec, Observation, PreparedInference, VlaContract, VlaRequest,
-    VisionObservation, VlaRuntime,
+    Action, InferenceSpec, Observation, PreparedInference, VisionObservation, VlaContract,
+    VlaRequest, VlaRuntime,
 };
 
 use super::backend::{
-    kernels, DeviceBuffer as CudaBuffer, ImageLayout as KernelImageLayout, RuntimeBackend,
+    ops, DeviceBuffer as CudaBuffer, ImageLayout as KernelImageLayout, RuntimeBackend,
 };
 use super::fp8_calibration::{checkpoint_identity, Pi0FastFp8Calibration};
 use super::{
-    Pi0FastBf16Runtime, Pi0FastCalibrationPlan, Pi0FastConfig, Pi0FastFp8Runtime,
-    Pi0FastFp8Scales, Pi0FastWeights, StaticBf16Pi0FastWeights, StaticFp8Pi0FastWeights,
+    Pi0FastBf16Runtime, Pi0FastCalibrationPlan, Pi0FastConfig, Pi0FastFp8Runtime, Pi0FastFp8Scales,
+    Pi0FastWeights, StaticBf16Pi0FastWeights, StaticFp8Pi0FastWeights,
 };
 
 /// Explicit opt-in for an uncalibrated FP8 bring-up, in the form
@@ -52,7 +52,9 @@ fn artifact_root(path: &Path) -> PathBuf {
     if path.is_dir() {
         path.to_path_buf()
     } else {
-        path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
     }
 }
 
@@ -71,10 +73,23 @@ impl RuntimeVariant {
         token_ids: &CudaBuffer,
         token_count: usize,
         stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
     ) -> Result<Vec<u32>> {
         match self {
-            Self::Bf16(runtime) => runtime.infer(patches, token_ids, token_count, stop_token),
-            Self::Fp8(runtime) => runtime.infer(patches, token_ids, token_count, stop_token),
+            Self::Bf16(runtime) => runtime.infer_with_limit(
+                patches,
+                token_ids,
+                token_count,
+                stop_token,
+                max_new_tokens,
+            ),
+            Self::Fp8(runtime) => runtime.infer_with_limit(
+                patches,
+                token_ids,
+                token_count,
+                stop_token,
+                max_new_tokens,
+            ),
         }
     }
 
@@ -119,9 +134,11 @@ impl Pi0FastVlaRuntime {
 
     fn device_tokens(&self, tokens: &[u32]) -> Result<CudaBuffer> {
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_ne_bytes()).collect();
-        let buffer = CudaBuffer::alloc(bytes.len(), self.backend.device_id())
+        let buffer =
+            CudaBuffer::alloc(bytes.len(), self.backend.device_id()).map_err(Error::Cuda)?;
+        buffer
+            .copy_from_host_on(&bytes, self.backend.context().stream())
             .map_err(Error::Cuda)?;
-        buffer.copy_from_host(&bytes).map_err(Error::Cuda)?;
         Ok(buffer)
     }
 
@@ -142,20 +159,33 @@ impl Pi0FastVlaRuntime {
             }
             VisionObservation::RgbU8 { bytes, layout } => {
                 let config = &self.config;
-                let patches =
-                    self.backend
-                        .to_device(&Tensor::zeros(self.patch_shape().to_vec(), DType::F32))?;
+                let patches = self
+                    .backend
+                    .to_device(&Tensor::zeros(self.patch_shape().to_vec(), DType::F32))?;
                 let images = CudaBuffer::alloc(bytes.len(), self.backend.device_id())
                     .map_err(Error::Cuda)?;
-                images.copy_from_host(bytes).map_err(Error::Cuda)?;
-                kernels::preprocess::rgb_u8_to_patches_f32(
+                images
+                    .copy_from_host_on(bytes, self.backend.context().stream())
+                    .map_err(Error::Cuda)?;
+                ops::preprocess::preprocess(
                     self.backend.context(),
-                    &images,
-                    &patches,
-                    config.effective_views(),
-                    config.image_size,
-                    config.patch_size,
-                    kernel_image_layout(*layout),
+                    ops::preprocess::PreprocessArgs {
+                        images: &images,
+                        patches: &patches,
+                        lookup_table: None,
+                        spec: ops::preprocess::PreprocessSpec {
+                            layout: kernel_image_layout(*layout),
+                            geometry: ops::preprocess::PatchGeometry::Uniform {
+                                views: config.effective_views(),
+                                image_height: config.image_size,
+                                image_width: config.image_size,
+                                patch_size: config.patch_size,
+                                temporal_patch_size: 1,
+                                merge_size: 1,
+                            },
+                            normalization: ops::preprocess::PatchNormalization::UnitRange,
+                        },
+                    },
                 )?;
                 Ok(patches)
             }
@@ -179,8 +209,13 @@ impl Pi0FastVlaRuntime {
 
     fn run(&self, observation: &Observation, stop_token: Option<u32>) -> Result<Vec<u32>> {
         let (patches, tokens) = self.device_inputs(observation)?;
-        self.runtime
-            .infer(&patches, &tokens, observation.token_ids.len(), stop_token)
+        self.runtime.infer(
+            &patches,
+            &tokens,
+            observation.token_ids.len(),
+            stop_token,
+            None,
+        )
     }
 
     /// Collect one Observation's BF16 activation maxima for FP8 calibration.
@@ -205,6 +240,13 @@ impl Pi0FastVlaRuntime {
 }
 
 impl VlaRuntime for Pi0FastVlaRuntime {
+    fn model_variant(&self) -> Option<&'static str> {
+        Some(match &self.runtime {
+            RuntimeVariant::Bf16(_) => "bf16",
+            RuntimeVariant::Fp8(_) => "fp8_static",
+        })
+    }
+
     fn contract(&self) -> VlaContract {
         VlaContract {
             action_shape: [1, self.config.max_action_tokens],
@@ -234,6 +276,25 @@ impl VlaRuntime for Pi0FastVlaRuntime {
         stop_token: Option<u32>,
     ) -> Result<Tensor> {
         let tokens = self.run(request.observation, stop_token)?;
+        self.token_tensor(&tokens)
+    }
+
+    fn infer_action_tokens_with_limit(
+        &self,
+        request: &VlaRequest<'_>,
+        stop_token: Option<u32>,
+        max_new_tokens: Option<usize>,
+    ) -> Result<Tensor> {
+        self.config.decode_token_limit(max_new_tokens)?;
+        let observation = request.observation;
+        let (patches, ids) = self.device_inputs(observation)?;
+        let tokens = self.runtime.infer(
+            &patches,
+            &ids,
+            observation.token_ids.len(),
+            stop_token,
+            max_new_tokens,
+        )?;
         self.token_tensor(&tokens)
     }
 
@@ -290,7 +351,9 @@ fn fp8_activation_scale() -> Result<Option<f32>> {
         Err(_) => return Ok(None),
     };
     let scale = raw.parse::<f32>().map_err(|error| {
-        Error::Other(format!("{FP8_ACTIVATION_SCALE_ENV} must be a float: {error}"))
+        Error::Other(format!(
+            "{FP8_ACTIVATION_SCALE_ENV} must be a float: {error}"
+        ))
     })?;
     if !scale.is_finite() || scale <= 0.0 {
         return Err(Error::Other(format!(
@@ -353,7 +416,7 @@ pub(super) fn load_registered(
     backend: Arc<dyn Backend>,
     options: &LoadOptions,
 ) -> Result<LoadedModel> {
-    let backend = crate::accelerator::cuda::downcast_arc(backend)
+    let backend = crate::accelerator::downcast_cuda_new_arc(backend)
         .ok_or_else(|| Error::Other("π0-FAST is only registered for CUDA".into()))?;
     if options.config.is_some() {
         return Err(Error::Other(
@@ -367,6 +430,7 @@ pub(super) fn load_registered(
             "π0-FAST does not support synthetic weights yet".into(),
         ));
     }
+    let precision = resolve_precision(super::config::load_precision(options)?)?;
     let root = artifact_root(path);
     let config_path = root.join("config.json");
     let config = Arc::new(if config_path.is_file() {
@@ -375,7 +439,7 @@ pub(super) fn load_registered(
         Pi0FastConfig::default()
     });
     let host_weights = Pi0FastWeights::from_safetensors(&config, path)?;
-    let runtime = match resolve_precision(options.precision)? {
+    let runtime = match precision {
         ModelPrecision::Fp8 => {
             let weights = Arc::new(StaticFp8Pi0FastWeights::from_host(
                 &host_weights,

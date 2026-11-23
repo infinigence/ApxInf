@@ -4,9 +4,8 @@
 
 namespace apxinf::gemm::vendor {
 
-// Shared only by the vendor providers. These buffers are intentionally not
-// part of the common Execution: another provider can define a completely
-// different private state without modifying the common framework.
+// Vendor-specific scratch bindings. Allocation ownership is registered with
+// Execution::scratch, then transferred to runner storage after selection.
 struct CommonResources {
   void* projection = nullptr;
   void* unpack_a = nullptr;
@@ -22,11 +21,14 @@ struct CommonResources {
   void release() noexcept;
 };
 
-void allocate_common_resources(const Spec& spec,
+void allocate_common_resources(Execution& state, const Spec& spec,
                                CommonResources& resources,
-                               bool native_fp8);
+                               bool native_fp8,
+                               bool native_bias_epilogue = false);
 uint32_t common_projection_dtype(const Spec& spec);
-size_t common_resource_requirements(const Spec& spec, bool native_fp8);
+size_t common_resource_requirements(const Spec& spec,
+                                    bool native_fp8,
+                                    bool native_bias_epilogue = false);
 cudaError_t launch_postprocess(const Spec& spec,
                                CommonResources& resources,
                                const apxinf_gemm_bindings_t& bindings,

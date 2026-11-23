@@ -22,9 +22,10 @@
 #![cfg(apxinf_hip_runtime)]
 
 use apxinf_core::{
-    Backend, CpuBackend, DType, Device, KvCache, NextTokenLogits, RngKey, SamplingBackend,
+    Backend, DType, Device, KvCache, NextTokenLogits, RngKey, SamplingBackend,
     Tensor, TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec,
 };
+use apxinf_cpu::CpuBackend;
 use apxinf_hip::HipBackend;
 use half::bf16;
 

@@ -98,7 +98,7 @@ rollout after the RoPE correction:
 
 The CUDA test
 `rope_half_split_f16_matches_fp32_reference` in
-`crates/apxinf-cuda/src/tests/operators.rs` covers the corrected RoPE layout.
+`crates/apxinf-cuda-new/src/ops/tests/l3_behavior.rs` covers the corrected RoPE layout.
 
 ## Performance
 
@@ -165,7 +165,7 @@ computation itself is unchanged.
 
 ```bash
 CUDA_PATH=/path/to/cuda cargo check -p apxinf-model --features cuda
-CUDA_PATH=/path/to/cuda cargo test -p apxinf-cuda rope_half_split_f16_matches_fp32_reference
+CUDA_PATH=/path/to/cuda cargo test -p apxinf-cuda-new rope_half_split_f16_matches_fp32_reference
 python -m pytest python/apxinf/tests/test_smolvla_policy.py
 ```
 

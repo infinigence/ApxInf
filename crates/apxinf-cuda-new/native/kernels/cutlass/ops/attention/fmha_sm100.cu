@@ -58,7 +58,7 @@ template <typename Element, typename ElementOut>
 struct FmhaTypes {
   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
       Element, float, float, TileShape, StrideQ, StrideK, StrideV,
-      cutlass::fmha::collective::NoMask>;
+      cutlass::fmha::collective::ResidualMask>;
   using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
       ElementOut, float, typename Mainloop::TileShapePV, StrideO, StrideLSE>;
   using Kernel = cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<

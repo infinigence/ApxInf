@@ -54,10 +54,14 @@ pub struct MlxBackend {
 }
 impl MlxBackend {
     pub fn new(index: usize) -> Result<Self> {
-        Ok(Self {
-            stream: Stream::metal(index)?,
-            index,
-        })
+        let stream = Stream::metal(index)?;
+        if let Some(caps) = stream.metal_caps() {
+            eprintln!(
+                "Metal {}: {} ({})",
+                index, caps.device_name, caps.architecture
+            );
+        }
+        Ok(Self { stream, index })
     }
     pub fn stream(&self) -> &Stream {
         &self.stream

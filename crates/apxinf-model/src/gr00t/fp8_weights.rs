@@ -7,14 +7,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use apxinf_core::{Backend, Error, Result, Tensor};
+use apxinf_core::{DType, Error, Result, Shape, Tensor};
 use serde::Deserialize;
 
 use super::action_weights::Gr00tLinearWeights;
 use super::assets::checkpoint_identity;
 #[cfg(test)]
 use super::assets::LocalSha256;
-use super::backend::{kernels, RuntimeBackend};
+use super::backend::{ops, RuntimeBackend};
 use super::device_weights::DeviceLinearWeights;
 
 const CALIBRATION_SCHEMA: &str = "apxinf.fp8-calibration.v1";
@@ -282,22 +282,7 @@ pub(super) struct Gr00tFp8LinearWeights {
 
 impl Gr00tFp8LinearWeights {
     fn quantize_activation(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
-        if !thor_fp8_packed_static_quantization(
-            backend.context().caps().sm,
-            std::env::var_os("APXINF_GR00T_FP8_LEGACY_STATIC_QUANT").is_some(),
-        ) {
-            kernels::quantization::quantize_bf16_e4m3(
-                backend.context(),
-                input,
-                self.activation_scale,
-            )
-        } else {
-            kernels::quantization::quantize_bf16_e4m3_packed8(
-                backend.context(),
-                input,
-                self.activation_scale,
-            )
-        }
+        ops::quantization::quantize_fixed_scale(backend.context(), input, self.activation_scale)
     }
 
     pub(super) fn from_host(
@@ -318,7 +303,7 @@ impl Gr00tFp8LinearWeights {
         let weight_scale = e4m3_weight_scale(maximum);
         let weight = backend.to_device(&weights.weight)?;
         let weight =
-            kernels::quantization::quantize_bf16_e4m3(backend.context(), &weight, weight_scale)?;
+            ops::quantization::quantize_fixed_scale(backend.context(), &weight, weight_scale)?;
         Ok(Self {
             weight,
             weight_scale,
@@ -344,7 +329,7 @@ impl Gr00tFp8LinearWeights {
         let weight_scale = e4m3_weight_scale(maximum);
         let weight = backend.to_device(weight)?;
         let weight =
-            kernels::quantization::quantize_bf16_e4m3(backend.context(), &weight, weight_scale)?;
+            ops::quantization::quantize_fixed_scale(backend.context(), &weight, weight_scale)?;
         Ok(Self {
             weight,
             weight_scale,
@@ -388,42 +373,12 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         bias: &Tensor,
         backend: &RuntimeBackend,
     ) -> Result<Option<Self::ReusableInput>> {
-        Ok(Some(kernels::activation::bias_gelu_quant_bf16_e4m3(
+        Ok(Some(ops::pointwise::bias_gelu_quantized(
             backend.context(),
             input,
             bias,
             self.activation_scale,
         )?))
-    }
-
-    fn forward_reusable_quantized_bias_gelu(
-        &self,
-        input: &Self::ReusableInput,
-        output_scale: f32,
-        backend: &RuntimeBackend,
-    ) -> Result<Option<Self::ReusableInput>> {
-        if std::env::var_os("APXINF_GR00T_FP8_LEGACY_M41_FC1_EPILOGUE").is_some()
-            || backend.context().caps().sm != 110
-            || input.shape().dims() != [41, 1536]
-            || self.weight.shape().dims() != [1536, 6144]
-        {
-            return Ok(None);
-        }
-        let Some(bias) = self.bias.as_ref() else {
-            return Ok(None);
-        };
-        if bias.shape().dims() != [6144] {
-            return Ok(None);
-        }
-        kernels::fused::try_fp8_bias_gelu_quant_e4m3_m41(
-            backend.context(),
-            input,
-            &self.weight,
-            bias,
-            self.activation_scale,
-            self.weight_scale,
-            output_scale,
-        )
     }
 
     fn residual_layer_norm_quantized(
@@ -435,17 +390,37 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         eps: f32,
         backend: &RuntimeBackend,
     ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
-        let fused = kernels::fused::bias_residual_layer_quant_bf16_e4m3(
+        let hidden = backend
+            .context()
+            .allocate_output(projection.shape().clone(), DType::BF16)?;
+        let normalized = backend
+            .context()
+            .allocate_output(projection.shape().clone(), DType::F8E4M3)?;
+        ops::fused_add_norm(
             backend.context(),
-            projection,
-            None,
-            residual,
-            norm_weight,
-            norm_bias,
-            eps,
-            self.activation_scale,
+            ops::FusedAddNormArgs {
+                input: projection,
+                bias: None,
+                residual,
+                gate: None,
+                hidden: &hidden,
+                normalized: None,
+                kind: ops::NormKind::Layer,
+                affine: ops::Affine::Weight {
+                    weight: norm_weight,
+                    bias: Some(norm_bias),
+                    offset: false,
+                },
+                quantized: Some(ops::QuantOut::StaticE4m3 {
+                    output: &normalized,
+                    scale: self.activation_scale,
+                }),
+                numerics: ops::NormNumerics::Flexible,
+                bias_order: ops::BiasOrder::SingleRound,
+                eps,
+            },
         )?;
-        Ok(Some((fused.hidden, fused.normalized)))
+        Ok(Some((hidden, normalized)))
     }
 
     fn supports_fused_bias_gelu_quantization(&self) -> bool {
@@ -460,40 +435,6 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         self.forward_quantized_tensor(input, backend)
     }
 
-    fn forward_reusable_quantized_bias_residual(
-        &self,
-        input: &Self::ReusableInput,
-        residual: &Tensor,
-        backend: &RuntimeBackend,
-    ) -> Result<Option<Tensor>> {
-        let Some(bias) = self.bias.as_ref() else {
-            return Ok(None);
-        };
-        let use_thor_m41_fc2_epilogue = backend.context().caps().sm == 110
-            && input.shape().dims() == [41, 6144]
-            && self.weight.shape().dims() == [6144, 1536]
-            && bias.shape().dims() == [1536]
-            && residual.shape().dims() == [41, 1536]
-            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_M41_FC2_EPILOGUE").is_none();
-        if !use_thor_m41_fc2_epilogue {
-            return Ok(None);
-        }
-        let weight = kernels::gemm::Fp8WeightView {
-            values_e4m3: &self.weight,
-            scale: self.weight_scale,
-            dual_geglu_interleaved: false,
-            dual_geglu_auto_interleaved: None,
-        };
-        kernels::gemm::try_fp8_bias_then_residual_bf16(
-            backend.context(),
-            input,
-            self.activation_scale,
-            weight,
-            bias,
-            residual,
-        )
-    }
-
     fn quantize_tensor_input(
         &self,
         input: &Tensor,
@@ -503,34 +444,21 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
     }
 
     fn forward_quantized_tensor(&self, input: &Tensor, backend: &RuntimeBackend) -> Result<Tensor> {
-        let weight = kernels::gemm::Fp8WeightView {
-            values_e4m3: &self.weight,
-            scale: self.weight_scale,
-            dual_geglu_interleaved: false,
-            dual_geglu_auto_interleaved: None,
-        };
-        let versions = backend.context().library_versions();
-        let use_thor_m41_ffn_down = backend.context().caps().sm == 110
-            && thor_m41_custom_tactic_versions_supported(&versions.cuda, &versions.cublas)
-            && input.shape().dims() == [41, 6144]
-            && self.weight.shape().dims() == [6144, 1536]
-            && std::env::var_os("APXINF_GR00T_FP8_LEGACY_M41_FFN_DOWN").is_none();
-        if use_thor_m41_ffn_down {
-            kernels::gemm::fp8_bf16_custom(
-                backend.context(),
-                input,
-                self.activation_scale,
-                weight,
-                kernels::gemm::Fp8Bf16CustomConfig {
-                    tile_id: 409,
-                    custom_option: 3,
-                    stages_id: 36,
-                    cluster_shape_id: 3,
-                },
-            )
-        } else {
-            kernels::gemm::fp8_bf16(backend.context(), input, self.activation_scale, weight)
+        let a = input.shape().dims();
+        let b = self.weight.shape().dims();
+        if a.len() != 2 || b.len() != 2 || a[1] != b[0] {
+            return Err(Error::Other(format!(
+                "GR00T FP8 GEMM shape mismatch: {a:?} @ {b:?}"
+            )));
         }
+        let mut output = backend
+            .context()
+            .allocate_output(Shape::new(vec![a[0], b[1]]), DType::BF16)?;
+        let mut args = ops::gemm::GemmArgs::new(input, &self.weight, &mut output);
+        args.quantization = ops::gemm::GemmQuantization::Fp8UnitScale;
+        args.alpha = self.activation_scale * self.weight_scale;
+        ops::gemm::gemm(backend.context(), args)?;
+        Ok(output)
     }
 
     fn adaptive_layer_norm_quantized(
@@ -540,12 +468,26 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         eps: f32,
         backend: &RuntimeBackend,
     ) -> Result<Option<(Tensor, Self::ReusableInput)>> {
-        let (normalized, quantized) = kernels::norm::adaptive_layer_quant_bf16_e4m3(
+        let normalized = backend
+            .context()
+            .allocate_output(input.shape().clone(), DType::BF16)?;
+        let quantized = backend
+            .context()
+            .allocate_output(input.shape().clone(), DType::F8E4M3)?;
+        ops::norm::norm(
             backend.context(),
-            input,
-            modulation,
-            eps,
-            self.activation_scale,
+            ops::NormArgs {
+                input,
+                output: Some(&normalized),
+                kind: ops::NormKind::Layer,
+                affine: ops::Affine::Adaptive { style: modulation },
+                quantized: Some(ops::QuantOut::StaticE4m3 {
+                    output: &quantized,
+                    scale: self.activation_scale,
+                }),
+                numerics: ops::NormNumerics::Flexible,
+                eps,
+            },
         )?;
         Ok(Some((normalized, quantized)))
     }
@@ -557,13 +499,29 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
         eps: f32,
         backend: &RuntimeBackend,
     ) -> Result<Option<Self::ReusableInput>> {
-        Ok(Some(kernels::norm::rms_quant_bf16_e4m3(
+        let output = backend
+            .context()
+            .allocate_output(input.shape().clone(), DType::F8E4M3)?;
+        ops::norm::norm(
             backend.context(),
-            input,
-            weight,
-            eps,
-            self.activation_scale,
-        )?))
+            ops::NormArgs {
+                input,
+                output: None,
+                kind: ops::NormKind::Rms,
+                affine: ops::Affine::Weight {
+                    weight,
+                    bias: None,
+                    offset: false,
+                },
+                quantized: Some(ops::QuantOut::StaticE4m3 {
+                    output: &output,
+                    scale: self.activation_scale,
+                }),
+                numerics: ops::NormNumerics::Flexible,
+                eps,
+            },
+        )?;
+        Ok(Some(output))
     }
 
     fn uses_quantized_output(&self) -> bool {
@@ -571,51 +529,13 @@ impl DeviceLinearWeights for Gr00tFp8LinearWeights {
     }
 }
 
-/// The explicit cuBLASLt attributes were accepted with runtime 13000 and
-/// cuBLAS 130000, which CudaContext formats as "13.0". Even patch-version
-/// changes use the normal planner until this private tactic is revalidated.
-fn thor_m41_custom_tactic_versions_supported(cuda: &str, cublas: &str) -> bool {
-    cuda == "13.0" && cublas == "13.0"
-}
-
-fn thor_fp8_packed_static_quantization(sm: u32, legacy_requested: bool) -> bool {
-    sm == 110 && !legacy_requested
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpoint_identity, e4m3_weight_scale, thor_fp8_packed_static_quantization,
-        thor_m41_custom_tactic_versions_supported, Gr00tFp8Calibration, LocalSha256,
+        checkpoint_identity, e4m3_weight_scale, Gr00tFp8Calibration, LocalSha256,
         CALIBRATION_SCHEMA, E4M3_MAX,
     };
     use std::path::Path;
-
-    #[test]
-    fn packed_static_quantization_preserves_other_architectures_and_legacy_mode() {
-        assert!(thor_fp8_packed_static_quantization(110, false));
-        assert!(!thor_fp8_packed_static_quantization(110, true));
-        for sm in [0, 80, 87, 89, 90, 100, 103, 120] {
-            assert!(!thor_fp8_packed_static_quantization(sm, false));
-            assert!(!thor_fp8_packed_static_quantization(sm, true));
-        }
-    }
-
-    #[test]
-    fn explicit_m41_tactic_requires_the_accepted_library_versions() {
-        assert!(thor_m41_custom_tactic_versions_supported("13.0", "13.0"));
-        for (cuda, cublas) in [
-            ("13.2", "13.0"),
-            ("13.0", "13.4"),
-            ("13.0.1", "13.0"),
-            ("13.0", "13.0.1"),
-            ("13.0.0", "13.0"),
-            ("", "13.0"),
-            ("13.0", ""),
-        ] {
-            assert!(!thor_m41_custom_tactic_versions_supported(cuda, cublas));
-        }
-    }
 
     #[test]
     fn sha256_matches_the_standard_vector() {

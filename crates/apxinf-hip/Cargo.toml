@@ -7,6 +7,7 @@ build = "build.rs"
 
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
+apxinf-cpu = { path = "../apxinf-cpu" }
 
 [dev-dependencies]
 half = { version = "2", features = ["bytemuck"] }

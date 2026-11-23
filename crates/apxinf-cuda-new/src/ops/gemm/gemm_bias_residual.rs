@@ -12,6 +12,7 @@ pub struct GemmBiasResidualArgs<'a> {
 }
 
 pub fn gemm_bias_residual(ctx: &CudaContext, args: GemmBiasResidualArgs<'_>) -> Result<()> {
+    super::observer::observe(&args.gemm)?;
     execution::execute(
         ctx,
         normalize_bias_residual(ctx, args.gemm, args.bias, args.residual)?,

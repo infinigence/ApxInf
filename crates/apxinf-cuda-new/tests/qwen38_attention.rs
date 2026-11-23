@@ -242,6 +242,7 @@ fn vision_qkv_rope_uses_height_then_width_axes() {
             key: &mut key,
             value: &mut value,
             theta,
+            numerics: ops::AxialRopeNumerics::Flexible,
         },
     )
     .unwrap();
@@ -375,7 +376,7 @@ fn attention_gate_is_sigmoid_not_silu() {
     let data = upload_bf16(&ctx, &data_values, vec![count]);
     let gate = upload_bf16(&ctx, &gate_values, vec![count]);
 
-    ops::apply_output_gate(&ctx, &data, &gate).unwrap();
+    ops::apply_output_gate(&ctx, ops::OutputGateArgs::new(&data, &gate)).unwrap();
     ctx.synchronize().unwrap();
     let produced = read_bf16(&data);
 
@@ -404,4 +405,96 @@ fn attention_gate_is_sigmoid_not_silu() {
         "sanity: silu and sigmoid gates must differ enough for the check above \
          to discriminate, but the worst gap was only {worst_against_silu}"
     );
+}
+
+#[test]
+fn rounded_output_gate_accepts_dense_and_interleaved_sources() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (rows, heads, head_dim) = (3usize, 2usize, 8usize);
+    let width = heads * head_dim;
+    let projection_width = 2 * width + 7;
+    let data_values: Vec<f32> = (0..rows * width)
+        .map(|index| ((index % 19) as f32 - 9.0) / 7.0)
+        .collect();
+    let gate_values: Vec<f32> = (0..rows * width)
+        .map(|index| ((index % 11) as f32 - 5.0) / 4.0)
+        .collect();
+    let mut projection_values = vec![0.0f32; rows * projection_width];
+    for row in 0..rows {
+        for head in 0..heads {
+            for element in 0..head_dim {
+                let gate_index = (row * heads + head) * head_dim + element;
+                let projection_index =
+                    row * projection_width + head * 2 * head_dim + head_dim + element;
+                projection_values[projection_index] = gate_values[gate_index];
+            }
+        }
+    }
+
+    let dense_data = upload_bf16(&ctx, &data_values, vec![rows, width]);
+    let interleaved_data = upload_bf16(&ctx, &data_values, vec![rows, width]);
+    let dense_gate = upload_bf16(&ctx, &gate_values, vec![rows, width]);
+    let projection = upload_bf16(&ctx, &projection_values, vec![rows, projection_width]);
+
+    ops::apply_output_gate(
+        &ctx,
+        ops::OutputGateArgs::new(&dense_data, &dense_gate)
+            .with_numerics(ops::OutputGateNumerics::RoundedSigmoid),
+    )
+    .unwrap();
+    ops::apply_output_gate(
+        &ctx,
+        ops::OutputGateArgs::from_projection(&interleaved_data, &projection, heads, head_dim),
+    )
+    .unwrap();
+    ctx.synchronize().unwrap();
+
+    assert_eq!(read_bf16(&dense_data), read_bf16(&interleaved_data));
+}
+
+#[test]
+fn attention_gate_family_is_graph_safe() {
+    let ctx = CudaContext::new(0).unwrap();
+    let (tokens, heads, head_dim) = (2usize, 2usize, 4usize);
+    let elements = tokens * heads * head_dim;
+    let fused_values = (0..2 * elements)
+        .map(|index| ((index % 17) as f32 - 8.0) / 7.0)
+        .collect::<Vec<_>>();
+    let data_values = (0..elements)
+        .map(|index| ((index % 13) as f32 - 6.0) / 5.0)
+        .collect::<Vec<_>>();
+    let gate_values = (0..elements)
+        .map(|index| ((index % 11) as f32 - 5.0) / 4.0)
+        .collect::<Vec<_>>();
+    let fused = upload_bf16(&ctx, &fused_values, vec![tokens, heads, 2 * head_dim]);
+    let dense_gate = upload_bf16(&ctx, &gate_values, vec![tokens, heads, head_dim]);
+    let eager_query = upload_bf16(&ctx, &vec![0.0; elements], vec![tokens, heads, head_dim]);
+    let eager_split_gate = upload_bf16(&ctx, &vec![0.0; elements], vec![tokens, heads, head_dim]);
+    let eager_data = upload_bf16(&ctx, &data_values, vec![tokens, heads, head_dim]);
+    ops::split_query_and_gate(&ctx, &fused, &eager_query, &eager_split_gate).unwrap();
+    ops::apply_output_gate(
+        &ctx,
+        ops::OutputGateArgs::new(&eager_data, &dense_gate)
+            .with_numerics(ops::OutputGateNumerics::RoundedSigmoid),
+    )
+    .unwrap();
+
+    let graph_query = upload_bf16(&ctx, &vec![0.0; elements], vec![tokens, heads, head_dim]);
+    let graph_split_gate = upload_bf16(&ctx, &vec![0.0; elements], vec![tokens, heads, head_dim]);
+    let graph_data = upload_bf16(&ctx, &data_values, vec![tokens, heads, head_dim]);
+    let graph = apxinf_cuda_new::capture(&ctx, || {
+        ops::split_query_and_gate(&ctx, &fused, &graph_query, &graph_split_gate)?;
+        ops::apply_output_gate(
+            &ctx,
+            ops::OutputGateArgs::new(&graph_data, &dense_gate)
+                .with_numerics(ops::OutputGateNumerics::RoundedSigmoid),
+        )
+    })
+    .unwrap();
+    graph.replay().unwrap();
+    ctx.synchronize().unwrap();
+
+    assert_eq!(read_bf16(&graph_query), read_bf16(&eager_query));
+    assert_eq!(read_bf16(&graph_split_gate), read_bf16(&eager_split_gate));
+    assert_eq!(read_bf16(&graph_data), read_bf16(&eager_data));
 }

@@ -1,6 +1,8 @@
 pub(crate) mod contracts;
-pub(crate) mod launch;
+mod embedding;
 mod gather;
+pub(crate) mod launch;
 
-pub use contracts::{GatherArgs, GatherSemantic, PatchGeometry};
+pub use contracts::{EmbeddingScale, GatherArgs, GatherSemantic, PatchGeometry};
+pub use embedding::embedding_gather;
 pub use gather::gather;

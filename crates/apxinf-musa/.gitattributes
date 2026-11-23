@@ -1,0 +1,13 @@
+# Preserve the vendored MATE/MUTLASS tree byte-for-byte, including upstream
+# whitespace.
+#
+# This lives here rather than in the repository root's `.gitattributes` so that
+# the whole MUSA concern stays inside this crate. `git` reads `.gitattributes`
+# from the path's own directory and each of its parents, so a file here covers
+# `kernels/**` just as well; patterns are relative to this file.
+#
+# It needs the attribute for a reason the CUDA entries do not have to state:
+# `kernels/mutlass_fmha/README.md` gives re-vendoring as a `cp -a` of three
+# directories audited with `diff -r`, and whitespace normalisation is exactly
+# what would make that diff show changes nobody made.
+kernels/mutlass_fmha/** whitespace=-trailing-space,-space-before-tab

@@ -13,6 +13,7 @@ pub type cudaStream_t = *mut c_void;
 pub type cudaEvent_t = *mut c_void;
 
 pub const CUDA_SUCCESS: cudaError_t = 0;
+pub const CUDA_ERROR_MEMORY_ALLOCATION: cudaError_t = 2;
 pub const CUDA_STREAM_NON_BLOCKING: u32 = 1;
 
 #[repr(i32)]
@@ -99,6 +100,14 @@ extern "C" {
         devPtr: *mut c_void,
         value: i32,
         count: usize,
+        stream: cudaStream_t,
+    ) -> cudaError_t;
+    pub fn cudaMemset2DAsync(
+        devPtr: *mut c_void,
+        pitch: usize,
+        value: i32,
+        width: usize,
+        height: usize,
         stream: cudaStream_t,
     ) -> cudaError_t;
 

@@ -2,6 +2,7 @@ use apxinf_core::{DType, Result, Tensor};
 
 use super::contracts::{invalid, tensor_storage};
 use crate::ffi::abi::{gemm as abi, status};
+use crate::ops::quantization::ScaleLayout;
 use crate::CudaContext;
 
 /// Bytes an NVFP4 block-scale buffer occupies in the layout the kernel reads.
@@ -10,7 +11,7 @@ use crate::CudaContext;
 /// the logical `[rows, k / block_size]` grid up to the kernel's atom
 /// boundaries, so the answer is larger than the checkpoint's own scale tensor
 /// and has to be queried rather than derived.
-pub fn nvfp4_scale_buffer_bytes(rows: usize, k: usize, block_size: u32) -> Result<usize> {
+pub(crate) fn nvfp4_scale_buffer_bytes(rows: usize, k: usize, block_size: u32) -> Result<usize> {
     if rows == 0 || k == 0 || rows > i32::MAX as usize || k > i32::MAX as usize {
         return Err(invalid("NVFP4 scale buffer needs a nonempty shape"));
     }
@@ -33,7 +34,7 @@ pub fn nvfp4_scale_buffer_bytes(rows: usize, k: usize, block_size: u32) -> Resul
 /// The target layout depends only on `block_size`, not on which tactic the
 /// autotuner picks, so this runs once when weights are loaded and stays valid
 /// for the life of the model.
-pub fn nvfp4_pack_block_scales(
+pub(crate) fn nvfp4_pack_block_scales(
     ctx: &CudaContext,
     source: &Tensor,
     destination: &Tensor,
@@ -74,21 +75,6 @@ pub fn nvfp4_pack_block_scales(
         ))
     }
 }
-/// Which layout a quantizer should write its block scales in.
-///
-/// The block-scaled GEMM reads a tcgen05 atom layout; the GEMV indexes a
-/// plain row-major grid. Producing the right one directly costs nothing and
-/// saves the decode path a relayout pass per projection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScaleLayout {
-    /// `[rows, k / block_size]`, the layout a checkpoint stores and the GEMV
-    /// reads.
-    RowMajor,
-    /// The kernel atom layout the block-scaled GEMM reads. Size it with
-    /// [`nvfp4_scale_buffer_bytes`].
-    GemmAtom,
-}
-
 impl ScaleLayout {
     fn flag(self) -> i32 {
         match self {
@@ -116,7 +102,7 @@ impl ScaleLayout {
 /// absolute magnitudes by folding `input_scale * weight_scale_2` into `alpha`.
 /// Passing a different value silently rescales the layer rather than failing,
 /// which is why it is a required argument and not a default.
-pub fn nvfp4_quantize_activation(
+pub(crate) fn nvfp4_quantize_activation(
     ctx: &CudaContext,
     activation: &Tensor,
     packed: &Tensor,
@@ -127,7 +113,9 @@ pub fn nvfp4_quantize_activation(
 ) -> Result<()> {
     let dims = activation.shape().dims().to_vec();
     if dims.len() != 2 {
-        return Err(invalid("NVFP4 activation quantization requires a rank-2 tensor"));
+        return Err(invalid(
+            "NVFP4 activation quantization requires a rank-2 tensor",
+        ));
     }
     let (rows, k) = (dims[0], dims[1]);
     if block_size == 0 || k % block_size as usize != 0 {
@@ -166,10 +154,10 @@ pub fn nvfp4_quantize_activation(
 
 /// RMSNorm fused with NVFP4 quantization.
 ///
-/// Equivalent to [`crate::ops::mlp::rms_norm`] followed by
-/// [`nvfp4_quantize_activation`], but never materializes the normalized BF16
-/// tensor. At prefill widths that round trip dominates both ops' arithmetic.
-pub fn nvfp4_quantize_rms_norm(
+/// Equivalent to weight-offset [`crate::ops::NormArgs`] followed by block
+/// quantization, but never materializes the normalized BF16 tensor. At prefill
+/// widths that round trip dominates both ops' arithmetic.
+pub(crate) fn nvfp4_quantize_rms_norm(
     ctx: &CudaContext,
     input: &Tensor,
     norm_weight: &Tensor,
@@ -182,7 +170,9 @@ pub fn nvfp4_quantize_rms_norm(
 ) -> Result<()> {
     let dims = input.shape().dims().to_vec();
     if dims.len() != 2 {
-        return Err(invalid("fused RMSNorm quantization requires a rank-2 tensor"));
+        return Err(invalid(
+            "fused RMSNorm quantization requires a rank-2 tensor",
+        ));
     }
     let (rows, k) = (dims[0], dims[1]);
     if block_size == 0 || k % block_size as usize != 0 {
@@ -223,9 +213,9 @@ pub fn nvfp4_quantize_rms_norm(
 /// SwiGLU fused with NVFP4 quantization.
 ///
 /// `fused` is the `[rows, 2*k]` gate/up projection, gate first. Equivalent to
-/// [`crate::ops::swiglu`] followed by [`nvfp4_quantize_activation`] without the
+/// [`crate::ops::swiglu_into`] followed by [`nvfp4_quantize_activation`] without the
 /// `[rows, k]` BF16 intermediate.
-pub fn nvfp4_quantize_swiglu(
+pub(crate) fn nvfp4_quantize_swiglu(
     ctx: &CudaContext,
     fused: &Tensor,
     packed: &Tensor,
@@ -279,7 +269,7 @@ pub fn nvfp4_quantize_swiglu(
 /// implementation currently supports the production SM110 shape; callers use
 /// the unfused GEMM + SwiGLU path for every other shape.
 #[allow(clippy::too_many_arguments)]
-pub fn nvfp4_gemm_swiglu(
+pub(crate) fn nvfp4_gemm_swiglu(
     ctx: &CudaContext,
     activation: &Tensor,
     activation_scales: &Tensor,

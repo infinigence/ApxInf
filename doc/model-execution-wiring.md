@@ -21,6 +21,20 @@ prepare static metadata, submit fixed control flow and receive results. CPU
 intermediate computation and D2H/H2D round trips remain private correctness
 scaffolds and must be replaced before port completion.
 
+For native Qwen3-TTS CustomVoice only, the requesting Metal maintainer accepted
+a one-Boolean EOS stopping boundary on 2026-10-19. Its exact scope and unchanged
+gates are defined in the [family decision](../crates/apxinf-model/src/metal_qwen3_tts/README.md#scoped-eos-control-boundary).
+This permits no codec-id/history readback, CPU tensor computation, arbitrary
+control exception or change to GPU/CUDA requirements for other families.
+
+A limited fixed-profile Clef GPU+ANE host-handoff exception is
+[proposed separately](coreml-ane.md#scoped-host-handoff-decision).
+The fork operator accepted that experimental scope on 2026-10-19; upstream
+maintainer approval remains pending. Until approval and all placement, transfer,
+numerical, performance, preparation, resource and lifetime gates are satisfied,
+the proposal does not change this acceptance contract or qualify either
+composition. GPU-only, CUDA and other families' requirements remain unchanged.
+
 For CUDA targets, fixed profiles must support CUDA Graph acceleration. Prefer one graph from
 canonical device inputs to outputs. For a VLA where concrete blockers prevent
 one graph, the accepted fallback partition covers Vision, Language and Action
@@ -178,13 +192,18 @@ is not proof that the model uses the right cache lifetime.
 ## Prepare and capture fixed-shape execution
 
 For a fixed target profile, query model/Blocks workspace requirements and let
-the runner's preparation code allocate stable inputs, outputs and scratch.
-Use `GraphWorkspace` and `prepare_with_workspace` for warmup, then `with_workspace`
-during capture through the shared CUDA capture scope. PI0.5's
+the runner's preparation code allocate stable inputs and outputs. In cuda-new,
+the runner owns a `ProviderWorkspace` for serial operator scratch and passes it
+to each profile's `ExecutionSession::with_provider_workspace`, together with a
+separate activation `GraphWorkspace`. Prepare the real traversal with
+`session.prepare`, then use `session.run` during CUDA capture. PI0.5's
 [`model_runner/prepare.rs`](../crates/apxinf-model/src/pi05/model_runner/prepare.rs)
-repeats warmup until tuning generation stabilizes; one invocation is not a
-universal readiness guarantee. Capture and eager call the same model semantics.
-Update captured input contents in place and replay through the prepared object.
+implements this ownership. Persistent KV/state stays outside provider scratch;
+see the [ownership contract](model-layer-architecture.md#repacked-gemm-weight-ownership).
+This contract is cuda-new-specific; other backends own their workspace
+preparation and lease APIs.
+Capture and eager call the same model semantics. Update captured input contents
+in place and replay through the prepared object.
 
 Preparation must exercise the real model computation. A method that only validates a
 configuration object is not execution preparation. If graph capture is

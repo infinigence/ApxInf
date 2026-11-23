@@ -159,3 +159,17 @@ fn cached_attention_preserves_grouping_and_prefill_decode_offsets() -> Result<()
         .is_err());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn metal_streams_report_the_mlx_architecture() -> Result<()> {
+    let b = MlxBackend::new(0)?;
+    let caps = b.stream().metal_caps().expect("Metal stream device facts");
+    assert!(!caps.device_name.is_empty(), "{caps:?}");
+    assert!(caps.architecture.starts_with("applegpu_g"), "{caps:?}");
+    assert!(caps.generation.is_some_and(|g| g >= 13), "{caps:?}");
+    assert!(caps.device_class.is_some(), "{caps:?}");
+    assert!(Stream::cpu()?.metal_caps().is_none());
+    eprintln!("{caps:?}");
+    Ok(())
+}

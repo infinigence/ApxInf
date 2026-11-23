@@ -9,8 +9,9 @@ mod linear {
     use crate::pi05::LinearWeights;
 
     pub struct Int8DynamicLinearWeights {
-        /// Canonical contiguous row-major `[input,output]` signed INT8 weight.
+        /// Logical `[input,output]` INT8 weight; `layout` tracks physical packing.
         pub weight: Tensor,
+        pub layout: crate::pi05::backend::ops::RepackedWeight,
         /// Dequantization multiplier for each output channel.
         pub channel_scales: Tensor,
         pub bias: Option<Tensor>,
@@ -23,7 +24,7 @@ mod linear {
         // W8A8 is defined as I8 x I8 with I32 accumulation.  Keep the
         // caller's tuning, workspace, graph-safety and cache choices, but do
         // not let a generic floating-point policy weaken that semantic
-        // contract after `GemmArgs::w8a8` established it.
+        // contract after `GemmArgs::row_channel_quantized` established it.
         policy.accumulation_dtype = DType::I32;
         policy
     }
@@ -35,10 +36,7 @@ mod linear {
 
         /// Pack QKV or gate/up along the output dimension, then independently
         /// quantize every output channel across its complete input row.
-        pub fn from_host_parts(
-            linears: &[&LinearWeights],
-            backend: &Context,
-        ) -> Result<Self> {
+        pub fn from_host_parts(linears: &[&LinearWeights], backend: &Context) -> Result<Self> {
             if linears.is_empty() {
                 return Err(Error::Other(
                     "cannot pack an empty INT8 linear group".into(),
@@ -51,29 +49,31 @@ mod linear {
                     .collect::<Vec<_>>(),
             )?;
             let (quantized, scales, input_dim, output_dim) = quantize_output_channels(&packed)?;
-            let weight = backend::to_device(backend, &Tensor::from_i8(
-                vec![input_dim, output_dim],
-                &quantized,
-            )?)?;
-            let channel_scales = backend::to_device(
+            let (weight, layout) = ops::RepackedWeight::upload_row_channel(
                 backend,
-                &Tensor::from_f32(vec![output_dim], &scales)?,
+                &Tensor::from_i8(vec![input_dim, output_dim], &quantized)?,
             )?;
+            let channel_scales =
+                backend::to_device(backend, &Tensor::from_f32(vec![output_dim], &scales)?)?;
             let bias = if linears.iter().all(|linear| linear.bias.is_none()) {
                 None
             } else if linears.iter().all(|linear| linear.bias.is_some()) {
-                Some(backend::to_device(backend, &concat_biases_bf16(
-                    &linears
-                        .iter()
-                        .map(|linear| linear.bias.as_ref().unwrap())
-                        .collect::<Vec<_>>(),
-                )?)?)
+                Some(backend::to_device(
+                    backend,
+                    &concat_biases_bf16(
+                        &linears
+                            .iter()
+                            .map(|linear| linear.bias.as_ref().unwrap())
+                            .collect::<Vec<_>>(),
+                    )?,
+                )?)
             } else {
                 return Err(Error::Other(
                     "cannot pack INT8 projections with mixed bias presence".into(),
                 ));
             };
             Ok(Self {
+                layout,
                 weight,
                 channel_scales,
                 bias,
@@ -121,14 +121,14 @@ mod linear {
 
             let mut output =
                 ctx.allocate_output(Shape::new(vec![rows, self.output_dim]), DType::BF16)?;
-            let mut args = ops::GemmArgs::w8a8(
+            let mut args = ops::GemmArgs::row_channel_quantized(
                 &quantized,
                 &row_scales,
                 &self.weight,
                 &self.channel_scales,
                 &mut output,
             )
-            .with_immutable_weight(ops::WeightVersion::new(0));
+            .with_repacked_weight(&self.layout);
             args.policy = w8a8_gemm_policy(gemm_policy);
             ops::gemm(ctx, args)?;
             Ok(output)
@@ -213,6 +213,7 @@ mod linear {
         fn w8a8_policy_preserves_tuning_choices_and_requires_i32_accumulation() {
             let input = ops::GemmPolicy {
                 accumulation_dtype: DType::F32,
+                numerics: ops::GemmNumerics::Default,
                 workspace_limit: 1234,
                 online_tune: false,
                 allow_fallback: false,
@@ -223,6 +224,7 @@ mod linear {
             let policy = w8a8_gemm_policy(&input);
 
             assert_eq!(policy.accumulation_dtype, DType::I32);
+            assert_eq!(policy.numerics, input.numerics);
             assert_eq!(policy.workspace_limit, input.workspace_limit);
             assert_eq!(policy.online_tune, input.online_tune);
             assert_eq!(policy.allow_fallback, input.allow_fallback);

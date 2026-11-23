@@ -221,6 +221,9 @@ impl ChatMessage {
     }
 }
 
+/// Transformers 5 `Qwen2Tokenizer` pre-tokenization pattern.
+const QWEN2_PRETOKENIZE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// Configuration loaded from tokenizer_config.json.
 #[derive(Debug, Deserialize, Default)]
 struct TokenizerConfig {
@@ -273,6 +276,95 @@ impl Tokenizer {
                 .and_then(|candidate| std::fs::read_to_string(candidate).ok())
         });
 
+        Ok(Self {
+            inner,
+            config,
+            chat_template,
+        })
+    }
+
+    /// Build the byte-level BPE tokenizer that Transformers 5 `Qwen2Tokenizer`
+    /// constructs from `vocab.json`, `merges.txt` and the added tokens of
+    /// `tokenizer_config.json`, for Qwen checkpoints that ship no
+    /// `tokenizer.json`: NFC, the Qwen2 split pattern, byte-level BPE.
+    /// Added tokens keep their configured ids; a mismatch fails loading.
+    pub fn from_qwen2_vocab<P: AsRef<Path>>(dir: P) -> Result<Self> {
+        let dir = dir.as_ref();
+        let read = |name: &str| {
+            std::fs::read_to_string(dir.join(name))
+                .map_err(|e| Error::Other(format!("read {}: {e}", dir.join(name).display())))
+        };
+        let parse = |name: &str| -> Result<serde_json::Value> {
+            serde_json::from_str(&read(name)?)
+                .map_err(|e| Error::Other(format!("parse {}: {e}", dir.join(name).display())))
+        };
+        let raw = parse("tokenizer_config.json")?;
+        if raw.get("tokenizer_class").and_then(|v| v.as_str()) != Some("Qwen2Tokenizer")
+            || raw.get("add_prefix_space").and_then(|v| v.as_bool()) == Some(true)
+        {
+            return Err(Error::Other(
+                "vocab.json/merges.txt loading supports Qwen2Tokenizer without add_prefix_space"
+                    .into(),
+            ));
+        }
+        let merges = read("merges.txt")?
+            .lines()
+            .filter(|line| !line.starts_with("#version"))
+            .map(|line| match line.split(' ').collect::<Vec<_>>()[..] {
+                [_, _] => Ok(serde_json::Value::from(line)),
+                _ => Err(Error::Other(format!("malformed merge `{line}`"))),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut added = Vec::new();
+        if let Some(map) = raw.get("added_tokens_decoder").and_then(|v| v.as_object()) {
+            for (id, token) in map {
+                let id: u32 = id.parse().map_err(|_| {
+                    Error::Other(format!("added token id `{id}` is not an integer"))
+                })?;
+                let mut token = token.clone();
+                token["id"] = id.into();
+                added.push((id, token));
+            }
+        }
+        added.sort_by_key(|(id, _)| *id);
+        let json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(),
+            "normalizer": {"type": "NFC"},
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": QWEN2_PRETOKENIZE},
+                 "behavior": "Isolated", "invert": false},
+                {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true,
+                 "use_regex": false},
+            ]},
+            "post_processor": null,
+            "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true,
+                        "use_regex": true},
+            "model": {"type": "BPE", "dropout": null, "unk_token": null,
+                      "continuing_subword_prefix": "", "end_of_word_suffix": "",
+                      "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                      "vocab": parse("vocab.json")?, "merges": merges},
+        });
+        let inner: HfTokenizer = json
+            .to_string()
+            .parse()
+            .map_err(|e| Error::Other(format!("tokenizer build: {e}")))?;
+        for (id, token) in &added {
+            let content = token["content"].as_str().unwrap_or_default();
+            if inner.token_to_id(content) != Some(*id) {
+                return Err(Error::Other(format!(
+                    "added token `{content}` did not receive its configured id {id}"
+                )));
+            }
+        }
+        let config: TokenizerConfig = serde_json::from_value(raw).unwrap_or_default();
+        let template = dir.join("chat_template.jinja");
+        let chat_template = config
+            .chat_template
+            .clone()
+            .or_else(|| std::fs::read_to_string(template).ok());
         Ok(Self {
             inner,
             config,
@@ -575,6 +667,83 @@ mod tests {
         .unwrap();
         env.render_str(template, serde_json::json!({"data":data}))
             .unwrap()
+    }
+
+    fn qwen2_dir(name: &str, config: serde_json::Value) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("apxinf-qwen2-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let vocab = [
+            "h", "i", "t", "e", "r", "Ġ", "hi", "Ġt", "Ġth", "er", "Ġther", "Ġthere", "!",
+        ];
+        let vocab: serde_json::Map<_, _> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.to_string(), serde_json::Value::from(i)))
+            .collect();
+        std::fs::write(
+            dir.join("vocab.json"),
+            serde_json::Value::from(vocab).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("merges.txt"),
+            "#version: 0.2\nh i\nĠ t\nĠt h\ne r\nĠth er\nĠther e\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
+        dir
+    }
+
+    fn qwen2_config(first_added: u32) -> serde_json::Value {
+        let token = |content: &str, special: bool| {
+            serde_json::json!({"content": content, "lstrip": false, "rstrip": false,
+                               "normalized": false, "single_word": false, "special": special})
+        };
+        serde_json::json!({
+            "tokenizer_class": "Qwen2Tokenizer",
+            "add_prefix_space": false,
+            "eos_token": "<|im_end|>",
+            "added_tokens_decoder": {
+                first_added.to_string(): token("<|im_start|>", true),
+                (first_added + 1).to_string(): token("<|im_end|>", true),
+                (first_added + 2).to_string(): token("<think>", false),
+            }
+        })
+    }
+
+    #[test]
+    fn qwen2_vocab_files_build_the_transformers_tokenizer() {
+        let dir = qwen2_dir("ok", qwen2_config(13));
+        let tokenizer = Tokenizer::from_qwen2_vocab(&dir).unwrap();
+        // Special and ordinary added tokens split before BPE; byte-level maps
+        // the space to Ġ and the merges join "Ġthere".
+        assert_eq!(
+            tokenizer
+                .encode_with_special_tokens("<|im_start|>hi there!<think><|im_end|>", true)
+                .unwrap(),
+            [13, 6, 11, 12, 15, 14]
+        );
+        assert_eq!(tokenizer.token_to_id("<think>"), Some(15));
+        assert_eq!(tokenizer.eos_token_id(), Some(14));
+        assert_eq!(tokenizer.decode(&[6, 11]).unwrap(), "hi there");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // Added tokens must receive their configured ids.
+        let dir = qwen2_dir("gap", qwen2_config(20));
+        assert!(Tokenizer::from_qwen2_vocab(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+        let mut other = qwen2_config(13);
+        other["tokenizer_class"] = "GPT2Tokenizer".into();
+        let dir = qwen2_dir("class", other);
+        assert!(Tokenizer::from_qwen2_vocab(&dir).is_err());
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            qwen2_config(13).to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("merges.txt"), "h i x\n").unwrap();
+        assert!(Tokenizer::from_qwen2_vocab(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

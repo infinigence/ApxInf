@@ -14,10 +14,10 @@ independent of both. Two surfaces:
 |---|---|
 | `Backend`: implemented | Every method `Backend` requires, plus sampling: `rms_norm`, `silu`, `add`, `mul`, `scale`, `matmul`, `rope`, `embedding`, `sdpa_decode`, `sdpa_prefill`, KV cache, transfers, synchronization |
 | `Backend`: not yet | The seven methods only Qwen3VL calls (`layer_norm`, `gelu_tanh`, `add_bias`, `rope_mrope`, `rope_vision_2d`, `vision_sdpa`, `concat_2d`); graph capture |
-| `native` | pi05's operator set: GEMM, LayerNorm/RMSNorm/adaptive RMSNorm and their fused residual forms, bias+activation, GeGLU, Euler step, embedding, position embedding, RGB→patches, QKV split with RoPE into a cache, non-causal attention; an arena allocator |
+| `native` | pi05's operator set: GEMM, LayerNorm/RMSNorm/adaptive RMSNorm and their fused residual forms, bias+activation, GeGLU, Euler step, embedding, position embedding, RGB→patches, QKV split with RoPE into a cache, non-causal attention (Composable Kernel flash-attention, with apxinf's own kernel as the reference and fallback); an arena allocator |
 | Dtypes | `Backend`: F32 and BF16. `native`: BF16. F32 arithmetic, one rounding at the store |
-| Verified on | Radeon 8060S (`gfx1151`, wave32), ROCm 7.2.1 |
-| Performance | Not optimized: eager, unfused, host-side sampling |
+| Verified on | Radeon 8060S (`gfx1151`, wave32), ROCm 7.2.1. The vendored CK attention instances resolve on `gfx115*` only (split-KV on `gfx11*`); other architectures take apxinf's own attention kernel, which is correct but slow |
+| Performance | Eager, unfused, host-side sampling. Attention uses tuned kernels (CK); GEMMs are hipBLAS defaults |
 
 `Backend` numerics follow `apxinf-cuda`. Two deliberate differences:
 
@@ -42,8 +42,18 @@ backend was built without ROCm. With ROCm:
 export ROCM_PATH=/opt/rocm             # default
 export APXINF_HIP_ARCH=gfx1151         # default: the first GPU rocm_agent_enumerator reports
 cargo test -p apxinf-hip               # needs device hip:0
+APXINF_HIP_GEMM_PROVIDER=lt cargo test -p apxinf-hip       # second run: the hipBLASLt arm
+APXINF_HIP_GEMM_PROVIDER=hipblas cargo test -p apxinf-hip  # third run: the forced-hipBLAS arm
 cargo build --features hip             # the workspace, with Device::Hip routed here
 ```
+
+The provider is process-wide and read once, so the hipBLASLt numeric test and
+the forced-hipBLAS dispatch test in `tests/native.rs` skip themselves in a
+default run; the extra invocations above are what exercise them. An explicitly
+requested `hipblas` is the A/B baseline and never consults the recipe, unlike
+the unset provider, which a found recipe promotes to per-shape routing.
+
+All arms need to run before a GEMM-path change is called tested.
 
 Use `device="hip:0"` from Python, or `Device::Hip(0)` from Rust.
 
@@ -69,6 +79,8 @@ function".
 | `kernels/common.h` | BF16 conversion, grid helpers and the block reduction every translation unit shares |
 | `kernels/apxinf_hip.hip` | Runtime, hipBLAS and the `Backend` operators' device code |
 | `kernels/norm.hip`, `kernels/elementwise.hip`, `kernels/native_attention.hip` | `native` operators' device code |
+| `kernels/ck_attention.hip` | C ABI over Composable Kernel's FMHA forward and split-KV entry points |
+| `kernels/ck/` | Vendored Composable Kernel subset and its generated instances; see `kernels/ck/VENDOR.md` |
 | `build.rs` | `hipcc` → static library, or the stub build when ROCm is absent |
 | `src/ffi.rs` | The C ABI, declared once for both builds |
 | `src/runtime.rs` | Context, stream, allocations, `Tensor` ↔ device pointer |
@@ -77,4 +89,4 @@ function".
 | `src/sampling.rs` | Token sampling and normal generation, delegated to the host implementations |
 | `src/native/` | `native` operators, the arena and device byte buffers |
 | `tests/ops.rs` | Every `Backend` operator against `CpuBackend`, with tolerances fixed up front |
-| `tests/native.rs` | Every `native` operator against an F32 host reference at pi05's shapes |
+| `tests/native.rs` | Every `native` operator against an F32 host reference at pi05's shapes; attention through every kernel that can run each shape |

@@ -61,8 +61,8 @@ fn fp8_finite_bf16_domain_matches_independent_rne_oracle() {
     // the 8-aligned full domain never reaches. Values sit around the
     // subnormal boundary, the midpoints and the saturation edge.
     let fallback = vec![
-        0, 0x8000, 0x3a80, 0xba80, 0x3b00, 0xbb00, 0x3c00,
-        0xbc00, 0x3c70, 0xbc70, 0x3f80, 0x7f7f, 0xff7f,
+        0, 0x8000, 0x3a80, 0xba80, 0x3b00, 0xbb00, 0x3c00, 0xbc00, 0x3c70, 0xbc70, 0x3f80, 0x7f7f,
+        0xff7f,
     ];
     let mut checked_values = 0;
     for bits in [&full_domain, &fallback] {
@@ -80,7 +80,7 @@ fn fp8_finite_bf16_domain_matches_independent_rne_oracle() {
                 std::env::set_var("APXINF_QWEN38_VECTOR_ELEMENTWISE", vector);
                 std::env::set_var("APXINF_FP8_NATIVE_PAIR", pair);
                 let output = upload(&ctx, &vec![0x7f; count], count, DType::F8E4M3);
-                ops::quantize_fp8_per_tensor(&ctx, &input, &output, scale).unwrap();
+                ops::quantize_per_tensor(&ctx, &input, &output, scale).unwrap();
                 ctx.synchronize().unwrap();
                 let mut actual = vec![0; count];
                 CudaBuffer::from_tensor(&output)
@@ -112,5 +112,83 @@ fn fp8_finite_bf16_domain_matches_independent_rne_oracle() {
     println!(
         "PASS {checked_values} FP8 codes, finite BF16 domain, five scales, \
          three dispatch modes and scalar fallback"
+    );
+}
+
+fn copy_codes(tensor: &Tensor) -> Vec<u8> {
+    let mut codes = vec![0; tensor.shape().numel()];
+    CudaBuffer::from_tensor(tensor)
+        .unwrap()
+        .copy_to_host(&mut codes)
+        .unwrap();
+    codes
+}
+
+#[test]
+fn fp8_per_tensor_non_finite_and_vector_dispatch_contract() {
+    let ctx = CudaContext::new(0).unwrap();
+    let old_vector = std::env::var_os("APXINF_QWEN38_VECTOR_ELEMENTWISE");
+    let old_pair = std::env::var_os("APXINF_FP8_NATIVE_PAIR");
+
+    // All BF16 infinities and NaNs, both signs and every payload.  The 256
+    // elements exercise the aligned vector path; the 13-element prefix also
+    // exercises the scalar/tail path.
+    let non_finite: Vec<u16> = (0_u16..=u16::MAX)
+        .filter(|bits| bits & 0x7f80 == 0x7f80)
+        .collect();
+    assert_eq!(non_finite.len(), 256);
+
+    let mut observed_differences = Vec::new();
+    for bits in [&non_finite[..], &non_finite[..13]] {
+        let count = bits.len();
+        let bytes: Vec<u8> = bits.iter().flat_map(|value| value.to_le_bytes()).collect();
+        let input = upload(&ctx, &bytes, count, DType::BF16);
+
+        let mut per_tensor_results = Vec::new();
+        for (vector, pair) in [("0", "0"), ("1", "0"), ("1", "1")] {
+            std::env::set_var("APXINF_QWEN38_VECTOR_ELEMENTWISE", vector);
+            std::env::set_var("APXINF_FP8_NATIVE_PAIR", pair);
+            let output = upload(&ctx, &vec![0; count], count, DType::F8E4M3);
+            ops::quantize_per_tensor(&ctx, &input, &output, 1.0).unwrap();
+            ctx.synchronize().unwrap();
+            per_tensor_results.push(copy_codes(&output));
+        }
+        assert_eq!(per_tensor_results[0], per_tensor_results[1]);
+        assert_eq!(per_tensor_results[0], per_tensor_results[2]);
+
+        let mut generic = upload(&ctx, &vec![0; count], count, DType::F8E4M3);
+        let mut args = ops::QuantizationArgs::new(
+            ops::QuantizationSemantic::FixedScaleE4m3,
+            &input,
+            &mut generic,
+        );
+        args.scale = 1.0;
+        ops::quantization(&ctx, args).unwrap();
+        ctx.synchronize().unwrap();
+        let generic_codes = copy_codes(&generic);
+        let differences = per_tensor_results[0]
+            .iter()
+            .zip(&generic_codes)
+            .filter(|(per_tensor, generic)| per_tensor != generic)
+            .count();
+        assert!(
+            differences > 0,
+            "the distinct per-tensor NaN contract unexpectedly became identical to FixedScaleE4m3"
+        );
+        observed_differences.push((count, differences));
+    }
+
+    for (name, old_value) in [
+        ("APXINF_QWEN38_VECTOR_ELEMENTWISE", old_vector),
+        ("APXINF_FP8_NATIVE_PAIR", old_pair),
+    ] {
+        if let Some(value) = old_value {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+    println!(
+        "PASS per-tensor vector modes agree; non-finite differences vs FixedScaleE4m3: {observed_differences:?}"
     );
 }

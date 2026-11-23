@@ -395,18 +395,35 @@ mod tests {
         let config = WallossConfig::from_json_str(CONFIG).unwrap();
         for prefix in [243, 32768, 128000 - config.action.action_horizon] {
             // Last language MLP: all KV + gate/up + activated coexist.
-            let kv = 4 * config.text.num_layers * config.text.num_kv_heads
-                * config.text.head_dim * (prefix + config.action.action_horizon);
+            let kv = 4
+                * config.text.num_layers
+                * config.text.num_kv_heads
+                * config.text.head_dim
+                * (prefix + config.action.action_horizon);
             let mlp = 6 * config.text.intermediate_size * prefix;
-            let capacity = crate::walloss::workspace::workspace_bytes(&config, 648, prefix).unwrap();
-            assert!(capacity > kv + mlp, "prefix={prefix}: {capacity} <= {}", kv + mlp);
+            let capacity =
+                crate::walloss::workspace::workspace_bytes(&config, 648, prefix).unwrap();
+            assert!(
+                capacity > kv + mlp,
+                "prefix={prefix}: {capacity} <= {}",
+                kv + mlp
+            );
         }
+    }
+
+    #[test]
+    fn workspace_covers_measured_two_view_profile_peak() {
+        let config = WallossConfig::from_json_str(CONFIG).unwrap();
+        // Thor 2x256 graph capture measured a 43.38 MiB workspace high-water.
+        let capacity = crate::walloss::workspace::workspace_bytes(&config, 648, 253).unwrap();
+        assert!(capacity >= 44 << 20, "capacity={capacity}");
     }
 
     #[test]
     fn workspace_tracks_checkpoint_dimensions_and_rejects_overflow() {
         let mut config = WallossConfig::from_json_str(CONFIG).unwrap();
-        let budget = |c: &WallossConfig| crate::walloss::workspace::workspace_bytes(c, 648, 32768).unwrap();
+        let budget =
+            |c: &WallossConfig| crate::walloss::workspace::workspace_bytes(c, 648, 32768).unwrap();
         let original = budget(&config);
         config.text.num_layers *= 2;
         assert!(budget(&config) > original);
@@ -523,5 +540,61 @@ mod tests {
             "\"action_hidden_size\": 768",
         );
         assert!(WallossConfig::from_json_str(&bad).is_err());
+    }
+}
+
+/// Load-time implementation choice; independent of legacy precision selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Variant {
+    Bf16,
+    DynamicFp8,
+}
+
+impl Variant {
+    pub(super) fn from_options(options: &crate::auto::LoadOptions) -> Result<Self> {
+        if options.precision != crate::auto::ModelPrecision::Auto {
+            return Err(Error::Other(
+                "WallOSS uses model_variant; leave legacy precision at auto".into(),
+            ));
+        }
+        match options.model_variant.as_deref().unwrap_or("auto") {
+            "auto" | "bf16" => Ok(Self::Bf16),
+            "fp8_dynamic" => Ok(Self::DynamicFp8),
+            value => Err(Error::Other(format!(
+                "unsupported WallOSS model_variant {value:?}; expected auto, bf16 or fp8_dynamic"
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod variant_tests {
+    use super::Variant;
+    use crate::auto::{LoadOptions, ModelPrecision};
+    #[test]
+    fn model_variant_selects_implementation_without_precision_conversion() {
+        for (name, expected) in [
+            ("auto", Variant::Bf16),
+            ("bf16", Variant::Bf16),
+            ("fp8_dynamic", Variant::DynamicFp8),
+        ] {
+            let options = LoadOptions {
+                model_variant: Some(name.into()),
+                ..Default::default()
+            };
+            assert_eq!(Variant::from_options(&options).unwrap(), expected);
+        }
+        for name in ["fp8", "fp8_static", "int8_dynamic"] {
+            assert!(Variant::from_options(&LoadOptions {
+                model_variant: Some(name.into()),
+                ..Default::default()
+            })
+            .is_err());
+        }
+        assert!(Variant::from_options(&LoadOptions {
+            precision: ModelPrecision::Bf16,
+            ..Default::default()
+        })
+        .is_err());
     }
 }

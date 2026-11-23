@@ -2,8 +2,6 @@ mod backend;
 mod dtype;
 mod error;
 mod kv_cache;
-mod ops;
-mod op_impls;
 mod sampling;
 mod shape;
 pub mod storage;
@@ -12,8 +10,7 @@ mod tensor;
 pub use backend::{Backend, Graph, RopeKind};
 pub use dtype::DType;
 pub use error::{Error, Result};
-pub use kv_cache::{CpuKVCache, KvCache};
-pub use op_impls::cpu::CpuBackend;
+pub use kv_cache::KvCache;
 pub use sampling::{
     philox4x32_10, standard_normal_f32, uniform_f32, NextTokenLogits,
     NormalGenerator, RngKey, SamplingBackend, TokenPenalties, TokenSample,
@@ -36,12 +33,17 @@ pub enum Device {
     /// crates reject it through the fallback arm they already have for
     /// non-CUDA devices.
     Hip(usize),
+    /// A Moore Threads GPU addressed through MUSA.
+    Musa(usize),
     Metal(usize),
 }
 
 impl Device {
     pub fn is_gpu(&self) -> bool {
-        matches!(self, Device::Cuda(_) | Device::Hip(_) | Device::Metal(_))
+        matches!(
+            self,
+            Device::Cuda(_) | Device::Hip(_) | Device::Musa(_) | Device::Metal(_)
+        )
     }
 }
 
@@ -51,6 +53,7 @@ impl std::fmt::Display for Device {
             Device::Cpu => write!(f, "cpu"),
             Device::Cuda(id) => write!(f, "cuda:{id}"),
             Device::Hip(id) => write!(f, "hip:{id}"),
+            Device::Musa(id) => write!(f, "musa:{id}"),
             Device::Metal(id) => write!(f, "metal:{id}"),
         }
     }

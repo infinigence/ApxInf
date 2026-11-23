@@ -1,16 +1,18 @@
+#[path = "build_support/conv3d_fingerprint.rs"]
+mod conv3d_fingerprint;
 use std::env;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[path = "../apxinf-cuda/build_support/nvcc_build.rs"]
-mod nvcc_build;
 #[path = "build_support/attention_fingerprint.rs"]
 mod attention_fingerprint;
 #[path = "build_support/cuda_arch.rs"]
 mod cuda_arch;
 #[path = "build_support/gemm_fingerprint.rs"]
 mod gemm_fingerprint;
+#[path = "build_support/nvcc_build.rs"]
+mod nvcc_build;
 
 use cuda_arch::{
     gencode_args, is_cutlass_sm100_family, select_cuda_arch, target_features, ArchSelection,
@@ -26,6 +28,7 @@ fn write_arch_header(out: &Path, selection: &ArchSelection) -> PathBuf {
          constexpr uint64_t kDeviceFeatureFa2 = UINT64_C(1) << 2;\n\
          constexpr uint64_t kDeviceFeatureCutlassSm89Bf16Geglu = UINT64_C(1) << 3;\n\
          constexpr uint64_t kDeviceFeatureCutlassSm87W8A8 = UINT64_C(1) << 4;\n\
+         constexpr uint64_t kDeviceFeatureFixedSm110 = UINT64_C(1) << 5;\n\
          struct CompiledTarget { int sm; uint64_t features; };\n\
          constexpr CompiledTarget kCompiledTargets[] = {\n",
     );
@@ -107,9 +110,7 @@ fn copy_tree(source: &Path, destination: &Path) {
 
 fn stage_patched_fa2(native: &Path, fa2_root: &Path, out: &Path) -> PathBuf {
     let staged = out.join("fa2-direct-e4m3-patched");
-    let patch = native
-        .join("patches")
-        .join("fa2-direct-e4m3-output.patch");
+    let patch = native.join("patches").join("fa2-direct-e4m3-output.patch");
     // Re-staging rewrites every file in the tree, which bumps the mtime of the
     // patched sources the E4M3 translation units depend on. Skip it when the
     // exact source tree and patch that produced the current staging are
@@ -127,17 +128,18 @@ fn stage_patched_fa2(native: &Path, fa2_root: &Path, out: &Path) -> PathBuf {
     files.sort_unstable();
     for file in &files {
         feed(file.to_string_lossy().as_bytes());
-        feed(&std::fs::read(file).unwrap_or_else(|error| {
-            panic!("read FA2 staging input {}: {error}", file.display())
-        }));
+        feed(
+            &std::fs::read(file).unwrap_or_else(|error| {
+                panic!("read FA2 staging input {}: {error}", file.display())
+            }),
+        );
     }
-    feed(&std::fs::read(&patch).unwrap_or_else(|error| {
-        panic!("read FA2 patch {}: {error}", patch.display())
-    }));
+    feed(
+        &std::fs::read(&patch)
+            .unwrap_or_else(|error| panic!("read FA2 patch {}: {error}", patch.display())),
+    );
     let key = format!("{fingerprint:032x}");
-    if staged.is_dir()
-        && std::fs::read_to_string(&stamp).ok().as_deref() == Some(key.as_str())
-    {
+    if staged.is_dir() && std::fs::read_to_string(&stamp).ok().as_deref() == Some(key.as_str()) {
         return staged;
     }
     if staged.exists() {
@@ -178,9 +180,50 @@ fn run(command: &mut Command, action: &str) {
     assert!(status.success(), "{action} failed with {status}");
 }
 
+fn configure_nvtx(cuda: &str, library_directories: &[PathBuf]) {
+    if env::var_os("CARGO_FEATURE_NVTX").is_none() {
+        return;
+    }
+    let header = PathBuf::from(cuda).join("include/nvtx3/nvToolsExt.h");
+    if header.is_file() {
+        let adapter =
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("native/adapters/nvtx.c");
+        println!("cargo:rerun-if-changed={}", adapter.display());
+        println!("cargo:rerun-if-changed={}", header.display());
+        cc::Build::new()
+            .file(adapter)
+            .include(PathBuf::from(cuda).join("include"))
+            .compile("apxinf_nvtx");
+        println!("cargo:rustc-link-lib=dl");
+        println!("cargo:rustc-cfg=nvtx_header");
+        return;
+    }
+    let has_v3 = library_directories.iter().any(|directory| {
+        directory.join("libnvtx3interop.so").is_file()
+            || directory.join("libnvtx3interop.so.1").is_file()
+    });
+    let has_v2 = library_directories.iter().any(|directory| {
+        directory.join("libnvToolsExt.so").is_file()
+            || directory.join("libnvToolsExt.so.1").is_file()
+    });
+    if has_v3 {
+        println!("cargo:rustc-cfg=nvtx_v3");
+    } else if has_v2 {
+        println!("cargo:rustc-cfg=nvtx_v2");
+    } else {
+        println!(
+            "cargo:warning=NVTX unavailable: no NVTX3 header or legacy library; markers disabled"
+        );
+    }
+}
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(apxinf_nvfp4_gemm_swiglu)");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_segmented_attention_sm110)");
     println!("cargo:rustc-check-cfg=cfg(apxinf_fa2_decode)");
+    println!("cargo:rustc-check-cfg=cfg(nvtx_header)");
+    println!("cargo:rustc-check-cfg=cfg(nvtx_v2)");
+    println!("cargo:rustc-check-cfg=cfg(nvtx_v3)");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=APXINF_CUDA_ARCH");
@@ -189,6 +232,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_VISIBLE_DEVICES");
     println!("cargo:rerun-if-changed=build_support/cuda_arch.rs");
     println!("cargo:rerun-if-changed=build_support/attention_fingerprint.rs");
+    println!("cargo:rerun-if-changed=build_support/conv3d_fingerprint.rs");
     println!("cargo:rerun-if-changed=build_support/gemm_fingerprint.rs");
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -212,6 +256,7 @@ fn main() {
     for directory in &library_directories {
         println!("cargo:rustc-link-search=native={}", directory.display());
     }
+    configure_nvtx(&cuda, &library_directories);
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let host = env::var("HOST").unwrap_or_default();
@@ -252,6 +297,9 @@ fn main() {
     if nvfp4_gemm_swiglu {
         println!("cargo:rustc-cfg=apxinf_nvfp4_gemm_swiglu");
     }
+    if native_sm110 {
+        println!("cargo:rustc-cfg=apxinf_segmented_attention_sm110");
+    }
 
     let id = env::var("APXINF_KERNEL_BUILD_ID").unwrap_or_else(|_| {
         gemm_fingerprint::build_id(
@@ -263,6 +311,8 @@ fn main() {
                 .map(|arch| (arch.nvcc_arch.as_str(), arch.cutlass_arch.as_str())),
         )
     });
+    let conv3d_id = conv3d_fingerprint::build_id(&native, &target,
+        selection.targets.iter().map(|arch| (arch.nvcc_arch.as_str(), arch.cutlass_arch.as_str())));
     let attention_id = attention_fingerprint::build_id(
         &native,
         &target,
@@ -296,25 +346,76 @@ fn main() {
         "attention/tuning_key.cpp",
         "attention/autotune.cpp",
         "attention/execution.cpp",
+        "attention/gates.cpp",
         "attention/providers/custom.cu",
-        "elementwise/execution.cpp",
-        "linear_attention/execution.cpp",
-        "attn_helpers/execution.cpp",
-        "reduction/execution.cpp",
-        "sampling.cu",
-        "norm.cu",
-        "pointwise.cu",
-        "rope.cu",
-        "gather.cu",
-        "quantization.cu",
+        "attention/providers/wide_bf16.cu",
+        "elementwise/ops.cpp",
+        "cache/ops.cpp",
+        "pointwise/fixed_bf16.cu",
+        "activation/fixed_bf16.cu",
+        "activation/fixed_decode.cu",
+        "activation/fixed_f16.cu",
+        "activation/fixed_swiglu_bf16.cu",
+        "attention/fixed_bf16.cu",
+        "attention/fixed_decode.cu",
+        "attention/fixed_f16.cu",
+        "cache/fixed_decode.cu",
+        "elementwise/fixed_bf16.cu",
+        "elementwise/fixed_decode.cu",
+        "elementwise/fixed_f16.cu",
+        "attention/gates_rounded_bf16.cu",
+        "embedding/fixed_bf16.cu",
+        "embedding/fixed_decode.cu",
+        "gemm/gemv.cpp",
+        "gdn/fixed.cu",
+        "norm/fixed_bf16.cu",
+        "norm/fixed_decode.cu",
+        "norm/fixed_f16.cu",
+        "norm/fixed_gated_bf16.cu",
+        "norm/fused_bf16.cu",
+        "preprocess/fixed_bf16.cu",
+        "preprocess/fixed_f16.cu",
+        "preprocess/planning_bf16.cu",
+        "quantization/fixed_bf16.cu",
+        "quantization/per_tensor.cpp",
+        "rope/fixed_bf16.cu",
+        "rope/fixed_decode.cu",
+        "rope/fixed_f16.cu",
+        "rope/qkv_bf16.cu",
+        "rope/partial.cpp",
+        "preprocess/ops.cpp",
+        "gdn/execution.cpp",
+        "sampling/argmax.cpp",
+        "sampling/suppress_bf16.cu",
+        "sampling/launch.cu",
+        "norm/launch.cu",
+        "pointwise/launch.cu",
+        "rope/launch.cu",
+        "gather/launch.cu",
+        "quantization/launch.cu",
+        "volume.cu",
+        "conv3d.cu",
+        "recurrence.cu",
+        "reduction.cu",
     ]
     .map(|source| adapters.join(source))
     .to_vec();
-    generic_sources.push(native.join("kernels/custom/mlp_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/norm_weight_offset.cu"));
+    generic_sources.push(native.join("kernels/custom/pointwise_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/quantization_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/gemv.cu"));
+    generic_sources.push(native.join("kernels/custom/elementwise_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/cache_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/quant_ops.cu"));
+    generic_sources.push(native.join("kernels/rope/multimodal.cu"));
+    generic_sources.push(native.join("kernels/custom/preprocess_ops.cu"));
     generic_sources.push(native.join("kernels/custom/gdn_ops.cu"));
     generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_tma.cpp"));
-    generic_sources.push(native.join("kernels/custom/attn_ops.cu"));
-    generic_sources.push(native.join("kernels/custom/model_ops.cu"));
+    generic_sources.push(native.join("kernels/custom/rope_partial.cu"));
+    generic_sources.push(native.join("kernels/custom/norm_head.cu"));
+    generic_sources.push(native.join("kernels/custom/attention_gates.cu"));
+    generic_sources.push(native.join("kernels/custom/gather_embedding.cu"));
+    generic_sources.push(native.join("kernels/custom/sampling_argmax.cu"));
     generic_sources.push(native.join("tests/framework_backend.cu"));
     let cutlass_root = native.join("kernels/cutlass");
     let fa2_root = native.join("kernels/fa2");
@@ -355,6 +456,7 @@ fn main() {
                 "gemm_bf16_geglu_sm100.cu",
                 "gemm_bf16_geglu_interleaved_sm100.cu",
                 "gemm_nvfp4_sm100.cu",
+                "gemm_bf16_gelu_exact_sm100.cu",
             ]
             .map(|source| operators.join(source)),
         );
@@ -370,22 +472,23 @@ fn main() {
                 .map(|source| attention.join(source)),
             );
             sm110_sources.extend([
+                native.join("adapters/attention/providers/segmented_sm110.cu"),
                 native.join("kernels/custom/gdn_bf16_prefill_prologue.cu"),
-                native.join(
-                    "adapters/linear_attention/providers/gdn_bf16_prefill_sm110.cu",
-                ),
+                native.join("adapters/gdn/providers/bf16_prefill_sm110.cu"),
                 native.join("kernels/flashinfer_gdn/gdn_bf16_prefill_sm110_launch.cu"),
             ]);
         }
         cutlass_sources.push(adapters.join("attention/providers/cutlass.cu"));
+        cutlass_sources.push(adapters.join("attention/providers/cutlass_persistent.cu"));
         // Vendored FlashInfer Cake GDN prefill: plain CUDA C++, but it needs
         // the same compute_110a codegen as the CUTLASS group because it emits
         // tcgen05 and TMA. See native/kernels/flashinfer_gdn/README.md.
         cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
     } else {
-        // The descriptor-side wrapper is part of the stable ABI on every CUDA
-        // target, but the generated Cake kernel itself requires Blackwell.
-        // Keep non-Blackwell builds linkable and report unsupported at launch.
+        // No sm100 target: the kernel translation unit is absent, so link the
+        // unsupported-status stub in its place (a weak symbol is not enough —
+        // once the archive resolves the weak definition it never pulls the
+        // strong member, which turned the real kernel into the stub on Thor).
         generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_stub.cpp"));
     }
     let has_fa2 = selection.targets.iter().any(|target| target.sm() >= 80);
@@ -395,9 +498,13 @@ fn main() {
     if has_fa2 {
         println!("cargo:rustc-cfg=apxinf_fa2_decode");
     }
+    // Always compiled: without APXINF_ATTENTION_FA2 the translation unit is
+    // only the extern "C" direct-dispatch stubs (strong symbols in the same
+    // TU — a weak stub beside a strong member does not link correctly out of
+    // a static archive).
+    generic_sources.push(adapters.join("attention/providers/fa2.cpp"));
     let mut fa2_sources = Vec::new();
     if has_fa2 {
-        generic_sources.push(adapters.join("attention/providers/fa2.cpp"));
         fa2_sources.extend(
             [
                 "fa2.cu",
@@ -432,17 +539,21 @@ fn main() {
     }
     let patched_fa2_root =
         (!fa2_e4m3_sources.is_empty()).then(|| stage_patched_fa2(&native, &fa2_root, &out));
+    let missing_sources = generic_sources
+        .iter()
+        .chain(&cutlass_sources)
+        .chain(&sm110_sources)
+        .chain(&cutlass_sm87_sources)
+        .chain(&cutlass_sm89_sources)
+        .chain(&fa2_sources)
+        .chain(&fa2_e4m3_sources)
+        .filter(|path| !path.is_file())
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
     assert!(
-        generic_sources
-            .iter()
-            .chain(&cutlass_sources)
-            .chain(&sm110_sources)
-            .chain(&cutlass_sm87_sources)
-            .chain(&cutlass_sm89_sources)
-            .chain(&fa2_sources)
-            .chain(&fa2_e4m3_sources)
-            .all(|path| path.is_file()),
-        "native build source is missing"
+        missing_sources.is_empty(),
+        "native build sources are missing:\n{}",
+        missing_sources.join("\n")
     );
 
     let cuda_includes = [
@@ -539,15 +650,8 @@ fn main() {
         )
         .enumerate()
     {
-        let (
-            source,
-            is_cutlass,
-            is_sm110,
-            is_cutlass_sm87,
-            is_cutlass_sm89,
-            is_fa2,
-            is_fa2_e4m3,
-        ) = source;
+        let (source, is_cutlass, is_sm110, is_cutlass_sm87, is_cutlass_sm89, is_fa2, is_fa2_e4m3) =
+            source;
         let object = out.join(format!(
             "gemm-{index}-{}.o",
             source.file_stem().unwrap().to_string_lossy()
@@ -565,12 +669,18 @@ fn main() {
         // kernel edit. Only the two tuning-key translation units read them;
         // putting them on every command line would invalidate the whole object
         // cache whenever one source file moves.
-        if source.file_name().is_some_and(|name| name == "tuning_key.cpp") {
+        if source
+            .file_name()
+            .is_some_and(|name| name == "tuning_key.cpp")
+        {
             if source.to_string_lossy().contains("/gemm/") {
                 command.arg(format!("-DAPXINF_GEMM_BUILD_ID=\"{id}\""));
             } else {
                 command.arg(format!("-DAPXINF_ATTENTION_BUILD_ID=\"{attention_id}\""));
             }
+        }
+        if source.file_name().is_some_and(|name| name == "conv3d.cu") {
+            command.arg(format!("-DAPXINF_CONV3D_BUILD_ID=\"{conv3d_id}-{id}\""));
         }
         command.args(if is_sm110 {
             &sm110_codegen
@@ -594,6 +704,9 @@ fn main() {
         }
         if nvfp4_gemm_swiglu {
             command.arg("-DAPXINF_NVFP4_GEMM_SWIGLU=1");
+        }
+        if native_sm110 {
+            command.arg("-DAPXINF_SEGMENTED_ATTENTION_SM110=1");
         }
         if has_cutlass_sm89 {
             command.arg("-DAPXINF_GEMM_CUTLASS_SM89=1");
@@ -687,15 +800,13 @@ fn main() {
                     "-DAPXINF_FMHA_KV_STAGES=4",
                     "-DAPXINF_SKIP_PAD_QSTAGE=1",
                     "-DAPXINF_P_CHUNKS16=1",
+                    // The captured WallOSS/Qwen vision gates pin the separate
+                    // RN rescale to preserve the translated row-sum arithmetic.
                     "-DAPXINF_ROWSUM_RESCALE_RN=1",
                 ]);
             }
             if file_name == Some("gdn_bf16_prefill_sm110_launch.cu") {
-                command.args([
-                    "-DHEAD_GROUP_LOG2=1",
-                    "-DNUM_O_HEADS_LOG2=5",
-                    "-DIS_GQA=0",
-                ]);
+                command.args(["-DHEAD_GROUP_LOG2=1", "-DNUM_O_HEADS_LOG2=5", "-DIS_GQA=0"]);
             }
         }
         if is_fa2 || is_fa2_e4m3 {
@@ -768,6 +879,7 @@ fn main() {
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");
+    println!("cargo:rustc-link-lib=dl");
     // The vendored FlashInfer GDN prefill builds its TMA descriptors with
     // cuTensorMapEncodeTiled, which lives in the driver library rather than
     // the runtime.

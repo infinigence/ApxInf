@@ -10,12 +10,12 @@ use std::sync::Arc;
 use apxinf_core::{Device, Error, Result};
 
 use super::backend::RuntimeBackend;
+use super::config::Variant;
 use super::model::{ModelVariant, WallossSchedule};
 use super::model_runner::WallossModelRunner;
 use super::weights::{WallossDynamicFp8Weights, WallossWeights};
 use super::{WallossConfig, WallossImageProcessorConfig};
-use crate::accelerator::cuda::downcast_arc;
-use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
+use crate::auto::{LoadOptions, LoadedModel};
 
 pub(crate) fn load_registered(
     path: &Path,
@@ -28,19 +28,14 @@ pub(crate) fn load_registered(
             "walloss does not support action_horizon/num_views config overrides".into(),
         ));
     }
-    if !matches!(
-        options.precision,
-        ModelPrecision::Auto | ModelPrecision::Bf16 | ModelPrecision::Fp8
-    ) {
-        return Err(Error::Other("walloss supports BF16 and FP8 on CUDA".into()));
-    }
+    Variant::from_options(options)?;
     if options.calibration_path.is_some() || options.uniform_fp8_scale.is_some() {
         return Err(Error::Other(
             "walloss FP8 uses dynamic rowwise activation scales and does not support calibration"
                 .into(),
         ));
     }
-    let backend = downcast_arc(backend)
+    let backend = crate::accelerator::downcast_cuda_new_arc(backend)
         .ok_or_else(|| Error::Other("walloss is only registered for CUDA".into()))?;
     if !matches!(device, Device::Cuda(_)) {
         return Err(Error::Other("walloss is only registered for CUDA".into()));
@@ -55,6 +50,7 @@ pub(in crate::walloss) fn load_model_runner(
     backend: Arc<RuntimeBackend>,
     options: &LoadOptions,
 ) -> Result<WallossModelRunner> {
+    let variant = Variant::from_options(options)?;
     let root = if path.is_dir() {
         path
     } else {
@@ -70,20 +66,19 @@ pub(in crate::walloss) fn load_model_runner(
     let host_weights = WallossWeights::from_safetensors(&mut config, path)?;
     let config = Arc::new(config);
     let schedule = Arc::new(WallossSchedule::new(&config, &backend)?);
-    let model = match options.precision {
-        ModelPrecision::Fp8 => ModelVariant::new_dynamic_fp8(
+    let model = match variant {
+        Variant::DynamicFp8 => ModelVariant::new_dynamic_fp8(
             Arc::clone(&backend),
             Arc::clone(&config),
             image_processor.clone(),
             WallossDynamicFp8Weights::from_host(&host_weights, &*backend)?,
         ),
-        ModelPrecision::Auto | ModelPrecision::Bf16 => ModelVariant::new_bf16(
+        Variant::Bf16 => ModelVariant::new_bf16(
             Arc::clone(&backend),
             Arc::clone(&config),
             image_processor.clone(),
             host_weights.to_bf16_device(&*backend)?,
         ),
-        ModelPrecision::W8A8 => unreachable!(),
     };
     eprintln!("[apxinf] WallOSS model_variant={}", model.name());
     Ok(WallossModelRunner::new(backend, config, schedule, model))

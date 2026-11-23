@@ -111,19 +111,39 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
             "native Attention prepare returned a null execution".into(),
         ));
     }
+    let retained_storage = normalized
+        .storage
+        .iter()
+        .map(CudaBuffer::retained_for_execution)
+        .collect();
     #[cfg(test)]
     let summary = unsafe { CStr::from_ptr(abi::apxinf_attention_summary(raw)) }
         .to_string_lossy()
         .into_owned();
-    let execution = Rc::new(Execution {
+    let mut execution = Execution {
         raw,
         stream: ctx.shared_stream(),
-        _storage: normalized.storage,
+        _storage: retained_storage,
         _resources: normalized.resources,
         #[cfg(test)]
         summary,
         _not_send: PhantomData,
-    });
+    };
+    let scratch_bytes = unsafe { abi::apxinf_attention_scratch_bytes(raw) } as usize;
+    if let Some(scratch) = crate::workspace::provider_scratch(ctx, scratch_bytes)? {
+        // Attention prepare only allocates scratch (it runs no kernels), so
+        // the private buffers are quiesced and rebinding is safe here. See
+        // framework::Scratch::bind for the full contract.
+        unsafe {
+            status::check(abi::apxinf_attention_bind_scratch(
+                raw,
+                scratch.ptr(),
+                scratch.len() as u64,
+            ))?;
+        }
+        execution._storage.push(scratch);
+    }
+    let execution = Rc::new(execution);
     crate::workspace::store_execution(key, Rc::clone(&execution));
     crate::workspace::use_execution(&execution)?;
     Ok(execution)
@@ -137,9 +157,10 @@ pub(crate) fn execute(ctx: &CudaContext, normalized: Normalized) -> Result<()> {
     )?;
     execution.stream.set_current_device().map_err(Error::Cuda)?;
     unsafe { status::check(abi::apxinf_attention_enqueue(execution.raw))? };
-    if crate::workspace::is_capturing()
-        || (crate::workspace::has_active_session() && !crate::workspace::is_preparing_session())
-    {
+    // Prepared attention resources and outputs remain owned by the active
+    // session; stream order is sufficient until the model synchronizes at its
+    // session boundary. Per-op synchronization here serializes graph prep.
+    if crate::workspace::is_capturing() || crate::workspace::has_active_session() {
         Ok(())
     } else {
         ctx.synchronize().map_err(Error::Cuda)

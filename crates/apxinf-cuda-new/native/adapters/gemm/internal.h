@@ -1,4 +1,5 @@
 #pragma once
+#include "../../framework/scratch.h"
 
 #include "../../include/apxinf_cuda/gemm.h"
 #include "../../framework/registry.h"
@@ -70,11 +71,19 @@ struct AlignmentRequirements {
 using AlignmentFn = AlignmentRequirements (*)(const Spec&);
 using ResourceRequirementsFn = size_t (*)(const Spec&);
 
+enum class WeightLayout : uint32_t {
+  Canonical = APXINF_GEMM_LAYOUT_CANONICAL,
+  NK = APXINF_GEMM_LAYOUT_NK,
+  GateUpInterleaved256 = APXINF_GEMM_LAYOUT_GATE_UP_INTERLEAVED_256,
+  GateUpAdjacent = APXINF_GEMM_LAYOUT_GATE_UP_ADJACENT,
+};
+
 struct Implementation {
   uint32_t provider_id;
   uint32_t implementation_id;
   uint32_t implementation_version;
   const char* name;
+  WeightLayout weight_layout;
   uint64_t required_device_features;
   bool graph_safe;
   bool deterministic;
@@ -87,6 +96,21 @@ struct Implementation {
   EnqueueFn enqueue;
   DestroyExecutionFn destroy;
 };
+
+bool supports_weight_layout(const Implementation& implementation, const Spec& spec);
+struct TemporaryWeight {
+  void* pointer = nullptr;
+  explicit TemporaryWeight(size_t bytes) {
+    if (bytes != 0) check_cuda(cudaMalloc(&pointer, bytes));
+  }
+  ~TemporaryWeight() { if (pointer != nullptr) cudaFree(pointer); }
+  TemporaryWeight(const TemporaryWeight&) = delete;
+  TemporaryWeight& operator=(const TemporaryWeight&) = delete;
+};
+
+void pack_weight(const Spec&, const apxinf_gemm_bindings_t&, void*, uint32_t);
+void repack_weight_inplace(const Spec&, const apxinf_gemm_bindings_t&,
+                          uint32_t target_layout, uint32_t& layout);
 
 bool supports_device(const Implementation& implementation,
                      int device,
@@ -135,13 +159,15 @@ struct AccuracyMetrics {
 };
 
 struct Execution {
+  apxinf::framework::Scratch scratch;
   Spec spec{};
   apxinf_gemm_bindings_t bindings{};
   int configuration = 0;
   int device = 0;
   const Implementation* implementation = nullptr;
   // Opaque provider-owned state. The common execution framework never knows which
-  // handles, descriptors, algorithms or temporary buffers a provider needs.
+  // handles, descriptors or algorithms a provider needs. Temporary buffer
+  // bindings register with scratch for runner-owned storage after selection.
   void* provider_state = nullptr;
   size_t resource_bytes = 0;
   // Upper bound for provider-owned device scratch. Providers may query
@@ -152,6 +178,19 @@ struct Execution {
 
   ~Execution();
 };
+
+// Only the autotuner/validator owns a private packed trial weight.
+// Member order destroys the execution before its temporary input allocation.
+struct CandidateTrial {
+  TemporaryWeight weight;
+  std::unique_ptr<Execution> execution;
+  const Implementation* implementation;
+  int configuration;
+  explicit CandidateTrial(size_t bytes) : weight(bytes) {}
+};
+std::unique_ptr<CandidateTrial> prepare_trial(
+    const Implementation&, int configuration, const Spec&,
+    const apxinf_gemm_policy_t&, const apxinf_gemm_bindings_t&, int device);
 
 using ImplementationRegistry = apxinf::framework::Registry<Implementation>;
 const ImplementationRegistry& registry(uint32_t semantic);
@@ -176,19 +215,28 @@ void prepare_cutlass_fp8_gemm(Execution& execution);
 void prepare_cutlass_w8a8(Execution& execution);
 void prepare_cutlass_geglu(Execution& execution);
 void prepare_cutlass_geglu_sm89(Execution& execution);
+void prepare_cutlass_bf16_swiglu(Execution& execution);
 size_t cutlass_fp8_resource_requirements(const Spec& spec);
 size_t cutlass_w8a8_resource_requirements(const Spec& spec);
 size_t cutlass_geglu_resource_requirements(const Spec& spec);
+size_t cutlass_bf16_swiglu_resource_requirements(const Spec& spec);
 void destroy_cutlass(Execution& execution) noexcept;
 cudaError_t launch_cutlass_fp8_gemm(Execution& execution);
+cudaError_t launch_cutlass_fp8_rowwise_gemm(Execution& execution);
 cudaError_t launch_cutlass_w8a8(Execution& execution);
+cudaError_t launch_cutlass_w8a8_m41_n6144_k1536(Execution& execution);
+cudaError_t launch_cutlass_w8a8_bias_m41_n4608_k1536(Execution& execution);
+cudaError_t launch_cutlass_w8a8_bias_gelu_m41_n6144_k1536(
+    Execution& execution);
 cudaError_t launch_cutlass_fp8_geglu(Execution& execution);
 cudaError_t launch_cutlass_bf16_geglu(Execution& execution);
+cudaError_t launch_cutlass_bf16_swiglu(Execution& execution);
 void prepare_cutlass_nvfp4(Execution& execution);
 size_t cutlass_nvfp4_resource_requirements(const Spec& spec);
 cudaError_t launch_cutlass_nvfp4(Execution& execution);
 cudaError_t launch_cutlass_bf16_geglu_sm89(Execution& execution);
 uint64_t cutlass_weight_prepack_count(const Execution& execution);
+
 
 TuningKeys tuning_keys(const Spec& spec,
                        const apxinf_gemm_policy_t& policy,
@@ -212,4 +260,10 @@ void validate_candidates(const Spec& spec,
                          const apxinf_gemm_bindings_t& bindings, int device,
                          const float* expected, size_t expected_len);
 
+size_t exact_gelu_resource_requirements(const Spec&);
+size_t exact_gelu_lut_resource_requirements(const Spec&);
+void prepare_exact_gelu_lut(Execution&);
+void prepare_exact_gelu(Execution&);
+cudaError_t launch_exact_gelu(Execution&);
+void destroy_exact_gelu(Execution&) noexcept;
 }  // namespace apxinf::gemm
