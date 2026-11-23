@@ -1,6 +1,8 @@
 //! LLM model architectures and abstractions.
 
 mod accelerator;
+#[cfg(feature = "ascend")]
+pub mod ascend_pi05;
 pub mod auto;
 pub mod builtin;
 pub mod cuda_cosmos_policy;

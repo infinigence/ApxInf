@@ -37,3 +37,7 @@ musa-mttx = ["musa", "apxinf-model/musa-mttx"]
 # Forward HIP support to the model crate, so `device="hip:N"` reaches the HIP
 # pi05 runtime. Builds without ROCm too; loading then reports why it cannot.
 hip = ["apxinf-model/hip"]
+# Forward Ascend support to the model crate, so `device="npu:N"` reaches the
+# ascend_pi05 runtime. Builds without CANN too; loading then reports why it
+# cannot.
+ascend = ["apxinf-model/ascend"]

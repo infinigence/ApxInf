@@ -139,9 +139,10 @@ fn parse_device(spec: &str) -> PyResult<Device> {
         "hip" => Ok(Device::Hip(index)),
         "musa" => Ok(Device::Musa(index)),
         "metal" | "mlx" => Ok(Device::Metal(index)),
+        "npu" => Ok(Device::Npu(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|musa|metal|mlx|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|hip|musa|metal|mlx|npu|cpu)"
         ))),
     }
 }

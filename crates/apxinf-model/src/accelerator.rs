@@ -49,6 +49,15 @@ pub(crate) fn create_backend_with_recipe_options(
         Device::Musa(_) => Err(apxinf_core::Error::Other(
             "MUSA support not compiled in".into(),
         )),
+        // Same shape as the MUSA arms: PI0.5 owns its concrete port in
+        // `ascend_pi05/`, and `Error` stays fully qualified so these arms
+        // compile in every feature combination.
+        #[cfg(feature = "ascend")]
+        Device::Npu(_) => Err(apxinf_core::Error::UnsupportedDevice(device)),
+        #[cfg(not(feature = "ascend"))]
+        Device::Npu(_) => Err(apxinf_core::Error::Other(
+            "Ascend support not compiled in".into(),
+        )),
     }
 }
 
