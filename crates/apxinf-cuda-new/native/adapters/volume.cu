@@ -59,10 +59,41 @@ bool launch_vectorized(const Execution& e) {
     case 96: return launch_vectorized<96>(e);
     case 192: return launch_vectorized<192>(e);
     case 384: return launch_vectorized<384>(e);
+    // Wan2.1 VAE encoder channels. Without these the full-resolution convs fall
+    // to the scalar im2col path, which is ~80x slower than the uint4 gather.
+    case 160: return launch_vectorized<160>(e);
+    case 320: return launch_vectorized<320>(e);
+    case 640: return launch_vectorized<640>(e);
     default: return false;
   }
 }
 }  // namespace
+
+extern "C" apxinf_status_t apxinf_rgb_patch2x2(apxinf_runtime_t runtime,
+    const void* input, void* output, int64_t frames, int64_t height,
+    int64_t width, apxinf_cuda_stream_t stream) {
+  return apxinf::framework::abi_boundary([&] {
+    if (!runtime || !input || !output || frames <= 0 || height <= 0 ||
+        width <= 0 || height % 2 || width % 2 ||
+        reinterpret_cast<uintptr_t>(output) % alignof(__nv_bfloat16))
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "invalid RGB patch geometry");
+    const int64_t count = multiply(multiply(multiply(frames, height), width), 3);
+    if (count > INT64_MAX / 2)
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "RGB patch byte size overflow");
+    const auto a = reinterpret_cast<uintptr_t>(input);
+    const auto b = reinterpret_cast<uintptr_t>(output);
+    if (a > UINTPTR_MAX - count || b > UINTPTR_MAX - count * 2 ||
+        (a < b + count * 2 && b < a + count))
+      throw Failure(APXINF_STATUS_INVALID_ARGUMENT, "RGB patch buffers overlap");
+    apxinf::framework::check_cuda(cudaSetDevice(runtime->device));
+    apxinf::volume::kernels::rgb_patch2x2<<<
+        int(std::min<int64_t>(4096, (count + 255) / 256)), 256, 0,
+        static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const uint8_t*>(input),
+            static_cast<__nv_bfloat16*>(output), frames, height, width);
+    apxinf::framework::check_cuda(cudaGetLastError());
+  });
+}
 
 extern "C" apxinf_status_t apxinf_unfold3d_prepare(apxinf_runtime_t runtime,
     const apxinf_unfold3d_spec_t* spec, const apxinf_unfold3d_bindings_t* bindings,

@@ -8,6 +8,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_fp8.h>
 #include <type_traits>
 
@@ -617,6 +618,15 @@ void launch_channel_l2(const T* input, const T* weight, T* normalized,
         return;
       }
     }
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      if (rows >= 1024 && reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(weight) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(normalized) % 16 == 0 &&
+          kernels::launch_channel_l2_warp_packed_bf16<false, false, Silu>(
+              input, nullptr, nullptr, nullptr, weight, normalized, rows, cols, eps, stream)) {
+        return;
+      }
+    }
     const int blocks = (rows - 1) / 8 + 1;
     if (rows >= 1024 && cols == 96) {
       kernels::channel_l2_norm_warp<T, 96, Silu><<<blocks, 256, 0, stream>>>(
@@ -924,6 +934,12 @@ cudaError_t launch_channel_update(const apxinf_norm_spec_t& spec,
     }
     return cudaGetLastError();
   }
+  if(rows>=1024 && packed) {
+    const bool launched=residual
+      ? kernels::launch_channel_l2_warp_packed_bf16<true,true,true>(input,bias,residual,hidden,weight,normalized,rows,cols,bindings.eps,stream)
+      : kernels::launch_channel_l2_warp_packed_bf16<true,false,true>(input,bias,residual,hidden,weight,normalized,rows,cols,bindings.eps,stream);
+    if(launched)return cudaGetLastError();
+  }
   cudaError_t error;
   if(residual) {
     if(cols%4==0 && aligned(input,8) && aligned(bias,8) && aligned(residual,8) && aligned(hidden,8))
@@ -1007,6 +1023,23 @@ cudaError_t launch(const apxinf_norm_spec_t& spec,
                          APXINF_NORM_STATISTIC_RMS,
                          APXINF_NORM_AFFINE_WEIGHT,
                          APXINF_NORM_GATE_NONE)) {
+    if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+      // Cosmos towers: one 2048-wide vector per thread (8 BF16 lanes).
+      // Falls back to the scalar kernel for any unaligned or other width.
+      static const bool scalar_path = std::getenv("APXINF_NORM_SCALAR") != nullptr;
+      if (!scalar_path && cols == kThreads * 8 &&
+          reinterpret_cast<uintptr_t>(input) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(residual) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(hidden) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(normalized) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(weight) % 16 == 0 &&
+          (bias == nullptr || reinterpret_cast<uintptr_t>(bias) % 16 == 0)) {
+        kernels::bias_residual_rms_norm_bf16_packed8<<<rows, kThreads, 0, stream>>>(
+            input, bias, residual, weight, hidden, normalized, rows, cols,
+            bindings.eps);
+        return cudaGetLastError();
+      }
+    }
     kernels::bias_residual_rms_norm<T><<<rows, kThreads, 0, stream>>>(
         input, bias, residual, weight, hidden, normalized, rows, cols,
         bindings.eps);

@@ -42,6 +42,7 @@ from .registry import available_policies, get_policy, register_policy
 # Concrete model policies (importing registers them under their model_type).
 from .impls import (
     CosmosPolicy,
+    Cosmos3EdgePolicy,
     Pi05Policy,
     Pi0FastPolicy,
     Gr00tPolicy,
@@ -52,6 +53,7 @@ from .impls import (
 
 __all__ = [
     "CosmosPolicy",
+    "Cosmos3EdgePolicy",
     "Policy",
     "ModelRunnerProtocol",
     "StateConditionedModelRunnerProtocol",

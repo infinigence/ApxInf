@@ -26,6 +26,15 @@ pub(crate) struct Bindings {
 }
 
 unsafe extern "C" {
+    pub(crate) fn apxinf_rgb_patch2x2(
+        runtime: Runtime,
+        input: *const c_void,
+        output: *mut c_void,
+        frames: i64,
+        height: i64,
+        width: i64,
+        stream: CudaStream,
+    ) -> i32;
     pub(crate) fn apxinf_unfold3d_prepare(
         runtime: Runtime,
         spec: *const Spec,

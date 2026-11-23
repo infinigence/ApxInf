@@ -52,7 +52,7 @@ void validate_spec(const apxinf_pointwise_spec_t& spec) {
            spec.semantic == APXINF_POINTWISE_SEMANTIC_EULER_UPDATE))) ||
       (!quantized_geglu && !quantized_swiglu &&
        spec.output_dtype != spec.dtype) ||
-      spec.activation > APXINF_POINTWISE_ACTIVATION_RELU ||
+      spec.activation > APXINF_POINTWISE_ACTIVATION_RELU_SQUARED ||
       spec.has_bias > 1 || spec.rows <= 0 || spec.cols <= 0 ||
       spec.input_cols <= 0 || spec.logical_cols <= 0 ||
       spec.rows > INT32_MAX || spec.cols > INT32_MAX ||

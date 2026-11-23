@@ -146,7 +146,9 @@ bool valid_contract_fields(const apxinf_rope_spec_t& spec) {
              (((spec.rotation_source == APXINF_ROPE_ROTATION_POSITION_OFFSET ||
                 spec.rotation_source == APXINF_ROPE_ROTATION_PRECOMPUTED_TABLE) &&
                spec.rotary_convention == APXINF_ROPE_CONVENTION_HALF_SPLIT) ||
-              (spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_IDS &&
+              ((spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_IDS ||
+                spec.rotation_source ==
+                    APXINF_ROPE_ROTATION_MULTIMODAL_F32_IDS) &&
                spec.rotary_convention ==
                    APXINF_ROPE_CONVENTION_HALF_SPLIT_INTERLEAVED_AXES) ||
               (spec.rotation_source == APXINF_ROPE_ROTATION_AXIAL_IDS &&
@@ -261,7 +263,8 @@ void validate_spec(const apxinf_rope_spec_t& spec) {
         spec.section_h == 0 && spec.section_w == 0;
     const bool multimodal =
         spec.dtype == APXINF_DTYPE_BF16 &&
-        spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_IDS &&
+        (spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_IDS ||
+         spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_F32_IDS) &&
         spec.rotary_dim == spec.head_dim &&
         static_cast<uint64_t>(spec.section_h) + spec.section_w <=
             spec.head_dim / 2;
@@ -320,7 +323,8 @@ void validate_bindings(const apxinf_rope_spec_t& spec,
   const bool uses_position_binding =
       spec.rotation_source == APXINF_ROPE_ROTATION_DEVICE_SCALAR ||
       spec.rotation_source == APXINF_ROPE_ROTATION_AXIAL_IDS ||
-      spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_IDS;
+      spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_IDS ||
+      spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_F32_IDS;
   if ((uses_position_binding != (bindings.position != nullptr)) ||
       (precomputed != (bindings.rotation_table != nullptr))) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -567,6 +571,15 @@ cudaError_t launch_apply(const apxinf_rope_spec_t& spec,
         static_cast<const __nv_bfloat16*>(bindings.qkv),
         static_cast<__nv_bfloat16*>(bindings.q), spec.head_dim, spec.q_heads,
         static_cast<uint32_t>(spec.tokens), bindings.theta, bindings.position,
+        spec.section_h, spec.section_w);
+    return cudaGetLastError();
+  }
+  if (spec.rotation_source == APXINF_ROPE_ROTATION_MULTIMODAL_F32_IDS) {
+    rope_mrope_f32_bf16_kernel<<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(bindings.qkv),
+        static_cast<__nv_bfloat16*>(bindings.q), spec.head_dim, spec.q_heads,
+        static_cast<uint32_t>(spec.tokens), bindings.theta,
+        reinterpret_cast<const float*>(bindings.position),
         spec.section_h, spec.section_w);
     return cudaGetLastError();
   }

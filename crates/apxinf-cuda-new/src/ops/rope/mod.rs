@@ -20,10 +20,12 @@ pub use multimodal::{
 };
 pub use partial::{partial_rope, rotary_dim};
 pub use qkv::{split_grouped_qkv, split_qkv_cache, GroupedQkvRopeArgs, QkvCacheRopeArgs};
-pub use rope::{
-    apply_batched as execute_batched, apply_mrope as execute_mrope, apply_vision_2d, rope,
-};
 pub(crate) use rope::apply_precomputed;
+pub use rope::{
+    apply_batched as execute_batched, apply_fractional_mrope as execute_fractional_mrope,
+    apply_fractional_mrope_into as execute_fractional_mrope_into, apply_mrope as execute_mrope,
+    apply_vision_2d, rope,
+};
 
 #[cfg(test)]
 pub(crate) const DOC_IDS: &[&str] = &["RmsNormPrecomputedRoPE"];

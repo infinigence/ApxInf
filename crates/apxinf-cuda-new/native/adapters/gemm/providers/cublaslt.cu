@@ -94,7 +94,8 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   resources->native_fp4 = native_fp4;
   const int64_t projection_columns = split_geglu ? spec.n / 2 : spec.n;
   const int64_t projection_stride = spec.n;
-  const bool custom_option = !split_geglu && state.configuration >= 8;
+  const bool custom_option = !split_geglu && state.configuration >= 8 && state.configuration < 80;
+  const bool split_k_sweep = !split_geglu && state.configuration >= 80 && state.configuration < 83;
   const bool explicit_tile = !split_geglu && state.configuration >= 72;
 #if CUDART_VERSION < 13000
   if (explicit_tile) {
@@ -103,14 +104,14 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
   }
 #endif
   if (state.configuration < 0 ||
-      (custom_option &&
-       (state.configuration >= 80 || native_fp8 || native_fp4 ||
+      ((custom_option || split_k_sweep) &&
+       (native_fp8 || native_fp4 ||
         direct_fp8_gelu || spec.semantic != APXINF_GEMM_SEMANTIC_GEMM ||
         spec.a_dtype != APXINF_DTYPE_BF16 ||
         spec.b_dtype != APXINF_DTYPE_BF16 ||
         spec.output_dtype != APXINF_DTYPE_BF16 ||
         spec.accumulation_dtype != APXINF_DTYPE_F32 ||
-        spec.quantization != APXINF_GEMM_QUANT_NONE))) {
+        spec.quantization != APXINF_GEMM_QUANT_NONE)) || state.configuration >= 83) {
     throw Failure(APXINF_STATUS_UNSUPPORTED,
                   "cuBLASLt configuration outside its contract");
   }
@@ -249,7 +250,8 @@ void prepare_cublaslt_impl(Execution& state, bool native_fp8,
     const uint32_t tile = CUBLASLT_MATMUL_TILE_128x224;
     const uint32_t stages = CUBLASLT_MATMUL_STAGES_64xAUTO;
     const uint16_t cluster = CUBLASLT_CLUSTER_SHAPE_2x1x1;
-    const uint32_t split_k = 1, reduction = 0, swizzle = 0;
+    const uint32_t split_k = split_k_sweep ? (2u << (state.configuration - 80)) : 1;
+    const uint32_t reduction = 0, swizzle = 0;
     const uint16_t inner_shape = 0;
     auto set = [&](cublasLtMatmulAlgoConfigAttributes_t attribute,
                    const void* value, size_t bytes) {

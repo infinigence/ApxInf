@@ -263,4 +263,10 @@ void prepare_exact_gelu_lut(Execution&);
 void prepare_exact_gelu(Execution&);
 cudaError_t launch_exact_gelu(Execution&);
 void destroy_exact_gelu(Execution&) noexcept;
+
+size_t relu2_resource_requirements(const Spec&);
+void prepare_relu2(Execution&);
+cudaError_t launch_relu2(Execution&);
+void destroy_relu2(Execution&) noexcept;
+
 }  // namespace apxinf::gemm
