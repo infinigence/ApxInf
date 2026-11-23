@@ -131,7 +131,7 @@ post-trained repository (`lingbotvla_cli.yaml`) and the upstream `assets/norm_st
 ## Tests and reference checks
 
 ```bash
-# operators and model library (needs a CUDA GPU; the cuda-new suite has five failures that also occur on main,
+# operators and model library (needs a CUDA GPU; the cuda-new suite has four failures that also occur on main,
 # see below)
 cargo test -p apxinf-cuda-new --release --lib moe
 cargo test -p apxinf-model --features cuda --release --lib lingbot
@@ -153,7 +153,7 @@ variables point at reference inputs the repository does not ship:
 `crates/apxinf-model/examples/lingbot_vla2_parity.rs` runs the checkpoint through `AutoModel` against raw reference files
 (layout in its header) and prints cosine, relative L2 and latency. It needs a CUDA GPU; on an 8 GB card pass `autotune`.
 
-`cargo test -p apxinf-cuda-new --release --lib -- --test-threads=1` reports five failures on this tree: a repacked GEGLU graph,
+`cargo test -p apxinf-cuda-new --release --lib -- --test-threads=1` reports four failures on this tree:
 `fused_add_channel_l2_norm_silu`, `rms_rope_matches_unfused`, and two `volume_lowering` tests. They fail the same way on `main` on an
 RTX 4060 and none involves the MoE operators.
 
