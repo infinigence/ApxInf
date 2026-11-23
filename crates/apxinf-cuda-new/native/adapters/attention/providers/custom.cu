@@ -64,7 +64,7 @@ void prepare_custom(Execution& execution) {
       }
     }
   }
-  if (bytes != 0) check_cuda(cudaMalloc(&state->probabilities, bytes));
+  if (bytes != 0) execution.scratch.allocate(&state->probabilities, bytes);
   execution.resource_bytes = bytes;
   execution.provider_state = state.release();
 }
@@ -122,7 +122,6 @@ cudaError_t launch_custom(Execution& execution) {
 void destroy_custom(Execution& execution) noexcept {
   auto* state = static_cast<CustomState*>(execution.provider_state);
   if (state == nullptr) return;
-  if (state->probabilities != nullptr) cudaFree(state->probabilities);
   delete state;
   execution.provider_state = nullptr;
 }
