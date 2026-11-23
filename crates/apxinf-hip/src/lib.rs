@@ -40,6 +40,7 @@
 //! graph. PI0.5 runs on it (`apxinf_model::hip_pi05`).
 
 mod ffi;
+pub mod graph;
 mod kv_cache;
 pub mod native;
 mod ops;
