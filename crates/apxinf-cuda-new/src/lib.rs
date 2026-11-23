@@ -42,6 +42,7 @@ pub use ops::{
 };
 pub use phase::PreparedPhase;
 pub use stream::{CudaEvent, CudaStream};
+pub use workspace::ProviderWorkspace;
 
 pub mod ops;
 pub use ops::{Conv3dArgs, Conv3dPolicy, PreparedConv3d, Unfold3dGeometry};

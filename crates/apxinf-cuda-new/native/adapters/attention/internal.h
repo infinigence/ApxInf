@@ -1,4 +1,5 @@
 #pragma once
+#include "../../framework/scratch.h"
 
 #include "../../framework/autotune.h"
 #include "../../framework/registry.h"
@@ -63,6 +64,7 @@ struct TuningKeys {
 };
 
 struct Execution {
+  apxinf::framework::Scratch scratch;
   Spec spec{};
   apxinf_attention_bindings_t bindings{};
   int configuration = 0;

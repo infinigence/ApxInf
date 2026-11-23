@@ -5,8 +5,14 @@
 //! `kernels/ck/VENDOR.md`), is compiled by `hipcc` for one GPU architecture,
 //! the objects are archived, the archive is linked with `amdhip64` and
 //! `hipblas`, and the `apxinf_hip_runtime` cfg is set. Units compile in
-//! parallel, and a unit whose object is newer than everything it depends on is
-//! not recompiled: the CK units are slow and their inputs rarely change.
+//! parallel through a bounded pool, and a unit whose object is newer than
+//! everything it depends on is not recompiled: the CK units are slow and
+//! their inputs rarely change.
+//!
+//! hipBLASLt is optional. When its header is present the second GEMM provider
+//! is compiled in and `hipblaslt` is linked; otherwise the provider's entry
+//! points become stubs and `native::gemm` keeps using hipBLAS. That keeps the
+//! crate buildable on ROCm installs that predate hipBLASLt.
 //!
 //! Without ROCm the crate still builds — macOS and CUDA-only hosts compile the
 //! workspace with `--features hip` — but the runtime cfg is absent, the C ABI is
@@ -23,6 +29,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
 /// Device translation units under `kernels/`. All of them include `common.h`.
@@ -31,6 +38,7 @@ const SOURCES: &[&str] = &[
     "norm.hip",
     "elementwise.hip",
     "native_attention.hip",
+    "rope.hip",
 ];
 
 fn main() {
@@ -63,10 +71,25 @@ fn main() {
     // compiler's identity into the object names, like the arch below.
     let toolchain = hipcc_version(&hipcc);
 
+    // Probed by header, not by ROCm version: a version table would go stale,
+    // and a missing header is exactly what breaks the compile.
+    let blaslt = rocm.join("include/hipblaslt/hipblaslt.h").is_file();
+    if !blaslt {
+        println!(
+            "cargo:warning=apxinf-hip: no hipblaslt.h under {}; \
+             building with hipBLAS as the only GEMM provider",
+            rocm.display()
+        );
+    }
+
     let ck = kernels.join("ck");
     let ck_include = ck.join("include");
     let ck_fmha = ck.join("example/ck_tile/01_fmha");
     let ck_generated = ck.join("generated");
+    // Probed before anything is spawned: the always-compiled units need to
+    // know whether `ck_attention.hip` will define the CK entry points or they
+    // must carry stubs.
+    let has_ck = ck_generated.join("fmha_fwd_api.cpp").is_file();
 
     let common = newest(&[kernels.join("common.h")]);
     let mut units: Vec<Unit> = SOURCES
@@ -84,22 +107,31 @@ fn main() {
             inputs_changed: common,
         })
         .collect();
-    // CK units depend on the whole vendored tree, which only changes on a CK bump.
-    let ck_inputs = newest_in(&ck).max(common);
-    let mut generated: Vec<PathBuf> = std::fs::read_dir(&ck_generated)
-        .unwrap_or_else(|e| panic!("apxinf-hip: read {}: {e}", ck_generated.display()))
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "cpp"))
-        .collect();
-    generated.sort();
-    for source in std::iter::once(kernels.join("ck_attention.hip")).chain(generated) {
-        let name = source.file_stem().unwrap().to_string_lossy().into_owned();
-        units.push(Unit {
-            object: out_dir.join(format!("{arch}_{toolchain}_ck_{name}.o")),
-            source,
-            ck: true,
-            inputs_changed: ck_inputs,
-        });
+    if has_ck {
+        // CK units depend on the whole vendored tree, which only changes on a
+        // CK bump.
+        let ck_inputs = newest_in(&ck).max(common);
+        let mut generated: Vec<PathBuf> = std::fs::read_dir(&ck_generated)
+            .unwrap_or_else(|e| panic!("apxinf-hip: read {}: {e}", ck_generated.display()))
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "cpp"))
+            .collect();
+        generated.sort();
+        for source in std::iter::once(kernels.join("ck_attention.hip")).chain(generated) {
+            let name = source.file_stem().unwrap().to_string_lossy().into_owned();
+            units.push(Unit {
+                object: out_dir.join(format!("{arch}_{toolchain}_ck_{name}.o")),
+                source,
+                ck: true,
+                inputs_changed: ck_inputs,
+            });
+        }
+    } else {
+        println!(
+            "cargo:warning=apxinf-hip: no vendored CK at {}; attention uses apxinf's \
+             own kernel only",
+            ck.display()
+        );
     }
 
     let compile = |unit: &Unit| {
@@ -113,7 +145,9 @@ fn main() {
         let mut command = Command::new(&hipcc);
         command
             .args(["-c", "-O3", "-fPIC"])
-            .arg(format!("--offload-arch={arch}"));
+            .arg(format!("--offload-arch={arch}"))
+            .arg(format!("-DAPXINF_HIP_HAS_BLASLT={}", blaslt as i32))
+            .arg(format!("-DAPXINF_HIP_HAS_CK={}", has_ck as i32));
         if unit.ck {
             // CK's own CMake flags for its FMHA forward kernels (ROCm >= 6.2);
             // recorded in kernels/ck/VENDOR.md.
@@ -152,8 +186,8 @@ fn main() {
             .output()
             .unwrap_or_else(|e| panic!("apxinf-hip: failed to run {}: {e}", hipcc.display()));
         if !output.status.success() {
-            // ROCm's device linker needs libxml2.so.2; distributions that ship a
-            // newer libxml2 report it here. LD_LIBRARY_PATH must reach a
+            // ROCm's device linker needs libxml2.so.2; distributions that ship
+            // a newer libxml2 report it here. LD_LIBRARY_PATH must reach a
             // compatible copy before the build starts.
             panic!(
                 "apxinf-hip: hipcc failed on {} for {arch}\n{}{}",
@@ -163,18 +197,16 @@ fn main() {
             );
         }
     };
-    // Respect cargo's job count (`cargo build -j2`); each hipcc uses ~1.5 GB.
-    let jobs = env::var("NUM_JOBS")
-        .ok()
-        .and_then(|jobs| jobs.parse::<usize>().ok())
-        .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
-        .unwrap_or(4)
-        .max(1);
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    // Each hipcc takes about 1.5 GB and the host may be unified-memory: the
+    // pool is bounded, never one process per unit. `APXINF_HIP_BUILD_JOBS`
+    // overrides Cargo's `NUM_JOBS`; 16 is the ceiling either way so a large
+    // host cannot be scaled into an OOM.
+    let jobs = job_limit();
+    let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..jobs.min(units.len()) {
             scope.spawn(|| loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let index = next.fetch_add(1, Ordering::Relaxed);
                 match units.get(index) {
                     Some(unit) => compile(unit),
                     None => break,
@@ -202,7 +234,14 @@ fn main() {
     );
     println!("cargo:rustc-link-lib=dylib=amdhip64");
     println!("cargo:rustc-link-lib=dylib=hipblas");
+    if blaslt {
+        println!("cargo:rustc-link-lib=dylib=hipblaslt");
+    }
     println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-check-cfg=cfg(apxinf_hip_ck)");
+    if has_ck {
+        println!("cargo:rustc-cfg=apxinf_hip_ck");
+    }
     println!("cargo:rustc-cfg=apxinf_hip_runtime");
     // The runtime refuses a device whose architecture differs from this one:
     // a mismatched code object only fails later, as "invalid device function".
@@ -237,6 +276,8 @@ fn target_arch(rocm: &Path) -> String {
         })
 }
 
+/// One `hipcc` translation unit, its output object, and whether it builds
+/// with Composable Kernel's include paths and flags.
 struct Unit {
     source: PathBuf,
     object: PathBuf,
@@ -244,6 +285,22 @@ struct Unit {
     ck: bool,
     /// Newest modification time among the unit's headers.
     inputs_changed: SystemTime,
+}
+
+/// How many `hipcc` processes run at once: `APXINF_HIP_BUILD_JOBS`, then
+/// Cargo's `NUM_JOBS`, then the machine's parallelism, capped at 16 so the
+/// pool cannot scale a large host into an OOM.
+fn job_limit() -> usize {
+    env::var("APXINF_HIP_BUILD_JOBS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| env::var("NUM_JOBS").ok().and_then(|value| value.parse().ok()))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
+        .clamp(1, 16)
 }
 
 /// A short token identifying the hipcc that will compile the objects.

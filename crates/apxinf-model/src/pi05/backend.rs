@@ -8,6 +8,7 @@ use apxinf_core::{Error, NormalGenerator, Result, Tensor};
 
 pub(crate) use apxinf_cuda_new::{
     capture, ops, CudaBuffer as DeviceBuffer, CudaContext as Context, ExecutionSession,
+    GraphWorkspace, ProviderWorkspace,
 };
 pub(crate) use apxinf_cuda_new::{sampling, transfers};
 
