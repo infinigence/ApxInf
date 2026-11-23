@@ -20,7 +20,7 @@ use crate::CudaContext;
 /// Fused per-head RMSNorm (weighted, bf16-rounded) + partial rope, one launch.
 ///
 /// Bit-identical to `norm` (`NormKind::Rms`) followed by `rope::partial_rope`
-/// on the same buffers: same 256-thread reduction tree, same `(1 + weight)`
+/// on the same buffers: same 256-thread reduction tree, same plain-weight
 /// multiplier, and the rope stage re-reads the norm output through memory
 /// after the bf16 round trip.
 ///
