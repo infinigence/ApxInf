@@ -33,7 +33,7 @@ pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
 #[cfg(feature = "cuda")]
-pub mod qwen3_asr;
+pub mod cuda_qwen3_asr;
 #[cfg(feature = "cuda")]
 pub mod qwen38;
 pub mod qwen3vl;
