@@ -283,5 +283,112 @@ class SessionUsageTests(unittest.TestCase):
             accounting.build_report(self.home, None)
 
 
+def claude_message(message_id, model="claude-model-a", input_tokens=10, read=80, write=5, output=7,
+                   sidechain=False, agent=None, session="claude-root", timestamp="2026-11-16T08:00:00Z"):
+    usage = {"input_tokens": input_tokens, "output_tokens": output}
+    if read is not None:
+        usage["cache_read_input_tokens"] = read
+    if write is not None:
+        usage["cache_creation_input_tokens"] = write
+    entry = {"type": "assistant", "sessionId": session, "isSidechain": sidechain, "timestamp": timestamp,
+             "message": {"id": message_id, "model": model, "role": "assistant", "usage": usage,
+                         "content": [{"type": "text", "text": "secret body"}]}}
+    if agent:
+        entry["agentId"] = agent
+    return entry
+
+
+class ClaudeCodeUsageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        results = SKILL.parents[1] / "devlocal" / "finish-work-session" / "results"
+        results.mkdir(parents=True, exist_ok=True)
+        cls.run_dir = Path(tempfile.mkdtemp(prefix="claude-tests-", dir=results))
+
+    def setUp(self):
+        self.home = self.run_dir / self._testMethodName
+        self.project = self.home / "projects" / "-repo"
+        self.project.mkdir(parents=True)
+
+    def transcript(self, entries, session="claude-root", child=None):
+        path = self.project / f"{session}.jsonl"
+        if child:
+            path = self.project / session / "subagents" / f"{child}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [{"type": "user", "sessionId": session, "message": {"role": "user", "content": "hi"}}, *entries]
+        path.write_text("".join(json.dumps(e) + "\n" for e in lines))
+        return path
+
+    def report(self, session="claude-root"):
+        return accounting.build_claude_report(self.home, session)
+
+    def test_cache_fields_map_to_input_and_content_blocks_dedupe(self):
+        self.transcript([claude_message("m1"), claude_message("m1"), claude_message("m2", output=3),
+                         claude_message("synthetic", model="<synthetic>", input_tokens=0, read=0, write=0, output=0)])
+        result = self.report()
+        self.assertEqual(result["agent"], "claude-code")
+        self.assertEqual(result["totals"]["input_tokens"], 190)
+        self.assertEqual(result["totals"]["cache_hit_tokens"], 160)
+        self.assertEqual(result["totals"]["cache_miss_tokens"], 30)
+        self.assertEqual(result["totals"]["output_tokens"], 10)
+        self.assertEqual(set(result["models"]), {"claude-model-a"})
+        self.assertEqual(result["coverage"], "recorded")
+        self.assertNotIn("secret body", json.dumps(result))
+
+    def test_streamed_partial_output_keeps_most_complete_count(self):
+        self.transcript([claude_message("m1", output=1), claude_message("m1", output=40)])
+        self.assertEqual(self.report()["totals"]["output_tokens"], 40)
+
+    def test_subagents_models_and_copied_history(self):
+        self.transcript([claude_message("m1")])
+        self.transcript([claude_message("m1"), claude_message("s1", model="claude-model-b", sidechain=True)],
+                        child="agent-abc")
+        self.transcript([claude_message("other")], session="unrelated")
+        result = self.report()
+        self.assertEqual(result["descendant_count"], 1)
+        self.assertEqual(result["models"]["claude-model-a"]["total_tokens"], 102)
+        self.assertEqual(result["models"]["claude-model-b"]["total_tokens"], 102)
+        self.assertEqual(result["coverage"], "recorded")
+
+    def test_legacy_inline_sidechains_get_rows(self):
+        self.transcript([claude_message("m1"), claude_message("s1", sidechain=True, agent="a1")])
+        result = self.report()
+        self.assertEqual([s["thread_id"] for s in result["sessions"]], ["claude-root", "sidechain:a1"])
+        self.assertEqual(result["totals"]["total_tokens"], 204)
+
+    def test_missing_cache_fields_are_unknown(self):
+        self.transcript([claude_message("m1", read=None, write=None)])
+        result = self.report()
+        self.assertIsNone(result["totals"]["cache_hit_tokens"])
+        self.assertEqual(result["coverage"], "partial")
+
+    def test_unmetered_child_makes_coverage_partial(self):
+        self.transcript([claude_message("m1")])
+        self.transcript([], child="agent-empty")
+        self.assertEqual(self.report()["coverage"], "partial")
+
+    def test_cli_detects_claude_environment(self):
+        self.transcript([claude_message("m1")])
+        environment = {k: v for k, v in os.environ.items() if not k.startswith("CODEX_")}
+        environment.update(CLAUDE_CODE_SESSION_ID="claude-root", CLAUDE_CONFIG_DIR=str(self.home))
+        result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--format", "json"],
+                                env=environment, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["totals"]["total_tokens"], 102)
+
+    def test_cli_session_file_sniffs_claude_format(self):
+        path = self.transcript([claude_message("m1")])
+        result = subprocess.run([sys.executable, "-B", str(SCRIPT), "--session-file", str(path),
+                                 "--claude-home", str(self.home), "--format", "json"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["root_thread_id"], "claude-root")
+
+    def test_unknown_session_fails_without_guessing(self):
+        self.transcript([claude_message("m1")])
+        with self.assertRaisesRegex(ValueError, "No Claude Code transcript"):
+            self.report("missing")
+
+
 if __name__ == "__main__":
     unittest.main()

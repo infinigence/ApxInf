@@ -1,7 +1,8 @@
 # Accounting contract
 
-This helper supports local Codex JSONL rollouts. These persisted schemas vary by
-runtime; they are not a billing API. The formats below were verified against the
+This helper supports local Codex JSONL rollouts and Claude Code JSONL
+transcripts (see [Claude Code transcripts](#claude-code-transcripts)). These
+persisted schemas vary by runtime; they are not a billing API. The formats below were verified against the
 local installation on 2026-11-16. Unknown or absent data must remain visible.
 
 ## Scope and ancestry
@@ -56,6 +57,34 @@ events are superseded by newer response checkpoints. Conflicting counters are
 reported as partial coverage. Missing cache fields produce unknown cache totals,
 not a guessed 0% hit rate. Cache writes are a subset of uncached input and are not
 added separately. Reasoning output is not added to recorded output.
+
+## Claude Code transcripts
+
+The root transcript is `<claude-home>/projects/<encoded-cwd>/<session-id>.jsonl`;
+if more than one project directory claims the ID, the largest is selected and
+flagged. Sub-agent transcripts live under `<session-id>/subagents/*.jsonl` next
+to it (any project directory is scanned for that session ID). Older versions
+wrote sub-agent turns inline with `isSidechain: true`; those are reported as
+`sidechain:<agentId>` rows of the root transcript.
+
+Only `type: "assistant"` entries carry usage, in `message.usage`. One API
+response is persisted as one entry per content block, all sharing `message.id`
+and the same usage, so deduplicate by `message.id` (fall back to `requestId`).
+If a duplicate has a larger `output_tokens` (streamed partial blocks), keep the
+larger; a differing input count warns. Message IDs are deduplicated across the
+whole tree, so history copied into a forked sub-agent is counted once.
+Entries with model `<synthetic>` are client-generated and skipped.
+
+Anthropic `input_tokens` excludes cache traffic. Input total is
+`input_tokens + cache_creation_input_tokens + cache_read_input_tokens`; cache hit
+is `cache_read_input_tokens`; cache miss therefore includes cache writes, as for
+Codex. Missing cache fields make the cache split unknown. The model is
+`message.model`, verbatim.
+
+Claude Code does not persist every auxiliary request (for example, session
+titles or other background side queries) as an assistant entry, so those are
+absent. A resumed session that copies earlier history into a new transcript
+counts that history once as part of the resumed session.
 
 ## Limits and verification
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report local Codex thread-tree usage without reading message text into output."""
+"""Report local Codex or Claude Code session-tree usage without reading message text into output."""
 
 from __future__ import annotations
 
@@ -339,6 +339,7 @@ def build_report(home: Path, session_id: str | None, explicit: Path | None = Non
     timestamps = [s["last_usage_at"] for s in sessions if s["last_usage_at"]]
     return {
         "schema_version": 1,
+        "agent": "codex",
         "root_thread_id": session_id,
         "snapshot_at": snapshot_time,
         "last_usage_at": max(timestamps) if timestamps else None,
@@ -352,6 +353,210 @@ def build_report(home: Path, session_id: str | None, explicit: Path | None = Non
         "warnings": notices,
         "scope_note": "Snapshot of recorded usage; excludes unflushed/running requests, this report's final answer, and later work. Missing usage is not zero.",
     }
+
+
+# --- Claude Code transcripts -------------------------------------------------
+
+CLAUDE_SKIPPED_MODELS = {"<synthetic>"}
+
+
+def claude_usage(value: Any) -> Usage:
+    """Map Anthropic usage, whose input_tokens exclude cache reads and writes."""
+    if not isinstance(value, dict):
+        raise ValueError("missing usage object")
+    fields = {}
+    for key in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+        raw = value.get(key)
+        if raw is None and key.startswith("cache_"):
+            fields[key] = None
+            continue
+        if type(raw) is not int or raw < 0:
+            raise ValueError(f"invalid or missing {key}")
+        fields[key] = raw
+    read, write = fields["cache_read_input_tokens"], fields["cache_creation_input_tokens"]
+    total_input = fields["input_tokens"] + (read or 0) + (write or 0)
+    return Usage(total_input, read, fields["output_tokens"])
+
+
+def claude_root_transcript(home: Path, session_id: str) -> tuple[Path, list[str]]:
+    matches = sorted((home / "projects").glob(f"*/{session_id}.jsonl"))
+    if not matches:
+        raise ValueError(f"No Claude Code transcript for session {session_id} under {home / 'projects'}.")
+    notices = []
+    if len(matches) > 1:
+        notices.append(f"Multiple transcripts claim session {session_id}; selected the largest without summing copies.")
+    return max(matches, key=lambda p: (p.stat().st_size, p.stat().st_mtime_ns, str(p))), notices
+
+
+def claude_session_id(path: Path) -> str:
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict) and isinstance(entry.get("sessionId"), str):
+                return entry["sessionId"]
+    return path.stem
+
+
+def claude_descendants(home: Path, root: Path, session_id: str) -> list[Path]:
+    """Subagent transcripts live in <project>/<session-id>/subagents/*.jsonl."""
+    found = set(root.parent.joinpath(session_id).rglob("*.jsonl"))
+    found.update((home / "projects").glob(f"*/{session_id}/**/*.jsonl"))
+    return sorted({p.resolve() for p in found} - {root.resolve()})
+
+
+def analyze_claude(path: Path, seen_tree: set[str], split_sidechains: bool):
+    """Return {row_key: (by_model, last_timestamp, metered, observed)} plus warnings."""
+    rows: dict[str, dict] = {}
+    pending: dict[str, tuple[str, str, Usage, Any]] = {}
+    order: list[str] = []
+    warnings: list[str] = []
+    copied = 0
+    before = path.stat().st_size
+    with path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            try:
+                entry = json.loads(line)
+                if not isinstance(entry, dict):
+                    raise ValueError("record is not an object")
+            except ValueError as exc:
+                warnings.append(f"Line {line_number}: unreadable record ({exc}).")
+                continue
+            if entry.get("type") != "assistant" or not isinstance(entry.get("message"), dict):
+                continue
+            message = entry["message"]
+            model = message.get("model") or "unknown"
+            if model in CLAUDE_SKIPPED_MODELS:
+                continue
+            key = f"sidechain:{entry.get('agentId') or 'unknown'}" if split_sidechains and entry.get("isSidechain") else ""
+            row = rows.setdefault(key, {"models": {}, "timestamp": None, "observed": set()})
+            row["observed"].add(model)
+            try:
+                value = claude_usage(message.get("usage"))
+            except (ValueError, TypeError) as exc:
+                warnings.append(f"Line {line_number}: invalid usage ({exc}).")
+                continue
+            response = message.get("id") or entry.get("requestId")
+            if not response:
+                warnings.append(f"Line {line_number}: message ID missing; duplicate detection unavailable.")
+                response = f"{path}:{line_number}"
+            if response in seen_tree:
+                copied += 1
+                continue
+            if response in pending:
+                previous = pending[response]
+                if previous[2].input != value.input:
+                    warnings.append(f"Line {line_number}: conflicting duplicate message usage.")
+                # Streaming may persist partial blocks first; keep the most complete output count.
+                if value.output < previous[2].output:
+                    continue
+            else:
+                order.append(response)
+            pending[response] = (key, model, value, entry.get("timestamp"))
+    if before != path.stat().st_size:
+        warnings.append("Transcript changed while being read; rerun for a later snapshot.")
+    for response in order:
+        key, model, value, timestamp = pending[response]
+        seen_tree.add(response)
+        row = rows[key]
+        add(row["models"], model, value)
+        row["timestamp"] = max(filter(None, (row["timestamp"], timestamp)), default=None)
+    if copied:
+        warnings.append(f"Skipped {copied} copied message records already counted elsewhere in this tree.")
+    return rows, warnings
+
+
+def build_claude_report(home: Path, session_id: str | None, explicit: Path | None = None) -> dict:
+    snapshot_time = datetime.now(timezone.utc).isoformat()
+    notices: list[str] = []
+    if explicit:
+        root = explicit.expanduser().resolve()
+        identity = claude_session_id(root)
+        if session_id and session_id != identity:
+            raise ValueError("--session-id disagrees with --session-file")
+        session_id = identity
+    elif not session_id:
+        raise ValueError("No current session ID; supply --session-id or --session-file (never guess the newest log).")
+    else:
+        root, notices = claude_root_transcript(home, session_id)
+    seen_tree: set[str] = set()
+    sessions, all_models = [], {}
+
+    def append(thread, parent, path, row, warnings):
+        metered = bool(row and row["models"])
+        models = row["models"] if row else {}
+        for model, value in models.items():
+            add(all_models, model, value)
+            if value.cached is None:
+                warnings.append(f"Cache-hit counts unavailable for model {model}; cache split is unknown.")
+        if not metered:
+            warnings.append("No recorded token usage; consumption is unknown, not zero.")
+        warnings = list(dict.fromkeys(warnings))
+        sessions.append({
+            "thread_id": thread, "parent_thread_id": parent, "rollout_path": str(path),
+            "status": "partial" if warnings and metered else "recorded" if metered else "unmetered",
+            "totals": total(models.values()).as_dict() if metered else None,
+            "observed_models": sorted(row["observed"]) if row else [],
+            "models": {k: v.as_dict() for k, v in sorted(models.items())},
+            "last_usage_at": row["timestamp"] if row else None, "warnings": warnings,
+        })
+
+    def ignorable(warnings):
+        return [w for w in warnings if not w.startswith("Skipped ")]
+
+    rows, warnings = analyze_claude(root, seen_tree, split_sidechains=True)
+    append(session_id, None, root, rows.pop("", None), ignorable(warnings))
+    for key in sorted(rows):  # legacy in-file sidechains
+        append(key, session_id, root, rows[key], [])
+    for path in claude_descendants(home, root, session_id):
+        try:
+            child_rows, child_warnings = analyze_claude(path, seen_tree, split_sidechains=False)
+        except (OSError, UnicodeError) as exc:
+            child_rows, child_warnings = {}, [f"Could not read transcript: {exc}"]
+        notes = [w for w in child_warnings if w.startswith("Skipped ")]
+        notices.extend(f"{path.stem}: {note}" for note in notes)
+        append(path.stem, session_id, path, child_rows.get(""), ignorable(child_warnings))
+    timestamps = [s["last_usage_at"] for s in sessions if s["last_usage_at"]]
+    return {
+        "schema_version": 1,
+        "agent": "claude-code",
+        "root_thread_id": session_id,
+        "snapshot_at": snapshot_time,
+        "last_usage_at": max(timestamps) if timestamps else None,
+        "coverage": "partial" if any(s["status"] != "recorded" for s in sessions)
+        or any(not n.split(": ", 1)[-1].startswith("Skipped ") for n in notices) else "recorded",
+        "session_count": len(sessions),
+        "descendant_count": len(sessions) - 1,
+        "metered_session_count": sum(s["totals"] is not None for s in sessions),
+        "totals": total(all_models.values()).as_dict() if all_models else None,
+        "models": {k: v.as_dict() for k, v in sorted(all_models.items())},
+        "sessions": sessions,
+        "warnings": notices,
+        "scope_note": "Snapshot of recorded usage; excludes unflushed/running requests, this report's final answer, "
+                      "later work, and auxiliary requests Claude Code does not persist in transcripts. "
+                      "Missing usage is not zero.",
+    }
+
+
+def detect_agent(requested: str, session_id: str | None, session_file: Path | None, claude_home: Path) -> str:
+    if requested != "auto":
+        return requested
+    if session_file:
+        try:
+            with session_file.expanduser().open(encoding="utf-8") as stream:
+                first = json.loads(stream.readline())
+            return "codex" if isinstance(first, dict) and first.get("type") == "session_meta" else "claude-code"
+        except (OSError, ValueError):
+            return "codex"
+    if session_id:
+        return "claude-code" if any((claude_home / "projects").glob(f"*/{session_id}.jsonl")) else "codex"
+    if os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID"):
+        return "codex"
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        return "claude-code"
+    return "codex"
 
 
 def markdown(report: dict) -> str:
@@ -370,7 +575,8 @@ def markdown(report: dict) -> str:
     separator = "|---|---:|---:|---:|---:|---:|"
     lines = [
         "# Session token usage", "",
-        f"Root thread: `{report['root_thread_id']}`. Snapshot: {report['snapshot_at']}.",
+        f"Agent: {report.get('agent', 'codex')}. Root thread: `{report['root_thread_id']}`. "
+        f"Snapshot: {report['snapshot_at']}.",
         f"Latest recorded usage: {report['last_usage_at'] or 'unavailable'}.", "",
         f"Coverage: **{report['coverage']}** — main thread + {report['descendant_count']} descendants; "
         f"{report['metered_session_count']}/{report['session_count']} sessions have usage records.", "",
@@ -398,17 +604,30 @@ def markdown(report: dict) -> str:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--session-id", help="Root thread ID (default: CODEX_THREAD_ID or CODEX_SESSION_ID)")
-    parser.add_argument("--session-file", type=Path, help="Explicit root rollout; overrides environment identity")
+    parser.add_argument("--agent", choices=("auto", "codex", "claude-code"), default="auto",
+                        help="Log format (default: detect from --session-file or the environment)")
+    parser.add_argument("--session-id", help="Root thread/session ID (default: CODEX_THREAD_ID, CODEX_SESSION_ID, "
+                                             "or CLAUDE_CODE_SESSION_ID)")
+    parser.add_argument("--session-file", type=Path, help="Explicit root rollout/transcript; overrides environment identity")
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser())
+    parser.add_argument("--claude-home", type=Path,
+                        default=Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser())
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
     parser.add_argument("--output-dir", type=Path, help="Save a unique Markdown/JSON pair here, respecting project artifact policy")
     args = parser.parse_args(argv)
+    claude_home = args.claude_home.expanduser().resolve()
+    agent = detect_agent(args.agent, args.session_id, args.session_file, claude_home)
     identity = args.session_id
     if not identity and not args.session_file:
-        identity = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID")
+        if agent == "codex":
+            identity = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID")
+        else:
+            identity = os.environ.get("CLAUDE_CODE_SESSION_ID")
     try:
-        report = build_report(args.codex_home.expanduser().resolve(), identity, args.session_file)
+        if agent == "codex":
+            report = build_report(args.codex_home.expanduser().resolve(), identity, args.session_file)
+        else:
+            report = build_claude_report(claude_home, identity, args.session_file)
         rendered = markdown(report)
         structured = json.dumps(report, indent=2) + "\n"
         if args.output_dir:

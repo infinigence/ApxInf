@@ -327,25 +327,28 @@ It works from the same guides a human would follow:
 - [model-layer architecture](doc/model-layer-architecture.md),
 - [adding new kernels](doc/adding-new-kernels.md).
 
-## Finish a Codex work session
+## Finish a work session
 
 [finish-work-session](skills/finish-work-session/SKILL.md) reports recorded token
-usage for the current session and all descendant agents. It separates input cache
-hits, input cache misses, and output tokens, with a per-model breakdown and
-explicit coverage for missing usage.
+usage for the current Codex or Claude Code session and all descendant agents. It
+separates input cache hits, input cache misses, and output tokens, with a
+per-model breakdown and explicit coverage for missing usage.
 
-Install from the repository root:
+Install it once, from the repository root:
 
 ```bash
-mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-ln -s "$(pwd)/skills/finish-work-session" "${CODEX_HOME:-$HOME/.codex}/skills/"
+# Claude Code
+mkdir -p .claude/skills && ln -s ../../skills/finish-work-session .claude/skills/
+
+# Codex
+mkdir -p ~/.agents/skills && ln -s "$(pwd)/skills/finish-work-session" ~/.agents/skills/
 ```
 
-Then say **"finish this session"** or invoke **`$finish-work-session`**.
-The Python helper also runs directly:
+Then say **"finish this session"**, or invoke **`/finish-work-session`** (Claude
+Code) or **`$finish-work-session`** (Codex). The Python helper also runs directly:
 
 ```bash
-python3 skills/finish-work-session/scripts/session_usage.py
+python3 skills/finish-work-session/scripts/session_usage.py --agent claude-code  # or --agent codex
 ```
 
 Reports are snapshots of locally recorded usage; running requests and the final

@@ -1,6 +1,6 @@
 ---
 name: finish-work-session
-description: Report recorded token consumption for a Codex work session and all descendant agents, with input cache hits, input cache misses, output tokens, and a per-model breakdown. Use when a developer says "finish this session", "wrap up this session", or asks for session token accounting.
+description: Report recorded token consumption for a Codex or Claude Code work session and all descendant agents (sub-agents), with input cache hits, input cache misses, output tokens, and a per-model breakdown. Use when a developer says "finish this session", "wrap up this session", or asks for session token accounting.
 ---
 
 Produce a usage report for the entire current main thread, including earlier
@@ -9,23 +9,31 @@ accounting; it does not itself request a commit, push, archive, or agent shutdow
 
 ## Collect usage
 
-Use the bundled Python 3 helper from the main session. It reads local Codex
-rollouts and, when available, the state database's thread paths and spawn edges.
-It needs no packages, credentials, network calls, or additional model requests.
+Use the bundled Python 3 helper from the main session. It reads local session
+logs only: Codex rollouts (plus the optional state database's thread paths and
+spawn edges) or Claude Code transcripts (plus their sub-agent transcripts). It
+needs no packages, credentials, network calls, or additional model requests.
 
-Resolve the project/worktree being worked on and the absolute skill directory.
-Run from that project, substituting the actual skill path:
+Resolve the project/worktree being worked on and the absolute skill directory
+(Claude Code shows it as the skill's base directory). Run from that project,
+substituting the actual skill path and naming the agent you are running in:
 
 ```bash
-python3 /absolute/path/to/finish-work-session/scripts/session_usage.py
+# Codex
+python3 /absolute/path/to/finish-work-session/scripts/session_usage.py --agent codex
+# Claude Code
+python3 /absolute/path/to/finish-work-session/scripts/session_usage.py --agent claude-code
 ```
 
-The helper selects `CODEX_THREAD_ID`, falling back to `CODEX_SESSION_ID`, and uses
-`CODEX_HOME` or `~/.codex`. If thread identity is unavailable, use a known main
-thread ID with `--session-id ID` or an explicit rollout with
-`--session-file /path/to/rollout.jsonl`. Do not guess by choosing the newest log
-or a thread with the same working directory. `--codex-home` supports another
-local installation. Do not substitute goal-scoped usage for whole-session usage.
+Without `--agent`, the helper detects the format from `--session-file` or the
+environment. Codex identity comes from `CODEX_THREAD_ID`, falling back to
+`CODEX_SESSION_ID`, under `CODEX_HOME` or `~/.codex` (`--codex-home` overrides).
+Claude Code identity comes from `CLAUDE_CODE_SESSION_ID`, under
+`CLAUDE_CONFIG_DIR` or `~/.claude` (`--claude-home` overrides). If identity is
+unavailable, use a known main session ID with `--session-id ID` or an explicit
+log with `--session-file /path/to/file.jsonl`. Do not guess by choosing the
+newest log or a session with the same working directory. Do not substitute
+goal-scoped usage for whole-session usage.
 
 Run accounting near the end of the work, after already-authorized agent work has
 settled where practical. Do not spawn agents just to prepare this report. If work
@@ -56,7 +64,9 @@ chat when useful or requested. Surface the helper's warnings and unknown values;
 do not describe partial coverage as complete accounting or missing usage as zero.
 
 Input already includes cached input: cache miss is input minus cache hit. Cache
-writes remain part of cache misses. Output is the recorded output counter; do
+writes remain part of cache misses. For Claude Code, the helper already adds the
+API's separate cache-read and cache-creation counters into input; do not add
+them again. Output is the recorded output counter; do
 not add reasoning output again. Preserve model identifiers, including unknown
 attribution, without guessing a model from the current settings or its nickname.
 
