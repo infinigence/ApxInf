@@ -108,8 +108,20 @@ impl Qwen3AsrModel {
     /// Full greedy transcription used by both `AsrTrait::transcribe` and the
     /// parity tests. The prompt is built internally from the fixed chat
     /// template; `prompt_token_ids` must be empty (v1 does not splice user
-    /// text prefixes).
-    fn transcribe_internal(&self, waveform: &[f32], language: &str) -> Result<AsrTranscription> {
+    /// text prefixes). `max_new_tokens` is the caller's generation bound; it
+    /// is clamped to the KV decode room, in which case a non-EOS stop is
+    /// reported as [`AsrStopReason::PositionCap`].
+    fn transcribe_internal(
+        &self,
+        waveform: &[f32],
+        language: &str,
+        max_new_tokens: usize,
+    ) -> Result<AsrTranscription> {
+        if max_new_tokens == 0 {
+            return Err(Error::Other(
+                "qwen3-asr max_new_tokens must be at least 1".into(),
+            ));
+        }
         let suffix = prompt_suffix(language).ok_or_else(|| {
             Error::Other(format!(
                 "qwen3-asr supports the languages {SUPPORTED_LANGUAGES:?}, got {language:?}"
@@ -153,6 +165,17 @@ impl Qwen3AsrModel {
         let prompt_len = prompt_prefix().len()
             + encoder::audio_token_count(valid)
             + suffix.len();
+        // Generation bound: the caller's limit clamped to the KV decode room.
+        // The decode loop stops at the position cap without consuming another
+        // row, so `prompt_len + n <= KV_CAPACITY` bounds the written rows.
+        let room = KV_CAPACITY
+            .checked_sub(prompt_len + 1)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "kv cache overflow: prompt {prompt_len} rows leave no decode room in capacity {KV_CAPACITY}"
+                ))
+            })?;
+        let effective = max_new_tokens.min(room);
         {
             let mut state = self.decode_state.borrow_mut();
             ensure_prefill_workspace(&self.ctx, &mut state.prefill_ws, prompt_len)?;
@@ -198,7 +221,7 @@ impl Qwen3AsrModel {
                 &mut state,
                 first_token,
                 prompt_len,
-                MAX_NEW_TOKENS,
+                effective,
                 &EOS_TOKENS,
             )?
         } else {
@@ -213,7 +236,7 @@ impl Qwen3AsrModel {
                     &mut state,
                     first_token,
                     prompt_len,
-                    MAX_NEW_TOKENS,
+                    effective,
                     &EOS_TOKENS,
                 )
             })?
@@ -226,9 +249,14 @@ impl Qwen3AsrModel {
             );
         }
 
+        // Both decode loops push the prefill token, return at EOS after the
+        // push, return once `generated.len() == effective`, and return at the
+        // position cap otherwise. A non-EOS stop short of the caller's bound
+        // is therefore exactly the clamped position cap.
         let stopped_reason = match generated.last() {
             Some(&id) if EOS_TOKENS.contains(&id) => AsrStopReason::Eos,
-            _ => AsrStopReason::MaxTokens,
+            _ if generated.len() >= max_new_tokens => AsrStopReason::MaxTokens,
+            _ => AsrStopReason::PositionCap,
         };
         let valid_tokens = generated.len();
         Ok(AsrTranscription {
@@ -321,7 +349,7 @@ impl AsrTrait for Qwen3AsrModel {
                 )));
             }
         }
-        self.transcribe_internal(request.waveform, language)
+        self.transcribe_internal(request.waveform, language, request.max_new_tokens)
     }
 }
 

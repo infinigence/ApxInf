@@ -797,14 +797,16 @@ impl AsrRunner {
     /// * `language` — explicit language code (e.g. `"Chinese"`); required by
     ///   families without detection.
     /// * `task` — `"transcribe"` (default).
-    /// * `max_new_tokens` — upper bound on generated tokens (default 224).
+    /// * `max_new_tokens` — upper bound on generated tokens (default 512, the
+    ///   converted checkpoint's generation_config bound; clamped to the KV
+    ///   decode room).
     ///
     /// Returns a dict with:
     /// * `token_ids` — list[int] of generated ids (prefix excluded, EOS
     ///   included when produced).
-    /// * `stopped_reason` — `"eos"` or `"max_tokens"`.
+    /// * `stopped_reason` — `"eos"`, `"max_tokens"`, or `"position_cap"`.
     /// * `valid_tokens` — number of generated tokens.
-    #[pyo3(signature = (waveform, language, task="transcribe", max_new_tokens=224))]
+    #[pyo3(signature = (waveform, language, task="transcribe", max_new_tokens=512))]
     fn transcribe(
         &self,
         py: Python<'_>,
