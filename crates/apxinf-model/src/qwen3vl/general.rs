@@ -24,6 +24,7 @@ use super::vision::{self, VisionOutput};
 
 pub struct GeneralQwen3VL {
     config: Qwen3VLConfig,
+    input_contract: Option<crate::vision_preprocess::VisionContract>,
     weights: Qwen3VLTextWeights,
     vision_weights: Qwen3VLVisionWeights,
     /// Pre-transposed `token_embedding` for the tied lm_head matmul. Shape
@@ -45,15 +46,22 @@ pub struct GeneralQwen3VL {
 }
 
 impl GeneralQwen3VL {
+    pub(crate) fn set_vision_contract(&mut self, contract: crate::vision_preprocess::VisionContract) {
+        self.input_contract = Some(contract);
+    }
+
     /// Load Qwen3-VL from a model directory containing `config.json` and
     /// `model.safetensors`. Weights are always loaded native (no bf16→f32
     /// upcast) because the CUDA text path is bf16-only.
     pub fn from_dir(model_dir: &Path, device: Device) -> Result<Self> {
         let cfg_path = model_dir.join("config.json");
         let cfg = Qwen3VLConfig::from_json_file(&cfg_path)?;
+        let contract = crate::vision_preprocess::VisionContract::from_dir(model_dir, "qwen3vl", 1, apxinf_core::DType::BF16)?;
         let (tensors, _meta) = safetensors::load_native_path(model_dir)
             .map_err(|e| Error::Other(format!("load safetensors: {e}")))?;
-        Self::from_weights(cfg, tensors, device)
+        let mut model = Self::from_weights(cfg, tensors, device)?;
+        model.set_vision_contract(contract);
+        Ok(model)
     }
 
     /// Build from a pre-parsed config + weight map + device. Useful for
@@ -117,6 +125,7 @@ impl GeneralQwen3VL {
 
         Ok(Self {
             config, weights, vision_weights, lm_head, backend, kv,
+            input_contract: None,
             rope_delta: 0,
             #[cfg(feature = "cuda")]
             decode_graph,
@@ -493,8 +502,16 @@ impl LlmTrait for GeneralQwen3VL {
         Ok(logits)
     }
 
+    fn sequence_capacity(&self) -> Option<usize> {
+        Some(self.config.text.max_position_embeddings.min(4096))
+    }
+
     fn backend(&self) -> &dyn Backend {
         &*self.backend
+    }
+
+    fn vision_contract(&self) -> Option<&crate::vision_preprocess::VisionContract> {
+        self.input_contract.as_ref()
     }
 
     fn capabilities(&self) -> LlmCapabilities {

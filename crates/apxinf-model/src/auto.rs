@@ -213,6 +213,29 @@ impl LoadedModel {
         }
     }
 
+    pub fn sequence_capacity(&self) -> Option<usize> {
+        match self {
+            Self::Text { model, .. } => model.sequence_capacity(),
+            _ => None,
+        }
+    }
+
+    pub fn vision_contract(&self) -> Option<&crate::vision_preprocess::VisionContract> {
+        match self {
+            Self::Text { model, .. } => model.vision_contract(),
+            _ => None,
+        }
+    }
+
+    pub fn prepare_images(
+        &self, tokens: &[u32], images: &[crate::vision_preprocess::DecodedImage], limit: usize,
+    ) -> Result<crate::vision_preprocess::PreparedVision> {
+        match self {
+            Self::Text { model, .. } => model.prepare_images(tokens, images, limit),
+            _ => Err(Error::Other("decoded image generation needs a text runtime".into())),
+        }
+    }
+
     /// Model plus deployment generation settings before request overrides.
     pub fn generation_defaults(&self) -> Result<&GenerationOptions> {
         match self {

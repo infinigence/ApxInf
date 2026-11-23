@@ -171,6 +171,14 @@ Llama-shaped shared config. Validate dimensions and architecture invariants at
 load time. Defaults are acceptable only when the reference format defines the
 same defaults.
 
+Text runtimes must report their actual safe `LlmTrait::sequence_capacity`,
+including allocation caps or dynamic allocator limits. Image-capable text
+runtimes additionally expose a checkpoint-owned `VisionContract`; reject missing
+or unsupported preprocessor fields at load time. Keep container decoding outside
+the model, and canonicalization, pixel dtype and placeholder expansion inside.
+Reuse the shared `vision_preprocess` algorithm when its declared semantics fit;
+record offline pixel/grid/token fixtures for each accepted processor layout.
+
 ### Weights
 
 Map checkpoint keys explicitly. Record every transpose, reshape, concatenation,

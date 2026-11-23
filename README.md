@@ -102,6 +102,15 @@ See the [MLX architecture and supported profiles](doc/mlx-backend.md) and
 [native SDK setup](crates/apxinf-mlx/README.md) for build requirements,
 MiniCPM/DSpark commands and supported options.
 
+### Serve an LLM/VLM over HTTP
+
+Build with `--features server,cuda` and run `apxinf serve --model /path/to/checkpoint
+--device cuda:0` to expose OpenAI Chat Completions and Anthropic Messages APIs.
+The optional server supports streaming, Qwen3 XML tool calls, and inline PNG/JPEG
+input for native vision-capable models through a bounded, serial worker.
+See [LLM/VLM HTTP serving](crates/apxinf-serving/README.md) for CPU/Metal builds,
+processor setup, request examples and supported protocol limits.
+
 ### Run a d3-mini text decision
 
 Download the complete [`vllm-sr/d3-mini`](https://huggingface.co/vllm-sr/d3-mini)

@@ -14,6 +14,7 @@ pub mod hip_gr00t;
 #[cfg(feature = "hip")]
 pub mod hip_pi05;
 pub mod image;
+pub mod vision_preprocess;
 pub mod llama;
 pub mod llm_trait;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]

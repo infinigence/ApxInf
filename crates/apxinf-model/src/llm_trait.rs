@@ -261,6 +261,29 @@ pub trait LlmTrait {
         LlmCapabilities::TEXT_ONLY
     }
 
+    /// Maximum prompt + generation length admitted by the actual runtime.
+    /// Static implementations report allocated KV size; dynamic ones report
+    /// the limit their request allocator can safely satisfy. None means unknown.
+    fn sequence_capacity(&self) -> Option<usize> {
+        self.preparation_status().kv_capacity
+    }
+
+    /// Checkpoint-owned decoded-image contract, independent of transport.
+    fn vision_contract(&self) -> Option<&crate::vision_preprocess::VisionContract> {
+        None
+    }
+
+    fn prepare_images(
+        &self,
+        tokens: &[u32],
+        images: &[crate::vision_preprocess::DecodedImage],
+        max_prompt_tokens: usize,
+    ) -> Result<crate::vision_preprocess::PreparedVision> {
+        self.vision_contract()
+            .ok_or_else(|| Error::Other("model has no decoded-image contract".into()))?
+            .prepare(tokens, images, max_prompt_tokens)
+    }
+
     /// Inspect family-owned preparation without performing compilation, changing
     /// state, or selecting a runtime. Legacy implementations report
     /// [`TextPreparationState::RuntimeManaged`], which is not an explicit Ready.
@@ -428,6 +451,11 @@ where
         .len()
         .checked_add(options.max_new_tokens)
         .ok_or_else(|| Error::Other("generation sequence length overflow".into()))?;
+    if let Some(limit) = model.sequence_capacity() {
+        if capacity > limit {
+            return Err(Error::Other(format!("prompt + generation requires {capacity} tokens; runtime KV capacity is {limit}")));
+        }
+    }
     let prompt_end = u32::try_from(prompt_tokens.len())
         .map_err(|_| Error::Other("generation position exceeds u32".into()))?;
     u32::try_from(capacity).map_err(|_| Error::Other("generation position exceeds u32".into()))?;
