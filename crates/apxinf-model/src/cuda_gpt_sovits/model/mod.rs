@@ -1,8 +1,6 @@
-//! GPT-SoVITS V5 network semantics and the eager synthesis orchestration.
+//! GPT-SoVITS V5 network semantics and the single synthesis orchestration.
 
-use std::cell::RefCell;
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use apxinf_core::{Error, Result, Tensor};
@@ -11,15 +9,12 @@ use apxinf_cuda_new::{transfers, CudaContext as Context};
 use super::config::GptSovitsConfig;
 use super::ops;
 use super::weights::Weights;
-use crate::cuda_gpt_sovits::model_runner::cache::{
-    ConditioningCache, ReferenceFeatures, ReferenceKey, TextKey,
-};
-use crate::tts_trait::{
-    gpt_sovits_inputs, GeneratedAudio, GptSovitsInputs, TtsRequest, TtsSampling,
-};
+use crate::tts_trait::{gpt_sovits_inputs, GeneratedAudio, TtsRequest, TtsSampling};
 
 mod bert;
 mod cfm;
+pub(super) mod conditioning;
+mod executor;
 mod gpt;
 mod hubert;
 mod sovits;
@@ -27,10 +22,12 @@ mod vocoder;
 
 pub(crate) use self::bert::Bert;
 pub(crate) use self::cfm::{run_chunked, validate_sample_steps, Cfm, StepModulation};
-pub(crate) use self::cfm::{MAX_TARGET_CHUNK, REFERENCE_FRAMES, TOTAL_CHUNK};
+pub(crate) use self::cfm::{ChunkArgs, MAX_TARGET_CHUNK, REFERENCE_FRAMES, TOTAL_CHUNK};
+pub(crate) use self::executor::SynthesisExecutor;
 pub(crate) use self::gpt::{
     device_sample_fp16_exponential_race, logits_prefix, sample_fp16_exponential_race, DecodeCache,
-    Gpt, DECODE_WORKSPACE_BYTES, DEVICE_SAMPLING_MAX_TOP_K, MIN_GENERATED_BEFORE_EOS,
+    DecodeEmbedScratch, Gpt, DECODE_WORKSPACE_BYTES, DEVICE_SAMPLING_MAX_TOP_K,
+    MIN_GENERATED_BEFORE_EOS,
 };
 pub(crate) use self::hubert::Hubert;
 pub(crate) use self::sovits::{repeat_row_ids, Sovits};
@@ -59,7 +56,7 @@ pub(super) fn sampling_of(request: &TtsRequest<'_>) -> (usize, f32, f32, f32, f3
 
 pub(super) const SPEC_MIN: f32 = -12.0;
 pub(super) const SPEC_MAX: f32 = 2.0;
-pub(super) const OUTPUT_SAMPLE_RATE: u32 = 48000;
+pub(crate) const OUTPUT_SAMPLE_RATE: u32 = 48000;
 /// Semantic tokens per second and the hard cap on one request's generation.
 const SEMANTIC_TOKENS_PER_SECOND: f32 = 25.0;
 const MAX_SEMANTIC_TOKENS: usize = 1500;
@@ -128,20 +125,18 @@ pub(super) fn owned_tensor(ctx: &Context, source: &Tensor) -> Result<Tensor> {
 
 pub struct GptSovitsModel {
     pub(super) ctx: Arc<Context>,
-    pub(super) bert: Arc<Bert>,
-    pub(super) hubert: Arc<Hubert>,
-    pub(super) gpt: Arc<Gpt>,
-    pub(super) sovits: Arc<Sovits>,
-    pub(super) cfm: Arc<Cfm>,
-    pub(super) vocoder: Arc<Vocoder>,
-    pub(super) config: GptSovitsConfig,
-    pub(super) cache: Rc<RefCell<ConditioningCache>>,
+    pub(crate) bert: Arc<Bert>,
+    pub(crate) hubert: Arc<Hubert>,
+    pub(crate) gpt: Arc<Gpt>,
+    pub(crate) sovits: Arc<Sovits>,
+    pub(crate) cfm: Arc<Cfm>,
+    pub(crate) vocoder: Arc<Vocoder>,
+    pub(crate) config: GptSovitsConfig,
     mel_denorm: MelDenormConstants,
 }
 
 /// The four mel-denormalization affine constants (see `denormalize_mel`),
-/// uploaded once at load and shared by every eager synthesis request.
-/// The prepared path captures its own copies during `prepare()`.
+/// uploaded once at load and shared by every synthesis request.
 struct MelDenormConstants {
     one: Tensor,
     scale: Tensor,
@@ -179,66 +174,8 @@ impl GptSovitsModel {
             cfm: Arc::new(cfm),
             vocoder: Arc::new(vocoder),
             config,
-            cache: Rc::new(RefCell::new(ConditioningCache::default())),
             mel_denorm,
         })
-    }
-
-    fn bert_phone_features(
-        &self,
-        token_ids: &[u32],
-        word2ph: &[u32],
-        phone_count: usize,
-    ) -> Result<Tensor> {
-        self.bert_phone_features_inner(token_ids, word2ph, phone_count, true)
-    }
-
-    fn bert_phone_features_inner(
-        &self,
-        token_ids: &[u32],
-        word2ph: &[u32],
-        phone_count: usize,
-        cache_text: bool,
-    ) -> Result<Tensor> {
-        let key = TextKey::new(token_ids, word2ph, phone_count, false);
-        if cache_text {
-            if let Some(value) = self.cache.borrow_mut().text(&key) {
-                return Ok(value);
-            }
-        }
-        let hidden = self.bert.forward(&self.ctx, token_ids)?;
-        if hidden.shape().dims()[0] != word2ph.len() {
-            return Err(Error::Other(format!(
-                "BERT token/word2ph mismatch: {} tokens vs {} entries",
-                hidden.shape().dims()[0],
-                word2ph.len()
-            )));
-        }
-        let mut map: Vec<i32> = Vec::with_capacity(phone_count);
-        for (index, count) in word2ph.iter().enumerate() {
-            for _ in 0..*count {
-                map.push(index as i32);
-            }
-        }
-        if map.len() != phone_count {
-            return Err(Error::Other(format!(
-                "word2ph expands to {} phones, expected {phone_count}",
-                map.len()
-            )));
-        }
-        let ids = Tensor::from_i32(vec![map.len()], &map)?;
-        let ids = transfers::to_cuda(&ids, self.ctx.device_id())?;
-        let value = ops::gather_rows(&self.ctx, &hidden, &ids)?;
-        if cache_text {
-            self.cache.borrow_mut().insert_text(key, value.clone());
-        }
-        Ok(value)
-    }
-
-    fn codes_to_vec(&self, codes: &Tensor) -> Result<Vec<u32>> {
-        let host = transfers::to_cpu(codes)?;
-        let values = host.as_i32()?;
-        Ok(values.iter().map(|value| *value as u32).collect())
     }
 
     fn codes_from_vec(&self, codes: &[u32]) -> Result<Tensor> {
@@ -247,46 +184,16 @@ impl GptSovitsModel {
         transfers::to_cuda(&host, self.ctx.device_id())
     }
 
-    fn reference_features(&self, inputs: &GptSovitsInputs<'_>) -> Result<Rc<ReferenceFeatures>> {
-        let key = ReferenceKey::new(inputs, false);
-        if let Some(value) = self.cache.borrow_mut().reference(&key) {
-            return Ok(value);
-        }
-        let frames = inputs.reference_mel.len() / 100;
-        let spec_frames = inputs.reference_spec.len() / 704;
-        let mel = super::weights::fp16_tensor(&self.ctx, &[frames, 100], inputs.reference_mel)?;
-        let spec =
-            super::weights::fp16_tensor(&self.ctx, &[spec_frames, 704], inputs.reference_spec)?;
-        let bert = self.bert_phone_features_inner(
-            inputs.reference_bert_token_ids,
-            inputs.reference_word2ph,
-            inputs.reference_phone_ids.len(),
-            false,
-        )?;
-        let codes = self.hubert.encode(&self.ctx, inputs.reference_audio_16k)?;
-        let prompt = self.codes_to_vec(&codes)?;
-        let style = self.sovits.style(&self.ctx, &spec)?;
-        let features = self.sovits.decode_features(
-            &self.ctx,
-            &codes,
-            inputs.reference_phone_ids,
-            &style,
-            1.0,
-        )?;
-        let value = Rc::new(ReferenceFeatures {
-            bert,
-            prompt,
-            style,
-            features,
-            mel,
-        });
-        self.cache
-            .borrow_mut()
-            .insert_reference(key, Rc::clone(&value));
-        Ok(value)
-    }
-
-    pub fn synthesize(&self, request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
+    /// The single network orchestration: conditioning, semantic decoding,
+    /// acoustic feature synthesis, mel denormalization and vocoding, in the
+    /// official order and with the official alignment rules. How each
+    /// capturable stage executes — eager operators or prepared graph replay —
+    /// is the executor's decision; the math and its ordering live here once.
+    pub(crate) fn synthesize_with(
+        &self,
+        request: &TtsRequest<'_>,
+        exec: &dyn SynthesisExecutor,
+    ) -> Result<GeneratedAudio> {
         let inputs = gpt_sovits_inputs(request)?;
         let (top_k, top_p, temperature, repetition_penalty, max_seconds) = sampling_of(request);
         if !inputs.speed_factor.is_finite() || inputs.speed_factor <= 0.0 {
@@ -308,30 +215,38 @@ impl GptSovitsModel {
         if reference_frames == 0 || reference_spec_frames == 0 {
             return Err(Error::Other("reference mel/spec is empty".into()));
         }
-        let reference = self.reference_features(inputs)?;
+        if inputs.cfg_rate > 1e-5 {
+            return Err(Error::Other(
+                "gpt_sovits v5turbo does not support classifier-free guidance".into(),
+            ));
+        }
+        validate_sample_steps(inputs.sample_steps)?;
+        // NVTX segment timeline for nsys. The graph-replay executor is a black
+        // box, so the four stages are only separable with host-side marks;
+        // without the `nvtx` feature each range is a zero-cost no-op.
+        let _tts_reference_range = crate::profiling::trace::range("tts.reference");
+        let reference = exec.reference_features(inputs)?;
+        drop(_tts_reference_range);
         let reference_mel = reference.mel.clone();
         let reference_bert = reference.bert.clone();
-        let target_bert = self
-            .bert_phone_features(
-                inputs.bert_token_ids,
-                inputs.word2ph,
-                inputs.phone_ids.len(),
-            )
+        let _tts_bert_range = crate::profiling::trace::range("tts.bert");
+        let target_bert = exec
+            .target_bert(inputs)
             .map_err(|error| Error::Other(format!("target bert: {error}")))?;
+        drop(_tts_bert_range);
         let bert = ops::concat_rows(&self.ctx, &reference_bert, &target_bert)
             .map_err(|error| Error::Other(format!("bert concat: {error}")))?;
         let mut phones = inputs.reference_phone_ids.to_vec();
         phones.extend_from_slice(inputs.phone_ids);
 
         let prompt = &reference.prompt;
+        let _tts_gpt_range = crate::profiling::trace::range("tts.gpt");
         let max_new_tokens = max_semantic_tokens(max_seconds);
-        let generated = self
-            .gpt
-            .generate(
-                &self.ctx,
+        let generated = exec
+            .generate_semantic(
                 &phones,
                 &bert,
-                &prompt,
+                prompt,
                 request.seed,
                 top_k,
                 top_p,
@@ -340,23 +255,40 @@ impl GptSovitsModel {
                 max_new_tokens,
             )
             .map_err(|error| Error::Other(format!("gpt: {error}")))?;
+        drop(_tts_gpt_range);
         if generated.is_empty() {
             return Err(Error::Other("semantic decoder produced no tokens".into()));
+        }
+        if let Some(expected) = exec.expected_target_frames() {
+            let generated_frames = generated
+                .len()
+                .checked_mul(4)
+                .ok_or_else(|| Error::Other("prepared target length overflow".into()))?;
+            if generated_frames != expected {
+                return Err(Error::Other(format!(
+                    "prepared target frame mismatch: graph expects {expected}, GPT produced {generated_frames} frames from {} semantic tokens",
+                    generated.len()
+                )));
+            }
         }
         let target_codes = self.codes_from_vec(&generated)?;
 
         let ge = reference.style.clone();
         let reference_features = reference.features.clone();
-        let target_features = self
-            .sovits
-            .decode_features(
-                &self.ctx,
-                &target_codes,
-                inputs.phone_ids,
-                &ge,
-                inputs.speed_factor,
-            )
+        let _tts_sovits_range = crate::profiling::trace::range("tts.sovits");
+        let target_features = exec
+            .target_features(&target_codes, inputs.phone_ids, &ge, inputs.speed_factor)
             .map_err(|error| Error::Other(format!("target decode: {error}")))?;
+        drop(_tts_sovits_range);
+        if let Some(expected) = exec.expected_target_frames() {
+            if target_features.shape().dims() != [expected, 512] {
+                return Err(Error::Other(format!(
+                    "prepared target frame mismatch: graph expects {expected}, GPT produced {} frames from {} semantic tokens",
+                    target_features.shape().dims()[0],
+                    generated.len()
+                )));
+            }
+        }
         // The tts request carries the final prompt mel (typically 500
         // frames), while reference features are decoded at the pre-truncation
         // rate derived from the full reference spectrogram. PyTorch first
@@ -371,18 +303,36 @@ impl GptSovitsModel {
                 }
                 None => reference_features,
             };
-        let mel = self
-            .cfm
-            .synthesize(
-                &self.ctx,
-                &reference_features,
-                &target_features,
-                &reference_mel,
-                inputs.sample_steps,
-                inputs.cfg_rate,
-                request.seed,
-            )
-            .map_err(|error| Error::Other(format!("cfm: {error}")))?;
+        let reference_frames = reference_frames
+            .min(reference_features.shape().dims()[0])
+            .min(REFERENCE_FRAMES);
+        let original_mel = ops::slice_rows(
+            &self.ctx,
+            &reference_mel,
+            reference_mel.shape().dims()[0] - reference_frames,
+            reference_frames,
+        )?;
+        let original_features = ops::slice_rows(
+            &self.ctx,
+            &reference_features,
+            reference_features.shape().dims()[0] - reference_frames,
+            reference_frames,
+        )?;
+        let mel = run_chunked(
+            &self.ctx,
+            &original_mel,
+            &original_features,
+            &target_features,
+            reference_frames,
+            |args| {
+                let _tts_cfm_range = crate::profiling::trace::range("tts.cfm.chunk");
+                let seed = request.seed.wrapping_add(args.chunk_index as u64);
+                let generated = exec.cfm_chunk(args, inputs.sample_steps, seed)?;
+                drop(_tts_cfm_range);
+                Ok(generated)
+            },
+        )
+        .map_err(|error| Error::Other(format!("cfm: {error}")))?;
         let constants = &self.mel_denorm;
         let mel = denormalize_mel(
             &self.ctx,
@@ -392,10 +342,9 @@ impl GptSovitsModel {
             &constants.zero,
             &constants.shift,
         )?;
-        let samples = self
-            .vocoder
-            .synth(&self.ctx, &mel)
-            .map_err(|error| Error::Other(format!("vocoder: {error}")))?;
+        let _tts_vocoder_range = crate::profiling::trace::range("tts.vocoder");
+        let samples = exec.vocode(&mel)?;
+        drop(_tts_vocoder_range);
         // No implicit trailing pause. The public pipeline appends
         // `fragment_interval` silence after every text fragment, matching the
         // official `audio_postprocess`.

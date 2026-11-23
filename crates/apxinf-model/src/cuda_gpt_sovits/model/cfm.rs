@@ -687,7 +687,7 @@ impl Cfm {
         Self::suppress_reference(ctx, &updated, prompt_len, target_len)
     }
 
-    fn run_chunk(
+    pub(crate) fn run_chunk(
         &self,
         ctx: &Context,
         features: &Tensor,
@@ -764,60 +764,6 @@ impl Cfm {
             )?;
         }
         ops::slice_rows(ctx, &x, prompt_len, target_len)
-    }
-
-    /// `reference_features` and `target_features` are `[frames, 512]`;
-    /// `reference_mel` is normalized `[frames, 100]`.
-    pub fn synthesize(
-        &self,
-        ctx: &Context,
-        reference_features: &Tensor,
-        target_features: &Tensor,
-        reference_mel: &Tensor,
-        steps: usize,
-        cfg_rate: f32,
-        seed: u64,
-    ) -> Result<Tensor> {
-        validate_sample_steps(steps)?;
-        if cfg_rate > 1e-5 {
-            return Err(Error::Other(
-                "gpt_sovits v5turbo does not support classifier-free guidance".into(),
-            ));
-        }
-        let reference_frames = reference_mel.shape().dims()[0]
-            .min(reference_features.shape().dims()[0])
-            .min(REFERENCE_FRAMES);
-        let prompt_mel = ops::slice_rows(
-            ctx,
-            reference_mel,
-            reference_mel.shape().dims()[0] - reference_frames,
-            reference_frames,
-        )?;
-        let prompt_features = ops::slice_rows(
-            ctx,
-            reference_features,
-            reference_features.shape().dims()[0] - reference_frames,
-            reference_frames,
-        )?;
-        let original_mel = prompt_mel;
-        let original_features = prompt_features;
-        run_chunked(
-            ctx,
-            &original_mel,
-            &original_features,
-            target_features,
-            reference_frames,
-            |args| {
-                self.run_chunk(
-                    ctx,
-                    args.prompt_features,
-                    args.target,
-                    args.prompt_mel,
-                    steps,
-                    seed.wrapping_add(args.chunk_index as u64),
-                )
-            },
-        )
     }
 }
 

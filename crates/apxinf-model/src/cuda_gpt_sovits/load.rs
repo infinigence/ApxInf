@@ -7,7 +7,7 @@ use apxinf_core::{Backend, Device, Error, Result};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
 
-use super::model::GptSovitsModel;
+use super::model_runner::GptSovitsTts;
 
 /// Registry entry for the GPT-SoVITS V5 family.
 pub fn load(
@@ -25,6 +25,6 @@ pub fn load(
         Device::Cuda(device_id) => device_id,
         other => return Err(Error::UnsupportedDevice(other)),
     };
-    let model = GptSovitsModel::load_with_autotune(path, device_id, options.autotune)?;
+    let model = GptSovitsTts::load_with_autotune(path, device_id, options.autotune)?;
     Ok(LoadedModel::Tts(Box::new(model)))
 }

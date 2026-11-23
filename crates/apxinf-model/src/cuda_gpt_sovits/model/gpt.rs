@@ -1,28 +1,44 @@
 //! GPT (Text2Semantic) decoder for GPT-SoVITS V5.
 
-use std::cell::RefCell;
-
-use apxinf_core::{philox4x32_10, DType, Error, Result, Shape, Tensor};
+use apxinf_core::{philox4x32_10, Error, Result, Shape, Tensor};
 use apxinf_cuda_new::ops::{
     self as cuda_ops, AttentionMask, KvCacheAttentionArgs, KvCacheDecodeMeta,
 };
 use apxinf_cuda_new::{transfers, CudaBuffer, CudaContext as Context};
 
-use crate::cuda_gpt_sovits::config::{
-    GPT_AUDIO_VOCAB, GPT_BERT_DIM, GPT_EOS, GPT_HEADS, GPT_HIDDEN, GPT_LAYERS,
-};
-use crate::cuda_gpt_sovits::model_runner::gpt_decode::{
-    DecodeEmbedScratch, DecodeResources, PrefillResources,
-};
+use crate::cuda_gpt_sovits::config::{GPT_BERT_DIM, GPT_HEADS, GPT_HIDDEN, GPT_LAYERS};
 use crate::cuda_gpt_sovits::ops;
 use crate::cuda_gpt_sovits::weights::{fp16_tensor, ids_tensor, Linear, Weights};
 
 const MAX_POSITIONS: usize = 4000;
 pub(crate) const MIN_GENERATED_BEFORE_EOS: usize = 11;
 pub(crate) const DECODE_WORKSPACE_BYTES: usize = 64 * 1024 * 1024;
-// Prefill keeps one whole eager traversal of intermediates in the session
-// arena. Measured peak is ~51 MB; the rest is headroom for longer prompts.
-const PREFILL_WORKSPACE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Fixed buffers for the one-token decode embedding.
+///
+/// `embed_audio` allocates five tensors per call: two 4-byte id vectors, two
+/// 2 KB gathered rows and the 2 KB sum, and the decode loop dropped all five
+/// as soon as they had been copied into `decode_input`. Each free synchronizes
+/// the device, so the step paid five allocator round trips and five drains for
+/// 6 KB of scratch. Keeping them for the life of the decode resources removes
+/// the allocation entirely and writes the sum straight into the graph input.
+pub(crate) struct DecodeEmbedScratch {
+    pub(crate) ids: Tensor,
+    pub(crate) positions: Tensor,
+    pub(crate) table_row: Tensor,
+    pub(crate) position_row: Tensor,
+}
+
+impl DecodeEmbedScratch {
+    pub(crate) fn new(ctx: &Context) -> Result<Self> {
+        Ok(Self {
+            ids: transfers::to_cuda(&Tensor::from_i32(vec![1], &[0])?, ctx.device_id())?,
+            positions: transfers::to_cuda(&Tensor::from_i32(vec![1], &[0])?, ctx.device_id())?,
+            table_row: ops::alloc(ctx, &[1, GPT_HIDDEN])?,
+            position_row: ops::alloc(ctx, &[1, GPT_HIDDEN])?,
+        })
+    }
+}
 
 struct Layer {
     q: Linear,
@@ -50,8 +66,6 @@ pub(crate) struct DecodeCache {
 }
 
 pub struct Gpt {
-    pub(crate) decode_resources: RefCell<Option<DecodeResources>>,
-    pub(crate) prefill_resources: RefCell<Option<PrefillResources>>,
     text_emb: Tensor,
     audio_emb: Tensor,
     bert_proj: Linear,
@@ -395,8 +409,6 @@ impl Gpt {
             audio_pe,
             layers,
             out,
-            decode_resources: RefCell::new(None),
-            prefill_resources: RefCell::new(None),
         })
     }
 
@@ -635,79 +647,7 @@ impl Gpt {
         })
     }
 
-    /// Prefill inside a reusable execution session. Native operator resources
-    /// are prepared once per (text_len, audio_len, cache capacity) instead of
-    /// once per operator per request; a replay pass allocates from the session
-    /// arena and launches the prepared executions directly.
-    pub(crate) fn prefill_session_cached(
-        &self,
-        ctx: &Context,
-        text: &Tensor,
-        audio: &Tensor,
-        cache: &mut DecodeCache,
-    ) -> Result<Tensor> {
-        let text_len = text.shape().dims()[0];
-        let audio_len = audio.shape().dims()[0];
-        let mut slot = self.prefill_resources.borrow_mut();
-        let reusable = matches!(slot.as_ref(), Some(resources)
-            if resources.capacity == cache.capacity
-                && resources.text_len == text_len
-                && resources.audio_len == audio_len);
-        if !reusable {
-            *slot = Some(PrefillResources {
-                session: cuda_ops::ExecutionSession::with_capacity_pinning_prepared_buffers(
-                    PREFILL_WORKSPACE_BYTES,
-                    ctx.device_id(),
-                )?,
-                text: ops::alloc(ctx, &[text_len, GPT_HIDDEN])?,
-                audio: ops::alloc(ctx, &[audio_len, GPT_HIDDEN])?,
-                text_len,
-                audio_len,
-                capacity: cache.capacity,
-                prepared: false,
-            });
-        }
-        // Either the slot was reusable (so already `Some`) or it was just
-        // filled above, so this borrow cannot fail.
-        let resources = slot.as_mut().expect("prefill resources");
-        transfers::copy_cuda_to_cuda(ctx, text, &resources.text)?;
-        transfers::copy_cuda_to_cuda(ctx, audio, &resources.audio)?;
-        let staged_text = resources.text.clone();
-        let staged_audio = resources.audio.clone();
-        let session = resources.session.clone();
-        let prepared = resources.prepared;
-        let saved = (cache.text_len, cache.audio_len);
-        let mut replay_error: Option<Error> = None;
-        if prepared {
-            match cuda_ops::with_session(&session, || {
-                self.prefill_cached(ctx, staged_text.clone(), staged_audio.clone(), cache)
-            }) {
-                Ok(logits) => return Ok(logits),
-                Err(error) => {
-                    // The address-keyed cache no longer matches this operand
-                    // set; fall back to a full prepare pass instead of failing.
-                    replay_error = Some(error);
-                    cache.text_len = saved.0;
-                    cache.audio_len = saved.1;
-                }
-            }
-        }
-        let logits = cuda_ops::prepare_with_session(&session, || {
-            self.prefill_cached(ctx, staged_text.clone(), staged_audio.clone(), cache)
-        })
-        .map_err(|error| match replay_error {
-            Some(previous) => Error::Other(format!(
-                "GPT prefill replay failed ({previous}) and re-prepare failed ({error})"
-            )),
-            None => error,
-        })?;
-        if let Some(resources) = slot.as_mut() {
-            resources.prepared = true;
-        }
-        Ok(logits)
-    }
-
-    fn prefill_cached(
+    pub(crate) fn prefill_cached(
         &self,
         ctx: &Context,
         text: Tensor,
@@ -803,6 +743,8 @@ impl Gpt {
 #[cfg(test)]
 mod sampling_tests {
     use super::*;
+    use apxinf_core::DType;
+    use crate::cuda_gpt_sovits::config::GPT_AUDIO_VOCAB;
 
     #[test]
     fn fp16_sampling_probabilities_match_reference_boundaries() {

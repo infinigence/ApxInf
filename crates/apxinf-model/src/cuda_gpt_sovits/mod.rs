@@ -7,4 +7,4 @@ mod model_runner;
 mod ops;
 mod weights;
 
-pub use model::GptSovitsModel;
+pub use model_runner::GptSovitsTts;
