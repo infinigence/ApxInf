@@ -37,6 +37,20 @@ Qwen3.8-27B-NVFP4 is a text LLM behind `LlmTrait` with the same
 - [model-port-workflow](../skills/model-port-workflow/SKILL.md): a complete new-family port, including module ownership, registration, public integration and GPU evidence.
 - [analyze-model-impl](../skills/analyze-model-impl/SKILL.md): trace the selected implementation from model/runner through actual backend calls; source inspection alone is not a benchmark.
 - [l3-reference-testing](../skills/l3-reference-testing/SKILL.md): independent numerical tests for `apxinf-cuda-new` L3 semantics/candidates; these are separate from current PI0.5 backend and model-level acceptance.
+- [finish-work-session](../skills/finish-work-session/SKILL.md): report recorded token usage (input cache hits, input cache misses, output, per-model breakdown) for the current Codex or Claude Code session and all descendant agents; missing usage stays visible instead of counting as zero.
+
+To install finish-work-session, run from the repository root:
+
+```bash
+# Claude Code
+mkdir -p .claude/skills && ln -s ../../skills/finish-work-session .claude/skills/
+
+# Codex
+mkdir -p ~/.agents/skills && ln -s "$(pwd)/skills/finish-work-session" ~/.agents/skills/
+```
+
+Then say "finish this session", or invoke `/finish-work-session` (Claude Code) or `$finish-work-session` (Codex). The helper also runs directly with
+`python3 skills/finish-work-session/scripts/session_usage.py --agent claude-code` (or `--agent codex`). Reports are snapshots of locally recorded usage; running requests and the final reporting response are not included. Save reports under `devlocal/<feat-name>/reports/`.
 
 Skills resolve these documents from the checkout/worktree being modified,
 even when installed globally through a symlink to another branch. Repository
