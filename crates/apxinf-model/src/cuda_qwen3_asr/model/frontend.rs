@@ -14,8 +14,8 @@ use apxinf_cuda_new::ops::whisper_frontend::{
 use apxinf_cuda_new::ops::GemmArgs;
 use apxinf_cuda_new::{transfers, CudaContext as Context};
 
-use super::config::{FRAMES, MEL_BINS, SAMPLES};
-use super::weights::Weights;
+use crate::cuda_qwen3_asr::config::{FRAMES, MEL_BINS, SAMPLES};
+use crate::cuda_qwen3_asr::weights::Weights;
 
 pub const N_FFT: usize = 400;
 pub const HOP: usize = 160;

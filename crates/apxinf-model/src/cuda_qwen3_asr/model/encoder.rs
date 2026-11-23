@@ -22,8 +22,8 @@ use apxinf_cuda_new::ops::{
 use apxinf_cuda_new::transfers::copy_cuda_to_cuda;
 use apxinf_cuda_new::{CudaBuffer, CudaContext as Context};
 
-use super::config::*;
-use super::weights::{DTYPE, Weights};
+use crate::cuda_qwen3_asr::config::*;
+use crate::cuda_qwen3_asr::weights::{DTYPE, Weights};
 
 /// Packed valid positions per chunk (len N_CHUNKS).
 fn chunk_post_cnn_lens(valid_frames: usize) -> Vec<usize> {

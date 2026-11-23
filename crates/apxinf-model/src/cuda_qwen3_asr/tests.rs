@@ -16,9 +16,9 @@ use apxinf_cuda_new::CudaBuffer;
 use apxinf_cuda_new::CudaContext as Context;
 
 use super::config::*;
-use super::decoder::{self, Decoder, DecoderStages, KvCaches, PrefillWorkspace};
-use super::encoder::{self, EncoderStages};
-use super::frontend::Frontend;
+use super::model::decoder::{self, Decoder, DecoderStages, KvCaches, PrefillWorkspace};
+use super::model::encoder::{self, EncoderStages};
+use super::model::frontend::Frontend;
 use super::model::Qwen3AsrModel;
 use super::weights::{DTYPE, Weights};
 use crate::asr_trait::{AsrRequest, AsrTrait};

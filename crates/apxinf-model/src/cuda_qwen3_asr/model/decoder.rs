@@ -14,8 +14,8 @@ use apxinf_cuda_new::ops::{
 use apxinf_cuda_new::transfers::copy_cuda_to_cuda;
 use apxinf_cuda_new::{CudaBuffer, CudaContext as Context};
 
-use super::config::*;
-use super::weights::{DTYPE, Weights};
+use crate::cuda_qwen3_asr::config::*;
+use crate::cuda_qwen3_asr::weights::{DTYPE, Weights};
 
 fn alloc(ctx: &Context, dims: &[usize]) -> Result<Tensor> {
     ctx.allocate_output(Shape::new(dims.to_vec()), DTYPE)
@@ -571,59 +571,6 @@ impl Decoder {
         Self
     }
 
-    /// Greedy decode loop, eager mode (no CUDA Graph): every step runs
-    /// op-by-op through [`super::decode_graph::step_body`]. Prefill has
-    /// already run; `first_token` is the token its argmax selected and
-    /// `prompt_len` the row the first step writes. Returns the generated ids
-    /// (EOS included).
-    pub(crate) fn decode_eager(
-        &self,
-        ctx: &Context,
-        weights: &mut Weights,
-        state: &mut super::decode_graph::DecodeState,
-        first_token: i32,
-        prompt_len: usize,
-        max_new_tokens: usize,
-        eos_tokens: &[u32],
-    ) -> Result<Vec<u32>> {
-        let mut next = first_token;
-        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
-        let mut position = prompt_len;
-        let timing = std::env::var("APXINF_QWEN3ASR_TIMING").is_ok();
-        let mut steps: usize = 0;
-        let mut step_us: u128 = 0;
-        // Persistent decode workspace (model-level DecodeState): every step
-        // reuses the same intermediate addresses, which is also what makes
-        // the relaxed session's execution-cache keys recur between
-        // transcriptions.
-        let super::decode_graph::DecodeState { caches, ws, .. } = state;
-        loop {
-            if eos_tokens.contains(&(next as u32)) {
-                generated.push(next as u32);
-                return Ok(generated);
-            }
-            generated.push(next as u32);
-            if generated.len() >= max_new_tokens {
-                return Ok(generated);
-            }
-            if position + 1 >= KV_CAPACITY {
-                // Position cap: stop without consuming another row.
-                return Ok(generated);
-            }
-            let t_step = std::time::Instant::now();
-            next = self.step_fast(ctx, weights, caches, ws, next, position)?;
-            step_us += t_step.elapsed().as_micros();
-            steps += 1;
-            position += 1;
-            if timing && steps % 16 == 0 {
-                eprintln!(
-                    "[qwen3_asr] decode step {steps} cumulative={:?}",
-                    std::time::Duration::from_micros(step_us as u64)
-                );
-            }
-        }
-    }
-
     /// Prefill `ids` (length T) with `audio_embeds` `[n_audio, 2048]` copied
     /// over the token rows `[audio_offset, audio_offset + n_audio)`.
     /// Returns the first greedily-selected next token.
@@ -686,33 +633,6 @@ impl Decoder {
         )
     }
 
-    /// One eager decode step: publish the token/position, run
-    /// [`super::decode_graph::step_body`], and read the greedy next token
-    /// back (the `id_to_host` sync is also what orders the next step's
-    /// `KvCacheDecodeMeta` update against kernels still in flight).
-    fn step_fast(
-        &self,
-        ctx: &Context,
-        weights: &mut Weights,
-        caches: &mut KvCaches,
-        ws: &mut StepWorkspace,
-        token: i32,
-        position: usize,
-    ) -> Result<i32> {
-        let kv_len = position + 1;
-        if kv_len > KV_CAPACITY {
-            return Err(Error::Other(format!(
-                "kv cache overflow: {kv_len} rows exceed capacity {KV_CAPACITY}"
-            )));
-        }
-        ws.set_token(token)?;
-        ws.set_position(position)?;
-        super::decode_graph::step_body(ctx, weights, caches, ws, position)?;
-        let next = id_to_host(ctx, &ws.index)?;
-        dump_logits_step(ctx, ws)?;
-        Ok(next)
-    }
-
     /// The embedding gather writes into the persistent `ws.hidden[0]`, and the
     /// prompt ids are rewritten into the persistent `ws.ids` (no
     /// per-transcription allocation, stable gather input address).
@@ -739,8 +659,8 @@ impl Decoder {
     ///
     /// The `stages` capture path stays available: captures always deep-clone,
     /// because workspace buffers are overwritten in place and a shallow clone
-    /// would follow those writes. Only prefill calls this; decode goes through
-    /// `step_body` instead.
+    /// would follow those writes. Only prefill calls this; the decode loops
+    /// live in `model_runner::decode`.
     pub(crate) fn layers_staged(
         &self,
         ctx: &Context,
@@ -764,7 +684,7 @@ impl Decoder {
             let p = format!("text.layers.{layer}");
             // The residual is a shallow clone of the current slot (shared
             // storage); this layer's add writes the other slot, which keeps the
-            // snapshot safe - the same rotation as step_body.
+            // snapshot safe - the same rotation as the decode steps.
             let residual = ws.hidden[cur].clone();
             let iln_w = weights.get(ctx, &format!("{p}.input_layernorm.w"))?;
             rms_norm_into(ctx, &ws.hidden[cur], &iln_w, &mut ws.normed)?;

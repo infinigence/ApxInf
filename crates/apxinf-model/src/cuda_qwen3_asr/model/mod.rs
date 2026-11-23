@@ -1,4 +1,5 @@
-//! qwen3-asr model runtime: waveform -> mel -> audio tower -> Qwen3 decode.
+//! qwen3-asr model runtime: waveform -> mel -> audio tower -> Qwen3 decode,
+//! and the eager stage orchestration shared by both decode strategies.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -6,16 +7,19 @@ use std::sync::Arc;
 
 use apxinf_core::{Device, Error, Result, Shape, Tensor};
 
-use super::config::*;
-use super::decode_graph::DecodeState;
-use super::decoder::{ensure_prefill_workspace, Decoder};
-use super::encoder;
-use super::frontend::Frontend;
-use super::weights::Weights;
-use crate::asr_trait::{
-    AsrContract, AsrRequest, AsrStopReason, AsrTrait, AsrTranscription,
-};
+use crate::asr_trait::{AsrStopReason, AsrTranscription};
+use crate::cuda_qwen3_asr::config::*;
+use crate::cuda_qwen3_asr::model_runner::decode::DecodeState;
+use crate::cuda_qwen3_asr::weights::{DTYPE, Weights};
 use apxinf_cuda_new::{CudaContext as Context, ExecutionSession};
+
+pub(super) mod decode_step;
+pub(super) mod decoder;
+pub(super) mod encoder;
+pub(super) mod frontend;
+
+use self::decoder::{ensure_prefill_workspace, Decoder};
+use self::frontend::Frontend;
 
 /// Arena reservation for the frontend + audio tower + prefill stage.
 ///
@@ -92,7 +96,7 @@ impl Qwen3AsrModel {
         let decode_state = RefCell::new(DecodeState::alloc(&ctx)?);
         let mel = RefCell::new(ctx.allocate_output(
             Shape::new(vec![FRAMES, MEL_BINS]),
-            super::weights::DTYPE,
+            DTYPE,
         )?);
         Ok(Self {
             ctx: Arc::new(ctx),
@@ -111,7 +115,7 @@ impl Qwen3AsrModel {
     /// text prefixes). `max_new_tokens` is the caller's generation bound; it
     /// is clamped to the KV decode room, in which case a non-EOS stop is
     /// reported as [`AsrStopReason::PositionCap`].
-    fn transcribe_internal(
+    pub(crate) fn transcribe_internal(
         &self,
         waveform: &[f32],
         language: &str,
@@ -318,38 +322,6 @@ impl Qwen3AsrModel {
             );
         }
         Ok((next, prompt.len()))
-    }
-}
-
-impl AsrTrait for Qwen3AsrModel {
-    fn contract(&self) -> AsrContract {
-        AsrContract {
-            sample_rate: SAMPLE_RATE,
-            num_mel_bins: MEL_BINS,
-            max_audio_samples: SAMPLES,
-            max_decoder_positions: KV_CAPACITY,
-            multilingual: true,
-            languages: SUPPORTED_LANGUAGES.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    fn transcribe(&self, request: &AsrRequest<'_>) -> Result<AsrTranscription> {
-        if !request.prompt_token_ids.is_empty() {
-            return Err(Error::Other(
-                "qwen3-asr builds its prompt internally; pass an empty prompt_token_ids".into(),
-            ));
-        }
-        let language = request.language.ok_or_else(|| {
-            Error::Other("qwen3-asr needs an explicit language (no auto-detection)".into())
-        })?;
-        if let Some(task) = request.task {
-            if task != "transcribe" {
-                return Err(Error::Other(format!(
-                    "qwen3-asr supports task \"transcribe\", got {task:?}"
-                )));
-            }
-        }
-        self.transcribe_internal(request.waveform, language, request.max_new_tokens)
     }
 }
 
