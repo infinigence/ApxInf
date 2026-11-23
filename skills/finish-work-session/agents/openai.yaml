@@ -1,0 +1,3 @@
+interface:
+  display_name: "Finish Work Session"
+  short_description: "Report session and sub-agent token usage"
