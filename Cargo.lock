@@ -95,15 +95,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "apxinf-cpu"
-version = "0.1.0"
-dependencies = [
- "apxinf-core",
- "cblas",
- "half",
-]
-
-[[package]]
 name = "apxinf-coreml"
 version = "0.1.0"
 dependencies = [
@@ -113,6 +104,15 @@ dependencies = [
  "prost",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "apxinf-cpu"
+version = "0.1.0"
+dependencies = [
+ "apxinf-core",
+ "cblas",
+ "half",
 ]
 
 [[package]]
@@ -166,6 +166,7 @@ name = "apxinf-model"
 version = "0.1.0"
 dependencies = [
  "apxinf-core",
+ "apxinf-coreml",
  "apxinf-cpu",
  "apxinf-cuda-new",
  "apxinf-hip",
@@ -175,6 +176,7 @@ dependencies = [
  "apxinf-tokenizer",
  "half",
  "once_cell",
+ "prost",
  "serde",
  "serde_json",
  "sha2",

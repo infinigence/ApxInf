@@ -1,4 +1,5 @@
 #pragma once
+#include "../../framework/scratch.h"
 
 #include "../../include/apxinf_cuda/gemm.h"
 #include "../../framework/registry.h"
@@ -158,13 +159,15 @@ struct AccuracyMetrics {
 };
 
 struct Execution {
+  apxinf::framework::Scratch scratch;
   Spec spec{};
   apxinf_gemm_bindings_t bindings{};
   int configuration = 0;
   int device = 0;
   const Implementation* implementation = nullptr;
   // Opaque provider-owned state. The common execution framework never knows which
-  // handles, descriptors, algorithms or temporary buffers a provider needs.
+  // handles, descriptors or algorithms a provider needs. Temporary buffer
+  // bindings register with scratch for runner-owned storage after selection.
   void* provider_state = nullptr;
   size_t resource_bytes = 0;
   // Upper bound for provider-owned device scratch. Providers may query

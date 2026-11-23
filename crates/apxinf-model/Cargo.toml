@@ -8,6 +8,7 @@ license = "Apache-2.0"
 apxinf-core = { path = "../apxinf-core" }
 apxinf-cpu = { path = "../apxinf-cpu" }
 apxinf-mlx = { path = "../apxinf-mlx", optional = true }
+apxinf-coreml = { path = "../apxinf-coreml", optional = true }
 apxinf-cuda-new = { path = "../apxinf-cuda-new", optional = true }
 apxinf-hip = { path = "../apxinf-hip", optional = true }
 apxinf-musa = { path = "../apxinf-musa", optional = true, default-features = false }
@@ -20,12 +21,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.10", optional = true }
 
+[dev-dependencies]
+# Decodes recorded Core ML packages in the Clef GPU+ANE device test.
+prost = "0.14"
+sha2 = "0.10"
+
 [features]
 default = []
 openblas = ["apxinf-cpu/openblas"]
 # Full NVIDIA CUDA inference on the apxinf-cuda-new runtime.
 cuda = ["dep:apxinf-cuda-new"]
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
+# Core ML (Apple Neural Engine) stages in Metal families; implies `mlx`.
+coreml = ["mlx", "dep:apxinf-coreml", "apxinf-coreml/native"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # It no longer gates anything: `cuda` already pulls in `apxinf-cuda-new`, and
 # the model code that used to hide behind this flag now follows `cuda`.
@@ -108,6 +116,3 @@ required-features = ["cuda"]
 [[example]]
 name = "clef_decision_index"
 required-features = ["mlx"]
-
-[dev-dependencies]
-sha2 = "0.10"

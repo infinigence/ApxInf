@@ -204,8 +204,31 @@ storage/state and retiring the old graph readers.
 
 Ordinary Tensor/`WeightVersion` arguments stay canonical: they do not authorize
 in-place packing and cannot select kernels requiring packed weights. Callers
-wanting these kernels must attach `RepackedWeight`. This change does not move
-computation scratch out of provider state or change activation workspace ownership.
+wanting these kernels must attach `RepackedWeight`. Provider computation scratch
+is managed separately from weights and activations.
+PI0.5's runner owns a cuda-new `ProviderWorkspace`, shared by its prepared
+profiles on the same stream. Each session owns its activation `GraphWorkspace`;
+persistent KV/state remains model/request storage. Serial GEMM vendor scratch
+(workspace, unpack/dequantization and projection) and attention temporary
+probabilities/LSE/partials borrow aligned slices of a per-stream block. Different
+streams/devices use distinct blocks. Blocks are rounded up to a fixed
+granularity, so growth never rewrites an old binding and per-block overhead stays
+bounded; executions and captured graphs retain the actual block they reference.
+Constants such as cuBLASLt zero bias and output scale remain private. The opaque
+prepared NVFP4 GEMM workspace and the segmented FA2 LSE buffer remain private
+until their embedded launch state supports external rebinding.
+
+Tuning candidates use private scratch. Final prepared executions borrow runner
+storage after selection and retain the actual block for graph lifetime.
+Repeated `ExecutionSession::prepare` reuses matching cached executions and
+retains them until session drop by default. Variable-length eager runners such
+as PI0FAST keep later decode executions warm across multiple early stops.
+Runner authors may opt in with `ExecutionSession::retire_stale_bindings()` before
+cloning the session when changing bindings should be discarded: executions
+unused for two prepare traversals are retired after a successful traversal.
+Captured graphs retain their own executions and storage. Retirement is separate
+from provider scratch sharing; stable eager arena bindings remain cache hits
+across repeated preparation without enabling CUDA Graphs.
 
 Kernel weight layout is an explicit property of each native `Implementation`
 registry entry. Implementation IDs are local to a semantic registry and must
@@ -336,10 +359,13 @@ renamed as part of unrelated work.
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | `model/` (`WallossModel` + `ModelVariant` over BF16 and dynamic FP8, `blocks/`), `model_runner/` (`WallossModelRunner`, `prepare.rs`: explicit preparation policy/status, capture during preparation, one implicit plan replaced on shape change), `weights/`; per-request grids via `VlaMetadata::image_grid_thw` kept in the family's plan key; model-reported workspace backed by the config-only `workspace.rs` budget; rejected host requests preserve the cached plan; `check_walloss_module_boundaries.py`. See [WallOSS](walloss.md). |
 | GR00T / `VlaRuntime` | Existing `vla_runtime.rs`, `executor.rs`, precision runtime/executor files and private `backbone/`; not migrated to PI0.5's explicit preparation contract |
+| GR00T on HIP / `VlaRuntime` | `hip_gr00t/` in the PI0.5 layout (`model/`, `model_runner/`, `weights/`); `ModelVariant` dispatch over a `Blocks` seam, audited workspace requirements, `EmbodimentSource` outliving upload, execution-policy-driven capture with graph replay; `check_hip_gr00t_module_boundaries.py` applies the PI0.5 rule set. See [HIP port](hip-gr00t.md) |
 | Llama, Qwen3-VL / `LlmTrait` | Existing `general.rs` and family-specific state/decode graph paths; shared autoregressive generation remains in `LlmTrait`, not the VLA runner |
+| Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/total context 40960, request-sized KV/RoPE and 256-token decode attention buckets; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
+| MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/ordinary total context 65792, admitting 65536 prompt tokens plus 256 output tokens; request-sized KV/RoPE and 512-token long prefill; DSpark total context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
 | Qwen3 / `LlmTrait`, MLX | Independent `metal_qwen3/{config,weights,model}.rs`; exact 0.6B geometry/context 2048; `bf16-public`, `bf16-compiled` (local functions and decoder blocks), `mixed-w8` (scoped projections, packed tied table, local functions and Q/K Metal fusion). |
 | MiniCPM5 / `LlmTrait`, MLX | Independent `metal_minicpm5/` with `model.rs`, `math.rs`, `weights.rs` and `dspark.rs`; official 2B/context 4096; `bf16-public`, `bf16-compiled` (whole decode step and packed residual/norm), explicit `dspark` (compiled draft chain plus target verification). |
-| Clef Flash / `SchemaDecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 16384 tokens; `auto` (default) selects the composition qualified on the device: on `applegpu_g13s`, optimized GPU kernels (gate GEMM with SwiGLU epilogue, wm1/wn2 split projections, causal convolution and eight-lane recurrence), which passed quality and paired latency gates there; elsewhere the reference; `reference` is the stock MLX-VLM composition. Both prepare the local shapeless decay/beta callable at load for lengths 1, 2 and 16384; this is not whole-backbone/head preparation. |
+| Clef Flash / `SchemaDecisionRuntime`, MLX | Independent `metal_clef/{config,encode,weights,model}.rs`; affine Q4 Qwen3.5 hybrid backbone and BF16 joint schema head, up to 16384 tokens. `auto` (default) selects the composition qualified on the device: on `applegpu_g13s`, optimized GPU kernels (gate GEMM with SwiGLU epilogue, wm1/wn2 split projections, causal convolution and eight-lane recurrence), which passed quality and paired latency gates there; elsewhere the reference. With `coreml`, explicit `gpu-ane-columns` selects 6656 GPU columns and 5632 ANE INT8 columns per MLP in 512-token tiles; this is not device-qualified by the GPU path's evidence. `reference` is the stock MLX-VLM composition. The decision CLI owns its 1 GiB process cache limit; loading the library model leaves the caller's limit unchanged. All compositions prepare the local shapeless decay/beta callable at load for lengths 1, 2 and 16384; this is not whole-backbone/head or Core ML preparation. |
 
 New VLA code should use `Model` for forward computation and `ModelRunner` for
 execution ownership. Existing family symbols remain their actual names until
