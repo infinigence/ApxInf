@@ -73,6 +73,30 @@ impl Drop for BlasHandle {
     }
 }
 
+/// The optional second GEMM provider.
+///
+/// Null when the crate was built against a ROCm without hipBLASLt, or when the
+/// handle could not be created. Both cases are states, not errors:
+/// `native::gemm` keeps using hipBLAS, which is the default provider anyway.
+///
+/// The handle owns the per-shape descriptor and tactic caches on the C++ side,
+/// so it must outlive every GEMM issued through it and is dropped last.
+struct BlasLtHandle {
+    raw: *mut c_void,
+}
+
+// SAFETY: as for `BlasHandle`.
+unsafe impl Send for BlasLtHandle {}
+unsafe impl Sync for BlasLtHandle {}
+
+impl Drop for BlasLtHandle {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { ffi::apxinf_hip_blaslt_destroy(self.raw) };
+        }
+    }
+}
+
 /// A device allocation, owned by the tensor storage that refers to it.
 ///
 /// Holding an `Arc` to the stream keeps the stream alive as long as any tensor
@@ -94,9 +118,7 @@ unsafe impl Sync for HipBuffer {}
 
 impl Drop for HipBuffer {
     fn drop(&mut self) {
-        unsafe {
-            ffi::apxinf_hip_free(self.ptr, self.stream_ordered as i32, self.stream.raw())
-        };
+        unsafe { ffi::apxinf_hip_free(self.ptr, self.stream_ordered as i32, self.stream.raw()) };
     }
 }
 
@@ -106,18 +128,20 @@ impl HipBuffer {
     }
 }
 
-/// Everything one HIP device needs: its stream, BLAS handle and properties.
+/// Everything one HIP device needs: its stream, BLAS handles and properties.
 pub struct HipContext {
     device_id: usize,
     stream: Arc<HipStream>,
     blas: BlasHandle,
+    blaslt: BlasLtHandle,
     caps: HipDeviceCaps,
 }
 
 impl HipContext {
     pub fn new(device_id: usize) -> Result<Self> {
-        let device = i32::try_from(device_id)
-            .map_err(|_| Error::Other(format!("apxinf-hip: device index {device_id} is too large")))?;
+        let device = i32::try_from(device_id).map_err(|_| {
+            Error::Other(format!("apxinf-hip: device index {device_id} is too large"))
+        })?;
 
         let mut count = 0i32;
         let status = unsafe { ffi::apxinf_hip_device_count(&mut count) };
@@ -134,7 +158,9 @@ impl HipContext {
                 "apxinf-hip: device hip:{device_id} requested, {count} HIP device(s) visible"
             )));
         }
-        check("hipSetDevice", unsafe { ffi::apxinf_hip_set_device(device) })?;
+        check("hipSetDevice", unsafe {
+            ffi::apxinf_hip_set_device(device)
+        })?;
 
         let caps = query_caps(device)?;
         let compiled = env!("APXINF_HIP_ARCH");
@@ -149,9 +175,21 @@ impl HipContext {
         }
 
         let mut raw_stream = std::ptr::null_mut();
-        check("hipStreamCreate", unsafe { ffi::apxinf_hip_stream_create(&mut raw_stream) })?;
+        check("hipStreamCreate", unsafe {
+            ffi::apxinf_hip_stream_create(&mut raw_stream)
+        })?;
         let stream = Arc::new(HipStream { raw: raw_stream });
 
+        // hipBLAS and hipBLASLt run initialization kernels on the legacy
+        // default stream, and a legacy-stream operation while any capture in
+        // the process is open fails with error 906 -- which hipblaslt answers
+        // by exiting the process (measured on ROCm 7.1, even with a
+        // non-blocking capturing stream). Serialize handle initialization
+        // against capture with the same lock, so a context built while
+        // another thread captures waits instead of dying. Constructing a
+        // context from inside a capture is refused for the same reason as any
+        // other allocation there.
+        let _library_init = crate::graph::allocation_exclusive()?;
         let mut raw_blas = std::ptr::null_mut();
         let status = unsafe { ffi::apxinf_hip_blas_create(&mut raw_blas, stream.raw()) };
         // Wrap before checking so a handle created before `hipblasSetStream`
@@ -159,7 +197,21 @@ impl HipContext {
         let blas = BlasHandle { raw: raw_blas };
         check("hipblasCreate", status)?;
 
-        Ok(Self { device_id, stream, blas, caps })
+        // Not checked: a ROCm without hipBLASLt, or a handle that will not
+        // create, leaves the provider unavailable rather than failing the
+        // context. hipBLAS alone is a complete backend.
+        let mut raw_blaslt = std::ptr::null_mut();
+        let _ = unsafe { ffi::apxinf_hip_blaslt_create(&mut raw_blaslt, stream.raw()) };
+        let blaslt = BlasLtHandle { raw: raw_blaslt };
+        drop(_library_init);
+
+        Ok(Self {
+            device_id,
+            stream,
+            blas,
+            blaslt,
+            caps,
+        })
     }
 
     pub fn device_id(&self) -> usize {
@@ -182,10 +234,17 @@ impl HipContext {
         self.blas.raw
     }
 
+    /// The hipBLASLt handle, or null when the provider is unavailable.
+    pub(crate) fn blaslt(&self) -> *mut c_void {
+        self.blaslt.raw
+    }
+
     /// Make this device current on the calling thread. HIP's current device is
     /// per thread, so every entry point binds before issuing work.
     pub(crate) fn bind(&self) -> Result<()> {
-        check("hipSetDevice", unsafe { ffi::apxinf_hip_set_device(self.device_id as i32) })
+        check("hipSetDevice", unsafe {
+            ffi::apxinf_hip_set_device(self.device_id as i32)
+        })
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -195,7 +254,24 @@ impl HipContext {
         })
     }
 
+    /// Probe the stream without disturbing it: `Ok(())` when it is idle and
+    /// healthy, `Err` naming either pending work (`hipErrorNotReady`) or the
+    /// first error latched on it. Unlike a real call, `hipStreamQuery` does
+    /// not clear a latched error, so this is how a caller decides whether a
+    /// failed capture left the stream usable for eager execution.
+    pub fn stream_status(&self) -> Result<()> {
+        self.bind()?;
+        check("hipStreamQuery", unsafe { ffi::apxinf_hip_stream_query(self.stream()) })
+    }
+
     pub(crate) fn alloc(&self, bytes: usize) -> Result<HipBuffer> {
+        // `hipMalloc` fails device-wide while a capture is open anywhere in
+        // the process. When another thread is capturing, wait for it to close
+        // and retry-fail loudly only if the wait itself was mistimed; when
+        // this thread is capturing, the allocation is the contract violation
+        // `HipGraph::capture` documents and stays an error. See
+        // `graph::allocation_exclusive`.
+        let _exclusive = crate::graph::allocation_exclusive()?;
         let mut ptr = std::ptr::null_mut();
         check("hipMalloc", unsafe {
             ffi::apxinf_hip_malloc(
@@ -230,8 +306,12 @@ impl HipContext {
         let (ptr, bytes) = (buffer.ptr() as usize, buffer.bytes);
         // SAFETY: `ptr..ptr+bytes` is a live device allocation on this device,
         // and the owner frees it only after the last handle drops.
-        let handle = unsafe { GpuStorageHandle::from_raw_parts(ptr, bytes, Some(Arc::new(buffer))) };
-        let storage = Storage::Gpu { device: self.device(), handle };
+        let handle =
+            unsafe { GpuStorageHandle::from_raw_parts(ptr, bytes, Some(Arc::new(buffer))) };
+        let storage = Storage::Gpu {
+            device: self.device(),
+            handle,
+        };
         // SAFETY: the allocation holds exactly `numel * size_of(dtype)` bytes.
         unsafe { Tensor::from_raw_parts_unchecked(shape, dtype, self.device(), storage) }
     }
@@ -271,11 +351,21 @@ impl HipContext {
     /// Copy device memory to the host after all queued work has completed.
     pub(crate) fn download(&self, dst: &mut [u8], src: *const c_void) -> Result<()> {
         check("hipMemcpy D2H", unsafe {
-            ffi::apxinf_hip_memcpy_dtoh(dst.as_mut_ptr().cast(), src, dst.len() as u64, self.stream())
+            ffi::apxinf_hip_memcpy_dtoh(
+                dst.as_mut_ptr().cast(),
+                src,
+                dst.len() as u64,
+                self.stream(),
+            )
         })
     }
 
-    pub(crate) fn copy_on_device(&self, dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+    pub(crate) fn copy_on_device(
+        &self,
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+    ) -> Result<()> {
         check("hipMemcpy D2D", unsafe {
             ffi::apxinf_hip_memcpy_dtod(dst, src, bytes as u64, self.stream())
         })
@@ -292,7 +382,10 @@ impl HipContext {
             .ok_or(Error::UnsupportedDevice(tensor.device()))?;
         let len = tensor.size_in_bytes();
         if bytes.len() < len {
-            return Err(Error::DataLengthMismatch { expected: len, got: bytes.len() });
+            return Err(Error::DataLengthMismatch {
+                expected: len,
+                got: bytes.len(),
+            });
         }
         self.bind()?;
         let (out, ptr) = self.empty(tensor.shape().dims().to_vec(), tensor.dtype())?;
