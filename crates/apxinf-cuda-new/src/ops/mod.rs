@@ -2,6 +2,8 @@
 
 pub mod attention;
 pub mod cache;
+pub mod conv1d;
+pub mod conv2d;
 pub mod elementwise;
 pub mod embedding;
 pub mod gather;
@@ -11,11 +13,15 @@ pub mod norm;
 pub mod pillow_bicubic;
 pub mod pointwise;
 pub mod preprocess;
+pub mod qk_norm_rope;
+pub use qk_norm_rope::{cache_append_row, qk_norm_rope};
 pub mod quantization;
+pub mod relative_attention;
 pub mod rope;
 pub mod sampling;
 pub(crate) mod validation;
 mod volume;
+pub mod whisper_frontend;
 
 // Keep these crate-private aliases while graph/workspace and unit tests still
 // refer to the GEMM implementation through `crate::ops`.
@@ -39,6 +45,8 @@ pub use attention::{
     AttentionPolicy, KvCacheAttentionArgs, KvCacheDecodeMeta, SegmentedAttentionArgs,
 };
 pub use cache::core::{append as cache_append, concat_rows, copy_tensor, reserve_prefix};
+pub use conv1d::{conv1d, Conv1dAccumulation, Conv1dArgs, Conv1dSemantic};
+pub use conv2d::{conv2d, Conv2dArgs};
 pub use elementwise::add_into;
 pub use elementwise::core::{
     activation as elementwise_activation, add as elementwise_add, add_bias as elementwise_add_bias,
@@ -63,7 +71,7 @@ pub use gemm::{
     RepackedWeight, WeightVersion,
 };
 pub use norm::{
-    channel_l2_norm, channel_l2_norm_silu, fused_add_channel_l2_norm_silu, fused_add_norm,
+    channel_l2_norm, channel_l2_norm_silu, fused_add_channel_l2_norm_silu, fused_add_norm, norm,
     residual_add, Affine, BiasOrder, ChannelL2NormArgs, FusedAddChannelL2NormArgs,
     FusedAddNormArgs, NormArgs, NormKind, NormNumerics, QuantOut, ResidualAddArgs, ResidualGate,
 };
@@ -76,6 +84,7 @@ pub use quantization::{
     BlockQuantizationArgs, BlockQuantizationSemantic, PackBlockScalesArgs, QuantizationArgs,
     QuantizationSemantic, ScaleLayout,
 };
+pub use relative_attention::{relative_attention, RelativeAttentionArgs};
 pub use rope::apply_vision_2d as rope_apply_vision_2d;
 pub use rope::{
     decode_rope, decode_rotation, execute_batched as rope_apply_batched,
@@ -85,8 +94,12 @@ pub use rope::{
     DecodeRotationPosition, GroupedQkvRopeArgs, MropeCacheArgs, MultimodalRopeArgs,
     QkvCacheRopeArgs, RopeArgs, RopeSemantic,
 };
-pub use sampling::{argmax, ArgmaxArgs};
 pub use volume::{Conv3dArgs, Conv3dPolicy, PreparedConv3d, Unfold3dGeometry};
+pub use sampling::{argmax, exponential_race_sample, ArgmaxArgs, ExponentialRaceArgs,
+    EXPONENTIAL_RACE_MAX_TOP_K, EXPONENTIAL_RACE_MAX_VOCAB};
+pub use cache::write_kv_cache_token;
+pub use elementwise::{argmax_rows, fill_zero, mean_rows};
+pub use embedding::sinusoidal_embedding_table;
 
 /// Run a fixed-shape forward pass that may tune and create native executions.
 pub fn prepare_with_session<T>(

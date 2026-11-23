@@ -1,9 +1,12 @@
 //! LLM model architectures and abstractions.
 
 mod accelerator;
+pub mod asr_trait;
 pub mod auto;
 pub mod builtin;
 pub mod cuda_cosmos_policy;
+#[cfg(feature = "cuda")]
+pub mod cuda_gpt_sovits;
 pub mod d3;
 pub mod decision;
 pub mod debug;
@@ -30,16 +33,19 @@ pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
 #[cfg(feature = "cuda")]
+pub mod cuda_qwen3_asr;
+#[cfg(feature = "cuda")]
 pub mod qwen38;
 pub mod qwen3vl;
 pub mod qwen_drive;
 pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
-pub mod speech;
+pub mod tts_trait;
 pub mod vla;
 mod walloss;
 
+pub use asr_trait::{AsrContract, AsrRequest, AsrSpec, AsrStopReason, AsrTrait, AsrTranscription};
 pub use auto::{AutoModel, LoadOptions, LoadedModel, ModelPrecision, SyntheticWeights};
 pub use builtin::register_builtin_models;
 pub use d3::{
@@ -53,7 +59,10 @@ pub use decision::{
 };
 pub use debug::{DebugCapture, DebugConfig};
 pub use image::{GeneratedImage, ImageRequest, ImageRuntime};
-pub use speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
+pub use tts_trait::{
+    GeneratedAudio, GptSovitsInputs, PreparedTts, TtsCacheConfig, TtsCacheInfo, TtsContract,
+    TtsExtension, TtsRequest, TtsTrait, TtsSampling, TtsSpec, gpt_sovits_inputs,
+};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};

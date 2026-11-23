@@ -64,10 +64,12 @@ from .policies import (
     VIEW_SLOTS,
     AutoPolicy,
     ComposablePolicy,
+    GptSovitsPolicy,
     Gr00tPolicy,
     Pi05Policy,
     Pi0FastPolicy,
     Policy,
+    Qwen3AsrPolicy,
     WallossPolicy,
 )
 from .processors import (
@@ -87,9 +89,11 @@ __all__ = [
     "Policy",
     "ComposablePolicy",
     # L2 policies
+    "GptSovitsPolicy",
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",
+    "Qwen3AsrPolicy",
     "WallossPolicy",
     "AutoPolicy",
     # offline calibration framework
@@ -109,6 +113,7 @@ __all__ = [
     "CANONICAL_PROMPT_KEY",
     # bindings (lazy)
     "ModelRunner",
+    "SpeechRunner",
     # processor steps
     "ProcessorStep",
     "Pipeline",
@@ -131,4 +136,12 @@ def __getattr__(name: str):
         from apxinf_py import ModelRunner
 
         return ModelRunner
+    if name == "SpeechRunner":
+        from apxinf_py import SpeechRunner
+
+        return SpeechRunner
+    if name == "AsrRunner":
+        from apxinf_py import AsrRunner
+
+        return AsrRunner
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

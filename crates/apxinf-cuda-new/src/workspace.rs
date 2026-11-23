@@ -203,6 +203,8 @@ struct ExecutionSessionInner {
     caches: RefCell<HashMap<TypeId, Box<dyn Any>>>,
     prepared_sequence: RefCell<Vec<usize>>,
     sequence_cursor: Cell<usize>,
+    /// Opt-in: pin arena blocks during `prepare` the way capture does.
+    pin_prepared_buffers: bool,
 }
 
 impl ExecutionSessionInner {
@@ -245,18 +247,43 @@ pub struct ExecutionSession {
 
 impl ExecutionSession {
     pub fn new(workspace: GraphWorkspace) -> Self {
+        Self::build(workspace, false)
+    }
+
+    pub fn with_capacity(capacity_bytes: usize, device: usize) -> Result<Self> {
+        GraphWorkspace::new(capacity_bytes, device).map(Self::new)
+    }
+
+    /// Like [`Self::new`], but preparation pins arena blocks for the length of
+    /// its traversal exactly as capture does.
+    ///
+    /// Direct-launch operators take their outputs from the arena, so prepare
+    /// and capture must see identical buffer lifetimes: otherwise the free
+    /// list, and with it every later output address, diverges and the captured
+    /// `ExecutionKey`s no longer match the prepared ones. Sessions created with
+    /// [`Self::new`] keep the original behavior, where preparation retains
+    /// nothing.
+    pub fn new_pinning_prepared_buffers(workspace: GraphWorkspace) -> Self {
+        Self::build(workspace, true)
+    }
+
+    pub fn with_capacity_pinning_prepared_buffers(
+        capacity_bytes: usize,
+        device: usize,
+    ) -> Result<Self> {
+        GraphWorkspace::new(capacity_bytes, device).map(Self::new_pinning_prepared_buffers)
+    }
+
+    fn build(workspace: GraphWorkspace, pin_prepared_buffers: bool) -> Self {
         Self {
             inner: Rc::new(ExecutionSessionInner {
                 workspace,
                 caches: RefCell::new(HashMap::new()),
                 prepared_sequence: RefCell::new(Vec::new()),
                 sequence_cursor: Cell::new(0),
+                pin_prepared_buffers,
             }),
         }
-    }
-
-    pub fn with_capacity(capacity_bytes: usize, device: usize) -> Result<Self> {
-        GraphWorkspace::new(capacity_bytes, device).map(Self::new)
     }
 
     pub fn workspace(&self) -> &GraphWorkspace {
@@ -292,6 +319,7 @@ impl ExecutionSession {
 thread_local! {
     static ACTIVE_SESSION: Cell<*const ExecutionSessionInner> = const { Cell::new(std::ptr::null()) };
     static PREPARING: Cell<bool> = const { Cell::new(false) };
+    static PINNING_PREPARE: Cell<bool> = const { Cell::new(false) };
     static CAPTURE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static CAPTURE_TARGET: Cell<Option<CaptureTarget>> = const { Cell::new(None) };
     static CAPTURED_RESOURCES: RefCell<Vec<Rc<dyn Any>>> = const { RefCell::new(Vec::new()) };
@@ -306,12 +334,14 @@ struct CaptureTarget {
 struct ActiveSessionGuard {
     session: *const ExecutionSessionInner,
     preparing: bool,
+    pinning_prepare: bool,
 }
 
 impl Drop for ActiveSessionGuard {
     fn drop(&mut self) {
         ACTIVE_SESSION.with(|active| active.set(self.session));
         PREPARING.with(|preparing| preparing.set(self.preparing));
+        PINNING_PREPARE.with(|pinning| pinning.set(self.pinning_prepare));
     }
 }
 
@@ -333,12 +363,23 @@ fn with_session_phase<T>(
         session.inner.sequence_cursor.set(0);
         let previous = active.replace(Rc::as_ptr(&session.inner));
         let previous_preparing = PREPARING.with(|preparing| preparing.replace(prepare));
+        let pinning_prepare = prepare && session.inner.pin_prepared_buffers;
+        let previous_pinning = PINNING_PREPARE.with(|pinning| pinning.replace(pinning_prepare));
         let _guard = ActiveSessionGuard {
             session: previous,
             preparing: previous_preparing,
+            pinning_prepare: previous_pinning,
         };
+        let retained_before = CAPTURED_RESOURCES.with(|resources| resources.borrow().len());
         retain_resource(&session.inner);
         let result = operation();
+        if pinning_prepare && !is_capturing() {
+            // Preparation only pins blocks for the length of its own traversal;
+            // a capture starts its own retention list. Holding them past this
+            // point would keep the session and its arena alive on this thread
+            // until some later capture happened to clear the list.
+            CAPTURED_RESOURCES.with(|resources| resources.borrow_mut().truncate(retained_before));
+        }
         if result.is_ok()
             && !prepare
             && session.inner.sequence_cursor.get() != session.inner.prepared_sequence.borrow().len()
@@ -460,8 +501,14 @@ pub(crate) fn use_execution<T: Any>(resource: &Rc<T>) -> Result<()> {
     Ok(())
 }
 
+/// Resources are retained during capture, and during preparation only for
+/// sessions that opted in with [`ExecutionSession::new_pinning_prepared_buffers`].
+fn retains_now() -> bool {
+    is_capturing() || PINNING_PREPARE.with(Cell::get)
+}
+
 pub(crate) fn retain_resource<T: Any>(resource: &Rc<T>) {
-    if !is_capturing() {
+    if !retains_now() {
         return;
     }
     let resource: Rc<dyn Any> = resource.clone();
@@ -469,6 +516,30 @@ pub(crate) fn retain_resource<T: Any>(resource: &Rc<T>) {
         let mut resources = resources.borrow_mut();
         if !resources.iter().any(|stored| Rc::ptr_eq(stored, &resource)) {
             resources.push(resource);
+        }
+    });
+}
+
+/// Retain a buffer handle for the same boundary as [`retain_resource`].
+///
+/// Direct-launch operators create a fresh handle on every call, so the handle's
+/// own allocation cannot serve as its identity; the device address can. Without
+/// that, one capture of a repeated operator would retain the same arena block
+/// once per occurrence.
+pub(crate) fn retain_buffer(buffer: &CudaBuffer) {
+    if !retains_now() {
+        return;
+    }
+    let address = buffer.address().ptr() as usize;
+    CAPTURED_RESOURCES.with(|resources| {
+        let mut resources = resources.borrow_mut();
+        let stored = resources.iter().any(|resource| {
+            resource
+                .downcast_ref::<CudaBuffer>()
+                .is_some_and(|held| held.address().ptr() as usize == address)
+        });
+        if !stored {
+            resources.push(Rc::new(buffer.clone()));
         }
     });
 }

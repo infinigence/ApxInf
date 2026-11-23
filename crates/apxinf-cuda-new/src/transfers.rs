@@ -19,6 +19,43 @@ pub fn to_cuda(tensor: &Tensor, device_id: usize) -> Result<Tensor> {
     Ok(buffer.into_tensor(tensor.shape().clone(), tensor.dtype()))
 }
 
+/// Transfer a CPU tensor to the context device on the context stream.
+///
+/// Unlike [`to_cuda`] the copy is enqueued asynchronously, so the transfer
+/// overlaps earlier work on the same stream; the source is pageable host
+/// memory, and CUDA stages it before the call returns.
+pub fn to_cuda_on(ctx: &crate::CudaContext, tensor: &Tensor) -> Result<Tensor> {
+    if tensor.device() != Device::Cpu {
+        return Err(Error::Other("tensor is already on GPU".into()));
+    }
+    let bytes = tensor
+        .storage()
+        .as_cpu()
+        .ok_or_else(|| Error::Other("expected CPU storage".into()))?;
+    let buffer = CudaBuffer::alloc(bytes.len(), ctx.device_id()).map_err(Error::Cuda)?;
+    unsafe {
+        ffi::check_cuda(ffi::cudaMemcpyAsync(
+            buffer.ptr(),
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            ffi::cudaMemcpyKind::cudaMemcpyHostToDevice,
+            ctx.stream().handle(),
+        ))
+        .map_err(Error::Cuda)?;
+    }
+    Ok(buffer.into_tensor(tensor.shape().clone(), tensor.dtype()))
+}
+
+/// Device-wide barrier across every stream on the current device.
+///
+/// A context synchronize only drains the context's own non-blocking stream, so
+/// a host readback issued through a synchronous `cudaMemcpy` can still observe
+/// a buffer another stream is filling. Callers that submit work from more than
+/// one stream use this before the readback.
+pub fn synchronize_device() -> std::result::Result<(), String> {
+    unsafe { ffi::check_cuda(ffi::cudaDeviceSynchronize()) }
+}
+
 /// Copy a CPU tensor into shape-identical, stable-address CUDA storage.
 pub fn copy_cpu_to_cuda(source: &Tensor, destination: &Tensor) -> Result<()> {
     if source.device() != Device::Cpu {

@@ -17,6 +17,7 @@ Orin devices, and supports BF16, FP8 and INT8 precisions.
 
 ## What's NEW!
 - [2026/11] 🔥 ApxInf supports Moore Threads MUSA as Backend.
+- [2026/11] 🔥 ApxInf supports GPT-SoVITS V5 text-to-speech, deployable on Jetson Thor / Orin.
 - [2026/10] 🔥 ApxInf supports Decision 3.0 mini and Qwen3.8-27B with image inference.
 - [2026/10] 🔥 ApxInf supoorts SmolVLA, deployable on Jetson Xavier / Thor / Orin / RTX 4090.
 - [2026/09] 🔥 ApxInf supports PI0-FAST, GR00T-N1.7, Qwen-Drive, Qwen3.8-27B.
@@ -29,6 +30,7 @@ Orin devices, and supports BF16, FP8 and INT8 precisions.
       <th style="min-width: 260px;">VLA</th>
       <th style="min-width: 260px;">VLM</th>
       <th style="min-width: 260px;">Decision</th>
+      <th style="min-width: 260px;">TTS</th>
       <th style="min-width: 260px;">Hardware</th>
     </tr>
   </thead>
@@ -53,6 +55,11 @@ Orin devices, and supports BF16, FP8 and INT8 precisions.
       <td>
         <ul style="margin-left: 0; padding-left: 16px;">
           <li>Decision 3.0 mini ✅</li>
+        </ul>
+      </td>
+      <td>
+        <ul style="margin-left: 0; padding-left: 16px;">
+          <li>GPT-SoVITS V5 ✅</li>
         </ul>
       </td>
       <td>
@@ -303,6 +310,20 @@ Two views, 512x512 NHWC `uint8`, batch 1.
 | Jetson AGX Orin | BF16 | 67.4 ms | 14.8 Hz |
 | Jetson Xavier NX | FP16 | 312.38 ms | 3.2 Hz |
 | RTX 4090 | BF16 | 13.47 ms | 74.2 Hz |
+
+
+### GPT-SoVITS V5
+
+Text-to-speech, one 75-character Chinese request (about 15 s of audio), batch 1,
+CUDA Graph path, reference conditioning cached. RTF is synthesis time divided by
+audio duration; lower is better.
+
+| Hardware | Precision | P50 | RTF |
+|---|---|---:|---:|
+| Jetson AGX Thor | FP16 | 1.674 s | 0.112 |
+| Jetson AGX Orin | FP16 | 2.458 s | 0.163 |
+
+[Checkpoint conversion, Python API and acceptance criteria](doc/gpt-sovits-v5.md).
 
 
 ## Port a new model with an agent

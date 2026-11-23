@@ -10,6 +10,10 @@ use super::*;
 
 #[path = "backend_framework.rs"]
 mod framework;
+#[path = "hd32_decode.rs"]
+mod hd32_decode;
+#[path = "hd128_decode.rs"]
+mod hd128_decode;
 mod l3_behavior;
 #[path = "precision/nvfp4_precision.rs"]
 mod nvfp4_precision;
