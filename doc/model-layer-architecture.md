@@ -202,8 +202,31 @@ storage/state and retiring the old graph readers.
 
 Ordinary Tensor/`WeightVersion` arguments stay canonical: they do not authorize
 in-place packing and cannot select kernels requiring packed weights. Callers
-wanting these kernels must attach `RepackedWeight`. This change does not move
-computation scratch out of provider state or change activation workspace ownership.
+wanting these kernels must attach `RepackedWeight`. Provider computation scratch
+is managed separately from weights and activations.
+PI0.5's runner owns a cuda-new `ProviderWorkspace`, shared by its prepared
+profiles on the same stream. Each session owns its activation `GraphWorkspace`;
+persistent KV/state remains model/request storage. Serial GEMM vendor scratch
+(workspace, unpack/dequantization and projection) and attention temporary
+probabilities/LSE/partials borrow aligned slices of a per-stream block. Different
+streams/devices use distinct blocks. Blocks are rounded up to a fixed
+granularity, so growth never rewrites an old binding and per-block overhead stays
+bounded; executions and captured graphs retain the actual block they reference.
+Constants such as cuBLASLt zero bias and output scale remain private. The opaque
+prepared NVFP4 GEMM workspace and the segmented FA2 LSE buffer remain private
+until their embedded launch state supports external rebinding.
+
+Tuning candidates use private scratch. Final prepared executions borrow runner
+storage after selection and retain the actual block for graph lifetime.
+Repeated `ExecutionSession::prepare` reuses matching cached executions and
+retains them until session drop by default. Variable-length eager runners such
+as PI0FAST keep later decode executions warm across multiple early stops.
+Runner authors may opt in with `ExecutionSession::retire_stale_bindings()` before
+cloning the session when changing bindings should be discarded: executions
+unused for two prepare traversals are retired after a successful traversal.
+Captured graphs retain their own executions and storage. Retirement is separate
+from provider scratch sharing; stable eager arena bindings remain cache hits
+across repeated preparation without enabling CUDA Graphs.
 
 Kernel weight layout is an explicit property of each native `Implementation`
 registry entry. Implementation IDs are local to a semantic registry and must
