@@ -20,6 +20,10 @@ from audio_wav import encode_pcm16, inspect
 AUDIO_COMMIT = "f976eab8b47a3cada5aeb3b52a78451ee06117bc"
 
 
+class OutputLimitError(ValueError):
+    """The provider produced audio that exceeds a declared output limit."""
+
+
 def file_digest(path):
     result = hashlib.sha256()
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -148,7 +152,7 @@ class MlxAudioProvider:
                 count = audio.shape[0]
                 total = len(pcm) // 2 + count
                 if total > rate * 60 or total * 2 + 44 > MAX_OUTPUT:
-                    raise ValueError("output_limit")
+                    raise OutputLimitError("output_limit")
                 samples = self.np.asarray(audio, dtype=self.np.float32)
                 if samples.shape != (count,) or not self.np.isfinite(samples).all():
                     raise ValueError("invalid provider waveform")

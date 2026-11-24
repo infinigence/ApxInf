@@ -15,7 +15,7 @@ import threading
 from audio_contracts import (Accepted, AsrInput, AudioLimits, Cancel, Cancelled, ControlAck, Failed,
     Frame, MAX_FRAME, MediaGrant, PROTOCOL, Ready, ResourcesReleased, Shutdown, Speech, Stopped,
     Submit, Terminal, Transcript, parse_frame, strict_json)
-from audio_provider import CpuFixtureProvider, MlxAudioProvider
+from audio_provider import CpuFixtureProvider, MlxAudioProvider, OutputLimitError
 from audio_wav import inspect
 
 
@@ -86,8 +86,8 @@ class Worker:
                 if not isinstance(message, (Submit, Cancel, Shutdown)):
                     raise ValueError("unexpected control message")
                 with self.state_lock:
-                    if message.command_id in self.seen_commands or len(self.seen_commands) >= 1024:
-                        raise ValueError("duplicate command or exhausted command history")
+                    if message.command_id in self.seen_commands:
+                        raise ValueError("duplicate command")
                     self.seen_commands.add(message.command_id)
                     if isinstance(message, Submit):
                         execution = (message.key.request_id, message.key.attempt)
@@ -195,7 +195,7 @@ class Worker:
                     audio = provider.synthesize(op, cancelled)
                     result = Cancelled() if audio is None else Speech(self.write_output(submit, audio))
             except Exception as error:
-                code = "output_limit" if "output_limit" in str(error) else "provider_error"
+                code = "output_limit" if isinstance(error, OutputLimitError) else "provider_error"
                 print("audio provider error: " + str(error), file=sys.stderr)
                 result = Failed(code, "The audio provider could not complete the request.")
             finally:
