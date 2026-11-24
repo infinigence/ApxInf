@@ -15,6 +15,8 @@ use crate::registry;
 /// harmless and keeps `AutoModel::load_model` self-contained for users.
 pub fn register_builtin_models() {
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    // LFM3 (LiquidAI): `model_type: "lfm3"` resolves to this registry name.
+    registry::register("metal_lfm3", crate::metal_lfm3::load);
     registry::register("metal_clef", crate::metal_clef::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_minicpm5", crate::metal_minicpm5::load);

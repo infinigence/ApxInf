@@ -331,6 +331,11 @@ fn parse_meta_f32(m: &HashMap<String, String>, key: &str, default: f32) -> f32 {
 
 fn parse_dtype(s: &str) -> Option<DType> {
     match s {
+        // SafeTensors U32 is a raw 32-bit word; MLX affine 4-bit checkpoints
+        // store packed nibbles as U32. apxinf_core has no unsigned integer
+        // dtype, so the word is surfaced as I32 and reinterpreted as U32 by
+        // the consumer (metal_lfm3's Q4 loader).
+        "U32" => Some(DType::I32),
         "F32" => Some(DType::F32),
         "F16" => Some(DType::F16),
         "BF16" => Some(DType::BF16),
