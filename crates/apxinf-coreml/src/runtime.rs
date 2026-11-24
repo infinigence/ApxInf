@@ -179,6 +179,113 @@ impl Model {
     }
 }
 
+/// The cache directory size limit (`APXINF_COREML_CACHE_LIMIT`, human sizes such
+/// as `8G`, `512M` or `0` for no limit). Defaults to 16 GiB.
+fn cache_limit() -> u64 {
+    const ENV: &str = "APXINF_COREML_CACHE_LIMIT";
+    const DEFAULT: u64 = 16 << 30;
+    match std::env::var(ENV) {
+        Err(_) => DEFAULT,
+        Ok(value) => parse_size(value.trim()).unwrap_or(DEFAULT),
+    }
+}
+
+/// Parses `8G`, `512M`, `1024K` or a plain byte count into bytes.
+fn parse_size(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (digits, scale) = match value.as_bytes().last().copied() {
+        Some(b'k') | Some(b'K') => (&value[..value.len() - 1], 1u64 << 10),
+        Some(b'm') | Some(b'M') => (&value[..value.len() - 1], 1u64 << 20),
+        Some(b'g') | Some(b'G') => (&value[..value.len() - 1], 1u64 << 30),
+        Some(b't') | Some(b'T') => (&value[..value.len() - 1], 1u64 << 40),
+        _ => (value, 1),
+    };
+    digits.trim().parse::<u64>().ok().map(|n| n * scale)
+}
+
+/// Recursive size of `path` in bytes, ignoring entries it cannot read.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => dir_size(&path),
+                Ok(meta) => meta.len(),
+                Err(_) => 0,
+            }
+        })
+        .sum()
+}
+
+/// Evicts cached artifacts until `dir` fits in `limit` bytes.
+///
+/// Order: our own compiled `*.mlmodelc` programs oldest-first, then the ANE E5
+/// bundle cache as a last resort (it is regenerated on the next load, so this
+/// only costs one cold start). A `limit` of zero disables eviction.
+fn prune_to_limit(dir: &Path, limit: u64) {
+    if limit == 0 {
+        return;
+    }
+    // Core ML keeps its ANE bundle cache under `~/Library/Caches/<process>/`,
+    // not inside our own cache directory, and that is usually the bulk of the
+    // space. Account for it here and let the last-resort step remove it.
+    let mut bundles: Vec<PathBuf> = vec![dir.join("com.apple.e5rt.e5bundlecache")];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(name) = exe.file_name() {
+            if let Some(home) = std::env::var_os("HOME") {
+                bundles.push(
+                    PathBuf::from(home)
+                        .join("Library/Caches")
+                        .join(name)
+                        .join("com.apple.e5rt.e5bundlecache"),
+                );
+            }
+        }
+    }
+    bundles.retain(|path| path.is_dir());
+    let mut total = dir_size(dir) + bundles.iter().map(|path| dir_size(path)).sum::<u64>();
+    if total <= limit {
+        return;
+    }
+    let mut programs: Vec<(std::time::SystemTime, PathBuf, u64)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mlmodelc") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            programs.push((modified, path, dir_size(&entry.path())));
+        }
+    }
+    programs.sort_by_key(|(modified, _, _)| *modified);
+    for (_, path, size) in programs {
+        if total <= limit {
+            return;
+        }
+        if std::fs::remove_dir_all(&path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+    for bundle in bundles {
+        if total <= limit {
+            return;
+        }
+        let size = dir_size(&bundle);
+        if std::fs::remove_dir_all(&bundle).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+}
+
 /// A content-addressed directory of compiled programs. After [`seal`](Self::seal),
 /// a program that is not yet compiled is an error, so no compilation happens
 /// while requests run.
@@ -189,14 +296,27 @@ pub struct ProgramCache {
 
 impl ProgramCache {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            dir: dir.into(),
-            sealed: false,
-        }
+        let dir = dir.into();
+        // Keep the cache directory bounded before anything is loaded: an
+        // unbounded directory grows by a few GB for every composition it has
+        // ever seen, and the ANE bundle cache inside it is the bulk.
+        prune_to_limit(&dir, cache_limit());
+        Self { dir, sealed: false }
+    }
+
+    /// Trims the cache directory to `APXINF_COREML_CACHE_LIMIT` now. Callers
+    /// that finish a bulk load (which is when Core ML writes its E5 bundles)
+    /// call this once the last program is in place.
+    pub fn trim(&self) {
+        prune_to_limit(&self.dir, cache_limit());
     }
 
     pub fn seal(&mut self) {
         self.sealed = true;
+        // Loading runs the compile/write path and lets Core ML build its E5
+        // bundle cache, so the directory can exceed the limit again after the
+        // start-up prune. Trim once more now that nothing else will be written.
+        prune_to_limit(&self.dir, cache_limit());
     }
 
     /// The compiled directory for `package`, compiling it on a miss. The key
@@ -416,5 +536,38 @@ mod tests {
             raw: NonNull::dangling(),
         });
         assert!(model.predict(&[], &[("y", &[usize::MAX, 2])]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cache_limit_tests {
+    use super::{dir_size, parse_size, prune_to_limit};
+
+    #[test]
+    fn parses_human_sizes() {
+        assert_eq!(parse_size("1024"), Some(1024));
+        assert_eq!(parse_size("8G"), Some(8 << 30));
+        assert_eq!(parse_size("512M"), Some(512 << 20));
+        assert_eq!(parse_size("1T"), Some(1 << 40));
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("abc"), None);
+    }
+
+    #[test]
+    fn evicts_oldest_programs_first() {
+        let root = std::env::temp_dir().join(format!("apxinf-cache-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..3 {
+            let program = root.join(format!("{index:02}.mlmodelc"));
+            std::fs::create_dir_all(&program).unwrap();
+            std::fs::write(program.join("blob"), vec![0u8; 4096]).unwrap();
+        }
+        let before = dir_size(&root);
+        assert!(before >= 3 * 4096);
+        prune_to_limit(&root, 8192);
+        let after = dir_size(&root);
+        assert!(after <= 8192, "evicted size {after}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
