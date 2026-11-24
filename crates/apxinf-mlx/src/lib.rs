@@ -39,6 +39,8 @@ mod mpp_gemm;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod q4_f16;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod mrope_rope;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod qk_norm_rope;
 #[cfg(feature = "signpost")]
 pub mod signpost;
