@@ -1,8 +1,9 @@
 # Core ML and Apple Neural Engine execution (proposal)
 
 Status: design under review. The `apxinf-coreml` writer and optional native
-runtime (step 2 of the sequence below) are implemented; no family composition
-uses them and no path is qualified. On 2026-10-19 the
+runtime (step 2 of the sequence below) are implemented, and `metal_clef` has an
+explicit experimental column-split composition; no path is device-qualified.
+On 2026-10-19 the
 fork operator accepted the fixed-profile Clef host-handoff scope
 below, conditional on completing every qualification gate. This decision does
 not approve unrelated interfaces, qualify an implementation or merge a PR.
@@ -211,6 +212,13 @@ macOS 15 or newer. In the pinned
 the reference conversion's `iOS18` minimum target and `macOS15` are aliases
 for the same specification version.
 
+The fixed-profile Clef loader checks the generated source against owned plan
+facts. Static classification requires typed source values, valid weight blob
+extents and exact operation/input/output correspondence. Missing values,
+unexplained rewrites or non-ANE runtime preference fail preparation. Source
+independence does not prove opaque compiled numeric equality or materialization
+timing; the artifact and execution evidence below is still required.
+
 A compute plan describes anticipated placement, not an execution certificate.
 On 2026-10-19 the fork operator accepted the following combined,
 finite evidence for the fixed Clef compositions, instead of requiring a
@@ -243,8 +251,9 @@ unqualified with the blocking reason. An explicit GPU+ANE request must fail, not
 silently select CPU-only Core ML or the GPU-only composition, which remains a separate
 selection. Recheck the plan during preparation and invalidate qualification
 when any bound identity, profile or configuration changes, or when contrary
-placement evidence appears. These are proposed acceptance rules, not an
-implemented status API or a claim that loading enforces placement.
+placement evidence appears. These limited checks do not introduce a generic
+status API. Loading rejects unacceptable anticipated plans but does not enforce
+physical placement for every prediction.
 
 ## Scoped host-handoff decision
 

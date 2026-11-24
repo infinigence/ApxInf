@@ -779,3 +779,26 @@ fn top_k_mask_preserves_rows_axes_and_compiled_inputs() -> Result<()> {
     assert_ne!(output.to_f32_vec()?, masked.to_f32_vec()?);
     Ok(())
 }
+
+#[test]
+fn async_evaluation_completes_before_reads_and_checks_streams() -> Result<()> {
+    let s = Stream::cpu()?;
+    let a = Array::from_f32(&s, &[3], &[1., 2., 3.])?;
+    let b = a.mul(&a)?.add(&a)?;
+    let calls = s.counters().eval_calls;
+    s.async_eval(&[b.clone()])?;
+    assert_eq!(s.counters().eval_calls, calls + 1);
+    assert_eq!(b.to_f32_vec()?, [2., 6., 12.]);
+    // Separate logical streams do not mix, as for eval.
+    let foreign = Array::from_f32(&Stream::cpu()?, &[1], &[1.])?;
+    assert!(s.async_eval(&[foreign]).is_err());
+    Ok(())
+}
+
+#[test]
+fn cache_limit_reports_the_previous_limit() -> Result<()> {
+    let original = apxinf_mlx::set_cache_limit(1 << 30)?;
+    assert_eq!(apxinf_mlx::set_cache_limit(2 << 30)?, 1 << 30);
+    assert_eq!(apxinf_mlx::set_cache_limit(original)?, 2 << 30);
+    Ok(())
+}

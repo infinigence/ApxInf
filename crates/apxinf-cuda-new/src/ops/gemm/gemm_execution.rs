@@ -568,6 +568,20 @@ pub(crate) fn prepare(ctx: &CudaContext, normalized: Normalized) -> Result<Rc<Ex
         (prepare_native(ctx, &spec, &policy, &bindings, None)?, None)
     };
     drop(selected_storage);
+    let scratch_bytes = unsafe { abi::apxinf_gemm_scratch_bytes(native.0) } as usize;
+    if let Some(scratch) = crate::workspace::provider_scratch(ctx, scratch_bytes)? {
+        // Rebind only after native prepare has quiesced its private scratch:
+        // online tuning synchronizes to measure, and a restored recipe never
+        // ran kernels against its scratch. See framework::Scratch::bind.
+        unsafe {
+            status::check(abi::apxinf_gemm_bind_scratch(
+                native.0,
+                scratch.ptr(),
+                scratch.len() as u64,
+            ))?;
+        }
+        storage.push(scratch);
+    }
     let raw = native.into_raw();
     let key = ExecutionKey::new(ctx, spec, bindings, &options);
     #[cfg(test)]

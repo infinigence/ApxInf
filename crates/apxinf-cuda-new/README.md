@@ -387,3 +387,28 @@ Other legal sizes and alignments use the staged pointwise update followed by the
 existing channel normalization kernel. No scratch allocation or persistent
 state is required. CUDA Graph callers retain all bound storage through replay.
 The Norm Spec version is 10; its layout and the GEMM recipe contract are unchanged.
+
+### Provider scratch lifetime
+
+`ProviderWorkspace` is a runner-owned pool, separate from each profile's
+activation `GraphWorkspace` and persistent KV/state. Construct sessions with
+`ExecutionSession::with_provider_workspace` to share temporary storage between
+serial profiles. The pool partitions by device and stream; one operator's
+simultaneous temporaries receive disjoint 256-byte-aligned slices. Growing a
+block preserves all previous graph bindings. Executions retain borrowed storage
+but do not allocate a permanent scratch copy per operator. Standalone operators
+without a session keep their own temporary storage.
+
+Vendor GEMM workspace/unpack/dequantization/projection and custom/FA2/CUTLASS
+FMHA attention scratch participate. Constants, the opaque NVFP4 GEMM workspace,
+and the segmented FA2 LSE buffer remain private. Candidate tuning uses isolated
+temporary allocations. If the shared block cannot be allocated for lack of
+device memory, the execution keeps the private scratch its native prepare
+already allocated instead of failing. A new `prepare` traversal reuses matching
+cached executions. Sessions retain them until drop by default, allowing
+variable-length eager runners such as PI0FAST to reuse later decode steps after
+multiple shorter requests. Runner authors can opt in with
+`ExecutionSession::retire_stale_bindings()` before cloning the session; then
+bindings unused for two prepare traversals are retired after a successful
+traversal. This policy does not change provider scratch sharing. Old captured
+graphs retain the executions and buffers they actually reference.
