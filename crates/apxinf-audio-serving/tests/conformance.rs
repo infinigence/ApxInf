@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use apxinf_audio_serving::{
     contracts::{parse_frame, AttemptKey, AttemptState},
     wav,

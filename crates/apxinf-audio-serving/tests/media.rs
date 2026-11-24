@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use apxinf_audio_serving::{
     config::sha256,
     contracts::{AttemptKey, MediaGrant, MEDIA_QUOTA},

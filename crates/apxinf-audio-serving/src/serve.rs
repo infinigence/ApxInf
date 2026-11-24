@@ -94,7 +94,7 @@ fn options() -> Result<Options, String> {
 }
 
 #[tokio::main]
-async fn main() {
+pub async fn main() {
     if let Err(error) = run().await {
         eprintln!("audio service: {error}");
         std::process::exit(2);
