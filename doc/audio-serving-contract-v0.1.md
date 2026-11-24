@@ -33,7 +33,7 @@ Only the execution owner accesses model objects.
 | JSON nesting | 12 levels below the outer value |
 | JSON object | 64 fields |
 | JSON array | 256 entries |
-| Command history | 1024 commands per epoch, including reserved cancellation and shutdown commands |
+| Command history | At most 1024 unsettled commands in flight per epoch; acknowledged and settled command IDs are pruned, so the bound does not limit deployment lifetime |
 | ASR upload | 2097152 bytes |
 | ASR audio | PCM16 little-endian, mono, 16000 Hz, 1 through 480000 frames |
 | TTS text | 1 through 4096 Unicode scalar values and at most 16384 UTF-8 bytes |
@@ -214,7 +214,7 @@ The supervisor must not reuse an execution position before settlement.
 EOF, partial JSONL, unexpected events, and mismatched identities invalidate readiness and queued requests.
 The service does not replay failed requests or automatically substitute a worker.
 
-The supervisor creates each command ID once and retains bounded command history.
+The supervisor creates each command ID once and tracks it only until it is acknowledged or its attempt settles; the worker fences duplicate command IDs and execution keys for the whole epoch.
 Duplicate submissions are protocol faults and cannot execute twice.
 Cancellation receipt returns `control_ack` with `cancel_requested` or `already_terminal`.
 The acknowledgement never proves settlement.

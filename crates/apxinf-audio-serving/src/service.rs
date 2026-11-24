@@ -317,6 +317,7 @@ struct Active {
     cancellation_at: Option<Instant>,
     output_lease: Option<Arc<MediaLease>>,
     terminal_at: Option<Instant>,
+    submit_command: String,
 }
 fn respond(job: &mut Job, result: Result<Output, AudioError>) {
     if let Some(reply) = job.reply.take() {
@@ -437,7 +438,7 @@ async fn run_actor(
                         Message::ControlAck { command_id, status } => {
                             match (commands.get(command_id), status.as_str()) {
                                 (Some(&"cancel"), "cancel_requested" | "already_terminal") | (Some(&"shutdown"), "shutdown_requested") => {
-                                    commands.insert(command_id.clone(), "acknowledged");
+                                    commands.remove(command_id);
                                 },
                                 _ => fault = Some("protocol_fault"),
                             }
@@ -474,7 +475,9 @@ async fn run_actor(
                 } else {
                     "cancelled"
                 };
-                respond(&mut current.job, Err(AudioError::new(code)));
+                if !matches!(current.result, Some(Ok(_))) {
+                    respond(&mut current.job, Err(AudioError::new(code)));
+                }
                 if current.cancellation_at.is_none() && current.state.phase != AttemptPhase::Settled
                 {
                     current.cancellation_at = Some(now);
@@ -493,6 +496,7 @@ async fn run_actor(
             }
             if current.state.phase == AttemptPhase::Settled {
                 let mut current = active.take().unwrap();
+                commands.remove(&current.submit_command);
                 let result = current
                     .result
                     .take()
@@ -542,9 +546,7 @@ async fn run_actor(
         }
         queue = kept;
         if !stopping && fault.is_none() && active.is_none() && obs.ready.load(Ordering::SeqCst) {
-            if commands.len() >= 1020 {
-                stopping = true;
-            } else if let Some(mut job) = queue.pop_front() {
+            if let Some(mut job) = queue.pop_front() {
                 if service.config.pressure && !normal_pressure() {
                     respond(&mut job, Err(AudioError::new("capacity_unavailable")));
                 } else {
@@ -564,8 +566,9 @@ async fn run_actor(
                             None
                         };
                     let lease_id = uuid::Uuid::new_v4().to_string();
+                    let submit_command = uuid::Uuid::new_v4().to_string();
                     let message = Message::Submit {
-                        command_id: uuid::Uuid::new_v4().to_string(),
+                        command_id: submit_command.clone(),
                         key: job.key.clone(),
                         lease_id: lease_id.clone(),
                         model_revision: service.config.revision.clone(),
@@ -588,6 +591,7 @@ async fn run_actor(
                         cancellation_at: None,
                         output_lease,
                         terminal_at: None,
+                        submit_command,
                     });
                 }
             }
