@@ -7,6 +7,7 @@ extern "C" {
 const char* apx_mlx_error(void);
 int apx_mlx_stream_new(int32_t gpu, int32_t index, void** out);
 void apx_mlx_stream_free(void* stream);
+int apx_mlx_default_cache_limit(size_t limit);
 int apx_mlx_sync(void* stream);
 int apx_mlx_memory_stats(size_t* active, size_t* cache, size_t* peak);
 int apx_mlx_reset_peak_memory(void);
@@ -18,6 +19,8 @@ int apx_mlx_array_clone(const void* array, void** out);
 void apx_mlx_array_free(void* array);
 int apx_mlx_array_info(const void* array, int32_t* shape, size_t capacity, size_t* rank, int32_t* dtype);
 int apx_mlx_array_read(void* stream, const void* array, uint8_t* bytes, size_t len);
+/* Waits for this row-contiguous array only (not the rest of its stream) and copies its bytes. */
+int apx_mlx_array_read_ready(const void* array, uint8_t* bytes, size_t len);
 int apx_mlx_eval(void* stream, const void* const* arrays, size_t count);
 int apx_mlx_async_eval(const void* const* arrays, size_t count);
 int apx_mlx_op(void* stream, int32_t op, const void* const* inputs, size_t count, const int32_t* ints, size_t nints, const float* floats, size_t nfloats, void** out);

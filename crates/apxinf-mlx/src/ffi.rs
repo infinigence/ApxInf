@@ -6,6 +6,7 @@ extern "C" {
     pub fn apx_mlx_error() -> *const c_char;
     pub fn apx_mlx_stream_new(gpu: i32, index: i32, out: *mut Handle) -> i32;
     pub fn apx_mlx_stream_free(stream: Handle);
+    pub fn apx_mlx_default_cache_limit(limit: usize) -> i32;
     pub fn apx_mlx_sync(stream: Handle) -> i32;
     pub fn apx_mlx_memory_stats(active: *mut usize, cache: *mut usize, peak: *mut usize) -> i32;
     pub fn apx_mlx_reset_peak_memory() -> i32;
@@ -40,6 +41,7 @@ extern "C" {
         bytes: *mut u8,
         len: usize,
     ) -> i32;
+    pub fn apx_mlx_array_read_ready(array: *const c_void, bytes: *mut u8, len: usize) -> i32;
     pub fn apx_mlx_eval(stream: Handle, arrays: *const *const c_void, count: usize) -> i32;
     pub fn apx_mlx_async_eval(arrays: *const *const c_void, count: usize) -> i32;
     pub fn apx_mlx_op(

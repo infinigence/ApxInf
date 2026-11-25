@@ -23,6 +23,7 @@ model-specific examples and historical evidence link back to it.
 | Running the PI0.5 FP32 reference on CPU | [PI0.5 CPU reference](pi05-cpu-reference.md) — build, input and execution contracts, numerical validation |
 | Proposing Apple Neural Engine execution through Core ML | [Core ML and ANE](coreml-ane.md) — proposal under upstream review |
 | Converting, running or measuring GPT-SoVITS V5 speech synthesis | [GPT-SoVITS V5](gpt-sovits-v5.md) — checkpoint conversion, `TtsTrait` wiring, precision gate and audio-quality acceptance |
+| Profiling a Metal model with Instruments | [MLX Backend](mlx-backend.md#profiling-with-instruments) — the `mlx-signpost` feature, recording and cost |
 
 PI0.5 currently separates `model/`, `model_runner/` and `weights/`. Its
 [component view](model-lifecycle/architecture.md#implemented-pi05-pilot-stage-2)

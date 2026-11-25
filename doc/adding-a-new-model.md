@@ -66,6 +66,14 @@ may admit bounded chunk shapes without admitting a full prompt-sized forward;
 report those actual shapes in `preparation_status`. Specialized speculative
 generation belongs to the request-level hook.
 
+For asynchronous ordinary decode, opt into `token_sequence` and retain the
+shared publication/EOS/cancellation loop. Keep public `forward` synchronous.
+Test one-step lookahead, discarded EOS work, cancellation, position restoration,
+error cleanup and the synchronous fallback through `LoadedModel`. With P prompt
+tokens and N published tokens, the retained position is P+N.saturating_sub(1).
+The MLX cursor in `mlx_decode.rs` is shared model-layer scheduling; family KV
+and graph construction remain local.
+
 A small model commonly starts with:
 
 ```text
@@ -288,9 +296,12 @@ Complete these steps in the new family's own code and the existing registries:
    `builtin::register_builtin_models`, with the correct feature gate and names.
    `AutoModel::load_model` resolves `LoadOptions.model_name` or checkpoint
    metadata; test both explicit selection and the supported detection path.
-   For Metal, the current `mlx` feature registers `metal_qwen3` and
-   `metal_minicpm5`; `AutoModel` resolves the Metal prefix. MiniCPM5 must be
-   explicitly named because its official checkpoint identifies as `llama`.
+   For Metal, the current `mlx` feature registers `metal_qwen3`,
+   `metal_minicpm5`, `metal_clef` and `metal_d3`; `AutoModel` resolves the
+   Metal prefix. MiniCPM5 must be explicitly named because its official
+   checkpoint identifies as `llama`; a `d3-code-readout-v1` package detects as
+   `d3` and resolves to `metal_d3` on Metal (its CUDA-only intercept is gated
+   to non-Metal devices).
 2. For LLM/VLM, return `LoadedModel::text(Box<dyn LlmTrait>)` and exercise shared
    generation. For VLA, implement `VlaRuntime` on the family runner and return
    `LoadedModel::Vla(Box::new(runner))`. Required methods include `contract`,
