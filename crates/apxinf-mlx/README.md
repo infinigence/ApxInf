@@ -156,6 +156,12 @@ recurrence layouts change only the reduction order, not the operation.
 Their tests compare each kernel with MLX operators or a host reference on
 small shapes. They do not qualify the Clef model.
 
+The Neural Engine boundary kernels are `AneTileHandoff` (padded FP16 rows
+and channel-first tiles) and `AneTileMerge` (both per-token scales plus the
+GPU share); `MppF16Gemm` and `SplitMppF16Gemm` are the Metal 4 projection
+pair. `Array::to_bytes_ready` waits for one row-contiguous array only and
+leaves later work on its stream running.
+
 `InterleavedQkNormRope` adapts the mflux Qwen-Image attention prologue:
 per-head RMSNorm, interleaved-pair RoPE from FP32 tables and the
 `[B, L, H * D]` to `[B, H, L, D]` layout change in one kernel.
