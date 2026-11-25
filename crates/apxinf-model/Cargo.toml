@@ -25,6 +25,9 @@ sha2 = { version = "0.10", optional = true }
 # Decodes recorded Core ML packages in the Clef GPU+ANE device test.
 prost = "0.14"
 sha2 = "0.10"
+# Image decoding for the d3 Metal preprocessing device test; the runtime
+# itself takes decoded RGB.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [features]
 default = []
@@ -109,7 +112,6 @@ required-features = ["cuda"]
 
 [[example]]
 name = "d3_decision_index"
-required-features = ["cuda"]
 
 [[example]]
 name = "cosmos_policy_bench"
