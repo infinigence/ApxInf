@@ -72,6 +72,17 @@ comparing release observations and run memory qualification in an isolated
 process. The ignored `metal_memory` integration executable checks repeated
 compiled-instance release and pool reuse when run under the shared Metal lock.
 
+MLX keeps freed buffers in that allocator for reuse, and its own cache limit is
+its memory limit. Every new input shape adds buffers that later shapes rarely
+reuse, so a workload with many prompt lengths or image sizes grows the cache
+far past its live memory. `Stream::metal` therefore sets the cache limit to
+`DEFAULT_CACHE_LIMIT_BYTES` (1 GiB) unless the caller has already set one. A
+caller that wants another bound calls `set_cache_limit` before or after loading;
+creating another stream does not replace it. `set_cache_limit(usize::MAX)`
+removes the bound. MLX has no getter for the cache limit, so a stream treats a
+limit equal to MLX's memory limit, MLX's own initial value, as not chosen. The
+ignored `metal_cache_limit` executable checks both cases.
+
 Native `Array` operations use MLX semantics, including broadcasting. Metal
 models compose them directly and own their rounding, fusion and compilation
 recipes. `MlxBackend` is an adapter for the existing public `Backend`/sampling
