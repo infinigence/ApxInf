@@ -19,10 +19,33 @@ pub fn digest(path: &Path) -> Result<(u64, String), String> {
         hash.update(&buffer[..n]);
     }
     let after = file.metadata().map_err(|e| e.to_string())?;
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+    if stamp(&before)? != stamp(&after)? {
         return Err("An identity artifact changed during hashing.".into());
     }
     Ok((before.len(), format!("{:x}", hash.finalize())))
+}
+
+pub(crate) type Stamp = (u64, u64, u64, i64, i64, i64, i64);
+
+/// fstat identity of an open file: (dev, ino, size, mtime sec/nsec, ctime sec/nsec).
+#[cfg(unix)]
+pub(crate) fn stamp(meta: &std::fs::Metadata) -> Result<Stamp, String> {
+    use std::os::unix::fs::MetadataExt;
+    Ok((
+        meta.dev(),
+        meta.ino(),
+        meta.size(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    ))
+}
+
+/// Fail closed where the platform cannot provide the stamp.
+#[cfg(not(unix))]
+pub(crate) fn stamp(_: &std::fs::Metadata) -> Result<Stamp, String> {
+    Err("File identity stamps are unavailable on this platform.".into())
 }
 
 pub fn runtime(executable: &Path, library: &Path) -> Result<Value, String> {

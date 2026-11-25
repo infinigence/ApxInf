@@ -8,6 +8,7 @@ pub(super) struct GenerationPublic {
     pub(super) accepted: bool,
     pub(super) status: Option<&'static str>,
     pub(super) ended_at: Option<Instant>,
+    late_completed: bool,
 }
 
 impl GenerationPublic {
@@ -20,6 +21,7 @@ impl GenerationPublic {
             accepted: false,
             status: None,
             ended_at: None,
+            late_completed: false,
         }
     }
 
@@ -69,6 +71,16 @@ impl GenerationPublic {
         }
     }
 
+    /// Record a completed terminal frame first observed at or after the public deadline.
+    pub(super) fn observe_terminal(&mut self, job: &Job, timeout: Duration, frame: &Value) {
+        if self.status.is_none()
+            && job.ingress.elapsed() >= timeout
+            && frame["status"] == "completed"
+        {
+            self.late_completed = true;
+        }
+    }
+
     pub(super) fn expire(
         &mut self,
         job: &Job,
@@ -85,6 +97,12 @@ impl GenerationPublic {
                 .filter(|frame| frame["status"] == "failed")
                 .map(error_from_frame)
         });
+        // A completed terminal first observed at or after the public deadline is
+        // preserved like a failed one. Deadlines that pass while cleanup is pending
+        // still expire, so the public deadline stays independent of worker settlement.
+        if failure.is_none() && self.late_completed {
+            return;
+        }
         let (status, error) = match failure {
             Some(error) => ("failed", error),
             None => (

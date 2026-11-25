@@ -408,16 +408,12 @@ pub trait LlmTrait {
     ) -> Result<GenerationOutput> {
         let options = request.options.resolve()?;
         if cancel.is_cancelled() {
-            let mut profile = GenerationProfile::new();
-            profile.finalize(request.input.token_ids.len(), 0);
-            return Ok(GenerationOutput {
-                tokens: Vec::new(),
-                profile,
-            });
+            return Ok(empty_generation_output(request.input.token_ids.len(), GenerationProfile::new()));
         }
         generate_streaming_with_resolved_options(self, request.input, &options, |event| {
-            // A sampled token is already part of the returned tokens, so publish it
-            // even when cancellation is observed at its boundary.
+            // A sampled token is already part of `GenerationOutput.tokens` (and of the
+            // sequence's cache accounting), so publish it even when cancellation is
+            // observed at its boundary; the streamed prefix then equals the returned list.
             if let GenerationBoundary::Token(token) = event {
                 on_token(token);
             } else if cancel.is_cancelled() {

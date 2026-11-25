@@ -304,6 +304,13 @@ impl OutputParser {
                 }
             }
         }
+        if last && matches!(self.mode, Mode::Thinking) {
+            // Generation ended inside an unclosed think block: the block is hidden,
+            // so drop the held `</think>` prefix and finish like text mode instead
+            // of failing the whole response. Tool blocks still fail below.
+            self.pending.clear();
+            self.mode = Mode::Text;
+        }
         if last && !matches!(self.mode, Mode::Text) {
             return Err("The model output contains an incomplete structured block.".into());
         }
@@ -791,5 +798,21 @@ mod tests {
             assert!(error.contains(expected), "{key}={raw}: {error}");
             assert_eq!(parser.tool_count, 0);
         }
+    }
+
+    #[test]
+    fn unclosed_think_block_at_end_keeps_visible_text() {
+        let mut parser = OutputParser::new(vec![]);
+        let mut parts = parser.push("before <think>reasoning </thi", false).unwrap();
+        parts.extend(parser.push("", true).unwrap());
+        assert!(matches!(parts.as_slice(), [Part::Text(text)] if text == "before "));
+        assert_eq!(parser.tool_count, 0);
+    }
+
+    #[test]
+    fn unclosed_tool_block_at_end_still_fails() {
+        let mut parser = OutputParser::new(vec![]);
+        let error = parser.push("text <tool_call>{", true).unwrap_err();
+        assert!(error.contains("incomplete structured block"), "{error}");
     }
 }

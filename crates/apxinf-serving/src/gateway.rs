@@ -402,6 +402,8 @@ fn normalize(
         .or_else(|| value.get("max_completion_tokens"));
     let max_tokens = if count_only {
         0
+    } else if max_value.is_none() && api == Api::Anthropic {
+        return Err(ApiError::invalid("max_tokens is required."));
     } else {
         max_value
             .map_or(Some(512), Value::as_u64)

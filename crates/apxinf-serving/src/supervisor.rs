@@ -762,6 +762,9 @@ async fn launch_worker_until(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Own process group, so stopping the worker can signal its whole tree.
+    #[cfg(unix)]
+    command.process_group(0);
     if let WorkerRuntime::NativeMiniCpm5Prepared { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5 { metal_library, .. }
     | WorkerRuntime::NativeMiniCpm5Sampled { metal_library, .. }
@@ -924,8 +927,33 @@ fn startup_failure(error: String, cleanup: StopResult) -> String {
     }
 }
 
+/// Best-effort SIGKILL of the worker's whole process group (the worker is its own leader).
+#[cfg(unix)]
+fn kill_process_group(pid: u32) -> bool {
+    use std::ffi::c_int;
+    extern "C" {
+        fn killpg(pgrp: c_int, sig: c_int) -> c_int;
+    }
+    const SIGKILL: c_int = 9;
+    let Ok(pgrp) = c_int::try_from(pid) else {
+        return false;
+    };
+    if pgrp <= 0 {
+        return false;
+    }
+    // killpg takes plain integers and touches no Rust memory; pgrp is the positive pid of
+    // a child spawned with process_group(0), so it never targets this process's own group.
+    unsafe { killpg(pgrp, SIGKILL) == 0 }
+}
+
 async fn stop_child(child: &mut Child) -> StopResult {
-    let _ = child.start_kill();
+    #[cfg(unix)]
+    let group_killed = child.id().is_some_and(kill_process_group);
+    #[cfg(not(unix))]
+    let group_killed = false;
+    if !group_killed {
+        let _ = child.start_kill();
+    }
     tokio::time::timeout(SETTLEMENT_GRACE, child.wait())
         .await
         .map_err(|_| "Worker exit was not confirmed within 20 seconds.".to_owned())?
@@ -1648,7 +1676,7 @@ pub(crate) fn file_digest(path: &std::path::Path) -> Result<(u64, String), Strin
         hash.update(&buffer[..n]);
     }
     let after = file.metadata().map_err(|e| e.to_string())?;
-    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+    if crate::native_identity::stamp(&before)? != crate::native_identity::stamp(&after)? {
         return Err("An identity artifact changed during inspection.".into());
     }
     Ok((before.len(), format!("{:x}", hash.finalize())))
@@ -1899,6 +1927,7 @@ async fn execute(
     let mut public_error: Option<ApiError> = None;
     let mut consumer_stop: Option<&'static str> = None;
     let mut total_text_bytes = 0usize;
+    let mut settled_output_tokens: Option<u64> = None;
     let result: Result<(), ApiError> = async {
     loop {
         public.expire(&job, service, timeout, public_error.as_ref(), terminal.as_ref());
@@ -1937,6 +1966,11 @@ async fn execute(
             event = worker.frames.recv() => event,
             _ = tokio::time::sleep(public.next_wait(&job, timeout, cancelled_at)) => continue,
         };
+        if let Some(Ok(frame)) = &event {
+            if frame["kind"] == "terminal" {
+                public.observe_terminal(&job, timeout, frame);
+            }
+        }
         // A frame and the original public deadline can become observable together.
         public.expire(&job, service, timeout, public_error.as_ref(), terminal.as_ref());
         let frame = event.ok_or_else(|| ApiError::worker("The worker output closed during execution."))?
@@ -2067,18 +2101,7 @@ async fn execute(
         )
     })?;
     let output_tokens = terminal["usage"]["output_tokens"].as_u64().unwrap_or(0);
-    service
-        .metrics
-        .input_tokens
-        .fetch_add(input_tokens, Ordering::Relaxed);
-    service
-        .metrics
-        .output_tokens
-        .fetch_add(output_tokens, Ordering::Relaxed);
-    service
-        .metrics
-        .elapsed_ns
-        .fetch_add(job.ingress.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    settled_output_tokens = Some(output_tokens);
     if job.cancel.load(Ordering::Acquire) || job.output.is_closed() {
         consumer_stop.get_or_insert("client_disconnect");
     }
@@ -2110,6 +2133,20 @@ async fn execute(
     ));
     Ok(())
     }.await;
+    // Account usage on every exit: the terminal frame's count when one settled,
+    // otherwise the tokens streamed so far, so failures are not under-counted.
+    service
+        .metrics
+        .input_tokens
+        .fetch_add(input_tokens, Ordering::Relaxed);
+    service
+        .metrics
+        .output_tokens
+        .fetch_add(settled_output_tokens.unwrap_or(output_tokens), Ordering::Relaxed);
+    service
+        .metrics
+        .elapsed_ns
+        .fetch_add(job.ingress.elapsed().as_nanos() as u64, Ordering::Relaxed);
     result.map_err(|error| {
         withdraw_worker(service);
         public.finish(&job, service, "failed", Event::Error(error.clone()));

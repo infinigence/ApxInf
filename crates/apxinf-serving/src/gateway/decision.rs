@@ -16,6 +16,13 @@ async fn handle_decision(service: Arc<Service>, body: Bytes) -> Result<Response,
     }
     let request = crate::decision::parse_decision_request(&body)
         .map_err(|error| ApiError::invalid(error.to_string()))?;
+    if request.model.as_str() != service.model_id.as_str() {
+        return Err(ApiError::new(
+            404,
+            "model_not_found",
+            "Select the model listed by /v1/models.",
+        ));
+    }
     let record = request.record.clone();
     let ticket = service.enqueue_decision(request)?;
     let _guard = CancelGuard(ticket.cancel);
@@ -35,7 +42,7 @@ async fn handle_decision(service: Arc<Service>, body: Bytes) -> Result<Response,
                 "x-apxinf-model-revision",
                 service.ready["model_revision"]
                     .as_str()
-                    .unwrap()
+                    .unwrap_or("")
                     .parse()
                     .unwrap(),
             );
