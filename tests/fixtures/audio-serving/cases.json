@@ -1,0 +1,101 @@
+{
+  "frames": [
+    {"name":"ready_asr", "valid":true, "frame":{
+      "protocol":"apxinf-audio-worker/1.0", "worker_epoch":"11111111-1111-4111-8111-111111111111",
+      "message":{"kind":"ready","task":"asr","model":"fixture-asr","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","capability_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","manifest_revision":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","provider":"cpu_fixture","languages":["en"],"voices":[],"cancellation":"provider_boundary_or_process_reap","limits":{"upload_bytes":2097152,"asr_frames":480000,"text_scalars":4096,"text_bytes":16384,"output_bytes":8388608,"output_seconds":60,"queue":4,"uploads":2,"media_bytes":33554432}}}},
+    {"name":"ready_bad_limits", "valid":false, "frame":{
+      "protocol":"apxinf-audio-worker/1.0", "worker_epoch":"11111111-1111-4111-8111-111111111111",
+      "message":{"kind":"ready","task":"tts","model":"fixture-tts","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","capability_revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","manifest_revision":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","provider":"cpu_fixture","languages":["en"],"voices":["fixture"],"cancellation":"provider_boundary_or_process_reap","limits":{"upload_bytes":2097152,"asr_frames":480000,"text_scalars":4096,"text_bytes":16384,"output_bytes":8388608,"output_seconds":60,"queue":5,"uploads":2,"media_bytes":33554432}}}},
+    {"name":"submit_asr", "valid":true, "frame":{
+      "protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111",
+      "message":{"kind":"submit","command_id":"44444444-4444-4444-8444-444444444444","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"lease_id":"33333333-3333-4333-8333-333333333333","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timeout_ms":120000,"operation":{"task":"asr","language":"en","input":{"handle":"55555555-5555-4555-8555-555555555555","worker_epoch":"11111111-1111-4111-8111-111111111111","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"bytes":46,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","frames":1,"sample_rate":16000}}}}},
+    {"name":"submit_asr_wrong_epoch", "valid":false, "frame":{
+      "protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111",
+      "message":{"kind":"submit","command_id":"44444444-4444-4444-8444-444444444444","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"lease_id":"33333333-3333-4333-8333-333333333333","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timeout_ms":120000,"operation":{"task":"asr","language":"en","input":{"handle":"55555555-5555-4555-8555-555555555555","worker_epoch":"66666666-6666-4666-8666-666666666666","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"bytes":46,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","frames":1,"sample_rate":16000}}}}},
+    {"name":"submit_asr_duration", "valid":false, "frame":{
+      "protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111",
+      "message":{"kind":"submit","command_id":"44444444-4444-4444-8444-444444444444","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"lease_id":"33333333-3333-4333-8333-333333333333","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timeout_ms":120000,"operation":{"task":"asr","language":"en","input":{"handle":"55555555-5555-4555-8555-555555555555","worker_epoch":"11111111-1111-4111-8111-111111111111","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"bytes":960046,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","frames":480001,"sample_rate":16000}}}}},
+    {"name":"submit_tts", "valid":true, "frame":{
+      "protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111",
+      "message":{"kind":"submit","command_id":"44444444-4444-4444-8444-444444444444","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"lease_id":"33333333-3333-4333-8333-333333333333","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timeout_ms":120000,"operation":{"task":"tts","text":"Hello, 晴天!","voice":"fixture","language":"en","output_handle":"55555555-5555-4555-8555-555555555555"}}}},
+    {"name":"submit_tts_empty", "valid":false, "frame":{
+      "protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111",
+      "message":{"kind":"submit","command_id":"44444444-4444-4444-8444-444444444444","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"lease_id":"33333333-3333-4333-8333-333333333333","model_revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timeout_ms":120000,"operation":{"task":"tts","text":" ","voice":"fixture","language":"en","output_handle":"55555555-5555-4555-8555-555555555555"}}}},
+    {"name":"speech_terminal", "valid":true, "frame":{
+      "protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111",
+      "message":{"kind":"terminal","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"event_seq":1,"result":{"status":"speech","output":{"handle":"55555555-5555-4555-8555-555555555555","worker_epoch":"11111111-1111-4111-8111-111111111111","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"bytes":46,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","frames":1,"sample_rate":24000}}}}},
+    {"name":"speech_wrong_key", "valid":false, "frame":{
+      "protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111",
+      "message":{"kind":"terminal","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"event_seq":1,"result":{"status":"speech","output":{"handle":"55555555-5555-4555-8555-555555555555","worker_epoch":"11111111-1111-4111-8111-111111111111","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":2},"bytes":46,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","frames":1,"sample_rate":24000}}}}},
+    {"name":"accepted", "valid":true, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"accepted\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":1},\"event_seq\":0}}"},
+    {"name":"terminal", "valid":true, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"terminal\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":1},\"event_seq\":1,\"result\":{\"status\":\"transcript\",\"text\":\"晴天\"}}}"},
+    {"name":"released", "valid":true, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"resources_released\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":1},\"event_seq\":2,\"lease_id\":\"33333333-3333-4333-8333-333333333333\"}}"},
+    {"name":"wrong_lease", "valid":true, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"resources_released\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":1},\"event_seq\":2,\"lease_id\":\"44444444-4444-4444-8444-444444444444\"}}"},
+    {"name":"cancel", "valid":true, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"cancel\",\"command_id\":\"33333333-3333-4333-8333-333333333333\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":1}}}"},
+    {"name":"ack", "valid":true, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"control_ack\",\"command_id\":\"33333333-3333-4333-8333-333333333333\",\"status\":\"cancel_requested\"}}"},
+    {"name":"shutdown", "valid":true, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"shutdown\",\"command_id\":\"33333333-3333-4333-8333-333333333333\"}}"},
+    {"name":"stopped", "valid":true, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"stopped\"}}"},
+    {"name":"failed_provider", "valid":true, "frame":{"protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111","message":{"kind":"terminal","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"event_seq":1,"result":{"status":"failed","code":"provider_error","message":"The provider failed."}}}},
+    {"name":"failed_output_limit", "valid":true, "frame":{"protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111","message":{"kind":"terminal","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"event_seq":1,"result":{"status":"failed","code":"output_limit","message":"The output exceeds the limit."}}}},
+    {"name":"failed_missing_resource", "valid":true, "frame":{"protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111","message":{"kind":"terminal","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"event_seq":1,"result":{"status":"failed","code":"missing_resource","message":"A frozen resource is missing."}}}},
+    {"name":"failed_obsolete_queue_code", "valid":false, "frame":{"protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111","message":{"kind":"terminal","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"event_seq":1,"result":{"status":"failed","code":"queue_timeout","message":"The queue deadline expired."}}}},
+    {"name":"failed_obsolete_worker_code", "valid":false, "frame":{"protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111","message":{"kind":"terminal","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"event_seq":1,"result":{"status":"failed","code":"worker_fault","message":"The worker failed."}}}},
+    {"name":"failed_public_protocol_code", "valid":false, "frame":{"protocol":"apxinf-audio-worker/1.0","worker_epoch":"11111111-1111-4111-8111-111111111111","message":{"kind":"terminal","key":{"request_id":"22222222-2222-4222-8222-222222222222","attempt":1},"event_seq":1,"result":{"status":"failed","code":"protocol_fault","message":"The protocol failed."}}}},
+    {"name":"safe_max", "valid":true, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"accepted\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":9007199254740991},\"event_seq\":9007199254740991}}"},
+    {"name":"wrong_protocol", "valid":false, "raw":"{\"protocol\":\"apxinf-worker/2.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"stopped\"}}"},
+    {"name":"unknown_outer", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"extra\":0,\"message\":{\"kind\":\"stopped\"}}"},
+    {"name":"unknown_inner", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"stopped\",\"extra\":0}}"},
+    {"name":"duplicate_raw", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"stopped\",\"kind\":\"stopped\"}}"},
+    {"name":"boolean_integer", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"accepted\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":true},\"event_seq\":0}}"},
+    {"name":"float_integer", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"accepted\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":1.0},\"event_seq\":0}}"},
+    {"name":"unsafe_integer", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"accepted\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":9007199254740992},\"event_seq\":0}}"},
+    {"name":"nonfinite", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"accepted\",\"key\":{\"request_id\":\"22222222-2222-4222-8222-222222222222\",\"attempt\":NaN},\"event_seq\":0}}"},
+    {"name":"uuid_uppercase", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA\",\"message\":{\"kind\":\"stopped\"}}"},
+    {"name":"null_epoch", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":null,\"message\":{\"kind\":\"stopped\"}}"},
+    {"name":"trailing_json", "valid":false, "raw":"{\"protocol\":\"apxinf-audio-worker/1.0\",\"worker_epoch\":\"11111111-1111-4111-8111-111111111111\",\"message\":{\"kind\":\"stopped\"}}{}"}
+  ],
+  "wav": [
+    {"name":"repeated_unknown_chunks", "asr":true, "valid":true, "hex":"524946463600000057415645666d74201000000001000100803e0000007d000002001000646174610200000000004a554e4b000000004a554e4b00000000"},
+    {"name":"one_sample_asr", "asr":true, "valid":true, "hex":"524946462600000057415645666d74201000000001000100803e0000007d00000200100064617461020000000000"},
+    {"name":"one_sample_tts", "asr":false, "valid":true, "hex":"524946462600000057415645666d74201000000001000100c05d000080bb0000020010006461746102000000ff7f"},
+    {"name":"wrong_asr_rate", "asr":true, "valid":false, "hex":"524946462600000057415645666d74201000000001000100c05d000080bb0000020010006461746102000000ff7f"},
+    {"name":"riff_length", "asr":true, "valid":false, "hex":"524946462700000057415645666d74201000000001000100803e0000007d00000200100064617461020000000000"},
+    {"name":"stereo", "asr":true, "valid":false, "hex":"524946462600000057415645666d74201000000001000200803e0000007d00000200100064617461020000000000"},
+    {"name":"odd_data", "asr":true, "valid":false, "hex":"524946462600000057415645666d74201000000001000100803e0000007d00000200100064617461010000000000"},
+    {"name":"truncated_chunk", "asr":true, "valid":false, "hex":"524946462600000057415645666d74201000000001000100803e0000007d00000200100064617461ffffffff0000"},
+    {"name":"metadata_padding", "asr":true, "valid":true, "hex":"5249464630000000574156454a554e4b010000001100666d74201000000001000100803e0000007d00000200100064617461020000000000"},
+    {"name":"nonzero_padding", "asr":true, "valid":false, "hex":"5249464630000000574156454a554e4b0100000011ff666d74201000000001000100803e0000007d00000200100064617461020000000000"}
+  ],
+  "json": [
+    {"name":"safe_integer_literal", "raw":"9007199254740991", "valid":true},
+    {"name":"unsafe_integer_literal", "raw":"9007199254740992", "valid":false},
+    {"name":"beyond_u64_integer_literal", "raw":"100000000000000000000000000000", "valid":false},
+    {"name":"finite_exponent", "raw":"1e24", "valid":true},
+    {"name":"nonfinite_exponent", "raw":"1e999", "valid":false},
+    {"name":"negative_zero_literal", "raw":"-0", "valid":false},
+    {"name":"digits_in_string", "raw":"\"100000000000000000000000000000\"", "valid":true}
+  ],
+  "texts": [
+    {"name":"space", "text":" ", "valid":false},
+    {"name":"c0_separators", "text":"\u001c\u001d\u001e\u001f", "valid":true},
+    {"name":"nbsp", "text":"\u00a0", "valid":false},
+    {"name":"ideographic_space", "text":"\u3000", "valid":false},
+    {"name":"nonblank", "text":"\u00a0晴\u3000", "valid":true}
+  ],
+  "encodings": [
+    {"name":"utf8", "frame":"stopped", "encoding":"utf8", "bom":false, "valid":true},
+    {"name":"utf8_bom", "frame":"stopped", "encoding":"utf8", "bom":true, "valid":false},
+    {"name":"utf16le_bom", "frame":"stopped", "encoding":"utf16le", "bom":true, "valid":false},
+    {"name":"utf32le_bom", "frame":"stopped", "encoding":"utf32le", "bom":true, "valid":false},
+    {"name":"invalid_utf8", "hex":"fffe7b7d", "valid":false}
+  ],
+  "states": [
+    {"name":"settles_once", "events":["accepted","terminal","released"], "valid":true},
+    {"name":"double_accept", "events":["accepted","accepted"], "valid":false},
+    {"name":"terminal_first", "events":["terminal"], "valid":false},
+    {"name":"missing_terminal", "events":["accepted","released"], "valid":false},
+    {"name":"wrong_lease", "events":["accepted","terminal","wrong_lease"], "valid":false},
+    {"name":"double_settlement", "events":["accepted","terminal","released","released"], "valid":false},
+    {"name":"ack_is_not_settlement", "events":["ack"], "valid":false}
+  ]
+}
