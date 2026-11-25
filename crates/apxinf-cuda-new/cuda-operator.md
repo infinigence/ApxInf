@@ -16,6 +16,8 @@ This document describes only public contracts and does not promise a specific pr
 
 `ops::quantization(ctx, QuantizationArgs)` also owns shape-preserving representation conversions used between L3 operators. `CastF16ToBf16` converts F16 to BF16 and `CastBf16ToF32` converts BF16 to F32; both require identical nonempty input/output shapes and distinct device buffers. The latter is the standard boundary for a BF16 backbone feeding an FP32 readout GEMM.
 
+`RotateRowwiseI8` is the activation half of ConvRot W8A8. For BF16 `[rows, cols]` with `cols % 256 == 0` it multiplies every 256-column group by the normalized regular Hadamard matrix `H = (H4 ⊗ H4 ⊗ H4 ⊗ H4) / 16`, `H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]` (symmetric, `H·H = I`), in FP32 without an intermediate BF16 rounding. It then quantizes each row exactly like `RowwiseI8` (`scale = max(amax/127, 1e-12)`, divide in FP32, round half away from zero, clamp to `[-128, 127]`) and returns INT8 `[rows, cols]` plus F32 `[rows]` scales. The weight must have been rotated offline as `W·H` per 256-column group. Comfy-kitchen divides in BF16 instead, so INT8 codes differ from it in about 6% of activations; the FP32 division is the more accurate of the two against the unquantized product.
+
 ## Shared GEMM Contract
 
 GEMM uses `A=[M,K]` and a weight whose physical interpretation is carried by
@@ -36,6 +38,12 @@ state. It uploads fixed NK bytes when the compiled device backend supports the
 row/channel W8A8 contract, otherwise canonical bytes. This choice is independent
 of M and occurs before prepare; only one device representation is allocated.
 Attach the returned state to every consumer, including vendor fallback paths.
+`RepackedWeight::upload_row_channel_output_major(ctx, bytes, n, k)` does the same for a checkpoint
+weight stored `[N,K]`: the bytes are uploaded unchanged when the device has an output-major candidate
+for this K/N, otherwise transposed to canonical first. `OutputMajorSlot` is the reusable form for
+streaming one weight after another through a fixed address from a `PinnedRegion` (see
+`doc/cuda-new-api.md` §2.3a); a prepared execution binds that address and reads the current contents,
+so a fill must be ordered before its readers and not overwritten until they complete.
 The tensor retains its logical `[K,N]` shape and must not be read as canonical
 storage after upload. Channel scales retain their original output-channel order.
 - `Nvfp4`: A/B are both packed FP4 (`DType::E2M1Pair`, two E2M1 values per byte, low nibble first) with one unsigned-E4M3 scale per `block_size` elements along K. Output is BF16, `K` is a multiple of `block_size`, and the mode applies only to `gemm`.
@@ -330,6 +338,36 @@ not a promise of bitwise identity with arbitrary framework reductions. Graphs
 retain the input, index map, output and execution; enqueue has no allocation,
 host transfer or tuning. Noncontiguous selection and graph lifetime are tested
 in `tests/mixed_precision_ops.rs`.
+
+## Fixed-shape MoE helpers
+
+Two direct-launch helpers in `ops::moe` compose a dense-masked mixture-of-experts
+layer from ordinary GEMMs. They have no recipe, tuning or persistent state; enqueue
+allocates only the output through `CudaContext::allocate_output`, so they run
+eagerly, inside an `ExecutionSession`, and under Graph capture (tests replay with
+changed input contents). Like `silu_mul`, they are not L3 semantics with an
+`l3-operator` marker.
+
+`moe_route(ctx, x, gate, bias, top_k, routed_scale) -> F32 [T, E]` is a
+token-choice router with sigmoid scores. `x` is BF16 `[T, D]`, `gate` BF16
+`[E, D]`, `bias` F32 `[E]`. Per token, `logit[e] = dot(x[t], gate[e])` (FP32
+accumulation over BF16 products, fixed butterfly order, so repeated runs are
+bit-identical), `score = sigmoid(logit)`, and the `top_k` experts with the largest
+`score + bias` are selected, ties going to the lower index. The bias steers
+selection only. The result holds `score / (sum(selected scores) + 1e-20) *
+routed_scale` at selected experts and 0 elsewhere. Limits: `E <= 64`,
+`top_k <= min(8, E)`, `D % 8 == 0`, `T <= 4096`, 16-byte aligned `x`/`gate`, and
+`routed_scale` not NaN. One block per token.
+
+`moe_swiglu_scaled(ctx, gate, up, weights) -> BF16 [T, N]` multiplies each expert's
+SwiGLU block by its routing weight: `out[t,c] = bf16(silu(g) * u * w[t, c / (N/E)])`
+with `gate`/`up` BF16 `[T, N]`, `weights` F32 `[T, E]` and `N % E == 0`. All
+arithmetic is FP32 with one final rounding. Experts with weight 0 produce exact
+zeros, so one `K = N` down projection over the concatenated expert weights sums
+only the selected experts and equals sparse dispatch. An 8-element vector path is
+used when `N`, `N/E` and the three pointers are 8-element/16-byte aligned,
+otherwise a scalar path with identical numerics. The output must not overlap the
+inputs.
 
 ## Precomputed RMSNorm + rotary embedding
 

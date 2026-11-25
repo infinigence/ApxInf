@@ -21,6 +21,10 @@ pub enum QuantizationSemantic {
     RowwiseI8,
     /// Rounded SiLU(gate) multiplied by `secondary`, then rowwise INT8.
     SiluMulRowwiseI8,
+    /// Each 256-column group is multiplied by the normalized regular Hadamard
+    /// matrix in FP32 (ConvRot), then every row is quantized to signed INT8
+    /// with one computed F32 scale per row. Columns must be a multiple of 256.
+    RotateRowwiseI8,
 }
 
 impl QuantizationSemantic {
@@ -34,13 +38,14 @@ impl QuantizationSemantic {
             Self::SliceColumnsBf16 => 3,
             Self::RowwiseI8 => 4,
             Self::SiluMulRowwiseI8 => 7,
+            Self::RotateRowwiseI8 => 8,
         }
     }
 
     fn has_row_scales(self) -> bool {
         matches!(
             self,
-            Self::RowwiseE4m3 | Self::RowwiseI8 | Self::SiluMulRowwiseI8
+            Self::RowwiseE4m3 | Self::RowwiseI8 | Self::RotateRowwiseI8 | Self::SiluMulRowwiseI8
         )
     }
 }
@@ -128,6 +133,7 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
         QuantizationSemantic::RowwiseE4m3
         | QuantizationSemantic::SliceColumnsBf16
         | QuantizationSemantic::RowwiseI8
+        | QuantizationSemantic::RotateRowwiseI8
         | QuantizationSemantic::SiluMulRowwiseI8 => {
             let input_shape = args.input.shape().dims();
             let output_shape = args.out.shape().dims();
@@ -192,6 +198,12 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
             }
             (DType::BF16, DType::I8)
         }
+        QuantizationSemantic::RotateRowwiseI8 => {
+            if output_cols != input_cols {
+                return Err(invalid("rotated rowwise INT8 output shape must match input"));
+            }
+            (DType::BF16, DType::I8)
+        }
         QuantizationSemantic::SiluMulRowwiseI8 => {
             if output_cols != input_cols {
                 return Err(invalid(
@@ -203,6 +215,11 @@ pub(crate) fn normalize(ctx: &CudaContext, args: QuantizationArgs<'_>) -> Result
     };
     if args.input.dtype() != expected_input || args.out.dtype() != expected_output {
         return Err(invalid("Quantization tensor dtype disagrees with semantic"));
+    }
+    if semantic == QuantizationSemantic::RotateRowwiseI8 && input_cols % 256 != 0 {
+        return Err(invalid(
+            "rotated rowwise INT8 width must be a multiple of 256",
+        ));
     }
     if semantic == QuantizationSemantic::FixedScaleE4m3 {
         if !(args.scale.is_finite() && args.scale > 0.0) {
