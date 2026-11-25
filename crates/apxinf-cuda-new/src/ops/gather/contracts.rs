@@ -15,6 +15,10 @@ pub enum GatherSemantic {
     RgbToPatches,
     /// RGB cast to output dtype, rounded division by 127.5, then rounded subtraction of 1.
     RgbToPatchesStaged,
+    /// RGB u8 images to flattened patches as `((float(b) * float(1/255)) * 2) - 1`: FP32 multiplication
+    /// by the reciprocal of 255, FP32 doubling and subtraction (each rounded in FP32), then one
+    /// rounding to the output dtype. Same geometry and layouts as `RgbToPatches`.
+    RgbToPatchesReciprocal,
     /// Replace selected matrix rows according to a u32 row map.
     ReplaceRows,
 }
@@ -42,6 +46,7 @@ impl GatherSemantic {
             Self::BiasPosition => 1,
             Self::RgbToPatches => 2,
             Self::RgbToPatchesStaged => 4,
+            Self::RgbToPatchesReciprocal => 5,
             Self::ReplaceRows => 3,
         }
     }
@@ -160,7 +165,9 @@ fn dtype_code(dtype: DType, semantic: GatherSemantic) -> Result<u32> {
         DType::F32
             if matches!(
                 semantic,
-                GatherSemantic::RgbToPatches | GatherSemantic::EmbeddingLookup
+                GatherSemantic::RgbToPatches
+                    | GatherSemantic::RgbToPatchesReciprocal
+                    | GatherSemantic::EmbeddingLookup
             ) =>
         {
             Ok(0)
@@ -251,7 +258,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
                 return Err(invalid("bias-position received unrelated bindings"));
             }
         }
-        GatherSemantic::RgbToPatches | GatherSemantic::RgbToPatchesStaged => {
+        GatherSemantic::RgbToPatches
+        | GatherSemantic::RgbToPatchesStaged
+        | GatherSemantic::RgbToPatchesReciprocal => {
             if args.input.is_some()
                 || args.ids.is_some()
                 || args.ids_address.is_some()
@@ -304,7 +313,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: GatherArgs<'_>) -> Result<Norma
             dtype,
             count,
         )?,
-        GatherSemantic::RgbToPatches | GatherSemantic::RgbToPatchesStaged => {
+        GatherSemantic::RgbToPatches
+        | GatherSemantic::RgbToPatchesStaged
+        | GatherSemantic::RgbToPatchesReciprocal => {
             let geometry = args
                 .patches
                 .ok_or_else(|| invalid("RGB-to-patches requires a geometry"))?;

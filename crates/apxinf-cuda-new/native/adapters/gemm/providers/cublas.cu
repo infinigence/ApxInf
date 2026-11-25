@@ -2,12 +2,65 @@
 #include "../../../kernels/custom/gemm.cuh"
 #include "../../../kernels/elementwise/broadcast_bf16_f32.cuh"
 
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <tuple>
+
 namespace apxinf::gemm {
 namespace {
 
+// One cuBLAS handle is shared by every execution prepared for the same
+// (device, stream, thread, math mode). A handle is a heavyweight object (on
+// Thor each one cost on the order of 60 MB of device memory, measured with the
+// MolmoAct2 whole-model prepare of ~3000 executions). The math mode is fixed
+// per handle when it is created (never changed afterwards, in particular not
+// while a CUDA graph is being captured: toggling it per launch made capture
+// fail with cuBLAS status 14), so legacy and pedantic executions use two
+// separate shared handles. Stream and workspace are applied again at every
+// launch below, exactly as before. Executions of one stream run serially, so
+// sharing is safe; the thread component keeps concurrent host threads apart.
+struct SharedHandle {
+  cublasHandle_t handle = nullptr;
+  SharedHandle() = default;
+  SharedHandle(const SharedHandle&) = delete;
+  SharedHandle& operator=(const SharedHandle&) = delete;
+  ~SharedHandle() {
+    if (handle != nullptr) cublasDestroy(handle);
+  }
+};
+
+std::shared_ptr<SharedHandle> acquire_shared_handle(int device,
+                                                    cudaStream_t stream,
+                                                    bool legacy_math) {
+  static std::mutex mutex;
+  // weak_ptr: the handle lives exactly as long as some execution (or a graph
+  // retaining one) uses it, so nothing outlives the executions.
+  static std::map<std::tuple<int, void*, std::thread::id, bool>,
+                  std::weak_ptr<SharedHandle>>
+      registry;
+  std::lock_guard<std::mutex> lock(mutex);
+  for (auto it = registry.begin(); it != registry.end();) {
+    it = it->second.expired() ? registry.erase(it) : std::next(it);
+  }
+  const auto key = std::make_tuple(device, static_cast<void*>(stream),
+                                   std::this_thread::get_id(), legacy_math);
+  if (const auto found = registry.find(key); found != registry.end()) {
+    if (auto existing = found->second.lock()) return existing;
+  }
+  auto created = std::make_shared<SharedHandle>();
+  check_cublas(cublasCreate(&created->handle));
+  check_cublas(cublasSetMathMode(
+      created->handle, legacy_math ? CUBLAS_DEFAULT_MATH : CUBLAS_PEDANTIC_MATH));
+  registry[key] = created;
+  return created;
+}
+
 struct CublasState {
   vendor::CommonResources common;
-  cublasHandle_t handle = nullptr;
+  std::shared_ptr<SharedHandle> shared;
+  cublasHandle_t handle = nullptr;  // borrowed from `shared`
   void* workspace = nullptr;
   size_t workspace_bytes = 0;
   void* dequant_a = nullptr;
@@ -15,7 +68,7 @@ struct CublasState {
 
   ~CublasState() {
     release_resources();
-    if (handle != nullptr) cublasDestroy(handle);
+    handle = nullptr;  // `shared` destroys the handle with its last user
   }
 
   void release_resources() noexcept {
@@ -113,11 +166,10 @@ void prepare_cublas(Execution& state) {
     check_cuda(cudaMalloc(&resources->dequant_a, a_bytes));
     check_cuda(cudaMalloc(&resources->dequant_b, b_bytes));
   }
-  check_cublas(cublasCreate(&resources->handle));
-  check_cublas(cublasSetMathMode(
-      resources->handle, uses_legacy_cublas_numerics(state.spec)
-                             ? CUBLAS_DEFAULT_MATH
-                             : CUBLAS_PEDANTIC_MATH));
+  resources->shared = acquire_shared_handle(
+      state.device, static_cast<cudaStream_t>(state.bindings.stream),
+      uses_legacy_cublas_numerics(state.spec));
+  resources->handle = resources->shared->handle;
   resources->workspace_bytes = 4 * 1024 * 1024;
   check_cuda(cudaMalloc(&resources->workspace, resources->workspace_bytes));
   state.resource_bytes =
