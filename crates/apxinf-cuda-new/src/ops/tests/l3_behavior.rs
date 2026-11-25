@@ -1140,6 +1140,112 @@ fn rowwise_swiglu_accepts_logical_bias_with_padded_projection() {
 }
 
 #[test]
+fn quantization_rotate_rowwise_i8_matches_exact_host_reference() {
+    use apxinf_core::DType;
+
+    // Independent of the kernel's radix-4 butterfly: build the 256x256 matrix by
+    // repeated Kronecker products and multiply directly. Inputs are small
+    // integers, so every product and partial sum is exact in FP32 and the
+    // rotated values are exact multiples of 1/16 in either evaluation order.
+    fn hadamard_unscaled() -> Vec<f32> {
+        let h4: [[f32; 4]; 4] = [
+            [1.0, 1.0, 1.0, -1.0],
+            [1.0, 1.0, -1.0, 1.0],
+            [1.0, -1.0, 1.0, 1.0],
+            [-1.0, 1.0, 1.0, 1.0],
+        ];
+        let mut h = vec![vec![1.0f32]];
+        for _ in 0..4 {
+            let n = h.len();
+            let mut next = vec![vec![0.0f32; n * 4]; n * 4];
+            for (i, row) in h.iter().enumerate() {
+                for (j, value) in row.iter().enumerate() {
+                    for a in 0..4 {
+                        for b in 0..4 {
+                            next[i * 4 + a][j * 4 + b] = value * h4[a][b];
+                        }
+                    }
+                }
+            }
+            h = next;
+        }
+        h.into_iter().flatten().collect()
+    }
+
+    let ctx = CudaContext::new(0).unwrap();
+    let h = hadamard_unscaled();
+    for (rows, cols) in [(1usize, 256usize), (5, 768), (7, 5376), (3, 14336)] {
+        let source: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i * 37 + i / cols * 11) % 31) as f32) - 15.0)
+            .collect();
+        let input = tensor(0, vec![rows, cols], &source);
+        let mut values_out = zeros_tensor(0, vec![rows, cols], DType::I8);
+        let mut scales_out = zeros_tensor(0, vec![rows], DType::F32);
+        let mut args = QuantizationArgs::new(
+            QuantizationSemantic::RotateRowwiseI8,
+            &input,
+            &mut values_out,
+        );
+        args.scales = Some(&mut scales_out);
+        quantization(&ctx, args).unwrap();
+        ctx.synchronize().unwrap();
+
+        let mut q = vec![0u8; rows * cols];
+        crate::CudaBuffer::from_tensor(&values_out)
+            .unwrap()
+            .copy_to_host(&mut q)
+            .unwrap();
+        let mut s = vec![0u8; rows * 4];
+        crate::CudaBuffer::from_tensor(&scales_out)
+            .unwrap()
+            .copy_to_host(&mut s)
+            .unwrap();
+        for row in 0..rows {
+            let mut rotated = vec![0.0f32; cols];
+            for group in 0..cols / 256 {
+                for j in 0..256 {
+                    let mut acc = 0.0f32;
+                    for i in 0..256 {
+                        acc += source[row * cols + group * 256 + i] * h[i * 256 + j];
+                    }
+                    rotated[group * 256 + j] = acc / 16.0;
+                }
+            }
+            let amax = rotated.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let scale = (amax / 127.0).max(1.0e-12);
+            let got = f32::from_ne_bytes(s[row * 4..row * 4 + 4].try_into().unwrap());
+            assert_eq!(got, scale, "rows={rows} cols={cols} row={row} scale");
+            for (col, value) in rotated.iter().enumerate() {
+                let expected = (value / scale).round().clamp(-128.0, 127.0) as i8;
+                assert_eq!(
+                    q[row * cols + col] as i8,
+                    expected,
+                    "rows={rows} cols={cols} row={row} col={col}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn quantization_rotate_rowwise_i8_rejects_unaligned_width() {
+    use apxinf_core::DType;
+
+    let ctx = CudaContext::new(0).unwrap();
+    let input = zeros_tensor(0, vec![2, 255], DType::BF16);
+    let mut values_out = zeros_tensor(0, vec![2, 255], DType::I8);
+    let mut scales_out = zeros_tensor(0, vec![2], DType::F32);
+    let mut args = QuantizationArgs::new(
+        QuantizationSemantic::RotateRowwiseI8,
+        &input,
+        &mut values_out,
+    );
+    args.scales = Some(&mut scales_out);
+    let error = quantization(&ctx, args).unwrap_err();
+    assert!(error.to_string().contains("multiple of 256"), "{error}");
+}
+
+#[test]
 fn quantization_rejects_packed_fp4_input() {
     use apxinf_core::DType;
 
@@ -1153,6 +1259,7 @@ fn quantization_rejects_packed_fp4_input() {
         (QuantizationSemantic::CastF32ToBf16, DType::BF16),
         (QuantizationSemantic::SliceColumnsBf16, DType::BF16),
         (QuantizationSemantic::RowwiseI8, DType::I8),
+        (QuantizationSemantic::RotateRowwiseI8, DType::I8),
     ] {
         let mut output = zeros_tensor(0, vec![1, 16], dtype);
         let error =
@@ -3001,4 +3108,310 @@ fn video_precision_semantics_reject_incompatible_bindings() {
     let mut args=crate::GatherArgs::rgb_to_patches(&images,&mut out,crate::GatherPatchGeometry{views:1,image_size:1,patch_size:1,nhwc:true});
     args.semantic=crate::GatherSemantic::RgbToPatchesStaged;
     assert!(crate::gather(&ctx,args).is_err());
+}
+
+// ---- FP32 one-dimensional convolution family -------------------------------------------------------------------------------------
+
+/// Deterministic pseudo-random values in [-0.5, 0.5).
+fn conv1d_values(count: usize, seed: u32) -> Vec<f32> {
+    let mut state = seed.wrapping_mul(2654435761).wrapping_add(12345);
+    (0..count)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+        })
+        .collect()
+}
+
+/// `F.pad(mode="replicate")` or zero padding, then a valid strided, dilated cross-correlation, in FP64.
+#[allow(clippy::too_many_arguments)]
+fn conv1d_reference(
+    x: &[f32],
+    w: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    cin: usize,
+    cout: usize,
+    len: usize,
+    out_len: usize,
+    kernel: usize,
+    stride: usize,
+    dilation: usize,
+    before: usize,
+    replicate: bool,
+    depthwise: bool,
+) -> Vec<f64> {
+    let mut out = vec![0f64; batch * cout * out_len];
+    for b in 0..batch {
+        for co in 0..cout {
+            for t in 0..out_len {
+                let mut acc = bias.map_or(0.0, |b| b[co] as f64);
+                let channels: Vec<usize> = if depthwise {
+                    vec![co]
+                } else {
+                    (0..cin).collect()
+                };
+                for ci in channels {
+                    for k in 0..kernel {
+                        let s = (t * stride + k * dilation) as i64 - before as i64;
+                        let s = if s < 0 || s >= len as i64 {
+                            if !replicate { continue } else if s < 0 { 0 } else { len as i64 - 1 }
+                        } else { s };
+                        let weight = if depthwise { w[co * kernel + k] } else { w[(co * cin + ci) * kernel + k] };
+                        acc += weight as f64 * x[(b * cin + ci) * len + s as usize] as f64;
+                    }
+                }
+                out[(b * cout + co) * out_len + t] = acc;
+            }
+        }
+    }
+    out
+}
+
+fn assert_close(got: &[f32], want: &[f64], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let scale = want.iter().map(|v| v.abs()).fold(0.0, f64::max).max(1e-6);
+    let worst = got
+        .iter()
+        .zip(want)
+        .map(|(g, w)| (*g as f64 - w).abs())
+        .fold(0.0, f64::max);
+    assert!(
+        worst <= 2e-5 * scale,
+        "{what}: worst error {worst:.3e} against scale {scale:.3e}"
+    );
+}
+
+#[test]
+fn conv1d_matches_a_reference_for_dense_dilated_replicate_and_depthwise_shapes() {
+    use crate::{conv1d, Conv1dArgs, Conv1dPadding};
+    let ctx = CudaContext::new(0).unwrap();
+    // (batch, cin, cout, len, kernel, stride, dilation, before, out_len, replicate, depthwise): the shapes of a BigVGAN decoder
+    // (k 7 pre/post convs, dilated k 3/7/11 residual convs, the depthwise k 12 anti-aliasing filter with stride 2) plus edge cases
+    // (a single output column, an output longer than the padded input, tile-size remainders in time and channels).
+    for (i, &(batch, cin, cout, len, kernel, stride, dilation, before, out_len, replicate, depthwise)) in [
+        (2usize, 32usize, 40usize, 37usize, 7usize, 1usize, 1usize, 3usize, 37usize, false, false),
+        (1, 16, 16, 100, 3, 1, 5, 5, 100, false, false),
+        (1, 8, 8, 64, 11, 1, 3, 15, 64, false, false),
+        (2, 70, 65, 130, 3, 1, 1, 1, 130, false, false),
+        (1, 4, 3, 1, 1, 1, 1, 0, 1, false, false),
+        (1, 8, 8, 200, 12, 2, 1, 5, 100, true, true),
+        (2, 6, 6, 51, 12, 1, 1, 5, 51, true, true),
+        (1, 5, 5, 9, 12, 2, 1, 5, 5, true, true),
+        (1, 3, 2, 10, 5, 3, 2, 4, 6, true, false),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let x = conv1d_values(batch * cin * len, 1 + i as u32);
+        let weight_len = if depthwise {
+            cin * kernel
+        } else {
+            cout * cin * kernel
+        };
+        let w = conv1d_values(weight_len, 100 + i as u32);
+        let bias = conv1d_values(cout, 200 + i as u32);
+        let x_t = f32_tensor(0, vec![batch, cin, len], &x);
+        let w_t = f32_tensor(0, if depthwise { vec![cin, 1, kernel] } else { vec![cout, cin, kernel] }, &w);
+        let b_t = f32_tensor(0, vec![cout], &bias);
+        let out = zeros_tensor(0, vec![batch, cout, out_len], DType::F32);
+        let padding = if replicate { Conv1dPadding::Replicate { before } } else { Conv1dPadding::Zeros { before } };
+        conv1d(&ctx, Conv1dArgs { input: &x_t, weight: &w_t, bias: Some(&b_t), out: &out, stride, dilation, padding, depthwise }).unwrap();
+        ctx.synchronize().unwrap();
+        let want = conv1d_reference(&x, &w, Some(&bias), batch, cin, cout, len, out_len, kernel, stride, dilation, before, replicate, depthwise);
+        assert_close(&f32_values(&out), &want, &format!("case {i}: conv1d {batch}x{cin}->{cout} len {len} k {kernel} s {stride} d {dilation}"));
+        // without bias
+        let out = zeros_tensor(0, vec![batch, cout, out_len], DType::F32);
+        conv1d(&ctx, Conv1dArgs { input: &x_t, weight: &w_t, bias: None, out: &out, stride, dilation, padding, depthwise }).unwrap();
+        ctx.synchronize().unwrap();
+        let want = conv1d_reference(&x, &w, None, batch, cin, cout, len, out_len, kernel, stride, dilation, before, replicate, depthwise);
+        assert_close(&f32_values(&out), &want, &format!("case {i}: conv1d without bias"));
+    }
+}
+
+/// `F.pad(replicate)` then `F.conv_transpose1d(stride)`, cropped and scaled, in FP64; weight `[cin, cout / groups, kernel]`.
+#[allow(clippy::too_many_arguments)]
+fn conv_transpose1d_reference(
+    x: &[f32],
+    w: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    cin: usize,
+    cout: usize,
+    len: usize,
+    kernel: usize,
+    stride: usize,
+    replicate_pad: usize,
+    crop_left: usize,
+    out_len: usize,
+    groups: usize,
+    scale: f32,
+) -> Vec<f64> {
+    let padded_len = len + 2 * replicate_pad;
+    let mut out = vec![0f64; batch * cout * out_len];
+    let (gin, gout) = (cin / groups, cout / groups);
+    for b in 0..batch {
+        for co in 0..cout {
+            let group = co / gout;
+            for j in 0..out_len {
+                let tf = j + crop_left;
+                let mut acc = 0f64;
+                for p in 0..padded_len {
+                    if p * stride > tf || tf - p * stride >= kernel { continue }
+                    let k = tf - p * stride;
+                    let s = (p as i64 - replicate_pad as i64).clamp(0, len as i64 - 1) as usize;
+                    for cg in 0..gin {
+                        let ci = group * gin + cg;
+                        acc += x[(b * cin + ci) * len + s] as f64
+                            * w[(ci * gout + (co - group * gout)) * kernel + k] as f64;
+                    }
+                }
+                out[(b * cout + co) * out_len + j] =
+                    acc * scale as f64 + bias.map_or(0.0, |v| v[co] as f64);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn conv_transpose1d_matches_a_reference_for_plain_cropped_and_anti_aliased_shapes() {
+    use crate::{conv_transpose1d, ConvTranspose1dArgs};
+    let ctx = CudaContext::new(0).unwrap();
+    // (batch, cin, cout, len, kernel, stride, replicate_pad, crop_left, out_len, groups, scale): the vocoder's upsamplers
+    // (k 9 / s 5 with padding (k - s) / 2 cropped on both sides, k 4 / s 2), the anti-aliasing depthwise k 12 / s 2 with its replicate
+    // padding, crop and ratio scale, and degenerate ones (stride 1, a single input column, no crop).
+    for (i, &(batch, cin, cout, len, kernel, stride, rpad, crop, out_len, groups, scale)) in [
+        (1usize, 24usize, 12usize, 37usize, 9usize, 5usize, 0usize, 2usize, 181usize, 1usize, 1.0f32),
+        (2, 8, 4, 20, 4, 2, 0, 1, 38, 1, 1.0),
+        (1, 6, 6, 50, 12, 2, 5, 15, 100, 6, 2.0),
+        (1, 3, 3, 7, 12, 2, 5, 15, 14, 3, 2.0),
+        (1, 4, 5, 1, 6, 3, 0, 0, 6, 1, 0.5),
+        (1, 4, 4, 13, 3, 1, 0, 1, 13, 1, 1.0),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let x = conv1d_values(batch * cin * len, 7 + i as u32);
+        let w = conv1d_values(cin * (cout / groups) * kernel, 70 + i as u32);
+        let bias = conv1d_values(cout, 90 + i as u32);
+        let x_t = f32_tensor(0, vec![batch, cin, len], &x);
+        let w_t = f32_tensor(0, vec![cin, cout / groups, kernel], &w);
+        let b_t = f32_tensor(0, vec![cout], &bias);
+        let out = zeros_tensor(0, vec![batch, cout, out_len], DType::F32);
+        conv_transpose1d(&ctx, ConvTranspose1dArgs { input: &x_t, weight: &w_t, bias: Some(&b_t), out: &out, stride, replicate_pad: rpad, crop_left: crop, groups, scale }).unwrap();
+        ctx.synchronize().unwrap();
+        let want = conv_transpose1d_reference(&x, &w, Some(&bias), batch, cin, cout, len, kernel, stride, rpad, crop, out_len, groups, scale);
+        assert_close(&f32_values(&out), &want, &format!("case {i}: conv_transpose1d {cin}->{cout} len {len} k {kernel} s {stride}"));
+    }
+}
+
+#[test]
+fn snake_beta_matches_the_formula_and_may_run_in_place() {
+    use crate::{snake_beta, SnakeBetaArgs};
+    let ctx = CudaContext::new(0).unwrap();
+    let (batch, channels, len) = (2usize, 5usize, 41usize);
+    let x = conv1d_values(batch * channels * len, 3);
+    let alpha: Vec<f32> = conv1d_values(channels, 4)
+        .iter()
+        .map(|v| (v * 2.0).exp())
+        .collect();
+    let beta: Vec<f32> = conv1d_values(channels, 5)
+        .iter()
+        .map(|v| (v * 2.0).exp())
+        .collect();
+    let want: Vec<f64> = x
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let c = (i / len) % channels;
+            let s = (alpha[c] as f64 * *v as f64).sin();
+            *v as f64 + s * s / (beta[c] as f64 + 1e-9)
+        })
+        .collect();
+    let x_t = f32_tensor(0, vec![batch, channels, len], &x);
+    let (alpha_t, beta_t) = (f32_tensor(0, vec![channels], &alpha), f32_tensor(0, vec![channels], &beta));
+    let out = zeros_tensor(0, vec![batch, channels, len], DType::F32);
+    snake_beta(&ctx, SnakeBetaArgs { input: &x_t, alpha: &alpha_t, beta: &beta_t, out: &out }).unwrap();
+    ctx.synchronize().unwrap();
+    assert_close(&f32_values(&out), &want, "snake_beta");
+    snake_beta(&ctx, SnakeBetaArgs { input: &x_t, alpha: &alpha_t, beta: &beta_t, out: &x_t }).unwrap();
+    ctx.synchronize().unwrap();
+    assert_close(&f32_values(&x_t), &want, "snake_beta in place");
+}
+
+#[test]
+fn conv1d_family_rejects_inconsistent_arguments() {
+    use crate::{conv1d, conv_transpose1d, snake_beta, Conv1dArgs, Conv1dPadding, ConvTranspose1dArgs, SnakeBetaArgs};
+    let ctx = CudaContext::new(0).unwrap();
+    let x = f32_tensor(0, vec![1, 4, 10], &conv1d_values(40, 1));
+    let w = f32_tensor(0, vec![6, 4, 3], &conv1d_values(72, 2));
+    let out = zeros_tensor(0, vec![1, 6, 10], DType::F32);
+    let ok = |padding| Conv1dArgs { input: &x, weight: &w, bias: None, out: &out, stride: 1, dilation: 1, padding, depthwise: false };
+    assert!(conv1d(&ctx, ok(Conv1dPadding::Zeros { before: 1 })).is_ok());
+    // weight with the wrong input-channel count, wrong bias length, zero stride, a non-FP32 input, depthwise with unequal channels
+    let bad_weight = f32_tensor(0, vec![6, 3, 3], &conv1d_values(54, 3));
+    assert!(conv1d(
+        &ctx,
+        Conv1dArgs {
+            weight: &bad_weight,
+            ..ok(Conv1dPadding::Zeros { before: 1 })
+        }
+    )
+    .is_err());
+    let bad_bias = f32_tensor(0, vec![5], &[0.0; 5]);
+    assert!(conv1d(
+        &ctx,
+        Conv1dArgs {
+            bias: Some(&bad_bias),
+            ..ok(Conv1dPadding::Zeros { before: 1 })
+        }
+    )
+    .is_err());
+    assert!(conv1d(
+        &ctx,
+        Conv1dArgs {
+            stride: 0,
+            ..ok(Conv1dPadding::Zeros { before: 1 })
+        }
+    )
+    .is_err());
+    let bf16_input = zeros_tensor(0, vec![1, 4, 10], DType::BF16);
+    assert!(conv1d(
+        &ctx,
+        Conv1dArgs {
+            input: &bf16_input,
+            ..ok(Conv1dPadding::Zeros { before: 1 })
+        }
+    )
+    .is_err());
+    assert!(conv1d(
+        &ctx,
+        Conv1dArgs {
+            depthwise: true,
+            ..ok(Conv1dPadding::Zeros { before: 1 })
+        }
+    )
+    .is_err());
+    // transposed: an output longer than the transposed convolution produces, groups that are neither 1 nor depthwise
+    let tw = f32_tensor(0, vec![4, 3, 4], &conv1d_values(48, 4));
+    let t_out = zeros_tensor(0, vec![1, 3, 100], DType::F32);
+    let t_args = ConvTranspose1dArgs { input: &x, weight: &tw, bias: None, out: &t_out, stride: 2, replicate_pad: 0, crop_left: 0, groups: 1, scale: 1.0 };
+    assert!(conv_transpose1d(&ctx, t_args).is_err());
+    let t_out = zeros_tensor(0, vec![1, 3, 22], DType::F32);
+    let t_args = ConvTranspose1dArgs { input: &x, weight: &tw, bias: None, out: &t_out, stride: 2, replicate_pad: 0, crop_left: 0, groups: 2, scale: 1.0 };
+    assert!(conv_transpose1d(&ctx, t_args).is_err());
+    // snake: alpha of the wrong length
+    let alpha = f32_tensor(0, vec![3], &[1.0; 3]);
+    let beta = f32_tensor(0, vec![4], &[1.0; 4]);
+    assert!(snake_beta(
+        &ctx,
+        SnakeBetaArgs {
+            input: &x,
+            alpha: &alpha,
+            beta: &beta,
+            out: &x
+        }
+    )
+    .is_err());
 }

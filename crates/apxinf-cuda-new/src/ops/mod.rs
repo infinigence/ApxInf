@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod cache;
+pub mod conv1d;
 pub mod elementwise;
 pub mod embedding;
 pub mod gather;
@@ -60,7 +61,7 @@ pub use gemm::{
     gemv, gemv_bias, pack_swiglu_weight_host, BlockQuantizedSwiGluArgs, GemmArgs, GemmBiasArgs,
     GemmBiasGeluArgs, GemmBiasResidualArgs, GemmGegluArgs, GemmNumerics, GemmPolicy,
     GemmQuantization, GemmSwiGluArgs, GemmWeightLayout, GemvArgs, GemvBiasArgs, GemvBlockScales,
-    RepackedWeight, WeightVersion,
+    OutputMajorSlot, RepackedWeight, WeightVersion,
 };
 pub use norm::{
     channel_l2_norm, channel_l2_norm_silu, fused_add_channel_l2_norm_silu, fused_add_norm,
@@ -84,6 +85,9 @@ pub use rope::{
     split_qkv_mrope_cache, AxialRopeArgs, AxialRopeNumerics, DecodeRopeArgs, DecodeRotationArgs,
     DecodeRotationPosition, GroupedQkvRopeArgs, MropeCacheArgs, MultimodalRopeArgs,
     QkvCacheRopeArgs, RopeArgs, RopeSemantic,
+};
+pub use conv1d::{
+    conv1d, conv_transpose1d, snake_beta, Conv1dArgs, Conv1dPadding, ConvTranspose1dArgs, SnakeBetaArgs,
 };
 pub use sampling::{argmax, ArgmaxArgs};
 pub use volume::{Conv3dArgs, Conv3dPolicy, PreparedConv3d, Unfold3dGeometry};

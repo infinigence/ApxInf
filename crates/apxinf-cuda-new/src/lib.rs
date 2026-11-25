@@ -19,7 +19,7 @@ mod workspace;
 pub(crate) static CUDA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use backend::CudaNewBackend;
-pub use buffer::{CudaBuffer, CudaDeviceAddress, HostMappedBuffer};
+pub use buffer::{CudaBuffer, CudaDeviceAddress, HostMappedBuffer, PinnedRegion};
 pub use context::CudaContext;
 pub use cublas::{CublasHandle, CublasTranspose};
 pub use device_caps::{CudaArchFamily, CudaDeviceCaps};
@@ -41,7 +41,7 @@ pub use ops::{
     ResidualAddArgs, RopeArgs, RopeSemantic, SegmentedAttentionArgs, VisionPositionArgs,
 };
 pub use phase::PreparedPhase;
-pub use stream::CudaStream;
+pub use stream::{CudaEvent, CudaStream};
 pub use workspace::ProviderWorkspace;
 
 pub mod ops;
@@ -64,6 +64,11 @@ pub const FA2_DECODE: bool = cfg!(apxinf_fa2_decode);
 pub use ops::{F64RecurrenceState, PreparedRecurrence, RecurrenceCoefficients};
 
 pub use ops::PreparedIndexedMean;
+
+pub use ops::{
+    conv1d, conv_transpose1d, snake_beta, Conv1dArgs, Conv1dPadding, ConvTranspose1dArgs,
+    SnakeBetaArgs,
+};
 
 pub use ops::rms_norm_apply_precomputed;
 

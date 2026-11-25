@@ -388,6 +388,7 @@ fn main() {
         "sampling/argmax.cpp",
         "sampling/suppress_bf16.cu",
         "sampling/launch.cu",
+        "conv1d/fixed_f32.cu",
         "norm/launch.cu",
         "pointwise/launch.cu",
         "rope/launch.cu",
@@ -428,7 +429,7 @@ fn main() {
     if selection
         .targets
         .iter()
-        .any(|target| target.cutlass_arch == "sm_87")
+        .any(|target| matches!(target.cutlass_arch.as_str(), "sm_87" | "sm_89"))
     {
         cutlass_sm87_sources.push(cutlass_root.join("ops/gemm").join("gemm_i8_bf16_sm80.cu"));
     }
@@ -602,7 +603,7 @@ fn main() {
         selection
             .targets
             .iter()
-            .filter(|target| target.cutlass_arch == "sm_87")
+            .filter(|target| matches!(target.cutlass_arch.as_str(), "sm_87" | "sm_89"))
             .map(|target| target.cutlass_arch.clone()),
     );
     let fa2_codegen = gencode_args(

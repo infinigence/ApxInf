@@ -120,7 +120,7 @@ not a port requirement.
 | --- | --- | --- |
 | Python policy (`<Family>Policy`) | Public observation → canonical native inputs → decoded actions; prompt, tokenizer, state/action normalization and output context | [Pi05Policy](../python/apxinf/apxinf/policies/impls/pi05.py) |
 | Native binding (`ModelRunner`) | NumPy/Rust conversion, public shape validation, default sampling keys, host result conversion; delegates family computation to `VlaRuntime` | [PyO3 ModelRunner](../crates/apxinf-py/src/lib.rs) |
-| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision`, `Image` or `Speech`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
+| Loading factory (`AutoModel`) and result (`LoadedModel`) | Resolve a registry entry, invoke its loader, return `Text`, `Vla`, `Decision`, `Image`, `Video` or `Speech`; these do not add another inference loop | [auto.rs](../crates/apxinf-model/src/auto.rs), [registry.rs](../crates/apxinf-model/src/registry.rs) |
 | `config.rs`, `load.rs` | Validate family config; select a supported implementation, materialize weights and fixed embeddings, construct the runner through its constructor | [load.rs](../crates/apxinf-model/src/pi05/load.rs) |
 | `model_runner/` (`<Family>ModelRunner`) | Implements `VlaRuntime`; validates requests, owns preparation policy, input/RNG binding, bounded cache and invalidation | [runner.rs](../crates/apxinf-model/src/pi05/model_runner/runner.rs) |
 | `model_runner/prepare.rs` and prepared inference | Query requirements, allocate stable inputs/output/workspace, warm up, capture and retain resources; compatible `run` executes without capture/autotune | [prepare.rs](../crates/apxinf-model/src/pi05/model_runner/prepare.rs) |
@@ -148,6 +148,14 @@ text-to-image contract. A request carries the prompt, size, seed and step count;
 the result is caller-owned row-major RGB8. Each family documents the sizes and
 step counts it supports, rejects others before device work, and keeps guidance,
 scheduler and file encoding out of the request.
+
+`VideoRuntime` ([video.rs](../crates/apxinf-model/src/video.rs)) is the
+text-to-video-and-audio counterpart. A request carries the prompt, canvas size,
+frame count, seed and step count; the result is caller-owned row-major RGB8 frames
+plus interleaved `f32` audio with its sample rate and channel count. A family
+documents the sizes and frame counts it accepts, rejects values outside that range
+before device work, and keeps encoding and muxing out of the request. Whether an
+accepted size fits in device memory is a separate limit that the family documents.
 
 `SpeechRuntime` ([speech.rs](../crates/apxinf-model/src/speech.rs)) is the shared
 text-to-speech contract. A request carries the text, voice, language, an optional
@@ -362,6 +370,8 @@ renamed as part of unrelated work.
 | PI0.5 CPU / `VlaRuntime` | Independent `cpu_pi05/{config,weights,model,runner,load}.rs`; concrete `CpuPi05Model` and `CpuPi05Runner`, FP32 eager reference. See [CPU contract](pi05-cpu-reference.md). |
 | PI0.5 / `VlaRuntime`, MUSA | Independent `musa_pi05/` (`config.rs`, `math.rs`, `load.rs`, `model/`, `model_runner/`, `weights/`); `model_variant` selects `auto` (resolves to BF16), `bf16`, `int8_dynamic` or `int8_dynamic_no_encode`, while `fp8_static` is rejected before weights load; eager and captured execution, a prepared-shape ledger and a load-time tactic database. See [MUSA backend](musa-backend.md). |
 | Cosmos Policy / `VlaRuntime` | `cuda_cosmos_policy/`; single `model/blocks/bf16.rs` behind `Bf16Blocks`, `weights/{host,bf16}`, and `model_runner/{runner,prepare}`; BF16 LIBERO direct profile, full joint action/future-state/image/value denoising, FP64 solver state and family-owned fixed-profile preparation. [Scope and validation status](cosmos-policy.md) |
+| MiniMax-H3-Image / `ImageRuntime` | `cuda_minimax_h3_image/`; `model/blocks/{int8,text,vae,refiner}`, `weights/{host,bf16,text,vae}`, and `model_runner/{runner,prepare}`; INT8 ConvRot DiT with graph-captured six-step PDD denoise, Qwen3-VL text encoder streamed by DMA from the page-locked checkpoint, and tiled ViT VAE decode. [Scope and validation status](minimax-h3-image.md) |
+| MiniMax-H3 / `VideoRuntime` | `cuda_minimax_h3/`; `model/blocks/{int8,text,vae,audio_vae,refiner}`, `weights/{host,bf16,text,vae,audio_vae}`, and `model_runner/{runner,prepare,video,audio}`; INT8 ConvRot DiT over a packed text/audio/video sequence with a graph-captured denoise, the Qwen3-VL text encoder streamed by DMA, a ViT video VAE decoder streamed block by block and a BigVGAN audio decoder on the cuda-new `conv1d` operators; text-to-video-and-audio only. [Scope and validation status](minimax-h3.md) |
 | SmolVLA / `VlaRuntime` | `smolvla/`; native BF16 default with optional FP16 tensor-core GEMMs over a BF16 residual stream, two resized RGB views, native HF tokenizer in the Python policy, eager preparation and a 10-step flow schedule |
 | Qwen-Drive / `VlaRuntime` | Planning-only `model/`, `model_runner/`, `weights/`; one BF16 Blocks file; direct planning prepares the whole model and replays a captured graph, while variable-length reasoning stays eager with local GDN graphs. See [benchmark and runtime notes](qwen-drive-benchmark.md). |
 | WallOSS / `VlaRuntime` | `model/` (`WallossModel` + `ModelVariant` over BF16 and dynamic FP8, `blocks/`), `model_runner/` (`WallossModelRunner`, `prepare.rs`: explicit preparation policy/status, capture during preparation, one implicit plan replaced on shape change), `weights/`; per-request grids via `VlaMetadata::image_grid_thw` kept in the family's plan key; model-reported workspace backed by the config-only `workspace.rs` budget; rejected host requests preserve the cached plan; `check_walloss_module_boundaries.py`. See [WallOSS](walloss.md). |

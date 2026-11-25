@@ -74,7 +74,15 @@ pub fn rms_norm_apply_precomputed(
     crate::workspace::validate_capture_target(ctx.device_id(), bindings.stream as usize)?;
     // Fixed operators do not need a prepared execution, but graphs must own all
     // storage referenced by their captured kernels even after caller tensors drop.
-    let storage = Rc::new(vec![input, output, weight, table]);
+    // Retain the backing allocations only: pinning a session-arena lease here would
+    // keep a freed block alive during capture that preparation had already reused,
+    // moving every later arena allocation and breaking the prepared-execution keys
+    // (the convention of the GEMM and Attention executions).
+    let storage = Rc::new(
+        [&input, &output, &weight, &table]
+            .map(CudaBuffer::retained_for_execution)
+            .to_vec(),
+    );
     crate::workspace::retain_resource(&storage);
     unsafe {
         status::check(abi::apxinf_rope_rms_precomputed_launch(

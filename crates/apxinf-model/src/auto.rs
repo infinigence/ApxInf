@@ -15,6 +15,7 @@ use crate::generation_config::{
     load_generation_options, GenerationConfigSource, GenerationOptions,
 };
 use crate::image::{GeneratedImage, ImageRequest, ImageRuntime};
+use crate::video::{GeneratedVideo, VideoRequest, VideoRuntime};
 use crate::llm_trait::{
     GeneratedToken, GenerationOutput, GenerationRequest, LlmCapabilities, LlmInput, LlmTrait,
 };
@@ -112,6 +113,7 @@ pub enum LoadedModel {
     Vla(Box<dyn VlaRuntime>),
     Decision(DecisionModel),
     Image(Box<dyn ImageRuntime>),
+    Video(Box<dyn VideoRuntime>),
     Speech(Box<dyn SpeechRuntime>),
 }
 
@@ -129,6 +131,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not text".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
@@ -139,6 +142,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not VLA".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not VLA".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not VLA".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not VLA".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not VLA".into())),
         }
     }
@@ -149,6 +153,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
@@ -175,6 +180,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
@@ -185,6 +191,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
@@ -195,6 +202,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not decision".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
         }
     }
@@ -209,6 +217,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(model) => Ok(model.capabilities()),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not text".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
@@ -228,6 +237,9 @@ impl LoadedModel {
             )),
             Self::Image(_) => Err(Error::Other(
                 "image models do not use autoregressive generation defaults".into(),
+            )),
+            Self::Video(_) => Err(Error::Other(
+                "video models do not use autoregressive generation defaults".into(),
             )),
             Self::Speech(_) => Err(Error::Other(
                 "speech models do not use autoregressive generation defaults".into(),
@@ -275,6 +287,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not text".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
         }
     }
@@ -285,12 +298,28 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not image".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not image".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not image".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not image".into())),
             Self::Speech(_) => Err(Error::Other("loaded model is speech, not image".into())),
         }
     }
 
     pub fn generate_image(&mut self, request: &ImageRequest<'_>) -> Result<GeneratedImage> {
         self.image_mut()?.generate(request)
+    }
+
+    pub fn video_mut(&mut self) -> Result<&mut dyn VideoRuntime> {
+        match self {
+            Self::Video(model) => Ok(&mut **model),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not video".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not video".into())),
+            Self::Decision(_) => Err(Error::Other("loaded model is decision, not video".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not video".into())),
+            Self::Speech(_) => Err(Error::Other("loaded model is speech, not video".into())),
+        }
+    }
+
+    pub fn generate_video(&mut self, request: &VideoRequest<'_>) -> Result<GeneratedVideo> {
+        self.video_mut()?.generate(request)
     }
 
     pub fn speech_mut(&mut self) -> Result<&mut dyn SpeechRuntime> {
@@ -300,6 +329,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not speech".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not speech".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not speech".into())),
+            Self::Video(_) => Err(Error::Other("loaded model is video, not speech".into())),
         }
     }
 
@@ -447,6 +477,13 @@ impl AutoModel {
         if model_dir.join("joint_head_config.json").is_file() {
             return Ok("clef".to_owned());
         }
+        // MiniMax-H3-Image ships as three Comfy-Org checkpoints with no config.json; its manifest names the package.
+        if crate::cuda_minimax_h3_image::is_package(model_dir) {
+            return Ok("minimax-h3-image".to_owned());
+        }
+        if crate::cuda_minimax_h3::is_package(model_dir) {
+            return Ok("minimax-h3".to_owned());
+        }
         let decision_path = model_dir.join("decision_config.json");
         if decision_path.is_file() {
             let raw = std::fs::read_to_string(&decision_path).map_err(|error| {
@@ -568,6 +605,26 @@ impl AutoModel {
             return crate::cuda_cosmos_policy::load::load_with_cuda_new(path, device, options);
             #[cfg(not(feature = "cuda"))]
             return Err(Error::Other("Cosmos Policy requires CUDA support".into()));
+        }
+
+        if matches!(
+            model_name,
+            "minimax-h3" | "minimax-h3-cuda" | "cuda_minimax_h3"
+        ) {
+            #[cfg(feature = "cuda")]
+            return crate::cuda_minimax_h3::load::load_with_cuda_new(path, device, options);
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("MiniMax-H3 requires CUDA support".into()));
+        }
+
+        if matches!(
+            model_name,
+            "minimax-h3-image" | "minimax-h3-image-cuda" | "cuda_minimax_h3_image"
+        ) {
+            #[cfg(feature = "cuda")]
+            return crate::cuda_minimax_h3_image::load::load_with_cuda_new(path, device, options);
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("MiniMax-H3-Image requires CUDA support".into()));
         }
 
         register_builtin_models();
@@ -854,6 +911,10 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "gr00t_n1_7-hip"
             | "cosmos-policy"
             | "cuda_cosmos_policy"
+            | "minimax-h3-image"
+            | "cuda_minimax_h3_image"
+            | "minimax-h3"
+            | "cuda_minimax_h3"
     ) || matches!(device, Device::Metal(_))
 }
 #[cfg(test)]
@@ -996,6 +1057,21 @@ mod tests {
         );
         assert_eq!(config.vocab_size, frontend.vocab_size);
         config.validate().unwrap();
+    }
+
+    /// The MiniMax-H3 loaders accept `model_variant` `auto` and `int8_convrot`; admission must let those reach them.
+    #[test]
+    fn minimax_h3_families_admit_their_model_variants() {
+        for name in [
+            "minimax-h3-image",
+            "minimax-h3-image-cuda",
+            "cuda_minimax_h3_image",
+            "minimax-h3",
+            "minimax-h3-cuda",
+            "cuda_minimax_h3",
+        ] {
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
     }
 
     #[test]
@@ -1215,6 +1291,60 @@ mod tests {
             AutoModel::detect_model_name(&directory).unwrap(),
             "qwen_image"
         );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn minimax_h3_image_package_is_detected_by_its_manifest() {
+        let directory = temporary_directory("h3-image-detection");
+        assert!(
+            AutoModel::detect_model_name(&directory).is_err(),
+            "no manifest and no config.json"
+        );
+        std::fs::write(directory.join(crate::cuda_minimax_h3_image::MANIFEST), "{}").unwrap();
+        assert_eq!(
+            AutoModel::detect_model_name(&directory).unwrap(),
+            "minimax-h3-image"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn minimax_h3_package_is_detected_by_its_manifest_and_not_as_the_image_family() {
+        let directory = temporary_directory("h3-detection");
+        assert!(
+            AutoModel::detect_model_name(&directory).is_err(),
+            "no manifest and no config.json"
+        );
+        std::fs::write(directory.join(crate::cuda_minimax_h3::MANIFEST), "{}").unwrap();
+        assert_eq!(
+            AutoModel::detect_model_name(&directory).unwrap(),
+            "minimax-h3"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn minimax_h3_names_reach_the_h3_loader_and_not_the_image_loader() {
+        // An empty directory has no manifest, so each loader stops at its own package check before any device is opened.
+        let directory = temporary_directory("h3-explicit");
+        for (name, mentions) in [
+            ("minimax-h3", "apxinf_h3.json"),
+            ("minimax-h3-cuda", "apxinf_h3.json"),
+            ("cuda_minimax_h3", "apxinf_h3.json"),
+            ("minimax-h3-image", "apxinf_h3_image.json"),
+        ] {
+            let options = LoadOptions {
+                model_name: Some(name.into()),
+                ..LoadOptions::default()
+            };
+            let error = AutoModel::load_model(Device::Cuda(0), &directory, &options)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: an empty directory must not load"))
+                .to_string();
+            assert!(error.contains(mentions), "{name}: {error}");
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 

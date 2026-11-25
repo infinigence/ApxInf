@@ -22,7 +22,8 @@ impl CudaStream {
         Self::new_on(device as usize)
     }
 
-    pub(crate) fn new_on(device: usize) -> Result<Self, String> {
+    /// A non-blocking stream on `device`, for work that must overlap the context stream (for example weight copies).
+    pub fn new_on(device: usize) -> Result<Self, String> {
         unsafe {
             ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
         }
@@ -40,6 +41,21 @@ impl CudaStream {
     pub fn synchronize(&self) -> Result<(), String> {
         self.with_current_device(|| unsafe {
             ffi::check_cuda(ffi::cudaStreamSynchronize(self.handle))
+        })
+    }
+
+    /// Make later work on this stream wait for everything `event` recorded.
+    /// An event that was never recorded is already complete.
+    pub fn wait_for(&self, event: &CudaEvent) -> Result<(), String> {
+        self.with_current_device(|| unsafe {
+            ffi::check_cuda(ffi::cudaStreamWaitEvent(self.handle, event.handle, 0))
+        })
+    }
+
+    /// Record `event` after the work already queued on this stream.
+    pub fn record(&self, event: &CudaEvent) -> Result<(), String> {
+        self.with_current_device(|| unsafe {
+            ffi::check_cuda(ffi::cudaEventRecord(event.handle, self.handle))
         })
     }
 
@@ -86,6 +102,41 @@ impl CudaStream {
         Self {
             handle: std::ptr::null_mut::<c_void>(),
             device: device.max(0) as usize,
+        }
+    }
+}
+
+/// A CUDA event without timing, used to order work between two streams.
+pub struct CudaEvent {
+    handle: ffi::cudaEvent_t,
+    device: usize,
+}
+
+unsafe impl Send for CudaEvent {}
+unsafe impl Sync for CudaEvent {}
+
+impl CudaEvent {
+    pub fn new(device: usize) -> Result<Self, String> {
+        let mut handle: ffi::cudaEvent_t = std::ptr::null_mut();
+        unsafe {
+            ffi::check_cuda(ffi::cudaSetDevice(device as i32))?;
+            ffi::check_cuda(ffi::cudaEventCreateWithFlags(
+                &mut handle,
+                ffi::cudaEventDisableTiming,
+            ))?;
+        }
+        Ok(Self { handle, device })
+    }
+
+    pub fn device(&self) -> usize {
+        self.device
+    }
+}
+
+impl Drop for CudaEvent {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ffi::cudaEventDestroy(self.handle);
         }
     }
 }

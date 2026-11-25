@@ -4,6 +4,8 @@ mod accelerator;
 pub mod auto;
 pub mod builtin;
 pub mod cuda_cosmos_policy;
+pub mod cuda_minimax_h3;
+pub mod cuda_minimax_h3_image;
 pub mod d3;
 pub mod decision;
 pub mod debug;
@@ -43,6 +45,7 @@ pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
 pub mod speech;
+pub mod video;
 pub mod vla;
 mod walloss;
 
@@ -59,6 +62,7 @@ pub use decision::{
 };
 pub use debug::{DebugCapture, DebugConfig};
 pub use image::{GeneratedImage, ImageRequest, ImageRuntime};
+pub use video::{GeneratedVideo, VideoRequest, VideoRuntime};
 pub use speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
