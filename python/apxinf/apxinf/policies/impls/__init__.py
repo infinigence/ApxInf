@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from .cosmos_policy import CosmosPolicy
 from .gr00t import Gr00tPolicy
+from .molmoact2 import MolmoAct2Policy
 from .pi05 import Pi05Policy
 from .pi0fast import Pi0FastPolicy
 from .qwen_drive import QwenDrivePolicy
@@ -30,6 +31,7 @@ from .walloss import WallossPolicy
 
 __all__ = [
     "CosmosPolicy",
+    "MolmoAct2Policy",
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",

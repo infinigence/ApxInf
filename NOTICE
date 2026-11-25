@@ -76,6 +76,18 @@ The metal_qwen3_tts Talker, code predictor, sampling and waveform decoder
 adapt mlx-audio, revision 70f4add32911bab6f869b824864ad9f1e24dcb97.
 Copyright (c) 2025 Prince Canuma and contributors. MIT License.
 
+The MolmoAct2 policy (python/apxinf/apxinf/policies/impls/molmoact2.py) re-implements, in NumPy, the
+prompt/state helpers `_normalize_question_text`, `_discretize_normalized_state`, `_build_robot_text` and
+`_FeatureNormalizer` of `modeling_molmoact2.py`, the single-crop image-token expansion and BOS insertion
+of `processing_molmoact2.py`, and calls the same torchvision resize as `resize_image` of
+`image_processing_molmoact2.py`. Source: the Python files shipped with Hugging Face
+allenai/MolmoAct2-LIBERO, revision 0d24a92bd1faf321ef497c3bbd5681af97c65aa2. Those files carry no
+per-file license header; the publisher's repository https://github.com/allenai/molmoact2 states that the
+model is licensed under Apache 2.0 and contains the Apache License 2.0 as LICENSE. The comparison
+reference allenai/lerobot, revision 28b4f721f931aab554cb176412223f098023705f (Apache License 2.0), is used to
+produce reference outputs only and no code of it is copied. No checkpoint weights are distributed with
+ApxInf.
+
 The NumPy-compatible float32 range reduction and sine/cosine polynomials in
 crates/apxinf-model/src/metal_qwen_image/tables.rs are scalar Rust adaptations
 of the implementation present in NumPy 2.2.6, revision

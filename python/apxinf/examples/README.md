@@ -13,6 +13,7 @@ meaningless — the point is the call shape).
 | Example | Shows |
 |---|---|
 | [`pi05policy_infer.py`](pi05policy_infer.py) | Concrete `Pi05Policy.from_pretrained` — model-specific knobs (`action_dim`, `image_keys`). |
+| [`molmoact2policy_infer.py`](molmoact2policy_infer.py) | Concrete `MolmoAct2Policy.from_pretrained` — graph execution policy (`--execution eager`: prepared eager, no graph), prepare-on-first-call, repeated chunks, provided noise (see `doc/molmoact2.md`; needs the checkpoint, `torch`/`torchvision`). |
 | [`autopolicy_infer.py`](autopolicy_infer.py) | Generic `AutoPolicy.from_pretrained` — dispatch by `config.json` model type and pass concrete-policy options as JSON. |
 | [`openpi_server.py`](openpi_server.py) | Serve any registered policy over OpenPI's websocket protocol (`apxinf.serving`). |
 | [`openpi_client.py`](openpi_client.py) | Connect an OpenPI client, read metadata, send one observation, read actions. |

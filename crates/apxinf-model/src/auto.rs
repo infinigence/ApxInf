@@ -541,6 +541,16 @@ impl AutoModel {
             return Err(Error::Other("Cosmos Policy requires CUDA support".into()));
         }
 
+        if matches!(
+            model_name,
+            "molmoact2" | "molmoact2-cuda" | "cuda_molmoact2"
+        ) {
+            #[cfg(feature = "cuda")]
+            return crate::cuda_molmoact2::load::load_with_cuda_new(path, device, options);
+            #[cfg(not(feature = "cuda"))]
+            return Err(Error::Other("MolmoAct2 requires CUDA support".into()));
+        }
+
         register_builtin_models();
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
@@ -822,6 +832,8 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "smolvla_libero"
             | "cosmos-policy"
             | "cuda_cosmos_policy"
+            | "molmoact2"
+            | "cuda_molmoact2"
     ) || matches!(device, Device::Metal(_))
 }
 #[cfg(test)]
@@ -1028,6 +1040,36 @@ mod tests {
     fn cosmos_policy_admits_every_spelling_of_its_family() {
         for name in ["cosmos-policy", "cosmos-policy-cuda", "cuda_cosmos_policy"] {
             assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+        }
+    }
+
+    /// MolmoAct2 answers under every spelling of its family, and an explicit `model_variant` passes the
+    /// central admission and reaches the family loader, which alone decides what it accepts: `bf16` goes on
+    /// to read the checkpoint config (missing in the empty directory), another variant is rejected by the
+    /// loader with its own message, never by the central check.
+    #[test]
+    fn molmoact2_admits_every_spelling_and_leaves_the_variant_to_its_loader() {
+        for name in ["molmoact2", "molmoact2-cuda", "cuda_molmoact2"] {
+            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+            let path = temporary_directory("molmoact2-admission");
+            for (variant, family_error) in [("bf16", "MolmoAct2 config:"), ("fp16", "only the BF16 profile")] {
+                let options = LoadOptions {
+                    model_name: Some(name.into()),
+                    model_variant: Some(variant.into()),
+                    ..LoadOptions::default()
+                };
+                let error = match AutoModel::load_model(Device::Cuda(0), &path, &options) {
+                    Ok(_) => panic!("an empty directory cannot load as MolmoAct2"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    !error.contains("does not yet support model_variant"),
+                    "model_name={name} model_variant={variant} was rejected before the family loader: {error}"
+                );
+                let expected = if cfg!(feature = "cuda") { family_error } else { "requires CUDA support" };
+                assert!(error.contains(expected), "model_name={name} model_variant={variant}: {error}");
+            }
+            std::fs::remove_dir_all(path).unwrap();
         }
     }
 
