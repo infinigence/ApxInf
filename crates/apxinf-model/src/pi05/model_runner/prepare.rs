@@ -15,10 +15,43 @@ fn allocate_session(
     scratch: &ProviderWorkspace,
 ) -> Result<ExecutionSession> {
     Ok(ExecutionSession::with_provider_workspace(
-        GraphWorkspace::new(requirements.bytes, device)?,
+        GraphWorkspace::new(arena_capacity(requirements.bytes)?, device)?,
         scratch.clone(),
     ))
 }
+
+/// Environment variable that replaces the static workspace capacity of a PI0.5 session, in MiB.
+pub(in crate::pi05) const ARENA_MIB_ENV: &str = "APXINF_PI05_ARENA_MIB";
+
+/// Capacity of the session arena for a model whose conservative bound is `bound` bytes.
+///
+/// The bound counts every intermediate as live at once. On the INT8 path it is twice the BF16
+/// bound (7660 MiB for two views, a horizon of ten and ten prompt tokens), which leaves no room on
+/// an 8 GB card where the weights take 4024 MiB. Setting `APXINF_PI05_ARENA_MIB` replaces the bound
+/// with a measured capacity. A value that is not a positive integer is an error, not a silent
+/// fallback to the bound, so a typo cannot be mistaken for a setting that took effect. A capacity
+/// that is too small fails the first request with "static inference workspace exhausted", which
+/// names the bytes needed.
+pub(in crate::pi05) fn arena_capacity(bound: usize) -> Result<usize> {
+    arena_capacity_from(bound, std::env::var(ARENA_MIB_ENV).ok().as_deref())
+}
+
+fn arena_capacity_from(bound: usize, mib: Option<&str>) -> Result<usize> {
+    let Some(text) = mib else {
+        return Ok(bound);
+    };
+    let invalid = || {
+        Error::Other(format!(
+            "{ARENA_MIB_ENV}={text:?} is not a positive number of MiB that fits in the address space"
+        ))
+    };
+    let mib: usize = text.trim().parse().map_err(|_| invalid())?;
+    if mib == 0 {
+        return Err(invalid());
+    }
+    mib.checked_mul(1 << 20).ok_or_else(invalid)
+}
+
 pub struct CapturedGraph {
     graph: Box<dyn Graph>,
     output: Tensor,
@@ -414,4 +447,54 @@ pub(super) fn capture_loaded(
         count: spec.token_count,
         noise,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::arena_capacity_from;
+
+    const BOUND: usize = 7660 << 20;
+
+    #[test]
+    fn unset_keeps_the_conservative_bound() {
+        assert_eq!(arena_capacity_from(BOUND, None).unwrap(), BOUND);
+    }
+
+    #[test]
+    fn a_positive_value_replaces_the_bound_in_mib() {
+        assert_eq!(arena_capacity_from(BOUND, Some("256")).unwrap(), 256 << 20);
+        assert_eq!(arena_capacity_from(BOUND, Some(" 91 ")).unwrap(), 91 << 20);
+        // A capacity above the bound is allowed: the variable states what the user measured.
+        assert_eq!(
+            arena_capacity_from(BOUND, Some("9000")).unwrap(),
+            9000 << 20
+        );
+    }
+
+    #[test]
+    fn anything_else_is_an_error_naming_the_variable() {
+        let bad_values = [
+            "",
+            "0",
+            "-1",
+            "256MiB",
+            "1.5",
+            "abc",
+            "99999999999999999999",
+        ];
+        for bad in bad_values {
+            let message = arena_capacity_from(BOUND, Some(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains("APXINF_PI05_ARENA_MIB"),
+                "{bad:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_overflows_bytes_is_an_error() {
+        assert!(arena_capacity_from(BOUND, Some(&usize::MAX.to_string())).is_err());
+    }
 }

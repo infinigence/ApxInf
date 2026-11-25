@@ -377,7 +377,9 @@ impl Pi05ModelRunner {
     ) -> Result<EagerInputs> {
         let session = ExecutionSession::with_provider_workspace(
             GraphWorkspace::new(
-                self.model.workspace_requirements(spec.token_count)?.bytes,
+                super::prepare::arena_capacity(
+                    self.model.workspace_requirements(spec.token_count)?.bytes,
+                )?,
                 self.backend.device_id(),
             )?,
             self.provider_workspace.clone(),

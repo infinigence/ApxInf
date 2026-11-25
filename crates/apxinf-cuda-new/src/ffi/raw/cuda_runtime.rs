@@ -46,6 +46,11 @@ pub const cudaHostAllocPortable: u32 = 1;
 pub const cudaHostAllocMapped: u32 = 2;
 pub const cudaHostAllocWriteCombined: u32 = 4;
 
+// Flags for `cudaHostRegister` and `cudaEventCreateWithFlags`.
+pub const cudaHostRegisterPortable: u32 = 1;
+pub const cudaHostRegisterReadOnly: u32 = 8;
+pub const cudaEventDisableTiming: u32 = 2;
+
 extern "C" {
     pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> cudaError_t;
     pub fn cudaFree(devPtr: *mut c_void) -> cudaError_t;
@@ -63,6 +68,9 @@ extern "C" {
     /// is zero-copy: a CPU store is visible to kernels with no `cudaMemcpy`.
     pub fn cudaHostAlloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> cudaError_t;
     pub fn cudaFreeHost(ptr: *mut c_void) -> cudaError_t;
+    /// Page-lock an existing host range so copies from it are direct DMA.
+    pub fn cudaHostRegister(ptr: *mut c_void, size: usize, flags: u32) -> cudaError_t;
+    pub fn cudaHostUnregister(ptr: *mut c_void) -> cudaError_t;
     pub fn cudaHostGetDevicePointer(
         devPtr: *mut *mut c_void,
         hostPtr: *const c_void,
@@ -117,6 +125,9 @@ extern "C" {
     pub fn cudaStreamSynchronize(stream: cudaStream_t) -> cudaError_t;
 
     pub fn cudaEventCreate(event: *mut cudaEvent_t) -> cudaError_t;
+    pub fn cudaEventCreateWithFlags(event: *mut cudaEvent_t, flags: u32) -> cudaError_t;
+    pub fn cudaStreamWaitEvent(stream: cudaStream_t, event: cudaEvent_t, flags: u32)
+        -> cudaError_t;
     pub fn cudaEventDestroy(event: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventRecord(event: cudaEvent_t, stream: cudaStream_t) -> cudaError_t;
     pub fn cudaEventSynchronize(event: cudaEvent_t) -> cudaError_t;

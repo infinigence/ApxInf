@@ -34,7 +34,8 @@ Contents:
 ```rust
 use apxinf_cuda_new::{
     // §2 infrastructure
-    CudaContext, CudaStream, CudaBuffer, CudaDeviceAddress, HostMappedBuffer,
+    CudaContext, CudaStream, CudaEvent, CudaBuffer, CudaDeviceAddress, HostMappedBuffer,
+    PinnedRegion,
     // §5 sessions and graphs
     ExecutionSession, GraphWorkspace, PreparedPhase, CapturedGraph, capture,
     // §6 build-time constants: tell dependents whether an optional kernel was
@@ -96,6 +97,38 @@ buf.view(byte_offset, len) -> Result<Self, String>        // zero-copy slice
 CudaBuffer::from_tensor(&Tensor) -> Result<Self, String>  // borrows the Tensor's storage
 buf.as_tensor(shape, dtype) -> Result<Tensor, String>
 ```
+
+### 2.3a Copy streams, events and streamed weights
+
+For models whose weights do not fit beside the rest of the pipeline and must pass through the
+device once per request. Three pieces, all outside any graph:
+
+```rust
+CudaStream::new_on(device) -> Result<Self, String>          // a second, non-blocking stream
+stream.record(&event) / stream.wait_for(&event)             // order work between two streams
+CudaEvent::new(device) -> Result<Self, String>              // timing disabled
+
+PinnedRegion::register(owner: Arc<dyn AsRef<[u8]> + Send + Sync>, device) -> Result<Self, String>
+PinnedRegion::unregistered(owner, device) -> Self           // pageable fallback, same API
+buf.copy_from_region_async(dst_offset, &region, src_offset, len, &stream)   // enqueue, no wait
+
+ops::OutputMajorSlot::new(ctx, n, k) -> Result<Self>       // reusable W8A8 weight address
+slot.weight / slot.layout                                   // logical [K, N] tensor + shared layout state
+slot.fill(&region, offset, &stream)                         // checkpoint [N, K] bytes into the slot
+```
+
+`PinnedRegion::register` page-locks the owner's bytes (`cudaHostRegister`, read-only), so a copy from
+a file map is a DMA from the page cache with no staging copy; dropping the region waits for the
+device and unregisters. Registration pins host memory and may be refused by the driver or the
+container limit: callers fall back to `unregistered`, which is correct but about 3x slower. The
+owner must not change while registered (a read-only file map satisfies this).
+
+An `OutputMajorSlot` is filled in place for the next weight of the same shape. Executions bind the
+slot's address, so a prepared GEMM or a captured graph reads whatever the slot holds when it runs;
+order a fill before its readers with an event and do not refill until the readers have completed.
+On a device with no output-major candidate for this K/N the slot is canonical `[K, N]` and each
+fill transposes on the host first (`is_direct()` reports which). A copy stream that runs one weight
+ahead of the compute stream, with two slot sets used alternately, overlaps transfer and compute.
 
 ### 2.4 `HostMappedBuffer` — fixed-address host-mapped memory
 
