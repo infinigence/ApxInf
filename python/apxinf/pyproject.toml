@@ -25,6 +25,9 @@ policy = ["apxinf-py>=0.1.0"]
 # 15 is the floor because `scripts/pi05_remote_client.py` connects with
 # `proxy=` named, which the sync client only accepts from 15.0 on.
 serving = ["msgpack>=1.0.5", "websockets>=15.0"]
+# MolmoAct2Policy resizes camera frames on the host with torchvision's CPU uint8 bilinear resize (the
+# checkpoint's reference preprocessing); it raises when torch/torchvision are missing and has no fallback.
+molmoact2 = ["apxinf-py>=0.1.0", "torch>=2.1", "torchvision>=0.16"]
 # SentencePiece remains a test-only reference for native differential checks.
 # torch/torchvision back the reference-comparison tests for the Cosmos Policy
 # image recipe and the pi0-family fixtures; those tests skip when absent.

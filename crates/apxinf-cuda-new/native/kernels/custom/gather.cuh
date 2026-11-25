@@ -90,11 +90,17 @@ __global__ void bias_position(const T* projection, const T* bias,
   }
 }
 
+// Normalization recipes of rgb_u8_to_patches; the launcher maps the Gather semantic onto them.
+constexpr int kRgbRecipeUnitRange = 0;   // (b / 255) * 2 - 1 with a true FP32 division
+constexpr int kRgbRecipeStaged = 1;      // cast, /127.5, -1 with a rounding after each step
+constexpr int kRgbRecipeReciprocal = 2;  // ((b * float(1/255)) * 2) - 1, FP32 steps, one output rounding
+constexpr float kReciprocal255 = static_cast<float>(1.0 / 255.0);
+
 // Cuts RGB images into flattened patches and maps [0, 255] to [-1, 1].
 // Output is [views * patches_per_view, 3 * patch_size * patch_size].
 template <class T, bool kNhwc>
 __global__ void rgb_u8_to_patches(const uint8_t* images, T* patches, int views,
-                                  int image_size, int patch_size, bool staged) {
+                                  int image_size, int patch_size, int recipe) {
   const int patches_per_side = image_size / patch_size;
   const int patches_per_view = patches_per_side * patches_per_side;
   const int patch_area = patch_size * patch_size;
@@ -122,9 +128,14 @@ __global__ void rgb_u8_to_patches(const uint8_t* images, T* patches, int views,
                  x) * 3 + channel
               : ((static_cast<int64_t>(view) * 3 + channel) * image_size + y) *
                         image_size + x;
-    const float normalized = staged
-        ? __fsub_rn(to_float(from_float<T>(__fdiv_rn(to_float(from_float<T>(static_cast<float>(images[input_index]))), 127.5f))), 1.0f)
-        : (static_cast<float>(images[input_index]) / 255.0f) * 2.0f - 1.0f;
+    float normalized;
+    if (recipe == kRgbRecipeStaged) {
+      normalized = __fsub_rn(to_float(from_float<T>(__fdiv_rn(to_float(from_float<T>(static_cast<float>(images[input_index]))), 127.5f))), 1.0f);
+    } else if (recipe == kRgbRecipeReciprocal) {
+      normalized = __fsub_rn(__fmul_rn(__fmul_rn(static_cast<float>(images[input_index]), kReciprocal255), 2.0f), 1.0f);
+    } else {
+      normalized = (static_cast<float>(images[input_index]) / 255.0f) * 2.0f - 1.0f;
+    }
     patches[output_index] = from_float<T>(normalized);
   }
 }

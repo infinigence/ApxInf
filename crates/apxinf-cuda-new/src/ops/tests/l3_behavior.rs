@@ -3001,4 +3001,8 @@ fn video_precision_semantics_reject_incompatible_bindings() {
     let mut args=crate::GatherArgs::rgb_to_patches(&images,&mut out,crate::GatherPatchGeometry{views:1,image_size:1,patch_size:1,nhwc:true});
     args.semantic=crate::GatherSemantic::RgbToPatchesStaged;
     assert!(crate::gather(&ctx,args).is_err());
+    // The reciprocal recipe validates the same geometry/shape contract.
+    let mut args=crate::GatherArgs::rgb_to_patches(&images,&mut out,crate::GatherPatchGeometry{views:1,image_size:1,patch_size:1,nhwc:true});
+    args.semantic=crate::GatherSemantic::RgbToPatchesReciprocal;
+    assert!(crate::gather(&ctx,args).is_err());
 }

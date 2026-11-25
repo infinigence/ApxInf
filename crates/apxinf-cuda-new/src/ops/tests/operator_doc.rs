@@ -50,6 +50,7 @@ fn every_l3_operator_appears_once_in_cuda_operator_doc() {
         .chain([
             "Multiply",
             "RgbToPatchesStaged",
+            "RgbToPatchesReciprocal",
             "F64Recurrence",
             "IndexedColumnMean",
         ])

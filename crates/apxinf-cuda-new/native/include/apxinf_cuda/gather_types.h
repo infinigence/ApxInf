@@ -22,6 +22,16 @@
  *                     mapping [0, 255] to [-1, 1].
  *                     `rows` and `cols` must agree with that shape.
  *
+ *   RGB_TO_PATCHES_STAGED      same geometry; the byte is cast to the output
+ *                              dtype, divided by 127.5 and rounded, then 1 is
+ *                              subtracted and the result rounded again.
+ *
+ *   RGB_TO_PATCHES_RECIPROCAL  same geometry; FP32 arithmetic with the
+ *                              reciprocal of 255 as a multiplier:
+ *                              ((float(byte) * float(1/255)) * 2) - 1, each
+ *                              operation rounded in FP32, one rounding to the
+ *                              output dtype.
+ *
  *   REPLACE_ROWS      input [rows, cols], replacement [replacement_rows, cols],
  *                     row_map [rows] (u32) -> output [rows, cols].
  *                     UINT32_MAX keeps the input row.
@@ -32,6 +42,7 @@ typedef enum {
   APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES = 2,
   APXINF_GATHER_SEMANTIC_REPLACE_ROWS = 3,
   APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED = 4,
+  APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_RECIPROCAL = 5,
 } apxinf_gather_semantic_t;
 
 typedef enum {

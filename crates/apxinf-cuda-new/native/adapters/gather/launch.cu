@@ -23,6 +23,23 @@ bool may_have_bias(uint32_t semantic) {
   return semantic == APXINF_GATHER_SEMANTIC_BIAS_POSITION;
 }
 
+bool is_rgb_to_patches(uint32_t semantic) {
+  return semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES ||
+         semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED ||
+         semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_RECIPROCAL;
+}
+
+int rgb_recipe(uint32_t semantic) {
+  switch (semantic) {
+    case APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED:
+      return kernels::kRgbRecipeStaged;
+    case APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_RECIPROCAL:
+      return kernels::kRgbRecipeReciprocal;
+    default:
+      return kernels::kRgbRecipeUnitRange;
+  }
+}
+
 void validate_spec(const apxinf_gather_spec_t& spec) {
   // F32 is accepted for RGB preprocessing and the portable backend's default
   // embedding path.
@@ -30,9 +47,10 @@ void validate_spec(const apxinf_gather_spec_t& spec) {
       spec.dtype == APXINF_DTYPE_F16 || spec.dtype == APXINF_DTYPE_BF16 ||
       (spec.dtype == APXINF_DTYPE_F32 &&
        (spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES ||
+        spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_RECIPROCAL ||
         spec.semantic == APXINF_GATHER_SEMANTIC_EMBEDDING_LOOKUP));
   if (spec.version != APXINF_GATHER_SPEC_VERSION ||
-      spec.semantic > APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED ||
+      spec.semantic > APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_RECIPROCAL ||
       !dtype_ok ||
       spec.has_bias > 1 ||
       spec.embedding_scale > APXINF_GATHER_EMBEDDING_SCALE_SQRT_WIDTH ||
@@ -66,7 +84,7 @@ void validate_spec(const apxinf_gather_spec_t& spec) {
     throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
                   "bias-position rows must be a whole number of views");
   }
-  if (spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES || spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED) {
+  if (is_rgb_to_patches(spec.semantic)) {
     if (spec.views == 0 || spec.image_size == 0 || spec.patch_size == 0 ||
         spec.image_size % spec.patch_size != 0) {
       throw Failure(APXINF_STATUS_INVALID_ARGUMENT,
@@ -177,6 +195,7 @@ cudaError_t launch(const apxinf_gather_spec_t& spec,
           static_cast<int>(spec.tokens_per_view));
       break;
     case APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED:
+    case APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_RECIPROCAL:
     case APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES: {
       const auto* images = static_cast<const uint8_t*>(bindings.input);
       if (spec.nhwc != 0) {
@@ -184,13 +203,13 @@ cudaError_t launch(const apxinf_gather_spec_t& spec,
             images, output, static_cast<int>(spec.views),
             static_cast<int>(spec.image_size),
             static_cast<int>(spec.patch_size),
-            spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED);
+            rgb_recipe(spec.semantic));
       } else {
         kernels::rgb_u8_to_patches<T, false><<<grid, kThreads, 0, stream>>>(
             images, output, static_cast<int>(spec.views),
             static_cast<int>(spec.image_size),
             static_cast<int>(spec.patch_size),
-            spec.semantic == APXINF_GATHER_SEMANTIC_RGB_TO_PATCHES_STAGED);
+            rgb_recipe(spec.semantic));
       }
       break;
     }

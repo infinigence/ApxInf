@@ -66,6 +66,19 @@ alignment, and workspace before allocating provider resources. Configurations
 0–71 retain their existing meaning; selection uses the ordinary fingerprint
 and autotuner, with no model-specific dispatch.
 
+The cuBLAS (`cublas+custom-epilogue`) provider, which is also the fallback when no
+recipe exists, shares one `cublasHandle_t` among all executions prepared for the same
+device, stream, host thread and math mode (legacy default or pedantic; the mode is
+set once when the handle is created and never changed afterwards, in particular not
+during graph capture). Stream and the execution's own 4 MiB workspace are still set at
+every launch, so numerics and algorithm selection are unchanged. The handle is
+destroyed with its last user. Before this, every execution created its own handle; on
+Jetson Thor a handle costs tens of megabytes of device memory, so a whole-model
+preparation with thousands of executions (MolmoAct2: 1,461 GEMM executions per plan traversal,
+created again by the sizing probe and by the real preparation, 2,961 in total including model
+construction) consumed tens of gigabytes. The cuBLASLt handle and the attention cuBLAS candidate
+(`wide_bf16`) are still per execution.
+
 <!-- l3-operator:gemm_bias -->
 ### `gemm_bias`
 
@@ -302,6 +315,22 @@ The existing `RgbToPatches` single-round recipe is unchanged. The fixed kernel
 has no workspace or selection; input bytes and output buffers remain device
 resident during capture. Exhaustive byte rounding is checked in
 `tests/mixed_precision_ops.rs`.
+
+<!-- l3-operator:RgbToPatchesReciprocal -->
+### RgbToPatchesReciprocal
+
+`GatherSemantic::RgbToPatchesReciprocal` uses the existing RGB patch geometry and
+layouts (NHWC or NCHW source, output rows `(view, patch_y, patch_x)`, columns
+`(channel, dy, dx)`), with a third normalization recipe: convert the byte to FP32,
+multiply by the FP32 reciprocal `float(1/255)`, multiply by 2, subtract 1 (each
+operation rounded in FP32), then round once to the output dtype. F16, BF16 and F32
+outputs are supported. It differs from `RgbToPatches`, which divides by 255 with a
+true FP32 division, only where the reciprocal product and the quotient round to
+different FP32 values and that difference survives the output rounding. The
+`RgbToPatches` and `RgbToPatchesStaged` recipes are unchanged. The fixed kernel has no
+workspace or selection; input bytes and output buffers remain device resident during
+capture. Every byte value, channel, view, layout and dtype is checked against an
+independent CPU reference in `tests/rgb_patch_normalization.rs`.
 
 <!-- l3-operator:F64Recurrence -->
 ### F64Recurrence
