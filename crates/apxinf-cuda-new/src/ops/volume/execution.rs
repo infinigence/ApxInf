@@ -15,17 +15,24 @@ use crate::{CudaBuffer, CudaContext, CudaStream};
 pub struct PreparedUnfold3d(Rc<Execution>);
 
 struct Execution {
-    execution: NonNull<std::ffi::c_void>,
+    execution: Option<NonNull<std::ffi::c_void>>,
     storage: Vec<CudaBuffer>,
     stream: Arc<CudaStream>,
 }
 
 impl PreparedUnfold3d {
     pub fn new(ctx: &CudaContext, args: Unfold3dArgs<'_>) -> Result<Self> {
+        let normalized = normalize(ctx, args)?;
+        if crate::workspace::is_measurement() {
+            return Ok(Self(Rc::new(Execution {
+                execution: None,
+                storage: normalized.storage,
+                stream: ctx.shared_stream(),
+            })));
+        }
         if !crate::workspace::may_prepare_native_resources() {
             return Err(invalid("Unfold3d must be prepared before capture"));
         }
-        let normalized = normalize(ctx, args)?;
         let mut execution = std::ptr::null_mut();
         unsafe {
             status::check(abi::apxinf_unfold3d_prepare(
@@ -36,13 +43,18 @@ impl PreparedUnfold3d {
             ))?;
         }
         Ok(Self(Rc::new(Execution {
-            execution: NonNull::new(execution).ok_or_else(|| invalid("null Unfold3d execution"))?,
+            execution: Some(
+                NonNull::new(execution).ok_or_else(|| invalid("null Unfold3d execution"))?,
+            ),
             storage: normalized.storage,
             stream: ctx.shared_stream(),
         })))
     }
 
     pub fn enqueue(&self) -> Result<()> {
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         let execution = &self.0;
         let _keep_alive = &execution.storage;
         crate::workspace::validate_capture_target(
@@ -50,14 +62,23 @@ impl PreparedUnfold3d {
             execution.stream.handle() as usize,
         )?;
         crate::workspace::use_execution(execution)?;
-        unsafe { status::check(abi::apxinf_unfold3d_enqueue(execution.execution.as_ptr())) }
+        unsafe {
+            status::check(abi::apxinf_unfold3d_enqueue(
+                execution
+                    .execution
+                    .ok_or_else(|| invalid("measurement Unfold3d cannot execute"))?
+                    .as_ptr(),
+            ))
+        }
     }
 }
 
 impl Drop for Execution {
     fn drop(&mut self) {
         unsafe {
-            abi::apxinf_unfold3d_destroy(self.execution.as_ptr());
+            if let Some(execution) = self.execution {
+                abi::apxinf_unfold3d_destroy(execution.as_ptr());
+            }
         }
     }
 }

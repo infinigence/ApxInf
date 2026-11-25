@@ -59,6 +59,9 @@ pub fn split_qkv_cache(ctx: &CudaContext, args: QkvCacheRopeArgs<'_>) -> Result<
     ] {
         expect_bf16(tensor, "QKV cache RoPE")?;
     }
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(rope_abi::apxinf_rope_split_qkv_cache_bf16(
             gpu_ptr(args.projection)?,
@@ -140,6 +143,9 @@ pub fn split_grouped_qkv(ctx: &CudaContext, args: GroupedQkvRopeArgs<'_>) -> Res
         args.value,
     ] {
         expect_bf16(tensor, "grouped QKV RoPE")?;
+    }
+    if crate::workspace::is_measurement() {
+        return Ok(());
     }
     unsafe {
         check_cuda(rope_abi::apxinf_rope_split_grouped_qkv_bf16(

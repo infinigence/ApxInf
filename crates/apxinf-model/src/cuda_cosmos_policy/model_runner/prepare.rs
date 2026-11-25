@@ -187,7 +187,7 @@ impl ModelRunner {
             model,
             ctx: self.ctx.clone(),
             inputs,
-            session: ExecutionSession::with_capacity(workspace_bytes, self.ctx.device_id())?,
+            session: ExecutionSession::with_virtual_capacity(workspace_bytes)?,
             generator,
             gemm,
             attention,
@@ -215,7 +215,9 @@ impl ModelRunner {
                 attention,
                 ..
             } = &mut state;
-            session.prepare(|| model.forward(gemm, attention))?;
+            session.prepare_right_sized(self.ctx.device_id(), 1 << 20, |session| {
+                session.prepare(|| model.forward(gemm, attention))
+            })?;
         }
         // The captured traversal replays exactly the operators prepared above;
         // lookup hits the session cache, so keeping `online_tune` true is safe

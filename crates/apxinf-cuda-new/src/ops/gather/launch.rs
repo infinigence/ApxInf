@@ -5,6 +5,9 @@ use crate::ffi::abi::{gather as abi, status};
 use crate::CudaContext;
 
 pub(crate) fn execute(ctx: &CudaContext, normalized: Normalized) -> Result<()> {
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     let _storage = &normalized.storage;
     crate::workspace::validate_capture_target(
         ctx.device_id(),

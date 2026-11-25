@@ -202,6 +202,24 @@ implements this ownership. Persistent KV/state stays outside provider scratch;
 see the [ownership contract](model-layer-architecture.md#repacked-gemm-weight-ownership).
 This contract is cuda-new-specific; other backends own their workspace
 preparation and lease APIs.
+
+Plan activation storage before allocating it. Create a virtual `GraphWorkspace`
+(or `ExecutionSession::with_virtual_capacity`) with a logical capacity bound,
+then call `prepare_right_sized(device, margin, operation)` before capture.
+The first traversal allocates synthetic-address views and skips device execution
+and GEMM/Attention/Conv3d native selection. It records allocation sizes and offsets, using lease lifetimes
+to measure the high-water mark; it cannot read device results back to the host. The final
+arena is allocated once at the aligned high-water mark plus margin. Its prepare
+and capture traversals reuse the recorded offsets and reject changed allocation
+sizes/order or reuse of a region still held by a live lease.
+
+PI0.5 (graph and eager), WallOSS, GR00T, Qwen-Drive and Cosmos Policy use this
+flow. Model precision/fusion paths must be fixed before measurement; provider
+scratch is separate and selected on the real arena. Online tuning runs only on
+real inputs/outputs during native preparation. Persistent model state must be
+reset at the start of each traversal. The real prepare remains necessary for
+pointer-bound native resources, followed by capture; sizing does not establish
+GPU correctness. Validate replay, changed inputs and retained-output ownership.
 Capture and eager call the same model semantics. Update captured input contents
 in place and replay through the prepared object.
 

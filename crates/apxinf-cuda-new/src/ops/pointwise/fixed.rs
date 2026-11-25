@@ -44,6 +44,9 @@ fn swiglu_bf16(ctx: &CudaContext, gate_up: &Tensor) -> Result<Tensor> {
     let r = i32::try_from(rows).map_err(|_| Error::Other("SwiGLU rows exceed i32".into()))?;
     let n = i32::try_from(inner).map_err(|_| Error::Other("SwiGLU inner exceeds i32".into()))?;
     let output = ctx.allocate_output(Shape::new(vec![rows, inner]), DType::BF16)?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     let input_buffer = CudaBuffer::from_tensor(gate_up).map_err(Error::Cuda)?;
     let output_buffer = CudaBuffer::from_tensor(&output).map_err(Error::Cuda)?;
     unsafe {
@@ -77,6 +80,9 @@ pub fn silu_mul(ctx: &CudaContext, gate: &Tensor, up: &Tensor) -> Result<Tensor>
     let count = u32::try_from(gate.numel())
         .map_err(|_| Error::Other("SiLU multiply count exceeds u32".into()))?;
     let output = ctx.allocate_output(Shape::new(gate.shape().dims().to_vec()), DType::BF16)?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     let gate_buffer = CudaBuffer::from_tensor(gate).map_err(Error::Cuda)?;
     let up_buffer = CudaBuffer::from_tensor(up).map_err(Error::Cuda)?;
     let output_buffer = CudaBuffer::from_tensor(&output).map_err(Error::Cuda)?;
@@ -115,6 +121,9 @@ pub fn silu_mul_quantized(
     let count = i64::try_from(gate.numel())
         .map_err(|_| Error::Other("silu_mul_quant count exceeds i64".into()))?;
     let output = ctx.allocate_output(Shape::new(gate.shape().dims().to_vec()), DType::F8E4M3)?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     let gate_buffer = CudaBuffer::from_tensor(gate).map_err(Error::Cuda)?;
     let up_buffer = CudaBuffer::from_tensor(up).map_err(Error::Cuda)?;
     let output_buffer = CudaBuffer::from_tensor(&output).map_err(Error::Cuda)?;
@@ -165,6 +174,9 @@ pub fn bias_gelu_quantized(
     let cols_i32 =
         i32::try_from(cols).map_err(|_| Error::Other("bias GELU cols exceed i32".into()))?;
     let output = ctx.allocate_output(Shape::new(vec![rows, cols]), DType::F8E4M3)?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     let input_buffer = CudaBuffer::from_tensor(input).map_err(Error::Cuda)?;
     let bias_buffer = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
     let output_buffer = CudaBuffer::from_tensor(&output).map_err(Error::Cuda)?;
@@ -211,6 +223,9 @@ pub fn bias_gelu_quantize_rows(
     let (rows, cols) = (dims[0], dims[1]);
     let values = ctx.allocate_output(Shape::new(vec![rows, cols]), DType::I8)?;
     let scales = ctx.allocate_output(Shape::new(vec![rows]), DType::F32)?;
+    if crate::workspace::is_measurement() {
+        return Ok(crate::ops::quantization::DynamicI8Tensor { values, scales });
+    }
     let input_buffer = CudaBuffer::from_tensor(input).map_err(Error::Cuda)?;
     let bias_buffer = CudaBuffer::from_tensor(bias).map_err(Error::Cuda)?;
     let values_buffer = CudaBuffer::from_tensor(&values).map_err(Error::Cuda)?;
@@ -252,6 +267,9 @@ pub fn silu_mul_quantize_rows(
     let (rows, cols) = (dims[0], dims[1]);
     let mut values = ctx.allocate_output(Shape::new(vec![rows, cols]), DType::I8)?;
     let mut scales = ctx.allocate_output(Shape::new(vec![rows]), DType::F32)?;
+    if crate::workspace::is_measurement() {
+        return Ok(crate::ops::quantization::DynamicI8Tensor { values, scales });
+    }
     let mut args = crate::ops::QuantizationArgs::new(
         crate::ops::QuantizationSemantic::SiluMulRowwiseI8,
         gate,
@@ -286,6 +304,9 @@ pub fn swiglu_quantize_rows(
     }
     let mut values = ctx.allocate_output(Shape::new(vec![rows, output_cols]), DType::F8E4M3)?;
     let mut scales = ctx.allocate_output(Shape::new(vec![rows]), DType::F32)?;
+    if crate::workspace::is_measurement() {
+        return Ok(crate::ops::quantization::DynamicFp8Tensor { values, scales });
+    }
     let mut args = crate::ops::PointwiseArgs::new(
         crate::ops::PointwiseSemantic::SwigluRowwiseE4m3,
         gate_up,
@@ -314,6 +335,9 @@ fn swiglu_bf16_rounded(ctx: &CudaContext, gate_up: &Tensor) -> Result<Tensor> {
     let r = i32::try_from(rows).map_err(|_| Error::Other("SwiGLU rows overflow".into()))?;
     let n = i32::try_from(inner).map_err(|_| Error::Other("SwiGLU inner overflow".into()))?;
     let output = ctx.allocate_output(Shape::new(vec![rows, inner]), DType::BF16)?;
+    if crate::workspace::is_measurement() {
+        return Ok(output);
+    }
     let input_buffer = CudaBuffer::from_tensor(gate_up).map_err(Error::Cuda)?;
     let output_buffer = CudaBuffer::from_tensor(&output).map_err(Error::Cuda)?;
     unsafe {
@@ -346,6 +370,14 @@ fn swiglu_f16(ctx: &CudaContext, gate_up: &Tensor) -> Result<Tensor> {
     }
     let inner = twice_inner / 2;
     let output = f16_output(ctx, rows, inner)?;
+    if crate::workspace::is_measurement() {
+        return Ok(make_gpu_tensor(
+            Shape::new(vec![rows, inner]),
+            DType::F16,
+            ctx.device_id(),
+            output,
+        ));
+    }
     unsafe {
         check_cuda(abi::apxinf_activation_swiglu_f16(
             gpu_ptr(gate_up)?,
@@ -385,6 +417,9 @@ pub fn silu_into(
         "decode SiLU",
         &[("input", input, bytes), ("output", output, bytes)],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     let status = unsafe {
         match dtype {
             DType::F32 => abi::apxinf_activation_fixed_decode_silu_f32(
@@ -434,6 +469,9 @@ pub fn silu_mul_into(
             ),
         ],
     )?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     check_cuda(unsafe {
         abi::apxinf_activation_fixed_decode_silu_mul_bf16(
             gate_up.ptr(),

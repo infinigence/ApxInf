@@ -72,6 +72,9 @@ pub fn argmax(ctx: &CudaContext, args: ArgmaxArgs<'_>) -> Result<()> {
     }
     let logits = tensor_buffer(ctx, args.logits, DType::BF16, count, "logits")?;
     let index = tensor_buffer(ctx, args.index, DType::I32, 1, "index")?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     if let Some(remap) = args.remap {
         let remap = tensor_buffer(ctx, remap, DType::I32, count, "remap")?;
         unsafe {

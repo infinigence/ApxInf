@@ -79,6 +79,9 @@ pub fn vision_position(ctx: &CudaContext, args: VisionPositionArgs<'_>) -> Resul
         return Err(invalid("vision position tensor storage must not overlap"));
     }
     crate::workspace::validate_capture_target(ctx.device_id(), ctx.stream().handle() as usize)?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         check_cuda(preprocess_abi::apxinf_preprocess_vision_position_bf16(
             table.ptr(),
@@ -115,6 +118,14 @@ pub fn fourier_features(
     expect_bf16(freqs, "fourier features")?;
     let out_width = point_dim * num_features * 2;
     let output = bf16_output(ctx, rows, out_width)?;
+    if crate::workspace::is_measurement() {
+        return Ok(make_gpu_tensor(
+            Shape::new(vec![rows, out_width]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        ));
+    }
     unsafe {
         check_cuda(preprocess_abi::apxinf_preprocess_fourier_features_bf16(
             gpu_ptr(waypoints)?,
@@ -154,6 +165,14 @@ pub fn concat7_cols(ctx: &CudaContext, srcs: [&Tensor; 7], broadcast_mask: u32) 
         expect_bf16(src, "concat7")?;
     }
     let output = bf16_output(ctx, first_rows, 7 * cols)?;
+    if crate::workspace::is_measurement() {
+        return Ok(make_gpu_tensor(
+            Shape::new(vec![first_rows, 7 * cols]),
+            DType::BF16,
+            ctx.device_id(),
+            output,
+        ));
+    }
     unsafe {
         check_cuda(preprocess_abi::apxinf_preprocess_concat7_cols_bf16(
             gpu_ptr(srcs[0])?,
@@ -196,6 +215,9 @@ pub fn flow_update(
         || !step.is_finite()
     {
         return Err(Error::Other("flow update shape mismatch".into()));
+    }
+    if crate::workspace::is_measurement() {
+        return Ok(());
     }
     unsafe {
         check_cuda(preprocess_abi::apxinf_preprocess_flow_update_f32(

@@ -12,6 +12,7 @@ use apxinf_core::{Error, Result};
 use crate::buffer::CudaBuffer;
 
 const WORKSPACE_ALIGNMENT: usize = 256;
+pub(crate) const VIRTUAL_ADDRESS_BASE: usize = 0x100000;
 
 /// Provider scratch blocks are rounded up to this granularity, so per-block
 /// overhead stays under one granularity unit instead of up to 2× at each
@@ -32,11 +33,14 @@ struct WorkspaceState {
     peak_requested_bytes: usize,
     high_water_bytes: usize,
     free_blocks: BTreeMap<usize, usize>,
+    allocations: Vec<(usize, usize)>,
+    layout: Option<Arc<Vec<(usize, usize)>>>,
+    layout_cursor: usize,
 }
 
 struct WorkspaceLease {
     state: Arc<Mutex<WorkspaceState>>,
-    _storage: CudaBuffer,
+    _storage: Option<CudaBuffer>,
     start: usize,
     extent: usize,
     requested_bytes: usize,
@@ -65,7 +69,8 @@ impl Drop for WorkspaceLease {
 /// Persistent device arena used by a fixed-shape CUDA graph.
 /// Native operator executions are deliberately not stored here.
 pub struct GraphWorkspace {
-    storage: CudaBuffer,
+    storage: Option<CudaBuffer>,
+    capacity: usize,
     state: Arc<Mutex<WorkspaceState>>,
 }
 
@@ -77,7 +82,8 @@ impl GraphWorkspace {
             ));
         }
         Ok(Self {
-            storage: CudaBuffer::alloc(capacity_bytes, device).map_err(Error::Cuda)?,
+            storage: Some(CudaBuffer::alloc(capacity_bytes, device).map_err(Error::Cuda)?),
+            capacity: capacity_bytes,
             state: Arc::new(Mutex::new(WorkspaceState {
                 free_blocks: BTreeMap::from([(0, capacity_bytes)]),
                 ..WorkspaceState::default()
@@ -85,8 +91,36 @@ impl GraphWorkspace {
         })
     }
 
+    /// A virtual arena that records allocations and the free-list high-water
+    /// mark without reserving device memory. Views have synthetic addresses
+    /// for alias/offset validation, never valid CUDA pointers. Only measurement
+    /// prepare may use them; operators skip device work. `capacity` bounds the
+    /// logical offset space only.
+    pub fn new_virtual(capacity_bytes: usize) -> Result<Self> {
+        if capacity_bytes == 0 {
+            return Err(Error::Other(
+                "static inference workspace capacity must be non-zero".into(),
+            ));
+        }
+        capacity_bytes
+            .checked_add(VIRTUAL_ADDRESS_BASE)
+            .ok_or_else(|| Error::Other("virtual activation address space overflow".into()))?;
+        Ok(Self {
+            storage: None,
+            capacity: capacity_bytes,
+            state: Arc::new(Mutex::new(WorkspaceState {
+                free_blocks: BTreeMap::from([(0, capacity_bytes)]),
+                ..WorkspaceState::default()
+            })),
+        })
+    }
+
+    pub fn is_virtual(&self) -> bool {
+        self.storage.is_none()
+    }
+
     pub fn capacity(&self) -> usize {
-        self.storage.len()
+        self.capacity
     }
 
     pub fn used(&self) -> usize {
@@ -102,7 +136,7 @@ impl GraphWorkspace {
     }
 
     fn reset(&self) -> Result<()> {
-        let capacity = self.storage.len();
+        let capacity = self.capacity;
         let mut state = self.lock_state()?;
         state.generation = state
             .generation
@@ -112,27 +146,61 @@ impl GraphWorkspace {
         state.live_requested_bytes = 0;
         state.peak_requested_bytes = 0;
         state.high_water_bytes = 0;
+        state.allocations.clear();
+        state.layout_cursor = 0;
         state.free_blocks.clear();
         state.free_blocks.insert(0, capacity);
         Ok(())
     }
 
     pub fn allocate(&self, bytes: usize, device: usize) -> Result<CudaBuffer> {
-        if device != self.storage.device() {
-            return Err(Error::Other(format!(
-                "static inference workspace is on CUDA {}, but operation targets CUDA {device}",
-                self.storage.device()
-            )));
+        if let Some(storage) = &self.storage {
+            if device != storage.device() {
+                return Err(Error::Other(format!(
+                    "static inference workspace is on CUDA {}, but operation targets CUDA {device}",
+                    storage.device()
+                )));
+            }
         }
         let extent = align_extent(bytes)?;
         let mut state = self.lock_state()?;
-        let start = take_free_block(&mut state.free_blocks, extent).ok_or_else(|| {
-            Error::Other(format!(
-                "static inference workspace exhausted: need {} contiguous bytes, capacity is {} bytes",
-                extent.max(bytes),
-                self.storage.len()
-            ))
-        })?;
+        let start = if let Some(layout) = &state.layout {
+            let &(planned_bytes, start) = layout.get(state.layout_cursor).ok_or_else(|| {
+                Error::Other("activation allocation sequence exceeds its measured layout".into())
+            })?;
+            if planned_bytes != bytes {
+                return Err(Error::Other(format!("activation size changed at allocation {}: measured {planned_bytes}, got {bytes}", state.layout_cursor)));
+            }
+            // The lifetime of a lease may differ between prepare and capture.
+            // Require the planned extent to be free before binding its address.
+            let block = state
+                .free_blocks
+                .iter()
+                .find_map(|(&offset, &len)| {
+                    (offset <= start && start + extent <= offset + len).then_some((offset, len))
+                })
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "measured activation offset {start} is still live at allocation {}",
+                        state.layout_cursor
+                    ))
+                })?;
+            state.free_blocks.remove(&block.0);
+            if start > block.0 {
+                state.free_blocks.insert(block.0, start - block.0);
+            }
+            if start + extent < block.0 + block.1 {
+                state
+                    .free_blocks
+                    .insert(start + extent, block.0 + block.1 - start - extent);
+            }
+            state.layout_cursor += 1;
+            start
+        } else {
+            take_free_block(&mut state.free_blocks, extent).ok_or_else(|| Error::Other(format!(
+                "static inference workspace exhausted: need {} contiguous bytes, capacity is {} bytes", extent.max(bytes), self.capacity)))?
+        };
+        state.allocations.push((bytes, start));
         state.active_allocations = state
             .active_allocations
             .checked_add(1)
@@ -155,10 +223,15 @@ impl GraphWorkspace {
             generation: state.generation,
         });
         drop(state);
-        let retained_owner: Arc<dyn Any + Send + Sync> = Arc::new(self.storage.clone());
-        self.storage
-            .view_with_owner(start, bytes, lease, retained_owner)
-            .map_err(Error::Cuda)
+        match &self.storage {
+            Some(storage) => {
+                let retained_owner: Arc<dyn Any + Send + Sync> = Arc::new(storage.clone());
+                storage
+                    .view_with_owner(start, bytes, lease, retained_owner)
+                    .map_err(Error::Cuda)
+            }
+            None => Ok(CudaBuffer::dummy(bytes, device, start, lease)),
+        }
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, WorkspaceState>> {
@@ -343,6 +416,15 @@ impl ExecutionSession {
         self
     }
 
+    /// A session whose arena records allocations without reserving device
+    /// memory. Intended for `prepare_right_sized`: the measurement traversal
+    /// runs against the virtual arena, then the arena is rebuilt with real
+    /// storage at the measured peak. Operators skip device work and native
+    /// selection on this pass; requested online tuning runs on the real pass.
+    pub fn with_virtual_capacity(capacity_bytes: usize) -> Result<Self> {
+        GraphWorkspace::new_virtual(capacity_bytes).map(Self::new)
+    }
+
     pub fn workspace(&self) -> &GraphWorkspace {
         &self.inner.workspace
     }
@@ -359,6 +441,75 @@ impl ExecutionSession {
 
     pub fn used(&self) -> usize {
         self.inner.workspace.used()
+    }
+
+    /// Right-size this session's arena to what `operation` actually needs.
+    ///
+    /// Runs `operation` — one shape-deterministic prepare traversal — against
+    /// the current arena to measure its high-water mark, then rebuilds the
+    /// arena to that mark plus `margin` and runs `operation` once more. Returns
+    /// the second traversal's result. The arena is only ever rebuilt smaller,
+    /// so an existing real-arena caller may retain its conservative upper
+    /// bound. New fixed-profile callers should use a virtual arena: its bound
+    /// limits logical offsets, without reserving that much device memory.
+    ///
+    /// The contract on `operation`:
+    ///
+    /// * It must run a complete prepare traversal via [`prepare_with_session`]
+    ///   against the `&ExecutionSession` it receives, so the arena's free-list
+    ///   high-water mark reflects the traversal's live extent.
+    /// * Allocation sizes/order must be shape-deterministic. The measured
+    ///   offsets are installed in the rebuilt arena; subsequent prepare/run
+    ///   traversals validate sizes and that each planned region is free.
+    ///   Native implementation choice must not change model tensor geometry.
+    /// * It must be idempotent with respect to persistent device state it
+    ///   mutates (a recurrent/planning state, for example, is reset at the
+    ///   start of `operation`), since it is invoked twice.
+    ///
+    /// A captured CUDA graph cannot be re-pointed at a different arena, so call
+    /// this before capture. Virtual measurement creates no native plans; the
+    /// second traversal selects and prepares them against final real pointers.
+    /// Legacy real-arena callers rebuild their provisional native plans.
+    pub fn prepare_right_sized<T>(
+        &mut self,
+        device: usize,
+        margin: usize,
+        mut operation: impl FnMut(&Self) -> Result<T>,
+    ) -> Result<T> {
+        operation(self)?;
+        let layout = Arc::new(self.workspace().lock_state()?.allocations.clone());
+        let peak = layout.iter().try_fold(0usize, |peak, &(bytes, start)| {
+            Ok::<_, Error>(
+                peak.max(
+                    start
+                        .checked_add(align_extent(bytes)?)
+                        .ok_or_else(|| Error::Other("activation layout extent overflow".into()))?,
+                ),
+            )
+        })?;
+        let exact = peak
+            .checked_add(margin)
+            .ok_or_else(|| Error::Other("activation capacity overflow".into()))?
+            .max(WORKSPACE_ALIGNMENT);
+        // A virtual (synthetic-address) arena must be rebuilt with real storage before
+        // capture, even when the measured peak already fits its logical capacity.
+        if self.inner.workspace.is_virtual() || exact < self.capacity() {
+            // Rebuild the activation arena only; the provider workspace (native
+            // GEMM/Attention scratch) is shared with the caller and survives the
+            // resize, so a runner that shares one scratch across profiles keeps
+            // that bound intact.
+            let scratch = self.inner.scratch.clone();
+            let retire_stale_bindings = self.inner.retire_stale_bindings;
+            let rebuilt =
+                Self::with_provider_workspace(GraphWorkspace::new(exact, device)?, scratch);
+            rebuilt.workspace().lock_state()?.layout = Some(layout);
+            *self = if retire_stale_bindings {
+                rebuilt.retire_stale_bindings()
+            } else {
+                rebuilt
+            };
+        }
+        operation(self)
     }
 
     /// Traverse the real execution once before graph capture.
@@ -383,6 +534,7 @@ impl ExecutionSession {
 
 thread_local! {
     static ACTIVE_SESSION: Cell<*const ExecutionSessionInner> = const { Cell::new(std::ptr::null()) };
+    static MEASURING: Cell<bool> = const { Cell::new(false) };
     static PREPARING: Cell<bool> = const { Cell::new(false) };
     static CAPTURE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static CAPTURE_TARGET: Cell<Option<CaptureTarget>> = const { Cell::new(None) };
@@ -398,12 +550,14 @@ struct CaptureTarget {
 struct ActiveSessionGuard {
     session: *const ExecutionSessionInner,
     preparing: bool,
+    measuring: bool,
 }
 
 impl Drop for ActiveSessionGuard {
     fn drop(&mut self) {
         ACTIVE_SESSION.with(|active| active.set(self.session));
         PREPARING.with(|preparing| preparing.set(self.preparing));
+        MEASURING.with(|measuring| measuring.set(self.measuring));
     }
 }
 
@@ -416,6 +570,11 @@ fn with_session_phase<T>(
         if !active.get().is_null() {
             return Err(Error::Other(
                 "nested execution sessions are not supported".into(),
+            ));
+        }
+        if session.workspace().is_virtual() && (!prepare || is_capturing()) {
+            return Err(Error::Other(
+                "virtual activation arena is only valid for measurement".into(),
             ));
         }
         session.inner.workspace.reset()?;
@@ -433,15 +592,30 @@ fn with_session_phase<T>(
         session.inner.sequence_cursor.set(0);
         let previous = active.replace(Rc::as_ptr(&session.inner));
         let previous_preparing = PREPARING.with(|preparing| preparing.replace(prepare));
+        let previous_measuring = MEASURING
+            .with(|measuring| measuring.replace(prepare && session.workspace().is_virtual()));
         let _guard = ActiveSessionGuard {
             session: previous,
             preparing: previous_preparing,
+            measuring: previous_measuring,
         };
         // Captures need the activation arena and each used execution, not the
         // mutable binding cache. Retaining the whole session would pin a later
         // eager generation merely because an older graph is still alive.
         retain_resource(&session.inner.workspace);
         let result = operation();
+        if result.is_ok() {
+            let state = session.workspace().lock_state()?;
+            if state
+                .layout
+                .as_ref()
+                .is_some_and(|layout| state.layout_cursor != layout.len())
+            {
+                return Err(Error::Other(
+                    "activation traversal ended before its measured allocation sequence".into(),
+                ));
+            }
+        }
         // Retire only after a successful traversal. A partial traversal that
         // errors out has not established a complete set of used bindings, so
         // retiring then would drop executions the next request still needs.
@@ -479,8 +653,16 @@ pub(crate) fn with_session<T>(
 /// Native resources may be created only outside capture. A non-preparation
 /// traversal with an active session must hit the execution cache.
 pub(crate) fn may_prepare_native_resources() -> bool {
-    !is_capturing()
+    !is_measurement()
+        && !is_capturing()
         && (PREPARING.with(Cell::get) || ACTIVE_SESSION.with(|active| active.get().is_null()))
+}
+
+/// True while a virtual activation arena is being traversed for sizing.
+/// Operators skip native selection/device work. Metadata needed for tensor
+/// geometry is resolved here; full provider validation runs on the real pass.
+pub(crate) fn is_measurement() -> bool {
+    MEASURING.with(Cell::get)
 }
 
 pub(crate) fn has_active_session() -> bool {
@@ -630,12 +812,15 @@ pub(crate) fn output_buffer_zeroed(ctx: &crate::CudaContext, bytes: usize) -> Re
         if inner.is_null() {
             CudaBuffer::alloc_zeros_async(bytes, ctx.device_id(), ctx.stream()).map_err(Error::Cuda)
         } else {
-            let buffer = unsafe { &*inner }
-                .workspace
-                .allocate(bytes, ctx.device_id())?;
-            buffer
-                .memset_async(0, bytes, ctx.stream())
-                .map_err(Error::Cuda)?;
+            let workspace = &unsafe { &*inner }.workspace;
+            let buffer = workspace.allocate(bytes, ctx.device_id())?;
+            // A virtual (synthetic-address) arena records offsets only; the clear is
+            // deferred to the real arena rebuilt after the measurement pass.
+            if !workspace.is_virtual() {
+                buffer
+                    .memset_async(0, bytes, ctx.stream())
+                    .map_err(Error::Cuda)?;
+            }
             Ok(buffer)
         }
     })
@@ -657,16 +842,22 @@ pub(crate) fn output_buffer_tail_zeroed(
         .ok_or_else(|| Error::Other("scratch used bytes exceed group extent".into()))?;
     ACTIVE_SESSION.with(|active| {
         let inner = active.get();
-        let buffer = if inner.is_null() {
+        if inner.is_null() {
             // A fresh driver allocation still has to establish the tail, but
             // it is not a reused arena, so the payload rows need no clearing.
-            CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)?
-        } else {
-            unsafe { &*inner }
-                .workspace
-                .allocate(bytes, ctx.device_id())?
-        };
-        if tail > 0 && groups > 0 {
+            let buffer = CudaBuffer::alloc(bytes, ctx.device_id()).map_err(Error::Cuda)?;
+            if tail > 0 && groups > 0 {
+                buffer
+                    .memset_2d_async(0, used_bytes, group_bytes, tail, groups, ctx.stream())
+                    .map_err(Error::Cuda)?;
+            }
+            return Ok(buffer);
+        }
+        let inner = unsafe { &*inner };
+        let buffer = inner.workspace.allocate(bytes, ctx.device_id())?;
+        // A virtual (synthetic-address) arena records offsets only; the tail clear is
+        // deferred to the real arena rebuilt after the measurement pass.
+        if tail > 0 && groups > 0 && !inner.workspace.is_virtual() {
             buffer
                 .memset_2d_async(0, used_bytes, group_bytes, tail, groups, ctx.stream())
                 .map_err(Error::Cuda)?;
@@ -778,5 +969,137 @@ mod tests {
         let mut bytes = vec![0; small.len()];
         small.copy_to_host(&mut bytes).unwrap();
         assert!(bytes.iter().all(|&x| x == 42));
+    }
+
+    #[test]
+    fn measurement_does_not_create_native_resources_and_restores_phase() {
+        let session = ExecutionSession::with_virtual_capacity(1 << 20).unwrap();
+        assert!(!is_measurement());
+        let result: Result<()> = session.prepare(|| {
+            assert!(is_measurement());
+            assert!(!may_prepare_native_resources());
+            assert!(CudaBuffer::alloc(32, 0).is_err());
+            assert!(CudaBuffer::try_alloc(32, 0).is_err());
+            let buffer = session.workspace().allocate(32, 0)?;
+            buffer.zero().unwrap();
+            buffer.copy_from_host(&[1; 32]).unwrap();
+            assert!(buffer.copy_to_host(&mut [0; 32]).is_err());
+            Err(Error::Other("intentional measurement failure".into()))
+        });
+        assert!(result.is_err());
+        assert!(!is_measurement());
+        assert!(session.run(|| Ok(())).is_err());
+    }
+
+    #[test]
+    fn measurement_restores_phase_after_panic() {
+        let session = ExecutionSession::with_virtual_capacity(4096).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = session.prepare(|| {
+                assert!(is_measurement());
+                panic!("intentional measurement panic");
+            });
+        }));
+        assert!(result.is_err());
+        assert!(!is_measurement());
+        assert!(!has_active_session());
+        session.prepare(|| Ok(())).unwrap();
+    }
+
+    #[test]
+    fn virtual_arena_rejects_address_space_overflow() {
+        assert!(GraphWorkspace::new_virtual(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn planned_traversal_rejects_missing_and_extra_allocations() {
+        let session = ExecutionSession::with_virtual_capacity(4096).unwrap();
+        session.workspace().lock_state().unwrap().layout = Some(Arc::new(vec![(256, 0)]));
+        assert!(session.prepare(|| Ok(())).is_err());
+        assert!(session
+            .prepare(|| {
+                let _first = session.workspace().allocate(256, 0)?;
+                let _extra = session.workspace().allocate(256, 0)?;
+                Ok(())
+            })
+            .is_err());
+        session
+            .prepare(|| {
+                let _first = session.workspace().allocate(256, 0)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn planned_offsets_reject_reuse_while_a_lease_is_live() {
+        let arena = GraphWorkspace::new_virtual(4096).unwrap();
+        arena.lock_state().unwrap().layout = Some(Arc::new(vec![(1024, 0), (1024, 0)]));
+        let first = arena.allocate(1024, 0).unwrap();
+        assert!(arena.allocate(1024, 0).is_err());
+        drop(first);
+        assert!(arena.allocate(1024, 0).is_ok());
+    }
+
+    #[test]
+    fn planned_offsets_reject_size_and_order_drift() {
+        let arena = GraphWorkspace::new_virtual(4096).unwrap();
+        arena.lock_state().unwrap().layout = Some(Arc::new(vec![(1024, 0), (512, 1024)]));
+        assert!(arena.allocate(512, 0).is_err());
+        let first = arena.allocate(1024, 0).unwrap();
+        drop(first);
+        assert!(arena.allocate(1024, 0).is_err());
+        let second = arena.allocate(512, 0).unwrap();
+        assert_eq!(second.ptr() as usize, 0x100000 + 1024);
+    }
+
+    #[test]
+    fn virtual_arena_records_offsets_and_rebuilds_real_storage() {
+        let mut session = ExecutionSession::with_virtual_capacity(1 << 20)
+            .unwrap()
+            .retire_stale_bindings();
+        assert!(session.workspace().is_virtual());
+        // First traverse synthetic offsets, then rebuild real storage with
+        // the same offsets; the first pass makes no device allocation.
+        let pass = std::cell::Cell::new(0usize);
+        let result = session
+            .prepare_right_sized(0, 256, |sess| {
+                sess.prepare(|| {
+                    let a = sess.workspace().allocate(1024, 0).unwrap();
+                    let b = sess.workspace().allocate(4096, 0).unwrap();
+                    if pass.get() == 0 {
+                        assert_eq!(b.ptr() as usize - a.ptr() as usize, 1024);
+                    }
+                    pass.set(pass.get() + 1);
+                    drop(a);
+                    drop(b);
+                    Ok(7usize)
+                })
+            })
+            .unwrap();
+        assert_eq!(result, 7);
+        // The virtual arena has been replaced by real storage sized to the
+        // measured high-water plus the margin, and the second traversal ran
+        // against that real arena.
+        assert!(!session.workspace().is_virtual());
+        assert!(session.inner.retire_stale_bindings);
+        assert_eq!(session.capacity(), 5120 + 256);
+        assert_eq!(session.used(), 5120);
+    }
+
+    #[test]
+    fn zero_byte_layout_rebuilds_minimum_real_arena() {
+        let mut session = ExecutionSession::with_virtual_capacity(4096).unwrap();
+        session
+            .prepare_right_sized(0, 0, |sess| {
+                sess.prepare(|| {
+                    let _empty = sess.workspace().allocate(0, 0)?;
+                    Ok(())
+                })
+            })
+            .unwrap();
+        assert!(!session.workspace().is_virtual());
+        assert_eq!(session.capacity(), WORKSPACE_ALIGNMENT);
+        assert_eq!(session.used(), 0);
     }
 }

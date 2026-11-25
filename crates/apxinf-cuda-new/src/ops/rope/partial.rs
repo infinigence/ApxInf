@@ -35,6 +35,9 @@ pub fn partial_rope(
     }
     let data_buffer = tensor_storage(ctx, data, DType::BF16, &dims)?;
     let position_buffer = tensor_storage(ctx, positions, DType::I32, &[tokens])?;
+    if crate::workspace::is_measurement() {
+        return Ok(());
+    }
     unsafe {
         status::check(abi::apxinf_rope_partial(
             data_buffer.ptr(),

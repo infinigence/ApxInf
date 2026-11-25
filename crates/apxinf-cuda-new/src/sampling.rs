@@ -235,7 +235,8 @@ impl TokenSampler for CudaTokenSampler {
         // the sampling kernels. Sampling returns a host token and therefore
         // must explicitly wait for its own stream before reading `output`.
         unsafe {
-            ffi::check_cuda(ffi::cudaStreamSynchronize(self.stream.handle())).map_err(Error::Cuda)?;
+            ffi::check_cuda(ffi::cudaStreamSynchronize(self.stream.handle()))
+                .map_err(Error::Cuda)?;
         }
         let mut output = [0u8; OUTPUT_BYTES];
         self.output.copy_to_host(&mut output).map_err(Error::Cuda)?;
@@ -289,6 +290,9 @@ impl NormalGenerator for CudaNormalGenerator {
     }
 
     fn generate(&mut self, rng: RngKey) -> Result<&Tensor> {
+        if crate::workspace::is_measurement() {
+            return Ok(&self.output);
+        }
         let output = CudaBuffer::from_tensor(&self.output).map_err(Error::Cuda)?;
         let status = unsafe {
             sampling_ffi::apxinf_cuda_new_fill_standard_normal(

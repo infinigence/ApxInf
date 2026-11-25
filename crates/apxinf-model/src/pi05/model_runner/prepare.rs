@@ -11,14 +11,16 @@ use std::sync::Arc;
 
 fn allocate_session(
     requirements: &WorkspaceRequirements,
-    device: usize,
+    _device: usize,
     scratch: &ProviderWorkspace,
 ) -> Result<ExecutionSession> {
     Ok(ExecutionSession::with_provider_workspace(
-        GraphWorkspace::new(requirements.bytes, device)?,
+        GraphWorkspace::new_virtual(requirements.bytes)?,
         scratch.clone(),
     ))
 }
+/// Headroom added to the measured arena peak by `prepare_right_sized`.
+pub(super) const WORKSPACE_MARGIN: usize = 1 << 20;
 pub struct CapturedGraph {
     graph: Box<dyn Graph>,
     output: Tensor,
@@ -190,24 +192,32 @@ impl<B: PrepareBlocks> CaptureBuilder<'_, B> {
         }
         let modulation = self.model.prepare_all_modulation(time_embeddings)?;
         backend::synchronize(backend)?;
-        let session = allocate_session(
+        let mut session = allocate_session(
             &self.model.workspace_requirements(token_count)?,
             self.ctx().device_id(),
             self.scratch,
         )?;
-        let eager_output = ops::prepare_with_session(&session, || {
-            self.infer_captured_inputs(
-                &patches,
-                raw_images.as_ref(),
-                raw_image_layout,
-                token_ids,
-                token_count,
-                noise,
-                &modulation,
-            )
-        })?;
+        let eager_output =
+            session.prepare_right_sized(self.ctx().device_id(), WORKSPACE_MARGIN, |session| {
+                ops::prepare_with_session(session, || {
+                    self.infer_captured_inputs(
+                        &patches,
+                        raw_images.as_ref(),
+                        raw_image_layout,
+                        token_ids,
+                        token_count,
+                        noise,
+                        &modulation,
+                    )
+                })
+            })?;
         backend::synchronize(backend)?;
         drop(eager_output);
+        eprintln!(
+            "π0.5 prepared workspace: reserved={} bytes, peak={} bytes",
+            session.capacity(),
+            session.used(),
+        );
 
         let captured_output = std::cell::RefCell::new(None);
         let graph = capture_cuda_graph(self.ctx(), || {

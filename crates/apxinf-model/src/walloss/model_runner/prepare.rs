@@ -2,7 +2,7 @@
 //! the explicit preparation contract.
 //!
 //! Preparation allocates every graph-visible input at a stable address, runs
-//! one eager pass on placeholder inputs to resolve GEMM plans and size the
+//! a virtual traversal followed by a real prepare on placeholder inputs to size the
 //! workspace, and captures the CUDA graph unless the policy is `Eager`.
 //! `run` neither captures nor tunes: it binds per-call inputs in place and
 //! replays (or runs eagerly).
@@ -26,6 +26,9 @@ use super::super::model::{
 };
 use super::super::WallossConfig;
 use super::runner::{prepare_host_inputs, WallossHostInputs, WallossHostVision};
+
+/// Headroom added to the measured arena peak by `prepare_right_sized`.
+const WORKSPACE_MARGIN: usize = 1 << 20;
 
 /// Vision grids a prepared plan is built for, `[t, h, w]` patches per image.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,7 +164,7 @@ impl WallossPreparedInference {
         let requirements = model
             .model()
             .workspace_requirements(patch_rows, prefix_tokens)?;
-        let workspace = ops::ExecutionSession::with_capacity(requirements.bytes, device)?;
+        let workspace = ops::ExecutionSession::with_virtual_capacity(requirements.bytes)?;
         let mut plan = Self {
             spec,
             shape,
@@ -185,10 +188,11 @@ impl WallossPreparedInference {
         Ok(plan)
     }
 
-    /// One eager pass before capture resolves every GEMM plan. With the
-    /// request that created the plan, it runs on real inputs so missing GEMM
-    /// keys can be autotuned; explicit preparation runs on placeholders.
-    fn warm_up(&self, request: Option<&VlaRequest<'_>>) -> Result<()> {
+    /// A virtual traversal sizes the workspace, then a real prepare resolves
+    /// GEMM plans against its final addresses. With the request that created the
+    /// plan, it runs on real inputs so missing GEMM keys can be autotuned;
+    /// explicit preparation runs on placeholders.
+    fn warm_up(&mut self, request: Option<&VlaRequest<'_>>) -> Result<()> {
         let forward = || {
             self.model
                 .model()
@@ -204,12 +208,25 @@ impl WallossPreparedInference {
                     request,
                 )?;
                 self.bind(&host, request)?;
-                ops::prepare_with_session(&self.workspace, forward)?
+                self.workspace.prepare_right_sized(
+                    self.backend.device_id(),
+                    WORKSPACE_MARGIN,
+                    |session| ops::prepare_with_session(session, forward),
+                )?
             }
-            None => ops::prepare_with_session(&self.workspace, forward)?,
+            None => self.workspace.prepare_right_sized(
+                self.backend.device_id(),
+                WORKSPACE_MARGIN,
+                |session| ops::prepare_with_session(session, forward),
+            )?,
         };
         self.backend.synchronize()?;
         drop(output);
+        eprintln!(
+            "WallOSS prepared workspace: reserved={} bytes, peak={} bytes",
+            self.workspace.capacity(),
+            self.workspace.used(),
+        );
         Ok(())
     }
 

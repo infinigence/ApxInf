@@ -329,6 +329,9 @@ impl PillowBicubicRgbPlan {
         if self.raw.device() != ctx.device_id() || self.final_rgb.device() != ctx.device_id() {
             return Err(Error::Other("Pillow resize plan device mismatch".into()));
         }
+        if crate::workspace::is_measurement() {
+            return Ok(());
+        }
         for group in &self.groups {
             let [sw, sh, tw, th, fw, fh] = group.key;
             let axis = |input: &CudaBuffer,

@@ -47,6 +47,13 @@ struct Mutable {
     state: PlanningState,
     generator: Box<dyn NormalGenerator>,
 }
+/// Headroom added to the measured arena peak when right-sizing the workspace.
+///
+/// The capture replays the identical traversal (`validate_phase_usage` enforces
+/// it), so the measured high-water mark is exact; a small margin guards any
+/// address-dependent native scratch variation. Kept far below the former 32 GiB
+/// reservation.
+const WORKSPACE_MARGIN: usize = 1 << 20;
 /// Graph output aliases plan storage until the next run. Plans are serial and
 /// retain weights, stable inputs, KV/state, workspace and native execution choices.
 pub(super) struct DirectPlan {
@@ -160,8 +167,10 @@ impl DirectPlan {
         let generator = backend.create_normal_generator(inputs.noise.clone())?;
         // One arena is reused sequentially for Vision, Language and Action inside
         // the same graph. Only persistent visual features and shared KV cross phases.
+        // Measure activation offsets without device execution or tuning;
+        // native selection and binding happen on the final real arena.
         let bytes = 32usize * (1 << 30);
-        let workspace = ops::ExecutionSession::with_capacity(bytes, ctx.device_id())?;
+        let workspace = ops::ExecutionSession::with_virtual_capacity(bytes)?;
         let noise_workspace =
             ops::ExecutionSession::with_capacity(inputs.noise.numel() * 4 + 256, ctx.device_id())?;
         let spec = sample.observation.inference_spec();
@@ -190,68 +199,84 @@ impl DirectPlan {
             model,
         };
         {
-            let valid = validate(&plan.model, sample)?;
-            let mut mutable = plan.mutable.borrow_mut();
-            plan.bind(sample, &valid, &mut mutable)?;
-            // Resolve address-dependent native resources before capture. The
-            // complete forward is one cuda-new session traversal; phase
-            // boundaries remain a model-level diagnostic only.
-            let mut preflight = WorkspaceExecution {
-                workspace: &plan.workspace,
-                usage: Vec::new(),
-            };
-            let output = match ops::prepare_with_session(&plan.workspace, || {
-                plan.model
-                    .forward_direct(&plan.inputs, &mut mutable.state, &mut preflight)
-            }) {
-                Ok(output) => output,
-                Err(error) => {
-                    // A partial RGB frame sequence can have queued work.
-                    backend.synchronize()?;
-                    return Err(error);
-                }
-            };
-            eprintln!(
-                "qwen_drive prepared workspace: reserved={} bytes, phase_used={:?}",
-                plan.workspace.capacity(),
-                preflight.usage
-            );
-            backend.synchronize()?;
-            // The preflight result is not externally visible. Retaining its
-            // workspace lease while capturing the same traversal changes the
-            // deterministic allocation addresses and misses pointer-bound
-            // native execution entries (notably GEMM output bindings).
-            drop(output);
-            if policy != ExecutionPolicy::Eager {
-                let mut captured = WorkspaceExecution {
-                    workspace: &plan.workspace,
-                    usage: Vec::new(),
-                };
-                match backend.capture_graph(|| {
-                    let output = ops::with_session(&plan.workspace, || {
-                        plan.model
-                            .forward_direct(&plan.inputs, &mut mutable.state, &mut captured)
-                    })?;
-                    validate_phase_usage(&preflight.usage, &captured.usage)?;
-                    Ok(output)
-                }) {
-                    Ok((graph, output)) => {
-                        // Complete first-launch setup before reporting Ready.
-                        graph.replay()?;
-                        backend.synchronize()?;
-                        plan.graph = Some(graph);
-                        plan.output = output;
-                    }
-                    Err(error) if policy == ExecutionPolicy::PreferGraph => {
-                        plan.fallback = Some(error.to_string());
-                        eprintln!("qwen_drive whole-model capture fell back to eager: {error}");
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            plan.preflight_and_capture(sample, policy)?;
         }
         Ok(plan)
     }
+    /// Run the prepared forward once, then capture it against `self.workspace`.
+    ///
+    /// Revalidates and rebinds so the caller may swap the arena between a
+    /// measurement traversal and this one. `validate_phase_usage` asserts the
+    /// capture reproduces the preflight layout exactly.
+    fn preflight_and_capture(
+        &mut self,
+        sample: &VlaRequest<'_>,
+        policy: ExecutionPolicy,
+    ) -> Result<()> {
+        let backend = self.model.backend().clone();
+        let device = backend.context().device_id();
+        let valid = validate(&self.model, sample)?;
+        let mut mutable = self.mutable.borrow_mut();
+        self.bind(sample, &valid, &mut mutable)?;
+        // `prepare_right_sized` runs the forward once to measure the arena
+        // high-water mark, rebuilds the arena to that peak plus margin, then
+        // runs it again. Each traversal resets the recurrent state first, so
+        // the measurement traversal's mutation is discarded.
+        let (output, preflight_usage) =
+            self.workspace
+                .prepare_right_sized(device, WORKSPACE_MARGIN, |session| {
+                    let mut execution = WorkspaceExecution {
+                        workspace: session,
+                        usage: Vec::new(),
+                    };
+                    let output = ops::prepare_with_session(session, || {
+                        self.model.reset_state(&mut mutable.state)?;
+                        self.model
+                            .forward_direct(&self.inputs, &mut mutable.state, &mut execution)
+                    })?;
+                    Ok((output, execution.usage))
+                })?;
+        eprintln!(
+            "qwen_drive prepared workspace: reserved={} bytes, phase_used={:?}",
+            self.workspace.capacity(),
+            preflight_usage
+        );
+        backend.synchronize()?;
+        // The preflight result is not externally visible. Retaining its
+        // workspace lease while capturing the same traversal changes the
+        // deterministic allocation addresses and misses pointer-bound native
+        // execution entries (notably GEMM output bindings).
+        drop(output);
+        if policy != ExecutionPolicy::Eager {
+            let mut captured = WorkspaceExecution {
+                workspace: &self.workspace,
+                usage: Vec::new(),
+            };
+            match backend.capture_graph(|| {
+                let output = ops::with_session(&self.workspace, || {
+                    self.model
+                        .forward_direct(&self.inputs, &mut mutable.state, &mut captured)
+                })?;
+                validate_phase_usage(&preflight_usage, &captured.usage)?;
+                Ok(output)
+            }) {
+                Ok((graph, output)) => {
+                    // Complete first-launch setup before reporting Ready.
+                    graph.replay()?;
+                    backend.synchronize()?;
+                    self.graph = Some(graph);
+                    self.output = output;
+                }
+                Err(error) if policy == ExecutionPolicy::PreferGraph => {
+                    self.fallback = Some(error.to_string());
+                    eprintln!("qwen_drive whole-model capture fell back to eager: {error}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     fn bind(
         &self,
         request: &VlaRequest<'_>,

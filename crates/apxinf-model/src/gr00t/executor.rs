@@ -34,12 +34,11 @@ use super::math::{
 use super::weights::Gr00tWeights;
 use super::Gr00tConfig;
 
-// The current stable-address bump arena needs cumulative allocation volume,
-// not peak live bytes. Nsight measured 2.521 GiB for the representative
-// three-view input; 4 GiB leaves alignment and small-shape variance headroom.
-// This is intentionally a first graph-correctness bound, not the final memory
-// plan. The maintained rationale lives in doc/gr00t-n1.7.md.
+// Logical bound for virtual activation placement; no device seed is allocated.
+// The measured offsets determine the final arena before native preparation.
 const INITIAL_GRAPH_WORKSPACE_BYTES: usize = 4usize << 30;
+/// Headroom added to the measured arena peak by `prepare_right_sized`.
+const WORKSPACE_MARGIN: usize = 1 << 20;
 const USE_FUSED_FP8_RMS_NORM: bool = true;
 const USE_FUSED_FP8_VISION_LAYER_NORM: bool = true;
 const USE_FUSED_FP8_VISION_CONCAT_QUANT: bool = true;
@@ -739,6 +738,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         token_buffer: Option<DeviceBuffer>,
     ) -> Result<()> {
         self.prepare_embodiment(observation.embodiment_id)?;
+        self.prepare_backbone_positions(observation)?;
         if let Some(buffer) = token_buffer {
             self.backbone_token_cache = Some((observation.token_ids.clone(), buffer));
         } else if !matches!(
@@ -802,15 +802,20 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         inputs: Gr00tGraphInputs,
         device_observation: Gr00tObservation,
     ) -> Result<Gr00tCapturedGraph> {
-        let workspace = ops::ExecutionSession::with_capacity(
-            INITIAL_GRAPH_WORKSPACE_BYTES,
-            self.backend.device_id(),
-        )?;
+        // Measure activation offsets without device execution or tuning;
+        // native selection and binding happen on the final real arena.
+        let mut workspace =
+            ops::ExecutionSession::with_virtual_capacity(INITIAL_GRAPH_WORKSPACE_BYTES)?;
 
         let preflight_start = Instant::now();
-        let eager_output =
-            ops::prepare_with_session(&workspace, || self.infer_device(&device_observation))
-                .map_err(|error| Error::Other(format!("whole-graph preflight failed: {error}")))?;
+        let eager_output = workspace.prepare_right_sized(
+            self.backend.device_id(),
+            WORKSPACE_MARGIN,
+            |session| {
+                ops::prepare_with_session(session, || self.infer_device(&device_observation))
+                    .map_err(|error| Error::Other(format!("whole-graph preflight failed: {error}")))
+            },
+        )?;
         self.backend.synchronize()?;
         let preflight_seconds = preflight_start.elapsed().as_secs_f64();
         drop(eager_output);
@@ -861,17 +866,7 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
         Ok(())
     }
 
-    fn forward_backbone(
-        &mut self,
-        observation: &Gr00tObservation,
-        token_groups: &Gr00tBackboneTokenGroups,
-    ) -> Result<Tensor> {
-        let _backbone_range = crate::profiling::trace::range("gr00t_backbone");
-        let pixels = if observation.pixel_values.device() == self.backend.device() {
-            observation.pixel_values.clone()
-        } else {
-            self.backend.to_device(&observation.pixel_values)?
-        };
+    fn prepare_backbone_positions(&mut self, observation: &Gr00tObservation) -> Result<()> {
         if !matches!(
             &self.vision_position_cache,
             Some((grid, _)) if grid == &observation.image_grid_thw
@@ -888,6 +883,36 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             )?;
             self.vision_position_cache = Some((observation.image_grid_thw.clone(), positions));
         }
+        let position_ids = multimodal_rope_positions(
+            &self.backbone_config,
+            &observation.token_ids,
+            &observation.image_grid_thw,
+        )?;
+        if !matches!(&self.backbone_position_cache, Some((cached, _)) if cached == &position_ids) {
+            let bytes = position_ids
+                .iter()
+                .flat_map(|position| position.to_ne_bytes())
+                .collect::<Vec<_>>();
+            let buffer =
+                DeviceBuffer::alloc(bytes.len(), self.backend.device_id()).map_err(Error::Cuda)?;
+            buffer.copy_from_host(&bytes).map_err(Error::Cuda)?;
+            self.backbone_position_cache = Some((position_ids, buffer));
+        }
+        Ok(())
+    }
+
+    fn forward_backbone(
+        &mut self,
+        observation: &Gr00tObservation,
+        token_groups: &Gr00tBackboneTokenGroups,
+    ) -> Result<Tensor> {
+        let _backbone_range = crate::profiling::trace::range("gr00t_backbone");
+        let pixels = if observation.pixel_values.device() == self.backend.device() {
+            observation.pixel_values.clone()
+        } else {
+            self.backend.to_device(&observation.pixel_values)?
+        };
+        self.prepare_backbone_positions(observation)?;
         let positions = &self
             .vision_position_cache
             .as_ref()
@@ -1164,25 +1189,12 @@ impl<E: Gr00tPrecisionExecution> Gr00tExecutor<E> {
             false,
             &image_indices,
         )?;
-        let position_ids = multimodal_rope_positions(
-            &self.backbone_config,
-            &observation.token_ids,
-            &observation.image_grid_thw,
-        )?;
-        let position_buffer = match &self.backbone_position_cache {
-            Some((cached, buffer)) if cached == &position_ids => buffer.clone(),
-            _ => {
-                let bytes = position_ids
-                    .iter()
-                    .flat_map(|position| position.to_ne_bytes())
-                    .collect::<Vec<_>>();
-                let buffer = DeviceBuffer::alloc(bytes.len(), self.backend.device_id())
-                    .map_err(Error::Cuda)?;
-                buffer.copy_from_host(&bytes).map_err(Error::Cuda)?;
-                self.backbone_position_cache = Some((position_ids.clone(), buffer.clone()));
-                buffer
-            }
-        };
+        let position_buffer = self
+            .backbone_position_cache
+            .as_ref()
+            .ok_or_else(|| Error::Other("GR00T text positions were not prepared".into()))?
+            .1
+            .clone();
         for layer in 0..self.backbone_config.text.n_layers {
             let _layer_range = crate::profiling::trace::range("gr00t_qwen_layer");
             hidden = forward_qwen_layer(
