@@ -90,8 +90,13 @@ pub enum ComputeUnits {
 }
 
 /// A loaded Core ML program. Not `Send`: predictions run on the owning thread.
+///
+/// A model loaded through [`ProgramCache`] keeps a shared lock on its cache
+/// entry until it is dropped, so no eviction removes the program under it.
 pub struct Model {
     raw: NonNull<c_void>,
+    /// The cache entry, locked shared; dropped after `raw` is freed.
+    _entry: Option<File>,
 }
 
 impl Drop for Model {
@@ -102,13 +107,20 @@ impl Drop for Model {
 }
 
 impl Model {
+    /// Loads the compiled program at `compiled`. Nothing here protects it
+    /// from eviction; [`ProgramCache::load`] does.
     pub fn load(compiled: &Path, units: ComputeUnits) -> Result<Self> {
+        Self::load_holding(compiled, units, None)
+    }
+
+    fn load_holding(compiled: &Path, units: ComputeUnits, entry: Option<File>) -> Result<Self> {
         let path = c_path(compiled)?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: `path` is NUL-terminated; `raw` receives a retained object.
         check(unsafe { ffi::apx_coreml_load(path.as_ptr(), units as i32, &mut raw) })?;
         Ok(Self {
             raw: NonNull::new(raw).ok_or(Error::Other("Core ML returned no model".into()))?,
+            _entry: entry,
         })
     }
 
@@ -193,6 +205,19 @@ fn cache_error(error: std::io::Error) -> Error {
 /// interrupted deletion never leaves a partial program under its own name.
 const EVICTED_PREFIX: &str = ".evicted-";
 
+/// Whether the locked `entry` is still the one published at `compiled`. An
+/// entry evicted, and maybe published again, while it was opened and locked
+/// is not.
+fn is_published(entry: &File, compiled: &Path) -> std::io::Result<bool> {
+    let current = match std::fs::metadata(compiled) {
+        Ok(current) => current,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let locked = entry.metadata()?;
+    Ok((locked.dev(), locked.ino()) == (current.dev(), current.ino()))
+}
+
 /// Opens the published entry at `compiled`, holds a shared lock on it and
 /// refreshes its last-use time. `None` when no entry is there, including one
 /// evicted while this waited for the lock.
@@ -204,17 +229,11 @@ fn use_entry(compiled: &Path) -> std::io::Result<Option<File>> {
             Err(error) => return Err(error),
         };
         entry.lock_shared()?;
-        let current = match std::fs::metadata(compiled) {
-            Ok(current) => current,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let locked = entry.metadata()?;
-        if (locked.dev(), locked.ino()) == (current.dev(), current.ino()) {
+        if is_published(&entry, compiled)? {
             entry.set_modified(SystemTime::now())?;
             return Ok(Some(entry));
         }
-        // Evicted and published again while this waited; lock the new one.
+        // Evicted while this waited; look again for one published since.
     }
 }
 
@@ -293,15 +312,29 @@ fn evict(
     compiled: &Path,
     remove: impl Fn(&Path) -> std::io::Result<()>,
 ) -> std::io::Result<bool> {
-    let entry = match File::open(compiled) {
-        Ok(entry) => entry,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
+    match File::open(compiled) {
+        Ok(entry) => evict_entry(dir, compiled, entry, remove),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Evicts `entry`, opened from `compiled`, if no live cache holds it and it
+/// is still the entry published there. One evicted and replaced since it was
+/// opened is left alone: the path now names another loader's program.
+fn evict_entry(
+    dir: &Path,
+    compiled: &Path,
+    entry: File,
+    remove: impl Fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
     match entry.try_lock() {
         Ok(()) => {}
         Err(TryLockError::WouldBlock) => return Ok(false),
         Err(TryLockError::Error(error)) => return Err(error),
+    }
+    if !is_published(&entry, compiled)? {
+        return Ok(false);
     }
     let stamp = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -325,6 +358,11 @@ fn evict(
 /// Every program a cache resolves stays in use until the cache is dropped:
 /// it holds a shared lock on the entry, which eviction from any process
 /// respects. Each hit also refreshes the entry's last-use time.
+///
+/// A path from [`compiled`](Self::compiled) is protected only while this
+/// cache lives, so keep the cache alive while loading from it. A [`Model`]
+/// from [`load`](Self::load) or [`load_with_placement`](Self::load_with_placement)
+/// holds its own lock on the entry and may outlive the cache.
 pub struct ProgramCache {
     dir: PathBuf,
     byte_budget: Option<u64>,
@@ -356,9 +394,13 @@ impl ProgramCache {
     /// so a working set larger than the budget is kept whole. The cache is
     /// sealed even if eviction fails.
     pub fn seal(&mut self) -> Result<()> {
+        self.seal_with(remove_tree)
+    }
+
+    fn seal_with(&mut self, remove: impl Fn(&Path) -> std::io::Result<()>) -> Result<()> {
         self.sealed = true;
         match self.byte_budget {
-            Some(budget) => evict_to_budget(&self.dir, budget, remove_tree),
+            Some(budget) => evict_to_budget(&self.dir, budget, remove),
             None => Ok(()),
         }
     }
@@ -374,6 +416,16 @@ impl ProgramCache {
         package: &Package,
         compiler: impl FnOnce(&Path, &Path) -> Result<()>,
     ) -> Result<PathBuf> {
+        self.resolve_with(package, compiler).map(|(compiled, _)| compiled)
+    }
+
+    /// The compiled directory for `package` and a handle sharing this cache's
+    /// lock on it, which keeps the entry in use while either lives.
+    fn resolve_with(
+        &self,
+        package: &Package,
+        compiler: impl FnOnce(&Path, &Path) -> Result<()>,
+    ) -> Result<(PathBuf, File)> {
         let mut hash = Sha256::new();
         hash.update(package.model_bytes());
         hash.update(&package.weights);
@@ -386,8 +438,8 @@ impl ProgramCache {
             .collect();
         let compiled = self.dir.join(format!("{key}.mlmodelc"));
         if let Some(entry) = use_entry(&compiled).map_err(cache_error)? {
-            self.hold(key, entry);
-            return Ok(compiled);
+            let held = self.hold(key, entry).map_err(cache_error)?;
+            return Ok((compiled, held));
         }
         if self.sealed {
             return Err(Error::Contract(
@@ -416,20 +468,26 @@ impl ProgramCache {
                 .map_err(cache_error)?
                 .ok_or_else(|| Error::Other("cannot place the compiled Core ML program".into()))?,
         };
-        self.hold(key, entry);
-        Ok(compiled)
+        let held = self.hold(key, entry).map_err(cache_error)?;
+        Ok((compiled, held))
     }
 
-    fn hold(&self, key: String, entry: File) {
+    /// Keeps `entry` locked for this cache's lifetime and returns a duplicate
+    /// handle; `flock` locks belong to the open file, so it shares the lock.
+    fn hold(&self, key: String, entry: File) -> std::io::Result<File> {
         self.in_use
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(key)
-            .or_insert(entry);
+            .or_insert(entry)
+            .try_clone()
     }
 
+    /// Loads `package`, compiling it on a miss. The model keeps the program
+    /// in use until it is dropped, even after this cache is.
     pub fn load(&self, package: &Package, units: ComputeUnits) -> Result<Model> {
-        Model::load(&self.compiled(package)?, units)
+        let (compiled, entry) = self.resolve_with(package, compile)?;
+        Model::load_holding(&compiled, units, Some(entry))
     }
 
     pub fn load_with_placement(
@@ -440,8 +498,8 @@ impl ProgramCache {
         admit: impl FnOnce(&crate::placement::ExpectedPlacement) -> Result<()>,
     ) -> Result<Model> {
         let timeout_ms = crate::placement::timeout_millis(timeout)?;
-        let compiled = self
-            .compiled(package)?
+        let (compiled, entry) = self.resolve_with(package, compile)?;
+        let compiled = compiled
             .canonicalize()
             .map_err(|error| Error::Other(format!("Core ML compiled path: {error}")))?;
         let facts = crate::placement::inspect(&compiled, units, timeout_ms).map_err(|error| {
@@ -450,7 +508,7 @@ impl ProgramCache {
                 compiled.display()
             ))
         })?;
-        let model = Model::load(&compiled, units)?;
+        let model = Model::load_holding(&compiled, units, Some(entry))?;
         admit(&facts)?;
         Ok(model)
     }
@@ -693,8 +751,16 @@ mod tests {
             std::fs::remove_file(trash.join("weight.bin"))?;
             Err(std::io::Error::other("killed mid-deletion"))
         };
-        assert!(evict_to_budget(root.path(), budget, crash).is_err());
+        let mut sealing = ProgramCache::new(root.path()).with_byte_budget(budget);
+        assert!(sealing.seal_with(crash).is_err());
         assert!(!evicted.exists(), "a partial program kept its name");
+        assert!(
+            matches!(
+                sealing.compiled_with(&program(3), |_, _| panic!("sealed miss compiled")),
+                Err(Error::Contract(_))
+            ),
+            "a failed eviction left the cache unsealed"
+        );
         for _ in 0..2 {
             evict_to_budget(root.path(), budget, remove_tree).unwrap();
             assert_eq!(listing(root.path()), listing_of(&kept));
@@ -702,6 +768,51 @@ mod tests {
         let mut sealed = ProgramCache::new(root.path());
         sealed.seal().unwrap();
         assert_eq!(sealed.compiled(&program(2)).unwrap(), kept);
+    }
+
+    #[test]
+    fn eviction_through_a_stale_handle_leaves_what_is_published_since() {
+        let root = tempfile::tempdir().unwrap();
+        let compiled = publish(root.path(), 1, 100);
+        // Opened before another eviction removed it and a loader published
+        // the same key again.
+        let stale = File::open(&compiled).unwrap();
+        let trash = root.path().join(".evicted-test");
+        std::fs::rename(&compiled, &trash).unwrap();
+        std::fs::remove_dir_all(&trash).unwrap();
+        let loader = ProgramCache::new(root.path());
+        let republished = loader
+            .compiled_with(&program(1), |_, target| write_compiled(target))
+            .unwrap();
+        assert_eq!(republished, compiled);
+        assert!(!evict_entry(root.path(), &compiled, stale, remove_tree).unwrap());
+        assert!(
+            compiled.join("compiled").is_file(),
+            "the program published again was evicted"
+        );
+        drop(loader);
+        // Opened before another eviction moved it away, with nothing since.
+        let stale = File::open(&compiled).unwrap();
+        std::fs::rename(&compiled, &trash).unwrap();
+        assert!(!evict_entry(root.path(), &compiled, stale, remove_tree).unwrap());
+        assert!(trash.join("compiled").is_file());
+    }
+
+    #[test]
+    fn a_resolved_handle_keeps_its_program_after_the_cache_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let compiled = publish(root.path(), 1, 100);
+        let cache = ProgramCache::new(root.path());
+        let (resolved, entry) = cache
+            .resolve_with(&program(1), |_, _| panic!("hit compiled"))
+            .unwrap();
+        assert_eq!(resolved, compiled);
+        drop(cache);
+        sealed_with_budget(root.path(), 0);
+        assert!(compiled.is_dir(), "a program a model holds was evicted");
+        drop(entry);
+        sealed_with_budget(root.path(), 0);
+        assert!(!compiled.exists(), "a released program was kept over budget");
     }
 
     fn listing_of(compiled: &Path) -> Vec<String> {
@@ -712,6 +823,7 @@ mod tests {
     fn invalid_input_extent_returns_error_before_native_prediction() {
         let model = ManuallyDrop::new(Model {
             raw: NonNull::dangling(),
+            _entry: None,
         });
         let shape = [usize::MAX, 2];
         assert!(model.predict(&[("x", &[], &shape)], &[]).is_err());
@@ -745,6 +857,7 @@ mod tests {
     fn invalid_output_extent_returns_error_before_native_prediction() {
         let model = ManuallyDrop::new(Model {
             raw: NonNull::dangling(),
+            _entry: None,
         });
         assert!(model.predict(&[], &[("y", &[usize::MAX, 2])]).is_err());
     }

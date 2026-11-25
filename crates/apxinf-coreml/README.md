@@ -49,7 +49,9 @@ not byte-reproducible. The writer instead matches it in three ways:
   the least recently used programs until the rest fit; every hit refreshes a
   program's last-use time. A program that any live `ProgramCache`, in any
   process, has resolved is never evicted, so a working set larger than the
-  budget is kept whole. Eviction moves a program aside before deleting it, so
+  budget is kept whole. A `Model` from `ProgramCache::load` keeps its program
+  from eviction until it is dropped, even after the cache is; a path from
+  `ProgramCache::compiled` is protected only while the cache lives. Eviction moves a program aside before deleting it, so
   an interrupted eviction never leaves a partial program under its key, and
   the next `seal` deletes the leftovers. Without a budget the directory is
   unbounded. Core ML's own per-executable bundle cache

@@ -151,7 +151,8 @@ Python. Device prediction equivalence remains a separate native test.
   program and weight digests plus the macOS build. The writer creates the
   entry in a temporary directory and renames it into place, so concurrent
   loads never read a partial entry. With a byte budget, sealing evicts the
-  least recently used entries that no live cache holds until the rest fit.
+  least recently used entries that no live cache or cache-loaded model holds
+  until the rest fit.
 - **Load.** The model is loaded with the compute units the family requests
   (the GPU+ANE composition uses `MLComputeUnitsCPUAndNeuralEngine`). After loading, the runtime is
   sealed: a later application compile request is an error. Loaded and sealed
