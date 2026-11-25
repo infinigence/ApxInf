@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 build = "build.rs"
+rust-version = "1.89"
 [features]
 default = []
 native = []
