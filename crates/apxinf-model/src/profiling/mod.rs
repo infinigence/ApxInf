@@ -4,7 +4,8 @@
 //! - [`GenerationProfile`] measures timing metrics (TTFT/TPOT/TPS/latency) in
 //!   process and reports numbers itself.
 //! - [`trace`] emits named time-span markers consumed by an external profiler
-//!   (NVTX / Nsight on CUDA); it produces no numbers of its own.
+//!   (NVTX / Nsight on CUDA, MTTX / msys on MUSA, os_signpost / Instruments
+//!   on Apple); it produces no numbers of its own.
 
 pub mod trace;
 
