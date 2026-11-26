@@ -44,7 +44,25 @@ f  = post_ffn_norm(feed_forward(ffn_norm(x))); x = x + f
 - Short conv: `in_proj -> chunk(B, C, x) -> u = B * x -> width-7 causal depthwise
   conv in FP32 -> y = C * conv -> out_proj`. The six retained input columns are
   request state, not output state.
-- MLP: `silu(w1) * w3 -> w2`.
+- MLP: `silu(w1) * w3 -> w2`. With `--features coreml` and
+  `APXINF_LFM3_ANE=<split>` set to an intermediate column (or a fraction such
+  as `0.7333`, which rounds to the registered 5632-column ANE share), prefill
+  keeps columns `[0, split)` on the GPU and runs `[split, 7680)` as one FP16
+  Core ML program per layer on the Neural Engine (FP32 `y * gate_scale * up_scale` restore, then
+  the two down projections are summed). Unset/`0` is the unchanged GPU-only path;
+  decode (`len == 1`) never uses the ANE path — the split is wired into the
+  prefill branch only, and the full BF16 projections stay resident for decode
+  alongside the GPU share's sliced copies and the FP16 program constants (the
+  pre-registration's neutral-memory estimate assumed sliced weights only; that
+  estimate missed decode's full-width MLP and is corrected at the measured
+  window). The program is the FP16 chain
+  measured in issue #151 and must be entirely ANE-preferred, otherwise loading
+  fails rather than reporting a CPU/GPU fallback as an ANE run.
+  `APXINF_LFM3_MLP_ABLATE=1` is a timing-only instrument: prefill's MLP section
+  (gate/up/silu/down) is replaced by a same-shape zero tensor so a window can
+  difference out the MLP wall clock (`f`). It changes numerics on purpose, is
+  rejected for values other than `0`/`1`, must never appear in a correctness or
+  TTFT gate arm, and never touches decode.
 - Head: `embedding_norm` then the tied embedding used as `lm_head`.
 
 Prefill evaluates every layer boundary; decode builds one graph per token and
@@ -130,8 +148,9 @@ hashes every artifact).
 - Context is capped at 8192 positions (see above); long-context work would need
   a bounded or paged full-attention KV before raising it.
 - No compiled or captured decode scope yet; `preparation_status` says so.
-- The port uses the ordinary lazy MLX dispatch path for every operation; the
-  Python lane's ANE-composed prefill and 4-bit packed decode are not ported.
+- The port uses the ordinary lazy MLX dispatch path outside the optional ANE
+  MLP column split above; the Python lane's ANE-composed prefill and 4-bit
+  packed decode are not otherwise ported.
 - Rotary tables follow the platform C library, which matches the reference
   lane's float32 numpy path to within 1 ULP rather than bit-for-bit. A
   bit-exact table would require reproducing numpy's float32 SIMD trig.

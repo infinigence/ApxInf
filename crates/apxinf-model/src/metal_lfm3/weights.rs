@@ -34,6 +34,37 @@ impl Linear {
             Linear::Q4(q4) => q4.apply(x),
         }
     }
+
+    /// Canonical BF16 `[in, out]` weight, or an error for a 4-bit projection.
+    /// The ANE column split needs the dense checkpoint weights; combining it
+    /// with `APXINF_LFM3_4BIT` is not a supported configuration.
+    #[cfg(feature = "coreml")]
+    pub(crate) fn bf16(&self) -> Result<&Array> {
+        match self {
+            Linear::Bf16 { canonical } => Ok(canonical),
+            Linear::Q4(_) => Err(Error::Other(
+                "LFM3 ANE needs BF16 projections; APXINF_LFM3_4BIT is not supported with APXINF_LFM3_ANE"
+                    .into(),
+            )),
+        }
+    }
+
+    /// This projection restricted to output columns `[start, end)`.
+    #[cfg(feature = "coreml")]
+    pub(crate) fn output_slice(&self, start: usize, end: usize) -> Result<Self> {
+        Ok(Self::Bf16 {
+            canonical: self.bf16()?.slice_axis(1, start, end)?.contiguous()?,
+        })
+    }
+
+    /// This projection restricted to input columns `[start, end)`.
+    #[cfg(feature = "coreml")]
+    pub(crate) fn input_slice(&self, start: usize, end: usize) -> Result<Self> {
+        Ok(Self::Bf16 {
+            canonical: self.bf16()?.slice_axis(0, start, end)?.contiguous()?,
+        })
+    }
+
     /// All arrays to warm at load: the BF16 operand, or the Q4 triple.
     pub fn warm_arrays(&self) -> Vec<Array> {
         match self {

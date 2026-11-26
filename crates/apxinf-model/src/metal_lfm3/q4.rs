@@ -36,7 +36,11 @@ impl Q4 {
 
     /// The packed/scale/bias arrays to warm at load (uploaded bytes).
     pub fn arrays(&self) -> [Array; 3] {
-        [self.weight.clone(), self.scales.clone(), self.biases.clone()]
+        [
+            self.weight.clone(),
+            self.scales.clone(),
+            self.biases.clone(),
+        ]
     }
 
     /// Gather `ids` rows of the tied table and dequantize only those rows to
@@ -121,11 +125,29 @@ pub fn take(
         return Ok(None);
     }
     Ok(Some(Q4 {
-        weight: take_array(map, &format!("{stem}.weight"), MlxDType::U32, &[output, input / 8], stream)?
-            .expect("triple completeness checked above"),
-        scales: take_array(map, &format!("{stem}.scales"), MlxDType::BF16, &[output, input / 64], stream)?
-            .expect("triple completeness checked above"),
-        biases: take_array(map, &format!("{stem}.biases"), MlxDType::BF16, &[output, input / 64], stream)?
-            .expect("triple completeness checked above"),
+        weight: take_array(
+            map,
+            &format!("{stem}.weight"),
+            MlxDType::U32,
+            &[output, input / 8],
+            stream,
+        )?
+        .expect("triple completeness checked above"),
+        scales: take_array(
+            map,
+            &format!("{stem}.scales"),
+            MlxDType::BF16,
+            &[output, input / 64],
+            stream,
+        )?
+        .expect("triple completeness checked above"),
+        biases: take_array(
+            map,
+            &format!("{stem}.biases"),
+            MlxDType::BF16,
+            &[output, input / 64],
+            stream,
+        )?
+        .expect("triple completeness checked above"),
     }))
 }

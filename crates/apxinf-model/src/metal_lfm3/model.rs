@@ -11,13 +11,18 @@
 //! accumulation is kept only as the test-only parity reference. Every other
 //! operation names the backend primitive the reference itself calls.
 
+#[cfg(feature = "coreml")]
+use super::weights::Linear;
 use super::{
     config::{LayerKind, Lfm3Config},
     q4,
     weights::{LayerWeights, Mixer, Weights},
 };
-use crate::llm_trait::{LlmInput, LlmTrait, TextPreparationState, TextPreparationStatus};
-use apxinf_core::{Backend, Device, Error, Result, Tensor};
+use crate::llm_trait::{
+    LlmInput, LlmTrait, TextPreparationState, TextPreparationStatus, TokenSequence,
+};
+use crate::mlx_decode::{DecodeFinish, DeviceDecode, GreedySequence};
+use apxinf_core::{Backend, Device, Error, Result, Tensor, TokenSampler, TokenSamplingParams};
 use apxinf_loader::ModelConfig;
 use apxinf_mlx::{fusions::CausalDepthwiseConv, Array, MlxBackend, MlxDType, Stream};
 use std::{collections::HashMap, sync::Arc, time::Instant};
@@ -48,6 +53,26 @@ pub fn prefill_fast_enabled() -> bool {
 /// so the unset baseline arm never inspects quantized keys (empty-arm gate).
 pub fn native_4bit_enabled() -> bool {
     q4::enabled()
+}
+
+/// `APXINF_LFM3_MLP_ABLATE=1` short-circuits the prefill MLP section
+/// (gate/up/silu/down) to a same-shape zero tensor so a timing window can
+/// difference out the MLP wall clock (`f`, `doc/lfm3-ane-fp16-port-preregister.md`
+/// §3.1.8/§5.3). This arm changes numerics and is for timing only: it must
+/// never appear in a correctness or TTFT gate arm. Anything but `0`/`1` is
+/// rejected at load so a typo cannot silently turn the instrument off
+/// mid-window.
+fn mlp_ablate_requested() -> Result<bool> {
+    let Some(raw) = std::env::var_os("APXINF_LFM3_MLP_ABLATE") else {
+        return Ok(false);
+    };
+    match raw.to_string_lossy().trim() {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        other => Err(Error::Other(format!(
+            "APXINF_LFM3_MLP_ABLATE must be 0 or 1, got `{other}`"
+        ))),
+    }
 }
 
 // Platform C math library, used only to generate the fixed rotary tables on the
@@ -93,6 +118,61 @@ fn apply_rope(x: &Array, cos: &Array, sin: &Array, dim: usize) -> Result<Array> 
 /// `silu(gate) * up` expressed exactly as the reference's `nn.silu(g) * u`.
 fn silu_mul(gate: &Array, up: &Array) -> Result<Array> {
     gate.mul(&gate.sigmoid()?)?.mul(up)
+}
+
+/// ANE column split for the MLP (`APXINF_LFM3_ANE`), in intermediate columns.
+///
+/// `0` (the default) leaves the MLP on the GPU-only path, byte-identical to
+/// before this switch existed. An integer in `1..7680` is the split point:
+/// columns `[0, share)` stay on the GPU and `[share, 7680)` run as one FP16
+/// Core ML program per layer (`--features coreml`). The two halves' down
+/// projections are summed before `post_ffn_norm`.
+///
+/// A fraction in `(0, 1)` is the pre-registered ANE share: `S = round(share *
+/// 7680 / 64) * 64`, columns `[7680 - S, 7680)` on the ANE. `0.7333` is the
+/// registered `S = 5632` point; the integer form stays for the #159 scaffold
+/// smoke and for choosing an arbitrary split.
+///
+/// Without the `coreml` feature the switch still validates and exercises the
+/// split geometry, but both halves run on the GPU; the model never claims an ANE
+/// run in that build. A non-zero share is not expected to be byte-identical to
+/// `share == 0` because the projection's column count changes the GEMM tiling
+/// (#128); the token gate in `doc/lfm3-ane-fp16-port-preregister.md` decides.
+fn ane_mlp_split(limit: usize) -> Result<usize> {
+    let Some(raw) = std::env::var_os("APXINF_LFM3_ANE") else {
+        return Ok(0);
+    };
+    let text = raw.to_string_lossy();
+    let value = text.trim();
+    if let Ok(share) = value.parse::<usize>() {
+        if share > limit {
+            return Err(Error::Other(format!(
+                "APXINF_LFM3_ANE must be <= {limit}, got {share}"
+            )));
+        }
+        return Ok(share);
+    }
+    let share: f64 = value.parse().map_err(|_| {
+        Error::Other(format!(
+            "APXINF_LFM3_ANE must be an integer column or a fraction in (0,1), got `{text}`"
+        ))
+    })?;
+    if !share.is_finite() || share < 0.0 || share >= 1.0 {
+        return Err(Error::Other(format!(
+            "APXINF_LFM3_ANE fraction must be in (0,1), got `{text}`"
+        )));
+    }
+    if share == 0.0 {
+        return Ok(0);
+    }
+    let ane = ((share * limit as f64 / 64.0).round() as usize) * 64;
+    if ane < 64 || ane > limit - 64 {
+        return Err(Error::Other(format!(
+            "APXINF_LFM3_ANE share {share} rounds to {ane} columns; needs 64..={}",
+            limit - 64
+        )));
+    }
+    Ok(limit - ane)
 }
 
 /// Fused one-token depthwise convolution over a seven-column window.
@@ -170,10 +250,41 @@ struct PrefillCache {
     states: Vec<LayerState>,
 }
 
+/// The GPU half of the ANE column split for one layer: the BF16 projections
+/// restricted to columns `[0, share)`, used only by the prefill split arm.
+/// Keeping these alongside the full weights is what lets decode keep the
+/// untouched full-width MLP while prefill runs the honest GPU share (computing
+/// the full projection and slicing the result would inflate the GPU arm's
+/// FLOPs and wreck the `f` accounting).
+#[cfg(feature = "coreml")]
+struct AneGpuShare {
+    w1: Linear,
+    w3: Linear,
+    w2: Linear,
+}
+
 pub struct Lfm3Model {
     config: Lfm3Config,
     backend: MlxBackend,
     weights: Weights,
+    /// `APXINF_LFM3_ANE` split point: columns `[0, ane_share)` stay on the GPU
+    /// and `[ane_share, intermediate)` run on the Neural Engine. `0` is the
+    /// default GPU-only path and builds no Core ML program.
+    ane_share: usize,
+    /// One loaded FP16 program per layer when `ane_share > 0`. Empty otherwise;
+    /// the `coreml` feature is the only build that can fill it.
+    #[cfg(feature = "coreml")]
+    ane: Vec<super::ane_slice::AneSlice>,
+    /// The GPU share's BF16 projections (columns `[0, ane_share)` of w1/w3,
+    /// matching w2 input slice) for the prefill split arm. The full weights
+    /// stay in `weights` because decode (`len == 1`) keeps running the
+    /// untouched full-width MLP; the split is prefill-only. Empty when
+    /// `ane_share == 0`.
+    #[cfg(feature = "coreml")]
+    ane_gpu: Vec<AneGpuShare>,
+    /// `APXINF_LFM3_MLP_ABLATE=1`: prefill MLP section replaced by zeros
+    /// (timing-only instrument, captured once at construction).
+    ablate: bool,
     /// Compiled `apxinf_causal_depthwise_conv` pipeline for the decode step.
     causal_conv: CausalDepthwiseConv,
     kinds: Vec<LayerKind>,
@@ -225,6 +336,43 @@ impl Lfm3Model {
             .ok_or_else(|| err("LFM3 native implementation requires an MLX backend"))?
             .clone();
         let weights = Weights::load(&config, tensors, backend.stream())?;
+        let intermediate = config.intermediate_size;
+        let ane_share = ane_mlp_split(intermediate)?;
+        if ane_share >= intermediate {
+            return Err(Error::Other(format!(
+                "APXINF_LFM3_ANE must be < {intermediate} (the split needs a GPU half), got {ane_share}"
+            )));
+        }
+        let ablate = mlp_ablate_requested()?;
+        // Build each layer's program from the full BF16 weights and keep the
+        // GPU share's projections beside (not instead of) the full weights:
+        // decode keeps the untouched full-width MLP, so the split is wired
+        // into the prefill path only. share == 0 never enters this block, so
+        // the default arm neither compiles nor loads a Core ML program.
+        #[cfg(feature = "coreml")]
+        let (ane, ane_gpu) = if ane_share == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            let cache = apxinf_coreml::ProgramCache::new(super::ane_slice::cache_dir());
+            let mut slices = Vec::with_capacity(weights.layers.len());
+            let mut gpu = Vec::with_capacity(weights.layers.len());
+            for layer in &weights.layers {
+                slices.push(super::ane_slice::AneSlice::load(
+                    &cache,
+                    ane_share,
+                    intermediate,
+                    &layer.w1,
+                    &layer.w3,
+                    &layer.w2,
+                )?);
+                gpu.push(AneGpuShare {
+                    w1: layer.w1.output_slice(0, ane_share)?,
+                    w3: layer.w3.output_slice(0, ane_share)?,
+                    w2: layer.w2.input_slice(0, ane_share)?,
+                });
+            }
+            (slices, gpu)
+        };
         let causal_conv = CausalDepthwiseConv::new(backend.stream())?;
         let kinds = config.layer_kinds()?;
         let layers = config.num_hidden_layers;
@@ -232,6 +380,12 @@ impl Lfm3Model {
             config,
             backend,
             weights,
+            ane_share,
+            #[cfg(feature = "coreml")]
+            ane,
+            #[cfg(feature = "coreml")]
+            ane_gpu,
+            ablate,
             causal_conv,
             kinds,
             initial_kv: vec![None; layers],
@@ -263,6 +417,22 @@ impl Lfm3Model {
                 "native_4bit census: quantized_triples={}/154",
                 model.weights.quantized_layers
             );
+        }
+        // Worker-witness banner (G3): an ANE claim without a matching banner
+        // is an INVALID run. The default arm prints nothing.
+        #[cfg(feature = "coreml")]
+        if ane_share > 0 {
+            eprintln!(
+                "lfm3_ane: split={ane_share}/{intermediate} programs={} feature=coreml",
+                model.ane.len()
+            );
+        }
+        #[cfg(not(feature = "coreml"))]
+        if ane_share > 0 {
+            eprintln!("lfm3_ane: split={ane_share}/{intermediate} programs=0 feature=mlx-only");
+        }
+        if model.ablate {
+            eprintln!("lfm3_mlp_ablate=on (timing-only arm: prefill MLP shorted to zeros)");
         }
         model.prepare(1, 0)?;
         Ok(model)
@@ -475,7 +645,12 @@ impl Lfm3Model {
         state: &Array,
         continuing: bool,
     ) -> Result<(Array, Array)> {
-        let Mixer::Conv { in_proj, out_proj, taps, .. } = &layer.mixer
+        let Mixer::Conv {
+            in_proj,
+            out_proj,
+            taps,
+            ..
+        } = &layer.mixer
         else {
             return Err(err("LFM3 conv layer has an attention weight plan"));
         };
@@ -499,11 +674,19 @@ impl Lfm3Model {
             return Err(err("LFM3 conv input shorter than its chunk"));
         }
         let weight = taps.reshape(&[h, taps_kernel, 1])?;
-        let conv = z_stream.cast(MlxDType::F32)?.conv1d(&weight, 1, taps_kernel - 1, 1, h)?;
-        let y = gate.mul(&conv.slice_axis(1, stream_len - len, stream_len)?.cast(MlxDType::BF16)?)?;
+        let conv = z_stream
+            .cast(MlxDType::F32)?
+            .conv1d(&weight, 1, taps_kernel - 1, 1, h)?;
+        let y = gate.mul(
+            &conv
+                .slice_axis(1, stream_len - len, stream_len)?
+                .cast(MlxDType::BF16)?,
+        )?;
         let op = out_proj.call(&y)?;
         let first = stream_len.saturating_sub(keep);
-        let mut next = z_stream.slice_axis(1, first, stream_len)?.transpose(&[0, 2, 1])?;
+        let mut next = z_stream
+            .slice_axis(1, first, stream_len)?
+            .transpose(&[0, 2, 1])?;
         let width = next.shape()[2];
         if width < keep {
             next = next.pad(&[0, 0, keep - width], &[0, 0, 0])?;
@@ -685,7 +868,9 @@ impl Lfm3Model {
         let heads = self.config.num_attention_heads;
         let eps = self.config.norm_eps;
         let dim = self.config.head_dim;
-        Self::attention_step_parts(n, layer, kind, kv, start, &cos, &sin, stream, heads, eps, dim)
+        Self::attention_step_parts(
+            n, layer, kind, kv, start, &cos, &sin, stream, heads, eps, dim,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -764,21 +949,75 @@ impl Lfm3Model {
         Ok((op, KvState { keys, values }))
     }
 
-    /// Sandwich-norm residual composition shared by both branches.
+    /// Sandwich-norm residual composition shared by both branches. `len` is
+    /// the step's token count; the ANE split and the ablation instrument are
+    /// prefill-only, so a one-token step always takes the original path.
     fn mix_and_residual(
         &self,
         x: &Array,
         op: &Array,
         layer: &LayerWeights,
+        layer_idx: usize,
+        len: usize,
     ) -> Result<Array> {
         let eps = self.config.norm_eps;
         let op = norm(op, &layer.post_operator_norm, eps)?;
         let hidden = x.add(&op)?;
         let ffn = norm(&hidden, &layer.ffn_norm, eps)?;
-        let gate = layer.w1.call(&ffn)?;
-        let up = layer.w3.call(&ffn)?;
-        let activated = silu_mul(&gate, &up)?;
-        let down = layer.w2.call(&activated)?;
+        let share = self.ane_share;
+        #[cfg(not(feature = "coreml"))]
+        let _ = layer_idx;
+        let down = if share == 0 || len == 1 {
+            // The default and the decode arm: exactly the three GPU calls this
+            // MLP made before the ANE switch existed, on the full-width
+            // weights. Decode (`len == 1`) lands here no matter what share is
+            // set, so a non-zero share can never change a decode step
+            // (pre-registration §3.2: decode stays on the GPU, untouched).
+            let gate = layer.w1.call(&ffn)?;
+            let up = layer.w3.call(&ffn)?;
+            let activated = silu_mul(&gate, &up)?;
+            layer.w2.call(&activated)?
+        } else if self.ablate {
+            // Timing-only instrument (`APXINF_LFM3_MLP_ABLATE=1`,
+            // pre-registration §3.1.8): the prefill MLP section is a zero
+            // tensor of the down shape. It changes numerics on purpose and
+            // must never appear in a correctness or TTFT gate arm.
+            Array::zeros(x.stream(), x.shape(), x.dtype())?
+        } else {
+            #[cfg(feature = "coreml")]
+            {
+                let slice = self.ane.get(layer_idx).ok_or_else(|| {
+                    Error::Other(format!(
+                        "LFM3 ANE split is {share} but layer {layer_idx} has no Core ML program"
+                    ))
+                })?;
+                let gpu_share = self.ane_gpu.get(layer_idx).ok_or_else(|| {
+                    Error::Other(format!(
+                        "LFM3 ANE split is {share} but layer {layer_idx} has no GPU share"
+                    ))
+                })?;
+                // The full weights stay in `weights` for decode; the GPU half
+                // runs on its sliced projections so its FLOPs are the honest
+                // share, and the ANE half returns its FP32-restored down part.
+                let gate = gpu_share.w1.call(&ffn)?;
+                let up = gpu_share.w3.call(&ffn)?;
+                let gpu = silu_mul(&gate, &up)?;
+                let gpu = gpu_share.w2.call(&gpu)?;
+                gpu.add(&slice.predict(&ffn)?)?
+            }
+            #[cfg(not(feature = "coreml"))]
+            {
+                // No Core ML in this build: exercise the split geometry on the
+                // GPU, exactly as the scaffold did.
+                let gate = layer.w1.call(&ffn)?;
+                let up = layer.w3.call(&ffn)?;
+                let gpu = silu_mul(&gate.slice_axis(1, 0, share)?, &up.slice_axis(1, 0, share)?)?;
+                let ane = super::ane_slice::AneSlice::new(share, self.config.intermediate_size)?
+                    .from_parts(&gate, &up)?;
+                let activated = Array::concat(&[&gpu, &ane], 1)?;
+                layer.w2.call(&activated)?
+            }
+        };
         let down = norm(&down, &layer.post_ffn_norm, eps)?;
         hidden.add(&down)
     }
@@ -819,7 +1058,7 @@ impl Lfm3Model {
             };
             (op, LayerState::Attention(next))
         };
-        let output = self.mix_and_residual(x, &op, layer)?;
+        let output = self.mix_and_residual(x, &op, layer, layer_idx, len)?;
         if let Some(states) = states {
             // The fast arm publishes the captured snapshot into the live slots
             // inside `build_graph` so both stay in lockstep; skip the eval here
@@ -954,7 +1193,14 @@ impl Lfm3Model {
         let mut cached_states = (self.prefill_fast && len > 1).then(Vec::new);
         for layer_idx in 0..self.config.num_hidden_layers {
             x = self
-                .run_layer(&x, layer_idx, start, len, per_layer_eval, cached_states.as_mut())
+                .run_layer(
+                    &x,
+                    layer_idx,
+                    start,
+                    len,
+                    per_layer_eval,
+                    cached_states.as_mut(),
+                )
                 .map_err(|e| err(format!("layer {layer_idx}: {e}")))?;
         }
         let hidden = norm(&x, &self.weights.final_norm, self.config.norm_eps)
@@ -1079,6 +1325,79 @@ impl Lfm3Model {
     }
 }
 
+impl DeviceDecode for Lfm3Model {
+    fn stream(&self) -> &Stream {
+        self.backend.stream()
+    }
+
+    fn decode(&mut self, token: &Array) -> Result<Array> {
+        if self.invalid.is_some() || self.position >= self.capacity {
+            return Err(err("LFM3 decode requires valid prepared capacity"));
+        }
+        if token.shape() != [1] {
+            return Err(err(format!(
+                "LFM3 decode expects one device-resident token id, got {:?}",
+                token.shape()
+            )));
+        }
+        // The lookahead step may be discarded by `finish_decode`; the conv
+        // windows it shifts must move back, so keep the pre-step references.
+        self.conv_snapshot = Some(self.conv.clone());
+        let start = self.position;
+        let build_started = self.stages.then(Instant::now);
+        let logits = match self.build_graph(token, start, 1, true) {
+            Ok(logits) => logits,
+            Err(error) => {
+                self.invalid = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        if let Some(build_ms) = build_started.map(|t| t.elapsed().as_secs_f64() * 1000.) {
+            self.report_stage("device", build_ms, 0.0);
+        }
+        self.position = start + 1;
+        Ok(logits)
+    }
+
+    fn finish_decode(&mut self, outcome: DecodeFinish) -> Result<()> {
+        if let Err(error) = self.backend.stream().synchronize() {
+            self.invalid = Some(error.to_string());
+            return Err(error);
+        }
+        match outcome {
+            DecodeFinish::PublishedPosition(position)
+                if self.invalid.is_none()
+                    && position <= self.position
+                    && self.position - position <= 1 =>
+            {
+                if self.position != position {
+                    // The discarded lookahead step wrote KV row `position`,
+                    // which the next write overwrites and attention never
+                    // reads past `[low, end)`. The conv windows, however,
+                    // slid: restore the snapshot taken before that step.
+                    #[cfg(test)]
+                    if !self.disable_conv_restore {
+                        self.restore_conv_snapshot();
+                    }
+                    #[cfg(not(test))]
+                    self.restore_conv_snapshot();
+                    self.position = position;
+                }
+                Ok(())
+            }
+            DecodeFinish::Invalidated => {
+                self.invalid
+                    .get_or_insert_with(|| "greedy request failed or was abandoned".into());
+                Ok(())
+            }
+            _ => {
+                self.invalid = Some("invalid LFM3 greedy rollback position".into());
+                Err(err("invalid LFM3 greedy rollback position"))
+            }
+        }
+    }
+}
+
 impl LlmTrait for Lfm3Model {
     fn preparation_status(&self) -> TextPreparationStatus {
         let ready = self.invalid.is_none()
@@ -1151,6 +1470,28 @@ impl LlmTrait for Lfm3Model {
         self.conv_snapshot = None;
         self.position = 0;
         self.invalid = None;
+    }
+
+    /// Greedy decode runs on the pipelined device sequence unless the
+    /// operator forces the legacy synchronous path with
+    /// `APXINF_MLX_SYNC_DECODE=1` (forwarded into the worker with the
+    /// gateway's `--worker-env`); anything but penalty-free greedy keeps the
+    /// shared synchronous sequence.
+    fn token_sequence<'a>(
+        &'a mut self,
+        first: Tensor,
+        sampler: Box<dyn TokenSampler>,
+        params: &TokenSamplingParams,
+        prompt_end: u32,
+    ) -> Result<Box<dyn TokenSequence + 'a>> {
+        if crate::mlx_decode::enabled(params) {
+            let first = self.backend.array(&first)?;
+            Ok(Box::new(GreedySequence::new(self, first, prompt_end)?))
+        } else {
+            Ok(Box::new(crate::llm_trait::SyncTokenSequence::new(
+                self, first, sampler, prompt_end,
+            )))
+        }
     }
 
     fn prewarm_decode(&mut self, prompt_len: usize, max_new_tokens: usize) {
@@ -1246,4 +1587,751 @@ mod tests {
         Ok(())
     }
 
+    // ---- Pipelined greedy decode acceptance tests (issue #122). Real ----
+    // checkpoint, real Metal: `APXINF_LFM3_TEST_MODEL=<snapshot dir> cargo
+    // test -p apxinf-model --features mlx,coreml metal_lfm3 -- --ignored
+    // --test-threads=1` under the shared Metal qualification lock. The tests
+    // mutate process env to select the schedule, so they must run
+    // single-threaded.
+
+    use crate::generation_config::GenerationOptions;
+    use crate::llm_trait::GenerationCancellation;
+
+    const SYNC_ENV: &str = "APXINF_MLX_SYNC_DECODE";
+    const NO_RESTORE_ENV: &str = "APXINF_LFM3_TEST_NO_CONV_RESTORE";
+    const PREFILL_FAST_ENV: &str = "APXINF_LFM3_PREFILL_FAST";
+
+    fn test_checkpoint() -> Result<std::path::PathBuf> {
+        std::env::var_os("APXINF_LFM3_TEST_MODEL")
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| err("set APXINF_LFM3_TEST_MODEL to the LFM3 snapshot dir"))
+    }
+
+    fn load_checkpoint_model() -> Result<Lfm3Model> {
+        let path = test_checkpoint()?;
+        let json = std::fs::read_to_string(path.join("config.json"))
+            .map_err(|e| err(format!("cannot read LFM3 config: {e}")))?;
+        let config = Lfm3Config::from_json(&json)?;
+        let (tensors, _) = apxinf_loader::safetensors::load_native_path(&path)
+            .map_err(|e| err(format!("cannot load LFM3 checkpoint: {e}")))?;
+        let mut model = Lfm3Model::new(config, tensors, Arc::new(MlxBackend::new(0)?))?;
+        if std::env::var_os(NO_RESTORE_ENV).is_some() {
+            model.disable_conv_restore = true;
+        }
+        Ok(model)
+    }
+
+    fn pseudo_prompt(len: usize, seed: u64) -> Vec<u32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 33) as u32) % 120_000
+            })
+            .collect()
+    }
+
+    fn set_sync_schedule(on: bool) {
+        if on {
+            std::env::set_var(SYNC_ENV, "1");
+        } else {
+            std::env::remove_var(SYNC_ENV);
+        }
+    }
+
+    fn set_prefill_fast(on: bool) {
+        if on {
+            std::env::set_var(PREFILL_FAST_ENV, "1");
+        } else {
+            std::env::remove_var(PREFILL_FAST_ENV);
+        }
+    }
+
+    fn run_greedy(model: &mut Lfm3Model, prompt: &[u32], budget: usize) -> Result<Vec<u32>> {
+        let options = GenerationOptions::greedy(budget, None);
+        let output = model.generate_streaming_with_options(
+            crate::llm_trait::GenerationRequest {
+                input: LlmInput::text(prompt),
+                options: &options,
+            },
+            |_| {},
+        )?;
+        Ok(output.token_ids())
+    }
+
+    /// The production greedy rule (NaN/+inf/-inf normalisation, first-index
+    /// ties) applied to a forward's logits row.
+    fn greedy_from_logits(model: &Lfm3Model, logits: &Tensor) -> Result<u32> {
+        let array = model.backend.array(logits)?;
+        let (_feed, checked) = apxinf_mlx::greedy_token_arrays(&array)?;
+        let bytes = checked.to_bytes_ready()?;
+        let token = u32::from_ne_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| err("greedy token must contain one u32"))?,
+        );
+        if token == u32::MAX {
+            return Err(err("all token logits are invalid"));
+        }
+        Ok(token)
+    }
+
+    /// Byte snapshot of every attention layer's KV rows `[0, position)` and
+    /// every conv layer's window — the continuation state a request hands to
+    /// its sequel.
+    fn state_bytes(
+        model: &Lfm3Model,
+        position: usize,
+    ) -> Result<(Vec<Option<Vec<u8>>>, Vec<Option<Vec<u8>>>)> {
+        model.backend.stream().synchronize()?;
+        let kv = model
+            .kv
+            .iter()
+            .map(|state| {
+                state
+                    .as_ref()
+                    .map(|kv| -> Result<Vec<u8>> {
+                        let keys = kv
+                            .keys
+                            .slice_axis(2, 0, position)?
+                            .contiguous()?
+                            .to_bytes_ready()?;
+                        let values = kv
+                            .values
+                            .slice_axis(2, 0, position)?
+                            .contiguous()?
+                            .to_bytes_ready()?;
+                        let mut bytes = keys;
+                        bytes.extend_from_slice(&values);
+                        Ok(bytes)
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let conv = model
+            .conv
+            .iter()
+            .map(|state| {
+                state
+                    .as_ref()
+                    .map(|array| array.contiguous()?.to_bytes_ready())
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((kv, conv))
+    }
+
+    /// Drive `take` pipelined reads with lookahead, then finish as the driver
+    /// does on an EOS break after `take` publishes: one step is rolled back.
+    fn drive_pipelined_prefix(
+        model: &mut Lfm3Model,
+        prompt: &[u32],
+        take: usize,
+    ) -> Result<Vec<u32>> {
+        let prompt_end = prompt.len() as u32;
+        let first = model.prefill(LlmInput::text(prompt))?;
+        let first = model.backend.array(&first)?;
+        let mut seq = Box::new(GreedySequence::new(model, first, prompt_end)?);
+        let mut published = Vec::with_capacity(take);
+        for _ in 0..take {
+            published.push(seq.next(true)?.token_id);
+        }
+        seq.finish(take)?;
+        Ok(published)
+    }
+
+    /// T1: pipelined and synchronous greedy emit identical token ids on every
+    /// prompt, at the full 128-token decode depth of the benchmark cell.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn t1_pipelined_greedy_matches_sync_token_for_token() -> Result<()> {
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 101 + i)).collect();
+        let mut model = load_checkpoint_model()?;
+        set_sync_schedule(true);
+        let mut expected = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            expected.push(run_greedy(&mut model, prompt, 128)?);
+        }
+        set_sync_schedule(false);
+        for (index, prompt) in prompts.iter().enumerate() {
+            let got = run_greedy(&mut model, prompt, 128)?;
+            assert_eq!(
+                got, expected[index],
+                "prompt {index}: pipelined greedy diverged from sync"
+            );
+        }
+        Ok(())
+    }
+
+    /// T2: EOS and budget edges return the same sequences as sync and land on
+    /// `position == P+N-1`. The first-token-EOS case is driven at the
+    /// sequence level so it is deterministic; cancel is driven through the
+    /// shared generation loop.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn t2_budget_eos_and_cancel_boundaries_match_sync() -> Result<()> {
+        let prompt = pseudo_prompt(16, 7);
+        let mut model = load_checkpoint_model()?;
+
+        // Budget exhaustion: 1 and 8 tokens, both schedules, same prompt.
+        for budget in [1usize, 8] {
+            set_sync_schedule(true);
+            let sync_ids = run_greedy(&mut model, &prompt, budget)?;
+            let sync_pos = model.position();
+            set_sync_schedule(false);
+            let pipe_ids = run_greedy(&mut model, &prompt, budget)?;
+            let pipe_pos = model.position();
+            assert_eq!(sync_ids, pipe_ids, "budget {budget}: published tokens");
+            assert_eq!(pipe_pos, sync_pos, "budget {budget}: final position");
+            assert_eq!(
+                sync_pos,
+                prompt.len() + sync_ids.len() - 1,
+                "budget {budget}: position must be P+N-1"
+            );
+        }
+
+        // First-token EOS: synthetic prefill logits whose argmax is EOS. The
+        // driver-side break after one publish must roll the lookahead step
+        // back, leaving exactly the prefill state (the sync outcome).
+        let prompt_end = prompt.len() as u32;
+        model.reset();
+        model.prefill(LlmInput::text(&prompt))?; // real prefill state; first logits unused
+        let mut values = vec![-1e30f32; model.config.vocab_size];
+        values[124_894] = 1.0; // any in-vocab id stands in for EOS here
+        let synthetic = Array::from_f32(model.backend.stream(), &[1, values.len()], &values)?;
+        let mut seq = Box::new(GreedySequence::new(&mut model, synthetic, prompt_end)?);
+        let token = seq.next(true)?;
+        assert_eq!(
+            token.token_id, 124_894,
+            "synthetic EOS must be the first token"
+        );
+        seq.finish(1)?;
+        assert_eq!(
+            model.position(),
+            prompt.len(),
+            "first-token EOS must roll back to the prefill position"
+        );
+        let (kv, conv) = state_bytes(&model, model.position())?;
+        // Sync reference for this scenario is prefill-only state.
+        model.reset();
+        model.prepare(prompt.len(), 0)?;
+        model.prefill(LlmInput::text(&prompt))?;
+        let (kv_ref, conv_ref) = state_bytes(&model, model.position())?;
+        assert_eq!(kv, kv_ref, "first-token EOS: KV must equal prefill state");
+        assert_eq!(
+            conv, conv_ref,
+            "first-token EOS: conv must equal prefill state"
+        );
+
+        // Cancel right after the first publish: the lookahead decode is
+        // discarded and both schedules agree on the published prefix.
+        set_sync_schedule(true);
+        let cancel_sync = GenerationCancellation::default();
+        let mut published_sync = Vec::new();
+        let options = GenerationOptions::greedy(16, None);
+        let cancel_flag = cancel_sync.clone();
+        model.generate_streaming_cancellable_dyn(
+            crate::llm_trait::GenerationRequest {
+                input: LlmInput::text(&prompt),
+                options: &options,
+            },
+            &cancel_sync,
+            &mut |token| {
+                published_sync.push(token.token_id);
+                cancel_flag.cancel();
+            },
+        )?;
+        let sync_pos = model.position();
+        set_sync_schedule(false);
+        let cancel_pipe = GenerationCancellation::default();
+        let mut published_pipe = Vec::new();
+        let cancel_flag = cancel_pipe.clone();
+        model.generate_streaming_cancellable_dyn(
+            crate::llm_trait::GenerationRequest {
+                input: LlmInput::text(&prompt),
+                options: &options,
+            },
+            &cancel_pipe,
+            &mut |token| {
+                published_pipe.push(token.token_id);
+                cancel_flag.cancel();
+            },
+        )?;
+        assert_eq!(published_pipe, published_sync, "cancel: published prefix");
+        assert_eq!(model.position(), sync_pos, "cancel: final position");
+        assert_eq!(
+            model.position(),
+            prompt.len() + published_pipe.len() - 1,
+            "cancel: position must be P+N-1"
+        );
+        Ok(())
+    }
+
+    /// T3: after a pipelined run whose lookahead step was rolled back, every
+    /// KV row `[0, position)` and all 13 conv windows are byte-identical to
+    /// the synchronous reference, and a 16-token continuation matches too.
+    /// The manual early stop makes the rollback deterministic.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn t3_pipelined_continuation_state_matches_sync_byte_for_byte() -> Result<()> {
+        let prompt = pseudo_prompt(24, 11);
+        let take = 12usize;
+        let mut pipe = load_checkpoint_model()?;
+
+        // Pipelined arm: `take` publishes plus one lookahead step, finished
+        // like an EOS break so the extra step is rolled back.
+        let published = drive_pipelined_prefix(&mut pipe, &prompt, take)?;
+        let position = pipe.position();
+        assert_eq!(
+            position,
+            prompt.len() + take - 1,
+            "rolled-back position must be P+N-1"
+        );
+        let (kv_pipe, conv_pipe) = state_bytes(&pipe, position)?;
+
+        // Continuation on the pipe arm, seeded with the last published token.
+        let mut cont_pipe = Vec::new();
+        let mut prev = published[take - 1];
+        for _ in 0..16 {
+            let logits = pipe.forward(&[prev], pipe.position() as u32)?;
+            prev = greedy_from_logits(&pipe, &logits)?;
+            cont_pipe.push(prev);
+        }
+
+        // Synchronous reference: prefill, then consume the same published
+        // trajectory for `take - 1` steps (the token read from the last
+        // legit logits is the continuation seed, not a consumed input).
+        let mut reference = load_checkpoint_model()?;
+        reference.prepare(prompt.len(), take + 16)?;
+        reference.prefill(LlmInput::text(&prompt))?;
+        for &token in &published[..take - 1] {
+            reference.forward(&[token], reference.position() as u32)?;
+        }
+        assert_eq!(reference.position(), position);
+        let (kv_ref, conv_ref) = state_bytes(&reference, position)?;
+        assert_eq!(
+            kv_pipe, kv_ref,
+            "KV rows [0, position) must match sync byte-for-byte"
+        );
+        assert_eq!(
+            conv_pipe, conv_ref,
+            "13 conv windows must match sync byte-for-byte after the rollback"
+        );
+
+        let mut cont_ref = Vec::new();
+        let mut prev = published[take - 1];
+        for _ in 0..16 {
+            let logits = reference.forward(&[prev], reference.position() as u32)?;
+            prev = greedy_from_logits(&reference, &logits)?;
+            cont_ref.push(prev);
+        }
+        assert_eq!(
+            cont_pipe, cont_ref,
+            "16-token continuation after the rollback must match sync"
+        );
+        Ok(())
+    }
+
+    /// T3's fault proof: with the conv restore disabled, the byte-level state
+    /// check fails. `APXINF_LFM3_TEST_NO_CONV_RESTORE=1 cargo test ...
+    /// t3_pipelined` makes the state equality in T3 fail — that output is the
+    /// PR evidence. This companion test pins the positive direction without
+    /// the env knob.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn t3_fault_injection_without_conv_restore_is_detected() -> Result<()> {
+        let prompt = pseudo_prompt(24, 11);
+        let take = 12usize;
+        let mut faulted = load_checkpoint_model()?;
+        faulted.disable_conv_restore = true;
+        drive_pipelined_prefix(&mut faulted, &prompt, take)?;
+        let (_, conv_faulted) = state_bytes(&faulted, faulted.position())?;
+
+        let mut reference = load_checkpoint_model()?;
+        reference.disable_conv_restore = false;
+        drive_pipelined_prefix(&mut reference, &prompt, take)?;
+        let (_, conv_reference) = state_bytes(&reference, reference.position())?;
+
+        assert_ne!(
+            conv_faulted, conv_reference,
+            "fault injection left the conv windows identical — the T3 state check would not catch the missing restore"
+        );
+        let diff = conv_faulted
+            .iter()
+            .zip(&conv_reference)
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "fault injection: {diff}/{} conv layers diverged after the skipped restore",
+            conv_reference.len()
+        );
+        Ok(())
+    }
+
+    /// P1 — the QUEUE #3 hard gate (doc §Gate.1): with the fast arm on, greedy
+    /// decode emits the identical token ids on every prompt at the full
+    /// 128-token depth. One differing token ⇒ INVALID. The fast toggle flips
+    /// the already-loaded model so both arms share one weight set; the env is
+    /// still reset at entry and exit so `prefill_fast_enabled()` (and thus the
+    /// banner source) cannot be poisoned by a prior panicked test.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn p1_fast_prefill_greedy_matches_baseline_token_for_token() -> Result<()> {
+        let prompts: Vec<Vec<u32>> = (0..4).map(|i| pseudo_prompt(24, 201 + i)).collect();
+
+        set_prefill_fast(false);
+        let mut model = load_checkpoint_model()?;
+        model.set_prefill_fast(false);
+        assert!(!model.prefill_fast, "P1: baseline arm must be off");
+        assert!(
+            model.prefill_cache.is_none(),
+            "P1: baseline arm must hold no cached graph"
+        );
+        let mut expected = Vec::with_capacity(prompts.len());
+        for prompt in &prompts {
+            expected.push(run_greedy(&mut model, prompt, 128)?);
+        }
+
+        model.set_prefill_fast(true);
+        assert!(model.prefill_fast, "P1: fast arm toggle did not take");
+        for (index, prompt) in prompts.iter().enumerate() {
+            let got = run_greedy(&mut model, prompt, 128)?;
+            assert_eq!(
+                got, expected[index],
+                "prompt {index}: fast prefill diverged from baseline — INVALID (doc §Gate.1)"
+            );
+        }
+
+        model.set_prefill_fast(false);
+        set_prefill_fast(false);
+        Ok(())
+    }
+
+    /// P2 — the empty-arm gate (doc §Gate.4): with the env unset, the model
+    /// captured the fast arm off, holds no cached graph after a full request,
+    /// and `prefill_fast_enabled()` (the same source the worker banner reads)
+    /// reports false. If the fast path dispatched while the switch was off,
+    /// `prefill_cache` would be `Some` here.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn p2_fast_arm_stays_off_when_switch_unset() -> Result<()> {
+        set_prefill_fast(false);
+        assert!(
+            !prefill_fast_enabled(),
+            "P2: helper must report false when the env is unset"
+        );
+        let mut model = load_checkpoint_model()?;
+        assert!(
+            !model.prefill_fast,
+            "P2: model captured the fast arm while the env was unset"
+        );
+        let prompt = pseudo_prompt(24, 301);
+        let ids = run_greedy(&mut model, &prompt, 32)?;
+        assert_eq!(ids.len(), 32, "P2: budget must be honoured");
+        assert!(
+            model.prefill_cache.is_none(),
+            "P2: empty-arm — a cached prefill graph was built with the switch off"
+        );
+        Ok(())
+    }
+
+    /// P3 — cache correctness (doc §Tests P3): the armed model runs two
+    /// different prompts back to back. The second prompt (a different length,
+    /// so the static key differs) must match a fresh single-prompt run token
+    /// for token. This is the stale-cache canary for the review-time finding
+    /// that a cache hit replays the previous prompt's logits array without
+    /// re-binding the new ids.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn p3_cached_second_prompt_matches_fresh_run() -> Result<()> {
+        let first = pseudo_prompt(24, 401);
+        let second = pseudo_prompt(128, 402);
+
+        // Armed model: two different prompts in one process. The second has a
+        // different static key, so it must rebuild (or be provably equivalent).
+        set_prefill_fast(true);
+        let mut model = load_checkpoint_model()?;
+        model.set_prefill_fast(true);
+        let armed_first = run_greedy(&mut model, &first, 64)?;
+        let armed_second = run_greedy(&mut model, &second, 64)?;
+
+        // Fresh armed model, only the second prompt — the single-run reference.
+        let mut fresh = load_checkpoint_model()?;
+        fresh.set_prefill_fast(true);
+        let fresh_second = run_greedy(&mut fresh, &second, 64)?;
+        assert_eq!(
+            armed_first.len(),
+            64,
+            "P3: first prompt budget must be honoured before the second starts"
+        );
+        assert_eq!(
+            armed_second, fresh_second,
+            "P3: second prompt in-process diverged from a fresh run — stale cache (doc §Tests P3)"
+        );
+
+        // Same-shape replay: two equal-length prompts in a row must not return
+        // the first prompt's logits either — run peer_b in the already-warm
+        // model and compare against peer_b in a fresh model.
+        let peer_a = pseudo_prompt(24, 501);
+        let peer_b = pseudo_prompt(24, 502);
+        run_greedy(&mut fresh, &peer_a, 64)?;
+        let replayed_b = run_greedy(&mut fresh, &peer_b, 64)?;
+        let mut fresh_b = load_checkpoint_model()?;
+        fresh_b.set_prefill_fast(true);
+        let expected_b = run_greedy(&mut fresh_b, &peer_b, 64)?;
+        assert_eq!(
+            replayed_b, expected_b,
+            "P3: same-shape replay of a different prompt diverged from a fresh run — stale cache on cache-hit (doc §Tests P3)"
+        );
+
+        model.set_prefill_fast(false);
+        set_prefill_fast(false);
+        Ok(())
+    }
+
+    /// One-layer smoke for the FP16 Core ML path: builds layer 0's program,
+    /// loads it with placement admission, and predicts one 512-token tile.
+    #[cfg(feature = "coreml")]
+    #[test]
+    #[ignore = "requires APXINF_LFM3_TEST_MODEL and an ANE host"]
+    fn ane_slice_program_loads_and_predicts_one_layer() -> Result<()> {
+        let path = test_checkpoint()?;
+        let json = std::fs::read_to_string(path.join("config.json"))
+            .map_err(|e| err(format!("cannot read LFM3 config: {e}")))?;
+        let config = Lfm3Config::from_json(&json)?;
+        let (tensors, _) = apxinf_loader::safetensors::load_native_path(&path)
+            .map_err(|e| err(format!("cannot load LFM3 checkpoint: {e}")))?;
+        let backend = Arc::new(MlxBackend::new(0)?);
+        let weights = Weights::load(&config, tensors, backend.stream())?;
+        let start = 5632;
+        let cache = apxinf_coreml::ProgramCache::new(super::super::ane_slice::cache_dir());
+        let slice = super::super::ane_slice::AneSlice::load(
+            &cache,
+            start,
+            config.intermediate_size,
+            &weights.layers[0].w1,
+            &weights.layers[0].w3,
+            &weights.layers[0].w2,
+        )?;
+        // A deterministic unit-range activation; this is a program-identity
+        // smoke, not the #151 real-activation corpus.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let values: Vec<f32> = (0..512 * config.hidden_size)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+            })
+            .collect();
+        let x = Array::from_f32(backend.stream(), &[1, 512, config.hidden_size], &values)?
+            .cast(MlxDType::BF16)?;
+        let y = slice.predict(&x)?;
+        assert_eq!(y.shape(), &[1, 512, config.hidden_size]);
+
+        // Same column share on the GPU in BF16: down(silu(x*w1) * (x*w3)).
+        let end = config.intermediate_size;
+        let gate = x.matmul(
+            &weights.layers[0]
+                .w1
+                .bf16()?
+                .slice_axis(1, start, end)?
+                .contiguous()?,
+        )?;
+        let up = x.matmul(
+            &weights.layers[0]
+                .w3
+                .bf16()?
+                .slice_axis(1, start, end)?
+                .contiguous()?,
+        )?;
+        let activation = gate.mul(&gate.sigmoid()?)?.mul(&up)?;
+        let reference = activation.matmul(
+            &weights.layers[0]
+                .w2
+                .bf16()?
+                .slice_axis(0, start, end)?
+                .contiguous()?,
+        )?;
+        let ane = y.to_f32_vec()?;
+        let gpu = reference.to_f32_vec()?;
+        let (mut error, mut energy) = (0f64, 0f64);
+        for (&a, &g) in ane.iter().zip(&gpu) {
+            let d = f64::from(a - g);
+            error += d * d;
+            energy += f64::from(g) * f64::from(g);
+        }
+        let relative = (error / energy).sqrt();
+        println!(
+            "LFM3 ANE slice {start}..{end}: relL2 vs BF16 GPU = {:.4}%",
+            relative * 100.0
+        );
+        assert!(relative < 0.02, "ANE program identity relL2 {relative:.4}");
+        Ok(())
+    }
+
+    // ---- FP16 ANE MLP column split acceptance (issue #157). Real ----
+    // checkpoint, real Metal: `APXINF_LFM3_TEST_MODEL=<snapshot dir> cargo
+    // test -p apxinf-model --features mlx,coreml metal_lfm3 -- --ignored
+    // --test-threads=1` under the shared Metal qualification lock. The tests
+    // mutate process env to select the schedule, so they must run
+    // single-threaded.
+
+    const ANE_ENV: &str = "APXINF_LFM3_ANE";
+    const ABLATE_ENV: &str = "APXINF_LFM3_MLP_ABLATE";
+
+    fn set_ane_share(value: Option<&str>) {
+        match value {
+            Some(value) => std::env::set_var(ANE_ENV, value),
+            None => std::env::remove_var(ANE_ENV),
+        }
+    }
+
+    fn set_mlp_ablate(on: bool) {
+        if on {
+            std::env::set_var(ABLATE_ENV, "1");
+        } else {
+            std::env::remove_var(ABLATE_ENV);
+        }
+    }
+
+    /// Raw bytes of the last-position prefill logits for a prompt.
+    fn prefill_logits_bytes(model: &mut Lfm3Model, prompt: &[u32]) -> Result<Vec<u8>> {
+        let logits = model.prefill(LlmInput::text(prompt))?;
+        model.backend.array(&logits)?.to_bytes_ready()
+    }
+
+    #[test]
+    fn mlp_ablate_env_parses_strictly() {
+        let saved = std::env::var_os(ABLATE_ENV);
+        std::env::remove_var(ABLATE_ENV);
+        assert!(!mlp_ablate_requested().unwrap(), "unset must be off");
+        std::env::set_var(ABLATE_ENV, "0");
+        assert!(!mlp_ablate_requested().unwrap(), "0 must be off");
+        std::env::set_var(ABLATE_ENV, "1");
+        assert!(mlp_ablate_requested().unwrap(), "1 must be on");
+        std::env::set_var(ABLATE_ENV, "2");
+        assert!(mlp_ablate_requested().is_err(), "2 must be refused");
+        std::env::set_var(ABLATE_ENV, "");
+        assert!(mlp_ablate_requested().is_err(), "empty must be refused");
+        match saved {
+            Some(value) => std::env::set_var(ABLATE_ENV, value),
+            None => std::env::remove_var(ABLATE_ENV),
+        }
+    }
+
+    /// G6/share=0 gate: `APXINF_LFM3_ANE=0` must be byte-identical to the
+    /// unset arm on the same prompt — the switch off is a no-op.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn ane_share_zero_prefill_matches_unset_byte_for_byte() -> Result<()> {
+        let prompt = pseudo_prompt(24, 617);
+        set_ane_share(None);
+        let mut baseline = load_checkpoint_model()?;
+        let expected = prefill_logits_bytes(&mut baseline, &prompt)?;
+
+        set_ane_share(Some("0"));
+        let mut zero = load_checkpoint_model()?;
+        let got = prefill_logits_bytes(&mut zero, &prompt)?;
+        set_ane_share(None);
+        assert_eq!(
+            got, expected,
+            "APXINF_LFM3_ANE=0 must be byte-identical to the unset GPU-only arm"
+        );
+        Ok(())
+    }
+
+    /// Decode-untouched gate (pre-registration §3.2): from identical
+    /// freshly-reset state, an armed model's one-token step must equal the
+    /// share=0 model's byte for byte — logits and KV/conv state. If a
+    /// non-zero share leaked into `len == 1`, the ANE tile padding alone
+    /// would break the byte equality.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn ane_armed_decode_step_matches_share_zero_byte_for_byte() -> Result<()> {
+        let token_id = 42_000i32;
+
+        set_ane_share(None);
+        let mut baseline = load_checkpoint_model()?;
+        baseline.reset();
+        baseline.prepare(1, 4)?;
+        let token = Array::from_i32(baseline.backend.stream(), &[1], &[token_id])?;
+        let expected = baseline.decode(&token)?.to_bytes_ready()?;
+        let (expected_kv, expected_conv) = state_bytes(&baseline, 1)?;
+
+        set_ane_share(Some("0.7333"));
+        let mut armed = load_checkpoint_model()?;
+        armed.reset();
+        armed.prepare(1, 4)?;
+        let token = Array::from_i32(armed.backend.stream(), &[1], &[token_id])?;
+        let got = armed.decode(&token)?.to_bytes_ready()?;
+        let (got_kv, got_conv) = state_bytes(&armed, 1)?;
+        set_ane_share(None);
+
+        assert_eq!(
+            got, expected,
+            "an armed ANE share must not change the decode step's logits"
+        );
+        assert_eq!(got_kv, expected_kv, "armed decode changed the KV state");
+        assert_eq!(
+            got_conv, expected_conv,
+            "armed decode changed the conv state"
+        );
+        Ok(())
+    }
+
+    /// End-to-end smoke for the armed arm: prefill runs the split across all
+    /// 24 layers and eight greedy decode steps follow, deterministically.
+    #[cfg(feature = "coreml")]
+    #[test]
+    #[ignore = "requires shared Metal qualification lock, APXINF_LFM3_TEST_MODEL and an ANE host"]
+    fn ane_armed_greedy_runs_eight_tokens_deterministically() -> Result<()> {
+        let prompt = pseudo_prompt(24, 619);
+        set_ane_share(Some("0.7333"));
+        let mut first = load_checkpoint_model()?;
+        let expected = run_greedy(&mut first, &prompt, 8)?;
+        let mut second = load_checkpoint_model()?;
+        let got = run_greedy(&mut second, &prompt, 8)?;
+        set_ane_share(None);
+        assert_eq!(got.len(), 8, "armed arm must honour the decode budget");
+        assert_eq!(
+            got, expected,
+            "armed arm greedy must be deterministic run to run"
+        );
+        Ok(())
+    }
+
+    /// The ablation instrument (pre-registration §3.1.8): with
+    /// `APXINF_LFM3_MLP_ABLATE=1` the prefill MLP section is a zero tensor,
+    /// so the logits change on purpose, the shapes stay valid, and decode
+    /// still runs afterwards.
+    #[test]
+    #[ignore = "requires shared Metal qualification lock and APXINF_LFM3_TEST_MODEL"]
+    fn ane_mlp_ablate_shorts_prefill_mlp_and_still_decodes() -> Result<()> {
+        let prompt = pseudo_prompt(24, 623);
+
+        set_mlp_ablate(true);
+        let mut ablated = load_checkpoint_model()?;
+        let ablated_bytes = prefill_logits_bytes(&mut ablated, &prompt)?;
+        // Decode still runs on the ablated model: reset, re-prefill, one step.
+        ablated.reset();
+        let first = ablated.prefill(LlmInput::text(&prompt))?;
+        let first = ablated.backend.array(&first)?;
+        let prompt_end = prompt.len() as u32;
+        let mut seq = Box::new(GreedySequence::new(&mut ablated, first, prompt_end)?);
+        let _ = seq.next(true)?;
+        seq.finish(1)?;
+        set_mlp_ablate(false);
+
+        let mut normal = load_checkpoint_model()?;
+        let normal_bytes = prefill_logits_bytes(&mut normal, &prompt)?;
+
+        assert_ne!(
+            ablated_bytes, normal_bytes,
+            "ablated prefill logits must differ (the MLP section is zeros)"
+        );
+        Ok(())
+    }
 }

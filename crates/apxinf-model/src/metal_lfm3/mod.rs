@@ -5,10 +5,11 @@
 //! RMSNorm, a per-head sigmoid attention gate and two independent partial-RoPE
 //! parameter sets. See `README.md` for the supported contract and scope.
 
-pub mod config;
+pub mod ane_slice;
+mod config;
 mod model;
-mod weights;
 mod q4;
+mod weights;
 pub use model::{native_4bit_enabled, prefill_fast_enabled, Lfm3Model};
 
 use crate::auto::{LoadOptions, LoadedModel, ModelPrecision};
@@ -31,7 +32,8 @@ pub fn load(
         .map_err(|e| Error::Other(format!("cannot read LFM3 config: {e}")))?;
     let config = Lfm3Config::from_json(&json)?;
     config.validate_checkpoint_scope()?;
-    let (mut tensors, _) = apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
+    let (mut tensors, _) =
+        apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
     // The BF16 checkpoint keys are `model.*`; the Hugging Face MLX-quantized
     // export wraps them in `language_model.` and adds `{scales,biases}` next
     // to each packed `weight`. Normalizing the prefix once here means the
