@@ -8,6 +8,8 @@ mod ane_admission;
 mod config;
 mod encode;
 mod model;
+mod preprocess;
+mod vision;
 mod weights;
 
 pub use config::{Config, MAX_INPUT_TOKENS};

@@ -125,13 +125,20 @@ pub struct Head {
     pub residual_gate: Array,
 }
 
-struct Take {
-    map: HashMap<String, Array>,
-    what: &'static str,
+/// Strict checkpoint tensor reader: every requested name must be present with
+/// exactly the expected dtype and shape, and no kept tensor may be left over.
+pub(crate) struct Take {
+    pub(crate) map: HashMap<String, Array>,
+    pub(crate) what: &'static str,
 }
 
 impl Take {
-    fn array(&mut self, name: &str, dtype: MlxDType, shape: &[usize]) -> Result<Array> {
+    pub(crate) fn array(
+        &mut self,
+        name: &str,
+        dtype: MlxDType,
+        shape: &[usize],
+    ) -> Result<Array> {
         let array = self
             .map
             .remove(name)
@@ -147,11 +154,11 @@ impl Take {
         Ok(array)
     }
 
-    fn bf16(&mut self, name: &str, shape: &[usize]) -> Result<Array> {
+    pub(crate) fn bf16(&mut self, name: &str, shape: &[usize]) -> Result<Array> {
         self.array(name, MlxDType::BF16, shape)
     }
 
-    fn q4(&mut self, name: &str, out: usize, input: usize) -> Result<Q4> {
+    pub(crate) fn q4(&mut self, name: &str, out: usize, input: usize) -> Result<Q4> {
         Ok(Q4 {
             weight: self.array(&format!("{name}.weight"), MlxDType::U32, &[out, input / 8])?,
             scales: self.bf16(&format!("{name}.scales"), &[out, input / 64])?,
@@ -159,7 +166,7 @@ impl Take {
         })
     }
 
-    fn finish(self) -> Result<()> {
+    pub(crate) fn finish(self) -> Result<()> {
         let mut extra: Vec<_> = self.map.into_keys().collect();
         if extra.is_empty() {
             return Ok(());
@@ -175,7 +182,8 @@ impl Take {
 }
 
 impl Backbone {
-    /// Loads every `language_model.*` tensor; the vision tower is never read.
+    /// Loads every `language_model.*` tensor. The vision tower's
+    /// `vision_tower.*` tensors are read by `Vision::load`.
     pub fn load(config: &Config, stream: &Stream, checkpoint: &Path) -> Result<Self> {
         let files =
             apxinf_loader::safetensors::safetensors_files(checkpoint).map_err(Error::Other)?;
