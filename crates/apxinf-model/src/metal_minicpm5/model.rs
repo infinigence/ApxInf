@@ -555,6 +555,8 @@ impl crate::mlx_decode::DeviceDecode for MiniCpm5 {
 }
 
 impl LlmTrait for MiniCpm5 {
+    fn sequence_capacity(&self) -> Option<usize> { Some(self.config.max_position_embeddings.min(super::config::CONTEXT_CAPACITY)) }
+
     fn token_sequence<'a>(
         &'a mut self,
         first: Tensor,

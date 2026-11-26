@@ -31,6 +31,7 @@ pub struct Qwen38 {
     model: weights::Model,
     /// Some text-only checkpoints intentionally omit the visual tower.
     vision: Option<VisionWeights>,
+    input_contract: Option<crate::vision_preprocess::VisionContract>,
     /// Stable per-shape vision buffers and the session owning that traversal's
     /// prepared executions. `ExecutionKey` includes binding pointers, so the
     /// cache only hits while the scratch addresses stay put; a new patch count
@@ -52,6 +53,10 @@ pub struct Qwen38 {
 }
 
 impl Qwen38 {
+    pub(crate) fn set_vision_contract(&mut self, contract: crate::vision_preprocess::VisionContract) {
+        self.input_contract = Some(contract);
+    }
+
     /// Load from an already-read checkpoint tensor map.
     ///
     /// `kv_capacity` bounds prompt + generation length; caches are allocated
@@ -114,6 +119,7 @@ impl Qwen38 {
             backend,
             model,
             vision,
+            input_contract: None,
             vision_session: None,
             scratch,
             prefill: None,
@@ -406,8 +412,16 @@ impl LlmTrait for Qwen38 {
         Ok(self.logits_view())
     }
 
+    fn sequence_capacity(&self) -> Option<usize> {
+        Some(self.kv_capacity)
+    }
+
     fn backend(&self) -> &dyn Backend {
         &*self.backend
+    }
+
+    fn vision_contract(&self) -> Option<&crate::vision_preprocess::VisionContract> {
+        self.input_contract.as_ref()
     }
 
     fn capabilities(&self) -> LlmCapabilities {

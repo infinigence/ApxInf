@@ -452,6 +452,16 @@ adapter-owned. PI0.5 and WallOSS both use this distinction: their native RGB
 paths perform model tensor canonicalization in Rust/CUDA, while their Python
 policies still construct the model inputs and interpret the model actions.
 
+Autoregressive VLMs expose `LlmTrait::vision_contract`: decoded RGB is the
+application seam, while the model owns checkpoint-fixed canonicalization,
+image-placeholder expansion and pixel dtype. `vision_preprocess` shares the
+pure CPU algorithm used by Qwen3-VL/Qwen38 and the Metal d3 frontage; it is not
+an image-container decoder or a backend selector. Text and image chat rendering
+share `apxinf-tokenizer`. Registered vision loaders validate local preprocessor
+assets before returning a capability. `sequence_capacity` reports allocated KV
+capacity (or the admitted bound of a dynamic request allocator), so callers can
+reject prompt + generation overflow before inference.
+
 ## Five responsibilities inside a model
 
 These are structural responsibilities within the model layer, not sequential

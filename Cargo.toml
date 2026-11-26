@@ -10,6 +10,7 @@ members = [
     "crates/apxinf-loader",
     "crates/apxinf-model",
     "crates/apxinf-musa",
+    "crates/apxinf-serving",
     "crates/apxinf-tokenizer",
     "crates/apxinf-py",
 ]
@@ -53,6 +54,8 @@ musa-mttx = ["musa", "apxinf-musa/mttx"]
 # Optional CPU GEMM acceleration. Requires an installed OpenBLAS library.
 # May be combined with GPU features; OpenBLAS only affects the CPU backend.
 openblas = ["apxinf-cpu/openblas"]
+# Optional OpenAI/Anthropic-compatible HTTP serving.
+server = ["dep:apxinf-serving"]
 
 [dependencies]
 apxinf-core = { path = "crates/apxinf-core" }
@@ -63,6 +66,7 @@ apxinf-hip = { path = "crates/apxinf-hip", optional = true }
 apxinf-musa = { path = "crates/apxinf-musa", optional = true, default-features = false }
 apxinf-loader = { path = "crates/apxinf-loader" }
 apxinf-model = { path = "crates/apxinf-model" }
+apxinf-serving = { path = "crates/apxinf-serving", optional = true }
 apxinf-tokenizer = { path = "crates/apxinf-tokenizer" }
 clap = { version = "=4.5.23", features = ["derive"] }
 serde_json = "1"

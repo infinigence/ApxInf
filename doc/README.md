@@ -76,6 +76,7 @@ ignored `devlocal/<feat-name>/` according to [AGENTS.md](../AGENTS.md).
 
 ## Model operation
 
+- [LLM/VLM HTTP serving](../crates/apxinf-serving/README.md) — optional OpenAI/Anthropic APIs, image input, streaming, tool calls and serial worker contracts
 - [PI0.5 CUDA regression](pi05-cuda-regression.md)
 - [PI0.5 one-step warm-start evaluation](run_warmstart_with_onestep.md)
 - [GR00T N1.7](gr00t-n1.7.md)

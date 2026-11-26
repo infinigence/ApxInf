@@ -714,6 +714,8 @@ impl crate::mlx_decode::DeviceDecode for Qwen3Model {
 }
 
 impl LlmTrait for Qwen3Model {
+    fn sequence_capacity(&self) -> Option<usize> { Some(self.config.max_position_embeddings.min(super::config::MAX_CONTEXT)) }
+
     fn token_sequence<'a>(
         &'a mut self,
         first: Tensor,

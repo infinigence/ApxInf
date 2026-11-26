@@ -208,6 +208,10 @@ impl LlmTrait for GeneralLlama {
         Ok(logits)
     }
 
+    fn sequence_capacity(&self) -> Option<usize> {
+        Some(self.config.max_seq_len)
+    }
+
     fn backend(&self) -> &dyn Backend {
         &*self.backend
     }

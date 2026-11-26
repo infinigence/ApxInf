@@ -252,6 +252,82 @@ enum Commands {
         device: String,
     },
 
+    /// Serve an LLM/VLM through OpenAI/Anthropic-compatible HTTP APIs
+    #[cfg(feature = "server")]
+    Serve {
+        /// Path to a Hugging Face checkpoint directory
+        #[arg(short, long)]
+        model: PathBuf,
+
+        /// Explicit registry family; omitted to use config.json:model_type
+        #[arg(long)]
+        model_name: Option<String>,
+
+        /// Family-local implementation variant
+        #[arg(long)]
+        model_variant: Option<String>,
+
+        /// Auxiliary checkpoint asset as NAME=PATH
+        #[arg(long, value_parser = parse_asset)]
+        asset: Vec<(String, PathBuf)>,
+
+        /// Model name exposed by /v1/models and accepted in requests
+        #[arg(long)]
+        served_model_name: Option<String>,
+
+        /// Bind address. Use 0.0.0.0 only on a trusted network.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: std::net::IpAddr,
+
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+
+        /// Device to run inference on
+        #[arg(short, long, default_value = "cuda:0")]
+        device: String,
+
+        /// Text weight dtype: auto, fp32, or bf16
+        #[arg(long, default_value = "auto")]
+        dtype: String,
+
+        /// Maximum queued requests behind the active batch-one request
+        #[arg(long, default_value_t = 16)]
+        queue_capacity: usize,
+
+        /// Maximum HTTP request bytes
+        #[arg(long, default_value_t = 12*1024*1024)]
+        max_body_bytes: usize,
+        /// Maximum encoded file bytes per image
+        #[arg(long, default_value_t = 4*1024*1024)]
+        max_image_bytes: usize,
+        /// Maximum decoded image side for container admission
+        #[arg(long, default_value_t = 4096)]
+        max_image_dimension: u32,
+        /// Maximum total decoded image pixels per request
+        #[arg(long, default_value_t = 16*1024*1024)]
+        max_decoded_pixels: usize,
+        /// Log worker request timings
+        #[arg(long)]
+        log_timing: bool,
+
+        /// Maximum prompt tokens accepted by the HTTP layer
+        #[arg(long, default_value_t = 4096)]
+        max_input_tokens: usize,
+
+        /// Maximum generated tokens accepted per request
+        #[arg(long, default_value_t = 1024)]
+        max_output_tokens: usize,
+
+        /// Enable measured operator autotuning on recipe misses. Use only for
+        /// an explicit warmup pass, then restart serving without this flag.
+        #[arg(long)]
+        autotune: bool,
+
+        /// Absolute directory containing persistent operator tuning recipes
+        #[arg(long)]
+        tuning_dir: Option<PathBuf>,
+    },
+
     /// Run a quick test of the engine
     Test,
 }
@@ -441,6 +517,98 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        #[cfg(feature = "server")]
+        Commands::Serve {
+            model,
+            model_name,
+            model_variant,
+            asset,
+            served_model_name,
+            host,
+            port,
+            device,
+            dtype,
+            queue_capacity,
+            max_body_bytes, max_image_bytes, max_image_dimension, max_decoded_pixels, log_timing,
+            max_input_tokens,
+            max_output_tokens,
+            autotune,
+            tuning_dir,
+        } => {
+            if queue_capacity == 0 || max_input_tokens == 0 || max_output_tokens == 0 {
+                eprintln!("queue and token limits must be positive");
+                std::process::exit(1);
+            }
+            let device = match parse_device(&device) {
+                Ok(device) => device,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            };
+            let text_weight_dtype = match dtype.to_ascii_lowercase().as_str() {
+                "auto" => None,
+                "fp32" | "f32" => Some(DType::F32),
+                "bf16" => Some(DType::BF16),
+                other => {
+                    eprintln!("unsupported text weight dtype '{other}'; use auto, fp32, or bf16");
+                    std::process::exit(1);
+                }
+            };
+            let mut assets = std::collections::BTreeMap::new();
+            for (name, path) in asset {
+                if assets.insert(name.clone(), path).is_some() {
+                    eprintln!("duplicate auxiliary asset: {name}");
+                    std::process::exit(1);
+                }
+            }
+            if tuning_dir.as_ref().is_some_and(|path| !path.is_absolute()) {
+                eprintln!("--tuning-dir must be an absolute path");
+                std::process::exit(1);
+            }
+            if autotune && tuning_dir.is_none() {
+                eprintln!("--autotune requires an explicit absolute --tuning-dir");
+                std::process::exit(1);
+            }
+            let alias = served_model_name.unwrap_or_else(|| {
+                model
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("apxinf-model")
+                    .to_owned()
+            });
+            let load_options = LoadOptions {
+                model_name,
+                model_variant,
+                text_weight_dtype,
+                assets,
+                autotune,
+                tuning_path: tuning_dir,
+                ..LoadOptions::default()
+            };
+            let config = apxinf_serving::ServeConfig {
+                host,
+                port,
+                queue_capacity,
+                media_limits:apxinf_serving::MediaLimits { body_bytes:max_body_bytes,image_bytes:max_image_bytes,image_dimension:max_image_dimension,decoded_pixels:max_decoded_pixels },
+                log_timing,
+                api: apxinf_serving::ApiConfig {
+                    served_model_name: alias,
+                    max_output_tokens,
+                },
+                engine: apxinf_serving::ApxInfEngineConfig {
+                    model_path: model,
+                    device,
+                    load_options,
+                    default_max_tokens: max_output_tokens,
+                    max_input_tokens,
+                },
+            };
+            if let Err(error) = apxinf_serving::serve_blocking(config) {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
         Commands::Test => {
             run_test();
         }
@@ -584,6 +752,64 @@ mod device_tests {
         };
         assert_eq!(model_name.as_deref(), Some("minicpm5"));
         assert_eq!(model_variant.as_deref(), Some("bf16-compiled"));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn serving_cli_keeps_generic_model_loading_options() {
+        let cli = Cli::try_parse_from([
+            "apxinf",
+            "serve",
+            "--model",
+            "/checkpoint",
+            "--device",
+            "cpu",
+            "--model-name",
+            "llama",
+            "--model-variant",
+            "reference",
+            "--asset",
+            "aux=/asset",
+            "--served-model-name",
+            "local",
+            "--queue-capacity",
+            "2",
+            "--max-input-tokens",
+            "32",
+            "--max-output-tokens",
+            "4",
+            "--autotune",
+            "--tuning-dir",
+            "/recipes",
+        ])
+        .unwrap();
+        let Commands::Serve {
+            device,
+            model_name,
+            model_variant,
+            asset,
+            served_model_name,
+            queue_capacity,
+            max_input_tokens,
+            max_output_tokens,
+            autotune,
+            tuning_dir,
+            ..
+        } = cli.command
+        else {
+            panic!("expected serve command");
+        };
+        assert_eq!(device, "cpu");
+        assert_eq!(model_name.as_deref(), Some("llama"));
+        assert_eq!(model_variant.as_deref(), Some("reference"));
+        assert_eq!(asset, vec![("aux".into(), std::path::PathBuf::from("/asset"))]);
+        assert_eq!(served_model_name.as_deref(), Some("local"));
+        assert_eq!(
+            (queue_capacity, max_input_tokens, max_output_tokens),
+            (2, 32, 4)
+        );
+        assert!(autotune);
+        assert_eq!(tuning_dir, Some(std::path::PathBuf::from("/recipes")));
     }
 
     #[test]
