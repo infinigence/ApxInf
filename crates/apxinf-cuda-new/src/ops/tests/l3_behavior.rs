@@ -1140,6 +1140,112 @@ fn rowwise_swiglu_accepts_logical_bias_with_padded_projection() {
 }
 
 #[test]
+fn quantization_rotate_rowwise_i8_matches_exact_host_reference() {
+    use apxinf_core::DType;
+
+    // Independent of the kernel's radix-4 butterfly: build the 256x256 matrix by
+    // repeated Kronecker products and multiply directly. Inputs are small
+    // integers, so every product and partial sum is exact in FP32 and the
+    // rotated values are exact multiples of 1/16 in either evaluation order.
+    fn hadamard_unscaled() -> Vec<f32> {
+        let h4: [[f32; 4]; 4] = [
+            [1.0, 1.0, 1.0, -1.0],
+            [1.0, 1.0, -1.0, 1.0],
+            [1.0, -1.0, 1.0, 1.0],
+            [-1.0, 1.0, 1.0, 1.0],
+        ];
+        let mut h = vec![vec![1.0f32]];
+        for _ in 0..4 {
+            let n = h.len();
+            let mut next = vec![vec![0.0f32; n * 4]; n * 4];
+            for (i, row) in h.iter().enumerate() {
+                for (j, value) in row.iter().enumerate() {
+                    for a in 0..4 {
+                        for b in 0..4 {
+                            next[i * 4 + a][j * 4 + b] = value * h4[a][b];
+                        }
+                    }
+                }
+            }
+            h = next;
+        }
+        h.into_iter().flatten().collect()
+    }
+
+    let ctx = CudaContext::new(0).unwrap();
+    let h = hadamard_unscaled();
+    for (rows, cols) in [(1usize, 256usize), (5, 768), (7, 5376), (3, 14336)] {
+        let source: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i * 37 + i / cols * 11) % 31) as f32) - 15.0)
+            .collect();
+        let input = tensor(0, vec![rows, cols], &source);
+        let mut values_out = zeros_tensor(0, vec![rows, cols], DType::I8);
+        let mut scales_out = zeros_tensor(0, vec![rows], DType::F32);
+        let mut args = QuantizationArgs::new(
+            QuantizationSemantic::RotateRowwiseI8,
+            &input,
+            &mut values_out,
+        );
+        args.scales = Some(&mut scales_out);
+        quantization(&ctx, args).unwrap();
+        ctx.synchronize().unwrap();
+
+        let mut q = vec![0u8; rows * cols];
+        crate::CudaBuffer::from_tensor(&values_out)
+            .unwrap()
+            .copy_to_host(&mut q)
+            .unwrap();
+        let mut s = vec![0u8; rows * 4];
+        crate::CudaBuffer::from_tensor(&scales_out)
+            .unwrap()
+            .copy_to_host(&mut s)
+            .unwrap();
+        for row in 0..rows {
+            let mut rotated = vec![0.0f32; cols];
+            for group in 0..cols / 256 {
+                for j in 0..256 {
+                    let mut acc = 0.0f32;
+                    for i in 0..256 {
+                        acc += source[row * cols + group * 256 + i] * h[i * 256 + j];
+                    }
+                    rotated[group * 256 + j] = acc / 16.0;
+                }
+            }
+            let amax = rotated.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let scale = (amax / 127.0).max(1.0e-12);
+            let got = f32::from_ne_bytes(s[row * 4..row * 4 + 4].try_into().unwrap());
+            assert_eq!(got, scale, "rows={rows} cols={cols} row={row} scale");
+            for (col, value) in rotated.iter().enumerate() {
+                let expected = (value / scale).round().clamp(-128.0, 127.0) as i8;
+                assert_eq!(
+                    q[row * cols + col] as i8,
+                    expected,
+                    "rows={rows} cols={cols} row={row} col={col}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn quantization_rotate_rowwise_i8_rejects_unaligned_width() {
+    use apxinf_core::DType;
+
+    let ctx = CudaContext::new(0).unwrap();
+    let input = zeros_tensor(0, vec![2, 255], DType::BF16);
+    let mut values_out = zeros_tensor(0, vec![2, 255], DType::I8);
+    let mut scales_out = zeros_tensor(0, vec![2], DType::F32);
+    let mut args = QuantizationArgs::new(
+        QuantizationSemantic::RotateRowwiseI8,
+        &input,
+        &mut values_out,
+    );
+    args.scales = Some(&mut scales_out);
+    let error = quantization(&ctx, args).unwrap_err();
+    assert!(error.to_string().contains("multiple of 256"), "{error}");
+}
+
+#[test]
 fn quantization_rejects_packed_fp4_input() {
     use apxinf_core::DType;
 
@@ -1153,6 +1259,7 @@ fn quantization_rejects_packed_fp4_input() {
         (QuantizationSemantic::CastF32ToBf16, DType::BF16),
         (QuantizationSemantic::SliceColumnsBf16, DType::BF16),
         (QuantizationSemantic::RowwiseI8, DType::I8),
+        (QuantizationSemantic::RotateRowwiseI8, DType::I8),
     ] {
         let mut output = zeros_tensor(0, vec![1, 16], dtype);
         let error =

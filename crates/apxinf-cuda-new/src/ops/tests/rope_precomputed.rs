@@ -257,3 +257,46 @@ fn rms_rope_packed_special_values_match_unfused_bits() {
     ctx.synchronize().unwrap();
     assert_eq!(read(&x), read(&expected));
 }
+
+/// A session-arena activation passed to the fused RMSNorm+RoPE must not stay leased after the call during capture: preparation
+/// frees it at once and reuses its block, so a lease kept by capture shifts every later arena allocation and the prepared
+/// executions that bind those addresses miss.
+#[test]
+fn rms_rope_does_not_pin_arena_leases_during_capture() {
+    use crate::{ExecutionSession, PreparedPhase};
+    let _guard = crate::CUDA_TEST_LOCK.lock().unwrap();
+    let ctx = CudaContext::new(0).unwrap();
+    let (tokens, heads, dim) = (4usize, 2usize, 64usize);
+    let weight = tensor(&[dim], &vec![1.0; dim], DType::BF16, 0);
+    let table = tensor(&[tokens, 2, dim / 2], &(0..tokens * dim).map(|i| if i % dim < dim / 2 { 1.0 } else { 0.0 }).collect::<Vec<_>>(), DType::F32, 0);
+    let addresses = std::cell::RefCell::new(Vec::<usize>::new());
+    let session = ExecutionSession::with_capacity(8 << 20, ctx.device_id()).unwrap();
+    let phase = PreparedPhase::prepare_and_capture(&ctx, session, || {
+        {
+            // an arena tensor consumed in place, then dropped
+            let scratch = ctx
+                .allocate_output(Shape::new(vec![tokens, heads, dim]), DType::BF16)
+                .unwrap();
+            rms_norm_apply_precomputed(&ctx, &scratch, &weight, &table, 1e-6, &scratch)?;
+        }
+        // the next arena allocation must land where it did during preparation (the block just freed)
+        let next = ctx.allocate_output(Shape::new(vec![tokens, heads, dim]), DType::BF16)?;
+        addresses
+            .borrow_mut()
+            .push(CudaBuffer::from_tensor(&next).unwrap().ptr() as usize);
+        Ok(())
+    })
+    .unwrap();
+    let seen = addresses.borrow();
+    assert_eq!(
+        seen.len(),
+        2,
+        "one allocation per traversal: prepare, then capture"
+    );
+    assert_eq!(
+        seen[0], seen[1],
+        "capture moved the arena allocation that follows an RMSNorm+RoPE call"
+    );
+    phase.replay().unwrap();
+    ctx.synchronize().unwrap();
+}

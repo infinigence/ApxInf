@@ -73,6 +73,27 @@ pub fn quantize_rows_i8(ctx: &CudaContext, input: &Tensor) -> Result<DynamicI8Te
     Ok(DynamicI8Tensor { values, scales })
 }
 
+/// ConvRot activation path: rotate every 256-column group by the normalized
+/// regular Hadamard matrix in FP32, then quantize each row to signed INT8.
+/// Pair the result with a weight rotated offline as `W @ H` and its
+/// per-output-channel scales.
+pub fn rotate_quantize_rows_i8(ctx: &CudaContext, input: &Tensor) -> Result<DynamicI8Tensor> {
+    let dims = input.shape().dims();
+    if dims.len() != 2 {
+        return Err(Error::Other(
+            "rotated rowwise INT8 quantization requires a rank-2 input".into(),
+        ));
+    }
+    let rows = dims[0];
+    let mut values = ctx.allocate_output(Shape::new(dims.to_vec()), DType::I8)?;
+    let mut scales = ctx.allocate_output(Shape::new(vec![rows]), DType::F32)?;
+    let mut args =
+        ops::QuantizationArgs::new(ops::QuantizationSemantic::RotateRowwiseI8, input, &mut values);
+    args.scales = Some(&mut scales);
+    ops::quantization(ctx, args)?;
+    Ok(DynamicI8Tensor { values, scales })
+}
+
 /// Keep the leading `output_cols` columns of a matrix.
 ///
 /// The input dtype selects the original BF16 kernel or FP16 strided-copy

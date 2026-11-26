@@ -6,6 +6,7 @@ pub mod builtin;
 pub mod cuda_cosmos_policy;
 #[cfg(feature = "cuda")]
 pub mod cuda_gpt_sovits;
+pub mod cuda_minimax_h3_image;
 pub mod d3;
 pub mod decision;
 pub mod debug;
