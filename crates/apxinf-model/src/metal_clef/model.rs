@@ -201,6 +201,8 @@ pub struct Network {
     ane: Vec<super::ane::AneMlp>,
     /// MRoPE inverse frequencies, computed on the device as MLX-VLM does.
     inv_freq: Array,
+    /// Qwen3.5 vision tower, resident in every composition.
+    vision: super::vision::Vision,
 }
 
 /// Python scalars combine with arrays in the array's dtype.
@@ -270,6 +272,7 @@ impl Network {
         #[cfg_attr(not(feature = "coreml"), allow(unused_mut))] mut backbone: Backbone,
         head: Head,
         composition: Composition,
+        path: &std::path::Path,
     ) -> Result<Self> {
         let kernels = Kernels {
             recurrence: GatedDeltaRecurrence::new(&stream)?,
@@ -311,6 +314,7 @@ impl Network {
                 model.warm()?;
             }
         }
+        let vision = super::vision::Vision::load(&config, &stream, path)?;
         Ok(Self {
             config,
             stream,
@@ -321,6 +325,7 @@ impl Network {
             #[cfg(feature = "coreml")]
             ane,
             inv_freq,
+            vision,
         })
     }
 
@@ -330,10 +335,53 @@ impl Network {
 
     /// Per-question logits, lazily; the caller evaluates them once.
     pub fn logits(&self, encoded: &Encoded) -> Result<Vec<Array>> {
+        self.logits_with_vision(encoded, None)
+    }
+
+    /// Per-question logits for a request with optional image patches, lazily.
+    ///
+    /// The tower runs first, its features replace the prompt's image
+    /// placeholder rows in order, and every attention layer uses the prompt's
+    /// three-axis mRoPE positions. A request without images takes the same path
+    /// with equal axes, so the text result is unchanged.
+    pub fn logits_with_vision(
+        &self,
+        encoded: &Encoded,
+        vision: Option<(&Array, &[[u32; 3]], &[u8; 32])>,
+    ) -> Result<Vec<Array>> {
         let tokens = encoded.input_ids.len();
+        let width = self.config.text.hidden_size;
         let ids = embedding_ids(&encoded.input_ids, self.config.text.vocab_size)?;
         let ids = Array::from_i32(&self.stream, &[tokens], &ids)?;
-        let hidden = self.backbone_forward(&ids.reshape(&[1, tokens])?, tokens)?;
+        let e = &self.backbone.embedding;
+        let mut hidden = e.weight.take(&ids, 0)?.dequantize(
+            &e.scales.take(&ids, 0)?,
+            &e.biases.take(&ids, 0)?,
+            64,
+            4,
+        )?;
+        let positions = match vision {
+            None => Array::arange(&self.stream, 0.0, tokens as f32, 1.0, MlxDType::I32)?
+                .reshape(&[1, tokens])?,
+            Some((_, grids, _)) => {
+                let positions = super::vision::mrope_position_ids(
+                    &encoded.input_ids,
+                    grids,
+                    self.config.image_token_id,
+                )?;
+                let mut flat = Vec::with_capacity(tokens * 3);
+                for axis in 0..3 {
+                    flat.extend(positions.iter().map(|position| position[axis]));
+                }
+                Array::from_i32(&self.stream, &[3, 1, tokens], &flat)?
+            }
+        };
+        if let Some((pixels, grids, _)) = vision {
+            let features = self.vision.forward(pixels, grids)?;
+            hidden = self.splice_vision(&encoded.input_ids, &hidden, &features)?;
+        }
+        let _ = width;
+        let hidden = self.backbone_forward(&hidden.reshape(&[1, tokens])?, &positions, tokens)?;
         self.head_forward(
             &hidden.reshape(&[tokens, self.config.text.hidden_size])?,
             &ids,
@@ -341,7 +389,44 @@ impl Network {
         )
     }
 
-    fn backbone_forward(&self, ids: &Array, tokens: usize) -> Result<Array> {
+    /// Replaces the image placeholder rows with the tower's features, in order.
+    fn splice_vision(&self, input_ids: &[u32], hidden: &Array, features: &Array) -> Result<Array> {
+        let tokens = hidden.shape()[0];
+        let width = hidden.shape()[1];
+        let rows = features.shape()[0];
+        if features.shape() != [rows, width] {
+            return Err(Error::Contract(
+                "Clef vision features must be [rows, hidden]",
+            ));
+        }
+        let mut index = Vec::with_capacity(tokens);
+        let mut source = 0i32;
+        let image = self.config.image_token_id;
+        for (position, &id) in input_ids.iter().enumerate() {
+            if id == image {
+                index.push((tokens + source as usize) as i32);
+                source += 1;
+            } else {
+                index.push(position as i32);
+            }
+        }
+        if source as usize != rows {
+            return Err(Error::Contract(
+                "Clef prompt image placeholders and vision rows disagree",
+            ));
+        }
+        let combined = Array::concat(
+            &[
+                &hidden.reshape(&[1, tokens, width])?,
+                &features.reshape(&[1, rows, width])?,
+            ],
+            1,
+        )?;
+        let index = Array::from_i32(&self.stream, &[tokens], &index)?;
+        combined.take(&index, 1)?.reshape(&[tokens, width])
+    }
+
+    fn backbone_forward(&self, ids: &Array, positions: &Array, tokens: usize) -> Result<Array> {
         let e = &self.backbone.embedding;
         let mut h = e.weight.take(ids, 0)?.dequantize(
             &e.scales.take(ids, 0)?,
@@ -349,8 +434,6 @@ impl Network {
             64,
             4,
         )?;
-        let positions = Array::arange(&self.stream, 0.0, tokens as f32, 1.0, MlxDType::I32)?
-            .reshape(&[1, tokens])?;
         for (index, layer) in self.backbone.layers.iter().enumerate() {
             let x = h.fast_rms_norm(&layer.input_norm, EPS)?;
             let r = match &layer.mixer {
