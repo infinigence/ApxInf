@@ -5,7 +5,7 @@ use half::bf16;
 
 use crate::ops::rope::apply_precomputed;
 use crate::{capture, norm, rms_norm_apply_precomputed, CudaBuffer, CudaContext, NormArgs};
-fn tensor(d: &[usize], v: &[f32], dtype: DType, offset: usize) -> Tensor {
+fn tensor(ctx: &CudaContext, d: &[usize], v: &[f32], dtype: DType, offset: usize) -> Tensor {
     let bytes: Vec<u8> = if dtype == DType::BF16 {
         v.iter()
             .flat_map(|&x| bf16::from_f32(x).to_bits().to_ne_bytes())
@@ -17,7 +17,9 @@ fn tensor(d: &[usize], v: &[f32], dtype: DType, offset: usize) -> Tensor {
         .unwrap()
         .view(offset, bytes.len())
         .unwrap();
-    b.copy_from_host(&bytes).unwrap();
+    // A pageable cudaMemcpy may return before its DMA lands and is not ordered
+    // against the non-blocking context stream the kernels run on.
+    b.copy_from_host_on(&bytes, ctx.stream()).unwrap();
     b.as_tensor(Shape::new(d.to_vec()), dtype).unwrap()
 }
 fn read(t: &Tensor) -> Vec<u16> {
@@ -50,6 +52,9 @@ fn unfused(ctx: &CudaContext, x: &Tensor, w: &Tensor, t: &Tensor, out: &Tensor) 
 }
 #[test]
 fn rms_rope_matches_unfused_cpu_alias_and_retained_graph() {
+    let _guard = crate::CUDA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let ctx = CudaContext::new(0).unwrap();
     let mut cases = vec![
         (1, 1, 2, 7),
@@ -91,25 +96,28 @@ fn rms_rope_matches_unfused_cpu_alias_and_retained_graph() {
             })
             .collect();
         let x = tensor(
+            &ctx,
             &shape,
             &values,
             DType::BF16,
             if mask & 1 != 0 { 2 } else { 0 },
         );
         let w = tensor(
+            &ctx,
             &[dim],
             &weights,
             DType::BF16,
             if mask & 2 != 0 { 2 } else { 0 },
         );
-        let t = tensor(&[tokens, 2, dim / 2], &table, DType::F32, 4);
+        let t = tensor(&ctx, &[tokens, 2, dim / 2], &table, DType::F32, 4);
         let out = tensor(
+            &ctx,
             &shape,
             &vec![0.; n],
             DType::BF16,
             if mask & 4 != 0 { 2 } else { 0 },
         );
-        let expected = tensor(&shape, &vec![0.; n], DType::BF16, 0);
+        let expected = tensor(&ctx, &shape, &vec![0.; n], DType::BF16, 0);
         unfused(&ctx, &x, &w, &t, &expected);
         rms_norm_apply_precomputed(&ctx, &x, &w, &t, 1e-6, &out).unwrap();
         ctx.synchronize().unwrap();
@@ -151,9 +159,12 @@ fn rms_rope_matches_unfused_cpu_alias_and_retained_graph() {
         let new_weight: Vec<_> = weights.iter().map(|&x| round(x + 0.125)).collect();
         let new_table: Vec<_> = table.iter().map(|&x| -x).collect();
         for (dst, src) in [
-            (&x, tensor(&shape, &new_values, DType::BF16, 0)),
-            (&w, tensor(&[dim], &new_weight, DType::BF16, 0)),
-            (&t, tensor(&[tokens, 2, dim / 2], &new_table, DType::F32, 0)),
+            (&x, tensor(&ctx, &shape, &new_values, DType::BF16, 0)),
+            (&w, tensor(&ctx, &[dim], &new_weight, DType::BF16, 0)),
+            (
+                &t,
+                tensor(&ctx, &[tokens, 2, dim / 2], &new_table, DType::F32, 0),
+            ),
         ] {
             let mut bytes = vec![0; src.size_in_bytes()];
             CudaBuffer::from_tensor(&src)
@@ -162,7 +173,7 @@ fn rms_rope_matches_unfused_cpu_alias_and_retained_graph() {
                 .unwrap();
             CudaBuffer::from_tensor(dst)
                 .unwrap()
-                .copy_from_host(&bytes)
+                .copy_from_host_on(&bytes, ctx.stream())
                 .unwrap();
         }
         unfused(&ctx, &x, &w, &t, &expected);
@@ -175,9 +186,12 @@ fn rms_rope_matches_unfused_cpu_alias_and_retained_graph() {
             .iter()
             .flat_map(|&v| bf16::from_f32(v).to_bits().to_ne_bytes())
             .collect();
+        // cudaMemcpy from pageable memory may return before its DMA lands and is
+        // not ordered against the non-blocking context stream the graph replays
+        // on, so restore through that stream.
         CudaBuffer::from_tensor(&x)
             .unwrap()
-            .copy_from_host(&bytes)
+            .copy_from_host_on(&bytes, ctx.stream())
             .unwrap();
         drop(x);
         drop(w);
@@ -191,11 +205,14 @@ fn rms_rope_matches_unfused_cpu_alias_and_retained_graph() {
 }
 #[test]
 fn rms_rope_rejects_malformed_shapes_epsilon_and_overlap() {
+    let _guard = crate::CUDA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let ctx = CudaContext::new(0).unwrap();
-    let x = tensor(&[1, 1, 128], &vec![1.; 128], DType::BF16, 0);
-    let w = tensor(&[128], &vec![1.; 128], DType::BF16, 0);
-    let t = tensor(&[1, 2, 64], &vec![0.5; 128], DType::F32, 0);
-    let out = tensor(&[1, 1, 128], &vec![0.; 128], DType::BF16, 0);
+    let x = tensor(&ctx, &[1, 1, 128], &vec![1.; 128], DType::BF16, 0);
+    let w = tensor(&ctx, &[128], &vec![1.; 128], DType::BF16, 0);
+    let t = tensor(&ctx, &[1, 2, 64], &vec![0.5; 128], DType::F32, 0);
+    let out = tensor(&ctx, &[1, 1, 128], &vec![0.; 128], DType::BF16, 0);
     for eps in [0., -1., f32::NAN, f32::INFINITY] {
         assert!(rms_norm_apply_precomputed(&ctx, &x, &w, &t, eps, &out).is_err());
     }
@@ -233,6 +250,9 @@ fn rms_rope_rejects_malformed_shapes_epsilon_and_overlap() {
 
 #[test]
 fn rms_rope_packed_special_values_match_unfused_bits() {
+    let _guard = crate::CUDA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let ctx = CudaContext::new(0).unwrap();
     let shape = [1025, 1, 128];
     let mut data = vec![0.25; 1025 * 128];
@@ -244,11 +264,11 @@ fn rms_rope_packed_special_values_match_unfused_bits() {
     {
         data[row * 128] = bf16::from_bits(bits).to_f32();
     }
-    let x = tensor(&shape, &data, DType::BF16, 0);
-    let w = tensor(&[128], &vec![0.5; 128], DType::BF16, 0);
-    let t = tensor(&[1025, 2, 64], &vec![0.75; 1025 * 128], DType::F32, 4);
-    let out = tensor(&shape, &vec![0.; data.len()], DType::BF16, 0);
-    let expected = tensor(&shape, &vec![0.; data.len()], DType::BF16, 0);
+    let x = tensor(&ctx, &shape, &data, DType::BF16, 0);
+    let w = tensor(&ctx, &[128], &vec![0.5; 128], DType::BF16, 0);
+    let t = tensor(&ctx, &[1025, 2, 64], &vec![0.75; 1025 * 128], DType::F32, 4);
+    let out = tensor(&ctx, &shape, &vec![0.; data.len()], DType::BF16, 0);
+    let expected = tensor(&ctx, &shape, &vec![0.; data.len()], DType::BF16, 0);
     unfused(&ctx, &x, &w, &t, &expected);
     rms_norm_apply_precomputed(&ctx, &x, &w, &t, 1e-6, &out).unwrap();
     ctx.synchronize().unwrap();

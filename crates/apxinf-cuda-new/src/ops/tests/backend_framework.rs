@@ -2181,7 +2181,9 @@ fn gpu_canonical_weight_does_not_opt_into_inplace_packing() {
     }
     let (m, k, n) = (8, 256, 128);
     let a = bytes_tensor(0, vec![m, k], DType::I8, &vec![1; m * k]);
-    let source = (0..k * n).map(|i| (i % 7) as u8).collect::<Vec<_>>();
+    let source = (0..k * n)
+        .map(|i| ((i * 13 + 5) % 11) as u8)
+        .collect::<Vec<_>>();
     let b = bytes_tensor(0, vec![k, n], DType::I8, &source);
     let rows = scales(0, &vec![1.0; m]);
     let channels = scales(0, &vec![1.0; n]);
@@ -2194,8 +2196,12 @@ fn gpu_canonical_weight_does_not_opt_into_inplace_packing() {
     let normalized =
         super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None).unwrap();
     // An immutable Tensor is still canonical; only RepackedWeight permits mutation.
-    assert!(super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).is_err());
+    // The NK implementation is restorable for these bytes, but it packs a
+    // private copy at preparation: the caller's allocation must stay untouched
+    // and the result must still match the canonical K x N interpretation.
+    super::execution::seed_recipe(&ctx, &normalized, 3, 6, 1, 0).unwrap();
     let execution = super::execution::prepare(&ctx, normalized).unwrap();
+    assert!(execution.summary().starts_with("cutlass-w8a8-sm87 "));
     execution.enqueue().unwrap();
     ctx.synchronize().unwrap();
     let mut actual = vec![0; source.len()];
@@ -2287,7 +2293,11 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
             }
         }
         let channels = scales(0, &vec![1.0; n]);
-        let cache = scratch_cache_dir("w8a8-load-layout");
+        // The weight state keeps a GEMM choice per Spec and cache directory, so
+        // the vendor fallback and the seeded native recipe need separate
+        // directories or the second run would reuse the first one's choice.
+        let vendor_cache = scratch_cache_dir("w8a8-load-layout-vendor");
+        let native_cache = scratch_cache_dir("w8a8-load-layout-native");
         for m in [1, 8, 17] {
             let mut input = vec![0; m * k];
             for row in 0..m {
@@ -2304,6 +2314,7 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
                 let mut args = GemmArgs::row_channel_quantized(&a, &rows, &b, &channels, &mut out)
                     .with_repacked_weight(&layout);
                 args.policy.online_tune = false;
+                let cache = if native { &native_cache } else { &vendor_cache };
                 args.policy.cache_dir = Some(cache.to_string_lossy().into_owned());
                 let mut normalized =
                     super::contracts::normalize(&ctx, args, super::contracts::Semantic::Gemm, None)
@@ -2335,7 +2346,8 @@ fn gpu_w8a8_load_fixes_layout_before_prepare() {
                 );
             }
         }
-        std::fs::remove_dir_all(cache).unwrap();
+        std::fs::remove_dir_all(vendor_cache).unwrap();
+        std::fs::remove_dir_all(native_cache).unwrap();
     }
 }
 
