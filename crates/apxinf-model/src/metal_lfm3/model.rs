@@ -14,7 +14,7 @@
 #[cfg(feature = "coreml")]
 use super::weights::Linear;
 use super::{
-    config::{LayerKind, Lfm3Config},
+    config::{LayerKind, Lfm3Config, MAX_CONTEXT},
     q4,
     weights::{LayerWeights, Mixer, Weights},
 };
@@ -1462,6 +1462,14 @@ impl LlmTrait for Lfm3Model {
 
     fn vocab_size(&self) -> usize {
         self.config.vocab_size
+    }
+
+    /// The family allocates per request in `prewarm_decode`, so this reports
+    /// the static context limit rather than the current allocation. The
+    /// load-time allocation is one capacity grain (256 rows), which would
+    /// otherwise reject any request longer than that before prewarm runs.
+    fn sequence_capacity(&self) -> Option<usize> {
+        Some(self.config.max_position_embeddings.min(MAX_CONTEXT))
     }
 
     fn reset(&mut self) {
