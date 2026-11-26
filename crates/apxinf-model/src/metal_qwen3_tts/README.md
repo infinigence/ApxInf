@@ -81,6 +81,18 @@ measured +1.66% over the parity path (eight utterances, p = 0.013) with
 identical codes and waveforms. `reference` keeps the parity path's composed
 SwiGLU everywhere.
 
+Opt-in decode copies: `APXINF_TTS_W8_PREDICTOR` and `APXINF_TTS_W8_TALKER` add
+affine group-64 copies of the code predictor and the talker. A value of `1`
+selects 8 bits, `4`, `6` or `8` selects that width, and unset or `0` leaves the
+family on the BF16 path. A copy is used only for a one-row input, so prefill
+and every multi-row call stay BF16, and all copies are evaluated once at load
+instead of lazily per projection. The copies are lossy: on Apple M4 the same
+English text with voice `serena` produced 12.72 s of audio with BF16, 12.96 s
+with the predictor copy and 12.56 s with both, so the decoded token stream
+changes. RTF measured 0.99 for BF16, 0.97 to 0.93 with the predictor copy and
+0.73 with both, and load time rose from about 1.5 s to 1.9 s. Both switches are
+off by default.
+
 Verification status: CPU tests cover configuration admission, voices,
 languages and dialects. Codes and waveforms against the reference, repeated
 requests, memory and latency are measured on Apple M4 and reported in the PR;

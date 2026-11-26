@@ -118,7 +118,62 @@ pub fn load(
         );
     }
     let ops = Ops::new(&stream)?;
-    let (talker, predictor) = weights::Talker::load(&stream, path)?;
+    let (mut talker, mut predictor) = weights::Talker::load(&stream, path)?;
+    // `APXINF_TTS_W8_PREDICTOR=1` (or 4/6/8 for the width) gives the code
+    // predictor's five layers quantized decode copies: it re-reads its 136 MB of
+    // weights once per codebook group, 15 times per frame.
+    if let Ok(value) = std::env::var("APXINF_TTS_W8_PREDICTOR") {
+        if value != "0" {
+            let bits = value
+                .parse::<i32>()
+                .ok()
+                .filter(|b| matches!(b, 4 | 6 | 8))
+                .unwrap_or(8);
+            let mut count = 0usize;
+            for layer in predictor.layers.iter_mut() {
+                for linear in [
+                    &mut layer.attention.q,
+                    &mut layer.attention.k,
+                    &mut layer.attention.v,
+                    &mut layer.attention.o,
+                    &mut layer.mlp.gate,
+                    &mut layer.mlp.up,
+                    &mut layer.mlp.down,
+                ] {
+                    linear.w8 = Some(apxinf_mlx::Quantized::new(&linear.weight, bits)?);
+                    count += 1;
+                }
+            }
+            eprintln!("Qwen3-TTS: W{bits} decode copies on {count} predictor projections");
+        }
+    }
+    // Same treatment for the 1.7B talker (`APXINF_TTS_W8_TALKER=1`): it reads
+    // ~3.4 GB per frame, so the bytes lever applies there too.
+    if let Ok(value) = std::env::var("APXINF_TTS_W8_TALKER") {
+        if value != "0" {
+            let bits = value
+                .parse::<i32>()
+                .ok()
+                .filter(|b| matches!(b, 4 | 6 | 8))
+                .unwrap_or(8);
+            let mut count = 0usize;
+            for layer in talker.layers.iter_mut() {
+                for linear in [
+                    &mut layer.attention.q,
+                    &mut layer.attention.k,
+                    &mut layer.attention.v,
+                    &mut layer.attention.o,
+                    &mut layer.mlp.gate,
+                    &mut layer.mlp.up,
+                    &mut layer.mlp.down,
+                ] {
+                    linear.w8 = Some(apxinf_mlx::Quantized::new(&linear.weight, bits)?);
+                    count += 1;
+                }
+            }
+            eprintln!("Qwen3-TTS: W{bits} decode copies on {count} talker projections");
+        }
+    }
     let model = Model::new(talker, predictor, &ops, fused)?;
     let decoder = codec::Decoder::new(weights::Codec::load(&stream, path)?, &ops)?;
     Ok(LoadedModel::Tts(Box::new(QwenTts {

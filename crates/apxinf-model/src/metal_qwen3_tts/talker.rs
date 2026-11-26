@@ -129,6 +129,7 @@ mod preparation_tests {
                     MlxDType::BF16,
                 )?)?,
                 bias: None,
+                w8: None,
             })
         };
         let mlp = Mlp {
