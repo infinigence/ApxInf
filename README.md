@@ -276,17 +276,24 @@ One or two views, batch 1. Best recorded P50.
 ### Qwen3.8-27B-NVFP4
 
 Text LLM, 48 Gated DeltaNet + 16 full-attention layers, mixed NVFP4/FP8.
-2048-token prompt, 128 greedy tokens, batch 1, BF16 KV cache; steady state
-after one warm-up generation. See [doc/qwen38-nvfp4.md](doc/qwen38-nvfp4.md)
-for CLI inference.
+2048-token prompt, 128 greedy tokens, batch 1, BF16 KV cache; prepared recipes
+and one excluded warm-up generation. See [doc/qwen38-nvfp4.md](doc/qwen38-nvfp4.md)
+for CLI inference and recipe preparation.
 
 | Hardware | Precision | TTFT (2048) | Decode | Throughput |
 |---|---|---:|---:|---:|
 | Jetson AGX Thor | NVFP4/FP8 | 534 ms | 78.1 ms/token | 12.8 tok/s |
 
 ```bash
+# Prepare recipes in a separate process; this does not report benchmark timings.
 cargo run -p apxinf-model --features cuda --release --example qwen38_bench -- \
-    <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 --repeats 3
+    <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 \
+    --prepare --tuning-path ./devlocal/qwen38-bench/recipes
+
+# Measure with autotuning disabled, using the same recipes and configuration.
+cargo run -p apxinf-model --features cuda --release --example qwen38_bench -- \
+    <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 --repeats 3 \
+    --tuning-path ./devlocal/qwen38-bench/recipes
 ```
 
 

@@ -72,17 +72,35 @@ is wanted, and raise `--max-tokens` accordingly.
 | `--no-eos-stop` | fixed-length generation |
 | `--sample --temperature T --top-k K --top-p P --seed S` | categorical sampling |
 
-Latency notes: the first process on a machine additionally pays one-time
-kernel autotuning (recipes persist under `/tmp/apxinf-qwen38-*-recipes`);
-each CLI invocation pays weight loading and one CUDA-graph capture. A
-resident process reaches steady state from its second generation.
+Latency notes: online autotuning is disabled by default. A missing recipe
+uses an inference fallback, which can make prefill substantially slower;
+additional warm-up generations do not enable tuning. Explicit preparation
+pays the tuning cost and persists recipes. The default directory is
+`configs/tuning/nvidia/thor-sm110/cuda<version>-cublas<version>/`, relative to
+the working directory. Each CLI invocation also pays weight loading and one
+CUDA-graph capture.
 
 ## Benchmarking
 
 ```bash
 cargo run -p apxinf-model --features cuda --release --example qwen38_bench -- \
-    <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 --repeats 3
+    <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 \
+    --prepare --tuning-path ./devlocal/qwen38-bench/recipes
+
+cargo run -p apxinf-model --features cuda --release --example qwen38_bench -- \
+    <path-to-Qwen3.8-27B-NVFP4> --prompt-len 2048 --max-new 128 --repeats 3 \
+    --tuning-path ./devlocal/qwen38-bench/recipes
 ```
+
+`--prepare` enables tuning in a separate process, verifies two deterministic
+generations and exits without reporting latency statistics. The measurement
+process disables tuning. Keep checkpoint, shapes, toolkit, kernel build and
+recipe directory identical between the two commands; repeat preparation when
+they change. Existing `APXINF_QWEN38_GEMM_TUNE_CACHE` and
+`APXINF_QWEN38_TUNE_CACHE` overrides still take precedence for their operations;
+unset them when using the explicit directory above, or keep them identical
+throughout preparation and measurement. Without `--tuning-path`, both modes
+use the default hardware/toolkit directory from the same working directory.
 
 Deterministic prompt through the public entry (`AutoModel` →
 `generate_streaming`); JSON per repeat plus a summary. Repeat 0 is the
@@ -101,9 +119,8 @@ Jetson AGX Thor, locked clocks (1575 MHz GPC):
 - Quantizer contract suites: `qwen38_fp8_quant_contract`,
   `qwen38_nvfp4_quant_contract` (`apxinf-cuda-new`).
 - The 2048-token end-to-end benchmark exercises `ops::gemm_swiglu` with the
-  block-quantized binding in every layer, checks deterministic generated tokens, and compares the token
-  hash with the accepted reference run. Other prompt lengths exercise the
-  generic fallback.
+  block-quantized binding in every layer and checks identical generated tokens
+  across repeats. Other prompt lengths exercise the generic fallback.
 
 ## Limitations
 
