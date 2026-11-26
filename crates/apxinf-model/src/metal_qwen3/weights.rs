@@ -10,11 +10,18 @@ struct Quantized {
     packed: Array,
     scales: Array,
     biases: Array,
+    /// Decode weight width: `APXINF_QWEN3_W8_BITS` (8 default, 4 or 6 accepted).
+    bits: i32,
 }
 
 impl Quantized {
     fn new(hf_weight: &Array) -> Result<Self> {
-        let [packed, scales, biases] = hf_weight.quantize(64, 8)?;
+        let bits = match std::env::var("APXINF_QWEN3_W8_BITS").ok().as_deref() {
+            Some("4") => 4,
+            Some("6") => 6,
+            _ => 8,
+        };
+        let [packed, scales, biases] = hf_weight.quantize(64, bits)?;
         hf_weight
             .stream()
             .eval(&[packed.clone(), scales.clone(), biases.clone()])?;
@@ -22,11 +29,19 @@ impl Quantized {
             packed,
             scales,
             biases,
+            bits,
         })
     }
 
     fn project(&self, x: &Array) -> Result<Array> {
-        x.quantized_matmul(&self.packed, &self.scales, &self.biases, true, 64, 8)
+        x.quantized_matmul(
+            &self.packed,
+            &self.scales,
+            &self.biases,
+            true,
+            64,
+            self.bits,
+        )
     }
 
     fn gather(&self, ids: &Array) -> Result<Array> {
@@ -34,7 +49,7 @@ impl Quantized {
             &self.scales.take(ids, 0)?,
             &self.biases.take(ids, 0)?,
             64,
-            8,
+            self.bits,
         )
     }
 
