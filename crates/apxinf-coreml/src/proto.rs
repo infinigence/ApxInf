@@ -259,5 +259,7 @@ pub mod data_type {
     pub const STRING: i32 = 2;
     pub const FLOAT16: i32 = 10;
     pub const INT8: i32 = 21;
+    pub const UINT4: i32 = 35;
+    pub const UINT6: i32 = 38;
     pub const INT32: i32 = 23;
 }

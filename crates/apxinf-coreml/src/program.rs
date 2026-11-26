@@ -310,6 +310,67 @@ impl ProgramBuilder {
         }
     }
 
+    pub fn constexpr_lut_to_dense(
+        &mut self,
+        indices: &[u8],
+        shape: &[usize],
+        lut: &[f16],
+        groups: usize,
+        bits: u32,
+    ) -> Result<Var> {
+        let count: usize = shape.iter().product();
+        let entries = 1usize << bits;
+        if !matches!(bits, 4 | 6) {
+            return Err(contract("lut_to_dense supports 4- and 6-bit palettes"));
+        }
+        if indices.len() != count || lut.len() != groups * entries {
+            return Err(contract("lut_to_dense needs one index per weight and one table per group"));
+        }
+        if groups == 0 || shape.is_empty() || shape[0] % groups != 0 {
+            return Err(contract("lut_to_dense groups must divide the first dimension"));
+        }
+        if indices.iter().any(|&i| usize::from(i) >= entries) {
+            return Err(contract("lut_to_dense index outside the palette"));
+        }
+        let name = self.op_name("constexpr_lut_to_dense", None);
+        let (mil_dtype, blob_dtype) = match bits {
+            4 => (data_type::UINT4, BlobDataType::UInt4),
+            _ => (data_type::UINT6, BlobDataType::UInt6),
+        };
+        let packed = pack_indices(indices, bits);
+        let indices = self.blob_value(mil_dtype, shape, blob_dtype, &packed);
+        // Core ML's layout: one table per group, then the palette, then the vector axis.
+        let mut lut_shape = vec![groups];
+        lut_shape.extend(std::iter::repeat(1).take(shape.len() - 1));
+        lut_shape.push(entries);
+        lut_shape.push(1);
+        let bytes: Vec<u8> = lut.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let lut = self.blob_value(data_type::FLOAT16, &lut_shape, BlobDataType::Float16, &bytes);
+        let arg = |v: proto::Value| proto::Argument {
+            arguments: vec![proto::Binding {
+                binding: Some(binding::Binding::Value(v)),
+            }],
+        };
+        let out = Var {
+            builder: self.id,
+            name: name.clone(),
+            dtype: data_type::FLOAT16,
+            shape: shape.to_vec(),
+        };
+        let inputs = [
+            ("indices".to_owned(), arg(indices)),
+            ("lut".to_owned(), arg(lut)),
+        ]
+        .into();
+        self.push(
+            "constexpr_lut_to_dense",
+            &name,
+            inputs,
+            std::slice::from_ref(&out),
+        );
+        Ok(out)
+    }
+
     /// `constexpr_blockwise_shift_scale(data, scale)`: INT8 `data` times FP16
     /// `scale` broadcast over its unit dimensions, materialized at load. Both
     /// parameters need equal rank >= 1; Core ML rejects rank-0 parameters.
@@ -889,6 +950,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pack_indices_packs_four_and_six_bits_little_endian() {
+        // 4-bit: two palette indices per byte, low nibble first.
+        assert_eq!(pack_indices(&[0x1, 0x2, 0xF, 0x0], 4), vec![0x21, 0x0F]);
+        // 6-bit: four indices fill three bytes exactly.
+        assert_eq!(pack_indices(&[0b000001, 0b000010, 0b000100, 0b001000], 6).len(), 3);
+    }
+
+    #[test]
+    fn lut_to_dense_rejects_unsupported_palettes_and_shapes() {
+        let mut b = ProgramBuilder::new();
+        // Only 4- and 6-bit palettes exist in MIL.
+        assert!(b
+            .constexpr_lut_to_dense(&[0; 4], &[4], &[f16::ONE; 32 * 4], 1, 5)
+            .is_err());
+        // One index per weight, one table entry per palette slot per group.
+        assert!(b
+            .constexpr_lut_to_dense(&[0; 3], &[4], &[f16::ONE; 16], 1, 4)
+            .is_err());
+        assert!(b
+            .constexpr_lut_to_dense(&[0; 4], &[4], &[f16::ONE; 15], 1, 4)
+            .is_err());
+        // An index outside the palette cannot be decoded.
+        assert!(b
+            .constexpr_lut_to_dense(&[16; 4], &[4], &[f16::ONE; 16], 1, 4)
+            .is_err());
+    }
+
+    #[test]
+    fn lut_to_dense_builds_a_float16_output_with_the_weight_shape() {
+        let mut b = ProgramBuilder::new();
+        let out = b
+            .constexpr_lut_to_dense(&[0, 1, 2, 3], &[4, 1, 1, 1], &[f16::ONE; 16], 1, 4)
+            .unwrap();
+        assert_eq!(out.dtype, data_type::FLOAT16);
+        assert_eq!(out.shape(), &[4, 1, 1, 1][..]);
+    }
+
+    #[test]
     fn names_follow_coremltools_counters_and_named_ops() {
         let mut b = ProgramBuilder::new();
         let x = b.input("x", &[1, 4, 1, 8]).unwrap();
@@ -1369,4 +1468,19 @@ mod tests {
             assert_eq!(package.weights.len(), 64);
         }
     }
+}
+
+fn pack_indices(indices: &[u8], bits: u32) -> Vec<u8> {
+    let total_bits = indices.len() * bits as usize;
+    let mut out = vec![0u8; total_bits.div_ceil(8)];
+    for (i, &v) in indices.iter().enumerate() {
+        let start = i * bits as usize;
+        for b in 0..bits as usize {
+            if v >> b & 1 == 1 {
+                let bit = start + b;
+                out[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+    }
+    out
 }

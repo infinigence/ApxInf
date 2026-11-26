@@ -1,6 +1,6 @@
 #![cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 use apxinf_core::Result;
-use apxinf_mlx::fusions::{PackedResidualRmsNorm, QkNormRope};
+use apxinf_mlx::fusions::{GdnConvSplit, MropeHalfSplitRope, PackedResidualRmsNorm, QkNormRope, RmsNormScale};
 use apxinf_mlx::{Array, MlxDType as D, Stream};
 
 #[test]
@@ -686,5 +686,92 @@ fn swiglu_gemv_matches_composed_parity_swiglu() -> Result<()> {
         .call(&Array::zeros(&s, &[1, 3, 1024], D::BF16)?, &w)
         .is_err());
     assert!(mlp.prepare(&gate.cast(D::F32)?, &up, &down).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn rms_norm_scale_matches_the_unfused_mlx_path() -> Result<()> {
+    let s = Stream::metal(0)?;
+    let epsilon = 1e-6;
+    let kernel = RmsNormScale::new(&s, epsilon)?;
+    // Two rows of the width the kernel accepts, with mixed magnitudes so a
+    // missing rounding point would show up as a mismatch.
+    let mut values = Vec::with_capacity(2 * 128);
+    for i in 0..2 * 128 {
+        values.push(((i as f32) * 0.37).sin() * (1.0 + (i % 7) as f32));
+    }
+    let x = Array::from_f32(&s, &[2, 128], &values)?.cast(D::BF16)?;
+    let scale = Array::from_f32(&s, &[], &[2.5])?.cast(D::BF16)?;
+
+    let got = kernel.call(&x, &scale)?.to_f32_vec()?;
+    let want = x.fast_rms_norm_unweighted(epsilon)?.mul(&scale)?.to_f32_vec()?;
+    assert_eq!(got, want, "fused RMSNorm+scale must round exactly like the unfused path");
+
+    // Geometry and type contract: only BF16 [.., 128] with one BF16 scalar.
+    assert!(kernel.call(&x, &Array::from_f32(&s, &[2], &[1.0, 1.0])?.cast(D::BF16)?).is_err());
+    assert!(kernel.call(&x.cast(D::F32)?, &scale).is_err());
+    assert!(RmsNormScale::new(&s, 0.0).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn gdn_conv_split_matches_slice_and_reshape() -> Result<()> {
+    let s = Stream::metal(0)?;
+    let kernel = GdnConvSplit::new(&s)?;
+    let (hk, dk, hv, dv) = (2usize, 4usize, 3usize, 2usize);
+    let (length, key_dim, value_dim) = (5usize, hk * dk, hv * dv);
+    let conv_dim = 2 * key_dim + value_dim;
+    let values: Vec<f32> = (0..length * conv_dim).map(|i| i as f32 * 0.25 - 3.0).collect();
+    let conv = Array::from_f32(&s, &[1, length, conv_dim], &values)?.cast(D::BF16)?;
+    let interleaved = conv.to_f32_vec()?;
+
+    let (q, k, v) = kernel.call(&conv, hk, dk, hv, dv)?;
+    assert_eq!(q.shape(), &[1, length, hk, dk][..]);
+    assert_eq!(k.shape(), &[1, length, hk, dk][..]);
+    assert_eq!(v.shape(), &[1, length, hv, dv][..]);
+
+    // Each output is the interleaved conv output read with the same strides,
+    // so the split must be bit-preserving, not approximate.
+    let reference = |offset: usize, width: usize| -> Vec<f32> {
+        let mut out = Vec::with_capacity(length * width);
+        for t in 0..length {
+            for c in 0..width {
+                out.push(interleaved[t * conv_dim + offset + c]);
+            }
+        }
+        out
+    };
+    assert_eq!(q.to_f32_vec()?, reference(0, key_dim));
+    assert_eq!(k.to_f32_vec()?, reference(key_dim, key_dim));
+    assert_eq!(v.to_f32_vec()?, reference(2 * key_dim, value_dim));
+
+    // Reject a mismatched channel count rather than truncating.
+    let bad = Array::from_f32(
+        &s,
+        &[1, length, conv_dim - 1],
+        &values[..length * (conv_dim - 1)],
+    )?
+    .cast(D::BF16)?;
+    assert!(kernel.call(&bad, hk, dk, hv, dv).is_err());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn mrope_half_split_rope_with_zero_positions_copies_the_input() -> Result<()> {
+    let s = Stream::metal(0)?;
+    let rotary = 8;
+    let kernel = MropeHalfSplitRope::new(&s, rotary)?;
+    let (batch, heads, length, width) = (1usize, 2usize, 3usize, 16usize);
+    let values: Vec<f32> = (0..batch * heads * length * width).map(|i| (i as f32) * 0.1 - 2.0).collect();
+    let x = Array::from_f32(&s, &[batch, heads, length, width], &values)?.cast(D::BF16)?;
+    let positions = Array::zeros(&s, &[3, batch, length], D::I32)?;
+    let inv_freq = Array::from_f32(&s, &[rotary / 2], &vec![0.5; rotary / 2])?;
+    let selector = Array::zeros(&s, &[rotary / 2], D::I32)?;
+
+    let out = kernel.call(&x, &positions, &inv_freq, &selector)?.to_f32_vec()?;
+    assert_eq!(out, x.to_f32_vec()?, "zero positions must leave every feature unchanged");
     Ok(())
 }
