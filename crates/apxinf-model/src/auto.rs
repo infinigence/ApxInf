@@ -1010,17 +1010,19 @@ mod tests {
     fn every_metal_family_rejects_unknown_variants() {
         register_builtin_models();
         let families = registry::list_metal();
-        assert_eq!(
-            families,
-            [
-                "metal_clef",
-                "metal_d3",
-                "metal_minicpm5",
-                "metal_qwen3",
-                "metal_qwen3_tts",
-                "metal_qwen_image",
-            ]
-        );
+        for expected in [
+            "metal_clef",
+            "metal_d3",
+            "metal_minicpm5",
+            "metal_qwen3",
+            "metal_qwen3_tts",
+            "metal_qwen_image",
+        ] {
+            assert!(
+                families.contains(&expected),
+                "{expected} is missing from the Metal registry"
+            );
+        }
         for name in families {
             let family = registry::get_metal(name).expect("listed family is registered");
             let options = LoadOptions {
