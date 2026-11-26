@@ -79,7 +79,75 @@ Deterministically reconstruct 224 x 224 NHWC `uint8` images from the normalized 
 | 2 | Real LIBERO workload: base camera + wrist camera |
 | 3 | Three-camera production-shape workload; not an official LIBERO camera configuration |
 
-Run three-view performance tests only. Do not use three views for LIBERO task-suite accuracy evaluation.
+Use three views with LIBERO weights only for performance or numerical parity tests. Do not treat those runs as LIBERO task-suite accuracy results.
+
+### OpenPI parity suite
+
+`scripts/compare_pi05_openpi.py` checks the normalized `[H, 32]` PI0.5 output
+against official OpenPI PyTorch. Both engines read the same `model.safetensors`,
+saved images, token IDs, flow noise, horizon, and flow-step count. The seven
+bounded cases cover a second scene or noise draw, long language, dark and
+bright images, zero and negative noise, float CHW images, and camera ordering.
+A suite without `--source-npz` is marked synthetic.
+
+```bash
+python scripts/compare_pi05_openpi.py prepare \
+  --suite-dir devlocal/pi05-openpi-parity/base-3view \
+  --image-keys base,left,right --horizon 10
+python scripts/compare_pi05_openpi.py openpi \
+  --suite-dir devlocal/pi05-openpi-parity/base-3view \
+  --checkpoint-dir /path/to/pi05_base
+python scripts/compare_pi05_openpi.py apxinf \
+  --suite-dir devlocal/pi05-openpi-parity/base-3view \
+  --checkpoint-dir /path/to/pi05_base --precision bf16
+python scripts/compare_pi05_openpi.py compare \
+  --suite-dir devlocal/pi05-openpi-parity/base-3view
+```
+
+For real images, pass one or two `--source-npz` files to `prepare`; each needs
+arrays named by `--image-keys`, already resized to 224 × 224 RGB. Change only
+the image keys, checkpoint path, horizon, and precision for another configuration.
+The report checks input and weight hashes and gives cosine, relative L2, and
+maximum absolute error per case. Its initial gate is cosine >= 0.997 and
+relative L2 <= 0.10. Keep failed cases visible; a pass on synthetic inputs does
+not establish robot-task accuracy.
+
+[`lerobot/pi05_base`](https://huggingface.co/lerobot/pi05_base/blob/main/config.json)
+is a real three-camera checkpoint with PyTorch safetensors. The official OpenPI
+[`pi05_base`](https://github.com/Physical-Intelligence/openpi/blob/main/README.md#base-models)
+is JAX-format and needs conversion for this comparison. OpenPI mode needs the
+official source on `PYTHONPATH`, a compatible CUDA PyTorch build,
+`transformers==4.53.2` with OpenPI's `transformers_replace` files,
+`safetensors`, and the OpenPI import dependencies (including JAX/Flax,
+`augmax`, and `dm-tree`). ApxInf mode needs the CUDA-enabled `apxinf_py`
+binding. Run the two inference stages in separate environments. FP8 requires
+a calibration profile generated for the **same weights and view count**; pass
+its path with `--calibration`. ApxInf's random FP8 benchmark uses
+`uniform:1.0` to measure latency, but its internal synthetic weights cannot
+be compared to OpenPI.
+
+Thor3 validation on 2026-09-28 used ApxInf based on `upstream/main`
+`c36cbbcdd2600240780c922fe8cd49fcc78a00a9` and `lerobot/pi05_base`
+revision `b211f3d44c36b6acfcf7ae94a64e8e96f75a64ba` (weight SHA256
+`0eb11ca9587678c1d2ef8cf32807c29f8ce53a2bfdfc1aa4a4c96f16fca59b0f`),
+OpenPI revision `215abfb217dbac7d5f1273282331b9b1866c0479`, `H=10`, ten
+flow steps, and seven synthetic cases. The fixed gate was cosine >= 0.997
+and relative L2 <= 0.10.
+
+| Active views | ApxInf precision | Passed | Failed case (cosine / relative L2) |
+|---:|---|---:|---|
+| 1 | BF16 | 6/7 | Dark image + zero noise: 0.97222 / 0.30955 |
+| 2 | BF16 | 6/7 | View-order contrast: 0.99113 / 0.18798 |
+| 3 | BF16 | 7/7 | None; minimum cosine 0.99927 |
+| 3 | FP8 | 4/7 | Dark + zero noise: 0.99127 / 0.18822; bright + negative noise: 0.97100 / 0.42063; view-order contrast: 0.98706 / 0.22440 |
+
+The three-view FP8 profile used seven synthetic observations from the same
+suite, so its result diagnoses this calibration and implementation path; it
+does not establish production FP8 accuracy. A separate genuine two-view
+LIBERO checkpoint passed 7/7 BF16 cases on Thor2. The one- and two-view
+`pi05_base` runs reduce the active camera count of a three-camera checkpoint
+and should be read as camera-mask corner tests. Full reports and inputs are
+kept under ignored `devlocal/pi05-openpi-parity/`.
 
 ## 5. Execution paths
 
