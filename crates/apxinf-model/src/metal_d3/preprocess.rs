@@ -20,6 +20,7 @@ pub fn preprocess(p: &PreprocessorContract, v: &VisionContract, rgb: &[u8], widt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apxinf_core::Error;
 
     fn contract() -> (PreprocessorContract, VisionContract) {
         let vision = VisionContract {
