@@ -39,3 +39,10 @@ crates/.gemm-pilot-link.lock
 target-gemm-pilot/
 target-p92i/
 .claude/
+
+/configs/tuning/**/*.recipe
+/configs/tuning/**/*.recipe.*.tmp
+# Crates write autotune recipes beside their own configs; they are measured
+# per device and never belong in the tree.
+/crates/*/configs/tuning/**/*.recipe
+/crates/*/configs/tuning/**/*.recipe.*.tmp

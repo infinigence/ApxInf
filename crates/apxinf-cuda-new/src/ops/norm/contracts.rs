@@ -3,6 +3,13 @@ use apxinf_core::{DType, Device, Error, Result, Tensor};
 use crate::ffi::abi::norm as abi;
 use crate::{CudaBuffer, CudaContext};
 
+/// Static shared-memory scratch the GRN kernel's block reduction uses
+/// (`shared_total[32]`, see `native/kernels/custom/norm.cuh`). CUDA counts
+/// static and dynamic shared memory against the same default 48 KiB
+/// per-block limit, so the dynamic `column_norm` allocation must reserve
+/// these bytes for it. Must stay in sync with `kGrnReductionSharedBytes`.
+const GRN_REDUCTION_SHARED_BYTES: usize = 32 * std::mem::size_of::<f32>();
+
 /// Public L3 operation selected by the call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Operation {
@@ -33,6 +40,10 @@ pub(crate) enum Statistic {
     Rms,
     Layer,
     ChannelL2,
+    /// Global response normalization over the whole activation.
+    Grn,
+    /// Per-column mean/variance with an input-dtype statistics boundary.
+    ColumnLayer,
 }
 
 impl Statistic {
@@ -42,6 +53,8 @@ impl Statistic {
             Self::Rms => 1,
             Self::Layer => 2,
             Self::ChannelL2 => 3,
+            Self::Grn => 4,
+            Self::ColumnLayer => 5,
         }
     }
 }
@@ -192,6 +205,11 @@ fn valid_contract(
         ) | (
             Operation::Norm,
             Statistic::Rms | Statistic::Layer,
+            AffineKind::Adaptive,
+            GateKind::None
+        ) | (
+            Operation::Norm,
+            Statistic::Grn | Statistic::ColumnLayer,
             AffineKind::Adaptive,
             GateKind::None
         ) | (
@@ -501,9 +519,20 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
             "StableDecode numerics supports plain RMSNorm or unbiased BF16 residual RMSNorm only",
         ));
     }
-    if args.bias_order == BiasOrder::BiasThenResidual && dtype != DType::BF16 {
+    if args.bias_order == BiasOrder::BiasThenResidual
+        && dtype != DType::BF16
+        && dtype != DType::F16
+    {
         return Err(invalid(
-            "BiasThenResidual order is BF16-only because its intermediate rounding is part of the contract",
+            "BiasThenResidual order is F16/BF16-only because its intermediate rounding is part of the contract",
+        ));
+    }
+    if matches!(operation, Operation::Norm)
+        && matches!(statistic, Statistic::Grn)
+        && cols * 4 + GRN_REDUCTION_SHARED_BYTES > 48 * 1024
+    {
+        return Err(invalid(
+            "GRN activation width exceeds the kernel's shared-memory budget",
         ));
     }
     if statistic == Statistic::Layer && affine == AffineKind::Adaptive && dtype != DType::BF16 {
@@ -524,7 +553,9 @@ pub(crate) fn normalize(ctx: &CudaContext, args: RawArgs<'_>) -> Result<Normaliz
         .checked_mul(cols)
         .ok_or_else(|| invalid("Norm size overflow"))?;
 
-    if !(args.eps.is_finite() && args.eps > 0.0) {
+    // GRN folds its epsilon into the kernel's arithmetic; the eps binding is
+    // only consumed by the mean-based statistics, so it is unconstrained there.
+    if statistic != Statistic::Grn && !(args.eps.is_finite() && args.eps > 0.0) {
         return Err(invalid("Norm eps must be finite and positive"));
     }
     if !(args.output_scale.is_finite() && args.output_scale > 0.0) {

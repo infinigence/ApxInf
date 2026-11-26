@@ -4,6 +4,8 @@ mod accelerator;
 pub mod auto;
 pub mod builtin;
 pub mod cuda_cosmos_policy;
+#[cfg(feature = "cuda")]
+pub mod cuda_gpt_sovits;
 pub mod d3;
 pub mod decision;
 pub mod debug;
@@ -43,7 +45,7 @@ pub mod qwen_drive;
 pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
-pub mod speech;
+pub mod tts_trait;
 pub mod vla;
 mod walloss;
 
@@ -60,7 +62,10 @@ pub use decision::{
 };
 pub use debug::{DebugCapture, DebugConfig};
 pub use image::{GeneratedImage, ImageRequest, ImageRuntime};
-pub use speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
+pub use tts_trait::{
+    GeneratedAudio, GptSovitsInputs, PreparedTts, TtsCacheConfig, TtsCacheInfo, TtsContract,
+    TtsExtension, TtsRequest, TtsTrait, TtsSampling, TtsSpec, gpt_sovits_inputs,
+};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
