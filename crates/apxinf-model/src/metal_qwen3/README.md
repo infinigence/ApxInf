@@ -39,6 +39,13 @@ This variant does not select the BF16 decoder-block callable: its inherited
 compilation boundary and valid-length attention remain explicit. It shares the
 device greedy decode path with `bf16-compiled`.
 
+`APXINF_QWEN3_W8_BITS` selects the width of every packed copy in `mixed-w8`:
+`8` (default), `6` or `4`, all at group size 64. The narrower widths are lossy
+and have no quality gate. Nothing else changes with the width: the one-row
+admission, the embedding gather and the BF16 prompt path are the same. On M4
+with Qwen3-0.6B, greedy, 128 tokens, TPOT measured 7.9 to 8.1 ms at 8 bits,
+6.5 ms at 6 and 4.8 ms at 4.
+
 `Qwen3Model::prepare(prompt_len, max_new_tokens)` allocates a bounded KV profile
 and warms its sequence shapes before inference. Capacity rounds up to 256 tokens
 within the smaller checkpoint/40960-token limit. A new request can grow or
