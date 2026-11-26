@@ -105,6 +105,10 @@ impl Config {
 pub enum Variant {
     Public,
     Compiled,
+    /// W8 decode projections with BF16 prompt GEMMs (`--model-variant
+    /// mixed-w8`), mirroring `metal_qwen3`. The compiled decode step is the
+    /// same; only a one-row lane projects through the affine copy.
+    MixedW8,
     DSpark,
 }
 
@@ -113,6 +117,7 @@ impl Variant {
         match name.unwrap_or("bf16-compiled") {
             "bf16-public" => Ok(Self::Public),
             "bf16-compiled" => Ok(Self::Compiled),
+            "mixed-w8" => Ok(Self::MixedW8),
             "dspark" => Ok(Self::DSpark),
             name => Err(Error::Other(format!(
                 "unsupported MiniCPM5 MLX variant: {name}"
@@ -158,7 +163,10 @@ mod tests {
         c.tie_word_embeddings = true;
         assert!(c.validate().is_err());
         assert_eq!(Variant::parse(None).unwrap(), Variant::Compiled);
-        assert!(Variant::parse(Some("mixed-w8")).is_err());
+        assert_eq!(
+            Variant::parse(Some("mixed-w8")).unwrap(),
+            Variant::MixedW8
+        );
     }
 
     #[test]

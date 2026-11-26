@@ -287,9 +287,9 @@ fn draft_step(
         h = h.add(&activated.mul(&up)?.matmul(&w.down)?)?;
         states.extend([k, v]);
     }
-    let logits = h
-        .fast_rms_norm(&weights.norm, EPSILON)?
-        .matmul(&target.head)?;
+    let logits = target
+        .head
+        .project(&h.fast_rms_norm(&weights.norm, EPSILON)?, false)?;
     let mut previous = args[1].slice_axis(1, 0, 1)?.reshape(&[1])?;
     let mut proposals = Vec::with_capacity(BLOCK);
     for i in 0..BLOCK {
@@ -910,7 +910,7 @@ mod tests {
         let (map, _) =
             apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
         let backend = apxinf_mlx::MlxBackend::new(0)?;
-        let weights = Weights::load(&config, backend.stream(), map)?;
+        let weights = Weights::load(&config, Variant::Compiled, backend.stream(), map)?;
         let target = MiniCpm5::new(config, weights, backend, Variant::DSpark)?;
         let mut model = DSpark::load(target, &draft)?;
         println!(
@@ -1051,7 +1051,7 @@ mod tests {
         let (map, _) =
             apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
         let backend = apxinf_mlx::MlxBackend::new(0)?;
-        let weights = Weights::load(&config, backend.stream(), map)?;
+        let weights = Weights::load(&config, Variant::Compiled, backend.stream(), map)?;
         let target = MiniCpm5::new(config, weights, backend, Variant::DSpark)?;
         let mut model = DSpark::load(target, &draft)?;
         let valid = GenerationOptions::greedy(4, None);
