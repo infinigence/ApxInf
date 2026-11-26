@@ -130,7 +130,8 @@ impl<M: DeviceDecode> Drop for GreedySequence<'_, M> {
 mod tests {
     use super::*;
     use crate::{GenerationCancellation, GenerationOptions, LlmInput, LlmTrait, LoadedModel};
-    use apxinf_core::{Backend, CpuBackend, Device, Tensor, TokenSampler};
+    use apxinf_core::{Backend, Device, Tensor, TokenSampler};
+    use apxinf_cpu::CpuBackend;
     use apxinf_loader::ModelConfig;
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
