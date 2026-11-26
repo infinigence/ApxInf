@@ -156,6 +156,15 @@ recurrence layouts change only the reduction order, not the operation.
 Their tests compare each kernel with MLX operators or a host reference on
 small shapes. They do not qualify the Clef model.
 
+`GdnFusedPrep` runs the d3 Gated DeltaNet operand chain over one read of the
+raw packed projection: the causal depthwise convolution over zero history in
+FP32 tap order, SiLU, the q/k/v split and the official per-head q/k l2-norm
+with sum epsilon `1e-6`. It takes BF16 `x [1, T, C]` and the depthwise taps,
+returns BF16 q, k and v, and rounds each output once where the separately
+composed chain rounds between its steps. Its provenance is EngineTailor (MIT),
+recorded in NOTICE. Its test compares it with the composed MLX chain, which
+qualifies the kernel, not the d3 model.
+
 The Neural Engine boundary kernels are `AneTileHandoff` (padded FP16 rows
 and channel-first tiles) and `AneTileMerge` (both per-token scales plus the
 GPU share); `MppF16Gemm` and `SplitMppF16Gemm` are the Metal 4 projection
