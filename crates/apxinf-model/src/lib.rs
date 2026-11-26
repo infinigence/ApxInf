@@ -56,7 +56,7 @@ pub use d3::{
     D3_DEFAULT_TEXT_PROFILE_LIMIT, D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET,
 };
 pub use decision::{
-    CodeDecisionRuntime, DecisionImage, DecisionInput, DecisionModel, DecisionOutput, DecisionQuestion,
+    CodeDecisionRuntime, DecisionInput, DecisionModel, DecisionOutput, DecisionQuestion,
     DecisionRuntime, DecisionSchema, DecisionScore, SchemaDecisionAnswer, SchemaDecisionOutput,
     SchemaDecisionRuntime, SchemaDecisionScore,
 };

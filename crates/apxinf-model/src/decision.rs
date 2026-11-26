@@ -40,15 +40,6 @@ impl<'a> DecisionInput<'a> {
     }
 }
 
-/// One media item attached to a schema request, in the form the caller has: a
-/// path to a PNG, or the PNG bytes. A family that accepts media decodes and
-/// preprocesses these inside the timed request, so callers never build tensors.
-#[derive(Clone, Copy, Debug)]
-pub enum DecisionImage<'a> {
-    Path(&'a std::path::Path),
-    Png(&'a [u8]),
-}
-
 /// A state and its questions, in request order. The family defines the
 /// meaning of `kind`, `instructions` and `criteria`, and derives each
 /// question's options from them.
