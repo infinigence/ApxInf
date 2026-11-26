@@ -65,7 +65,7 @@ fn real_checkpoint_long_chunk_and_bucket_boundary() -> Result<()> {
     let backend = MlxBackend::new(0)?;
     let (map, _) =
         apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
-    let weights = Weights::load(&config, backend.stream(), map)?;
+    let weights = Weights::load(&config, Variant::Compiled, backend.stream(), map)?;
     let mut model = MiniCpm5::new(config, weights, backend.clone(), Variant::Compiled)?;
     model.prepare(3, 1)?;
     let short = model.prefill(LlmInput::text(&[1, 7, 3]))?;
@@ -125,7 +125,7 @@ fn real_checkpoint_full_forward_retention_and_release() -> Result<()> {
     for cycle in 0..2 {
         let (map, _) =
             apxinf_loader::safetensors::load_native_path(&checkpoint).map_err(Error::Other)?;
-        let weights = Weights::load(&config, backend.stream(), map)?;
+        let weights = Weights::load(&config, Variant::Compiled, backend.stream(), map)?;
         // The observer backend owns only the stream, never weights or a model.
         let mut model = MiniCpm5::new(config.clone(), weights, backend.clone(), Variant::Compiled)?;
         assert_eq!(

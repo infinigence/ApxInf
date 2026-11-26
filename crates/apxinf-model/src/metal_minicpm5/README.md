@@ -28,6 +28,16 @@ decode with the fixed packed residual/norm kernel. Every new KV array and output
 is evaluated before the request state is published; failed preparation cannot
 be reported ready. Changing prepared capacity requires a reset.
 
+`mixed-w8` adds an MLX affine decode copy of every projection, and of the
+untied output head, derived once from the checkpoint at load (group 64;
+`APXINF_MINICPM5_W8_BITS` selects 4 or 6 instead of 8). Only a one-row lane
+projects through the copy; prompt GEMMs stay BF16, so every prefill row keeps
+the `bf16-compiled` result. On the official 2B checkpoint a 128-token decode
+drops from 51.0 to 27.4 ms/token (8-bit) and 15.2 ms/token (4-bit), and peak
+RSS rises from 8.28 to 8.95 GiB. The copy is lossy: greedy output matches BF16
+on short prompts and diverges later on longer ones, so the variant is opt-in and
+`bf16-compiled` stays the default.
+
 `LlmTrait::forward` always returns `[input_tokens, vocabulary]` logits.
 Generation `prefill` consumes prompts up to 4096 tokens in the original shape.
 Longer prompts use 512-token chunks, with a causal mask that includes the prior

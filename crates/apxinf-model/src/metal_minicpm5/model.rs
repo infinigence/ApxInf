@@ -5,7 +5,7 @@ use super::{
         attention_width, prefill_lengths, Config, Variant, DSPARK_CONTEXT_CAPACITY, PREFILL_CHUNK,
     },
     math,
-    weights::Weights,
+    weights::{Linear, Weights},
 };
 use crate::{
     LlmInput, LlmTrait, TextCompilationScope, TextPreparationState, TextPreparationStatus,
@@ -280,7 +280,7 @@ impl MiniCpm5 {
                 } else {
                     math::norm(&x, &w.input_norm, &eps)?
                 };
-                let project = |v: &Array, w: &Array| math::project(v, w, tapped);
+                let project = |v: &Array, w: &Linear| w.project(v, tapped);
                 let q = project(&n, &w.q)?
                     .reshape(&[1, rows, 16, 128])?
                     .transpose(&[0, 2, 1, 3])?;
@@ -317,7 +317,7 @@ impl MiniCpm5 {
                 }
             }
             let (_, normalized) = pack_rows(&x, delta.as_ref().unwrap(), &weights.norm)?;
-            let logits = math::project(&normalized, &weights.head, tapped)?;
+            let logits = weights.head.project(&normalized, tapped)?;
             let mut output = vec![logits];
             output.extend(states);
             if tapped {
@@ -357,18 +357,18 @@ impl MiniCpm5 {
         let mut taps = Vec::new();
         for (i, w) in self.weights.layers.iter().enumerate() {
             let n = self.norm(&x, &w.input_norm)?;
-            let q = n
-                .matmul(&w.q)?
-                .reshape(&[1, rows, 16, 128])?
-                .transpose(&[0, 2, 1, 3])?;
-            let k = n
-                .matmul(&w.k)?
-                .reshape(&[1, rows, 2, 128])?
-                .transpose(&[0, 2, 1, 3])?;
-            let v = n
-                .matmul(&w.v)?
-                .reshape(&[1, rows, 2, 128])?
-                .transpose(&[0, 2, 1, 3])?;
+            let q =
+                w.q.project(&n, false)?
+                    .reshape(&[1, rows, 16, 128])?
+                    .transpose(&[0, 2, 1, 3])?;
+            let k =
+                w.k.project(&n, false)?
+                    .reshape(&[1, rows, 2, 128])?
+                    .transpose(&[0, 2, 1, 3])?;
+            let v =
+                w.v.project(&n, false)?
+                    .reshape(&[1, rows, 2, 128])?
+                    .transpose(&[0, 2, 1, 3])?;
             let q = self.rotate(&q, &cos, &sin)?;
             let k = self.rotate(&k, &cos, &sin)?;
             let keys = previous[2 * i].slice_update(&k, &index, &[2])?;
@@ -383,12 +383,12 @@ impl MiniCpm5 {
                 )?
                 .transpose(&[0, 2, 1, 3])?
                 .reshape(&[1, rows, 2048])?;
-            x = x.add(&attention.matmul(&w.o)?)?;
+            x = x.add(&w.o.project(&attention, false)?)?;
             let n = self.norm(&x, &w.post_norm)?;
-            let gate = n.matmul(&w.gate)?;
-            let up = n.matmul(&w.up)?;
+            let gate = w.gate.project(&n, false)?;
+            let up = w.up.project(&n, false)?;
             let act = self.swiglu.call(&[gate, up])?.remove(0);
-            x = x.add(&act.matmul(&w.down)?)?;
+            x = x.add(&w.down.project(&act, false)?)?;
             states.extend([keys, values]);
             if self.variant == Variant::DSpark && [1, 10, 20, 30, 39].contains(&i) {
                 taps.push(x.clone());
@@ -400,7 +400,7 @@ impl MiniCpm5 {
         } else {
             normalized
         };
-        let mut out = vec![head_input.matmul(&self.weights.head)?];
+        let mut out = vec![self.weights.head.project(&head_input, false)?];
         out.extend(states);
         if self.variant == Variant::DSpark {
             out.push(Array::concat(&taps.iter().collect::<Vec<_>>(), 2)?);
@@ -564,7 +564,9 @@ impl LlmTrait for MiniCpm5 {
         params: &apxinf_core::TokenSamplingParams,
         prompt_end: u32,
     ) -> Result<Box<dyn crate::llm_trait::TokenSequence + 'a>> {
-        if self.variant == Variant::Compiled && crate::mlx_decode::enabled(params) {
+        if matches!(self.variant, Variant::Compiled | Variant::MixedW8)
+            && crate::mlx_decode::enabled(params)
+        {
             let first = self.backend.array(&first)?;
             Ok(Box::new(crate::mlx_decode::GreedySequence::new(
                 self, first, prompt_end,
@@ -608,6 +610,7 @@ impl LlmTrait for MiniCpm5 {
             variant: Some(match self.variant {
                 Variant::Public => "bf16-public",
                 Variant::Compiled => "bf16-compiled",
+                Variant::MixedW8 => "mixed-w8",
                 Variant::DSpark => "dspark-target",
             }),
             compiled_scopes: scopes,

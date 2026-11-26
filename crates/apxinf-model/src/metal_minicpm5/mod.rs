@@ -45,7 +45,7 @@ pub fn load(
     };
     let config = Config::from_json(&std::fs::read_to_string(directory.join("config.json"))?)?;
     let (map, _) = apxinf_loader::safetensors::load_native_path(path).map_err(Error::Other)?;
-    let weights = weights::Weights::load(&config, native.stream(), map)?;
+    let weights = weights::Weights::load(&config, variant, native.stream(), map)?;
     let target = MiniCpm5::new(config, weights, native, variant)?;
     if let Some(draft) = draft {
         Ok(LoadedModel::text(Box::new(DSpark::load(target, draft)?)))
@@ -115,7 +115,10 @@ mod admission_tests {
             admit(&options(Some("bf16-public"), &[])).unwrap().0,
             Variant::Public
         );
-        assert!(admit(&options(Some("mixed-w8"), &[])).is_err());
+        assert_eq!(
+            admit(&options(Some("mixed-w8"), &[])).unwrap().0,
+            Variant::MixedW8
+        );
         assert!(admit(&options(None, &["draft"])).is_err());
         assert!(admit(&options(Some("dspark"), &[])).is_err());
         assert!(admit(&options(Some("dspark"), &["drafter"])).is_err());
