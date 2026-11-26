@@ -147,11 +147,10 @@ fn stage_patched_fa2(native: &Path, fa2_root: &Path, out: &Path) -> PathBuf {
             .unwrap_or_else(|error| panic!("remove {}: {error}", staged.display()));
     }
     copy_tree(&fa2_root.join("flash_attn"), &staged.join("flash_attn"));
-    let mut command = Command::new("patch");
-    command
-        .current_dir(&staged)
-        .args(["--batch", "--forward", "-p0", "-i"])
-        .arg(&patch);
+    let mut command = Command::new(if cfg!(windows) { "git" } else { "patch" });
+    command.current_dir(&staged);
+    if cfg!(windows) { command.args(["apply", "--unsafe-paths", "-p0"]).arg(&patch); }
+    else { command.args(["--batch", "--forward", "-p0", "-i"]).arg(&patch); }
     run(&mut command, "apply FA2 direct-E4M3 patch");
     std::fs::write(&stamp, &key)
         .unwrap_or_else(|error| panic!("write {}: {error}", stamp.display()));
@@ -160,6 +159,7 @@ fn stage_patched_fa2(native: &Path, fa2_root: &Path, out: &Path) -> PathBuf {
 
 fn cuda_library_directories(cuda: &str, cpu_arch: &str) -> Vec<PathBuf> {
     [
+        format!("{cuda}/lib/x64"),
         format!("{cuda}/lib64"),
         format!("{cuda}/lib"),
         format!("{cuda}/targets/{cpu_arch}/lib"),
@@ -229,7 +229,7 @@ fn configure_nvtx(cuda: &str, library_directories: &[PathBuf]) {
             .file(adapter)
             .include(PathBuf::from(cuda).join("include"))
             .compile("apxinf_nvtx");
-        println!("cargo:rustc-link-lib=dl");
+        if !cfg!(windows) { println!("cargo:rustc-link-lib=dl"); }
         println!("cargo:rustc-cfg=nvtx_header");
         return;
     }
@@ -279,7 +279,7 @@ fn main() {
         .unwrap_or_else(|_| "/usr/local/cuda".into());
     let cpu_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let library_directories = cuda_library_directories(&cuda, &cpu_arch);
-    let bundled_nvcc = PathBuf::from(format!("{cuda}/bin/nvcc"));
+    let bundled_nvcc = PathBuf::from(&cuda).join(if cfg!(windows) { "bin/nvcc.exe" } else { "bin/nvcc" });
     if library_directories.is_empty() || !bundled_nvcc.is_file() {
         let id = env::var("APXINF_KERNEL_BUILD_ID")
             .unwrap_or_else(|_| format!("gemm-no-cuda-{}", env!("CARGO_PKG_VERSION")));
@@ -536,7 +536,19 @@ fn main() {
         // Vendored FlashInfer Cake GDN prefill: plain CUDA C++, but it needs
         // the same compute_110a codegen as the CUTLASS group because it emits
         // tcgen05 and TMA. See native/kernels/flashinfer_gdn/README.md.
-        cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+        // sm_120/sm_120a (consumer Blackwell) have no tcgen05, so keep the
+        // unsupported-status stub there (the Cake prefill emits tcgen05).
+        let has_tcgen05 = selection.targets.iter().any(|target| {
+            matches!(
+                target.cutlass_arch.as_str(),
+                "sm_100" | "sm_100a" | "sm_101" | "sm_101a" | "sm_110" | "sm_110a"
+            )
+        });
+        if has_tcgen05 {
+            cutlass_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_launch.cu"));
+        } else {
+            generic_sources.push(native.join("kernels/flashinfer_gdn/flashinfer_gdn_stub.cpp"));
+        }
     } else {
         // No sm100 target: the kernel translation unit is absent, so link the
         // unsupported-status stub in its place (a weak symbol is not enough —
@@ -706,8 +718,9 @@ fn main() {
         let (source, is_cutlass, is_sm110, is_cutlass_sm87, is_cutlass_sm89, is_fa2, is_fa2_e4m3) =
             source;
         let object = out.join(format!(
-            "gemm-{index}-{}.o",
-            source.file_stem().unwrap().to_string_lossy()
+            "gemm-{index}-{}.{}",
+            source.file_stem().unwrap().to_string_lossy(),
+            if cfg!(windows) { "obj" } else { "o" }
         ));
         let mut command = Command::new(&bundled_nvcc);
         command
@@ -715,7 +728,7 @@ fn main() {
             .arg(&source)
             .arg("-o")
             .arg(&object)
-            .args(["--compiler-options", "-fPIC", "-O3", "-std=c++17"])
+            .args(if cfg!(windows) { &["-O3", "-std=c++17"][..] } else { &["--compiler-options", "-fPIC", "-O3", "-std=c++17"][..] })
             .arg(format!("-I{}", native.join("include").display()))
             .arg(format!("-I{}", out.display()));
         // The conv1d adapter carries an optional cuDNN provider.
@@ -733,7 +746,7 @@ fn main() {
             .file_name()
             .is_some_and(|name| name == "tuning_key.cpp")
         {
-            if source.to_string_lossy().contains("/gemm/") {
+            if source.to_string_lossy().replace('\\', "/").contains("/gemm/") {
                 command.arg(format!("-DAPXINF_GEMM_BUILD_ID=\"{id}\""));
             } else {
                 command.arg(format!("-DAPXINF_ATTENTION_BUILD_ID=\"{attention_id}\""));
@@ -913,11 +926,11 @@ fn main() {
         let deps = out.join(format!("gemm-{index}-{stem}.d"));
         let stamp = out.join(format!("gemm-{index}-{stem}.cmdline"));
         let cmdline = nvcc_build::describe_command(&command);
-        if nvcc_build::object_is_current(&object, &deps, &stamp, &cmdline) {
+        if !cfg!(windows) && nvcc_build::object_is_current(&object, &deps, &stamp, &cmdline) {
             objects.push(object);
             continue;
         }
-        command.arg("-MD").arg("-MF").arg(&deps);
+        if !cfg!(windows) { command.arg("-MD").arg("-MF").arg(&deps); }
         jobs.push(nvcc_build::CompileJob {
             command,
             action: format!("compile {}", source.display()),
@@ -928,10 +941,11 @@ fn main() {
     }
     nvcc_build::run_parallel(jobs, workers);
 
-    let archive = out.join("libapxinf_gemm_native.a");
+    let archive = out.join(if cfg!(windows) { "apxinf_gemm_native.lib" } else { "libapxinf_gemm_native.a" });
     let _ = std::fs::remove_file(&archive);
-    let mut ar = Command::new("ar");
-    ar.arg("rcs").arg(&archive).args(&objects);
+    let mut ar = Command::new(if cfg!(windows) { "lib.exe" } else { "ar" });
+    if cfg!(windows) { ar.arg("/NOLOGO").arg(format!("/OUT:{}", archive.display())).args(&objects); }
+    else { ar.arg("rcs").arg(&archive).args(&objects); }
     run(&mut ar, "archive GEMM native objects");
 
     println!("cargo:rustc-link-search=native={}", out.display());
@@ -942,10 +956,10 @@ fn main() {
     println!("cargo:rustc-link-lib=cublasLt");
     println!("cargo:rustc-link-lib=cublas");
     println!("cargo:rustc-link-lib=cudart");
-    println!("cargo:rustc-link-lib=dl");
+    if !cfg!(windows) { println!("cargo:rustc-link-lib=dl"); }
     // The vendored FlashInfer GDN prefill builds its TMA descriptors with
     // cuTensorMapEncodeTiled, which lives in the driver library rather than
     // the runtime.
     println!("cargo:rustc-link-lib=cuda");
-    println!("cargo:rustc-link-lib=stdc++");
+    if !cfg!(windows) { println!("cargo:rustc-link-lib=stdc++"); }
 }

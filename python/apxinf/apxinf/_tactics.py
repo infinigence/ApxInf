@@ -27,10 +27,19 @@ def cuda_sm(device: str) -> int | None:
     else:
         return None
 
-    try:
-        cudart = ctypes.CDLL("libcudart.so")
-    except OSError as error:
-        raise RuntimeError(f"cannot query {device}: failed to load CUDA runtime: {error}") from error
+    import sys
+
+    names = ("cudart64_13.dll", "cudart64_12.dll") if sys.platform == "win32" else ("libcudart.so",)
+    cudart = None
+    last_error: OSError | None = None
+    for name in names:
+        try:
+            cudart = ctypes.CDLL(name)
+            break
+        except OSError as error:
+            last_error = error
+    if cudart is None:
+        raise RuntimeError(f"cannot query {device}: failed to load CUDA runtime: {last_error}") from last_error
 
     # cudaDevAttrComputeCapabilityMajor/Minor from cuda_runtime_api.h.
     def attribute(code: int) -> int:

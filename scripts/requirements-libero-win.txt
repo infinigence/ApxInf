@@ -1,0 +1,20 @@
+# LIBERO closed-loop simulation dependencies for native Windows (Python 3.10).
+# Versions are the set validated with scripts/run-libero-win.ps1 on RTX 5090.
+# Installed by: scripts/build-win.ps1 -Wheel -Libero   (LIBERO itself is cloned, not pip-installed)
+numpy==1.26.4
+scipy==1.15.3
+pillow==12.3.0
+opencv-python==4.11.0.86
+imageio==2.38.0
+h5py==3.16.0
+easydict==1.14
+bddl==1.0.1
+future==1.0.0
+matplotlib==3.10.9
+PyYAML==6.0.3
+gym==0.25.2
+gymnasium==1.4.0
+mujoco==2.3.7
+robosuite==1.4.1
+# LIBERO stores its init states as torch pickles
+torch==2.14.1
