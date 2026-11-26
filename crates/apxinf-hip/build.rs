@@ -38,6 +38,7 @@ const SOURCES: &[&str] = &[
     "norm.hip",
     "elementwise.hip",
     "native_attention.hip",
+    "action_attention.hip",
     "rope.hip",
 ];
 

@@ -112,6 +112,140 @@ __global__ void geglu_kernel(const bf16* gate_up, bf16* y, int64_t rows, int inn
   }
 }
 
+// Vectorized geglu: uint4, eight output elements per thread. The gate and up
+// halves live `inner` elements apart in the same row, so the two uint4 loads
+// are strided by half a row and the store is contiguous; the per-element F32
+// expression (and its evaluation order) is unchanged, so the output is
+// bit-identical to the scalar kernel. That kernel stays as the fallback for
+// `inner % 8 != 0` or tensors that are not 16-byte aligned.
+// Probe (devlocal/pi05-hip/perf/pointwise_probe.cpp, cold ring): language
+// 522x8192 150.6 -> 79.9 us (1.89x), action 10x4096 4.21 -> 3.06 us (1.38x),
+// diffs 0 on both.
+__global__ void geglu_vec_kernel(const bf16* gate_up, bf16* y, int64_t rows, int inner) {
+  const int64_t row_v = inner / 8;  // uint4 units per output row
+  const int64_t vcount = rows * row_v;
+  for (int64_t v = global_index(); v < vcount; v += grid_stride()) {
+    const int64_t row = v / row_v;
+    const int64_t vcol = v - row * row_v;
+    const uint4* gate = reinterpret_cast<const uint4*>(gate_up + row * 2 * inner);
+    const uint4* up = reinterpret_cast<const uint4*>(gate_up + row * 2 * inner + inner);
+    const uint4 gq = gate[vcol], uq = up[vcol];
+    const uint32_t gw[4] = {gq.x, gq.y, gq.z, gq.w};
+    const uint32_t uw[4] = {uq.x, uq.y, uq.z, uq.w};
+    uint32_t r[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int sh = (j & 1) * 16;
+      const float g = bf16_to_f32(static_cast<uint16_t>(gw[j >> 1] >> sh));
+      const float u = bf16_to_f32(static_cast<uint16_t>(uw[j >> 1] >> sh));
+      r[j >> 1] |= static_cast<uint32_t>(f32_to_bf16(gelu_tanh(g) * u)) << sh;
+    }
+    reinterpret_cast<uint4*>(y)[v] = uint4{r[0], r[1], r[2], r[3]};
+  }
+}
+
+// GeGLU writing k-major: yt[inner, stride] where the first `rows` entries of
+// each column strip hold that column's activation (the transpose of
+// `geglu_vec_kernel`'s y), so the down projection runs as op(B)=T over a
+// column-major [rows, inner] activation -- see `apxinf_hip_gemm_nt`. A naive
+// transposed store scatters one thread's eight results across eight rows and
+// measured 2.4x slower than the m-major kernel (pointwise_probe V2T, 272 vs
+// 113 us); this version stages a [128 col x 64 row] tile in LDS and writes
+// each column's rows through 32-B-aligned strips. The reads are the same
+// uint4 pattern, the per-element F32 expression (and its evaluation order)
+// is unchanged, so the element values are bit-identical -- only their
+// address changes.
+//
+// `stride` MUST be a multiple of 16 elements (32 B): with rows=522 the
+// natural stride 522 leaves every strip start at 1044 mod 32 = 20 B, so each
+// 64-B store straddles misaligned 32-B sectors and the partial lines force
+// read-modify-write on eviction -- the full-size cold-output probe
+// (perf/geglu_t_probe.cpp, 2026-11-19) measured the 32-row/64-B variant at
+// 484 us = 106 GB/s on 522x16384 while the m-major kernel runs 230 us.
+// Padding the stride to a multiple of 16 (528, +1.1% memory) plus the wider
+// tile takes the same shape to 314 us = 164 GB/s. The half-size probe that
+// greenlit the 11-18 kernel (522x8192, fixed output buffer) was blind to
+// both effects: its 8.5-MB output lived entirely in L2.
+__global__ void geglu_vec_transposed_kernel(const bf16* gate_up, bf16* yt, int64_t rows,
+                                            int inner, int stride) {
+  constexpr int kTileRows = 64;   // two 32-row halves per read pass
+  constexpr int kTileCols = 128;  // 16 uint4 column groups per tile row
+  constexpr int kLdsCols = kTileCols;
+  constexpr int kLdsRows = kTileRows + 1;  // +1: odd stride, 2-B banks de-conflict
+  __shared__ bf16 tile[kLdsCols][kLdsRows];
+  const int64_t col_blocks = inner / kTileCols;
+  const int64_t row_blocks = (rows + kTileRows - 1) / kTileRows;
+  const int64_t tiles = row_blocks * col_blocks;
+  // One tile per block per iteration: the tile is block-shared state, so
+  // unlike the other kernels here the grid-stride loop strides by blocks,
+  // not by threads.
+  for (int64_t t = blockIdx.x; t < tiles; t += gridDim.x) {
+    const int64_t rb = t / col_blocks;
+    const int64_t cb = t - rb * col_blocks;
+    const int64_t r0 = rb * kTileRows;
+    const int c0 = (int)(cb * kTileCols);
+    const int r_valid = (int)min((int64_t)kTileRows, rows - r0);
+    // Read: 256 threads cover 64 rows x 16 uint4 column groups in four
+    // passes of (row = (tid>>3) + 32*(half&1), colgroup = (half>>1)*8 +
+    // (tid&7)); each pass loads one gate uint4 and one up uint4 -- eight
+    // columns of one row. A warp covers one row's 128-B lines per pass.
+    const int r_in = (int)(threadIdx.x >> 3);
+    const int cg = (int)(threadIdx.x & 7);
+#pragma unroll
+    for (int half = 0; half < 4; ++half) {
+      const int rr = (half & 1) * 32 + r_in;
+      const int cc = (half >> 1) * 8 + cg;  // col group 0..15
+      const int64_t rrow = r0 + (rr < r_valid ? rr : 0);  // clamp: never OOB
+      const uint4* gate =
+          reinterpret_cast<const uint4*>(gate_up + rrow * 2 * inner) + c0 / 8 + cc;
+      const uint4* up =
+          reinterpret_cast<const uint4*>(gate_up + rrow * 2 * inner + inner) + c0 / 8 + cc;
+      const uint4 gq = *gate;
+      const uint4 uq = *up;
+      const uint32_t gw[4] = {gq.x, gq.y, gq.z, gq.w};
+      const uint32_t uw[4] = {uq.x, uq.y, uq.z, uq.w};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int sh = (j & 1) * 16;
+        const float g = bf16_to_f32(static_cast<uint16_t>(gw[j >> 1] >> sh));
+        const float u = bf16_to_f32(static_cast<uint16_t>(uw[j >> 1] >> sh));
+        // Rows past r_valid hold garbage here (their reads were clamped to a
+        // valid row); the write phase masks those lanes out, so it never
+        // escapes.
+        tile[cc * 8 + j][rr] = f32_to_bf16(gelu_tanh(g) * u);
+      }
+    }
+    __syncthreads();
+    // Write: warp w owns columns c0 + w*16 .. +15; each of its sixteen
+    // store instructions writes one column's 64 rows -- lanes = consecutive
+    // ROW PAIRS packed into uint32, 128 B contiguous, starting at a 32-B
+    // aligned strip head. Threads in the tail row block (rows not a
+    // multiple of 64) fall back to scalar row stores.
+    const int w = (int)(threadIdx.x >> 5);
+    const int lane = (int)(threadIdx.x & 31);
+    const bool full = (r_valid == kTileRows) && ((r0 + kTileRows) <= rows);
+    if (full) {
+      const int r_lo = (int)(r0 + 2 * lane);
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const uint32_t lo = tile[w * 16 + j][2 * lane];
+        const uint32_t hi = tile[w * 16 + j][2 * lane + 1];
+        uint32_t* dst =
+            reinterpret_cast<uint32_t*>(yt + (int64_t)(c0 + w * 16 + j) * stride + r_lo);
+        *dst = lo | (hi << 16);
+      }
+    } else {
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        const int col = c0 + w * 16 + j;
+        const bf16 v = tile[w * 16 + j][lane];
+        if (lane < r_valid) yt[(int64_t)col * stride + r0 + lane] = v;
+      }
+    }
+    __syncthreads();
+  }
+}
+
 // y = silu(gate) * up over separate operands -- GR00T's SwiGLU MLP, where the
 // two projections are distinct tensors rather than the packed `gate_up` that
 // `geglu` splits.
@@ -224,34 +358,56 @@ __global__ void rgb_to_patches_kernel(const uint8_t* images, bf16* patches, int 
 // theta^(-pair / half), position = position_offset + token) and copy V.
 // K and V land at row `kv_row_offset + token` of [rows, kv_heads, head_dim]
 // buffers, so the same kernel fills a fresh prefix cache or appends to one.
-// Grid (tokens, q_heads + 2 kv_heads); threads loop over the head's pairs.
+//
+// Grid (tokens); one block covers every head of the token. The (cosine,
+// sine) pair depends only on (pair, position), not on the head, so the
+// per-(token, head)-block form computed each token's 128 pairs once per
+// rotating head — q_heads + kv_heads times — while pi05's language side
+// pays 9x for 601K trig evaluations per call (~10 us of a 36.6 us kernel).
+// The block builds the table in LDS once (the expressions verbatim, so the
+// values are bit-identical), then threads stride the (head, pair) slots.
+// Dynamic LDS: half * 2 floats.
 __global__ void split_qkv_rope_kernel(const bf16* qkv, const bf16* bias, bf16* q, bf16* k,
                                       bf16* v, int q_heads, int kv_heads, int head_dim,
                                       float theta, int position_offset, int kv_row_offset) {
   const int token = blockIdx.x;
-  const int head = blockIdx.y;
   const int half = head_dim / 2;
+  const int heads = q_heads + 2 * kv_heads;
   const int64_t q_width = static_cast<int64_t>(q_heads) * head_dim;
   const int64_t kv_width = static_cast<int64_t>(kv_heads) * head_dim;
   const int64_t row = static_cast<int64_t>(token) * (q_width + 2 * kv_width);
   const int position = position_offset + token;
-  int64_t column;  // offset of this head inside the packed projection
-  bf16* destination;
-  bool rotate = true;
-  if (head < q_heads) {
-    column = static_cast<int64_t>(head) * head_dim;
-    destination = q + (static_cast<int64_t>(token) * q_heads + head) * head_dim;
-  } else if (head < q_heads + kv_heads) {
-    const int h = head - q_heads;
-    column = q_width + static_cast<int64_t>(h) * head_dim;
-    destination = k + (static_cast<int64_t>(kv_row_offset + token) * kv_heads + h) * head_dim;
-  } else {
-    const int h = head - q_heads - kv_heads;
-    column = q_width + kv_width + static_cast<int64_t>(h) * head_dim;
-    destination = v + (static_cast<int64_t>(kv_row_offset + token) * kv_heads + h) * head_dim;
-    rotate = false;
-  }
+
+  extern __shared__ float trig[];  // [2 * half]: cosine then sine.
   for (int pair = threadIdx.x; pair < half; pair += blockDim.x) {
+    const float frequency = powf(theta, -static_cast<float>(pair) / half);
+    float sine, cosine;
+    sincosf(position * frequency, &sine, &cosine);
+    trig[pair] = cosine;
+    trig[half + pair] = sine;
+  }
+  __syncthreads();
+
+  const int slots = heads * half;
+  for (int slot = threadIdx.x; slot < slots; slot += blockDim.x) {
+    const int head = slot / half;
+    const int pair = slot - head * half;
+    int64_t column;  // offset of this head inside the packed projection
+    bf16* destination;
+    bool rotate = true;
+    if (head < q_heads) {
+      column = static_cast<int64_t>(head) * head_dim;
+      destination = q + (static_cast<int64_t>(token) * q_heads + head) * head_dim;
+    } else if (head < q_heads + kv_heads) {
+      const int h = head - q_heads;
+      column = q_width + static_cast<int64_t>(h) * head_dim;
+      destination = k + (static_cast<int64_t>(kv_row_offset + token) * kv_heads + h) * head_dim;
+    } else {
+      const int h = head - q_heads - kv_heads;
+      column = q_width + kv_width + static_cast<int64_t>(h) * head_dim;
+      destination = v + (static_cast<int64_t>(kv_row_offset + token) * kv_heads + h) * head_dim;
+      rotate = false;
+    }
     float first = ld(qkv, row + column + pair);
     float second = ld(qkv, row + column + half + pair);
     if (bias != nullptr) {
@@ -259,9 +415,8 @@ __global__ void split_qkv_rope_kernel(const bf16* qkv, const bf16* bias, bf16* q
       second += ld(bias, column + half + pair);
     }
     if (rotate) {
-      const float frequency = powf(theta, -static_cast<float>(pair) / half);
-      float sine, cosine;
-      sincosf(position * frequency, &sine, &cosine);
+      const float cosine = trig[pair];
+      const float sine = trig[half + pair];
       destination[pair] = f32_to_bf16(first * cosine - second * sine);
       destination[half + pair] = f32_to_bf16(second * cosine + first * sine);
     } else {
@@ -483,8 +638,45 @@ extern "C" int apxinf_hip_native_bias_activation(const void* x, const void* bias
 extern "C" int apxinf_hip_native_geglu(const void* gate_up, void* y, int64_t rows, int inner,
                                        void* stream) {
   if (rows <= 0 || inner <= 0) return kInvalidArgument;
+  // The vectorized kernel's per-row unit count requires `inner % 8 == 0`, and
+  // uint4 requires 16-byte alignment of both halves of every row, which the
+  // base pointer and an even `inner` together provide (`inner` is a multiple
+  // of 8, so the up half starts at a multiple of 16 bytes into the row).
+  if (inner % 8 == 0 && (reinterpret_cast<uintptr_t>(gate_up) & 15u) == 0 &&
+      (reinterpret_cast<uintptr_t>(y) & 15u) == 0) {
+    geglu_vec_kernel<<<elementwise_grid(rows * (inner / 8)), kElementwiseBlock, 0,
+                       as_stream(stream)>>>(in(gate_up), out(y), rows, inner);
+    return last_launch_status();
+  }
   geglu_kernel<<<elementwise_grid(rows * inner), kElementwiseBlock, 0, as_stream(stream)>>>(
       in(gate_up), out(y), rows, inner);
+  return last_launch_status();
+}
+
+// `apxinf_hip_native_geglu` with the output stored k-major: y^T[inner, stride]
+// with `stride >= rows` the caller's padded row count (see the kernel's
+// comment for why the padding exists). Feeds `apxinf_hip_gemm_nt`; see the
+// kernels' comments for why one shape wants the pair.
+extern "C" int apxinf_hip_native_geglu_transposed(const void* gate_up, void* yt, int64_t rows,
+                                                  int inner, int stride, void* stream) {
+  if (rows <= 0 || inner <= 0) return kInvalidArgument;
+  if (rows > (1 << 30)) return kInvalidArgument;
+  // The tiled kernel's contracts: `inner % 128 == 0` for whole column tiles,
+  // `stride % 16 == 0 && stride >= rows` for the 32-B-aligned strips,
+  // `rows <= 4096` for the int row arithmetic, and 16-byte alignment for the
+  // uint4 loads. Every geglu width in π0.5 is a multiple of 128 (language
+  // 16384), so the m-major kernel stays the general fallback.
+  if (inner % 128 != 0 || stride % 16 != 0 || stride < rows ||
+      (reinterpret_cast<uintptr_t>(gate_up) & 15u) != 0) {
+    return kInvalidArgument;
+  }
+  const int64_t tiles = ((rows + 63) / 64) * (inner / 128);
+  // `tiles * kElementwiseBlock` asks for one block per tile;
+  // `elementwise_grid` caps it at kMaxGrid and the kernel's per-block loop
+  // covers the rest.
+  geglu_vec_transposed_kernel<<<elementwise_grid(tiles * kElementwiseBlock),
+                                kElementwiseBlock, 0, as_stream(stream)>>>(
+      in(gate_up), out(yt), rows, inner, stride);
   return last_launch_status();
 }
 
@@ -590,8 +782,8 @@ extern "C" int apxinf_hip_native_split_qkv_rope(const void* qkv, const void* bia
     return kInvalidArgument;
   }
   const int half = head_dim / 2;
-  const int block = half >= kAttentionBlock ? kAttentionBlock : ((half + 31) / 32) * 32;
-  split_qkv_rope_kernel<<<dim3(tokens, q_heads + 2 * kv_heads), block, 0, as_stream(stream)>>>(
+  const int block = 512;
+  split_qkv_rope_kernel<<<tokens, block, half * 2 * sizeof(float), as_stream(stream)>>>(
       in(qkv), in(bias), out(q), out(k), out(v), q_heads, kv_heads, head_dim, theta,
       position_offset, kv_row_offset);
   return last_launch_status();

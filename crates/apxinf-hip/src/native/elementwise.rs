@@ -166,6 +166,36 @@ pub fn geglu(ctx: &HipContext, gate_up: &Tensor, out: &Tensor) -> Result<()> {
     })
 }
 
+/// [`geglu`](self::geglu) with the output stored k-major:
+/// `out^T[inner, stride]` where the first `rows` entries of each column
+/// strip hold that column's activation, for the GEMM that
+/// [`crate::native::gemm_nt`] consumes (with the strip stride as its
+/// leading dimension). Same math, same rounding, element order unchanged --
+/// only the store layout moves. `out_t`'s row count is the strip stride:
+/// the caller pads `rows` up to a multiple of 16 so every strip starts on a
+/// 32-B boundary (see the kernel's comment for why).
+pub fn geglu_transposed(ctx: &HipContext, gate_up: &Tensor, out_t: &Tensor) -> Result<()> {
+    let (rows, packed) = rows_cols(gate_up)?;
+    let (inner, stride) = rows_cols(out_t)?;
+    if packed != 2 * inner || stride < rows || stride % 16 != 0 {
+        return Err(Error::ShapeMismatch {
+            expected: format!("[{inner}, {rows} padded to a multiple of 16] from [{rows}, {packed}]"),
+            got: out_t.shape().to_string(),
+        });
+    }
+    let (pg, py) = (bf16_ptr(ctx, gate_up)?, bf16_ptr(ctx, out_t)?);
+    check("geglu_transposed", unsafe {
+        ffi::apxinf_hip_native_geglu_transposed(
+            pg,
+            py,
+            long(rows)?,
+            int(inner)?,
+            int(stride)?,
+            ctx.stream(),
+        )
+    })
+}
+
 /// One explicit-Euler flow step: `out = state + dt * velocity`.
 pub fn euler_update(
     ctx: &HipContext,

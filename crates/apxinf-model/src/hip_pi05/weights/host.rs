@@ -17,7 +17,7 @@ use std::path::Path;
 use apxinf_core::{DType, Error, Result, Tensor};
 use half::bf16;
 
-use super::config::{Config, GemmaConfig};
+use super::super::config::{Config, GemmaConfig};
 
 const ROOT: &str = "paligemma_with_expert";
 

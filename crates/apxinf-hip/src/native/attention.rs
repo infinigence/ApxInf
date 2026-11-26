@@ -38,7 +38,7 @@ use super::{bf16_ptr, int, long, require_numel};
 use crate::ffi::{self, check, DTYPE_BF16};
 use crate::runtime::HipContext;
 
-/// Which provider served each attention call, as `(apxinf, CK)`.
+/// Which provider served each attention call, as `(apxinf, CK, folded)`.
 ///
 /// The fallback is silent by design -- a causal call, or a build without the
 /// vendored CK, lands on apxinf's kernel and returns the right answer -- so
@@ -46,19 +46,21 @@ use crate::runtime::HipContext;
 /// that found no speedup. The same reasoning as the GEMM's dispatch counters,
 /// and the same hazard: a test asserting "CK matches the reference" passes
 /// most convincingly when CK never ran.
-static DISPATCHES: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+static DISPATCHES: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
 
-/// `(apxinf, CK)` attention dispatch counts since [`reset_attention_counts`].
-pub fn attention_counts() -> (usize, usize) {
+/// `(apxinf, CK, folded)` attention dispatch counts since [`reset_attention_counts`].
+pub fn attention_counts() -> (usize, usize, usize) {
     (
         DISPATCHES[0].load(Ordering::Relaxed),
         DISPATCHES[1].load(Ordering::Relaxed),
+        DISPATCHES[2].load(Ordering::Relaxed),
     )
 }
 
 pub fn reset_attention_counts() {
     DISPATCHES[0].store(0, Ordering::Relaxed);
     DISPATCHES[1].store(0, Ordering::Relaxed);
+    DISPATCHES[2].store(0, Ordering::Relaxed);
 }
 
 /// apxinf's own kernel, bypassing provider selection.
@@ -90,14 +92,28 @@ fn ck_enabled() -> bool {
             .as_str()
         {
             "apxinf" | "native" => false,
-            "" | "ck" | "auto" => true,
+            "" | "folded" | "auto" => true,
             other => {
                 eprintln!(
-                    "apxinf-hip: APXINF_HIP_ATTENTION={other} is not ck or apxinf; using ck"
+                    "apxinf-hip: APXINF_HIP_ATTENTION={other} is not folded or apxinf; using ck"
                 );
                 true
             }
         }
+    })
+}
+
+/// Whether the folded pair may serve its geometries, from
+/// `APXINF_HIP_ATTENTION`: an explicit `ck` asks for CK's providers and is
+/// the A/B control that runs the split-KV path the folded pair replaced.
+/// `apxinf` already forces the reference kernel for every provider, so only
+/// `ck` needs its own answer here.
+fn folded_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("APXINF_HIP_ATTENTION")
+            .map(|v| !v.trim().eq_ignore_ascii_case("ck"))
+            .unwrap_or(true)
     })
 }
 
@@ -127,6 +143,13 @@ pub enum AttentionKernel {
     /// CK split-KV forward: keys split across `splits` workgroups per query
     /// tile, then combined. Needs [`attention_scratch_elements`] F32 scratch.
     CkSplitKv { splits: usize },
+    /// apxinf's folded flash-decoding pair (`kernels/action_attention.hip`):
+    /// query heads sharing one KV head fold into rows, K/V is read ~once, and
+    /// the split reduction lands in one combine kernel. Needs
+    /// [`attention_scratch_elements`] F32 scratch. Serves pi05's action
+    /// expert, where it measured 1.4x faster than `CkSplitKv` plus its
+    /// combine (probe `devlocal/pi05-hip/perf/attention_probe.cpp`).
+    Folded,
 }
 
 /// Key splits for CK split-KV. 4 measured fastest for pi05's action expert
@@ -146,10 +169,27 @@ const SPLITKV_SPLITS: usize = 4;
 /// instances are head dim 256 only. Split-KV pays off when few query rows face
 /// many keys: one 16-row query tile per head cannot fill the GPU. Its
 /// instances are unmasked, so a causal geometry takes the fused path instead.
+///
+/// `Folded` takes the small-GQA slice of that split-KV case — one batch, one
+/// KV head, few query rows — and runs the pair from
+/// `kernels/action_attention.hip` instead. That kernel is head-dim-256,
+/// q-rows-a-multiple-of-8, wave32 specialized, so the gate stays narrow and
+/// everything outside it keeps the CK path.
 pub fn attention_kernel(arch: &str, geometry: &AttentionGeometry) -> AttentionKernel {
     let g = geometry;
     if g.head_dim > 256 || !g.head_dim.is_multiple_of(8) {
         return AttentionKernel::Reference;
+    }
+    if g.causal_query_start.is_none()
+        && g.batch == 1
+        && g.kv_heads == 1
+        && g.head_dim == 256
+        && g.q_tokens * g.q_heads % 8 == 0
+        && g.q_tokens * g.q_heads <= 128
+        && g.kv_tokens >= 64
+        && arch.starts_with("gfx11")
+    {
+        return AttentionKernel::Folded;
     }
     if g.causal_query_start.is_none()
         && g.head_dim == 256
@@ -168,15 +208,18 @@ pub fn attention_kernel(arch: &str, geometry: &AttentionGeometry) -> AttentionKe
 }
 
 /// F32 scratch elements `kernel` needs for `geometry`: split-KV's partial
-/// log-sum-exps and outputs; zero for the other kernels. The log-sum-exp block
-/// is padded to 64 elements so the output block starts 256-byte aligned.
+/// log-sum-exps and outputs, or the folded pair's per-(row, split) partials;
+/// zero for the other kernels. The split-KV log-sum-exp block is padded to 64
+/// elements so the output block starts 256-byte aligned.
 pub fn attention_scratch_elements(geometry: &AttentionGeometry, kernel: AttentionKernel) -> usize {
     match kernel {
         AttentionKernel::CkSplitKv { splits } => {
             let rows = geometry.batch * geometry.q_heads * splits * geometry.q_tokens;
             rows.next_multiple_of(64) + rows * geometry.head_dim
         }
-        _ => 0,
+        // `q_rows * 8 * (256 + 2)`: the folded pair's kernel constants.
+        AttentionKernel::Folded => geometry.batch * geometry.q_tokens * geometry.q_heads * 8 * 258,
+        AttentionKernel::Reference | AttentionKernel::Ck => 0,
     }
 }
 
@@ -225,6 +268,18 @@ pub fn attention(
         }
         AttentionKernel::CkSplitKv { splits } => {
             if launch_ck_splitkv(ctx, geometry, &bound, splits, scratch)? {
+                return Ok(());
+            }
+            launch_native(ctx, geometry, &bound, geometry.q_heads * geometry.head_dim)
+        }
+        AttentionKernel::Folded => {
+            // An explicit `APXINF_HIP_ATTENTION=ck` is the A/B control: CK's
+            // split-KV is the path this pair replaced. On a missing scratch,
+            // graceful degradation: CK's split-KV fits in less than the folded
+            // scratch, so the allocation the caller made covers it.
+            if (folded_enabled() && launch_folded(ctx, geometry, &bound, scratch)?)
+                || launch_ck_splitkv(ctx, geometry, &bound, SPLITKV_SPLITS, scratch)?
+            {
                 return Ok(());
             }
             launch_native(ctx, geometry, &bound, geometry.q_heads * geometry.head_dim)
@@ -440,6 +495,49 @@ fn launch_native(
             ctx.stream(),
         )
     })
+}
+
+/// apxinf's folded flash-decoding pair (`kernels/action_attention.hip`).
+///
+/// The geometry gate in [`attention_kernel`] guarantees everything the C entry
+/// validates; `scratch` missing is the one runtime gap, returned as `false`
+/// for the split-KV fallback. q here is a whole contiguous tensor — the packed
+/// projection path never routes to `Folded`.
+fn launch_folded(
+    ctx: &HipContext,
+    geometry: &AttentionGeometry,
+    bound: &Bound,
+    scratch: Option<&Tensor>,
+) -> Result<bool> {
+    let Some(scratch) = scratch else {
+        return Ok(false);
+    };
+    let q_rows = geometry.batch * geometry.q_tokens * geometry.q_heads;
+    let needed = attention_scratch_elements(geometry, AttentionKernel::Folded);
+    if scratch.dtype() != DType::F32 || scratch.numel() < needed {
+        return Err(Error::ShapeMismatch {
+            expected: format!("at least {needed} f32 scratch elements"),
+            got: format!("{} {}", scratch.shape(), scratch.dtype()),
+        });
+    }
+    let base = ctx.ptr(scratch)?;
+    let scale = 1.0 / (geometry.head_dim as f32).sqrt();
+    check("attention (folded)", unsafe {
+        ffi::apxinf_hip_folded_attention(
+            bound.q,
+            bound.k,
+            bound.v,
+            bound.out,
+            base,
+            int(q_rows)?,
+            int(geometry.kv_tokens)?,
+            long(bound.kv_token_stride)?,
+            scale,
+            ctx.stream(),
+        )
+    })?;
+    DISPATCHES[2].fetch_add(1, Ordering::Relaxed);
+    Ok(true)
 }
 
 /// CK's fused flash-attention forward, `rows` query rows of `heads` heads at
