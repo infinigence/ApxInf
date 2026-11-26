@@ -96,6 +96,12 @@ fn admit(options: &LoadOptions) -> Result<(Variant, Option<&Path>)> {
     Ok((variant, draft))
 }
 
+/// Admission entry for the `metal_` registry table, so an unknown variant is
+/// rejected before `AutoModel` constructs a device.
+pub fn admission(options: &LoadOptions) -> Result<()> {
+    admit(options).map(drop)
+}
+
 #[cfg(test)]
 mod admission_tests {
     use super::*;

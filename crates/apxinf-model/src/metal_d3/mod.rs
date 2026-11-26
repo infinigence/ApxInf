@@ -72,6 +72,12 @@ fn admit(options: &LoadOptions) -> Result<ProfileLimits> {
     ProfileLimits::text(options)
 }
 
+/// Admission entry for the `metal_` registry table, so an unknown variant is
+/// rejected before `AutoModel` constructs a device.
+pub fn admission(options: &LoadOptions) -> Result<()> {
+    admit(options).map(drop)
+}
+
 /// `registry::ModelFactory` entry point, resolved by `AutoModel` for
 /// `Device::Metal` from the detected `d3` name or `--model-name metal_d3`.
 pub fn load(

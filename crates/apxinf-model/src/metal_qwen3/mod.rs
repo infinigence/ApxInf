@@ -53,6 +53,12 @@ fn admit(options: &LoadOptions) -> Result<Variant> {
     Variant::parse(options.model_variant.as_deref())
 }
 
+/// Admission entry for the `metal_` registry table, so an unknown variant is
+/// rejected before `AutoModel` constructs a device.
+pub fn admission(options: &LoadOptions) -> Result<()> {
+    admit(options).map(drop)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
