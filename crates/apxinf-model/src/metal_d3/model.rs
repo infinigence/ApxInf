@@ -12,13 +12,14 @@
 //!
 //! `GatedDeltaRecurrence` (four value rows per SIMD group) and `HalfSplitRope`
 //! (FP32 angles, one rounding to the input dtype) are the apxinf-mlx kernels
-//! for those primitives. The causal convolution is MLX `conv1d` over an
-//! explicit zero history.
+//! for those primitives. One `GdnFusedPrep` pass over the raw qkv row runs the
+//! causal depthwise convolution over `S - 1` zero rows, SiLU, the q/k/v split
+//! and the q/k l2-norm in FP32, rounding each output once.
 
 use std::rc::Rc;
 
 use apxinf_core::{Error, Result};
-use apxinf_mlx::fusions::{GatedDeltaRecurrence, HalfSplitRope};
+use apxinf_mlx::fusions::{GatedDeltaRecurrence, GdnFusedPrep, HalfSplitRope};
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 
 use super::config::{Config, Geometry, MAX_INPUT_TOKENS};
@@ -38,6 +39,7 @@ struct Parts {
     video_token_id: u32,
     vision_merge: usize,
     recurrence: GatedDeltaRecurrence,
+    fused_prep: GdnFusedPrep,
     rope: HalfSplitRope,
     inv_freq: Array,
     stream: Stream,
@@ -106,6 +108,15 @@ impl Model {
             video_token_id: config.video_token_id,
             vision_merge: config.vision.spatial_merge,
             recurrence: GatedDeltaRecurrence::new(&stream)?,
+            fused_prep: GdnFusedPrep::new(
+                &stream,
+                geometry.k_heads,
+                geometry.k_dim,
+                geometry.v_heads,
+                geometry.v_dim,
+                geometry.conv_kernel,
+                geometry.conv_dim(),
+            )?,
             rope: HalfSplitRope::new(&stream, geometry.rope_dims)?,
             inv_freq: inverse_frequencies(&stream, geometry)?,
             stream,
@@ -656,9 +667,7 @@ fn gated_delta_forward(
     length: usize,
 ) -> Result<Array> {
     let geometry = parts.geometry;
-    let key_dim = geometry.key_dim();
     let value_dim = geometry.value_dim();
-    let conv_dim = geometry.conv_dim();
     let qkv = project(input, &gated_delta.qkv.weight)?;
     let z = project(input, &gated_delta.z.weight)?.reshape(&[
         1,
@@ -668,45 +677,12 @@ fn gated_delta_forward(
     ])?;
     let b = project(input, &gated_delta.b.weight)?;
     let a = project(input, &gated_delta.a.weight)?;
-    // Stock reference: a depthwise causal convolution over `S - 1` zero rows.
-    let history = Array::zeros(
-        &parts.stream,
-        &[1, geometry.conv_kernel - 1, conv_dim],
-        qkv.dtype(),
-    )?;
-    let convolved =
-        Array::concat(&[&history, &qkv], 1)?.conv1d(&gated_delta.conv, 1, 0, 1, conv_dim)?;
-    let convolved = silu(&convolved)?;
-    let queries = convolved.slice_axis(2, 0, key_dim)?.reshape(&[
-        1,
-        length,
-        geometry.k_heads,
-        geometry.k_dim,
-    ])?;
-    let keys = convolved.slice_axis(2, key_dim, 2 * key_dim)?.reshape(&[
-        1,
-        length,
-        geometry.k_heads,
-        geometry.k_dim,
-    ])?;
-    let values = convolved.slice_axis(2, 2 * key_dim, conv_dim)?.reshape(&[
-        1,
-        length,
-        geometry.v_heads,
-        geometry.v_dim,
-    ])?;
-    // Official GDN q/k l2-norm: `x * rsqrt(sum(x^2) + 1e-6)`, written as an
-    // RMSNorm whose epsilon is on the mean (`1e-6 / k_dim`), then scaled by
-    // `k_dim^-1` for q and `k_dim^-0.5` for k. The mlx-lm variant uses a mean
-    // epsilon of `1e-6` and differs enough to move the probabilities; the
-    // checkpoint's own model uses this form.
-    let mean_epsilon = 1e-6 / geometry.k_dim as f32;
-    let queries = queries
-        .fast_rms_norm_unweighted(mean_epsilon)?
-        .mul(&scalar(&queries, (geometry.k_dim as f64).powf(-1.0))?)?;
-    let keys = keys
-        .fast_rms_norm_unweighted(mean_epsilon)?
-        .mul(&scalar(&keys, (geometry.k_dim as f64).powf(-0.5))?)?;
+    // One pass over the raw qkv row: the causal depthwise convolution over
+    // `S - 1` zero rows, SiLU, the q/k/v split and the official q/k l2-norm
+    // (`x * rsqrt(sum(x^2) + 1e-6)`, q scaled by `k_dim^-0.5`, k unit scale).
+    // The kernel keeps the chain in FP32 and rounds each output to BF16 once;
+    // the separately composed chain rounds between the steps.
+    let (queries, keys, values) = parts.fused_prep.call(&qkv, &gated_delta.conv)?;
     let (decay, beta) = decay_beta(&gated_delta.a_log, &a, &b, &gated_delta.dt_bias)?;
     let state = Array::zeros(
         &parts.stream,

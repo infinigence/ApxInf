@@ -29,6 +29,8 @@ mod gate_swiglu;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod gated_delta;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod gdn_fused_prep;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod half_split_rope;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod interleaved_qk_norm_rope;
