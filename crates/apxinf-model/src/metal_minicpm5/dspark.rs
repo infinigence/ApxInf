@@ -711,6 +711,8 @@ impl DSpark {
 }
 
 impl LlmTrait for DSpark {
+    fn sequence_capacity(&self) -> Option<usize> { Some(DSPARK_CONTEXT_CAPACITY) }
+
     fn load(_: ModelConfig, _: HashMap<String, Tensor>, _: Device) -> Result<Self> {
         Err(Error::Contract(
             "load DSpark with AutoModel and the official draft snapshot asset",
@@ -799,6 +801,14 @@ impl LlmTrait for DSpark {
             return Err(Error::Contract("DSpark is text-only"));
         }
         self.forward(input.token_ids, 0)
+    }
+    fn generate_streaming_cancellable_dyn(
+        &mut self,
+        _request: GenerationRequest<'_>,
+        _cancel: &crate::GenerationCancellation,
+        _on_token: &mut dyn FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        Err(Error::UnsupportedOp("DSpark cancellation"))
     }
     fn generate_streaming_with_options_dyn(
         &mut self,

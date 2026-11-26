@@ -17,6 +17,8 @@ pub fn register_builtin_models() {
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_clef", crate::metal_clef::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    registry::register("metal_d3", crate::metal_d3::load);
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_minicpm5", crate::metal_minicpm5::load);
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
     registry::register("metal_qwen3", crate::metal_qwen3::load);
@@ -54,6 +56,8 @@ pub fn register_builtin_models() {
     crate::cuda_cosmos_policy::register_builtin();
     #[cfg(feature = "cuda")]
     crate::cuda_minimax_h3_image::register_builtin();
+    #[cfg(feature = "cuda")]
+    registry::register("gpt_sovits", crate::cuda_gpt_sovits::load::load);
 }
 fn load_llama(
     path: &Path,
@@ -92,9 +96,11 @@ fn load_qwen3vl(
         path.parent().unwrap_or_else(|| Path::new("."))
     };
     let config = Qwen3VLConfig::from_json_file(&model_dir.join("config.json"))?;
+    let contract = crate::vision_preprocess::VisionContract::from_dir(model_dir, "qwen3vl", 1, DType::BF16)?;
     let (tensors, _) = apxinf_loader::safetensors::load_native_path(path)
         .map_err(|error| Error::Other(format!("load {}: {error}", path.display())))?;
-    let model = GeneralQwen3VL::from_weights_with_backend(config, tensors, backend)?;
+    let mut model = GeneralQwen3VL::from_weights_with_backend(config, tensors, backend)?;
+    model.set_vision_contract(contract);
     Ok(LoadedModel::text(Box::new(model)))
 }
 
@@ -138,16 +144,26 @@ fn load_qwen38(
     _backend: Arc<dyn Backend>,
     options: &LoadOptions,
 ) -> Result<LoadedModel> {
+    let model_dir = if path.is_dir() { path } else { path.parent().unwrap_or(Path::new(".")) };
     let (tensors, metadata) = apxinf_loader::safetensors::load_native_path(path)
         .map_err(|error| Error::Other(format!("load {}: {error}", path.display())))?;
     let config = apxinf_loader::safetensors::config_from_metadata(&metadata);
     let recipe = crate::auto::cuda_recipe_options(options)?;
-    let model = crate::qwen38::Qwen38::load_with_recipe_options(
+    let contract = if tensors.contains_key("model.visual.patch_embed.proj.weight") {
+        let contract = crate::vision_preprocess::VisionContract::from_dir(model_dir, "qwen38", 1, DType::BF16)?;
+        // The maintained Qwen38 kernel surface supports this checkpoint geometry.
+        if (contract.patch_size, contract.temporal_patch_size, contract.spatial_merge_size) != (16, 2, 2) {
+            return Err(Error::Other("preprocessor_config.json: unsupported patch_size/temporal_patch_size/merge_size for qwen38".into()));
+        }
+        Some(contract)
+    } else { None };
+    let mut model = crate::qwen38::Qwen38::load_with_recipe_options(
         config,
         tensors,
         device,
         recipe.online_tune,
         recipe.cache_dir,
     )?;
+    if let Some(contract) = contract { model.set_vision_contract(contract); }
     Ok(LoadedModel::text(Box::new(model)))
 }

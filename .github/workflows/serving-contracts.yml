@@ -1,0 +1,31 @@
+name: LLM/VLM serving contracts
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'crates/apxinf-serving/**'
+      - 'crates/apxinf-tokenizer/**'
+      - 'crates/apxinf-model/**'
+      - 'crates/apxinf-core/**'
+      - 'crates/apxinf-cpu/**'
+      - 'crates/apxinf-loader/**'
+      - '.github/workflows/serving-contracts.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  serving-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --package apxinf-serving -- --check
+      - run: cargo test --locked -p apxinf-serving -p apxinf-tokenizer --no-default-features
+      - run: cargo test --locked -p apxinf --features server --no-default-features
+      - run: cargo check --locked -p apxinf --no-default-features
+      - run: cargo test --locked -p apxinf-model --no-default-features --test vision_preprocessing --no-run
+      - run: cargo test --offline --locked -p apxinf-model --no-default-features --test vision_preprocessing

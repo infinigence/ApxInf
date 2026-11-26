@@ -9,7 +9,7 @@ mod sample;
 mod talker;
 mod weights;
 
-use crate::speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
+use crate::tts_trait::{GeneratedAudio, TtsContract, TtsRequest, TtsTrait};
 use crate::{LoadOptions, LoadedModel, ModelPrecision};
 use apxinf_core::{Backend, Device, Error, Result};
 use apxinf_mlx::{Array, MlxBackend};
@@ -121,7 +121,7 @@ pub fn load(
     let (talker, predictor) = weights::Talker::load(&stream, path)?;
     let model = Model::new(talker, predictor, &ops, fused)?;
     let decoder = codec::Decoder::new(weights::Codec::load(&stream, path)?, &ops)?;
-    Ok(LoadedModel::Speech(Box::new(QwenTts {
+    Ok(LoadedModel::Tts(Box::new(QwenTts {
         config,
         tokenizer,
         model,
@@ -132,21 +132,22 @@ pub fn load(
 }
 
 /// Request admission, before any device work.
-fn admit_request(config: &Config, request: &SpeechRequest<'_>) -> Result<()> {
+fn admit_request(config: &Config, request: &TtsRequest<'_>) -> Result<()> {
     if request.text.trim().is_empty() {
         return Err(Error::Contract("Qwen3-TTS needs nonempty text"));
     }
-    if !config.voices.contains_key(&request.voice.to_lowercase()) {
+    let voice = request.sampling.voice.unwrap_or("");
+    if !config.voices.contains_key(&voice.to_lowercase()) {
         return Err(Error::Other(format!(
             "Qwen3-TTS has no voice `{}`; supported: {}",
-            request.voice,
+            voice,
             config.voices.keys().cloned().collect::<Vec<_>>().join(", ")
         )));
     }
-    if !config.supports_language(request.language) {
+    if !config.supports_language(request.sampling.language.unwrap_or("")) {
         return Err(Error::Other(format!(
             "Qwen3-TTS does not support language `{}`",
-            request.language
+            request.sampling.language.unwrap_or("")
         )));
     }
     Ok(())
@@ -202,7 +203,7 @@ impl QwenTts {
     /// The non-streaming prefill `[1, L, 2048]` and the TTS pad embedding: the
     /// mlx-audio speaker/language/instruction prefix with its streaming text
     /// suffix replaced by the official non-streaming layout.
-    fn prefill(&self, request: &SpeechRequest<'_>) -> Result<(Array, Array)> {
+    fn prefill(&self, request: &TtsRequest<'_>) -> Result<(Array, Array)> {
         let t = self.config.tokens;
         let chat = format!(
             "<|im_start|>assistant\n{}<|im_end|>\n<|im_start|>assistant\n",
@@ -216,8 +217,11 @@ impl QwenTts {
         // [TTS BOS, EOS, pad] projected together; the EOS row is unused here.
         let tts = self.text(&[t.tts_bos as i32, t.tts_eos as i32, t.tts_pad as i32])?;
         let (bos, pad) = (tts.slice_axis(1, 0, 1)?, tts.slice_axis(1, 2, 3)?);
-        let voice = self.config.voices[&request.voice.to_lowercase()];
-        let prefix = match self.config.language_id(request.language, request.voice) {
+        let voice = self.config.voices[&request.sampling.voice.unwrap_or("").to_lowercase()];
+        let prefix = match self.config.language_id(
+            request.sampling.language.unwrap_or(""),
+            request.sampling.voice.unwrap_or(""),
+        ) {
             None => vec![t.nothink, t.think_bos, t.think_eos],
             Some(language) => vec![t.think, t.think_bos, language, t.think_eos],
         };
@@ -234,8 +238,8 @@ impl QwenTts {
         let combined = Array::concat(&[&pads, &bos], 1)?.add(&codec.slice_axis(1, 0, n - 1)?)?;
         let role = text_embed.slice_axis(1, 0, 3)?;
         let mut parts = Vec::new();
-        if !request.instruction.is_empty() {
-            let instruct = format!("<|im_start|>user\n{}<|im_end|>\n", request.instruction);
+        if let Some(instruction) = request.sampling.instruction.filter(|v| !v.is_empty()) {
+            let instruct = format!("<|im_start|>user\n{}<|im_end|>\n", instruction);
             parts.push(self.text(&self.ids(&instruct)?)?);
         }
         parts.extend([role, combined]);
@@ -282,8 +286,16 @@ impl QwenTts {
     }
 }
 
-impl SpeechRuntime for QwenTts {
-    fn synthesize(&mut self, request: &SpeechRequest<'_>) -> Result<GeneratedAudio> {
+impl TtsTrait for QwenTts {
+    fn contract(&self) -> Result<TtsContract> {
+        Ok(TtsContract {
+            sample_rate: codec_config::SAMPLE_RATE,
+            mel_frames_per_second: 0,
+            semantic_frames_per_second: 0,
+        })
+    }
+
+    fn synthesize(&mut self, request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
         admit_request(&self.config, request)?;
         let stream = self.ops.stream().clone();
         self.sampler.seed(request.seed)?;

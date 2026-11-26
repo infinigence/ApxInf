@@ -22,8 +22,6 @@ use apxinf_core::Device;
 use apxinf_model::{AutoModel, DecisionSchema, LoadOptions};
 use serde_json::{json, Map, Value};
 
-const CACHE_LIMIT_BYTES: usize = 1 << 30;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let model_dir = PathBuf::from(args.next().ok_or("missing model directory")?);
@@ -121,11 +119,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         serde_json::to_writer(&mut writer, &result)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
-        // Between requests only reused buffers are cached; bound them so the
-        // cache does not push a 16 GB host into swap over thousands of shapes.
-        if apxinf_mlx::memory_stats()?.cache_bytes > CACHE_LIMIT_BYTES {
-            apxinf_mlx::clear_cache()?;
-        }
         if (index + 1) % 25 == 0 || index + 1 == rows.len() {
             let memory = apxinf_mlx::memory_stats()?;
             eprintln!(

@@ -14,6 +14,14 @@ pub enum NormKind {
     Layer,
     /// Staged BF16 L2 clamp/divide/sqrt(cols)/weight normalization.
     ChannelL2,
+    /// Global response normalization: one block owns the whole activation,
+    /// the adaptive style holds gamma then beta, and the input is carried
+    /// through additively (`gamma * x * norm + beta + x`). The kernel's
+    /// 1e-6 epsilon is part of its arithmetic; `NormArgs::eps` is unused.
+    Grn,
+    /// Per-column mean/variance LayerNorm with an input-dtype statistics
+    /// boundary; the adaptive style holds scale then shift.
+    ColumnLayer,
 }
 
 /// Affine transform applied after the normalization statistic.
@@ -181,6 +189,8 @@ fn statistic(kind: NormKind) -> Statistic {
         NormKind::Rms => Statistic::Rms,
         NormKind::Layer => Statistic::Layer,
         NormKind::ChannelL2 => Statistic::ChannelL2,
+        NormKind::Grn => Statistic::Grn,
+        NormKind::ColumnLayer => Statistic::ColumnLayer,
     }
 }
 
@@ -286,6 +296,11 @@ pub fn norm(ctx: &CudaContext, args: NormArgs<'_>) -> Result<()> {
                 NormKind::Layer => {
                     return Err(super::contracts::invalid(
                         "LayerNorm requires an affine bias",
+                    ))
+                }
+                NormKind::Grn | NormKind::ColumnLayer => {
+                    return Err(super::contracts::invalid(
+                        "GRN/column LayerNorm require an adaptive affine",
                     ))
                 }
             }

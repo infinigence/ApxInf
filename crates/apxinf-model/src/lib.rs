@@ -4,6 +4,8 @@ mod accelerator;
 pub mod auto;
 pub mod builtin;
 pub mod cuda_cosmos_policy;
+#[cfg(feature = "cuda")]
+pub mod cuda_gpt_sovits;
 pub mod cuda_minimax_h3_image;
 pub mod d3;
 pub mod decision;
@@ -15,10 +17,13 @@ pub mod hip_gr00t;
 #[cfg(feature = "hip")]
 pub mod hip_pi05;
 pub mod image;
+pub mod vision_preprocess;
 pub mod llama;
 pub mod llm_trait;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_clef;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+pub mod metal_d3;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_minicpm5;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
@@ -29,6 +34,8 @@ pub mod musa_pi05;
 pub mod metal_qwen_image;
 #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
 pub mod metal_qwen3_tts;
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+mod mlx_decode;
 pub mod pi05;
 pub mod pi0fast;
 pub mod profiling;
@@ -39,7 +46,7 @@ pub mod qwen_drive;
 pub mod registry;
 #[cfg(feature = "cuda")]
 pub mod smolvla;
-pub mod speech;
+pub mod tts_trait;
 pub mod vla;
 mod walloss;
 
@@ -56,15 +63,18 @@ pub use decision::{
 };
 pub use debug::{DebugCapture, DebugConfig};
 pub use image::{GeneratedImage, ImageRequest, ImageRuntime};
-pub use speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
+pub use tts_trait::{
+    GeneratedAudio, GptSovitsInputs, PreparedTts, TtsCacheConfig, TtsCacheInfo, TtsContract,
+    TtsExtension, TtsRequest, TtsTrait, TtsSampling, TtsSpec, gpt_sovits_inputs,
+};
 pub use generation_config::{GenerationConfigSource, GenerationOptions, SamplingMode};
 #[cfg(feature = "cuda")]
 pub use llama::{DecodeGraph, DecodeGraphConfig, DecodeGraphWeights, DecodeLayerWeights};
 pub use llama::{GeneralLlama, KVCache, LlamaModel, LlamaWeights, TransformerLayer};
 pub use llm_trait::{
-    generate_streaming, generate_streaming_with_options, GeneratedToken, GenerationOutput,
-    GenerationRequest, ImageInput, LlmCapabilities, LlmInput, LlmTrait, TextCompilationScope,
-    TextPreparationState, TextPreparationStatus,
+    generate_streaming, generate_streaming_with_options, GeneratedToken, GenerationCancellation,
+    GenerationOutput, GenerationRequest, ImageInput, LlmCapabilities, LlmInput, LlmTrait,
+    TextCompilationScope, TextPreparationState, TextPreparationStatus,
 };
 pub use pi05::{Pi05Config, Pi05PerformanceProfile};
 pub use profiling::GenerationProfile;

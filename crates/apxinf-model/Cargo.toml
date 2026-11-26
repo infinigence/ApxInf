@@ -22,9 +22,15 @@ serde_json = "1"
 sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
+apxinf-tokenizer = { path = "../apxinf-tokenizer" }
+flate2 = "1"
+tempfile = "3"
 # Decodes recorded Core ML packages in the Clef GPU+ANE device test.
 prost = "0.14"
 sha2 = "0.10"
+# Image decoding for the d3 Metal preprocessing device test; the runtime
+# itself takes decoded RGB.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [features]
 default = []
@@ -34,6 +40,8 @@ cuda = ["dep:apxinf-cuda-new", "dep:apxinf-tokenizer"]
 mlx = ["dep:apxinf-mlx", "apxinf-mlx/native", "dep:sha2", "dep:apxinf-tokenizer"]
 # Core ML (Apple Neural Engine) stages in Metal families; implies `mlx`.
 coreml = ["mlx", "dep:apxinf-coreml", "apxinf-coreml/native"]
+# `mlx-signpost` adds os_signpost trace ranges for Instruments.
+mlx-signpost = ["mlx", "apxinf-mlx/signpost"]
 # Deprecated alias of `cuda`, kept so existing build commands keep working.
 # It no longer gates anything: `cuda` already pulls in `apxinf-cuda-new`, and
 # the model code that used to hide behind this flag now follows `cuda`.
@@ -107,7 +115,6 @@ required-features = ["cuda"]
 
 [[example]]
 name = "d3_decision_index"
-required-features = ["cuda"]
 
 [[example]]
 name = "cosmos_policy_bench"

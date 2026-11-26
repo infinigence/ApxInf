@@ -7,8 +7,12 @@ build = "build.rs"
 [features]
 default = []
 native = ["apxinf-core/opaque-storage"]
+# os_signpost ranges for Instruments, reached through `profiling::trace`.
+signpost = []
 [dependencies]
 apxinf-core = { path = "../apxinf-core" }
 half = "2"
 [build-dependencies]
 cc = "1"
+[dev-dependencies]
+serde_json = "1"

@@ -1,7 +1,11 @@
 //! Run pre-tokenized Decision Index requests and emit its native result format.
 //!
 //! Usage:
-//! `d3_decision_index MODEL_DIR RECORDS_JSONL RESULTS_JSONL [--autotune] [--tuning-dir DIR] [--profile-limit N] [--profile-token-budget N]`
+//! `d3_decision_index MODEL_DIR RECORDS_JSONL RESULTS_JSONL [--device cuda|metal] [--autotune] [--tuning-dir DIR] [--profile-limit N] [--profile-token-budget N]`
+//!
+//! `--device` defaults to `cuda` (the `cuda` feature); `metal` runs the
+//! `metal_d3` port (the `mlx` feature). Both read the same records and write the
+//! same result rows.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -16,6 +20,9 @@ use apxinf_model::{
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+
+#[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+const MLX_CACHE_LIMIT_BYTES: usize = 1 << 30;
 
 #[derive(Deserialize)]
 struct Question {
@@ -47,11 +54,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_dir = PathBuf::from(args.next().ok_or("missing model directory")?);
     let records_path = PathBuf::from(args.next().ok_or("missing records JSONL")?);
     let results_path = PathBuf::from(args.next().ok_or("missing results JSONL")?);
+    let mut device = Device::Cuda(0);
     let mut options = LoadOptions::default();
     options.d3_text_profile_limit = Some(D3_DEFAULT_TEXT_PROFILE_LIMIT);
     options.d3_text_profile_token_budget = Some(D3_DEFAULT_TEXT_PROFILE_TOKEN_BUDGET);
     while let Some(argument) = args.next() {
         match argument.as_str() {
+            "--device" => {
+                device = match args
+                    .next()
+                    .ok_or("--device requires cuda or metal")?
+                    .as_str()
+                {
+                    "cuda" => Device::Cuda(0),
+                    "metal" => Device::Metal(0),
+                    other => return Err(format!("unknown device {other:?}").into()),
+                };
+            }
             "--autotune" => options.autotune = true,
             "--tuning-dir" => {
                 options.tuning_path = Some(PathBuf::from(
@@ -116,7 +135,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let load_started = Instant::now();
-    let mut model = AutoModel::load_model(Device::Cuda(0), model_dir, &options)?;
+    let model_id = serde_json::from_str::<Value>(&std::fs::read_to_string(
+        model_dir.join("MODEL_MANIFEST.json"),
+    )?)?
+    .get("repo_id")
+    .and_then(Value::as_str)
+    .ok_or("MODEL_MANIFEST.json has no repo_id")?
+    .to_owned();
+    let engine = match device {
+        Device::Metal(_) => "apxinf-d3-metal",
+        _ => "apxinf-d3-cuda-new",
+    };
+    let mut model = AutoModel::load_model(device, &model_dir, &options)?;
     eprintln!("load_s={:.3}", load_started.elapsed().as_secs_f64());
     let mut writer = BufWriter::new(
         OpenOptions::new()
@@ -189,12 +219,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let elapsed_ms = request_started.elapsed().as_secs_f64() * 1_000.0;
         let mut result = record.evaluation.clone();
         result.insert("run_id".into(), json!(record.run_id));
-        result.insert("engine".into(), json!("apxinf-d3-cuda-new"));
+        result.insert("engine".into(), json!(engine));
         result.insert("status".into(), json!("ok"));
         result.insert(
             "response".into(),
             json!({
-                "model": "vllm-sr/d3-mini",
+                "model": model_id,
                 "answers": answers,
                 "usage": {"input_tokens": input_tokens},
             }),
@@ -203,6 +233,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result.insert("model_request_wall_ms".into(), json!(elapsed_ms));
         serde_json::to_writer(&mut writer, &result)?;
         writer.write_all(b"\n")?;
+        // MLX keeps freed buffers for reuse, and thousands of prompt lengths
+        // grow that cache until a 16 GB host swaps. Bound it between requests.
+        #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+        if matches!(device, Device::Metal(_))
+            && apxinf_mlx::memory_stats()?.cache_bytes > MLX_CACHE_LIMIT_BYTES
+        {
+            apxinf_mlx::clear_cache()?;
+        }
         if (index + 1) % 25 == 0 || index + 1 == records.len() {
             writer.flush()?;
             eprintln!(

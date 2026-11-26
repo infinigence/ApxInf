@@ -64,6 +64,7 @@ from .policies import (
     VIEW_SLOTS,
     AutoPolicy,
     ComposablePolicy,
+    GptSovitsPolicy,
     Gr00tPolicy,
     Pi05Policy,
     Pi0FastPolicy,
@@ -87,6 +88,7 @@ __all__ = [
     "Policy",
     "ComposablePolicy",
     # L2 policies
+    "GptSovitsPolicy",
     "Pi05Policy",
     "Pi0FastPolicy",
     "Gr00tPolicy",
@@ -109,6 +111,7 @@ __all__ = [
     "CANONICAL_PROMPT_KEY",
     # bindings (lazy)
     "ModelRunner",
+    "SpeechRunner",
     # processor steps
     "ProcessorStep",
     "Pipeline",
@@ -131,4 +134,8 @@ def __getattr__(name: str):
         from apxinf_py import ModelRunner
 
         return ModelRunner
+    if name == "SpeechRunner":
+        from apxinf_py import SpeechRunner
+
+        return SpeechRunner
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

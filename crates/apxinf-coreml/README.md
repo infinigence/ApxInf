@@ -18,14 +18,16 @@ Other operations are rejected until added with a test. Operations and their
 constants are named as coremltools 9.0 `mb.program` names them.
 `input` returns `Result<Var>` and rejects zero or unrepresentable dimensions
 and overflowing element counts before adding the input. Weight and operation
-shape checks also precede builder mutation. Scalar shapes (`[]`) remain valid;
-`split` sizes and axes must additionally fit their INT32 parameters.
+shape checks also precede builder mutation. Function inputs and outputs need
+rank >= 1; rank-0 shapes are only valid for internal values. `split` sizes
+and axes must additionally fit their INT32 parameters.
 
 `Var` values belong to the builder that created them, and every input,
 constant and operation output has a unique nonempty name. Operations reject a
-value from another builder, and `finish` rejects foreign, undefined or
-duplicate outputs. `tanh`, `abs` and `identity` also return `Result<Var>` so
-those checks run before an invalid operation enters the program.
+value from another builder, and `finish` rejects foreign, undefined, duplicate,
+rank-0 or passthrough outputs, as well as a program with no operations.
+`tanh`, `abs` and `identity` also return `Result<Var>` so those checks run
+before an invalid operation enters the program.
 
 `Package::write` writes the `.mlpackage` directory: a fixed `Manifest.json`,
 `model.mlmodel` and a MILBlob version 2 `weight.bin`. The protobuf subset in
@@ -45,6 +47,18 @@ not byte-reproducible. The writer instead matches it in three ways:
   directory is created under a temporary name and renamed into place.
 - `ProgramCache::seal` makes a later cache miss an error, so nothing compiles
   while requests run.
+- `ProgramCache::with_byte_budget` bounds the directory. `seal` then evicts
+  the least recently used programs until the rest fit; every hit refreshes a
+  program's last-use time. A program that any live `ProgramCache`, in any
+  process, has resolved is never evicted, so a working set larger than the
+  budget is kept whole. A `Model` from `ProgramCache::load` keeps its program
+  from eviction until it is dropped, even after the cache is; a path from
+  `ProgramCache::compiled` is protected only while the cache lives. Eviction moves a program aside before deleting it, so
+  an interrupted eviction never leaves a partial program under its key, and
+  the next `seal` deletes the leftovers. Without a budget the directory is
+  unbounded. Core ML's own per-executable bundle cache
+  (`~/Library/Caches/<executable>/com.apple.e5rt.e5bundlecache`) is not
+  counted or touched.
 - `Model::load` takes the compute units (for the ANE,
   `ComputeUnits::CpuAndNeuralEngine`).
 - `ProgramCache::load_with_placement` resolves a compiled artifact once, inspects
@@ -82,6 +96,10 @@ framework is linked.
 ## Tests
 
 - `cargo test -p apxinf-coreml` runs the portable writer tests.
+- The ignored `tests/batch_prediction.rs` checks batch/single prediction
+  parity and invalid-input rejection. With an exclusive device reservation,
+  run `cargo test -p apxinf-coreml --features native --test batch_prediction -- --ignored --test-threads=1`.
+  Ordinary native test runs do not schedule this ANE test.
 - With `native`, library tests also cover owned facts, nested/empty traversal,
   distinct unknown states, malformed views, completeness and timeout checks.
   The ignored `tests/placement.rs` exercises real CPU-only plan/configuration,
