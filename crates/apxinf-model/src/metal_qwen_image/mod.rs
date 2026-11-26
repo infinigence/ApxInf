@@ -72,6 +72,12 @@ fn admit(options: &LoadOptions) -> Result<()> {
     Ok(())
 }
 
+/// Admission entry for the `metal_` registry table, so an unknown variant is
+/// rejected before `AutoModel` constructs a device.
+pub fn admission(options: &LoadOptions) -> Result<()> {
+    admit(options)
+}
+
 pub fn load(
     path: &Path,
     device: Device,

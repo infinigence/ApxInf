@@ -69,6 +69,12 @@ fn admit(options: &LoadOptions) -> Result<Variant> {
     Ok(variant)
 }
 
+/// Admission entry for the `metal_` registry table, so an unknown variant is
+/// rejected before `AutoModel` constructs a device.
+pub fn admission(options: &LoadOptions) -> Result<()> {
+    admit(options).map(drop)
+}
+
 fn use_predictor_fusion(variant: Variant, architecture: &str) -> bool {
     variant == Variant::Auto && architecture == "applegpu_g16g"
 }

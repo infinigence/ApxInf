@@ -15,17 +15,41 @@ use crate::registry;
 /// harmless and keeps `AutoModel::load_model` self-contained for users.
 pub fn register_builtin_models() {
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
-    registry::register("metal_clef", crate::metal_clef::load);
+    registry::register_metal(
+        "metal_clef",
+        crate::metal_clef::admission,
+        crate::metal_clef::load,
+    );
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
-    registry::register("metal_d3", crate::metal_d3::load);
+    registry::register_metal(
+        "metal_d3",
+        crate::metal_d3::admission,
+        crate::metal_d3::load,
+    );
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
-    registry::register("metal_minicpm5", crate::metal_minicpm5::load);
+    registry::register_metal(
+        "metal_minicpm5",
+        crate::metal_minicpm5::admission,
+        crate::metal_minicpm5::load,
+    );
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
-    registry::register("metal_qwen3", crate::metal_qwen3::load);
+    registry::register_metal(
+        "metal_qwen3",
+        crate::metal_qwen3::admission,
+        crate::metal_qwen3::load,
+    );
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
-    registry::register("metal_qwen_image", crate::metal_qwen_image::load);
+    registry::register_metal(
+        "metal_qwen_image",
+        crate::metal_qwen_image::admission,
+        crate::metal_qwen_image::load,
+    );
     #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
-    registry::register("metal_qwen3_tts", crate::metal_qwen3_tts::load);
+    registry::register_metal(
+        "metal_qwen3_tts",
+        crate::metal_qwen3_tts::admission,
+        crate::metal_qwen3_tts::load,
+    );
     registry::register("llama", load_llama);
     registry::register("qwen3_vl", load_qwen3vl);
     registry::register("qwen3vl", load_qwen3vl);

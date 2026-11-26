@@ -70,6 +70,12 @@ fn admit(options: &LoadOptions) -> Result<Option<Composition>> {
     Ok(requested)
 }
 
+/// Admission entry for the `metal_` registry table, so an unknown variant is
+/// rejected before `AutoModel` constructs a device.
+pub fn admission(options: &LoadOptions) -> Result<()> {
+    admit(options).map(drop)
+}
+
 /// `auto` runs an optimized composition only on an architecture where it
 /// qualified.
 fn select(requested: Option<Composition>, architecture: &str) -> Composition {

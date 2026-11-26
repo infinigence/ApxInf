@@ -541,7 +541,12 @@ impl AutoModel {
             }
         };
 
-        if options.model_variant.is_some() && !supports_model_variant(model_name, device) {
+        // Metal families own their variant admission below, before device
+        // construction; the central whitelist covers the other devices.
+        if options.model_variant.is_some()
+            && !matches!(device, Device::Metal(_))
+            && !supports_model_variant(model_name)
+        {
             return Err(Error::Other(format!(
                 "model {model_name} does not yet support model_variant"
             )));
@@ -607,10 +612,12 @@ impl AutoModel {
 
         let specific_name = device_name.map(|suffix| format!("{model_name}-{suffix}"));
         let factory = if matches!(device, Device::Metal(_)) {
-            // Only a Metal-owned factory can admit this device. Resolve once
-            // during loading; model execution remains concrete native MLX.
-            registry::get(&metal_registry_name(model_name))
-                .ok_or(Error::UnsupportedDevice(device))?
+            // Only a Metal-owned family can admit this device, and it must
+            // admit its options before the backend exists.
+            let family = registry::get_metal(&metal_registry_name(model_name))
+                .ok_or(Error::UnsupportedDevice(device))?;
+            (family.admit)(options)?;
+            family.load
         } else {
             specific_name
                 .as_deref()
@@ -855,8 +862,9 @@ fn family_name(model_name: &str) -> &str {
 
 // Admission only: supported variant names and precision semantics are owned by
 // each family loader, not a second central implementation registry. A Metal
-// request reaches only a registered `metal_` factory, which parses its variant.
-fn supports_model_variant(model_name: &str, device: Device) -> bool {
+// request reaches only the `metal_` table, which carries its family's
+// admission function.
+fn supports_model_variant(model_name: &str) -> bool {
     matches!(
         family_name(model_name),
         "pi05"
@@ -877,7 +885,7 @@ fn supports_model_variant(model_name: &str, device: Device) -> bool {
             | "gr00t_n1_7-hip"
             | "cosmos-policy"
             | "cuda_cosmos_policy"
-    ) || matches!(device, Device::Metal(_))
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -995,6 +1003,61 @@ mod tests {
         }
     }
 
+    /// Every registered Metal family must reject a variant it does not
+    /// implement. The list assertion makes a new family add its entry here.
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn every_metal_family_rejects_unknown_variants() {
+        register_builtin_models();
+        let families = registry::list_metal();
+        assert_eq!(
+            families,
+            [
+                "metal_clef",
+                "metal_d3",
+                "metal_minicpm5",
+                "metal_qwen3",
+                "metal_qwen3_tts",
+                "metal_qwen_image",
+            ]
+        );
+        for name in families {
+            let family = registry::get_metal(name).expect("listed family is registered");
+            let options = LoadOptions {
+                model_variant: Some("__not_a_variant__".into()),
+                ..LoadOptions::default()
+            };
+            assert!(
+                (family.admit)(&options).is_err(),
+                "{name} accepted an unknown variant"
+            );
+        }
+    }
+
+    /// A family admits its options before `AutoModel` constructs a device or
+    /// opens the checkpoint, so the rejection is the variant error, not I/O.
+    #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn metal_variant_rejection_precedes_checkpoint_access() {
+        register_builtin_models();
+        let options = LoadOptions {
+            model_name: Some("metal_minicpm5".into()),
+            model_variant: Some("__not_a_variant__".into()),
+            ..LoadOptions::default()
+        };
+        let error = AutoModel::load_model(
+            Device::Metal(0),
+            Path::new("checkpoint-must-not-be-opened"),
+            &options,
+        )
+        .err()
+        .expect("an unknown variant must be rejected");
+        assert!(
+            !format!("{error}").contains("checkpoint-must-not-be-opened"),
+            "admission ran after checkpoint access: {error}"
+        );
+    }
+
     #[cfg(feature = "hip")]
     #[test]
     fn hip_pi05_config_converts_frontend_overrides_field_for_field() {
@@ -1021,8 +1084,11 @@ mod tests {
         config.validate().unwrap();
     }
 
+    /// Metal-only families stay out of the central whitelist: their
+    /// `model_variant` is admitted by the registered family before any device
+    /// exists, so admission here must not depend on the device argument.
     #[test]
-    fn metal_admission_defers_to_the_registered_factory() {
+    fn metal_admission_defers_to_the_registered_family() {
         for name in [
             "qwen3",
             "metal_qwen3",
@@ -1036,16 +1102,14 @@ mod tests {
             "metal_qwen_image",
             "qwen_image-mlx",
         ] {
-            assert!(supports_model_variant(name, Device::Metal(0)));
-            assert!(!supports_model_variant(name, Device::Cpu));
-            assert!(!supports_model_variant(name, Device::Cuda(0)));
+            assert!(!supports_model_variant(name), "{name}");
         }
-        assert!(supports_model_variant("pi05-cuda", Device::Cuda(0)));
-        assert!(supports_model_variant("pi05-hip", Device::Hip(0)));
-        assert!(supports_model_variant("pi05-musa", Device::Musa(0)));
-        assert!(supports_model_variant("qwen_drive", Device::Cpu));
-        assert!(supports_model_variant("smolvla", Device::Cuda(0)));
-        assert!(supports_model_variant("smolvla_libero", Device::Cuda(0)));
+        assert!(supports_model_variant("pi05-cuda"));
+        assert!(supports_model_variant("pi05-hip"));
+        assert!(supports_model_variant("pi05-musa"));
+        assert!(supports_model_variant("qwen_drive"));
+        assert!(supports_model_variant("smolvla"));
+        assert!(supports_model_variant("smolvla_libero"));
         for name in [
             "walloss",
             "walloss-cuda",
@@ -1060,7 +1124,7 @@ mod tests {
             "pi0fast",
             "pi0fast-cuda",
         ] {
-            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+            assert!(supports_model_variant(name), "{name}");
         }
     }
 
@@ -1069,11 +1133,10 @@ mod tests {
     #[test]
     fn a_backend_qualifier_does_not_decide_admission() {
         for name in ["pi05", "pi05-cuda", "pi05-hip", "pi05-musa"] {
-            assert!(supports_model_variant(name, Device::Musa(0)), "{name}");
-            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+            assert!(supports_model_variant(name), "{name}");
         }
         // The qualifier does not invent a family that has no variants either.
-        assert!(!supports_model_variant("llama-musa", Device::Musa(0)));
+        assert!(!supports_model_variant("llama-musa"));
     }
 
     /// Cosmos Policy answers under both the family name and the name it
@@ -1082,7 +1145,7 @@ mod tests {
     #[test]
     fn cosmos_policy_admits_every_spelling_of_its_family() {
         for name in ["cosmos-policy", "cosmos-policy-cuda", "cuda_cosmos_policy"] {
-            assert!(supports_model_variant(name, Device::Cuda(0)), "{name}");
+            assert!(supports_model_variant(name), "{name}");
         }
     }
 
@@ -1190,7 +1253,8 @@ mod tests {
             #[cfg(all(feature = "mlx", target_os = "macos", target_arch = "aarch64"))]
             {
                 register_builtin_models();
-                assert!(registry::get(&expected).is_some());
+                assert!(registry::get_metal(&expected).is_some());
+                assert!(registry::get(&expected).is_none());
             }
         }
         assert_eq!(metal_registry_name("llama"), "metal_llama");
