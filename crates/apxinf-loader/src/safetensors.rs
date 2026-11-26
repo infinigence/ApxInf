@@ -15,8 +15,8 @@ use std::path::{Component, Path, PathBuf};
 use memmap2::Mmap;
 use serde::Deserialize;
 
-use bytemuck;
 use apxinf_core::{DType, Device, Shape, Tensor};
+use bytemuck;
 
 use crate::config::ModelConfig;
 
@@ -31,6 +31,296 @@ struct TensorInfo {
 #[derive(Debug, Deserialize)]
 struct SafetensorsIndex {
     weight_map: HashMap<String, String>,
+}
+
+/// Header-only description of one tensor in a [`NativeSafetensorsReader`].
+///
+/// The shape borrows the reader's parsed header. Inspecting this value does not
+/// materialize an owned copy of the tensor payload.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeTensorMetadata<'a> {
+    pub dtype: DType,
+    pub shape: &'a [usize],
+    pub byte_len: usize,
+}
+
+#[derive(Debug)]
+struct NativeTensorRecord {
+    shard: usize,
+    dtype: DType,
+    shape: Vec<usize>,
+    start: usize,
+    end: usize,
+}
+
+/// Lazily materializes native CPU tensors from one SafeTensors checkpoint.
+///
+/// Opening a reader maps the checkpoint and parses only its JSON header. A
+/// tensor payload is copied into an owned CPU [`Tensor`] only when
+/// [`Self::load_tensor`] is called. This is intended for large CUDA models
+/// which upload one layer at a time; unlike [`load_native_path`], it does not
+/// first allocate an anonymous host copy of the complete checkpoint.
+///
+/// Path resolution, index validation and dtype conventions match the existing
+/// eager loader. In particular BF16 is not upcast and packed U8 is represented
+/// as `DType::E2M1Pair`. Mapping a file can populate OS file-cache pages; the
+/// copied-byte counter measures owned tensor payloads, not RSS or file cache.
+/// Checkpoint files must remain unchanged while this reader holds their maps.
+///
+/// ```no_run
+/// use std::path::Path;
+/// use apxinf_loader::safetensors::NativeSafetensorsReader;
+/// # fn main() -> Result<(), String> {
+/// let mut reader = NativeSafetensorsReader::open_path(Path::new("/models/checkpoint"))?;
+/// assert_eq!(reader.payload_bytes_copied(), 0);
+/// let tensor = reader.load_tensor("model.layers.0.input_layernorm.weight")?;
+/// // Upload/consume this tensor, then drop it before reading the next layer.
+/// drop(tensor);
+/// # Ok(())
+/// # }
+/// ```
+pub struct NativeSafetensorsReader {
+    shards: Vec<Mmap>,
+    tensors: HashMap<String, NativeTensorRecord>,
+    metadata: HashMap<String, String>,
+    payload_bytes_copied: usize,
+}
+
+impl NativeSafetensorsReader {
+    /// Open one SafeTensors file, a Hugging Face index, or a checkpoint
+    /// directory using the same path resolution rules as [`load_native_path`].
+    pub fn open_path(path: &Path) -> Result<Self, String> {
+        let resolved = resolve_checkpoint(path)?;
+        if is_index(&resolved) {
+            Self::open_index(&resolved)
+        } else {
+            Self::open_file(&resolved)
+        }
+    }
+
+    fn open_file(path: &Path) -> Result<Self, String> {
+        let parsed = map_native_file(path)?;
+        let tensors = parsed
+            .tensors
+            .into_iter()
+            .map(|(name, tensor)| {
+                (
+                    name,
+                    NativeTensorRecord {
+                        shard: 0,
+                        dtype: tensor.dtype,
+                        shape: tensor.shape,
+                        start: tensor.start,
+                        end: tensor.end,
+                    },
+                )
+            })
+            .collect();
+        Ok(Self {
+            shards: vec![parsed.mmap],
+            tensors,
+            metadata: parsed.metadata,
+            payload_bytes_copied: 0,
+        })
+    }
+
+    fn open_index(index_path: &Path) -> Result<Self, String> {
+        let (index, shard_names) = read_index(index_path)?;
+        let parent = index_path.parent().unwrap_or_else(|| Path::new("."));
+        let mut shards = Vec::with_capacity(shard_names.len());
+        let mut tensors = HashMap::with_capacity(index.weight_map.len());
+        let mut metadata = HashMap::new();
+
+        for shard_name in shard_names {
+            let parsed = map_native_file(&parent.join(&shard_name))?;
+            let shard = shards.len();
+            metadata.extend(parsed.metadata);
+            for (name, tensor) in parsed.tensors {
+                let Some(expected_shard) = index.weight_map.get(&name) else {
+                    continue;
+                };
+                if expected_shard != &shard_name {
+                    return Err(format!(
+                        "tensor `{name}` was found in `{shard_name}`, index assigns it to `{expected_shard}`"
+                    ));
+                }
+                let record = NativeTensorRecord {
+                    shard,
+                    dtype: tensor.dtype,
+                    shape: tensor.shape,
+                    start: tensor.start,
+                    end: tensor.end,
+                };
+                if tensors.insert(name.clone(), record).is_some() {
+                    return Err(format!("duplicate indexed tensor `{name}`"));
+                }
+            }
+            shards.push(parsed.mmap);
+        }
+        let missing = index
+            .weight_map
+            .keys()
+            .filter(|name| !tensors.contains_key(*name))
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "SafeTensors shards are missing indexed tensors: {}",
+                missing.join(", ")
+            ));
+        }
+        Ok(Self {
+            shards,
+            tensors,
+            metadata,
+            payload_bytes_copied: 0,
+        })
+    }
+
+    /// Tensor names in unspecified order.
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
+    }
+
+    /// Shape, dtype and payload byte count without loading the tensor.
+    pub fn tensor_metadata(&self, name: &str) -> Option<NativeTensorMetadata<'_>> {
+        self.tensors.get(name).map(|tensor| NativeTensorMetadata {
+            dtype: tensor.dtype,
+            shape: &tensor.shape,
+            byte_len: tensor.end - tensor.start,
+        })
+    }
+
+    /// File metadata, merged in shard-name order for indexed checkpoints.
+    pub fn metadata(&self) -> &HashMap<String, String> {
+        &self.metadata
+    }
+
+    /// Total payload bytes copied by successful [`Self::load_tensor`] calls.
+    /// Header parsing and memory mapping do not contribute to this counter.
+    pub fn payload_bytes_copied(&self) -> usize {
+        self.payload_bytes_copied
+    }
+
+    /// Copy one tensor payload into an owned native CPU tensor.
+    pub fn load_tensor(&mut self, name: &str) -> Result<Tensor, String> {
+        let tensor = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| format!("missing SafeTensors tensor `{name}`"))?;
+        let mmap = self
+            .shards
+            .get(tensor.shard)
+            .ok_or_else(|| format!("tensor `{name}` refers to a missing shard"))?;
+        let copied = self
+            .payload_bytes_copied
+            .checked_add(tensor.end - tensor.start)
+            .ok_or_else(|| "SafeTensors copied-byte counter overflow".to_string())?;
+        let bytes = mmap[tensor.start..tensor.end].to_vec();
+        let loaded = Tensor::from_raw(
+            Shape::from(tensor.shape.clone()),
+            tensor.dtype,
+            Device::Cpu,
+            bytes,
+        )
+        .map_err(|e| format!("tensor `{name}` construction error: {e}"))?;
+        self.payload_bytes_copied = copied;
+        Ok(loaded)
+    }
+}
+
+struct ParsedNativeFile {
+    mmap: Mmap,
+    tensors: HashMap<String, ParsedNativeTensor>,
+    metadata: HashMap<String, String>,
+}
+
+struct ParsedNativeTensor {
+    dtype: DType,
+    shape: Vec<usize>,
+    start: usize,
+    end: usize,
+}
+
+fn map_native_file(path: &Path) -> Result<ParsedNativeFile, String> {
+    let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("mmap failed: {e}"))? };
+    if mmap.len() < 8 {
+        return Err("file too small to be a SafeTensors file".into());
+    }
+    let header_len = usize::try_from(u64::from_le_bytes(mmap[..8].try_into().unwrap()))
+        .map_err(|_| "SafeTensors header length exceeds address space".to_string())?;
+    let data_start = 8usize
+        .checked_add(header_len)
+        .ok_or_else(|| "SafeTensors header offset overflow".to_string())?;
+    if mmap.len() < data_start {
+        return Err(format!(
+            "file too small: expected at least {data_start} bytes, got {}",
+            mmap.len()
+        ));
+    }
+    let header_json = std::str::from_utf8(&mmap[8..data_start])
+        .map_err(|e| format!("invalid UTF-8 in header: {e}"))?;
+    let raw: HashMap<String, serde_json::Value> =
+        serde_json::from_str(header_json).map_err(|e| format!("JSON parse error: {e}"))?;
+    let mut metadata = HashMap::new();
+    if let Some(serde_json::Value::Object(meta)) = raw.get("__metadata__") {
+        for (key, value) in meta {
+            if let Some(value) = value.as_str() {
+                metadata.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+    let mut tensors = HashMap::with_capacity(raw.len().saturating_sub(1));
+    for (name, value) in raw {
+        if name == "__metadata__" {
+            continue;
+        }
+        let info: TensorInfo = serde_json::from_value(value)
+            .map_err(|e| format!("failed to parse tensor '{name}': {e}"))?;
+        let dtype = parse_dtype(&info.dtype)
+            .ok_or_else(|| format!("unsupported dtype '{}' for tensor '{name}'", info.dtype))?;
+        let start = data_start
+            .checked_add(info.data_offsets[0])
+            .ok_or_else(|| format!("tensor `{name}` start offset overflow"))?;
+        let end = data_start
+            .checked_add(info.data_offsets[1])
+            .ok_or_else(|| format!("tensor `{name}` end offset overflow"))?;
+        if start > end || end > mmap.len() {
+            return Err(format!(
+                "tensor '{name}': data_offsets {:?} exceed file size {}",
+                info.data_offsets,
+                mmap.len()
+            ));
+        }
+        let expected = info
+            .shape
+            .iter()
+            .try_fold(dtype.size_in_bytes(), |bytes, dim| bytes.checked_mul(*dim));
+        if expected != Some(end - start) {
+            return Err(format!(
+                "tensor `{name}` byte length mismatch: shape {:?} with {dtype} expects {:?}, got {}",
+                info.shape,
+                expected,
+                end - start
+            ));
+        }
+        tensors.insert(
+            name,
+            ParsedNativeTensor {
+                dtype,
+                shape: info.shape,
+                start,
+                end,
+            },
+        );
+    }
+    Ok(ParsedNativeFile {
+        mmap,
+        tensors,
+        metadata,
+    })
 }
 
 /// Load a SafeTensors file. Returns all tensors on CPU.

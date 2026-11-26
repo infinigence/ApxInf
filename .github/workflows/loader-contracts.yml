@@ -1,0 +1,19 @@
+name: SafeTensors loader contracts
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/apxinf-loader/**'
+      - 'crates/apxinf-core/**'
+      - '.github/workflows/loader-contracts.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  loader-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked -p apxinf-loader
