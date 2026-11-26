@@ -23,6 +23,20 @@ mod fixed_launchers {
             count: i32,
             stream: cudaStream_t,
         ) -> cudaError_t;
+
+        pub(crate) fn apxinf_sampling_exponential_race(
+            logits: *const c_void,
+            seen: *const c_void,
+            output: *mut c_void,
+            vocab: i64,
+            seed: u64,
+            step: u64,
+            top_k: u32,
+            temperature: f32,
+            repetition: f32,
+            dtype: u32,
+            stream: cudaStream_t,
+        ) -> cudaError_t;
     }
 }
 pub(crate) use fixed_launchers::*;

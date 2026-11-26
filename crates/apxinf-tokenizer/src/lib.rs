@@ -224,6 +224,81 @@ impl ChatMessage {
 /// Transformers 5 `Qwen2Tokenizer` pre-tokenization pattern.
 const QWEN2_PRETOKENIZE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// Function payload attached to an assistant message in a tool-use turn.
+///
+/// Hugging Face provider templates expect `arguments` as an object even though
+/// OpenAI carries the same value as a JSON string on the wire. The serving layer
+/// validates and parses that string before constructing this representation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatToolCallFunction {
+    pub name: String,
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A previous assistant tool call rendered back into a provider chat template.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub function: ChatToolCallFunction,
+}
+
+/// Rich chat message used by network serving and multi-turn tool use.
+///
+/// The original [`ChatMessage`] remains the compact, source-compatible text
+/// API. This type adds the fields consumed by modern Hugging Face templates:
+/// nullable content, assistant `tool_calls`, tool response IDs, and optional
+/// reasoning content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatTemplateMessage {
+    pub role: String,
+    pub content: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatTemplateMessage {
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(serde_json::Value::String(content.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    pub fn assistant_tool_calls(
+        content: Option<String>,
+        reasoning_content: Option<String>,
+        tool_calls: Vec<ChatToolCall>,
+    ) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: content.map(serde_json::Value::String),
+            reasoning_content,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: Some(serde_json::Value::String(content.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
+
 /// Configuration loaded from tokenizer_config.json.
 #[derive(Debug, Deserialize, Default)]
 struct TokenizerConfig {
@@ -281,6 +356,14 @@ impl Tokenizer {
             config,
             chat_template,
         })
+    }
+
+    /// Load packaged tokenizer assets without filesystem or network access.
+    pub fn from_json_assets(tokenizer: &[u8], config: &[u8], template: Option<&str>) -> Result<Self> {
+        let inner=HfTokenizer::from_bytes(tokenizer).map_err(|e| Error::Other(format!("tokenizer load: {e}")))?;
+        let config:TokenizerConfig=serde_json::from_slice(config).map_err(|e| Error::Other(format!("tokenizer config: {e}")))?;
+        let chat_template=config.chat_template.clone().or_else(|| template.map(str::to_owned));
+        Ok(Self {inner,config,chat_template})
     }
 
     /// Build the byte-level BPE tokenizer that Transformers 5 `Qwen2Tokenizer`
@@ -513,9 +596,20 @@ impl Tokenizer {
         self.render_chat_template(messages, options, true)
     }
 
-    fn render_chat_template(
+    /// Render rich multi-turn messages exactly as the checkpoint template sees
+    /// them. This is the serving counterpart of
+    /// [`Self::apply_chat_template_with_options`].
+    pub fn apply_chat_template_messages_with_options(
         &self,
-        messages: &[ChatMessage],
+        messages: &[ChatTemplateMessage],
+        options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<String> {
+        self.render_chat_template(messages, options, true)
+    }
+
+    fn render_chat_template<T: Serialize + ?Sized>(
+        &self,
+        messages: &T,
         options: &serde_json::Map<String, serde_json::Value>,
         hf_whitespace: bool,
     ) -> Result<String> {
@@ -549,31 +643,36 @@ impl Tokenizer {
             .map_err(|e| Error::Other(format!("template error: {e}")))?;
 
         // Build template context
-        let bos = self
-            .config
-            .bos_token
-            .clone()
-            .or_else(|| {
-                self.inner
-                    .get_vocab(true)
-                    .iter()
-                    .find(|(t, _)| *t == "<s>" || *t == "<|begin_of_text|>")
-                    .map(|(t, _)| t.clone())
-            })
-            .unwrap_or_default();
-
-        let eos = self
-            .config
-            .eos_token
-            .clone()
-            .or_else(|| {
-                self.inner
-                    .get_vocab(true)
-                    .iter()
-                    .find(|(t, _)| *t == "</s>" || *t == "<|eot_id|>" || *t == "<|end_of_text|>")
-                    .map(|(t, _)| t.clone())
-            })
-            .unwrap_or_default();
+        let resolve = |configured: Option<&str>, spellings: &[&str]| -> String {
+            if let Some(token) = configured {
+                return token.to_owned();
+            }
+            let mut matches = spellings
+                .iter()
+                .copied()
+                .filter(|token| self.inner.token_to_id(token).is_some());
+            let Some(first) = matches.next() else {
+                return String::new();
+            };
+            if matches.next().is_none() {
+                return first.to_owned();
+            }
+            // Preserve legacy map-iteration selection for ambiguous spellings.
+            self.inner
+                .get_vocab(true)
+                .iter()
+                .find(|(token, _)| spellings.contains(&token.as_str()))
+                .map(|(token, _)| token.clone())
+                .unwrap_or_default()
+        };
+        let bos = resolve(
+            self.config.bos_token.as_deref(),
+            &["<s>", "<|begin_of_text|>"],
+        );
+        let eos = resolve(
+            self.config.eos_token.as_deref(),
+            &["</s>", "<|eot_id|>", "<|end_of_text|>"],
+        );
 
         // Create context as serde Value (map)
         let mut context = serde_json::json!({
@@ -859,6 +958,269 @@ mod tests {
         assert!(tokenizer
             .apply_chat_template_with_options(&messages, &options)
             .is_err());
+    }
+
+    fn special_token_template(tokens: &[&str]) -> Tokenizer {
+        let vocab = tokens
+            .iter()
+            .copied()
+            .chain(std::iter::once("[UNK]"))
+            .enumerate()
+            .map(|(id, token)| (token.to_owned(), id as u32))
+            .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_owned())
+            .build()
+            .unwrap();
+        Tokenizer {
+            inner: HfTokenizer::new(model),
+            config: TokenizerConfig::default(),
+            chat_template: Some("{{ bos_token }}|{{ eos_token }}".to_owned()),
+        }
+    }
+
+    fn legacy_fallback_prompt(tokenizer: &Tokenizer) -> String {
+        let snapshot = || {
+            tokenizer
+                .inner
+                .get_vocab(true)
+                .iter()
+                .map(|(token, id)| (token.clone(), *id))
+                .collect::<Vec<_>>()
+        };
+        let order = snapshot();
+        for _ in 0..3 {
+            assert_eq!(
+                snapshot(),
+                order,
+                "legacy oracle requires stable snapshot traversal on this unchanged fixture"
+            );
+        }
+        let bos = tokenizer
+            .inner
+            .get_vocab(true)
+            .iter()
+            .find(|(t, _)| *t == "<s>" || *t == "<|begin_of_text|>")
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        let eos = tokenizer
+            .inner
+            .get_vocab(true)
+            .iter()
+            .find(|(t, _)| *t == "</s>" || *t == "<|eot_id|>" || *t == "<|end_of_text|>")
+            .map(|(t, _)| t.clone())
+            .unwrap_or_default();
+        format!("{bos}|{eos}")
+    }
+
+    #[test]
+    fn template_special_tokens_preserve_configured_strings() {
+        for tokens in [
+            &[][..],
+            &["<s>", "</s>"][..],
+            &[
+                "<s>",
+                "<|begin_of_text|>",
+                "</s>",
+                "<|eot_id|>",
+                "<|end_of_text|>",
+            ][..],
+        ] {
+            let mut tokenizer = special_token_template(tokens);
+            tokenizer.config.bos_token = Some("configured-bos".to_owned());
+            tokenizer.config.eos_token = Some("configured-eos".to_owned());
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                "configured-bos|configured-eos"
+            );
+            tokenizer.config.bos_token = Some(String::new());
+            tokenizer.config.eos_token = Some(String::new());
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                "|"
+            );
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_return_empty_without_candidates() {
+        let tokenizer = special_token_template(&[]);
+        assert_eq!(
+            tokenizer
+                .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                .unwrap(),
+            "|"
+        );
+    }
+
+    #[test]
+    fn template_special_tokens_resolve_each_sole_spelling_at_id_zero() {
+        for spelling in ["<s>", "<|begin_of_text|>"] {
+            let mut tokenizer = special_token_template(&[spelling]);
+            tokenizer.config.eos_token = Some("configured-eos".to_owned());
+            assert_eq!(tokenizer.token_to_id(spelling), Some(0));
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                format!("{spelling}|configured-eos")
+            );
+        }
+        for spelling in ["</s>", "<|eot_id|>", "<|end_of_text|>"] {
+            let mut tokenizer = special_token_template(&[spelling]);
+            tokenizer.config.bos_token = Some("configured-bos".to_owned());
+            assert_eq!(tokenizer.token_to_id(spelling), Some(0));
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                format!("configured-bos|{spelling}")
+            );
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_keep_legacy_selection_for_ambiguous_vocabularies() {
+        for tokens in [
+            &["<s>", "<|begin_of_text|>"][..],
+            &["</s>", "<|eot_id|>"][..],
+            &["</s>", "<|end_of_text|>"][..],
+            &["<|eot_id|>", "<|end_of_text|>"][..],
+            &["</s>", "<|eot_id|>", "<|end_of_text|>"][..],
+            &[
+                "<s>",
+                "<|begin_of_text|>",
+                "</s>",
+                "<|eot_id|>",
+                "<|end_of_text|>",
+            ][..],
+        ] {
+            let tokenizer = special_token_template(tokens);
+            let expected = legacy_fallback_prompt(&tokenizer);
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                expected,
+                "{tokens:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_follow_added_token_mutations() {
+        for (first, second, unique_prompt) in [
+            ("<s>", "<|begin_of_text|>", "<s>|"),
+            ("<|begin_of_text|>", "<s>", "<|begin_of_text|>|"),
+            ("</s>", "<|eot_id|>", "|</s>"),
+            ("<|eot_id|>", "<|end_of_text|>", "|<|eot_id|>"),
+            ("<|end_of_text|>", "</s>", "|<|end_of_text|>"),
+        ] {
+            let mut tokenizer = special_token_template(&[]);
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                "|"
+            );
+            assert_eq!(tokenizer.add_tokens(&[first.to_owned()]), 1);
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                unique_prompt
+            );
+            assert_eq!(tokenizer.add_tokens(&[second.to_owned()]), 1);
+            let expected = legacy_fallback_prompt(&tokenizer);
+            assert_eq!(
+                tokenizer
+                    .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                    .unwrap(),
+                expected,
+                "{first}, {second}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_allow_base_and_added_overlap() {
+        for spelling in [
+            "<s>",
+            "<|begin_of_text|>",
+            "</s>",
+            "<|eot_id|>",
+            "<|end_of_text|>",
+        ] {
+            let mut tokenizer = special_token_template(&[spelling]);
+            tokenizer.chat_template = Some("{{ bos_token }}{{ eos_token }}".to_owned());
+            assert_eq!(tokenizer.add_tokens(&[spelling.to_owned()]), 1);
+            let prompt = tokenizer
+                .apply_chat_template_with_options(&[], &serde_json::Map::new())
+                .unwrap();
+            assert_eq!(prompt, spelling);
+            assert_eq!(tokenizer.token_to_id(&prompt), Some(0));
+            assert_eq!(tokenizer.encode(&prompt).unwrap(), [0]);
+        }
+    }
+
+    #[test]
+    fn template_special_tokens_preserve_legacy_whitespace() {
+        let mut tokenizer = special_token_template(&["<s>", "</s>"]);
+        tokenizer.chat_template = Some(
+            " \n{{ bos_token }}\n\n{{ messages[0].content }}\n\n{{ eos_token }}\n\n ".to_owned(),
+        );
+        let messages = [ChatMessage::user("hello")];
+        assert_eq!(
+            tokenizer
+                .apply_chat_template_with_options(&messages, &serde_json::Map::new())
+                .unwrap(),
+            " \n<s>\n\nhello\n\n</s>\n\n "
+        );
+        assert_eq!(
+            tokenizer.apply_chat_template(&messages).unwrap(),
+            "<s>\nhello\n</s>\n"
+        );
+    }
+
+    #[test]
+    fn rich_messages_render_tool_calls_and_tool_responses() {
+        let tokenizer = Tokenizer {
+            inner: HfTokenizer::new(WordLevel::default()),
+            config: TokenizerConfig::default(),
+            chat_template: Some(
+                "{{ messages[0].role }}|{{ messages[0].tool_calls[0].function.name }}|{{ messages[0].tool_calls[0].function.arguments.city }}|{{ messages[1].role }}|{{ messages[1].tool_call_id }}|{{ messages[1].content }}"
+                    .into(),
+            ),
+        };
+        let messages = [
+            ChatTemplateMessage::assistant_tool_calls(
+                None,
+                Some("checking weather".into()),
+                vec![ChatToolCall {
+                    id: Some("call-1".into()),
+                    kind: Some("function".into()),
+                    function: ChatToolCallFunction {
+                        name: "weather.get".into(),
+                        arguments: serde_json::Map::from_iter([(
+                            "city".into(),
+                            serde_json::Value::String("上海".into()),
+                        )]),
+                    },
+                }],
+            ),
+            ChatTemplateMessage::tool(r#"{"temperature":21}"#, "call-1"),
+        ];
+        assert_eq!(
+            tokenizer
+                .apply_chat_template_messages_with_options(&messages, &serde_json::Map::new())
+                .unwrap(),
+            r#"assistant|weather.get|上海|tool|call-1|{"temperature":21}"#
+        );
     }
 
     #[test]

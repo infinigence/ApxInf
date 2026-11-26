@@ -87,7 +87,7 @@ __device__ __forceinline__ float apxinf_logit_to_float(__nv_bfloat16 value) {
 }
 
 template <typename T>
-__global__ void apxinf_cuda_new_prepare_logits_kernel(
+static __global__ void apxinf_cuda_new_prepare_logits_kernel(
     const T* logits, const uint32_t* counts, float* adjusted,
     uint32_t* token_ids, uint32_t vocab_size, float repetition,
     float frequency, float presence, float inverse_temperature) {
@@ -115,7 +115,7 @@ __device__ __forceinline__ bool apxinf_better_pair(
          (value == best_value && token < best_token);
 }
 
-__global__ void apxinf_cuda_new_argmax_stage1_kernel(
+static __global__ void apxinf_cuda_new_argmax_stage1_kernel(
     const float* logits, uint32_t vocab_size, float* partial_values,
     uint32_t* partial_tokens) {
   float best_value = -CUDART_INF_F;
@@ -149,7 +149,7 @@ __global__ void apxinf_cuda_new_argmax_stage1_kernel(
   }
 }
 
-__global__ void apxinf_cuda_new_argmax_stage2_kernel(
+static __global__ void apxinf_cuda_new_argmax_stage2_kernel(
     const float* partial_values, const uint32_t* partial_tokens,
     uint32_t partial_count, uint32_t* counts, ApxInfSamplingOutput* output) {
   float best_value = -CUDART_INF_F;
@@ -186,7 +186,7 @@ __global__ void apxinf_cuda_new_argmax_stage2_kernel(
   }
 }
 
-__global__ void apxinf_cuda_new_softmax_weights_kernel(
+static __global__ void apxinf_cuda_new_softmax_weights_kernel(
     const float* sorted_logits, float* weights, uint32_t vocab_size,
     uint32_t candidate_limit) {
   const float maximum = sorted_logits[0];
@@ -216,7 +216,7 @@ __device__ __forceinline__ uint32_t apxinf_lower_bound_cdf(
   return first < count ? first : count - 1;
 }
 
-__global__ void apxinf_cuda_new_select_cdf_kernel(
+static __global__ void apxinf_cuda_new_select_cdf_kernel(
     const uint32_t* sorted_tokens, const float* weights, const float* cdf,
     uint32_t candidate_limit, float top_p, uint32_t random_selection,
     uint32_t return_logprob, uint64_t seed, uint64_t sequence, uint64_t draw,
@@ -276,7 +276,7 @@ __device__ __forceinline__ void apxinf_store_normal(__nv_bfloat16* output,
 }
 
 template <typename T>
-__global__ void apxinf_cuda_new_standard_normal_kernel(
+static __global__ void apxinf_cuda_new_standard_normal_kernel(
     T* output, uint64_t count, uint64_t seed, uint64_t sequence,
     uint64_t draw) {
   for (uint64_t pair = blockIdx.x * static_cast<uint64_t>(blockDim.x) +

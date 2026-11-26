@@ -39,6 +39,11 @@ int apx_mlx_stream_new(int32_t gpu,int32_t index,void** out){TRY
  // stream-destruction API, so new_stream per model would retain global queues.
  *out=new S(mx::default_stream(d));CATCH}
 void apx_mlx_stream_free(void* p){delete static_cast<S*>(p);}
+// MLX starts with its cache limit equal to its memory limit and has no getter
+// for the cache limit, so any other previous value was set by the caller.
+int apx_mlx_default_cache_limit(size_t limit){TRY
+ const size_t initial=mx::get_memory_limit();const size_t previous=mx::set_cache_limit(limit);
+ if(previous!=initial)mx::set_cache_limit(previous);CATCH}
 int apx_mlx_sync(void* p){TRY mx::synchronize(*static_cast<S*>(p));CATCH}
 int apx_mlx_memory_stats(size_t* active,size_t* cache,size_t* peak){TRY *active=mx::get_active_memory();*cache=mx::get_cache_memory();*peak=mx::get_peak_memory();CATCH}
 int apx_mlx_reset_peak_memory(void){TRY mx::reset_peak_memory();CATCH}
@@ -60,6 +65,8 @@ int apx_mlx_array_info(const void* p,int32_t* dims,size_t capacity,size_t* rank,
  const auto& a=*static_cast<const A*>(p);*rank=a.ndim();*dt=dtype_code(a.dtype());if(capacity<a.ndim())throw std::invalid_argument("shape output too short");for(size_t i=0;i<a.ndim();++i)dims[i]=a.shape(i);CATCH}
 int apx_mlx_array_read(void* s,const void* p,uint8_t* bytes,size_t len){TRY
  auto a=mx::contiguous(*static_cast<const A*>(p),false,*static_cast<S*>(s));if(a.nbytes()!=len)throw std::invalid_argument("download byte length mismatch");mx::eval(a);mx::synchronize(*static_cast<S*>(s));if(len)std::memcpy(bytes,a.data<uint8_t>(),len);CATCH}
+int apx_mlx_array_read_ready(const void* p,uint8_t* bytes,size_t len){TRY
+ auto a=*static_cast<const A*>(p);mx::eval(a);if(!a.flags().row_contiguous||a.nbytes()!=len)throw std::invalid_argument("ready download needs a row-contiguous array of the requested length");if(len)std::memcpy(bytes,a.data<uint8_t>(),len);CATCH}
 int apx_mlx_eval(void* s,const void* const* p,size_t n){TRY mx::eval(arrays(p,n));mx::synchronize(*static_cast<S*>(s));CATCH}
 // Enqueues evaluation and returns; a later eval or read of the same arrays waits for it.
 int apx_mlx_async_eval(const void* const* p,size_t n){TRY mx::async_eval(arrays(p,n));CATCH}

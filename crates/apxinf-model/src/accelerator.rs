@@ -80,6 +80,14 @@ pub(crate) mod musa {
     pub(crate) use apxinf_musa::mttx;
 }
 
+/// Apple seam. Like MUSA, what `profiling::trace` needs from this backend is
+/// its marker module, and it is compiled exactly when Apple is the backend
+/// that module picks.
+#[cfg(all(feature = "mlx-signpost", not(any(feature = "cuda", feature = "musa"))))]
+pub(crate) mod mlx {
+    pub(crate) use apxinf_mlx::signpost;
+}
+
 /// Create a backend on the `apxinf-cuda-new` runtime.
 ///
 /// Models written entirely against `dyn Backend` — llama and qwen3-vl — take

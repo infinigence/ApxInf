@@ -21,7 +21,7 @@ use crate::llm_trait::{
 use crate::pi05::Pi05Config;
 use crate::profiling::GenerationProfile;
 use crate::registry;
-use crate::speech::{GeneratedAudio, SpeechRequest, SpeechRuntime};
+use crate::tts_trait::{GeneratedAudio, TtsRequest, TtsTrait};
 use crate::vla::{
     Action, ExecutionPolicy, InferenceSpec, PreparedInference, VlaRequest, VlaRuntime,
 };
@@ -79,8 +79,9 @@ pub struct LoadOptions {
     /// on recipe misses during preparation or first execution. When false,
     /// missing records resolve once to a safe inference fallback.
     pub autotune: bool,
-    /// Maximum number of fixed-length d3 text CUDA Graph profiles retained in
-    /// memory. `None` uses the d3 runtime's safe default.
+    /// Maximum number of fixed-length d3 text profiles retained in memory
+    /// (CUDA Graphs on CUDA, compiled MLX callables on Metal). `None` uses the
+    /// d3 runtime's safe default.
     pub d3_text_profile_limit: Option<usize>,
     /// Sum of token capacities across retained d3 text profiles. `None` uses
     /// the d3 runtime's safe default. A single request may exceed the budget.
@@ -111,7 +112,7 @@ pub enum LoadedModel {
     Vla(Box<dyn VlaRuntime>),
     Decision(DecisionModel),
     Image(Box<dyn ImageRuntime>),
-    Speech(Box<dyn SpeechRuntime>),
+    Tts(Box<dyn TtsTrait>),
 }
 
 impl LoadedModel {
@@ -128,7 +129,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
-            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not text".into())),
         }
     }
 
@@ -138,7 +139,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not VLA".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not VLA".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not VLA".into())),
-            Self::Speech(_) => Err(Error::Other("loaded model is speech, not VLA".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not VLA".into())),
         }
     }
 
@@ -148,7 +149,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
-            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
         }
     }
 
@@ -174,7 +175,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
-            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
         }
     }
 
@@ -184,7 +185,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
-            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
         }
     }
 
@@ -194,7 +195,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not decision".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not decision".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not decision".into())),
-            Self::Speech(_) => Err(Error::Other("loaded model is speech, not decision".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not decision".into())),
         }
     }
 
@@ -208,7 +209,30 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(model) => Ok(model.capabilities()),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
-            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not text".into())),
+        }
+    }
+
+    pub fn sequence_capacity(&self) -> Option<usize> {
+        match self {
+            Self::Text { model, .. } => model.sequence_capacity(),
+            _ => None,
+        }
+    }
+
+    pub fn vision_contract(&self) -> Option<&crate::vision_preprocess::VisionContract> {
+        match self {
+            Self::Text { model, .. } => model.vision_contract(),
+            _ => None,
+        }
+    }
+
+    pub fn prepare_images(
+        &self, tokens: &[u32], images: &[crate::vision_preprocess::DecodedImage], limit: usize,
+    ) -> Result<crate::vision_preprocess::PreparedVision> {
+        match self {
+            Self::Text { model, .. } => model.prepare_images(tokens, images, limit),
+            _ => Err(Error::Other("decoded image generation needs a text runtime".into())),
         }
     }
 
@@ -228,8 +252,8 @@ impl LoadedModel {
             Self::Image(_) => Err(Error::Other(
                 "image models do not use autoregressive generation defaults".into(),
             )),
-            Self::Speech(_) => Err(Error::Other(
-                "speech models do not use autoregressive generation defaults".into(),
+            Self::Tts(_) => Err(Error::Other(
+                "tts models do not use autoregressive generation defaults".into(),
             )),
         }
     }
@@ -274,7 +298,7 @@ impl LoadedModel {
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not text".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not text".into())),
             Self::Image(_) => Err(Error::Other("loaded model is image, not text".into())),
-            Self::Speech(_) => Err(Error::Other("loaded model is speech, not text".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not text".into())),
         }
     }
 
@@ -284,7 +308,7 @@ impl LoadedModel {
             Self::Text { .. } => Err(Error::Other("loaded model is text, not image".into())),
             Self::Vla(_) => Err(Error::Other("loaded model is VLA, not image".into())),
             Self::Decision(_) => Err(Error::Other("loaded model is decision, not image".into())),
-            Self::Speech(_) => Err(Error::Other("loaded model is speech, not image".into())),
+            Self::Tts(_) => Err(Error::Other("loaded model is tts, not image".into())),
         }
     }
 
@@ -292,18 +316,44 @@ impl LoadedModel {
         self.image_mut()?.generate(request)
     }
 
-    pub fn speech_mut(&mut self) -> Result<&mut dyn SpeechRuntime> {
+    pub fn tts_mut(&mut self) -> Result<&mut dyn TtsTrait> {
         match self {
-            Self::Speech(model) => Ok(&mut **model),
-            Self::Text { .. } => Err(Error::Other("loaded model is text, not speech".into())),
-            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not speech".into())),
-            Self::Decision(_) => Err(Error::Other("loaded model is decision, not speech".into())),
-            Self::Image(_) => Err(Error::Other("loaded model is image, not speech".into())),
+            Self::Tts(model) => Ok(&mut **model),
+            Self::Text { .. } => Err(Error::Other("loaded model is text, not tts".into())),
+            Self::Vla(_) => Err(Error::Other("loaded model is VLA, not tts".into())),
+            Self::Decision(_) => Err(Error::Other("loaded model is decision, not tts".into())),
+            Self::Image(_) => Err(Error::Other("loaded model is image, not tts".into())),
         }
     }
 
-    pub fn synthesize(&mut self, request: &SpeechRequest<'_>) -> Result<GeneratedAudio> {
-        self.speech_mut()?.synthesize(request)
+    pub fn synthesize(&mut self, request: &TtsRequest<'_>) -> Result<GeneratedAudio> {
+        self.tts_mut()?.synthesize(request)
+    }
+
+    /// Stop at the next token boundary and return the published prefix.
+    pub fn generate_streaming_cancellable(
+        &mut self,
+        input: LlmInput<'_>,
+        options: &GenerationOptions,
+        cancel: &crate::GenerationCancellation,
+        mut on_token: impl FnMut(GeneratedToken),
+    ) -> Result<GenerationOutput> {
+        let effective = GenerationOptions::apxinf_defaults()
+            .overlay(self.generation_defaults()?)
+            .overlay(options);
+        match self {
+            Self::Text { model, .. } => model.generate_streaming_cancellable_dyn(
+                GenerationRequest {
+                    input,
+                    options: &effective,
+                },
+                cancel,
+                &mut on_token,
+            ),
+            _ => Err(Error::Other(
+                "loaded model does not support text generation".into(),
+            )),
+        }
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -523,7 +573,9 @@ impl AutoModel {
             ));
         }
 
-        if matches!(model_name, "d3" | "d3-cuda") {
+        // On Metal, fall through to the registered `metal_d3` port, which
+        // `metal_registry_name` resolves from the detected `d3` name.
+        if matches!(model_name, "d3" | "d3-cuda") && !matches!(device, Device::Metal(_)) {
             #[cfg(feature = "cuda")]
             return crate::d3::load::load_with_cuda_new(path, device, options);
 

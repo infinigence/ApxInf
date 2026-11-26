@@ -68,6 +68,16 @@ generation schedule. The infallible `reset`/`prewarm_decode` hooks cannot
 swallow MLX failures: use a fallible family preparation method, or retain an
 invalidated error returned by the next fallible call.
 
+Compiled Qwen3 and ordinary compiled MiniCPM5 use one-step greedy lookahead.
+`greedy_token_arrays` produces an in-vocabulary device ID and a checked ID with
+an invalid-logits sentinel. `mlx_decode.rs` submits only the next checked ID
+with `async_eval` before reading the current checked ID with
+`to_bytes_ready`. The latter waits only for that array. Stop/error cleanup drains
+the stream; EOS/cancellation then trims the unused logical position. No KV
+snapshot is retained. `APXINF_MLX_SYNC_DECODE=1` selects the synchronous fallback.
+Async generation profiles include callback wall time and the final drain, since
+callbacks can overlap GPU execution. Other variants keep their existing schedule.
+
 Keep `LlmTrait` and `VlaRuntime` distinct. A small text model may retain the
 existing `config.rs`, `weights.rs`, `general.rs` organization. A VLA uses its
 own Model and ModelRunner responsibilities. Do not import another family's
@@ -81,12 +91,13 @@ placing a model-name switch in the backend. Reuse the existing registry,
 
 ### Implemented text selections
 
-The `mlx` Cargo feature registers `metal_qwen3` and `metal_minicpm5` with
-`AutoModel`. `Device::Metal(N)` resolves a `metal_<family>` implementation; the CLI
-accepts `metal[:N]` and `mlx[:N]`, and displays `metal:N`; native MLX currently
-accepts only index 0 and rejects other indices before creating a stream. A missing feature,
-unsupported device or absent family implementation fails explicitly. Existing
-CPU/CUDA models do not silently execute a Metal request on CPU.
+The `mlx` Cargo feature registers `metal_qwen3`, `metal_minicpm5`, `metal_clef`
+and `metal_d3` with `AutoModel`. `Device::Metal(N)` resolves a `metal_<family>`
+implementation; the CLI accepts `metal[:N]` and `mlx[:N]`, and displays `metal:N`;
+native MLX currently accepts only index 0 and rejects other indices before
+creating a stream. A missing feature, unsupported device or absent family
+implementation fails explicitly. Existing CPU/CUDA models do not silently
+execute a Metal request on CPU.
 
 Metal admission requires a registered `metal_` factory and is resolved before
 device construction or checkpoint loading. It does not fall back to a legacy
@@ -94,8 +105,10 @@ generic model factory; CPU/CUDA registry fallback remains unchanged. Only the
 selected family parses `model_variant`, so adding a Metal family does not edit
 a central variant list. Explicit
 `--model-name metal_qwen3` and `--model-name metal_minicpm5` select these
-implementations. The original `qwen3`/`minicpm5` and `qwen3-mlx`/`minicpm5-mlx`
-selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
+implementations, as does `--model-name metal_d3` (the detected `d3` name already
+resolves to it). The original
+`qwen3`/`minicpm5` and `qwen3-mlx`/`minicpm5-mlx` selectors remain aliases on
+Metal; Qwen3 checkpoint detection still works.
 
 | Family selection | Profile admitted by current code | Actual prepared execution |
 | --- | --- | --- |
@@ -105,6 +118,7 @@ selectors remain aliases on Metal; Qwen3 checkpoint detection still works.
 | MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 65792 total positions, including 65536 prompt + 256 output | Ordered device composition; source public SwiGLU remains locally compiled |
 | MiniCPM5 `bf16-compiled` (default) | Same profile | Local norm/RoPE and complete decode-step compilation, including the packed residual/RMSNorm kernel |
 | MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within a separate 4096-total-position limit | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
+| d3 `bf16` (also `auto`) | `vllm-sr/d3-lite` BF16: hidden 1024, 24 layers (18 GDN + 6 non-causal full attention), B1, up to 262144 positions, 255-code FP32 readout; image requests add the `visual.*` tower (12 blocks + merger) over **one still image** per request | Text: one whole-request `Compiled` callable per prompt length (`ids [1,L]`, `candidate_count [1]` → masked FP32 probabilities), traced on first use, replayed without retracing, least recently used evicted under `d3_text_profile_limit`/`d3_text_profile_token_budget`. Image: eager preprocess and vision tower, then one compiled callable per `(length, image_tokens)` under the same default bound. Video and multi-image requests are rejected by name |
 
 These rows describe implemented scopes, not qualified targets. The maintained
 owners are [Qwen3](../crates/apxinf-model/src/metal_qwen3/README.md) and
@@ -131,6 +145,9 @@ cargo run --features mlx -- generate --model /path/to/MiniCPM5-2B \
   --asset draft=/path/to/official-DSpark --greedy \
   --chat-options '{"enable_thinking":false}' --max-tokens 80 \
   --prompt 'Explain gravity briefly.'
+
+cargo run --features mlx -- decide --model /path/to/d3-lite \
+  --device metal:0 --prompt 'Which option is correct?' --candidates 255
 ```
 
 The CLI renders the checkpoint chat template with the supplied options.
@@ -186,7 +203,7 @@ Omitting it or using `--model-variant auto` preserves the optimization target.
 ### Implemented speech selection
 
 [`metal_qwen3_tts`](../crates/apxinf-model/src/metal_qwen3_tts/README.md) runs
-Qwen3-TTS-12Hz-1.7B-CustomVoice through `SpeechRuntime`: batch one,
+Qwen3-TTS-12Hz-1.7B-CustomVoice through `TtsTrait`: batch one,
 non-streaming, the checkpoint's voices and languages, an optional style
 instruction and a seed. AutoModel detects it from `model_type` `qwen3_tts`.
 It follows the EngineTailor MLX parity path (mlx-audio 70f4add with reference
@@ -257,6 +274,21 @@ do not certify native shader/JIT behavior for every length. Qualification must
 separately check changed operands, unseen lengths, Metal parity, retained
 outputs and warm resources. The non-generative `SchemaDecisionRuntime` does not
 borrow the text runtime's readiness status or advertise a fabricated `Ready`.
+
+## d3 decision execution
+
+The `metal_d3` family compiles the whole request rather than a local seam: the
+forward is one graph (embedding, 24 layers, final norm, FP32 readout, masked
+softmax) with no decode and no KV cache, so there is no smaller repeated unit to
+qualify. Each prompt length gets its own compiled profile, traced and warmed by
+`Compiled::prepare` on first use; the candidate count is an input value and
+reuses the profile. Profiles are bounded by the shared d3 text-profile options
+and evicted least recently used first; an evicted length traces again. The same
+body runs eagerly in the maintained ignored test that compares the two and
+checks replay, changed inputs and eviction. Image requests add an eager
+preprocess and vision tower and a second compiled callable per
+`(length, image_tokens)`. See the
+[module README](../crates/apxinf-model/src/metal_d3/README.md).
 
 ## Native dependency and ABI
 
@@ -435,6 +467,9 @@ A latency result does not waive retained-memory growth or stale-state errors.
 `Stream::counters` records explicit bridge upload/download bytes and Rust trace
 callbacks. It does not count every internal MLX pipeline compilation or physical
 DMA. `memory_stats` is the process-wide MLX allocator, not process RSS.
+Its buffer cache is bounded to `apxinf_mlx::DEFAULT_CACHE_LIMIT_BYTES` when
+the first Metal stream is created, unless the application has set a limit with
+`apxinf_mlx::set_cache_limit`; model code does not clear the cache to bound it.
 Synchronize before reading allocator statistics, and measure preparation
 separately from warm requests. Keep numerical, semantic and performance
 validation independent of these diagnostic counters.
@@ -464,6 +499,36 @@ by a later call. `Tensor::clone` is not assumed to deep-copy. Tests cover two
 live engines, repeated reset/load/unload, retained outputs, cancellation/error
 cleanup and capacity exhaustion. Unified memory does not remove ownership,
 copy, device-residency or synchronization obligations.
+
+## Profiling with Instruments
+
+Build with `--features mlx-signpost` and every `profiling::trace::range` in the
+process becomes an `os_signpost` interval. Each interval has subsystem
+`com.apxinf`, category `PointsOfInterest`, signpost name `range`, and the range
+name as its start message. Metal Qwen3 opens a `prefill` or `decode` range per
+step with an `eval` range inside it, so the time before `eval` is host graph
+construction and `eval` covers evaluation, including the wait for the GPU.
+
+```sh
+cargo build --release --features mlx-signpost
+xcrun xctrace record --template 'Metal System Trace' \
+  --instrument 'Points of Interest' --output run.trace \
+  --env DYLD_LIBRARY_PATH="$MLX_ROOT/lib" \
+  --launch -- target/release/apxinf generate --model /path/to/Qwen3-0.6B \
+  --device metal --dtype bf16 --greedy --max-tokens 8 --prompt 'Hello'
+```
+
+The recording holds the ranges in the Points of Interest instrument, on the
+same timeline as Metal System Trace's GPU intervals. Without Instruments,
+`/usr/bin/log show --signpost --last 5m --predicate 'subsystem == "com.apxinf"'`
+lists the same intervals (zsh has a `log` builtin, hence the full path).
+
+Points of Interest signposts are written to the unified log whether or not a
+recorder is attached, so each range costs an FFI call and a log write: a few
+microseconds (1.5 to 5 µs per begin/end pair in a tight C loop on Apple M2 with
+nothing recording). That is why the backend is a separate feature. Keep ranges
+at step or stage granularity, not per operation. Names are logged as public
+strings and kept in the system log, so a name must not carry request content.
 
 ## Migration sequence and acceptance
 

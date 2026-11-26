@@ -122,6 +122,12 @@ fn metal_caps(index: i32) -> Result<MetalDeviceCaps> {
     Ok(MetalDeviceCaps::new(text(name), text(architecture)))
 }
 
+/// Cache limit that every Metal stream construction applies, unless the
+/// caller has already chosen one with [`set_cache_limit`]. MLX keeps freed
+/// buffers for reuse and, by default, lets that cache grow to its memory
+/// limit; each new input shape adds buffers that later shapes rarely reuse.
+pub const DEFAULT_CACHE_LIMIT_BYTES: usize = 1 << 30;
+
 #[derive(Clone)]
 pub struct Stream(Rc<StreamInner>);
 /// Cumulative observations for one logical execution stream and its clones.
@@ -156,7 +162,9 @@ impl Stream {
         if index != 0 {
             return Err(Error::UnsupportedDevice(apxinf_core::Device::Metal(index)));
         }
-        Self::create(true, index)
+        let stream = Self::create(true, index)?;
+        check(unsafe { ffi::apx_mlx_default_cache_limit(DEFAULT_CACHE_LIMIT_BYTES) })?;
+        Ok(stream)
     }
     fn create(gpu: bool, index: usize) -> Result<Self> {
         let mut raw = std::ptr::null_mut();
@@ -389,6 +397,19 @@ impl Array {
         check(unsafe {
             ffi::apx_mlx_array_read(self.stream().raw(), self.raw(), out.as_mut_ptr(), out.len())
         })?;
+        self.stream()
+            .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
+        Ok(out)
+    }
+    /// Like [`to_bytes`](Self::to_bytes), but waits only for this array's
+    /// computation, not for other work queued on its stream, and adds no
+    /// operation: work submitted later with [`Stream::async_eval`] keeps
+    /// running. The array must be row-contiguous (for example a kernel output).
+    pub fn to_bytes_ready(&self) -> Result<Vec<u8>> {
+        let mut out = vec![0; self.numel() * self.dtype().size_in_bytes()];
+        self.stream()
+            .record(|c| c.eval_calls = c.eval_calls.saturating_add(1));
+        check(unsafe { ffi::apx_mlx_array_read_ready(self.raw(), out.as_mut_ptr(), out.len()) })?;
         self.stream()
             .record(|c| c.downloads_bytes = c.downloads_bytes.saturating_add(out.len()));
         Ok(out)

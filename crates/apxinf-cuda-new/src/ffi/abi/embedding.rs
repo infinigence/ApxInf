@@ -36,6 +36,16 @@ mod fixed_launchers {
             frequency_step: f32,
             stream: cudaStream_t,
         ) -> cudaError_t;
+        pub(crate) fn apxinf_embedding_sinusoidal_table(
+            times: *const c_void,
+            output: *mut c_void,
+            rows: i64,
+            width: i64,
+            scale: f32,
+            log_step: f32,
+            dtype: u32,
+            stream: cudaStream_t,
+        ) -> cudaError_t;
     }
 }
 pub(crate) use fixed_launchers::*;
