@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,6 +81,39 @@ async fn output_cap_truncation_is_reported_as_length_not_a_protocol_error() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
 }
 
+#[tokio::test]
+async fn clamps_max_tokens_above_the_cap_and_rejects_zero() {
+    let (app, requests) = recording_app().await;
+    let (status, body) = json_response(
+        app.clone(),
+        serde_json::json!({
+            "model":"fake-model",
+            "messages":[{"role":"user","content":"你好"}],
+            "max_tokens":100000
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        request.max_tokens, 128,
+        "engine must receive the clamped output cap"
+    );
+
+    // An explicit zero stays a client error rather than being clamped up.
+    let (status, body) = json_response(
+        app,
+        serde_json::json!({
+            "model":"fake-model",
+            "messages":[{"role":"user","content":"你好"}],
+            "max_tokens":0
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["param"], "max_tokens", "{body}");
+}
+
 async fn wait_until_ready(worker: &WorkerClient) {    for _ in 0..1_000 {
         if worker.ready() {
             return;
@@ -159,6 +192,46 @@ async fn app() -> (axum::Router, Arc<AtomicUsize>) {
             worker,
         ),
         calls,
+    )
+}
+
+struct RecordingEngine {
+    requests: Sender<EngineRequest>,
+}
+
+impl ChatEngine for RecordingEngine {
+    fn complete(&mut self, request: EngineRequest) -> Result<EngineOutput, ApiError> {
+        let _ = self.requests.send(request);
+        Ok(EngineOutput {
+            text: "ok".into(),
+            prompt_tokens: 1,
+            reused_prompt_tokens: 0,
+            completion_tokens: 1,
+            hit_length: false,
+            ttft_ms: None,
+            tpot_ms: None,
+            generation_tps: None,
+            total_latency_ms: None,
+        })
+    }
+}
+
+async fn recording_app() -> (axum::Router, Receiver<EngineRequest>) {
+    let (sender, receiver) = channel();
+    let worker = WorkerClient::spawn(2, move || {
+        Ok(Box::new(RecordingEngine { requests: sender }) as Box<dyn ChatEngine>)
+    });
+    wait_until_ready(&worker).await;
+    (
+        router(
+            ApiConfig {
+                served_model_name: "fake-model".into(),
+                max_output_tokens: 128,
+                ..Default::default()
+            },
+            worker,
+        ),
+        receiver,
     )
 }
 

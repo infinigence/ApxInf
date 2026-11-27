@@ -132,6 +132,19 @@ fn convert_message(
     match message.role.as_str() {
         "user" => convert_user_content(&message.content, message_index, output),
         "assistant" => convert_assistant_content(&message.content, message_index, output),
+        // Claude Code 2.1.330 (and the Messages API generally) may place a
+        // system message mid-conversation. Mirror the top-level `system`
+        // handling: extract text blocks and skip an empty result.
+        "system" => {
+            let text = text_blocks(
+                &message.content,
+                &format!("messages[{message_index}].content"),
+            )?;
+            if !text.is_empty() {
+                output.push(text_message("system", text));
+            }
+            Ok(())
+        }
         other => Err(ApiError::invalid(
             format!("unsupported message role '{other}'"),
             Some(format!("messages[{message_index}].role")),

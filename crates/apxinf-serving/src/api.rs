@@ -29,6 +29,9 @@ use crate::protocol::{
     AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
     ModelCard, ModelList, PromptTokensDetails, Usage,
 };
+use crate::responses::{
+    response_tools, responses_response_base, responses_usage, ResponsesRequest,
+};
 use crate::tool_calling::{
     looks_like_inkling2, parse_assistant_output, parse_inkling2_json, parse_qwen3_xml,
     validate_tool_choice, ToolFormat, ToolRegistry,
@@ -85,6 +88,7 @@ pub fn router_with_limits(
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/responses", post(responses))
         .layer(DefaultBodyLimit::max(limits.body_bytes))
         .with_state(Arc::new(state))
 }
@@ -209,7 +213,7 @@ async fn chat_completions(
             Some("body".to_owned()),
         )
     })?;
-    validate_request(&request, &state.api)?;
+    let requested_max_tokens = validate_request(&request, &state.api)?;
     let (messages, images) = decode_request_messages(&state, request.messages).await?;
     request.messages = messages;
     let registry = ToolRegistry::validate(&request.tools)?;
@@ -220,15 +224,12 @@ async fn chat_completions(
         .as_ref()
         .is_some_and(|options| options.include_usage);
     let parallel_tool_calls = request.parallel_tool_calls;
-    let max_tokens = request
-        .max_completion_tokens
-        .or(request.max_tokens)
-        .unwrap_or_else(|| {
-            state
-                .api
-                .max_output_tokens
-                .min(GenerationOptions::DEFAULT_MAX_NEW_TOKENS)
-        });
+    let max_tokens = requested_max_tokens.unwrap_or_else(|| {
+        state
+            .api
+            .max_output_tokens
+            .min(GenerationOptions::DEFAULT_MAX_NEW_TOKENS)
+    });
     let engine_request = EngineRequest {
         messages: request.messages,
         images,
@@ -329,15 +330,14 @@ async fn messages(
         disable_spec_decode: false,
         chat_template_kwargs: empty_options(),
     };
-    validate_request(&openai_request, &state.api)?;
+    let requested_max_tokens = validate_request(&openai_request, &state.api)?;
     let (messages, images) = decode_request_messages(&state, openai_request.messages).await?;
     openai_request.messages = messages;
     let registry = ToolRegistry::validate(&openai_request.tools)?;
     let tool_choice = validate_tool_choice(openai_request.tool_choice.as_ref(), &registry)?;
     let parallel_tool_calls = openai_request.parallel_tool_calls;
     let stream = openai_request.stream;
-    let max_tokens = openai_request
-        .max_tokens
+    let max_tokens = requested_max_tokens
         .expect("Anthropic max_tokens was validated as required");
     let engine_request = EngineRequest {
         messages: openai_request.messages,
@@ -398,6 +398,182 @@ async fn messages(
         usage: prepared.usage.into(),
     })
     .into_response())
+}
+
+async fn responses(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<ResponsesRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(request) = payload.map_err(|error| {
+        ApiError::invalid(
+            format!("invalid JSON request: {}", error.body_text()),
+            Some("body".to_owned()),
+        )
+    })?;
+    let converted = request.into_chat_completion()?;
+    let mut openai_request = ChatCompletionRequest {
+        model: converted.model,
+        messages: converted.messages,
+        tools: converted.tools,
+        tool_choice: converted.tool_choice,
+        parallel_tool_calls: converted.parallel_tool_calls,
+        stream: converted.stream,
+        stream_options: None,
+        max_tokens: converted.max_tokens,
+        max_completion_tokens: None,
+        temperature: converted.temperature,
+        top_k: None,
+        top_p: converted.top_p,
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        n: None,
+        stop: None,
+        logprobs: None,
+        response_format: None,
+        enable_thinking: Some(converted.enable_thinking),
+        disable_spec_decode: false,
+        chat_template_kwargs: empty_options(),
+    };
+    let requested_max_tokens = validate_request(&openai_request, &state.api)?;
+    let (messages, images) = decode_request_messages(&state, openai_request.messages).await?;
+    openai_request.messages = messages;
+    let registry = ToolRegistry::validate(&openai_request.tools)?;
+    let tool_choice = validate_tool_choice(openai_request.tool_choice.as_ref(), &registry)?;
+    let parallel_tool_calls = openai_request.parallel_tool_calls;
+    let stream = openai_request.stream;
+    let tool_choice_value = openai_request
+        .tool_choice
+        .clone()
+        .unwrap_or_else(|| json!("auto"));
+    let tools_echo = response_tools(&openai_request.tools);
+    let max_tokens = requested_max_tokens.unwrap_or_else(|| {
+        state
+            .api
+            .max_output_tokens
+            .min(GenerationOptions::DEFAULT_MAX_NEW_TOKENS)
+    });
+    let engine_request = EngineRequest {
+        messages: openai_request.messages,
+        images,
+        tools: openai_request.tools,
+        tool_choice: tool_choice.clone(),
+        chat_template_kwargs: openai_request.chat_template_kwargs,
+        enable_thinking: openai_request.enable_thinking.unwrap_or(false),
+        max_tokens,
+        temperature: openai_request.temperature,
+        top_k: openai_request.top_k,
+        top_p: openai_request.top_p,
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        stop_after_tool_call: !parallel_tool_calls,
+    };
+    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let id = format!("resp_{sequence:016x}");
+    let created = unix_seconds();
+    let model = state.api.served_model_name.clone();
+    if stream {
+        let receiver = state
+            .worker
+            .submit_stream_for_request(engine_request, Some(sequence))?;
+        return Ok(responses_streaming_response(
+            receiver,
+            state.api.tool_format,
+            registry,
+            tool_choice,
+            parallel_tool_calls,
+            sequence,
+            ResponsesEnvelope {
+                id,
+                created,
+                model,
+                tool_choice: tool_choice_value,
+                tools: tools_echo,
+                parallel_tool_calls,
+            },
+        ));
+    }
+    let output = state.worker.complete(engine_request).await?;
+    let prepared = prepare_completion(
+        output,
+        state.api.tool_format,
+        &registry,
+        &tool_choice,
+        parallel_tool_calls,
+        sequence,
+    )?;
+    Ok(Json(responses_response_object(
+        &id,
+        created,
+        &model,
+        &tool_choice_value,
+        &tools_echo,
+        parallel_tool_calls,
+        &prepared,
+    ))
+    .into_response())
+}
+
+fn responses_response_object(
+    id: &str,
+    created: u64,
+    model: &str,
+    tool_choice: &Value,
+    tools: &[Value],
+    parallel_tool_calls: bool,
+    prepared: &PreparedCompletion,
+) -> Value {
+    let incomplete = prepared.finish_reason == "length";
+    let mut response =
+        responses_response_base(id, created, model, tool_choice, tools, parallel_tool_calls);
+    let status = if incomplete {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    response["status"] = json!(status);
+    response["output"] = json!(responses_output_items(prepared));
+    response["usage"] = responses_usage(&prepared.usage);
+    if incomplete {
+        response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    }
+    response
+}
+
+fn responses_output_items(prepared: &PreparedCompletion) -> Vec<Value> {
+    let mut items = Vec::new();
+    if let Some(reasoning) = prepared
+        .reasoning_content
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    {
+        items.push(json!({
+            "id": format!("rs_{:016x}", items.len()),
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        }));
+    }
+    if let Some(content) = prepared.content.as_deref().filter(|text| !text.is_empty()) {
+        items.push(json!({
+            "id": format!("msg_{:016x}", items.len()),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content, "annotations": []}],
+        }));
+    }
+    for call in &prepared.tool_calls {
+        items.push(json!({
+            "id": format!("fc_{:016x}", items.len()),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call.id,
+            "name": call.function.name,
+            "arguments": call.function.arguments,
+        }));
+    }
+    items
 }
 
 struct PreparedCompletion {
@@ -992,6 +1168,605 @@ async fn send_anthropic_stream_error(
     .await;
 }
 
+struct ResponsesEnvelope {
+    id: String,
+    created: u64,
+    model: String,
+    tool_choice: Value,
+    tools: Vec<Value>,
+    parallel_tool_calls: bool,
+}
+
+impl ResponsesEnvelope {
+    fn response(&self) -> Value {
+        responses_response_base(
+            &self.id,
+            self.created,
+            &self.model,
+            &self.tool_choice,
+            &self.tools,
+            self.parallel_tool_calls,
+        )
+    }
+}
+
+enum OpenResponsesItem {
+    Reasoning {
+        id: String,
+        index: usize,
+        text: String,
+    },
+    Message {
+        id: String,
+        index: usize,
+        text: String,
+    },
+}
+
+/// Translates the shared `StreamUpdate` sequence into Responses API SSE frames.
+///
+/// Items are opened lazily on their first update and closed when the next item
+/// class starts, so `response.completed` lists exactly the items whose deltas
+/// were already sent, in emission order, with matching `output_index` values.
+struct ResponsesWireState {
+    envelope: ResponsesEnvelope,
+    next_sequence_number: u64,
+    next_item_id: u64,
+    output: Vec<Value>,
+    open: Option<OpenResponsesItem>,
+}
+
+impl ResponsesWireState {
+    fn new(envelope: ResponsesEnvelope, sequence: u64) -> Self {
+        Self {
+            envelope,
+            next_sequence_number: 0,
+            next_item_id: sequence,
+            output: Vec::new(),
+            open: None,
+        }
+    }
+
+    async fn send_frame(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        event: &str,
+        mut data: Value,
+    ) -> bool {
+        data["type"] = Value::String(event.to_owned());
+        data["sequence_number"] = json!(self.next_sequence_number);
+        self.next_sequence_number += 1;
+        let frame = format!(
+            "event: {event}\ndata: {}\n\n",
+            serde_json::to_string(&data).expect("serde_json::Value is serializable")
+        );
+        sender.send(Ok(Bytes::from(frame))).await.is_ok()
+    }
+
+    fn new_item_id(&mut self, prefix: &str) -> String {
+        let value = self.next_item_id;
+        self.next_item_id += 1;
+        format!("{prefix}_{value:016x}")
+    }
+
+    async fn send_update(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        update: StreamUpdate,
+    ) -> bool {
+        match update {
+            StreamUpdate::Reasoning(delta) => self.push_reasoning(sender, delta).await,
+            StreamUpdate::Content(delta) => self.push_content(sender, delta).await,
+            StreamUpdate::ToolCall { call, .. } => self.push_tool_call(sender, call).await,
+        }
+    }
+
+    async fn push_reasoning(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        delta: String,
+    ) -> bool {
+        if matches!(self.open, Some(OpenResponsesItem::Message { .. }))
+            && !self.close_open(sender).await
+        {
+            return false;
+        }
+        if self.open.is_none() {
+            let id = self.new_item_id("rs");
+            let index = self.output.len();
+            if !self
+                .send_frame(
+                    sender,
+                    "response.output_item.added",
+                    json!({
+                        "output_index": index,
+                        "item": {"id": id, "type": "reasoning", "summary": []},
+                    }),
+                )
+                .await
+            {
+                return false;
+            }
+            if !self
+                .send_frame(
+                    sender,
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "item_id": id,
+                        "output_index": index,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                    }),
+                )
+                .await
+            {
+                return false;
+            }
+            self.open = Some(OpenResponsesItem::Reasoning {
+                id,
+                index,
+                text: String::new(),
+            });
+        }
+        let (item_id, index) = {
+            let Some(OpenResponsesItem::Reasoning { id, index, text }) = self.open.as_mut() else {
+                unreachable!("reasoning item is open");
+            };
+            text.push_str(&delta);
+            (id.clone(), *index)
+        };
+        self.send_frame(
+            sender,
+            "response.reasoning_summary_text.delta",
+            json!({
+                "item_id": item_id,
+                "output_index": index,
+                "summary_index": 0,
+                "delta": delta,
+            }),
+        )
+        .await
+    }
+
+    async fn push_content(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        delta: String,
+    ) -> bool {
+        if matches!(self.open, Some(OpenResponsesItem::Reasoning { .. }))
+            && !self.close_open(sender).await
+        {
+            return false;
+        }
+        if self.open.is_none() {
+            let id = self.new_item_id("msg");
+            let index = self.output.len();
+            if !self
+                .send_frame(
+                    sender,
+                    "response.output_item.added",
+                    json!({
+                        "output_index": index,
+                        "item": {
+                            "id": id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    }),
+                )
+                .await
+            {
+                return false;
+            }
+            if !self
+                .send_frame(
+                    sender,
+                    "response.content_part.added",
+                    json!({
+                        "item_id": id,
+                        "output_index": index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []},
+                    }),
+                )
+                .await
+            {
+                return false;
+            }
+            self.open = Some(OpenResponsesItem::Message {
+                id,
+                index,
+                text: String::new(),
+            });
+        }
+        let (item_id, index) = {
+            let Some(OpenResponsesItem::Message { id, index, text }) = self.open.as_mut() else {
+                unreachable!("message item is open");
+            };
+            text.push_str(&delta);
+            (id.clone(), *index)
+        };
+        self.send_frame(
+            sender,
+            "response.output_text.delta",
+            json!({
+                "item_id": item_id,
+                "output_index": index,
+                "content_index": 0,
+                "delta": delta,
+            }),
+        )
+        .await
+    }
+
+    async fn push_tool_call(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        call: crate::protocol::ToolCall,
+    ) -> bool {
+        if !self.close_open(sender).await {
+            return false;
+        }
+        let call_id = call.id;
+        let name = call.function.name;
+        let arguments = call.function.arguments;
+        let id = self.new_item_id("fc");
+        let index = self.output.len();
+        if !self
+            .send_frame(
+                sender,
+                "response.output_item.added",
+                json!({
+                    "output_index": index,
+                    "item": {
+                        "id": id,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "call_id": call_id.clone(),
+                        "name": name.clone(),
+                        "arguments": "",
+                    },
+                }),
+            )
+            .await
+        {
+            return false;
+        }
+        if !self
+            .send_frame(
+                sender,
+                "response.function_call_arguments.delta",
+                json!({
+                    "item_id": id,
+                    "output_index": index,
+                    "delta": arguments.clone(),
+                }),
+            )
+            .await
+        {
+            return false;
+        }
+        if !self
+            .send_frame(
+                sender,
+                "response.function_call_arguments.done",
+                json!({
+                    "item_id": id,
+                    "output_index": index,
+                    "arguments": arguments.clone(),
+                }),
+            )
+            .await
+        {
+            return false;
+        }
+        let completed = json!({
+            "id": id,
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        });
+        if !self
+            .send_frame(
+                sender,
+                "response.output_item.done",
+                json!({"output_index": index, "item": completed}),
+            )
+            .await
+        {
+            return false;
+        }
+        self.output.push(completed);
+        true
+    }
+
+    async fn close_open(&mut self, sender: &mpsc::Sender<Result<Bytes, Infallible>>) -> bool {
+        let Some(open) = self.open.take() else {
+            return true;
+        };
+        match open {
+            OpenResponsesItem::Reasoning { id, index, text } => {
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.reasoning_summary_text.done",
+                        json!({
+                            "item_id": id.clone(),
+                            "output_index": index,
+                            "summary_index": 0,
+                            "text": text.clone(),
+                        }),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.reasoning_summary_part.done",
+                        json!({
+                            "item_id": id.clone(),
+                            "output_index": index,
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": text.clone()},
+                        }),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                let item = json!({
+                    "id": id,
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": text}],
+                });
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.output_item.done",
+                        json!({"output_index": index, "item": item}),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                self.output.push(item);
+            }
+            OpenResponsesItem::Message { id, index, text } => {
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.output_text.done",
+                        json!({
+                            "item_id": id.clone(),
+                            "output_index": index,
+                            "content_index": 0,
+                            "text": text.clone(),
+                        }),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.content_part.done",
+                        json!({
+                            "item_id": id.clone(),
+                            "output_index": index,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": text.clone(), "annotations": []},
+                        }),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                let item = json!({
+                    "id": id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                });
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.output_item.done",
+                        json!({"output_index": index, "item": item}),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                self.output.push(item);
+            }
+        }
+        true
+    }
+
+    async fn send_completed(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        prepared: &PreparedCompletion,
+    ) -> bool {
+        if !self.close_open(sender).await {
+            return false;
+        }
+        let incomplete = prepared.finish_reason == "length";
+        let mut response = self.envelope.response();
+        let status = if incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        response["status"] = json!(status);
+        response["output"] = json!(self.output);
+        response["usage"] = responses_usage(&prepared.usage);
+        if incomplete {
+            response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        }
+        self.send_frame(sender, "response.completed", json!({"response": response}))
+            .await
+    }
+
+    async fn send_failed(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        error: ApiError,
+    ) {
+        let message = error.message;
+        let code = error.code;
+        let mut response = self.envelope.response();
+        response["status"] = json!("failed");
+        response["output"] = json!(self.output);
+        response["error"] = json!({"code": code, "message": message.clone()});
+        let _ = self
+            .send_frame(
+                sender,
+                "response.failed",
+                json!({
+                    "response": response,
+                    "error": {"code": code, "message": message},
+                }),
+            )
+            .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn responses_streaming_response(
+    mut receiver: mpsc::Receiver<Result<EngineStreamEvent, ApiError>>,
+    tool_format: ToolFormat,
+    registry: ToolRegistry,
+    tool_choice: crate::tool_calling::ToolChoice,
+    parallel_tool_calls: bool,
+    sequence: u64,
+    envelope: ResponsesEnvelope,
+) -> Response {
+    let (sender, body_receiver) = mpsc::channel::<Result<Bytes, Infallible>>(128);
+    tokio::spawn(async move {
+        let mut wire = ResponsesWireState::new(envelope, sequence);
+        let created = wire.envelope.response();
+        if !wire
+            .send_frame(&sender, "response.created", json!({"response": created}))
+            .await
+        {
+            return;
+        }
+        let in_progress = wire.envelope.response();
+        if !wire
+            .send_frame(
+                &sender,
+                "response.in_progress",
+                json!({"response": in_progress}),
+            )
+            .await
+        {
+            return;
+        }
+
+        let mut protocol = ProtocolStreamState::new(tool_format);
+        loop {
+            let event = tokio::select! {
+                _ = sender.closed() => return,
+                event = receiver.recv() => event,
+            };
+            let Some(event) = event else {
+                wire.send_failed(
+                    &sender,
+                    ApiError::unavailable("model worker stopped before responding"),
+                )
+                .await;
+                return;
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => {
+                    wire.send_failed(&sender, error).await;
+                    return;
+                }
+            };
+            match event {
+                EngineStreamEvent::TextDelta(delta) => {
+                    let updates = match protocol.push(
+                        &delta,
+                        &registry,
+                        &tool_choice,
+                        parallel_tool_calls,
+                        sequence,
+                    ) {
+                        Ok(updates) => updates,
+                        Err(error) => {
+                            wire.send_failed(&sender, error).await;
+                            return;
+                        }
+                    };
+                    for update in updates {
+                        if !wire.send_update(&sender, update).await {
+                            return;
+                        }
+                    }
+                }
+                EngineStreamEvent::Complete(output) => {
+                    if protocol.raw != output.text {
+                        wire.send_failed(
+                            &sender,
+                            ApiError::internal(
+                                "streamed text did not match the completed generation",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    let prepared = match prepare_completion(
+                        output,
+                        tool_format,
+                        &registry,
+                        &tool_choice,
+                        parallel_tool_calls,
+                        sequence,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            wire.send_failed(&sender, error).await;
+                            return;
+                        }
+                    };
+                    let updates = match protocol.finish(&prepared) {
+                        Ok(updates) => updates,
+                        Err(error) => {
+                            wire.send_failed(&sender, error).await;
+                            return;
+                        }
+                    };
+                    for update in updates {
+                        if !wire.send_update(&sender, update).await {
+                            return;
+                        }
+                    }
+                    wire.send_completed(&sender, &prepared).await;
+                    return;
+                }
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(body_receiver)))
+        .expect("static SSE response headers are valid")
+}
+
 struct StreamEnvelope<'a> {
     id: &'a str,
     created: u64,
@@ -1453,7 +2228,10 @@ async fn decode_request_messages(
     .map_err(|e| ApiError::internal(format!("image decoding failed: {e}")))?
 }
 
-fn validate_request(request: &ChatCompletionRequest, config: &ApiConfig) -> Result<(), ApiError> {
+fn validate_request(
+    request: &ChatCompletionRequest,
+    config: &ApiConfig,
+) -> Result<Option<usize>, ApiError> {
     if request
         .model
         .as_ref()
@@ -1486,7 +2264,7 @@ fn validate_request(request: &ChatCompletionRequest, config: &ApiConfig) -> Resu
         ));
     }
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
-    if max_tokens == Some(0) || max_tokens.is_some_and(|value| value > config.max_output_tokens) {
+    if max_tokens == Some(0) {
         return Err(ApiError::invalid(
             format!(
                 "requested output tokens must be in 1..={}",
@@ -1495,6 +2273,17 @@ fn validate_request(request: &ChatCompletionRequest, config: &ApiConfig) -> Resu
             Some("max_tokens".to_owned()),
         ));
     }
+    let max_tokens = max_tokens.map(|requested| {
+        if requested > config.max_output_tokens {
+            eprintln!(
+                "clamped max_tokens: requested={requested} max_output_tokens={}",
+                config.max_output_tokens
+            );
+            config.max_output_tokens
+        } else {
+            requested
+        }
+    });
     if request.disable_spec_decode {
         return Err(ApiError::invalid(
             "disable_spec_decode requires a model runtime extension not included in this server",
@@ -1541,7 +2330,7 @@ fn validate_request(request: &ChatCompletionRequest, config: &ApiConfig) -> Resu
     validate_finite_range(request.top_p, f32::MIN_POSITIVE, 1.0, "top_p")?;
     validate_finite_range(request.frequency_penalty, -2.0, 2.0, "frequency_penalty")?;
     validate_finite_range(request.presence_penalty, -2.0, 2.0, "presence_penalty")?;
-    Ok(())
+    Ok(max_tokens)
 }
 
 fn validate_finite_range(

@@ -200,6 +200,71 @@ async fn converts_anthropic_tools_and_tool_results() {
 }
 
 #[tokio::test]
+async fn accepts_mid_conversation_system_messages_from_claude_code() {
+    let (app, requests) = app().await;
+    let (status, body) = response(
+        app.clone(),
+        serde_json::json!({
+            "model":"fake-model",
+            "max_tokens":32,
+            "system":[{"type":"text","text":"top level system"}],
+            "messages":[
+                {"role":"user","content":"first"},
+                {"role":"system","content":[{"type":"text","text":"mid conversation system"}]},
+                {"role":"user","content":"second"}
+            ],
+            "context_management":{},
+            "output_config":{},
+            "metadata":{}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(request.messages.len(), 4);
+    assert_eq!(request.messages[0].role, "system");
+    assert_eq!(
+        request.messages[0].content,
+        Some(Value::String("top level system".into()))
+    );
+    assert_eq!(request.messages[1].role, "user");
+    assert_eq!(request.messages[2].role, "system");
+    assert_eq!(
+        request.messages[2].content,
+        Some(Value::String("mid conversation system".into()))
+    );
+    assert_eq!(request.messages[3].role, "user");
+    for message in &request.messages {
+        assert!(
+            message.role == "system" || message.role == "user",
+            "mid-conversation system text arrived as role '{}'",
+            message.role
+        );
+    }
+
+    let (status, body) = response(
+        app,
+        serde_json::json!({
+            "model":"fake-model",
+            "max_tokens":32,
+            "messages":[
+                {"role":"user","content":"hi"},
+                {"role":"system","content":[{
+                    "type":"image",
+                    "source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}
+                }]}
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
 async fn streams_anthropic_sse_event_sequence() {
     let (app, _) = app().await;
     let (status, body) = response(
@@ -243,6 +308,38 @@ async fn uses_anthropic_error_envelope() {
     let body: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["type"], "error");
     assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn clamps_max_tokens_above_the_cap_for_claude_code() {
+    let (app, requests) = app().await;
+    let (status, body) = response(
+        app.clone(),
+        serde_json::json!({
+            "model":"fake-model",
+            "max_tokens":128000,
+            "messages":[{"role":"user","content":"你好"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        request.max_tokens, 128,
+        "engine must receive the clamped output cap"
+    );
+
+    // An explicit zero stays a client error rather than being clamped up.
+    let (status, body) = response(
+        app,
+        serde_json::json!({
+            "model":"fake-model",
+            "max_tokens":0,
+            "messages":[{"role":"user","content":"你好"}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 struct Inkling2Engine;

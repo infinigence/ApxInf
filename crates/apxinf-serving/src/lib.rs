@@ -10,6 +10,7 @@ mod engine;
 mod error;
 mod media;
 pub mod protocol;
+mod responses;
 pub mod tool_calling;
 mod worker;
 
