@@ -333,6 +333,12 @@ impl Network {
         &self.stream
     }
 
+    /// Placeholder token the processor writes per merged image row; the prompt
+    /// must contain this many placeholders for the tower's features to splice.
+    pub fn image_token_id(&self) -> u32 {
+        self.config.image_token_id
+    }
+
     /// Per-question logits, lazily; the caller evaluates them once.
     pub fn logits(&self, encoded: &Encoded) -> Result<Vec<Array>> {
         self.logits_with_vision(encoded, None)

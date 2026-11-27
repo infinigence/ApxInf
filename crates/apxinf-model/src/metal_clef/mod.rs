@@ -146,20 +146,33 @@ impl ClefRunner {
         schema: &DecisionSchema,
         images: &[crate::vision_preprocess::DecodedImage],
     ) -> Result<SchemaDecisionOutput> {
-        let encoded = encode::encode(&self.tokenizer, schema)?;
-        let logits = if images.is_empty() {
-            self.network.logits(&encoded)?
+        let prepared = if images.is_empty() {
+            None
         } else {
-            let prepared = self.preprocessor.prepare(images)?;
-            let pixels = Array::from_f32(
-                self.network.stream(),
-                &[prepared.rows(), preprocess::PATCH_WIDTH],
-                &prepared.pixels,
-            )?;
-            self.network.logits_with_vision(
-                &encoded,
-                Some((&pixels, &prepared.grids, &prepared.image_key)),
-            )?
+            Some(self.preprocessor.prepare(images)?)
+        };
+        let encoded = match &prepared {
+            None => encode::encode(&self.tokenizer, schema)?,
+            Some(prepared) => encode::encode_with_images(
+                &self.tokenizer,
+                schema,
+                &prepared.grids,
+                self.network.image_token_id(),
+            )?,
+        };
+        let logits = match &prepared {
+            None => self.network.logits(&encoded)?,
+            Some(prepared) => {
+                let pixels = Array::from_f32(
+                    self.network.stream(),
+                    &[prepared.rows(), preprocess::PATCH_WIDTH],
+                    &prepared.pixels,
+                )?;
+                self.network.logits_with_vision(
+                    &encoded,
+                    Some((&pixels, &prepared.grids, &prepared.image_key)),
+                )?
+            }
         };
         self.network.stream().eval(&logits)?;
         let probabilities = logits
