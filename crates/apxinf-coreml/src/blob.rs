@@ -12,6 +12,8 @@ const SENTINEL: u32 = 0xDEAD_BEEF;
 pub enum BlobDataType {
     Float16 = 1,
     Int8 = 4,
+    UInt4 = 11,
+    UInt6 = 13,
 }
 
 #[derive(Default)]

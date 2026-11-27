@@ -209,7 +209,72 @@ pub fn render(value: &Value) -> Result<String> {
     Ok(out)
 }
 
+/// Merged image tokens: `height / merge * width / merge` per image, matching
+/// `int(prod(grid)) // merge_size**2`.
+pub fn merged_rows(grid: &[u32; 3]) -> Result<usize> {
+    const MERGE: u32 = 2;
+    let [temporal, height, width] = *grid;
+    if temporal == 0 || height == 0 || width == 0 {
+        return Err(invalid(format!("empty image grid {grid:?}")));
+    }
+    if height % MERGE != 0 || width % MERGE != 0 {
+        return Err(invalid(format!(
+            "image grid {grid:?} is not a multiple of the merge size {MERGE}"
+        )));
+    }
+    let rows = (temporal as usize)
+        .checked_mul((height / MERGE) as usize)
+        .and_then(|n| n.checked_mul((width / MERGE) as usize))
+        .ok_or_else(|| invalid("image grid overflows".into()))?;
+    Ok(rows)
+}
+
+/// The media token block, tokenized exactly as the reference does: one string
+/// per request, appended to the prefix, never merged with the state.
+fn media_ids(tokenizer: &Tokenizer, grids: &[[u32; 3]], image_token_id: u32) -> Result<Vec<u32>> {
+    if grids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut text = String::new();
+    let mut expected = 0usize;
+    for grid in grids {
+        let rows = merged_rows(grid)?;
+        text.push_str("<|vision_start|>");
+        for _ in 0..rows {
+            text.push_str("<|image_pad|>");
+        }
+        text.push_str("<|vision_end|>");
+        expected += rows;
+    }
+    // One trailing newline: the block's delimiter before the state text, not
+    // per image. That single extra token is the `+ 1` in the assertion below.
+    text.push('\n');
+    let ids = tokenizer.encode_with_special_tokens(&text, false)?;
+    let observed = ids.iter().filter(|&&id| id == image_token_id).count();
+    if image_token_id == 0 || observed != expected || ids.len() != expected + 2 * grids.len() + 1 {
+        return Err(invalid(format!(
+            "media block tokenized to {} ids with {observed} image placeholders, expected {expected} placeholders",
+            ids.len()
+        )));
+    }
+    Ok(ids)
+}
+
+/// `encode` without media: the text-only request form.
 pub fn encode(tokenizer: &Tokenizer, schema: &DecisionSchema) -> Result<Encoded> {
+    encode_with_images(tokenizer, schema, &[], 0)
+}
+
+/// Reference `_encode_media` layout: each image contributes
+/// `<|vision_start|>` + `<|vision_end|>` per merged row + `<|vision_end|>`, the
+/// block is appended after `STATE:\n` and followed by one newline, before the
+/// state text. `image_token_id` (0 for text-only requests) validates the count.
+pub fn encode_with_images(
+    tokenizer: &Tokenizer,
+    schema: &DecisionSchema,
+    grids: &[[u32; 3]],
+    image_token_id: u32,
+) -> Result<Encoded> {
     schema.validate()?;
     let tokens = |text: &str| tokenizer.encode_with_special_tokens(text, false);
     let mut schema_ids = tokens("\n\nSCHEMA FIELDS:\n")?;
@@ -254,9 +319,10 @@ pub fn encode(tokenizer: &Tokenizer, schema: &DecisionSchema) -> Result<Encoded>
             option_ids,
         });
     }
-    let prefix = tokens(&format!(
+    let mut prefix = tokens(&format!(
         "<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\nSTATE:\n"
     ))?;
+    prefix.extend(media_ids(tokenizer, grids, image_token_id)?);
     let suffix = tokens(
         "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:",
     )?;
@@ -518,6 +584,19 @@ mod tests {
             json!({"a": 0}),
         ] {
             assert!(truthy(&value), "{value}");
+        }
+    }
+
+    #[test]
+    fn merged_rows_follow_the_processor_token_count() {
+        // Suite crops: 384x320 -> 24x20 patches -> 12x10 merged rows = 120.
+        assert_eq!(merged_rows(&[1, 24, 20]).unwrap(), 120);
+        assert_eq!(merged_rows(&[1, 18, 24]).unwrap(), 108);
+        assert_eq!(merged_rows(&[1, 20, 30]).unwrap(), 150);
+        // Temporal grids multiply the merged rows, as `prod(grid) // merge^2`.
+        assert_eq!(merged_rows(&[2, 24, 20]).unwrap(), 240);
+        for invalid in [[0, 24, 20], [1, 23, 20], [1, 24, 21]] {
+            assert!(merged_rows(&invalid).is_err(), "{invalid:?}");
         }
     }
 }

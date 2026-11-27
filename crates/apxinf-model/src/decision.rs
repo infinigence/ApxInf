@@ -214,6 +214,21 @@ pub trait CodeDecisionRuntime {
 pub trait SchemaDecisionRuntime {
     fn capabilities(&self) -> LlmCapabilities;
     fn decide_schema(&mut self, request: &DecisionSchema) -> Result<SchemaDecisionOutput>;
+
+    /// A schema request with images, in request order. Families that accept
+    /// media decode nothing — the caller hands over decoded RGB — and run their
+    /// tower inside the timed request. The default rejects media explicitly
+    /// rather than ignoring it.
+    fn decide_schema_with_images(
+        &mut self,
+        _request: &DecisionSchema,
+        images: &[crate::vision_preprocess::DecodedImage],
+    ) -> Result<SchemaDecisionOutput> {
+        let _ = images;
+        Err(Error::Contract(
+            "this decision family does not accept images",
+        ))
+    }
 }
 
 /// The d3 name for [`CodeDecisionRuntime`], kept for existing callers.

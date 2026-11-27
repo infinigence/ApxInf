@@ -8,6 +8,8 @@ mod ane_admission;
 mod config;
 mod encode;
 mod model;
+mod preprocess;
+mod vision;
 mod weights;
 
 pub use config::{Config, MAX_INPUT_TOKENS};
@@ -26,6 +28,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub struct ClefRunner {
+    /// Checkpoint preprocessing contract, resolved once.
+    preprocessor: preprocess::Preprocessor,
     tokenizer: Tokenizer,
     network: Network,
 }
@@ -124,16 +128,52 @@ pub fn load(
     let head = weights::Head::load(&config, &stream, &path.join("joint_head.safetensors"))?;
     Ok(LoadedModel::Decision(DecisionModel::Schema(Box::new(
         ClefRunner {
+            preprocessor: preprocess::Preprocessor::load(path, 4)?,
             tokenizer,
-            network: Network::new(config, stream, backbone, head, composition)?,
+            network: Network::new(config, stream, backbone, head, composition, path)?,
         },
     ))))
 }
 
 impl ClefRunner {
     fn score_schema(&self, schema: &DecisionSchema) -> Result<SchemaDecisionOutput> {
-        let encoded = encode::encode(&self.tokenizer, schema)?;
-        let logits = self.network.logits(&encoded)?;
+        self.score_schema_with_images(schema, &[])
+    }
+
+    /// The same readout, with the tower's features spliced into the prompt.
+    fn score_schema_with_images(
+        &self,
+        schema: &DecisionSchema,
+        images: &[crate::vision_preprocess::DecodedImage],
+    ) -> Result<SchemaDecisionOutput> {
+        let prepared = if images.is_empty() {
+            None
+        } else {
+            Some(self.preprocessor.prepare(images)?)
+        };
+        let encoded = match &prepared {
+            None => encode::encode(&self.tokenizer, schema)?,
+            Some(prepared) => encode::encode_with_images(
+                &self.tokenizer,
+                schema,
+                &prepared.grids,
+                self.network.image_token_id(),
+            )?,
+        };
+        let logits = match &prepared {
+            None => self.network.logits(&encoded)?,
+            Some(prepared) => {
+                let pixels = Array::from_f32(
+                    self.network.stream(),
+                    &[prepared.rows(), preprocess::PATCH_WIDTH],
+                    &prepared.pixels,
+                )?;
+                self.network.logits_with_vision(
+                    &encoded,
+                    Some((&pixels, &prepared.grids, &prepared.image_key)),
+                )?
+            }
+        };
         self.network.stream().eval(&logits)?;
         let probabilities = logits
             .iter()
@@ -175,11 +215,22 @@ impl ClefRunner {
 
 impl SchemaDecisionRuntime for ClefRunner {
     fn capabilities(&self) -> LlmCapabilities {
-        LlmCapabilities::TEXT_ONLY
+        LlmCapabilities {
+            image: true,
+            ..LlmCapabilities::TEXT_ONLY
+        }
     }
 
     fn decide_schema(&mut self, schema: &DecisionSchema) -> Result<SchemaDecisionOutput> {
         self.score_schema(schema)
+    }
+
+    fn decide_schema_with_images(
+        &mut self,
+        schema: &DecisionSchema,
+        images: &[crate::vision_preprocess::DecodedImage],
+    ) -> Result<SchemaDecisionOutput> {
+        self.score_schema_with_images(schema, images)
     }
 }
 
