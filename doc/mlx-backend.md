@@ -59,8 +59,13 @@ combinations fail at construction with an explicit error.
 `LlmTrait::forward` retains its full `[seq_len, vocab_size]` logits contract.
 The generation-oriented `prefill(LlmInput)` hook may consume the whole prompt
 and return only `[1, vocab_size]`. Qwen3 uses cache-only prefix chunks of at
-most 512 followed by a final-token forward; MiniCPM5 uses 512-token chunks above
-4096 prompt tokens and projects the final normalized row of each chunk.
+most 2048 in compiled BF16 mode followed by a final-token forward. MiniCPM5
+uses 1024-token chunks above 4096 prompt tokens in compiled mode and projects
+the last row of the final chunk. Other variants retain the 512-token default.
+Experimental family-specific `APXINF_QWEN3_PREFILL_CHUNK` and
+`APXINF_MINICPM5_PREFILL_CHUNK` overrides select 512/1024/2048 at construction.
+Each family derives preparation and execution from the same private range plan;
+Mini's override preserves whole prompts through 4096 and all DSpark behavior.
 Long preparation advertises bounded chunk shapes, not a full prompt-sized
 forward. Call `forward` on an admitted shape for every input row's logits. Ordinary
 generation uses the shared sampler/EOS loop; DSpark overrides the request-level
@@ -101,24 +106,22 @@ execute a Metal request on CPU.
 
 Metal admission requires a registered `metal_` factory and is resolved before
 device construction or checkpoint loading. It does not fall back to a legacy
-generic model factory; CPU/CUDA registry fallback remains unchanged. Only the
-selected family parses `model_variant`, so adding a Metal family does not edit
-a central variant list. Explicit
+generic model factory; CPU/CUDA registry fallback remains unchanged. Explicit
 `--model-name metal_qwen3` and `--model-name metal_minicpm5` select these
-implementations, as does `--model-name metal_d3` (the detected `d3` name already
-resolves to it). The original
+implementations, as does `--model-name metal_d3_lite` for the d3-lite port (the
+detected `d3` name already resolves to `metal_d3`). The original
 `qwen3`/`minicpm5` and `qwen3-mlx`/`minicpm5-mlx` selectors remain aliases on
 Metal; Qwen3 checkpoint detection still works.
 
 | Family selection | Profile admitted by current code | Actual prepared execution |
 | --- | --- | --- |
 | Qwen3 `bf16-public` | Qwen3-0.6B BF16, B1, up to 40960 total positions | Ordered device composition; source public SwiGLU remains locally compiled |
-| Qwen3 `bf16-compiled` (default) | Same profile | Local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
-| Qwen3 `mixed-w8` | Same profile; affine W8/group 64 | Transformer projections use W8 at M1 and BF16 for larger M; fused gate/up; the tied input/output table is packed at every M; local norm/RoPE and fixed Q/K norm-to-RoPE Metal fusion; no BF16 decoder-block callable |
+| Qwen3 `bf16-compiled` | Same profile | Native weighted RMSNorm with prepared BF16 weights; local norm/RoPE compilation plus explicit-state B1/L1 decoder blocks after prefix state exists; no whole-step callable |
+| Qwen3 `mixed-w8` (default, also `auto`) | Same profile; affine W8/group 64 | Transformer projections use W8 at M1 and BF16 for larger M; fused gate/up; the tied input/output table is packed at every M; local norm/RoPE and fixed Q/K norm-to-RoPE Metal fusion; no BF16 decoder-block callable |
 | MiniCPM5 `bf16-public` | Official 2B BF16 geometry, B1, up to 65792 total positions, including 65536 prompt + 256 output | Ordered device composition; source public SwiGLU remains locally compiled |
-| MiniCPM5 `bf16-compiled` (default) | Same profile | Local norm/RoPE and complete decode-step compilation, including the packed residual/RMSNorm kernel |
+| MiniCPM5 `bf16-compiled` (default) | Same profile | KV-only evaluation of non-final prefill chunks, native weighted prefill RMSNorm with BF16 rounding before weight multiplication, local RoPE and complete decode-step compilation with packed residual/RMSNorm |
 | MiniCPM5 `dspark` | Same target plus the pinned official BF16 drafter; 1–256 output tokens within a separate 4096-total-position limit | Compiled five-layer draft and sequential Markov-head proposal chain, plus compiled target verification for up to eight rows; explicit accept/trim/pending-token schedule |
-| d3 `bf16` (also `auto`) | `vllm-sr/d3-lite` BF16: hidden 1024, 24 layers (18 GDN + 6 non-causal full attention), B1, up to 262144 positions, 255-code FP32 readout; image requests add the `visual.*` tower (12 blocks + merger) over **one still image** per request | Text: one whole-request `Compiled` callable per prompt length (`ids [1,L]`, `candidate_count [1]` → masked FP32 probabilities), traced on first use, replayed without retracing, least recently used evicted under `d3_text_profile_limit`/`d3_text_profile_token_budget`. Image: eager preprocess and vision tower, then one compiled callable per `(length, image_tokens)` under the same default bound. Video and multi-image requests are rejected by name |
+| d3-lite `bf16` (default), also `auto` / `bf16-compiled` | `vllm-sr/d3-lite` BF16 text path: hidden 1024, 24 layers (18 GDN + 6 non-causal full attention), B1, up to 262144 positions, 255-code FP32 readout; image requests add the `visual.*` tower (12 × 768 blocks + merger to 1024) over **one still image** per request | Text: whole-request `Compiled` forward (`ids [1,L]`, `candidate_count [1]` → masked FP32 probabilities); one `(length, candidate_count)` profile traced on first use and replayed without retracing; eager lazy graph retained for the compiled/eager acceptance test. Image: eager checkpoint-fixed preprocess (`preprocess.rs`) + eager vision tower (`vision.rs`), then a second `Compiled` forward (`ids`, `[3,L]` mRoPE positions, `candidate_count`, merged features, one placeholder-run start) with one `(length, candidate_count, image_tokens)` profile; the text callable and its profiles are untouched. Video and multi-image requests are rejected by name |
 
 These rows describe implemented scopes, not qualified targets. The maintained
 owners are [Qwen3](../crates/apxinf-model/src/metal_qwen3/README.md) and
@@ -127,6 +130,14 @@ arrays and guarded fusions in [apxinf-mlx](../crates/apxinf-mlx/README.md).
 Qwen3 reads `head_dim` explicitly (128, although hidden/heads is 64). MiniCPM5's
 official `model_type` is `llama`, so select `--model-name metal_minicpm5` explicitly.
 DSpark requires the named `draft` asset and is never selected by default.
+
+`Bf16QkTableRope` is a safe backend operation for BF16 Q `[1,Hq,1,D]`, K
+`[1,Hk,1,D]` and tables `[1,1,1,D]`, with positive heads and positive even D.
+It accepts array views and rounds each half-split product and sum to BF16.
+Qwen3 selects it only inside established-prefix `bf16-compiled` decoder blocks,
+after native Q/K normalization. Local prefill RoPE, `bf16-public`, and
+`mixed-w8` retain their existing operations. The backend owns launch geometry
+and bounds checks; Qwen3 owns table preparation, position and KV updates.
 
 The MLX allocator cache budget is process-wide and belongs to the embedding
 application, applied once before model loading. A cache limit does not cap
@@ -146,7 +157,7 @@ cargo run --features mlx -- generate --model /path/to/MiniCPM5-2B \
   --chat-options '{"enable_thinking":false}' --max-tokens 80 \
   --prompt 'Explain gravity briefly.'
 
-cargo run --features mlx -- decide --model /path/to/d3-lite \
+cargo run --features mlx -- decide --model /path/to/d3-lite-9c10703 \
   --device metal:0 --prompt 'Which option is correct?' --candidates 255
 ```
 
@@ -172,11 +183,14 @@ codec dependency is added.
   loads the DiT and VAE decoder with complete key, shape and dtype checks.
 - A request reads the text encoder one layer at a time and frees each layer.
   The DiT computes the text-prefix K/V once and then runs one compiled image
-  forward per step. On `applegpu_g16g` (M4), the architecture where it was
-  measured faster, the default `auto` variant uses the MPP GEMM for image
-  projections of at least 1024 aligned tokens after a load-time probe of the
-  three projection shapes at 1024 rows. Matching that probe does not qualify
-  all weights, shapes or image outputs. Other architectures use quantized matmul.
+  forward per step. On `applegpu_g16g` (M4), the architecture where they were
+  qualified, the default `auto` variant runs each image block as seven fused
+  kernels for 1024..=4096 aligned image tokens; these round differently from
+  mflux, so `auto` images there are not bit-identical to `reference`. For
+  other aligned counts of at least 1024 tokens it uses the MPP GEMM for image
+  projections after a load-time probe of the three projection shapes at 1024
+  rows; matching that probe does not qualify all weights, shapes or image
+  outputs. Other architectures use quantized matmul.
   `model_variant=reference` skips MPP and uses quantized matmul for all Q4
   projections, without changing the scheduler or other execution paths. The DiT
   is released before the tiled VAE decode (512 px tiles, 128 px overlap) and
@@ -203,7 +217,7 @@ Omitting it or using `--model-variant auto` preserves the optimization target.
 ### Implemented speech selection
 
 [`metal_qwen3_tts`](../crates/apxinf-model/src/metal_qwen3_tts/README.md) runs
-Qwen3-TTS-12Hz-1.7B-CustomVoice through `TtsTrait`: batch one,
+Qwen3-TTS-12Hz-1.7B-CustomVoice through `SpeechRuntime`: batch one,
 non-streaming, the checkpoint's voices and languages, an optional style
 instruction and a seed. AutoModel detects it from `model_type` `qwen3_tts`.
 It follows the EngineTailor MLX parity path (mlx-audio 70f4add with reference
@@ -238,14 +252,10 @@ cargo run --features mlx -- speak --model /path/to/Qwen3-TTS-12Hz-1.7B-CustomVoi
 ```
 ## Clef decision preparation
 
-`auto` selects only GPU execution. Core ML column splitting requires the explicit
-`gpu-ane-columns` model variant and the `coreml` feature. An architecture name
-does not qualify a new OS, checkpoint, or execution profile. The declared
-placement and complete-request qualification requirements still apply.
-
-The decision CLI sets its process allocator cache limit before loading.
-Library callers retain ownership of their process policy through
-`apxinf_mlx::set_cache_limit`; loading Clef does not change that limit.
+`auto` selects only GPU execution. Core ML splitting requires an explicit
+`gpu-ane-columns` or `gpu-ane-neurons` model variant and the `coreml` feature.
+An architecture name does not qualify a new OS, checkpoint, or execution profile.
+The declared placement and complete-request qualification requirements still apply.
 
 With `coreml`, Clef checks its selected fixed input/output profile before
 compilation and matches the inspected expected plan to the generated source
@@ -263,7 +273,7 @@ qualification in [the Core ML contract](coreml-ane.md).
 
 The `metal_clef` decision family prepares its existing shapeless decay/beta
 callable during loading, before returning the runner. Its disposable BF16
-operands match the admitted 32 value heads and token lengths 1, 2 and 16384;
+operands match the admitted 32 value heads and token lengths 1, 2 and 4096;
 `Compiled::prepare` evaluates both outputs and verifies Rust trace reuse for
 each warm profile. Preparation errors fail loading. Real requests retain the
 original single lazy invocation with their actual layer weights and values.
@@ -275,24 +285,49 @@ separately check changed operands, unseen lengths, Metal parity, retained
 outputs and warm resources. The non-generative `SchemaDecisionRuntime` does not
 borrow the text runtime's readiness status or advertise a fabricated `Ready`.
 
-## d3 decision execution
+## d3-lite decision execution
 
-The `metal_d3` family compiles the whole request rather than a local seam: the
-forward is one graph (embedding, 24 layers, final norm, FP32 readout, masked
-softmax) with no decode and no KV cache, so there is no smaller repeated unit to
-qualify. Each prompt length gets its own compiled profile, traced and warmed by
-`Compiled::prepare` on first use; the candidate count is an input value and
-reuses the profile. Profiles are bounded by the shared d3 text-profile options
-and evicted least recently used first; an evicted length traces again. The same
-body runs eagerly in the maintained ignored test that compares the two and
-checks replay, changed inputs and eviction. Image requests add an eager
-preprocess and vision tower and a second compiled callable per
-`(length, image_tokens)`. See the
-[module README](../crates/apxinf-model/src/metal_d3/README.md).
+The `metal_d3` family compiles the **whole request** rather than a local seam:
+the forward is a single one-shot graph (embedding, 24 layers, final norm, FP32
+readout, masked softmax) with no decode and no KV cache, so there is no smaller
+repeated unit to qualify. `Compiled::prepare` traces and warms one exact
+`(length, candidate_count)` profile on first use; later requests with the same
+profile replay without a Rust trace callback, and a new length traces exactly
+once. The same body is available eagerly (`Model::eager_probabilities`) and the
+maintained ignored test compares the two, verifies replay stability and changed
+input propagation. Whole-request compilation is a new scope for this family —
+it is not inherited from Clef or Qwen3 — and is qualified by that test and by
+the 48-case gate rather than by those families' evidence.
+
+Image requests (P1b) keep the text callable intact and add a second one-shot
+graph. The caller passes one still image through `DecisionInput::with_vision`
+(`pixel_values [N,1536]`, `grid_thw [1,h,w]`); the port runs its own
+checkpoint-fixed preprocess (`preprocess.rs`: smart_resize with Python
+banker's rounding, PyTorch's int16 bicubic, fused `(u8−127.5)/127.5`,
+merge-block patchify), the eager 12-block vision tower with its spatial merger
+(`vision.rs`), and then the compiled image callable
+`(ids [1,L], positions [3,L], candidate_count [1], features [1,M,1024], run_start [1])`
+under mRoPE. `(length, candidate_count, image_tokens)` profiles are traced on
+first use and replay without retracing; the features are evaluated before the
+call so the profile stays concrete. `multimodal_layout` reproduces the
+reference's `get_rope_index` positions from the placeholder runs. See the
+[P1b vision report](d3-lite-metal-vision.md) and the
+[P1a port report](d3-lite-metal.md) plus the reusable
+[`d3_lite_bench`](../crates/apxinf-model/examples/d3_lite_bench.rs) entry
+(`--set image` / `--images SUITE`).
+
+## Native serving preparation lifetime
+
+The opt-in [prepared-code profile](serving/native-prepared-v0.1.md) separates model-owned code from request KV.
+It retains one complete MiniCPM5 preparation key and reports memory after cleanup.
+The existing native profiles retain release-all settlement.
+This lifetime policy does not add a model arithmetic variant.
+Only the worker owner sets process-wide allocator cache limits.
+The ordinary public forward output contract remains unchanged.
 
 ## Native dependency and ABI
 
-The implemented bridge wraps the **MLX 0.32.3** C++ SDK with a small C ABI.
+The implemented bridge wraps the **MLX 0.32.4** C++ SDK with a small C ABI.
 `MLX_ROOT` identifies the matching `include/mlx/` and `lib/` distribution;
 headers are checked at build time and the linked version at stream construction.
 Do not combine arbitrary system headers with another wheel's library. A wheel
@@ -390,10 +425,27 @@ does not represent. Load them with `apxinf_mlx::load_safetensors` over
 keep only the keys the family uses. The family owns the key map, group size,
 bit width and every shape check.
 
-This native loader depends on the pinned MLX 0.32.3 SDK upgrade, including its
-lazy payload-read error propagation. Matching function signatures in 0.31.2
+This native loader depends on the pinned MLX 0.32.4 SDK (retaining 0.32.3+'s
+lazy payload-read error propagation). Matching function signatures in 0.31.2
 do not establish that guarantee. Native CPU regression tests cover failure
 after header validation, before payload evaluation completes.
+
+Qwen3 `bf16-compiled` retains BF16 checkpoint norm weights and uses native
+weighted RMSNorm for all input, post-attention, Q, K, and final norms in prefill
+and decode. Its private norm helper selects arithmetic from the prepared weight
+dtype. BF16 weights require BF16 activations; FP32 weights retain the ordered
+FP32 expression used by `bf16-public` and `mixed-w8`. This changes 222 of 1024
+text-fixed tokens relative to b2d58ea. External-teacher agreement is 221/222
+with no per-language regression. Five clean 1K blocks improve total time
+against ordered normalization; the full MLX matrix remains pending.
+
+MiniCPM5 compiled prefill uses native weighted RMSNorm with its existing BF16
+weights. The pinned MLX 0.32.3 Metal kernel casts the normalized value to BF16
+before multiplying the weight. Public and DSpark retain ordered normalization,
+and compiled decode retains packed residual/RMSNorm. Short-token, teacher and
+eight long logits/state checks match the unweighted path. Five clean 1K blocks
+give a median total-time ratio of 0.9961 against that path; the full matrix
+remains pending.
 
 Keep structural checks at preparation where possible, preserve safe operand and
 resource checks at invocation, and compare the actual compiled/fused path with
@@ -410,8 +462,12 @@ capture instead of fabricating a no-op graph.
 The current text implementations select compiled execution through explicit
 family variants and fallible family `prepare` methods. `Compiled` owns the pure
 Rust callback; `call` is lazy and `call_and_eval` completes all returned arrays.
-Preparation uses `Compiled::prepare`, which evaluates twice and rejects any
-Rust trace callback on the second invocation. Callable construction rejects
+`Compiled::prepare` evaluates twice and rejects any Rust trace callback on the
+second invocation. `Compiled::prepare_trace` checks graph reuse without evaluation.
+The opt-in MiniCPM5 exact-attention path evaluates its first and last
+widths and uses graph-only preparation for intermediate widths. Their first
+device evaluation can still compile shaders and allocate buffers; cold-request
+timing includes that work. Callable construction rejects
 the presence of `MLX_DISABLE_COMPILE`, even when its value is `0`; that MLX
 setting otherwise disables compilation silently. The reuse check observes
 Rust tracing, not all native shader compilation.
@@ -438,7 +494,7 @@ norm/RoPE kernel is not proof that full-step compilation was assessed.
 | --- | --- |
 | Construct | Bind device/runtime identity, weights, public semantics and supported profiles |
 | Prepare | Validate structural contracts; materialize immutable weights; create kernels/closures; trace/compile/warm supported profiles; establish memory bounds |
-| Run | Check live operands; bind explicit state; call the prepared closure; enqueue device work without retracing, retuning or creating persistent resources |
+| Run | Check live operands; bind explicit state; call the prepared closure without new Rust graph traces; include deferred device JIT/allocation in cold timing when preparation was graph-only |
 | Complete | Evaluate required outputs and new state on the correct stream; publish state only after successful completion |
 | Reset / invalidate | Make old request state unreachable; preserve retained resources or invalidate dependents before replacing them |
 | Release | Retain resources until dependent asynchronous work is complete; release partial preparations on failure |
@@ -467,9 +523,6 @@ A latency result does not waive retained-memory growth or stale-state errors.
 `Stream::counters` records explicit bridge upload/download bytes and Rust trace
 callbacks. It does not count every internal MLX pipeline compilation or physical
 DMA. `memory_stats` is the process-wide MLX allocator, not process RSS.
-Its buffer cache is bounded to `apxinf_mlx::DEFAULT_CACHE_LIMIT_BYTES` when
-the first Metal stream is created, unless the application has set a limit with
-`apxinf_mlx::set_cache_limit`; model code does not clear the cache to bound it.
 Synchronize before reading allocator statistics, and measure preparation
 separately from warm requests. Keep numerical, semantic and performance
 validation independent of these diagnostic counters.
@@ -499,36 +552,6 @@ by a later call. `Tensor::clone` is not assumed to deep-copy. Tests cover two
 live engines, repeated reset/load/unload, retained outputs, cancellation/error
 cleanup and capacity exhaustion. Unified memory does not remove ownership,
 copy, device-residency or synchronization obligations.
-
-## Profiling with Instruments
-
-Build with `--features mlx-signpost` and every `profiling::trace::range` in the
-process becomes an `os_signpost` interval. Each interval has subsystem
-`com.apxinf`, category `PointsOfInterest`, signpost name `range`, and the range
-name as its start message. Metal Qwen3 opens a `prefill` or `decode` range per
-step with an `eval` range inside it, so the time before `eval` is host graph
-construction and `eval` covers evaluation, including the wait for the GPU.
-
-```sh
-cargo build --release --features mlx-signpost
-xcrun xctrace record --template 'Metal System Trace' \
-  --instrument 'Points of Interest' --output run.trace \
-  --env DYLD_LIBRARY_PATH="$MLX_ROOT/lib" \
-  --launch -- target/release/apxinf generate --model /path/to/Qwen3-0.6B \
-  --device metal --dtype bf16 --greedy --max-tokens 8 --prompt 'Hello'
-```
-
-The recording holds the ranges in the Points of Interest instrument, on the
-same timeline as Metal System Trace's GPU intervals. Without Instruments,
-`/usr/bin/log show --signpost --last 5m --predicate 'subsystem == "com.apxinf"'`
-lists the same intervals (zsh has a `log` builtin, hence the full path).
-
-Points of Interest signposts are written to the unified log whether or not a
-recorder is attached, so each range costs an FFI call and a log write: a few
-microseconds (1.5 to 5 µs per begin/end pair in a tight C loop on Apple M2 with
-nothing recording). That is why the backend is a separate feature. Keep ranges
-at step or stage granularity, not per operation. Names are logged as public
-strings and kept in the system log, so a name must not carry request content.
 
 ## Migration sequence and acceptance
 

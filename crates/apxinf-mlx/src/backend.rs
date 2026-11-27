@@ -5,7 +5,7 @@ use crate::{Array, MlxDType, Stream};
 use apxinf_core::{
     Backend, DType, Device, Error, Graph, KvCache, NextTokenLogits, NormalGenerator, Result,
     SamplingBackend, Shape, Storage, Tensor, TokenPenalties, TokenSample, TokenSampler,
-    TokenSamplingInit, TokenSamplingSpec, TokenSelection,
+    TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec, TokenSelection,
 };
 use std::{any::Any, rc::Rc};
 
@@ -473,6 +473,8 @@ impl SamplingBackend for MlxBackend {
             backend: self.clone(),
             spec,
             remaining: None,
+            params: TokenSamplingParams::greedy(),
+            key: None,
         }))
     }
     fn create_normal_generator(&self, _output: Tensor) -> Result<Box<dyn NormalGenerator>> {
@@ -483,6 +485,9 @@ struct Greedy {
     backend: MlxBackend,
     spec: TokenSamplingSpec,
     remaining: Option<usize>,
+    params: TokenSamplingParams,
+    /// MLX PRNG key state; `None` for pure greedy (no draws).
+    key: Option<Array>,
 }
 impl TokenSampler for Greedy {
     fn spec(&self) -> TokenSamplingSpec {
@@ -490,12 +495,19 @@ impl TokenSampler for Greedy {
     }
     fn begin(&mut self, init: TokenSamplingInit<'_>) -> Result<()> {
         self.remaining = None;
+        self.key = None;
         init.params.validate(self.spec.vocab_size)?;
-        if init.params.selection != TokenSelection::Greedy
-            || init.params.penalties != TokenPenalties::default()
-            || init.params.return_logprob
-        {
-            return Err(Error::UnsupportedOp("MLX sampling options beyond greedy"));
+        self.params = init.params.clone();
+        let needs_rng = matches!(init.params.selection, TokenSelection::Random { .. });
+        if init.params.return_logprob {
+            return Err(Error::UnsupportedOp("MLX sampler does not return logprobs"));
+        }
+        if !needs_rng {
+            if init.params.penalties != TokenPenalties::default() {
+                return Err(Error::UnsupportedOp(
+                    "MLX penalties beyond repetition=1/frequency=0/presence=0",
+                ));
+            }
         }
         if init
             .prompt_token_ids
@@ -503,6 +515,9 @@ impl TokenSampler for Greedy {
             .any(|&x| x as usize >= self.spec.vocab_size)
         {
             return Err(err("prompt token exceeds vocabulary"));
+        }
+        if needs_rng {
+            self.key = Some(Array::random_key(self.backend.stream(), init.rng.seed)?);
         }
         self.remaining = Some(
             self.spec
@@ -531,14 +546,81 @@ impl TokenSampler for Greedy {
             ])?
             .slice_axis(0, logits.row_index(), logits.row_index() + 1)?
             .cast(MlxDType::F32)?;
-        // Match core NaN/+inf/-inf normalization; argmax resolves ties to first.
-        let token = greedy_token(&a)?;
+        let token = match self.key.take() {
+            None => greedy_token(&a)?,
+            Some(key) => {
+                // Temperature scaling, then top-k / top-p filtering, then a
+                // categorical draw. NaN/+inf rows are rejected by the same
+                // isfinite gate as the greedy path.
+                let params = self.params.clone();
+                let adjusted = match params.selection {
+                    TokenSelection::Greedy => a,
+                    TokenSelection::Random {
+                        temperature,
+                        top_k,
+                        top_p,
+                    } => {
+                        let scaled = a.mul(&Array::from_f32(
+                            a.stream(),
+                            &[1],
+                            &[1.0 / temperature.max(1e-8)],
+                        )?)?;
+                        let masked = match top_k {
+                            Some(k) => scaled.top_k_mask(k.min(self.spec.vocab_size), -1)?,
+                            None => scaled,
+                        };
+                        // Top-p: sort descending, keep the smallest prefix
+                        // whose cumulative softmax mass reaches `top_p`.
+                        let filtered = if top_p < 1.0 {
+                            top_p_mask(&masked, top_p)?
+                        } else {
+                            masked
+                        };
+                        // `mx.random.categorical` draws from unnormalized log
+                        // probabilities; -inf-masked entries get zero mass.
+                        let (next_key, subkey) = Array::random_split(&key)?;
+                        self.key = Some(next_key);
+                        let draw = filtered.categorical(-1, &subkey)?;
+                        draw
+                    }
+                };
+                let checked = adjusted
+                    .cast(MlxDType::U32)?
+                    .reshape(&[1])?
+                    .contiguous()?;
+                let token = checked.to_u32_scalar()?;
+                if token as usize >= self.spec.vocab_size {
+                    return Err(err("sampled token exceeds vocabulary"));
+                }
+                token
+            }
+        };
         self.remaining = Some(remaining - 1);
         Ok(TokenSample {
             token_id: token,
             logprob: None,
         })
     }
+}
+/// Apply a top-p (nucleus) mask along the last axis of log-probabilities.
+/// Keeps the smallest set of highest-probability tokens whose cumulative
+/// softmax mass is at least `top_p`; masks the rest with -inf.
+fn top_p_mask(logits: &Array, top_p: f32) -> Result<Array> {
+    let probs = logits.softmax(-1)?;
+    // Sort descending; MLX has no direct argsort-descending, so negate and use
+    // argpartition-free `argsort` on the negated copy.
+    let neg = probs.neg()?;
+    let order = neg.argsort(-1)?;
+    let sorted = probs.take_along_axis(&order, -1)?;
+    let cumsum = sorted.cumsum(-1)?;
+    // Keep tokens whose cumulative mass (excluding themselves) is < top_p.
+    let shifted = cumsum
+        .slice(&[0, 0], &[1, cumsum.shape()[1] - 1])?
+        .pad(&[0, 1], &[0, 0])?;
+    let keep = shifted.less(&Array::from_f32(logits.stream(), &[1], &[top_p])?)?;
+    let keep_scattered = keep.take_along_axis(&order, -1)?;
+    let neg_inf = Array::scalar(logits.stream(), f32::NEG_INFINITY, logits.dtype())?;
+    keep_scattered.where_select(logits, &neg_inf)
 }
 /// Device-resident greedy ID and a checked ID (u32::MAX for invalid logits).
 /// The unchecked ID remains safe to feed to an embedding before host validation.

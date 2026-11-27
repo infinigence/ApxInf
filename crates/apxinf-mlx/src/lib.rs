@@ -6,17 +6,30 @@ mod array;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod backend;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub mod banded_attn;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod causal_conv;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod device_caps;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub mod exact_gemv;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 mod ffi;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub mod loop_glue;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub mod moe_qmv;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+mod quantized;
+#[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
+pub use quantized::Quantized;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use array::DEFAULT_CACHE_LIMIT_BYTES;
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use array::{
-    clear_cache, load_safetensors, memory_stats, reset_peak_memory, set_cache_limit, Array,
-    Compiled, MemoryStats, MetalKernel, MlxDType, Stream, StreamCounters, TemplateArg,
+    clear_cache, load_safetensors, loaded_library_path, memory_stats, reset_peak_memory,
+    runtime_version, set_cache_limit, set_memory_limit, Array, Compiled, MemoryStats, MetalKernel,
+    MlxDType, QuantMode, Stream, StreamCounters, TemplateArg,
 };
 #[cfg(all(feature = "native", target_os = "macos", target_arch = "aarch64"))]
 pub use backend::{greedy_token_arrays, MlxBackend};

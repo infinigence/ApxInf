@@ -4,19 +4,22 @@ pub type Callback =
     unsafe extern "C" fn(Handle, *const *const c_void, usize, *mut Handle, usize) -> i32;
 extern "C" {
     pub fn apx_mlx_error() -> *const c_char;
+    pub fn apx_mlx_version() -> *const c_char;
+    pub fn apx_mlx_loaded_library_path(out: *mut *const c_char) -> i32;
     pub fn apx_mlx_stream_new(gpu: i32, index: i32, out: *mut Handle) -> i32;
     pub fn apx_mlx_stream_free(stream: Handle);
     pub fn apx_mlx_default_cache_limit(limit: usize) -> i32;
     pub fn apx_mlx_sync(stream: Handle) -> i32;
     pub fn apx_mlx_memory_stats(active: *mut usize, cache: *mut usize, peak: *mut usize) -> i32;
     pub fn apx_mlx_reset_peak_memory() -> i32;
-    pub fn apx_mlx_clear_cache() -> i32;
     pub fn apx_mlx_set_cache_limit(limit: usize, previous: *mut usize) -> i32;
+    pub fn apx_mlx_clear_cache() -> i32;
     pub fn apx_mlx_device_info(
         index: i32,
         name: *mut *const c_char,
         architecture: *mut *const c_char,
     ) -> i32;
+    pub fn apx_mlx_set_memory_limit(limit: usize, previous: *mut usize) -> i32;
     pub fn apx_mlx_array_new(
         stream: Handle,
         shape: *const i32,
@@ -89,7 +92,7 @@ extern "C" {
         array: *mut Handle,
     ) -> i32;
     pub fn apx_mlx_safetensors_free(loaded: Handle);
-    pub fn apx_mlx_metal_new(
+    pub fn apx_mlx_metal_new_opts(
         name: *const c_char,
         source: *const c_char,
         header: *const c_char,
@@ -97,10 +100,12 @@ extern "C" {
         input_count: usize,
         outputs: *const *const c_char,
         output_count: usize,
+        row_contiguous: i32,
+        atomic_outputs: i32,
         out: *mut Handle,
     ) -> i32;
     pub fn apx_mlx_metal_free(kernel: Handle);
-    pub fn apx_mlx_metal_call(
+    pub fn apx_mlx_metal_call_opts(
         stream: Handle,
         kernel: Handle,
         inputs: *const *const c_void,
@@ -115,6 +120,8 @@ extern "C" {
         template_kinds: *const i32,
         template_values: *const i32,
         template_count: usize,
+        has_init_value: i32,
+        init_value: f32,
         outputs: *mut Handle,
     ) -> i32;
 }

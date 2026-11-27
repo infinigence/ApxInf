@@ -79,6 +79,29 @@ fn preparation_verifies_replay_once_per_profile() -> Result<()> {
 }
 
 #[test]
+fn trace_preparation_defers_evaluation_and_reuses_each_shape_with_changed_values() -> Result<()> {
+    let s = Stream::cpu()?;
+    let compiled = Compiled::new(&s, 1, |a| Ok(vec![a[0].add(&a[0])?]))?;
+    for values in [&[1., 2.][..], &[3., 4., 5.][..]] {
+        let input = Array::from_f32(&s, &[values.len()], values)?;
+        compiled.prepare_trace(&[input])?;
+    }
+    let prepared = s.counters();
+    assert_eq!(prepared.eval_calls, 0);
+    assert!(prepared.trace_callbacks > 0);
+    for values in [&[10., 20.][..], &[30., 40., 50.][..]] {
+        let input = Array::from_f32(&s, &[values.len()], values)?;
+        let output = compiled.call_and_eval(&[input])?;
+        assert_eq!(s.counters().trace_callbacks, prepared.trace_callbacks);
+        assert_eq!(
+            output[0].to_f32_vec()?,
+            values.iter().map(|x| 2. * x).collect::<Vec<_>>()
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn upload_views_dtype_and_owned_lifetime() -> Result<()> {
     let s = Stream::cpu()?;
     let a = Array::from_f32(&s, &[2, 3], &[1., 2., 3., 4., 5., 6.])?;
@@ -595,6 +618,14 @@ fn image_operators_follow_mlx_semantics() -> Result<()> {
 }
 
 #[test]
+fn cache_limit_reports_the_previous_limit() -> Result<()> {
+    let original = apxinf_mlx::set_cache_limit(1 << 30)?;
+    assert_eq!(apxinf_mlx::set_cache_limit(2 << 30)?, 1 << 30);
+    assert_eq!(apxinf_mlx::set_cache_limit(original)?, 2 << 30);
+    Ok(())
+}
+
+#[test]
 fn audio_operators_and_key_sequence_follow_mlx() -> Result<()> {
     // Expected values from MLX Python 0.32.3 on the CPU device.
     let s = Stream::cpu()?;
@@ -796,14 +827,6 @@ fn async_evaluation_completes_before_reads_and_checks_streams() -> Result<()> {
 }
 
 #[test]
-fn cache_limit_reports_the_previous_limit() -> Result<()> {
-    let original = apxinf_mlx::set_cache_limit(1 << 30)?;
-    assert_eq!(apxinf_mlx::set_cache_limit(2 << 30)?, 1 << 30);
-    assert_eq!(apxinf_mlx::set_cache_limit(original)?, 2 << 30);
-    Ok(())
-}
-
-#[test]
 fn ready_downloads_wait_for_their_own_array_and_need_row_contiguity() -> Result<()> {
     let s = Stream::cpu()?;
     let a = Array::from_f32(&s, &[2, 2], &[1., 2., 3., 4.])?;
@@ -819,5 +842,36 @@ fn ready_downloads_wait_for_their_own_array_and_need_row_contiguity() -> Result<
     assert_eq!(values, [2., 4., 6., 8.]);
     assert_eq!(later.to_f32_vec()?, [2., 8., 18., 32.]);
     assert!(a.transpose(&[1, 0])?.to_bytes_ready().is_err());
+    Ok(())
+}
+
+#[test]
+fn cache_limit_returns_the_previous_process_policy() -> Result<()> {
+    let original = apxinf_mlx::set_cache_limit(1 << 30)?;
+    let observed = apxinf_mlx::set_cache_limit(2 << 30)?;
+    let restore = apxinf_mlx::set_cache_limit(original);
+    assert_eq!(observed, 1 << 30);
+    restore?;
+    Ok(())
+}
+
+#[test]
+fn pinned_mlx_runtime_version_matches_0_32_4() -> Result<()> {
+    assert_eq!(apxinf_mlx::runtime_version(), "0.32.4");
+    let _cpu = Stream::cpu()?;
+    let metal = Stream::metal(0)?;
+    let caps = metal.metal_caps().expect("Metal stream reports device caps");
+    assert!(
+        caps.architecture.starts_with("applegpu_g"),
+        "unexpected Metal architecture string: {}",
+        caps.architecture
+    );
+    eprintln!(
+        "apxinf-mlx runtime: mx::version()={}, device='{}', arch='{}', lib={}",
+        apxinf_mlx::runtime_version(),
+        caps.device_name,
+        caps.architecture,
+        apxinf_mlx::loaded_library_path()?.display()
+    );
     Ok(())
 }
