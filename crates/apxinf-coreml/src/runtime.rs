@@ -568,6 +568,9 @@ impl ProgramCache {
         Model::load_holding(&compiled, units, Some(entry))
     }
 
+    /// Loads `package`, compiling it on a miss, and reports where Core ML
+    /// would run each of its operations. `admit` decides whether a placement
+    /// is acceptable; a rejected placement is an error and no model is loaded.
     pub fn load_with_placement(
         &self,
         package: &Package,
@@ -580,17 +583,86 @@ impl ProgramCache {
         let compiled = compiled
             .canonicalize()
             .map_err(|error| Error::Other(format!("Core ML compiled path: {error}")))?;
-        let facts = crate::placement::inspect(&compiled, units, timeout_ms)?;
+        let facts = self.placed_facts(package, &compiled, units, timeout_ms)?;
         let model = Model::load_holding(&compiled, units, Some(entry))?;
         admit(&facts)?;
         Ok(model)
     }
+
+    /// The placement of `package`, read from the cached program at `compiled`,
+    /// or from a compilation of this process when that program cannot be
+    /// analysed.
+    ///
+    /// Core ML reports the device of a program's operations only for a
+    /// compilation the calling process made. Ask it about a compiled directory
+    /// another process wrote, and the answer can arrive with no device for any
+    /// operation, or as `Failed to construct compute plan, internal failure`;
+    /// a caller that requires a placement then rejects a program Core ML would
+    /// happily run, and a warm cache — the steady state — loads only when the
+    /// machine is in the mood. Which entries come back like that depends on
+    /// machine state, not on the program: the same entry analyses fine on other
+    /// runs, and recompiling the same bytes here analyses fine immediately.
+    ///
+    /// So a program whose cached analysis is unusable is compiled again, for
+    /// the analysis only. This costs a compilation for the entries that need
+    /// it, where rejecting the load costs the whole model. The scratch
+    /// compilation is deleted; the cached program is still the one loaded, and
+    /// the facts describe it, being a function of the same bytes.
+    fn placed_facts(
+        &self,
+        package: &Package,
+        compiled: &Path,
+        units: ComputeUnits,
+        timeout_ms: u64,
+    ) -> Result<crate::placement::ExpectedPlacement> {
+        self.placed_facts_with(package, compiled, |path| {
+            crate::placement::inspect(path, units, timeout_ms)
+        })
+    }
+
+    /// [`placed_facts`](Self::placed_facts) with the plan analysis injected, so
+    /// that a test can make the cached program unanalysable on demand.
+    fn placed_facts_with(
+        &self,
+        package: &Package,
+        compiled: &Path,
+        inspect: impl Fn(&Path) -> Result<crate::placement::ExpectedPlacement>,
+    ) -> Result<crate::placement::ExpectedPlacement> {
+        let cached = inspect(compiled);
+        if cached.as_ref().is_ok_and(analysed) {
+            return cached;
+        }
+        std::fs::create_dir_all(&self.dir).map_err(cache_error)?;
+        let scratch = tempfile::Builder::new()
+            .prefix(".placement-")
+            .tempdir_in(&self.dir)
+            .map_err(cache_error)?;
+        let source = scratch.path().join("program.mlpackage");
+        let target = scratch.path().join("program.mlmodelc");
+        package.write(&source)?;
+        compile(&source, &target)?;
+        let mut facts = inspect(&target)?;
+        facts.compiled_path = compiled.to_path_buf();
+        Ok(facts)
+    }
+}
+
+/// Whether a plan analysis reported a device for at least one operation. A
+/// program whose analysis reports none for any of them is one Core ML did not
+/// place, which is not the same as a program it placed nowhere.
+fn analysed(facts: &crate::placement::ExpectedPlacement) -> bool {
+    facts
+        .functions
+        .iter()
+        .flat_map(|function| &function.operations)
+        .any(|operation| operation.usage.is_some())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ProgramBuilder;
+    use std::cell::Cell;
     use std::mem::ManuallyDrop;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -600,6 +672,91 @@ mod tests {
         let input = builder.input("x", &[1]).unwrap();
         let output = builder.identity(&input, None).unwrap();
         builder.finish(&[&output]).unwrap()
+    }
+
+    /// An analysis that places one operation on the CPU.
+    fn placing(compiled: &Path) -> crate::placement::ExpectedPlacement {
+        let mut facts = unplacing(compiled);
+        facts.functions[0].operations[0].usage = Some(crate::placement::DeviceUsage {
+            supported: Vec::new(),
+            preferred: Some(crate::placement::ComputeDevice {
+                kind: crate::placement::ComputeDeviceKind::Cpu,
+                class_name: "MLCPUComputeDevice".into(),
+            }),
+        });
+        facts
+    }
+
+    /// An analysis that reports no device for any operation.
+    fn unplacing(compiled: &Path) -> crate::placement::ExpectedPlacement {
+        crate::placement::ExpectedPlacement {
+            compiled_path: compiled.to_path_buf(),
+            compute_units: ComputeUnits::CpuAndNeuralEngine,
+            functions: vec![crate::placement::FunctionPlacement {
+                name: "main".into(),
+                root_operation_count: 1,
+                operations: vec![crate::placement::OperationPlacement {
+                    path: vec![0],
+                    operator: "ios18.tanh".into(),
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    child_operation_counts: Vec::new(),
+                    usage: None,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the native Xcode compiler and macOS/SDK 14.4+"]
+    fn a_cached_analysis_without_a_placement_is_read_from_a_fresh_compilation() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = ProgramCache::new(root.path());
+        let package = package();
+        let compiled = cache.compiled(&package).unwrap();
+        let calls = Cell::new(0);
+        let facts = cache
+            .placed_facts_with(&package, &compiled, |path| {
+                calls.set(calls.get() + 1);
+                if path == compiled {
+                    Ok(unplacing(&compiled))
+                } else {
+                    Ok(placing(path))
+                }
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 2, "the unplaceable analysis was not repeated");
+        assert!(analysed(&facts), "the unplaceable analysis was accepted");
+        assert_eq!(facts.compiled_path, compiled);
+        assert!(compiled.is_dir(), "the cached program was disturbed");
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "the scratch compilation outlived the analysis"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the native Xcode compiler and macOS/SDK 14.4+"]
+    fn a_cached_analysis_with_a_placement_is_used_as_it_is() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = ProgramCache::new(root.path());
+        let package = package();
+        let compiled = cache.compiled(&package).unwrap();
+        let calls = Cell::new(0);
+        let facts = cache
+            .placed_facts_with(&package, &compiled, |path| {
+                calls.set(calls.get() + 1);
+                Ok(placing(path))
+            })
+            .unwrap();
+        assert_eq!(calls.get(), 1, "a placed analysis was analysed again");
+        assert_eq!(facts.compiled_path, compiled);
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "a compilation happened for a placed analysis"
+        );
     }
 
     fn write_compiled(target: &Path) -> Result<()> {
