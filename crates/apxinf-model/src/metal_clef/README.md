@@ -49,6 +49,8 @@ result is unchanged.
 cargo test -p apxinf-model --features coreml --lib metal_clef::
 ```
 
-The tower and preprocessing are covered by device tests; the single-image
-parity fingerprint is `enemy.noul = 0.023870831355452538` against the reference
-decide-server, and the text fingerprint is unchanged at `0.020645929500460625`.
+The tower and preprocessing are covered by the unit tests in this module and by
+the offline checkpoint-processor replay in `tests/vision_preprocessing.rs`. The
+image path pins no numeric fingerprint of its own: its pixels come from
+`vision_preprocess`, which reproduces the checkpoint processor's own resampling
+and normalization, and any consumer that resamples differently will differ.
