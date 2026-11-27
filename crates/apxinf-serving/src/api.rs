@@ -29,15 +29,19 @@ use crate::protocol::{
     AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
     ModelCard, ModelList, PromptTokensDetails, Usage,
 };
-use crate::tool_calling::{parse_qwen3_xml, validate_tool_choice, ToolRegistry};
+use crate::tool_calling::{
+    looks_like_inkling2, parse_assistant_output, parse_inkling2_json, parse_qwen3_xml,
+    validate_tool_choice, ToolFormat, ToolRegistry,
+};
 use crate::worker::{EngineStreamEvent, WorkerClient};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ApiConfig {
     pub served_model_name: String,
     pub max_output_tokens: usize,
+    pub tool_format: ToolFormat,
 }
 
 pub struct ServeConfig {
@@ -250,6 +254,7 @@ async fn chat_completions(
             .submit_stream_for_request(engine_request, Some(sequence))?;
         return Ok(streaming_response(
             receiver,
+            state.api.tool_format,
             registry,
             tool_choice,
             parallel_tool_calls,
@@ -263,6 +268,7 @@ async fn chat_completions(
     let output = state.worker.complete(engine_request).await?;
     let prepared = prepare_completion(
         output,
+        state.api.tool_format,
         &registry,
         &tool_choice,
         parallel_tool_calls,
@@ -278,6 +284,7 @@ async fn chat_completions(
             message: AssistantMessage {
                 role: "assistant",
                 content: prepared.content,
+                reasoning_content: prepared.reasoning_content,
                 tool_calls: (!prepared.tool_calls.is_empty()).then_some(prepared.tool_calls),
             },
             finish_reason: prepared.finish_reason,
@@ -356,6 +363,7 @@ async fn messages(
             .submit_stream_for_request(engine_request, Some(sequence))?;
         return Ok(anthropic_streaming_response(
             receiver,
+            state.api.tool_format,
             registry,
             tool_choice,
             parallel_tool_calls,
@@ -367,13 +375,18 @@ async fn messages(
     let output = state.worker.complete(engine_request).await?;
     let prepared = prepare_completion(
         output,
+        state.api.tool_format,
         &registry,
         &tool_choice,
         parallel_tool_calls,
         sequence,
     )?;
     let stop_reason = anthropic_stop_reason(&prepared.finish_reason).to_owned();
-    let content = response_content(prepared.content, prepared.tool_calls)?;
+    let content = response_content(
+        prepared.reasoning_content,
+        prepared.content,
+        prepared.tool_calls,
+    )?;
     Ok(Json(MessagesResponse {
         id,
         kind: "message",
@@ -388,6 +401,7 @@ async fn messages(
 }
 
 struct PreparedCompletion {
+    reasoning_content: Option<String>,
     content: Option<String>,
     tool_calls: Vec<crate::protocol::ToolCall>,
     finish_reason: String,
@@ -396,12 +410,38 @@ struct PreparedCompletion {
 
 fn prepare_completion(
     output: crate::EngineOutput,
+    tool_format: ToolFormat,
     registry: &ToolRegistry,
     tool_choice: &crate::tool_calling::ToolChoice,
     parallel_tool_calls: bool,
     sequence: u64,
 ) -> Result<PreparedCompletion, ApiError> {
-    let mut parsed = parse_qwen3_xml(&output.text, registry, tool_choice)?;
+    let usage = Usage {
+        prompt_tokens: output.prompt_tokens,
+        completion_tokens: output.completion_tokens,
+        total_tokens: output.prompt_tokens + output.completion_tokens,
+        prompt_tokens_details: Some(PromptTokensDetails {
+            cached_tokens: output.reused_prompt_tokens,
+        }),
+    };
+    let mut parsed = match parse_assistant_output(&output.text, tool_format, registry, tool_choice) {
+        Ok(parsed) => parsed,
+        // `hit_length` means generation stopped at the output cap, so a tool
+        // call can be cut mid-JSON. Reporting that as a protocol error makes the
+        // client resend the identical prompt and truncate in the same place, so
+        // it can never terminate. Report the truncation instead, and drop the
+        // call that could not be parsed.
+        Err(_) if output.hit_length => {
+            return Ok(PreparedCompletion {
+                reasoning_content: None,
+                content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "length".into(),
+                usage,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     if !parallel_tool_calls && parsed.tool_calls.len() > 1 {
         return Err(ApiError::internal(
             "model emitted multiple calls while parallel_tool_calls was false",
@@ -417,15 +457,8 @@ fn prepare_completion(
     } else {
         "stop"
     };
-    let usage = Usage {
-        prompt_tokens: output.prompt_tokens,
-        completion_tokens: output.completion_tokens,
-        total_tokens: output.prompt_tokens + output.completion_tokens,
-        prompt_tokens_details: Some(PromptTokensDetails {
-            cached_tokens: output.reused_prompt_tokens,
-        }),
-    };
     Ok(PreparedCompletion {
+        reasoning_content: parsed.reasoning_content,
         content: parsed.content,
         tool_calls: parsed.tool_calls,
         finish_reason: finish_reason.into(),
@@ -436,6 +469,7 @@ fn prepare_completion(
 #[allow(clippy::too_many_arguments)]
 fn streaming_response(
     mut receiver: mpsc::Receiver<Result<EngineStreamEvent, ApiError>>,
+    tool_format: ToolFormat,
     registry: ToolRegistry,
     tool_choice: crate::tool_calling::ToolChoice,
     parallel_tool_calls: bool,
@@ -452,7 +486,7 @@ fn streaming_response(
             created,
             model: &model,
         };
-        let mut state = ProtocolStreamState::new();
+        let mut state = ProtocolStreamState::new(tool_format);
         let mut role_sent = false;
 
         loop {
@@ -519,6 +553,7 @@ fn streaming_response(
                     }
                     let prepared = match prepare_completion(
                         output,
+                        tool_format,
                         &registry,
                         &tool_choice,
                         parallel_tool_calls,
@@ -592,8 +627,10 @@ fn streaming_response(
         .expect("static SSE response headers are valid")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn anthropic_streaming_response(
     mut receiver: mpsc::Receiver<Result<EngineStreamEvent, ApiError>>,
+    tool_format: ToolFormat,
     registry: ToolRegistry,
     tool_choice: crate::tool_calling::ToolChoice,
     parallel_tool_calls: bool,
@@ -625,7 +662,7 @@ fn anthropic_streaming_response(
             return;
         }
 
-        let mut protocol = ProtocolStreamState::new();
+        let mut protocol = ProtocolStreamState::new(tool_format);
         let mut wire = AnthropicWireState::new();
         loop {
             let event = tokio::select! {
@@ -679,6 +716,7 @@ fn anthropic_streaming_response(
                     }
                     let prepared = match prepare_completion(
                         output,
+                        tool_format,
                         &registry,
                         &tool_choice,
                         parallel_tool_calls,
@@ -697,7 +735,9 @@ fn anthropic_streaming_response(
                             return;
                         }
                     };
-                    if !wire.send_updates(&sender, updates).await || !wire.close_text(&sender).await
+                    if !wire.send_updates(&sender, updates).await
+                        || !wire.close_thinking(&sender).await
+                        || !wire.close_text(&sender).await
                     {
                         return;
                     }
@@ -740,6 +780,8 @@ fn anthropic_streaming_response(
 
 struct AnthropicWireState {
     next_index: usize,
+    thinking_index: Option<usize>,
+    thinking_open: bool,
     text_index: Option<usize>,
     text_open: bool,
 }
@@ -748,6 +790,8 @@ impl AnthropicWireState {
     fn new() -> Self {
         Self {
             next_index: 0,
+            thinking_index: None,
+            thinking_open: false,
             text_index: None,
             text_open: false,
         }
@@ -760,7 +804,48 @@ impl AnthropicWireState {
     ) -> bool {
         for update in updates {
             match update {
+                StreamUpdate::Reasoning(thinking) => {
+                    let index = match self.thinking_index {
+                        Some(index) => index,
+                        None => {
+                            let index = self.next_index;
+                            self.next_index += 1;
+                            self.thinking_index = Some(index);
+                            self.thinking_open = true;
+                            if !send_anthropic_sse(
+                                sender,
+                                "content_block_start",
+                                &json!({
+                                    "type":"content_block_start",
+                                    "index":index,
+                                    "content_block":{"type":"thinking","thinking":""},
+                                }),
+                            )
+                            .await
+                            {
+                                return false;
+                            }
+                            index
+                        }
+                    };
+                    if !send_anthropic_sse(
+                        sender,
+                        "content_block_delta",
+                        &json!({
+                            "type":"content_block_delta",
+                            "index":index,
+                            "delta":{"type":"thinking_delta","thinking":thinking},
+                        }),
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                }
                 StreamUpdate::Content(content) => {
+                    if !self.close_thinking(sender).await {
+                        return false;
+                    }
                     let index = match self.text_index {
                         Some(index) => index,
                         None => {
@@ -799,7 +884,7 @@ impl AnthropicWireState {
                     }
                 }
                 StreamUpdate::ToolCall { call, .. } => {
-                    if !self.close_text(sender).await {
+                    if !self.close_thinking(sender).await || !self.close_text(sender).await {
                         return false;
                     }
                     let index = self.next_index;
@@ -845,6 +930,22 @@ impl AnthropicWireState {
             }
         }
         true
+    }
+
+    async fn close_thinking(&mut self, sender: &mpsc::Sender<Result<Bytes, Infallible>>) -> bool {
+        if !self.thinking_open {
+            return true;
+        }
+        self.thinking_open = false;
+        send_anthropic_sse(
+            sender,
+            "content_block_stop",
+            &json!({
+                "type":"content_block_stop",
+                "index":self.thinking_index.expect("open thinking has an index"),
+            }),
+        )
+        .await
     }
 
     async fn close_text(&mut self, sender: &mpsc::Sender<Result<Bytes, Infallible>>) -> bool {
@@ -910,6 +1011,7 @@ impl StreamEnvelope<'_> {
 }
 
 enum StreamUpdate {
+    Reasoning(String),
     Content(String),
     ToolCall {
         index: usize,
@@ -922,21 +1024,36 @@ enum ProtocolStreamMode {
     Undecided,
     Text,
     Tool,
+    Inkling2,
 }
 
 struct ProtocolStreamState {
+    tool_format: ToolFormat,
     raw: String,
     mode: ProtocolStreamMode,
+    inkling_cursor: usize,
+    inkling_reasoning: String,
+    inkling_content: String,
     sent_tool_calls: usize,
+    streamed_reasoning: String,
     streamed_content: String,
 }
 
 impl ProtocolStreamState {
-    fn new() -> Self {
+    fn new(tool_format: ToolFormat) -> Self {
+        let mode = match tool_format {
+            ToolFormat::Inkling2Json => ProtocolStreamMode::Inkling2,
+            ToolFormat::Auto | ToolFormat::Qwen3Xml => ProtocolStreamMode::Undecided,
+        };
         Self {
+            tool_format,
             raw: String::new(),
-            mode: ProtocolStreamMode::Undecided,
+            mode,
+            inkling_cursor: 0,
+            inkling_reasoning: String::new(),
+            inkling_content: String::new(),
             sent_tool_calls: 0,
+            streamed_reasoning: String::new(),
             streamed_content: String::new(),
         }
     }
@@ -949,38 +1066,96 @@ impl ProtocolStreamState {
         parallel_tool_calls: bool,
         sequence: u64,
     ) -> Result<Vec<StreamUpdate>, ApiError> {
-        const MARKER: &str = "<tool_call>";
+        const QWEN_MARKER: &str = "<tool_call>";
+        const INKLING_MSG: &str = "<|message_model|>";
+        const INKLING_END_SAMPLING: &str = "<|content_model_end_sampling|>";
         self.raw.push_str(delta);
-        let mut updates = Vec::new();
-        if self.mode != ProtocolStreamMode::Tool {
-            if let Some(marker) = self.raw.find(MARKER) {
+
+        if self.mode == ProtocolStreamMode::Undecided {
+            let trimmed = self.raw.trim_start();
+            if self.tool_format == ToolFormat::Auto && looks_like_inkling2(&self.raw) {
+                self.mode = ProtocolStreamMode::Inkling2;
+            } else if self.tool_format == ToolFormat::Auto
+                && (INKLING_MSG.starts_with(trimmed) || INKLING_END_SAMPLING.starts_with(trimmed))
+            {
+                return Ok(Vec::new());
+            } else if let Some(marker) = self.raw.find(QWEN_MARKER) {
                 self.mode = ProtocolStreamMode::Tool;
+                let mut updates = Vec::new();
                 let content = self.raw[..marker].to_owned();
                 if !content.trim().is_empty() {
                     if let Some(content) = self.content_update(&content)? {
                         updates.push(StreamUpdate::Content(content));
                     }
                 }
-            } else if self.mode == ProtocolStreamMode::Undecided
-                && MARKER.starts_with(self.raw.trim_start())
-            {
+                return self.push_qwen_tools(
+                    updates,
+                    registry,
+                    tool_choice,
+                    parallel_tool_calls,
+                    sequence,
+                );
+            } else if QWEN_MARKER.starts_with(trimmed) {
                 return Ok(Vec::new());
             } else {
                 self.mode = ProtocolStreamMode::Text;
-                let content = self.raw.as_str();
-                let marker_prefix = (1..MARKER.len())
-                    .rev()
-                    .find(|length| content.ends_with(&MARKER[..*length]))
-                    .unwrap_or(0);
-                let stable_end = content.len() - marker_prefix;
-                let stable = content[..stable_end].to_owned();
-                if let Some(content) = self.content_update(&stable)? {
-                    updates.push(StreamUpdate::Content(content));
-                }
-                return Ok(updates);
             }
         }
 
+        match self.mode {
+            ProtocolStreamMode::Inkling2 => {
+                self.push_inkling2(registry, tool_choice, parallel_tool_calls, sequence)
+            }
+            ProtocolStreamMode::Text => {
+                if let Some(marker) = self.raw.find(QWEN_MARKER) {
+                    self.mode = ProtocolStreamMode::Tool;
+                    let mut updates = Vec::new();
+                    let content = self.raw[..marker].to_owned();
+                    if !content.trim().is_empty() {
+                        if let Some(content) = self.content_update(&content)? {
+                            updates.push(StreamUpdate::Content(content));
+                        }
+                    }
+                    return self.push_qwen_tools(
+                        updates,
+                        registry,
+                        tool_choice,
+                        parallel_tool_calls,
+                        sequence,
+                    );
+                }
+                let content = self.raw.as_str();
+                let marker_prefix = (1..QWEN_MARKER.len())
+                    .rev()
+                    .find(|length| content.ends_with(&QWEN_MARKER[..*length]))
+                    .unwrap_or(0);
+                let stable_end = content.len() - marker_prefix;
+                let stable = content[..stable_end].to_owned();
+                let mut updates = Vec::new();
+                if let Some(content) = self.content_update(&stable)? {
+                    updates.push(StreamUpdate::Content(content));
+                }
+                Ok(updates)
+            }
+            ProtocolStreamMode::Tool => self.push_qwen_tools(
+                Vec::new(),
+                registry,
+                tool_choice,
+                parallel_tool_calls,
+                sequence,
+            ),
+            ProtocolStreamMode::Undecided => unreachable!("resolved above"),
+        }
+    }
+
+    fn push_qwen_tools(
+        &mut self,
+        mut updates: Vec<StreamUpdate>,
+        registry: &ToolRegistry,
+        tool_choice: &crate::tool_calling::ToolChoice,
+        parallel_tool_calls: bool,
+        sequence: u64,
+    ) -> Result<Vec<StreamUpdate>, ApiError> {
         let Some(end) = self.raw.rfind("</tool_call>") else {
             return Ok(updates);
         };
@@ -1009,8 +1184,99 @@ impl ProtocolStreamState {
         Ok(updates)
     }
 
+    fn push_inkling2(
+        &mut self,
+        registry: &ToolRegistry,
+        tool_choice: &crate::tool_calling::ToolChoice,
+        parallel_tool_calls: bool,
+        sequence: u64,
+    ) -> Result<Vec<StreamUpdate>, ApiError> {
+        const MSG: &str = "<|message_model|>";
+        const END_MSG: &str = "<|end_message|>";
+        const THINKING: &str = "<|content_thinking|>";
+        const TEXT: &str = "<|content_text|>";
+        const END_SAMPLING: &str = "<|content_model_end_sampling|>";
+        const ENDOFTEXT: &str = "<|endoftext|>";
+
+        let mut updates = Vec::new();
+        loop {
+            let rest = &self.raw[self.inkling_cursor..];
+            let ws = rest.len() - rest.trim_start().len();
+            let trimmed = &rest[ws..];
+            if trimmed.starts_with(END_SAMPLING) {
+                self.inkling_cursor += ws + END_SAMPLING.len();
+                continue;
+            }
+            if trimmed.starts_with(ENDOFTEXT) {
+                self.inkling_cursor += ws + ENDOFTEXT.len();
+                continue;
+            }
+            if !trimmed.starts_with(MSG) {
+                break;
+            }
+            let after_msg = &trimmed[MSG.len()..];
+            if let Some(end_pos) = after_msg.find(END_MSG) {
+                let block_end = self.inkling_cursor + ws + MSG.len() + end_pos + END_MSG.len();
+                let block = &self.raw[self.inkling_cursor + ws..block_end];
+                let body = &after_msg[..end_pos];
+                if let Some(thought) = body.strip_prefix(THINKING) {
+                    self.inkling_reasoning.push_str(thought);
+                    let full = self.inkling_reasoning.clone();
+                    if let Some(delta) = self.reasoning_update(&full)? {
+                        updates.push(StreamUpdate::Reasoning(delta));
+                    }
+                } else if let Some(text) = body.strip_prefix(TEXT) {
+                    self.inkling_content.push_str(text);
+                    let full = self.inkling_content.clone();
+                    if let Some(delta) = self.content_update(&full)? {
+                        updates.push(StreamUpdate::Content(delta));
+                    }
+                } else {
+                    let parsed = parse_inkling2_json(block, registry, tool_choice)?;
+                    if !parallel_tool_calls && self.sent_tool_calls + parsed.tool_calls.len() > 1 {
+                        return Err(ApiError::internal(
+                            "model emitted multiple calls while parallel_tool_calls was false",
+                        ));
+                    }
+                    for mut call in parsed.tool_calls {
+                        let index = self.sent_tool_calls;
+                        call.id = format!("call-{sequence:016x}-{index}");
+                        updates.push(StreamUpdate::ToolCall { index, call });
+                        self.sent_tool_calls += 1;
+                    }
+                }
+                self.inkling_cursor = block_end;
+            } else {
+                // Stream partial thinking or text inside an open block, holding back any
+                // suffix that could be the start of `<|end_message|>`.
+                if let Some(partial) = after_msg.strip_prefix(THINKING) {
+                    let stable = stable_before_tag(partial, END_MSG);
+                    let mut full = self.inkling_reasoning.clone();
+                    full.push_str(stable);
+                    if let Some(delta) = self.reasoning_update(&full)? {
+                        updates.push(StreamUpdate::Reasoning(delta));
+                    }
+                } else if let Some(partial) = after_msg.strip_prefix(TEXT) {
+                    let stable = stable_before_tag(partial, END_MSG);
+                    let mut full = self.inkling_content.clone();
+                    full.push_str(stable);
+                    if let Some(delta) = self.content_update(&full)? {
+                        updates.push(StreamUpdate::Content(delta));
+                    }
+                }
+                break;
+            }
+        }
+        Ok(updates)
+    }
+
     fn finish(&mut self, prepared: &PreparedCompletion) -> Result<Vec<StreamUpdate>, ApiError> {
         let mut updates = Vec::new();
+        if let Some(reasoning) = prepared.reasoning_content.as_deref() {
+            if let Some(delta) = self.reasoning_update(reasoning)? {
+                updates.push(StreamUpdate::Reasoning(delta));
+            }
+        }
         if let Some(content) = prepared.content.as_deref() {
             if let Some(content) = self.content_update(content)? {
                 updates.push(StreamUpdate::Content(content));
@@ -1028,6 +1294,17 @@ impl ProtocolStreamState {
         Ok(updates)
     }
 
+    fn reasoning_update(&mut self, reasoning: &str) -> Result<Option<String>, ApiError> {
+        let delta = reasoning
+            .strip_prefix(&self.streamed_reasoning)
+            .ok_or_else(|| {
+                ApiError::internal("streamed reasoning changed before generation completed")
+            })?
+            .to_owned();
+        self.streamed_reasoning = reasoning.to_owned();
+        Ok((!delta.is_empty()).then_some(delta))
+    }
+
     fn content_update(&mut self, content: &str) -> Result<Option<String>, ApiError> {
         let delta = content
             .strip_prefix(&self.streamed_content)
@@ -1038,6 +1315,14 @@ impl ProtocolStreamState {
         self.streamed_content = content.to_owned();
         Ok((!delta.is_empty()).then_some(delta))
     }
+}
+
+fn stable_before_tag<'a>(text: &'a str, tag: &str) -> &'a str {
+    let keep = (1..tag.len())
+        .rev()
+        .find(|&len| tag.is_char_boundary(len) && text.ends_with(&tag[..len]))
+        .unwrap_or(0);
+    &text[..text.len() - keep]
 }
 
 async fn send_stream_role(
@@ -1062,6 +1347,7 @@ async fn send_stream_update(
     update: StreamUpdate,
 ) -> bool {
     let delta = match update {
+        StreamUpdate::Reasoning(reasoning) => json!({"reasoning_content": reasoning}),
         StreamUpdate::Content(content) => json!({"content": content}),
         StreamUpdate::ToolCall { index, call } => json!({
             "tool_calls": [{

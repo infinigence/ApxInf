@@ -76,6 +76,7 @@ async fn app() -> (axum::Router, Receiver<EngineRequest>) {
                     ApiConfig {
                         served_model_name: "fake-model".into(),
                         max_output_tokens: 128,
+                        ..Default::default()
                     },
                     worker,
                 ),
@@ -242,4 +243,97 @@ async fn uses_anthropic_error_envelope() {
     let body: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["type"], "error");
     assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+struct Inkling2Engine;
+
+impl ChatEngine for Inkling2Engine {
+    fn complete(&mut self, _request: EngineRequest) -> Result<EngineOutput, ApiError> {
+        Ok(EngineOutput {
+            text: concat!(
+                "<|message_model|><|content_thinking|>Inspecting file.<|end_message|>",
+                "<|message_model|><|content_text|>Calling read.<|end_message|>",
+                "<|message_model|>read<|content_invoke_tool_json|>",
+                "{\"name\":\"read\",\"args\":{\"path\":\"src/main.rs\"}}",
+                "<|end_message|><|content_model_end_sampling|>"
+            )
+            .to_owned(),
+            prompt_tokens: 10,
+            reused_prompt_tokens: 0,
+            completion_tokens: 15,
+            hit_length: false,
+            ttft_ms: None,
+            tpot_ms: None,
+            generation_tps: None,
+            total_latency_ms: None,
+        })
+    }
+
+    fn complete_stream(
+        &mut self,
+        request: EngineRequest,
+        on_text: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<EngineOutput, ApiError> {
+        let output = self.complete(request)?;
+        for ch in output.text.chars() {
+            if !on_text(ch.encode_utf8(&mut [0; 4])) {
+                break;
+            }
+        }
+        Ok(output)
+    }
+}
+
+#[tokio::test]
+async fn inkling2_emits_thinking_text_and_tool_use_over_messages() {
+    let worker = WorkerClient::spawn(2, || Ok(Box::new(Inkling2Engine) as Box<dyn ChatEngine>));
+    for _ in 0..1_000 {
+        if worker.ready() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(worker.ready());
+    let app = router(
+        ApiConfig {
+            served_model_name: "inkling2".into(),
+            max_output_tokens: 128,
+            ..Default::default()
+        },
+        worker,
+    );
+
+    let req = serde_json::json!({
+        "model": "inkling2",
+        "max_tokens": 64,
+        "tools": [{
+            "name": "read",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }
+        }],
+        "messages": [{"role": "user", "content": "read main.rs"}]
+    });
+    let (status, body) = response(app.clone(), req.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["stop_reason"], "tool_use");
+    assert_eq!(body["content"][0]["type"], "thinking");
+    assert_eq!(body["content"][0]["thinking"], "Inspecting file.");
+    assert_eq!(body["content"][1]["type"], "text");
+    assert_eq!(body["content"][1]["text"], "Calling read.");
+    assert_eq!(body["content"][2]["type"], "tool_use");
+    assert_eq!(body["content"][2]["name"], "read");
+    assert_eq!(body["content"][2]["input"], serde_json::json!({"path": "src/main.rs"}));
+
+    let mut stream_req = req;
+    stream_req["stream"] = serde_json::json!(true);
+    let (status, sse) = response(app, stream_req).await;
+    assert_eq!(status, StatusCode::OK, "{sse}");
+    assert!(sse.contains(r#""type":"thinking_delta""#));
+    assert!(sse.contains(r#""type":"text_delta""#));
+    assert!(sse.contains(r#""type":"input_json_delta""#));
+    assert!(sse.contains(r#""stop_reason":"tool_use""#));
 }

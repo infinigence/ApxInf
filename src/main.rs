@@ -318,6 +318,17 @@ enum Commands {
         #[arg(long, default_value_t = 1024)]
         max_output_tokens: usize,
 
+        /// Tool-call and output protocol: auto, qwen3, or inkling2
+        #[arg(long, default_value = "auto")]
+        tool_format: String,
+
+        /// Token selection for requests that specify no sampling parameters:
+        /// "model" honours the checkpoint's generation_config.json, "greedy"
+        /// decodes greedily so backends can use their accelerated greedy path.
+        /// Requests that set temperature/top_k/top_p always keep their choice.
+        #[arg(long, default_value = "model", value_parser = parse_sampling_default)]
+        sampling_default: apxinf_serving::SamplingDefault,
+
         /// Enable measured operator autotuning on recipe misses. Use only for
         /// an explicit warmup pass, then restart serving without this flag.
         #[arg(long)]
@@ -536,6 +547,8 @@ fn main() {
             max_body_bytes, max_image_bytes, max_image_dimension, max_decoded_pixels, log_timing,
             max_input_tokens,
             max_output_tokens,
+            tool_format,
+            sampling_default,
             autotune,
             tuning_dir,
         } => {
@@ -543,6 +556,13 @@ fn main() {
                 eprintln!("queue and token limits must be positive");
                 std::process::exit(1);
             }
+            let tool_format = match apxinf_serving::ToolFormat::from_cli_name(&tool_format) {
+                Ok(format) => format,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            };
             let device = match parse_device(&device) {
                 Ok(device) => device,
                 Err(error) => {
@@ -599,6 +619,7 @@ fn main() {
                 api: apxinf_serving::ApiConfig {
                     served_model_name: alias,
                     max_output_tokens,
+                    tool_format,
                 },
                 engine: apxinf_serving::ApxInfEngineConfig {
                     model_path: model,
@@ -606,6 +627,7 @@ fn main() {
                     load_options,
                     default_max_tokens: max_output_tokens,
                     max_input_tokens,
+                    sampling_default,
                 },
             };
             if let Err(error) = apxinf_serving::serve_blocking(config) {
@@ -616,6 +638,14 @@ fn main() {
         Commands::Test => {
             run_test();
         }
+    }
+}
+
+fn parse_sampling_default(value: &str) -> Result<apxinf_serving::SamplingDefault, String> {
+    match value {
+        "model" | "auto" => Ok(apxinf_serving::SamplingDefault::Model),
+        "greedy" => Ok(apxinf_serving::SamplingDefault::Greedy),
+        other => Err(format!("expected model or greedy, got '{other}'")),
     }
 }
 

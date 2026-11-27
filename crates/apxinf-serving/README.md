@@ -1,8 +1,19 @@
 # LLM/VLM HTTP serving
 
 `apxinf-serving` exposes a single LLM or VLM through OpenAI Chat Completions
-and Anthropic Messages endpoints. It is optional: ordinary CLI builds and the
-existing OpenPI WebSocket server do not depend on it.
+and Anthropic Messages endpoints (`apxinf serve`). It is optional: ordinary CLI
+builds and the existing OpenPI WebSocket server do not depend on it.
+
+## Tool & reasoning protocols
+
+`apxinf serve` supports `--tool-format auto|qwen3|inkling2` (default `auto`):
+
+- `qwen3`: Qwen3 XML `<tool_call><function=...>...</function></tool_call>`
+- `inkling2`: Inkling2 `<|message_model|><|content_thinking|>...`,
+  `<|content_text|>...`, and `<|content_invoke_tool_json|>` blocks (mapped to
+  OpenAI `reasoning_content` / Anthropic `thinking` blocks plus `tool_calls` /
+  `tool_use`)
+- `auto`: detects Inkling2 markers automatically and otherwise uses Qwen3 XML
 
 ## Start a server
 
@@ -28,6 +39,14 @@ The checkpoint must contain `tokenizer.json` and a chat template supported by
 and `--dtype auto|fp32|bf16` are forwarded to normal model loading. Sampling
 defaults come from the checkpoint's `generation_config.json`; explicit request
 settings override them.
+
+`--sampling-default model|greedy` (default `model`) chooses the token policy for
+requests that carry no sampling parameters. `model` honours the checkpoint, so a
+checkpoint with `do_sample: true` makes every such request sample. `greedy`
+decodes greedily instead, which keeps backends that accelerate greedy decoding
+only — `metal_inkling2` verifies MTP drafts by argmax — on their fast path. A
+request that sets `temperature`, `top_k` or `top_p` always keeps its own choice
+either way.
 
 OpenAI user content can be a string or an ordered array of text and image
 blocks. Assistant content remains text or nullable content with tool calls.
@@ -76,9 +95,12 @@ instead of being silently redirected.
 Anthropic requests support text/system content, tool-use/tool-result blocks,
 tool choice, `temperature`, `top_p`, and streaming. `max_tokens` is required.
 Nonempty stop sequences are rejected. `thinking.type=enabled`
-is forwarded to the checkpoint template; reasoning is not returned as separate
-Anthropic thinking blocks. This is a supported subset of each protocol, not a
-complete provider replacement.
+is forwarded to the checkpoint template. Both protocols support `--tool-format`
+(`auto`, `qwen3`, or `inkling2`, defaulting to `auto`): Inkling2 reasoning turns
+are surfaced as OpenAI `reasoning_content` and Anthropic `thinking` blocks, and
+tool calls are parsed from either Qwen3 XML (`<tool_call>`) or Inkling2 JSON
+(`<|content_invoke_tool_json|>`). This is a supported subset of each protocol,
+not a complete provider replacement.
 
 ## Image input
 
