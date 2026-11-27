@@ -1,6 +1,6 @@
 # Native MLX backend
 
-This crate adapts the MLX **0.32.3** C++ API to owned Rust arrays and the ApxInf
+This crate adapts the MLX **0.32.4** C++ API to owned Rust arrays and the ApxInf
 public tensor/sampling boundary. Metal models use its native array API directly. It contains no Python interpreter or external model provider.
 The `native` feature requires Apple Silicon macOS; the default empty feature set
 does not discover or link an MLX SDK.
@@ -48,6 +48,10 @@ request state. `synchronize` alone does not evaluate a lazy expression.
 `Compiled::prepare` evaluates one profile twice and rejects a replay that invokes
 the trace callback again. Family preparation can use it to verify compiler
 availability and exact-profile reuse. It does not observe Metal pipeline JIT.
+`Compiled::prepare_trace` checks the same graph reuse without evaluation.
+It leaves device compilation and allocation to the first evaluation; callers
+must include that work in cold-request timing rather than claim warmed Metal
+execution from the graph check alone.
 Constructing a compiled callable rejects any present `MLX_DISABLE_COMPILE`
 environment variable, even `MLX_DISABLE_COMPILE=0`, matching MLX's presence rule.
 The bridge never changes the process-wide compile mode to force availability.
@@ -66,22 +70,11 @@ dependent operation waits for it.
 `Stream::counters()` snapshots cumulative trace callbacks, explicit upload and
 download bytes, and evaluation boundaries (including downloads). Cloned streams
 share counters; separate logical streams do not. Byte counters report bridge
-host IO, not driver transfers. `memory_stats`, `reset_peak_memory`, `set_cache_limit`
-and `clear_cache` observe or change the process-wide MLX allocator. Synchronize before
+host IO, not driver transfers. `memory_stats`, `reset_peak_memory` and
+`clear_cache` observe or change the process-wide MLX allocator. Synchronize before
 comparing release observations and run memory qualification in an isolated
 process. The ignored `metal_memory` integration executable checks repeated
 compiled-instance release and pool reuse when run under the shared Metal lock.
-
-MLX keeps freed buffers in that allocator for reuse, and its own cache limit is
-its memory limit. Every new input shape adds buffers that later shapes rarely
-reuse, so a workload with many prompt lengths or image sizes grows the cache
-far past its live memory. `Stream::metal` therefore sets the cache limit to
-`DEFAULT_CACHE_LIMIT_BYTES` (1 GiB) unless the caller has already set one. A
-caller that wants another bound calls `set_cache_limit` before or after loading;
-creating another stream does not replace it. `set_cache_limit(usize::MAX)`
-removes the bound. MLX has no getter for the cache limit, so a stream treats a
-limit equal to MLX's memory limit, MLX's own initial value, as not chosen. The
-ignored `metal_cache_limit` executable checks both cases.
 
 Native `Array` operations use MLX semantics, including broadcasting. Metal
 models compose them directly and own their rounding, fusion and compilation
@@ -108,11 +101,11 @@ SafeTensors files (for example the list from
 `apxinf_loader::safetensors::safetensors_files`) into evaluated arrays. Other
 tensors are never read. MLX reads on its CPU device; there is no host staging
 copy.
-Native checkpoint loading requires the pinned MLX 0.32.3 runtime. Its CPU lazy
-reader propagates payload-read exceptions; 0.31.2 can report successful
-evaluation after a read fails. The native CPU regression truncates a fixture
-after header validation and requires a filename-labelled load error without
-publishing arrays or recording successful upload bytes.
+Native checkpoint loading requires the pinned MLX 0.32.4 runtime (preserving
+the 0.32.3+ CPU lazy reader's payload-read exception propagation; 0.31.2 can
+report successful evaluation after a read fails). The native CPU regression
+truncates a fixture after header validation and requires a filename-labelled
+load error without publishing arrays or recording successful upload bytes.
 
 This covers MLX-format affine checkpoints, whose packed weights are U32 and
 have no core `DType`. Duplicate names across files, tensors without a bridge
@@ -148,19 +141,23 @@ caches a separate Metal pipeline the first time it is used.
 
 The Clef fusions are `Q4TransposeDecode`, `PadRowsF16`, `SplitF16Gemm`,
 `GatedDeltaRecurrence`, `HalfSplitRope`, `Q4RowDecodeF16`, `F16Gemm`,
-`F16GateSwiglu` and `CausalDepthwiseConv`, with the wm1/wn2 tile of
-`SplitF16Gemm` and the `GatedDeltaLayout::EightLanes` recurrence. They decode affine Q4 group-64 weights to FP16 for one call
+`F16GateSwiglu` and `CausalDepthwiseConv`, with the `GatedDeltaLayout::EightLanes`
+recurrence. They decode affine Q4 group-64 weights to FP16 for one call
 only; they keep no decoded weight resident. `F16GateSwiglu` includes MLX
 0.32.3's Steel loader, MMA and transform headers as installed (MIT). The two
 recurrence layouts change only the reduction order, not the operation.
 Their tests compare each kernel with MLX operators or a host reference on
 small shapes. They do not qualify the Clef model.
 
-The Neural Engine boundary kernels are `AneTileHandoff` (padded FP16 rows
-and channel-first tiles) and `AneTileMerge` (both per-token scales plus the
-GPU share); `MppF16Gemm` and `SplitMppF16Gemm` are the Metal 4 projection
-pair. `Array::to_bytes_ready` waits for one row-contiguous array only and
-leaves later work on its stream running.
+`MppGemmDecodeQ4Rows`, `MppGemmGatedResidual`, `MppGemmSwigluPairs`,
+`MppGemmHeadsWithPrefix` and `MppGemmHeadRmsRope` extend the MPP BF16 GEMM with
+epilogues that consume its tile (Q4 row decode, gated residual, paired SwiGLU,
+head-major layout with a copied prefix, head RMSNorm with RoPE).
+`LayerNormModulate` and `GatedResidualLayerNormModulate` fuse a width-4096
+LayerNorm with modulation. Their modulation inputs are read through their
+strides (`MetalKernel::new_strided`), so broadcast views are not copied.
+Layout-only epilogues are tested bit for bit against the plain GEMM; the others
+are bounded against composed MLX operators. They do not qualify a model.
 
 `InterleavedQkNormRope` adapts the mflux Qwen-Image attention prologue:
 per-head RMSNorm, interleaved-pair RoPE from FP32 tables and the

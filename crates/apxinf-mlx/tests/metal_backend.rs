@@ -3,7 +3,7 @@
 //! here runs as part of default cargo test; all require explicit --ignored.
 use apxinf_core::{
     Backend, DType, Device, NextTokenLogits, Result, RngKey, SamplingBackend, Shape, Tensor,
-    TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec,
+    TokenSamplingInit, TokenSamplingParams, TokenSamplingSpec, TokenSelection,
 };
 use apxinf_mlx::{Array, MlxBackend, MlxDType, Stream};
 use std::rc::Rc;
@@ -171,5 +171,63 @@ fn metal_streams_report_the_mlx_architecture() -> Result<()> {
     assert!(caps.device_class.is_some(), "{caps:?}");
     assert!(Stream::cpu()?.metal_caps().is_none());
     eprintln!("{caps:?}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn cumsum_keeps_rank_and_is_inclusive_along_axis() -> Result<()> {
+    let b = MlxBackend::new(0)?;
+    let stream = b.stream().clone();
+    let x = Array::from_f32(&stream, &[2, 3], &[1., 2., 3., 4., 5., 6.])?;
+    let summed = x.cumsum(-1)?;
+    assert_eq!(summed.shape(), [2, 3]);
+    assert_eq!(summed.to_f32_vec()?, [1., 3., 6., 4., 9., 15.]);
+    // A bridge call that omits the axis argument silently binds MLX's
+    // flattened overload, which drops the batch dimension.
+    assert_eq!(Array::from_f32(&stream, &[1, 8], &[1.; 8])?.cumsum(-1)?.shape(), [1, 8]);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires shared Metal qualification lock"]
+fn sampled_token_selection_survives_top_p_and_top_k() -> Result<()> {
+    let b = MlxBackend::new(0)?;
+    let peak = 5.0_f32;
+    let logits = b.to_device(&Tensor::from_f32(
+        vec![1, 8],
+        &[0.1, 0.2, 0.3, peak, 0.4, 1.0, 0.05, 2.0],
+    )?)?;
+    for (top_k, top_p) in [(None, 0.9_f32), (Some(2_usize), 1.0), (Some(3), 0.5)] {
+        let mut sampler = b.create_token_sampler(TokenSamplingSpec {
+            vocab_size: 8,
+            max_sequence_len: 8,
+        })?;
+        let params = TokenSamplingParams {
+            selection: TokenSelection::Random {
+                temperature: 0.7,
+                top_k,
+                top_p,
+            },
+            penalties: Default::default(),
+            return_logprob: false,
+        };
+        sampler.begin(TokenSamplingInit {
+            prompt_token_ids: &[0],
+            params: &params,
+            rng: RngKey::new(7, 0, 0),
+        })?;
+        let first = sampler.sample(NextTokenLogits::last(&logits, 8)?)?.token_id;
+        assert!(first < 8, "top_k={top_k:?} top_p={top_p} produced {first}");
+        // The two highest logits are indices 3 (5.0) and 7 (2.0); top_k=2
+        // admits only those, and temperature scaling preserves that order.
+        if top_k == Some(2) {
+            let mut drawn = std::collections::HashSet::new();
+            for _ in 0..6 {
+                drawn.insert(sampler.sample(NextTokenLogits::last(&logits, 8)?)?.token_id);
+            }
+            assert!(drawn.is_subset(&[3_u32, 7].into_iter().collect()), "{drawn:?}");
+        }
+    }
     Ok(())
 }

@@ -24,7 +24,7 @@ fn main() {
     }
     let root = PathBuf::from(
         env::var_os("MLX_ROOT")
-            .expect("set MLX_ROOT to the MLX 0.32.3 C++ SDK root (include/ and lib/)"),
+            .expect("set MLX_ROOT to the MLX 0.32.4 C++ SDK root (include/ and lib/)"),
     );
     println!("cargo:rerun-if-changed={}", root.join("include/mlx/version.h").display());
     let version = fs::read_to_string(root.join("include/mlx/version.h"))
@@ -40,13 +40,63 @@ fn main() {
     assert!(
         macro_value("MLX_VERSION_MAJOR") == Some("0")
             && macro_value("MLX_VERSION_MINOR") == Some("32")
-            && macro_value("MLX_VERSION_PATCH") == Some("3"),
-        "apxinf-mlx pins MLX 0.32.3 headers and library"
+            && macro_value("MLX_VERSION_PATCH") == Some("4"),
+        "apxinf-mlx pins MLX 0.32.4 headers and library"
     );
     assert!(
         root.join("lib/libmlx.dylib").is_file(),
         "MLX_ROOT lacks lib/libmlx.dylib"
     );
+    // Inline MLX's steel NAX attention headers into OUT_DIR for Metal JIT kernels
+    // that do not receive an include search path at runtime.
+    let include_root = root.join("include");
+    let mut seen = std::collections::HashSet::new();
+    let mut inlined = String::new();
+    fn inline_header(
+        include_root: &std::path::Path,
+        rel: &str,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut String,
+    ) {
+        if !seen.insert(rel.to_string()) {
+            return;
+        }
+        let path = include_root.join(rel);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read MLX header {}: {e}", path.display()));
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed == "#pragma once" {
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("#include") {
+                let rest = rest.trim();
+                if let Some(inner) = rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    inline_header(include_root, inner, seen, out);
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    inline_header(
+        &include_root,
+        "mlx/backend/metal/kernels/steel/attn/nax.h",
+        &mut seen,
+        &mut inlined,
+    );
+    inline_header(
+        &include_root,
+        "mlx/backend/metal/kernels/steel/utils.h",
+        &mut seen,
+        &mut inlined,
+    );
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
+    fs::write(out_dir.join("steel_attn_nax_header.metal"), inlined)
+        .expect("failed to write steel_attn_nax_header.metal");
+
     cc::Build::new()
         .cpp(true)
         .std("c++20")

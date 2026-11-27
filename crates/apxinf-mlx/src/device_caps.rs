@@ -40,6 +40,16 @@ impl MetalDeviceCaps {
             device_class: parsed.map(|(_, class)| class),
         }
     }
+
+    /// True when the GPU generation supports Apple's M5-class NAX tensor units
+    /// (`applegpu_g17+`, or `g18+` for `'p'` class), matching MLX's own dispatch gate.
+    pub fn supports_nax(&self) -> bool {
+        match (self.generation, self.device_class) {
+            (Some(gen), Some('p')) => gen >= 18,
+            (Some(gen), Some(_)) => gen >= 17,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]

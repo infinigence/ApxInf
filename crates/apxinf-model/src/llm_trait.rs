@@ -317,6 +317,13 @@ pub trait LlmTrait {
     /// per-token TPOT stays at pure graph-replay cost. Default: no-op.
     fn prewarm_decode(&mut self, _prompt_len: usize, _max_new_tokens: usize) {}
 
+    /// Tokens from the current prompt that were served from a KV prefix cache
+    /// rather than re-prefilled. Zero by default; models with prefix caching
+    /// (e.g. metal_inkling2) override this.
+    fn last_reused_prompt_tokens(&self) -> usize {
+        0
+    }
+
     /// Vocabulary size used to validate logits and allocate sampler state.
     fn vocab_size(&self) -> usize;
 

@@ -615,6 +615,20 @@ impl Tokenizer {
     ) -> Result<String> {
         let template_str = self.chat_template.as_ref()
             .ok_or_else(|| Error::Other("no chat template available (missing tokenizer_config.json with chat_template field)".to_string()))?;
+        // Newer HF checkpoints (Inkling-2, Qwen3.5) wrap assistant turns in
+        // `{% generation %}...{% endgeneration %}` — a `transformers`
+        // AssistantTracker extension that only marks training masks. The tags
+        // are no-ops for prompt rendering; minijinja has no such statement, so
+        // strip them before compiling.
+        let template_owned;
+        let template_str = if template_str.contains("{%") && template_str.contains("generation") {
+            template_owned = template_str
+                .replace("{%- generation -%}", "")
+                .replace("{%- endgeneration -%}", "");
+            &template_owned
+        } else {
+            template_str.as_str()
+        };
 
         // Create environment and template on demand
         let mut env = Environment::new();

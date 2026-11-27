@@ -8,6 +8,7 @@ use std::{
     path::Path,
     ptr::NonNull,
     rc::Rc,
+    time::{Duration, Instant},
 };
 
 fn error(message: impl Into<String>) -> Error {
@@ -60,6 +61,21 @@ pub fn memory_stats() -> Result<MemoryStats> {
     })?;
     Ok(stats)
 }
+pub fn runtime_version() -> &'static str {
+    unsafe { CStr::from_ptr(ffi::apx_mlx_version()) }
+        .to_str()
+        .unwrap_or("")
+}
+pub fn loaded_library_path() -> Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut path = std::ptr::null();
+    check(unsafe { ffi::apx_mlx_loaded_library_path(&mut path) })?;
+    if path.is_null() {
+        return Err(error("Loaded MLX library path is absent"));
+    }
+    let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+    Ok(std::ffi::OsStr::from_bytes(bytes).into())
+}
 /// Reset the process-wide peak allocator observation. Use an isolated process
 /// for qualification; another model in this process shares the observation.
 pub fn reset_peak_memory() -> Result<()> {
@@ -76,6 +92,14 @@ pub fn set_cache_limit(limit: usize) -> Result<usize> {
 pub fn clear_cache() -> Result<()> {
     check(unsafe { ffi::apx_mlx_clear_cache() })
 }
+
+/// Set the process-wide MLX allocation guideline and return the previous value.
+/// MLX can exceed this value for one operation. It is not a physical memory cap.
+pub fn set_memory_limit(limit: usize) -> Result<usize> {
+    let mut previous = 0;
+    check(unsafe { ffi::apx_mlx_set_memory_limit(limit, &mut previous) })?;
+    Ok(previous)
+}
 fn count(shape: &[usize]) -> Result<usize> {
     shape.iter().try_fold(1usize, |n, &d| {
         n.checked_mul(d).ok_or_else(|| error("MLX shape overflow"))
@@ -91,12 +115,13 @@ pub enum MlxDType {
     I32 = 3,
     U32 = 4,
     Bool = 5,
+    U8 = 6,
 }
 impl MlxDType {
     pub fn size_in_bytes(self) -> usize {
         match self {
             Self::F16 | Self::BF16 => 2,
-            Self::Bool => 1,
+            Self::Bool | Self::U8 => 1,
             _ => 4,
         }
     }
@@ -108,9 +133,19 @@ impl MlxDType {
             3 => Ok(Self::I32),
             4 => Ok(Self::U32),
             5 => Ok(Self::Bool),
+            6 => Ok(Self::U8),
             _ => Err(error("invalid native dtype")),
         }
     }
+}
+
+/// Quantization format supported by MLX 0.32.4 quantized matrix ops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum QuantMode {
+    Affine = 0,
+    Nvfp4 = 1,
+    Mxfp8 = 2,
 }
 
 fn metal_caps(index: i32) -> Result<MetalDeviceCaps> {
@@ -364,8 +399,23 @@ impl Array {
         let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_ne_bytes()).collect();
         Self::from_bytes(stream, shape, MlxDType::I32, &bytes)
     }
+    pub fn from_u32(stream: &Stream, shape: &[usize], data: &[u32]) -> Result<Self> {
+        let bytes: Vec<u8> = data.iter().flat_map(|x| x.to_ne_bytes()).collect();
+        Self::from_bytes(stream, shape, MlxDType::U32, &bytes)
+    }
+    pub fn from_u8(stream: &Stream, shape: &[usize], data: &[u8]) -> Result<Self> {
+        Self::from_bytes(stream, shape, MlxDType::U8, data)
+    }
     pub fn scalar(stream: &Stream, value: f32, dtype: MlxDType) -> Result<Self> {
         Self::from_f32(stream, &[], &[value])?.cast(dtype)
+    }
+    pub fn full(stream: &Stream, shape: &[usize], val: &Array, dtype: MlxDType) -> Result<Self> {
+        count(shape)?
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| error("full array byte extent overflow"))?;
+        let mut p = vec![dtype as i32];
+        p.extend(dims(shape)?);
+        stream.op(79, &[val], &p, &[])
     }
     pub fn zeros(stream: &Stream, shape: &[usize], dtype: MlxDType) -> Result<Self> {
         count(shape)?
@@ -434,7 +484,11 @@ impl Array {
     }
     pub fn reshape(&self, shape: &[usize]) -> Result<Self> {
         if count(shape)? != self.numel() {
-            return Err(error("reshape changes element count"));
+            return Err(error(format!(
+                "reshape changes element count: {:?} -> {:?}",
+                self.shape(),
+                shape
+            )));
         }
         self.stream().op(1, &[self], &dims(shape)?, &[])
     }
@@ -921,6 +975,220 @@ impl Array {
         self.stream()
             .op(39, &[self, scales, biases], &[group_size, bits], &[])
     }
+    /// Bitcast view of the underlying bytes as `dtype` (MLX `mx::view`).
+    pub fn view(&self, dtype: MlxDType) -> Result<Self> {
+        self.stream().op(63, &[self], &[dtype as i32], &[])
+    }
+    /// Indexed quantized matrix multiplication (`mx::gather_qmm`) supporting
+    /// `affine`, `nvfp4`, and `mxfp8` carriers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_qmm(
+        &self,
+        weight: &Self,
+        scales: &Self,
+        biases: Option<&Self>,
+        lhs_indices: Option<&Self>,
+        rhs_indices: Option<&Self>,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: QuantMode,
+        global_scale: Option<&Self>,
+        sorted_indices: bool,
+    ) -> Result<Self> {
+        let mut arrays = vec![self, weight, scales];
+        if let Some(b) = biases {
+            arrays.push(b);
+        }
+        if let Some(l) = lhs_indices {
+            arrays.push(l);
+        }
+        if let Some(r) = rhs_indices {
+            arrays.push(r);
+        }
+        if let Some(g) = global_scale {
+            arrays.push(g);
+        }
+        let ints = [
+            mode as i32,
+            group_size,
+            bits,
+            transpose as i32,
+            sorted_indices as i32,
+            biases.is_some() as i32,
+            lhs_indices.is_some() as i32,
+            rhs_indices.is_some() as i32,
+            global_scale.is_some() as i32,
+        ];
+        self.stream().op(64, &arrays, &ints, &[])
+    }
+    /// Quantized matrix multiplication with explicit [`QuantMode`] and optional biases.
+    #[allow(clippy::too_many_arguments)]
+    pub fn quantized_matmul_mode(
+        &self,
+        weight: &Self,
+        scales: &Self,
+        biases: Option<&Self>,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: QuantMode,
+    ) -> Result<Self> {
+        let mut arrays = vec![self, weight, scales];
+        if let Some(b) = biases {
+            arrays.push(b);
+        }
+        let ints = [
+            mode as i32,
+            group_size,
+            bits,
+            transpose as i32,
+            biases.is_some() as i32,
+        ];
+        self.stream().op(65, &arrays, &ints, &[])
+    }
+    /// Dequantization with explicit [`QuantMode`], optional biases, and optional output dtype.
+    pub fn dequantize_mode(
+        &self,
+        scales: &Self,
+        biases: Option<&Self>,
+        group_size: i32,
+        bits: i32,
+        mode: QuantMode,
+        out_dtype: Option<MlxDType>,
+    ) -> Result<Self> {
+        let mut arrays = vec![self, scales];
+        if let Some(b) = biases {
+            arrays.push(b);
+        }
+        let ints = [
+            mode as i32,
+            group_size,
+            bits,
+            biases.is_some() as i32,
+            out_dtype.map_or(-1, |d| d as i32),
+        ];
+        self.stream().op(66, &arrays, &ints, &[])
+    }
+    /// Scaled dot-product attention with optional mask and optional attention sinks.
+    pub fn sdpa_with_sinks(
+        &self,
+        k: &Self,
+        v: &Self,
+        scale: f32,
+        causal: bool,
+        mask: Option<&Self>,
+        sinks: Option<&Self>,
+    ) -> Result<Self> {
+        let mut arrays = vec![self, k, v];
+        if let Some(m) = mask {
+            arrays.push(m);
+        }
+        if let Some(s) = sinks {
+            arrays.push(s);
+        }
+        let ints = [causal as i32, mask.is_some() as i32, sinks.is_some() as i32];
+        self.stream().op(67, &arrays, &ints, &[scale])
+    }
+    pub fn argsort(&self, axis: i32) -> Result<Self> {
+        self.stream().op(68, &[self], &[axis], &[])
+    }
+    /// Inclusive cumulative sum along `axis`, as `mx.cumsum(x, axis)`; float32.
+    pub fn cumsum(&self, axis: i32) -> Result<Self> {
+        self.stream().op(80, &[self], &[axis, 0], &[])
+    }
+    pub fn take_along_axis(&self, indices: &Self, axis: i32) -> Result<Self> {
+        self.stream().op(69, &[self, indices], &[axis], &[])
+    }
+    pub fn log(&self) -> Result<Self> {
+        self.unary(70)
+    }
+    pub fn stop_gradient(&self) -> Result<Self> {
+        self.unary(71)
+    }
+    pub fn slice_strided(
+        &self,
+        start: &[usize],
+        stop: &[usize],
+        strides: &[usize],
+    ) -> Result<Self> {
+        let rank = self.shape().len();
+        if start.len() != rank
+            || stop.len() != rank
+            || strides.len() != rank
+            || strides.contains(&0)
+            || start
+                .iter()
+                .zip(stop)
+                .zip(self.shape())
+                .any(|((&a, &b), &d)| a > b || b > d)
+        {
+            return Err(error("invalid strided array slice"));
+        }
+        let mut p = dims(start)?;
+        p.extend(dims(stop)?);
+        p.extend(dims(strides)?);
+        self.stream().op(72, &[self], &p, &[])
+    }
+    pub fn slice_update_static(
+        &self,
+        update: &Self,
+        start: &[usize],
+        stop: &[usize],
+    ) -> Result<Self> {
+        let rank = self.shape().len();
+        if start.len() != rank
+            || stop.len() != rank
+            || start
+                .iter()
+                .zip(stop)
+                .zip(self.shape())
+                .any(|((&a, &b), &d)| a > b || b > d)
+        {
+            return Err(error("invalid static slice_update bounds"));
+        }
+        let mut p = dims(start)?;
+        p.extend(dims(stop)?);
+        self.stream().op(73, &[self, update], &p, &[])
+    }
+    pub fn greater_equal(&self, b: &Self) -> Result<Self> {
+        self.binary(74, b)
+    }
+    pub fn less(&self, b: &Self) -> Result<Self> {
+        self.binary(75, b)
+    }
+    pub fn logical_and(&self, b: &Self) -> Result<Self> {
+        self.binary(76, b)
+    }
+    pub fn floor_divide(&self, b: &Self) -> Result<Self> {
+        self.binary(77, b)
+    }
+    pub fn array_equal(&self, b: &Self) -> Result<Self> {
+        self.binary(78, b)
+    }
+    pub fn to_i32_vec(&self) -> Result<Vec<i32>> {
+        Ok(self
+            .cast(MlxDType::I32)?
+            .to_bytes()?
+            .chunks_exact(4)
+            .map(|x| i32::from_ne_bytes(x.try_into().unwrap()))
+            .collect())
+    }
+    pub fn to_u32_vec(&self) -> Result<Vec<u32>> {
+        Ok(self
+            .cast(MlxDType::U32)?
+            .to_bytes()?
+            .chunks_exact(4)
+            .map(|x| u32::from_ne_bytes(x.try_into().unwrap()))
+            .collect())
+    }
+    pub fn to_bool_scalar(&self) -> Result<bool> {
+        if self.numel() != 1 || self.dtype() != MlxDType::Bool {
+            return Err(error("bool scalar read requires one bool element"));
+        }
+        let bytes = self.to_bytes()?;
+        Ok(bytes[0] != 0)
+    }
 }
 fn own_many(stream: &Stream, raw: &mut [ffi::Handle]) -> Result<Vec<Array>> {
     let mut out = Vec::with_capacity(raw.len());
@@ -1088,9 +1356,35 @@ impl Compiled {
     /// or unavailable compiler that returns the original eager body fails here.
     /// This observes Rust trace callbacks, not Metal pipeline/JIT compilation.
     pub fn prepare(&self, inputs: &[Array]) -> Result<Vec<Array>> {
+        self.prepare_timed(inputs).map(|(output, _, _)| output)
+    }
+
+    /// [`prepare`](Self::prepare) plus the host wall-clock of each of its two
+    /// `call_and_eval`s: `t₁` brackets the first call (trace + compile + Metal
+    /// JIT + eval) and `t₂` the replay (pure GPU work), so `t₁ − t₂` is the
+    /// trace/compile cost. Additive; [`prepare`](Self::prepare) is exactly this
+    /// call with the two durations dropped.
+    pub fn prepare_timed(&self, inputs: &[Array]) -> Result<(Vec<Array>, Duration, Duration)> {
+        let first = Instant::now();
         self.call_and_eval(inputs)?;
+        let t1 = first.elapsed();
         let before = self.trace.stream.counters().trace_callbacks;
+        let replay = Instant::now();
         let output = self.call_and_eval(inputs)?;
+        let t2 = replay.elapsed();
+        if self.trace.stream.counters().trace_callbacks != before {
+            return Err(error("MLX prepared profile retraced on replay; required compiled execution is unavailable"));
+        }
+        Ok((output, t1, t2))
+    }
+
+    /// Compile an exact input profile and verify reuse without evaluating it.
+    /// This prepares the MLX graph, not Metal pipelines or allocator workspaces.
+    /// The first evaluation can still incur device compilation and allocation.
+    pub fn prepare_trace(&self, inputs: &[Array]) -> Result<Vec<Array>> {
+        self.call(inputs)?;
+        let before = self.trace.stream.counters().trace_callbacks;
+        let output = self.call(inputs)?;
         if self.trace.stream.counters().trace_callbacks != before {
             return Err(error("MLX prepared profile retraced on replay; required compiled execution is unavailable"));
         }
@@ -1166,6 +1460,7 @@ pub struct MetalKernel {
     output_count: usize,
 }
 impl MetalKernel {
+    /// Inputs are made row-contiguous before each launch.
     pub fn new(
         stream: &Stream,
         name: &str,
@@ -1173,6 +1468,57 @@ impl MetalKernel {
         outputs: &[&str],
         source: &str,
         header: &str,
+    ) -> Result<Self> {
+        Self::build(stream, name, inputs, outputs, source, header, true, false)
+    }
+
+    /// Inputs keep their layout, so broadcast or sliced views are not copied;
+    /// the source must index every input through its `<name>_strides`.
+    pub fn new_strided(
+        stream: &Stream,
+        name: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        source: &str,
+        header: &str,
+    ) -> Result<Self> {
+        Self::build(stream, name, inputs, outputs, source, header, false, false)
+    }
+
+    /// Full options constructor supporting `row_contiguous` and `atomic_outputs`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
+        stream: &Stream,
+        name: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        source: &str,
+        header: &str,
+        row_contiguous: bool,
+        atomic_outputs: bool,
+    ) -> Result<Self> {
+        Self::build(
+            stream,
+            name,
+            inputs,
+            outputs,
+            source,
+            header,
+            row_contiguous,
+            atomic_outputs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        stream: &Stream,
+        name: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        source: &str,
+        header: &str,
+        row_contiguous: bool,
+        atomic_outputs: bool,
     ) -> Result<Self> {
         if stream.metal_index().is_none() {
             return Err(error("custom Metal kernels require a Metal stream"));
@@ -1187,7 +1533,7 @@ impl MetalKernel {
         let op: Vec<_> = outs.iter().map(|s| s.as_ptr()).collect();
         let mut raw = std::ptr::null_mut();
         check(unsafe {
-            ffi::apx_mlx_metal_new(
+            ffi::apx_mlx_metal_new_opts(
                 name.as_ptr(),
                 source.as_ptr(),
                 header.as_ptr(),
@@ -1195,6 +1541,8 @@ impl MetalKernel {
                 ip.len(),
                 op.as_ptr(),
                 op.len(),
+                row_contiguous as i32,
+                atomic_outputs as i32,
                 &mut raw,
             )
         })?;
@@ -1217,6 +1565,20 @@ impl MetalKernel {
         grid: [usize; 3],
         threadgroup: [usize; 3],
         templates: &[(&str, TemplateArg)],
+    ) -> Result<Vec<Array>> {
+        self.call_with_init(inputs, output_specs, grid, threadgroup, templates, None)
+    }
+
+    /// # Safety
+    /// Same safety contract as [`call`](Self::call), plus optional output zero/constant initialization.
+    pub unsafe fn call_with_init(
+        &self,
+        inputs: &[Array],
+        output_specs: &[(&[usize], MlxDType)],
+        grid: [usize; 3],
+        threadgroup: [usize; 3],
+        templates: &[(&str, TemplateArg)],
+        init_value: Option<f32>,
     ) -> Result<Vec<Array>> {
         if inputs.len() != self.input_count || output_specs.len() != self.output_count {
             return Err(error("Metal kernel arity mismatch"));
@@ -1250,7 +1612,7 @@ impl MetalKernel {
             })
             .unzip();
         let mut out = vec![std::ptr::null_mut(); self.output_count];
-        check(ffi::apx_mlx_metal_call(
+        check(ffi::apx_mlx_metal_call_opts(
             self.stream.raw(),
             self.raw.as_ptr(),
             p.as_ptr(),
@@ -1265,6 +1627,8 @@ impl MetalKernel {
             kinds.as_ptr(),
             values.as_ptr(),
             templates.len(),
+            init_value.is_some() as i32,
+            init_value.unwrap_or(0.0),
             out.as_mut_ptr(),
         ))?;
         own_many(&self.stream, &mut out)
