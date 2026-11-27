@@ -692,7 +692,8 @@ mod tests {
     fn program(width: usize) -> Package {
         let mut builder = ProgramBuilder::new();
         let input = builder.input("x", &[width]).unwrap();
-        builder.finish(&[&input]).unwrap()
+        let output = builder.identity(&input, None).unwrap();
+        builder.finish(&[&output]).unwrap()
     }
 
     /// Publishes a 4 KiB stand-in program and dates its last use `age_secs` ago.
@@ -940,6 +941,7 @@ mod tests {
     fn invalid_batch_extents_return_errors_before_native_prediction() {
         let model = ManuallyDrop::new(Model {
             raw: NonNull::dangling(),
+            _entry: None,
         });
         assert!(model
             .predict_batch(&[("x", &[usize::MAX, 2])], &[vec![&[]]], &[])
