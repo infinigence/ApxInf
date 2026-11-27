@@ -17,7 +17,7 @@ use super::weights::{
 use apxinf_core::{Error, Result};
 use apxinf_mlx::fusions::{
     padded_rows, CausalDepthwiseConv, F16GateSwiglu, F16Gemm, GatedDeltaLayout,
-    GatedDeltaRecurrence, HalfSplitRope, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16,
+    GatedDeltaRecurrence, MropeHalfSplitRope, PadRowsF16, Q4DecodeArithmetic, Q4RowDecodeF16,
     Q4TransposeDecode, SplitF16Gemm,
 };
 use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
@@ -25,6 +25,22 @@ use apxinf_mlx::{Array, Compiled, MlxDType, Stream};
 const EPS: f32 = 1e-6;
 const HEAD_EPS: f32 = 1e-5;
 const G_BETA_WARM_LENGTHS: [usize; 3] = [1, 2, MAX_INPUT_TOKENS];
+
+/// `_interleaved_position_selector(mrope_section, freq_dim)`: frequency `i`
+/// takes axis 0 unless the interleaved pattern of the later sections assigns it
+/// (`i % 3 == axis` within that section's span).
+fn mrope_selector(section: &[usize], frequencies: usize) -> Vec<i32> {
+    let mut selector = vec![0i32; frequencies];
+    let stride = section.len().max(1);
+    for axis in 1..section.len() {
+        let mut index = axis;
+        while index < (section[axis] * stride).min(frequencies) {
+            selector[index] = axis as i32;
+            index += stride;
+        }
+    }
+    selector
+}
 
 fn embedding_ids(ids: &[u32], vocab_size: usize) -> Result<Vec<i32>> {
     ids.iter()
@@ -46,7 +62,9 @@ fn embedding_ids(ids: &[u32], vocab_size: usize) -> Result<Vec<i32>> {
 
 struct Kernels {
     recurrence: GatedDeltaRecurrence,
-    rope: HalfSplitRope,
+    /// Three-axis interleaved mRoPE; a text-only request has equal axes and
+    /// degenerates to the plain half-split rotary exactly.
+    rope: MropeHalfSplitRope,
     /// MLX-VLM `_compute_g_beta`, compiled shapeless as there: the fused
     /// kernel rounds exp/logaddexp differently from eager operations on some
     /// devices (one decay ulp per layer on the M1 Pro).
@@ -201,6 +219,8 @@ pub struct Network {
     ane: Vec<super::ane::AneMlp>,
     /// MRoPE inverse frequencies, computed on the device as MLX-VLM does.
     inv_freq: Array,
+    /// Which mRoPE axis feeds each frequency (`_interleaved_position_selector`).
+    rope_selector: Array,
     /// Qwen3.5 vision tower, resident in every composition.
     vision: super::vision::Vision,
 }
@@ -276,7 +296,7 @@ impl Network {
     ) -> Result<Self> {
         let kernels = Kernels {
             recurrence: GatedDeltaRecurrence::new(&stream)?,
-            rope: HalfSplitRope::new(&stream, config.rotary_dim())?,
+            rope: MropeHalfSplitRope::new(&stream, config.rotary_dim())?,
             g_beta: prepared_g_beta(&stream, config.text.linear_num_value_heads)?,
         };
         let gpu = match composition {
@@ -308,6 +328,16 @@ impl Network {
         )?;
         let inv_freq = Array::scalar(&stream, 1.0, MlxDType::F32)?.div(&base.pow(&exponents)?)?;
         stream.eval(&[inv_freq.clone()])?;
+        // Interleaved 3-axis selector, from the admitted `mrope_section`.
+        let frequencies = dim / 2;
+        let section = config
+            .text
+            .rope_parameters
+            .mrope_section
+            .clone()
+            .unwrap_or_else(|| vec![11, 11, 10]);
+        let rope_selector =
+            Array::from_i32(&stream, &[frequencies], &mrope_selector(&section, frequencies))?;
         #[cfg(feature = "coreml")]
         for _ in 0..2 {
             for model in &ane {
@@ -325,12 +355,20 @@ impl Network {
             #[cfg(feature = "coreml")]
             ane,
             inv_freq,
+            rope_selector,
             vision,
         })
     }
 
     pub fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    /// Three equal axes: a text-only request's positions (`[3, 1, tokens]`).
+    fn text_positions(stream: &Stream, tokens: usize) -> Result<Array> {
+        let row = Array::arange(stream, 0.0, tokens as f32, 1.0, MlxDType::I32)?
+            .reshape(&[1, 1, tokens])?;
+        Array::concat(&[&row, &row, &row], 0)
     }
 
     /// Placeholder token the processor writes per merged image row; the prompt
@@ -367,8 +405,7 @@ impl Network {
             4,
         )?;
         let positions = match vision {
-            None => Array::arange(&self.stream, 0.0, tokens as f32, 1.0, MlxDType::I32)?
-                .reshape(&[1, tokens])?,
+            None => Self::text_positions(&self.stream, tokens)?,
             Some((_, grids, _)) => {
                 let positions = super::vision::mrope_position_ids(
                     &encoded.input_ids,
@@ -387,9 +424,9 @@ impl Network {
             hidden = self.splice_vision(&encoded.input_ids, &hidden, &features)?;
         }
         let _ = width;
-        let hidden = self.backbone_forward(&hidden.reshape(&[1, tokens])?, &positions, tokens)?;
+        let hidden = self.backbone_forward(&hidden.reshape(&[1, tokens, width])?, &positions, tokens)?;
         self.head_forward(
-            &hidden.reshape(&[tokens, self.config.text.hidden_size])?,
+            &hidden.reshape(&[tokens, width])?,
             &ids,
             &encoded.questions,
         )
@@ -432,14 +469,10 @@ impl Network {
         combined.take(&index, 1)?.reshape(&[tokens, width])
     }
 
-    fn backbone_forward(&self, ids: &Array, positions: &Array, tokens: usize) -> Result<Array> {
-        let e = &self.backbone.embedding;
-        let mut h = e.weight.take(ids, 0)?.dequantize(
-            &e.scales.take(ids, 0)?,
-            &e.biases.take(ids, 0)?,
-            64,
-            4,
-        )?;
+    fn backbone_forward(&self, embeds: &Array, positions: &Array, tokens: usize) -> Result<Array> {
+        // The caller embeds once and may splice vision features into `embeds`,
+        // so the backbone starts from embeddings, not token ids.
+        let mut h = embeds.clone();
         for (index, layer) in self.backbone.layers.iter().enumerate() {
             let x = h.fast_rms_norm(&layer.input_norm, EPS)?;
             let r = match &layer.mixer {
@@ -579,8 +612,8 @@ impl Network {
             .reshape(&[1, tokens, kv, d])?
             .transpose(&[0, 2, 1, 3])?;
         let rope = &self.kernels.rope;
-        let queries = rope.call(&queries, positions, &self.inv_freq)?;
-        let keys = rope.call(&keys, positions, &self.inv_freq)?;
+        let queries = rope.call(&queries, positions, &self.inv_freq, &self.rope_selector)?;
+        let keys = rope.call(&keys, positions, &self.inv_freq, &self.rope_selector)?;
         let out = queries
             .sdpa(&keys, &values, (d as f32).powf(-0.5), tokens > 1, None)?
             .transpose(&[0, 2, 1, 3])?
