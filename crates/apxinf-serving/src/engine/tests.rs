@@ -98,6 +98,7 @@ impl Checkpoint {
             load_options: LoadOptions::default(),
             default_max_tokens: 4,
             max_input_tokens,
+            sampling_default: SamplingDefault::default(),
         })
         .unwrap()
     }
@@ -204,6 +205,7 @@ fn native_engine_rejects_missing_chat_template_at_startup() {
         load_options: LoadOptions::default(),
         default_max_tokens: 4,
         max_input_tokens: 32,
+        sampling_default: SamplingDefault::default(),
     });
     match result {
         Ok(_) => panic!("missing chat template must fail loading"),
@@ -391,6 +393,7 @@ async fn overflowing_http_request_does_not_revoke_worker_readiness() {
             load_options: LoadOptions::default(),
             default_max_tokens: 50,
             max_input_tokens: 4096,
+            sampling_default: SamplingDefault::default(),
         })
         .map(|m| Box::new(m) as Box<dyn ChatEngine>)
     });
@@ -405,6 +408,7 @@ async fn overflowing_http_request_does_not_revoke_worker_readiness() {
         crate::ApiConfig {
             served_model_name: "tiny".into(),
             max_output_tokens: 50,
+            ..Default::default()
         },
         worker.clone(),
     );
@@ -423,4 +427,26 @@ async fn overflowing_http_request_does_not_revoke_worker_readiness() {
     let good = app.oneshot(request("world".into(), 1)).await.unwrap();
     assert_eq!(good.status(), StatusCode::OK);
     assert!(worker.ready());
+}
+
+#[test]
+fn requested_sampling_mode_prefers_the_request_and_only_defaults_when_silent() {
+    use crate::engine::{requested_sampling_mode, SamplingDefault};
+    use apxinf_model::SamplingMode;
+
+    // An explicit temperature always decides, including zero for greedy.
+    assert_eq!(
+        requested_sampling_mode(Some(0.0), SamplingDefault::Model),
+        Some(SamplingMode::Greedy)
+    );
+    assert_eq!(
+        requested_sampling_mode(Some(0.7), SamplingDefault::Greedy),
+        Some(SamplingMode::Random)
+    );
+    // Silence defers to the checkpoint, unless the deployment overrides it.
+    assert_eq!(requested_sampling_mode(None, SamplingDefault::Model), None);
+    assert_eq!(
+        requested_sampling_mode(None, SamplingDefault::Greedy),
+        Some(SamplingMode::Greedy)
+    );
 }

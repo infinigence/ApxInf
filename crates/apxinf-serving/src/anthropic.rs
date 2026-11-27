@@ -132,6 +132,19 @@ fn convert_message(
     match message.role.as_str() {
         "user" => convert_user_content(&message.content, message_index, output),
         "assistant" => convert_assistant_content(&message.content, message_index, output),
+        // Claude Code 2.1.330 (and the Messages API generally) may place a
+        // system message mid-conversation. Mirror the top-level `system`
+        // handling: extract text blocks and skip an empty result.
+        "system" => {
+            let text = text_blocks(
+                &message.content,
+                &format!("messages[{message_index}].content"),
+            )?;
+            if !text.is_empty() {
+                output.push(text_message("system", text));
+            }
+            Ok(())
+        }
         other => Err(ApiError::invalid(
             format!("unsupported message role '{other}'"),
             Some(format!("messages[{message_index}].role")),
@@ -239,10 +252,22 @@ fn convert_assistant_content(
             Some(format!("messages[{message_index}].content")),
         )
     })?;
+    let mut thinking = Vec::new();
     let mut text = Vec::new();
     let mut tool_calls = Vec::new();
     for (block_index, block) in blocks.iter().enumerate() {
         match block.get("type").and_then(Value::as_str) {
+            Some("thinking") => {
+                let thought = block
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        block_error(message_index, block_index, "thinking must be a string")
+                    })?;
+                if !thought.is_empty() {
+                    thinking.push(thought.to_owned());
+                }
+            }
             Some("text") => text.push(
                 block
                     .get("text")
@@ -292,7 +317,7 @@ fn convert_assistant_content(
     output.push(ChatCompletionMessage {
         role: "assistant".into(),
         content: (!text.is_empty()).then(|| Value::String(text.join("\n"))),
-        reasoning_content: None,
+        reasoning_content: (!thinking.is_empty()).then(|| thinking.join("\n")),
         tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
         tool_call_id: None,
     });
@@ -473,10 +498,14 @@ pub struct MessagesUsage {
 }
 
 pub fn response_content(
+    reasoning_content: Option<String>,
     content: Option<String>,
     tool_calls: Vec<ToolCall>,
 ) -> Result<Vec<Value>, ApiError> {
     let mut blocks = Vec::new();
+    if let Some(thinking) = reasoning_content.filter(|thinking| !thinking.is_empty()) {
+        blocks.push(json!({"type":"thinking","thinking":thinking}));
+    }
     if let Some(content) = content.filter(|content| !content.is_empty()) {
         blocks.push(json!({"type":"text","text":content}));
     }

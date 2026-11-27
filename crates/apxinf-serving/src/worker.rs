@@ -184,20 +184,43 @@ impl WorkerClient {
                                         .is_ok();
                                 }
                             }
+                            // Extract inference metrics before the terminal
+                            // frame consumes `result`.
+                            let perf = result.as_ref().ok().map(|out| {
+                                (
+                                    out.completion_tokens,
+                                    out.ttft_ms,
+                                    out.tpot_ms,
+                                    out.generation_tps,
+                                    out.reused_prompt_tokens,
+                                    out.prompt_tokens,
+                                )
+                            });
                             if connected {
                                 let terminal = result.map(EngineStreamEvent::Complete);
                                 let _ = response.blocking_send(terminal);
+                            }
+                            if let Some((sequence, started)) = &started {
+                                let ms = started.elapsed().as_secs_f64() * 1_000.0;
+                                if let Some((ct, ttft, tpot, tps, reused, pt)) = perf {
+                                    eprintln!(
+                                        "aios worker end: sequence={sequence:016x} worker_ms={ms:.6} \
+                                         prompt={pt} completion={ct} reused={reused} \
+                                         ttft_ms={} tpot_ms={} tok_s={}",
+                                        ttft.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
+                                        tpot.map(|v| format!("{v:.2}")).unwrap_or_else(|| "-".into()),
+                                        tps.map(|v| format!("{v:.1}")).unwrap_or_else(|| "-".into()),
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "aios worker end: sequence={sequence:016x} worker_ms={ms:.6}",
+                                    );
+                                }
                             }
                         }
                     }
                     if thread_status.state.load(Ordering::Acquire) == FAILED {
                         return;
-                    }
-                    if let Some((sequence, started)) = started {
-                        eprintln!(
-                            "aios worker end: sequence={sequence:016x} worker_ms={:.6}",
-                            started.elapsed().as_secs_f64() * 1_000.0
-                        );
                     }
                 }
             })

@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,8 +57,64 @@ async fn invalid_image_urls_fail_before_engine_admission() {
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
-async fn wait_until_ready(worker: &WorkerClient) {
-    for _ in 0..1_000 {
+#[tokio::test]
+async fn output_cap_truncation_is_reported_as_length_not_a_protocol_error() {
+    let (app, _calls) = app().await;
+    let body = serde_json::json!({"model":"fake-model", "messages":[
+        {"role":"user", "content":"truncated inkling2 tool call"}
+    ]});
+    let (status, body) = json_response(app.clone(), body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let choice = &body["choices"][0];
+    assert_eq!(choice["finish_reason"], "length", "{body}");
+    assert!(choice["message"]["tool_calls"].is_null(), "{body}");
+    assert_eq!(body["usage"]["completion_tokens"], 7, "{body}");
+    // The same cut without hit_length is a real protocol error, so the strict
+    // path must stay strict; only a truncated reply may degrade to `length`.
+    let (status, body) = json_response(
+        app,
+        serde_json::json!({"model":"fake-model", "messages":[
+            {"role":"user", "content":"truncated inkling2 tool call without length"}
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+}
+
+#[tokio::test]
+async fn clamps_max_tokens_above_the_cap_and_rejects_zero() {
+    let (app, requests) = recording_app().await;
+    let (status, body) = json_response(
+        app.clone(),
+        serde_json::json!({
+            "model":"fake-model",
+            "messages":[{"role":"user","content":"你好"}],
+            "max_tokens":100000
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let request = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(
+        request.max_tokens, 128,
+        "engine must receive the clamped output cap"
+    );
+
+    // An explicit zero stays a client error rather than being clamped up.
+    let (status, body) = json_response(
+        app,
+        serde_json::json!({
+            "model":"fake-model",
+            "messages":[{"role":"user","content":"你好"}],
+            "max_tokens":0
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["param"], "max_tokens", "{body}");
+}
+
+async fn wait_until_ready(worker: &WorkerClient) {    for _ in 0..1_000 {
         if worker.ready() {
             return;
         }
@@ -85,10 +141,19 @@ impl ChatEngine for FakeEngine {
         {
             return Err(ApiError::internal("fake generation failure"));
         }
-        let text = if request.messages.iter().any(|message| {
-            message.content.as_ref().and_then(Value::as_str) == Some("inspect tool stop policy")
-        }) {
+        let asked = |needle: &str| {
+            request
+                .messages
+                .iter()
+                .any(|message| message.content.as_ref().and_then(Value::as_str) == Some(needle))
+        };
+        // Cut mid-JSON with no <|end_message|>, exactly as the output cap does.
+        let truncated = asked("truncated inkling2 tool call");
+        let text = if asked("inspect tool stop policy") {
             request.stop_after_tool_call.to_string()
+        } else if truncated || asked("truncated inkling2 tool call without length") {
+            "<|message_model|><|content_invoke_tool_json|>{\"name\":\"weather.get\",\"args\":{\"city\":\"上"
+                .to_owned()
         } else if request.tools.is_empty() {
             "你好，我是离线 fake engine。".to_owned()
         } else {
@@ -99,7 +164,7 @@ impl ChatEngine for FakeEngine {
             prompt_tokens: 11,
             reused_prompt_tokens: 3,
             completion_tokens: 7,
-            hit_length: false,
+            hit_length: truncated,
             ttft_ms: Some(10.0),
             tpot_ms: Some(5.0),
             generation_tps: Some(200.0),
@@ -122,10 +187,51 @@ async fn app() -> (axum::Router, Arc<AtomicUsize>) {
             ApiConfig {
                 served_model_name: "fake-model".into(),
                 max_output_tokens: 128,
+                ..Default::default()
             },
             worker,
         ),
         calls,
+    )
+}
+
+struct RecordingEngine {
+    requests: Sender<EngineRequest>,
+}
+
+impl ChatEngine for RecordingEngine {
+    fn complete(&mut self, request: EngineRequest) -> Result<EngineOutput, ApiError> {
+        let _ = self.requests.send(request);
+        Ok(EngineOutput {
+            text: "ok".into(),
+            prompt_tokens: 1,
+            reused_prompt_tokens: 0,
+            completion_tokens: 1,
+            hit_length: false,
+            ttft_ms: None,
+            tpot_ms: None,
+            generation_tps: None,
+            total_latency_ms: None,
+        })
+    }
+}
+
+async fn recording_app() -> (axum::Router, Receiver<EngineRequest>) {
+    let (sender, receiver) = channel();
+    let worker = WorkerClient::spawn(2, move || {
+        Ok(Box::new(RecordingEngine { requests: sender }) as Box<dyn ChatEngine>)
+    });
+    wait_until_ready(&worker).await;
+    (
+        router(
+            ApiConfig {
+                served_model_name: "fake-model".into(),
+                max_output_tokens: 128,
+                ..Default::default()
+            },
+            worker,
+        ),
+        receiver,
     )
 }
 
@@ -398,6 +504,7 @@ async fn delivers_content_before_generation_completes() {
         ApiConfig {
             served_model_name: "incremental-model".into(),
             max_output_tokens: 16,
+            ..Default::default()
         },
         worker,
     );
@@ -540,6 +647,7 @@ async fn buffers_split_tool_xml_until_it_can_emit_valid_openai_json() {
         ApiConfig {
             served_model_name: "split-tool-model".into(),
             max_output_tokens: 32,
+            ..Default::default()
         },
         worker,
     );
@@ -790,6 +898,7 @@ async fn health_and_admission_report_loading_and_startup_failure() {
         ApiConfig {
             served_model_name: "failed-model".into(),
             max_output_tokens: 8,
+            ..Default::default()
         },
         worker.clone(),
     );
@@ -939,6 +1048,7 @@ async fn inference_panic_revokes_readiness_before_response_and_drops_model_on_ow
             ApiConfig {
                 served_model_name: "panic".into(),
                 max_output_tokens: 8,
+                ..Default::default()
             },
             worker.clone(),
         );
@@ -1039,6 +1149,7 @@ async fn http_replies_preserve_text_and_string_tool_arguments_across_protocols()
         ApiConfig {
             served_model_name: "echo".into(),
             max_output_tokens: 32,
+            ..Default::default()
         },
         worker,
     );

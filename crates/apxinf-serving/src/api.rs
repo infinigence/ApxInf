@@ -29,15 +29,22 @@ use crate::protocol::{
     AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
     ModelCard, ModelList, PromptTokensDetails, Usage,
 };
-use crate::tool_calling::{parse_qwen3_xml, validate_tool_choice, ToolRegistry};
+use crate::responses::{
+    response_tools, responses_response_base, responses_usage, ResponsesRequest,
+};
+use crate::tool_calling::{
+    looks_like_inkling2, parse_assistant_output, parse_inkling2_json, parse_qwen3_xml,
+    validate_tool_choice, ToolFormat, ToolRegistry,
+};
 use crate::worker::{EngineStreamEvent, WorkerClient};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ApiConfig {
     pub served_model_name: String,
     pub max_output_tokens: usize,
+    pub tool_format: ToolFormat,
 }
 
 pub struct ServeConfig {
@@ -81,6 +88,7 @@ pub fn router_with_limits(
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/responses", post(responses))
         .layer(DefaultBodyLimit::max(limits.body_bytes))
         .with_state(Arc::new(state))
 }
@@ -205,7 +213,7 @@ async fn chat_completions(
             Some("body".to_owned()),
         )
     })?;
-    validate_request(&request, &state.api)?;
+    let requested_max_tokens = validate_request(&request, &state.api)?;
     let (messages, images) = decode_request_messages(&state, request.messages).await?;
     request.messages = messages;
     let registry = ToolRegistry::validate(&request.tools)?;
@@ -216,15 +224,12 @@ async fn chat_completions(
         .as_ref()
         .is_some_and(|options| options.include_usage);
     let parallel_tool_calls = request.parallel_tool_calls;
-    let max_tokens = request
-        .max_completion_tokens
-        .or(request.max_tokens)
-        .unwrap_or_else(|| {
-            state
-                .api
-                .max_output_tokens
-                .min(GenerationOptions::DEFAULT_MAX_NEW_TOKENS)
-        });
+    let max_tokens = requested_max_tokens.unwrap_or_else(|| {
+        state
+            .api
+            .max_output_tokens
+            .min(GenerationOptions::DEFAULT_MAX_NEW_TOKENS)
+    });
     let engine_request = EngineRequest {
         messages: request.messages,
         images,
@@ -250,6 +255,7 @@ async fn chat_completions(
             .submit_stream_for_request(engine_request, Some(sequence))?;
         return Ok(streaming_response(
             receiver,
+            state.api.tool_format,
             registry,
             tool_choice,
             parallel_tool_calls,
@@ -263,6 +269,7 @@ async fn chat_completions(
     let output = state.worker.complete(engine_request).await?;
     let prepared = prepare_completion(
         output,
+        state.api.tool_format,
         &registry,
         &tool_choice,
         parallel_tool_calls,
@@ -278,6 +285,7 @@ async fn chat_completions(
             message: AssistantMessage {
                 role: "assistant",
                 content: prepared.content,
+                reasoning_content: prepared.reasoning_content,
                 tool_calls: (!prepared.tool_calls.is_empty()).then_some(prepared.tool_calls),
             },
             finish_reason: prepared.finish_reason,
@@ -322,15 +330,14 @@ async fn messages(
         disable_spec_decode: false,
         chat_template_kwargs: empty_options(),
     };
-    validate_request(&openai_request, &state.api)?;
+    let requested_max_tokens = validate_request(&openai_request, &state.api)?;
     let (messages, images) = decode_request_messages(&state, openai_request.messages).await?;
     openai_request.messages = messages;
     let registry = ToolRegistry::validate(&openai_request.tools)?;
     let tool_choice = validate_tool_choice(openai_request.tool_choice.as_ref(), &registry)?;
     let parallel_tool_calls = openai_request.parallel_tool_calls;
     let stream = openai_request.stream;
-    let max_tokens = openai_request
-        .max_tokens
+    let max_tokens = requested_max_tokens
         .expect("Anthropic max_tokens was validated as required");
     let engine_request = EngineRequest {
         messages: openai_request.messages,
@@ -356,6 +363,7 @@ async fn messages(
             .submit_stream_for_request(engine_request, Some(sequence))?;
         return Ok(anthropic_streaming_response(
             receiver,
+            state.api.tool_format,
             registry,
             tool_choice,
             parallel_tool_calls,
@@ -367,13 +375,18 @@ async fn messages(
     let output = state.worker.complete(engine_request).await?;
     let prepared = prepare_completion(
         output,
+        state.api.tool_format,
         &registry,
         &tool_choice,
         parallel_tool_calls,
         sequence,
     )?;
     let stop_reason = anthropic_stop_reason(&prepared.finish_reason).to_owned();
-    let content = response_content(prepared.content, prepared.tool_calls)?;
+    let content = response_content(
+        prepared.reasoning_content,
+        prepared.content,
+        prepared.tool_calls,
+    )?;
     Ok(Json(MessagesResponse {
         id,
         kind: "message",
@@ -387,7 +400,184 @@ async fn messages(
     .into_response())
 }
 
+async fn responses(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<ResponsesRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(request) = payload.map_err(|error| {
+        ApiError::invalid(
+            format!("invalid JSON request: {}", error.body_text()),
+            Some("body".to_owned()),
+        )
+    })?;
+    let converted = request.into_chat_completion()?;
+    let mut openai_request = ChatCompletionRequest {
+        model: converted.model,
+        messages: converted.messages,
+        tools: converted.tools,
+        tool_choice: converted.tool_choice,
+        parallel_tool_calls: converted.parallel_tool_calls,
+        stream: converted.stream,
+        stream_options: None,
+        max_tokens: converted.max_tokens,
+        max_completion_tokens: None,
+        temperature: converted.temperature,
+        top_k: None,
+        top_p: converted.top_p,
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        n: None,
+        stop: None,
+        logprobs: None,
+        response_format: None,
+        enable_thinking: Some(converted.enable_thinking),
+        disable_spec_decode: false,
+        chat_template_kwargs: empty_options(),
+    };
+    let requested_max_tokens = validate_request(&openai_request, &state.api)?;
+    let (messages, images) = decode_request_messages(&state, openai_request.messages).await?;
+    openai_request.messages = messages;
+    let registry = ToolRegistry::validate(&openai_request.tools)?;
+    let tool_choice = validate_tool_choice(openai_request.tool_choice.as_ref(), &registry)?;
+    let parallel_tool_calls = openai_request.parallel_tool_calls;
+    let stream = openai_request.stream;
+    let tool_choice_value = openai_request
+        .tool_choice
+        .clone()
+        .unwrap_or_else(|| json!("auto"));
+    let tools_echo = response_tools(&openai_request.tools);
+    let max_tokens = requested_max_tokens.unwrap_or_else(|| {
+        state
+            .api
+            .max_output_tokens
+            .min(GenerationOptions::DEFAULT_MAX_NEW_TOKENS)
+    });
+    let engine_request = EngineRequest {
+        messages: openai_request.messages,
+        images,
+        tools: openai_request.tools,
+        tool_choice: tool_choice.clone(),
+        chat_template_kwargs: openai_request.chat_template_kwargs,
+        enable_thinking: openai_request.enable_thinking.unwrap_or(false),
+        max_tokens,
+        temperature: openai_request.temperature,
+        top_k: openai_request.top_k,
+        top_p: openai_request.top_p,
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        stop_after_tool_call: !parallel_tool_calls,
+    };
+    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let id = format!("resp_{sequence:016x}");
+    let created = unix_seconds();
+    let model = state.api.served_model_name.clone();
+    if stream {
+        let receiver = state
+            .worker
+            .submit_stream_for_request(engine_request, Some(sequence))?;
+        return Ok(responses_streaming_response(
+            receiver,
+            state.api.tool_format,
+            registry,
+            tool_choice,
+            parallel_tool_calls,
+            sequence,
+            ResponsesEnvelope {
+                id,
+                created,
+                model,
+                tool_choice: tool_choice_value,
+                tools: tools_echo,
+                parallel_tool_calls,
+            },
+        ));
+    }
+    let output = state.worker.complete(engine_request).await?;
+    let prepared = prepare_completion(
+        output,
+        state.api.tool_format,
+        &registry,
+        &tool_choice,
+        parallel_tool_calls,
+        sequence,
+    )?;
+    Ok(Json(responses_response_object(
+        &id,
+        created,
+        &model,
+        &tool_choice_value,
+        &tools_echo,
+        parallel_tool_calls,
+        &prepared,
+    ))
+    .into_response())
+}
+
+fn responses_response_object(
+    id: &str,
+    created: u64,
+    model: &str,
+    tool_choice: &Value,
+    tools: &[Value],
+    parallel_tool_calls: bool,
+    prepared: &PreparedCompletion,
+) -> Value {
+    let incomplete = prepared.finish_reason == "length";
+    let mut response =
+        responses_response_base(id, created, model, tool_choice, tools, parallel_tool_calls);
+    let status = if incomplete {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    response["status"] = json!(status);
+    response["output"] = json!(responses_output_items(prepared));
+    response["usage"] = responses_usage(&prepared.usage);
+    if incomplete {
+        response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+    }
+    response
+}
+
+fn responses_output_items(prepared: &PreparedCompletion) -> Vec<Value> {
+    let mut items = Vec::new();
+    if let Some(reasoning) = prepared
+        .reasoning_content
+        .as_deref()
+        .filter(|text| !text.is_empty())
+    {
+        items.push(json!({
+            "id": format!("rs_{:016x}", items.len()),
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        }));
+    }
+    if let Some(content) = prepared.content.as_deref().filter(|text| !text.is_empty()) {
+        items.push(json!({
+            "id": format!("msg_{:016x}", items.len()),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content, "annotations": []}],
+        }));
+    }
+    for call in &prepared.tool_calls {
+        items.push(json!({
+            "id": format!("fc_{:016x}", items.len()),
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call.id,
+            "name": call.function.name,
+            "arguments": call.function.arguments,
+        }));
+    }
+    items
+}
+
 struct PreparedCompletion {
+    reasoning_content: Option<String>,
     content: Option<String>,
     tool_calls: Vec<crate::protocol::ToolCall>,
     finish_reason: String,
@@ -396,12 +586,38 @@ struct PreparedCompletion {
 
 fn prepare_completion(
     output: crate::EngineOutput,
+    tool_format: ToolFormat,
     registry: &ToolRegistry,
     tool_choice: &crate::tool_calling::ToolChoice,
     parallel_tool_calls: bool,
     sequence: u64,
 ) -> Result<PreparedCompletion, ApiError> {
-    let mut parsed = parse_qwen3_xml(&output.text, registry, tool_choice)?;
+    let usage = Usage {
+        prompt_tokens: output.prompt_tokens,
+        completion_tokens: output.completion_tokens,
+        total_tokens: output.prompt_tokens + output.completion_tokens,
+        prompt_tokens_details: Some(PromptTokensDetails {
+            cached_tokens: output.reused_prompt_tokens,
+        }),
+    };
+    let mut parsed = match parse_assistant_output(&output.text, tool_format, registry, tool_choice) {
+        Ok(parsed) => parsed,
+        // `hit_length` means generation stopped at the output cap, so a tool
+        // call can be cut mid-JSON. Reporting that as a protocol error makes the
+        // client resend the identical prompt and truncate in the same place, so
+        // it can never terminate. Report the truncation instead, and drop the
+        // call that could not be parsed.
+        Err(_) if output.hit_length => {
+            return Ok(PreparedCompletion {
+                reasoning_content: None,
+                content: None,
+                tool_calls: Vec::new(),
+                finish_reason: "length".into(),
+                usage,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     if !parallel_tool_calls && parsed.tool_calls.len() > 1 {
         return Err(ApiError::internal(
             "model emitted multiple calls while parallel_tool_calls was false",
@@ -417,15 +633,8 @@ fn prepare_completion(
     } else {
         "stop"
     };
-    let usage = Usage {
-        prompt_tokens: output.prompt_tokens,
-        completion_tokens: output.completion_tokens,
-        total_tokens: output.prompt_tokens + output.completion_tokens,
-        prompt_tokens_details: Some(PromptTokensDetails {
-            cached_tokens: output.reused_prompt_tokens,
-        }),
-    };
     Ok(PreparedCompletion {
+        reasoning_content: parsed.reasoning_content,
         content: parsed.content,
         tool_calls: parsed.tool_calls,
         finish_reason: finish_reason.into(),
@@ -436,6 +645,7 @@ fn prepare_completion(
 #[allow(clippy::too_many_arguments)]
 fn streaming_response(
     mut receiver: mpsc::Receiver<Result<EngineStreamEvent, ApiError>>,
+    tool_format: ToolFormat,
     registry: ToolRegistry,
     tool_choice: crate::tool_calling::ToolChoice,
     parallel_tool_calls: bool,
@@ -452,7 +662,7 @@ fn streaming_response(
             created,
             model: &model,
         };
-        let mut state = ProtocolStreamState::new();
+        let mut state = ProtocolStreamState::new(tool_format);
         let mut role_sent = false;
 
         loop {
@@ -519,6 +729,7 @@ fn streaming_response(
                     }
                     let prepared = match prepare_completion(
                         output,
+                        tool_format,
                         &registry,
                         &tool_choice,
                         parallel_tool_calls,
@@ -592,8 +803,10 @@ fn streaming_response(
         .expect("static SSE response headers are valid")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn anthropic_streaming_response(
     mut receiver: mpsc::Receiver<Result<EngineStreamEvent, ApiError>>,
+    tool_format: ToolFormat,
     registry: ToolRegistry,
     tool_choice: crate::tool_calling::ToolChoice,
     parallel_tool_calls: bool,
@@ -625,7 +838,7 @@ fn anthropic_streaming_response(
             return;
         }
 
-        let mut protocol = ProtocolStreamState::new();
+        let mut protocol = ProtocolStreamState::new(tool_format);
         let mut wire = AnthropicWireState::new();
         loop {
             let event = tokio::select! {
@@ -679,6 +892,7 @@ fn anthropic_streaming_response(
                     }
                     let prepared = match prepare_completion(
                         output,
+                        tool_format,
                         &registry,
                         &tool_choice,
                         parallel_tool_calls,
@@ -697,7 +911,9 @@ fn anthropic_streaming_response(
                             return;
                         }
                     };
-                    if !wire.send_updates(&sender, updates).await || !wire.close_text(&sender).await
+                    if !wire.send_updates(&sender, updates).await
+                        || !wire.close_thinking(&sender).await
+                        || !wire.close_text(&sender).await
                     {
                         return;
                     }
@@ -740,6 +956,8 @@ fn anthropic_streaming_response(
 
 struct AnthropicWireState {
     next_index: usize,
+    thinking_index: Option<usize>,
+    thinking_open: bool,
     text_index: Option<usize>,
     text_open: bool,
 }
@@ -748,6 +966,8 @@ impl AnthropicWireState {
     fn new() -> Self {
         Self {
             next_index: 0,
+            thinking_index: None,
+            thinking_open: false,
             text_index: None,
             text_open: false,
         }
@@ -760,7 +980,48 @@ impl AnthropicWireState {
     ) -> bool {
         for update in updates {
             match update {
+                StreamUpdate::Reasoning(thinking) => {
+                    let index = match self.thinking_index {
+                        Some(index) => index,
+                        None => {
+                            let index = self.next_index;
+                            self.next_index += 1;
+                            self.thinking_index = Some(index);
+                            self.thinking_open = true;
+                            if !send_anthropic_sse(
+                                sender,
+                                "content_block_start",
+                                &json!({
+                                    "type":"content_block_start",
+                                    "index":index,
+                                    "content_block":{"type":"thinking","thinking":""},
+                                }),
+                            )
+                            .await
+                            {
+                                return false;
+                            }
+                            index
+                        }
+                    };
+                    if !send_anthropic_sse(
+                        sender,
+                        "content_block_delta",
+                        &json!({
+                            "type":"content_block_delta",
+                            "index":index,
+                            "delta":{"type":"thinking_delta","thinking":thinking},
+                        }),
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                }
                 StreamUpdate::Content(content) => {
+                    if !self.close_thinking(sender).await {
+                        return false;
+                    }
                     let index = match self.text_index {
                         Some(index) => index,
                         None => {
@@ -799,7 +1060,7 @@ impl AnthropicWireState {
                     }
                 }
                 StreamUpdate::ToolCall { call, .. } => {
-                    if !self.close_text(sender).await {
+                    if !self.close_thinking(sender).await || !self.close_text(sender).await {
                         return false;
                     }
                     let index = self.next_index;
@@ -847,6 +1108,22 @@ impl AnthropicWireState {
         true
     }
 
+    async fn close_thinking(&mut self, sender: &mpsc::Sender<Result<Bytes, Infallible>>) -> bool {
+        if !self.thinking_open {
+            return true;
+        }
+        self.thinking_open = false;
+        send_anthropic_sse(
+            sender,
+            "content_block_stop",
+            &json!({
+                "type":"content_block_stop",
+                "index":self.thinking_index.expect("open thinking has an index"),
+            }),
+        )
+        .await
+    }
+
     async fn close_text(&mut self, sender: &mpsc::Sender<Result<Bytes, Infallible>>) -> bool {
         if !self.text_open {
             return true;
@@ -891,6 +1168,605 @@ async fn send_anthropic_stream_error(
     .await;
 }
 
+struct ResponsesEnvelope {
+    id: String,
+    created: u64,
+    model: String,
+    tool_choice: Value,
+    tools: Vec<Value>,
+    parallel_tool_calls: bool,
+}
+
+impl ResponsesEnvelope {
+    fn response(&self) -> Value {
+        responses_response_base(
+            &self.id,
+            self.created,
+            &self.model,
+            &self.tool_choice,
+            &self.tools,
+            self.parallel_tool_calls,
+        )
+    }
+}
+
+enum OpenResponsesItem {
+    Reasoning {
+        id: String,
+        index: usize,
+        text: String,
+    },
+    Message {
+        id: String,
+        index: usize,
+        text: String,
+    },
+}
+
+/// Translates the shared `StreamUpdate` sequence into Responses API SSE frames.
+///
+/// Items are opened lazily on their first update and closed when the next item
+/// class starts, so `response.completed` lists exactly the items whose deltas
+/// were already sent, in emission order, with matching `output_index` values.
+struct ResponsesWireState {
+    envelope: ResponsesEnvelope,
+    next_sequence_number: u64,
+    next_item_id: u64,
+    output: Vec<Value>,
+    open: Option<OpenResponsesItem>,
+}
+
+impl ResponsesWireState {
+    fn new(envelope: ResponsesEnvelope, sequence: u64) -> Self {
+        Self {
+            envelope,
+            next_sequence_number: 0,
+            next_item_id: sequence,
+            output: Vec::new(),
+            open: None,
+        }
+    }
+
+    async fn send_frame(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        event: &str,
+        mut data: Value,
+    ) -> bool {
+        data["type"] = Value::String(event.to_owned());
+        data["sequence_number"] = json!(self.next_sequence_number);
+        self.next_sequence_number += 1;
+        let frame = format!(
+            "event: {event}\ndata: {}\n\n",
+            serde_json::to_string(&data).expect("serde_json::Value is serializable")
+        );
+        sender.send(Ok(Bytes::from(frame))).await.is_ok()
+    }
+
+    fn new_item_id(&mut self, prefix: &str) -> String {
+        let value = self.next_item_id;
+        self.next_item_id += 1;
+        format!("{prefix}_{value:016x}")
+    }
+
+    async fn send_update(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        update: StreamUpdate,
+    ) -> bool {
+        match update {
+            StreamUpdate::Reasoning(delta) => self.push_reasoning(sender, delta).await,
+            StreamUpdate::Content(delta) => self.push_content(sender, delta).await,
+            StreamUpdate::ToolCall { call, .. } => self.push_tool_call(sender, call).await,
+        }
+    }
+
+    async fn push_reasoning(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        delta: String,
+    ) -> bool {
+        if matches!(self.open, Some(OpenResponsesItem::Message { .. }))
+            && !self.close_open(sender).await
+        {
+            return false;
+        }
+        if self.open.is_none() {
+            let id = self.new_item_id("rs");
+            let index = self.output.len();
+            if !self
+                .send_frame(
+                    sender,
+                    "response.output_item.added",
+                    json!({
+                        "output_index": index,
+                        "item": {"id": id, "type": "reasoning", "summary": []},
+                    }),
+                )
+                .await
+            {
+                return false;
+            }
+            if !self
+                .send_frame(
+                    sender,
+                    "response.reasoning_summary_part.added",
+                    json!({
+                        "item_id": id,
+                        "output_index": index,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": ""},
+                    }),
+                )
+                .await
+            {
+                return false;
+            }
+            self.open = Some(OpenResponsesItem::Reasoning {
+                id,
+                index,
+                text: String::new(),
+            });
+        }
+        let (item_id, index) = {
+            let Some(OpenResponsesItem::Reasoning { id, index, text }) = self.open.as_mut() else {
+                unreachable!("reasoning item is open");
+            };
+            text.push_str(&delta);
+            (id.clone(), *index)
+        };
+        self.send_frame(
+            sender,
+            "response.reasoning_summary_text.delta",
+            json!({
+                "item_id": item_id,
+                "output_index": index,
+                "summary_index": 0,
+                "delta": delta,
+            }),
+        )
+        .await
+    }
+
+    async fn push_content(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        delta: String,
+    ) -> bool {
+        if matches!(self.open, Some(OpenResponsesItem::Reasoning { .. }))
+            && !self.close_open(sender).await
+        {
+            return false;
+        }
+        if self.open.is_none() {
+            let id = self.new_item_id("msg");
+            let index = self.output.len();
+            if !self
+                .send_frame(
+                    sender,
+                    "response.output_item.added",
+                    json!({
+                        "output_index": index,
+                        "item": {
+                            "id": id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    }),
+                )
+                .await
+            {
+                return false;
+            }
+            if !self
+                .send_frame(
+                    sender,
+                    "response.content_part.added",
+                    json!({
+                        "item_id": id,
+                        "output_index": index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []},
+                    }),
+                )
+                .await
+            {
+                return false;
+            }
+            self.open = Some(OpenResponsesItem::Message {
+                id,
+                index,
+                text: String::new(),
+            });
+        }
+        let (item_id, index) = {
+            let Some(OpenResponsesItem::Message { id, index, text }) = self.open.as_mut() else {
+                unreachable!("message item is open");
+            };
+            text.push_str(&delta);
+            (id.clone(), *index)
+        };
+        self.send_frame(
+            sender,
+            "response.output_text.delta",
+            json!({
+                "item_id": item_id,
+                "output_index": index,
+                "content_index": 0,
+                "delta": delta,
+            }),
+        )
+        .await
+    }
+
+    async fn push_tool_call(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        call: crate::protocol::ToolCall,
+    ) -> bool {
+        if !self.close_open(sender).await {
+            return false;
+        }
+        let call_id = call.id;
+        let name = call.function.name;
+        let arguments = call.function.arguments;
+        let id = self.new_item_id("fc");
+        let index = self.output.len();
+        if !self
+            .send_frame(
+                sender,
+                "response.output_item.added",
+                json!({
+                    "output_index": index,
+                    "item": {
+                        "id": id,
+                        "type": "function_call",
+                        "status": "in_progress",
+                        "call_id": call_id.clone(),
+                        "name": name.clone(),
+                        "arguments": "",
+                    },
+                }),
+            )
+            .await
+        {
+            return false;
+        }
+        if !self
+            .send_frame(
+                sender,
+                "response.function_call_arguments.delta",
+                json!({
+                    "item_id": id,
+                    "output_index": index,
+                    "delta": arguments.clone(),
+                }),
+            )
+            .await
+        {
+            return false;
+        }
+        if !self
+            .send_frame(
+                sender,
+                "response.function_call_arguments.done",
+                json!({
+                    "item_id": id,
+                    "output_index": index,
+                    "arguments": arguments.clone(),
+                }),
+            )
+            .await
+        {
+            return false;
+        }
+        let completed = json!({
+            "id": id,
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        });
+        if !self
+            .send_frame(
+                sender,
+                "response.output_item.done",
+                json!({"output_index": index, "item": completed}),
+            )
+            .await
+        {
+            return false;
+        }
+        self.output.push(completed);
+        true
+    }
+
+    async fn close_open(&mut self, sender: &mpsc::Sender<Result<Bytes, Infallible>>) -> bool {
+        let Some(open) = self.open.take() else {
+            return true;
+        };
+        match open {
+            OpenResponsesItem::Reasoning { id, index, text } => {
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.reasoning_summary_text.done",
+                        json!({
+                            "item_id": id.clone(),
+                            "output_index": index,
+                            "summary_index": 0,
+                            "text": text.clone(),
+                        }),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.reasoning_summary_part.done",
+                        json!({
+                            "item_id": id.clone(),
+                            "output_index": index,
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": text.clone()},
+                        }),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                let item = json!({
+                    "id": id,
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": text}],
+                });
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.output_item.done",
+                        json!({"output_index": index, "item": item}),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                self.output.push(item);
+            }
+            OpenResponsesItem::Message { id, index, text } => {
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.output_text.done",
+                        json!({
+                            "item_id": id.clone(),
+                            "output_index": index,
+                            "content_index": 0,
+                            "text": text.clone(),
+                        }),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.content_part.done",
+                        json!({
+                            "item_id": id.clone(),
+                            "output_index": index,
+                            "content_index": 0,
+                            "part": {"type": "output_text", "text": text.clone(), "annotations": []},
+                        }),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                let item = json!({
+                    "id": id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text, "annotations": []}],
+                });
+                if !self
+                    .send_frame(
+                        sender,
+                        "response.output_item.done",
+                        json!({"output_index": index, "item": item}),
+                    )
+                    .await
+                {
+                    return false;
+                }
+                self.output.push(item);
+            }
+        }
+        true
+    }
+
+    async fn send_completed(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        prepared: &PreparedCompletion,
+    ) -> bool {
+        if !self.close_open(sender).await {
+            return false;
+        }
+        let incomplete = prepared.finish_reason == "length";
+        let mut response = self.envelope.response();
+        let status = if incomplete {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        response["status"] = json!(status);
+        response["output"] = json!(self.output);
+        response["usage"] = responses_usage(&prepared.usage);
+        if incomplete {
+            response["incomplete_details"] = json!({"reason": "max_output_tokens"});
+        }
+        self.send_frame(sender, "response.completed", json!({"response": response}))
+            .await
+    }
+
+    async fn send_failed(
+        &mut self,
+        sender: &mpsc::Sender<Result<Bytes, Infallible>>,
+        error: ApiError,
+    ) {
+        let message = error.message;
+        let code = error.code;
+        let mut response = self.envelope.response();
+        response["status"] = json!("failed");
+        response["output"] = json!(self.output);
+        response["error"] = json!({"code": code, "message": message.clone()});
+        let _ = self
+            .send_frame(
+                sender,
+                "response.failed",
+                json!({
+                    "response": response,
+                    "error": {"code": code, "message": message},
+                }),
+            )
+            .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn responses_streaming_response(
+    mut receiver: mpsc::Receiver<Result<EngineStreamEvent, ApiError>>,
+    tool_format: ToolFormat,
+    registry: ToolRegistry,
+    tool_choice: crate::tool_calling::ToolChoice,
+    parallel_tool_calls: bool,
+    sequence: u64,
+    envelope: ResponsesEnvelope,
+) -> Response {
+    let (sender, body_receiver) = mpsc::channel::<Result<Bytes, Infallible>>(128);
+    tokio::spawn(async move {
+        let mut wire = ResponsesWireState::new(envelope, sequence);
+        let created = wire.envelope.response();
+        if !wire
+            .send_frame(&sender, "response.created", json!({"response": created}))
+            .await
+        {
+            return;
+        }
+        let in_progress = wire.envelope.response();
+        if !wire
+            .send_frame(
+                &sender,
+                "response.in_progress",
+                json!({"response": in_progress}),
+            )
+            .await
+        {
+            return;
+        }
+
+        let mut protocol = ProtocolStreamState::new(tool_format);
+        loop {
+            let event = tokio::select! {
+                _ = sender.closed() => return,
+                event = receiver.recv() => event,
+            };
+            let Some(event) = event else {
+                wire.send_failed(
+                    &sender,
+                    ApiError::unavailable("model worker stopped before responding"),
+                )
+                .await;
+                return;
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => {
+                    wire.send_failed(&sender, error).await;
+                    return;
+                }
+            };
+            match event {
+                EngineStreamEvent::TextDelta(delta) => {
+                    let updates = match protocol.push(
+                        &delta,
+                        &registry,
+                        &tool_choice,
+                        parallel_tool_calls,
+                        sequence,
+                    ) {
+                        Ok(updates) => updates,
+                        Err(error) => {
+                            wire.send_failed(&sender, error).await;
+                            return;
+                        }
+                    };
+                    for update in updates {
+                        if !wire.send_update(&sender, update).await {
+                            return;
+                        }
+                    }
+                }
+                EngineStreamEvent::Complete(output) => {
+                    if protocol.raw != output.text {
+                        wire.send_failed(
+                            &sender,
+                            ApiError::internal(
+                                "streamed text did not match the completed generation",
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    let prepared = match prepare_completion(
+                        output,
+                        tool_format,
+                        &registry,
+                        &tool_choice,
+                        parallel_tool_calls,
+                        sequence,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            wire.send_failed(&sender, error).await;
+                            return;
+                        }
+                    };
+                    let updates = match protocol.finish(&prepared) {
+                        Ok(updates) => updates,
+                        Err(error) => {
+                            wire.send_failed(&sender, error).await;
+                            return;
+                        }
+                    };
+                    for update in updates {
+                        if !wire.send_update(&sender, update).await {
+                            return;
+                        }
+                    }
+                    wire.send_completed(&sender, &prepared).await;
+                    return;
+                }
+            }
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(body_receiver)))
+        .expect("static SSE response headers are valid")
+}
+
 struct StreamEnvelope<'a> {
     id: &'a str,
     created: u64,
@@ -910,6 +1786,7 @@ impl StreamEnvelope<'_> {
 }
 
 enum StreamUpdate {
+    Reasoning(String),
     Content(String),
     ToolCall {
         index: usize,
@@ -922,21 +1799,36 @@ enum ProtocolStreamMode {
     Undecided,
     Text,
     Tool,
+    Inkling2,
 }
 
 struct ProtocolStreamState {
+    tool_format: ToolFormat,
     raw: String,
     mode: ProtocolStreamMode,
+    inkling_cursor: usize,
+    inkling_reasoning: String,
+    inkling_content: String,
     sent_tool_calls: usize,
+    streamed_reasoning: String,
     streamed_content: String,
 }
 
 impl ProtocolStreamState {
-    fn new() -> Self {
+    fn new(tool_format: ToolFormat) -> Self {
+        let mode = match tool_format {
+            ToolFormat::Inkling2Json => ProtocolStreamMode::Inkling2,
+            ToolFormat::Auto | ToolFormat::Qwen3Xml => ProtocolStreamMode::Undecided,
+        };
         Self {
+            tool_format,
             raw: String::new(),
-            mode: ProtocolStreamMode::Undecided,
+            mode,
+            inkling_cursor: 0,
+            inkling_reasoning: String::new(),
+            inkling_content: String::new(),
             sent_tool_calls: 0,
+            streamed_reasoning: String::new(),
             streamed_content: String::new(),
         }
     }
@@ -949,38 +1841,96 @@ impl ProtocolStreamState {
         parallel_tool_calls: bool,
         sequence: u64,
     ) -> Result<Vec<StreamUpdate>, ApiError> {
-        const MARKER: &str = "<tool_call>";
+        const QWEN_MARKER: &str = "<tool_call>";
+        const INKLING_MSG: &str = "<|message_model|>";
+        const INKLING_END_SAMPLING: &str = "<|content_model_end_sampling|>";
         self.raw.push_str(delta);
-        let mut updates = Vec::new();
-        if self.mode != ProtocolStreamMode::Tool {
-            if let Some(marker) = self.raw.find(MARKER) {
+
+        if self.mode == ProtocolStreamMode::Undecided {
+            let trimmed = self.raw.trim_start();
+            if self.tool_format == ToolFormat::Auto && looks_like_inkling2(&self.raw) {
+                self.mode = ProtocolStreamMode::Inkling2;
+            } else if self.tool_format == ToolFormat::Auto
+                && (INKLING_MSG.starts_with(trimmed) || INKLING_END_SAMPLING.starts_with(trimmed))
+            {
+                return Ok(Vec::new());
+            } else if let Some(marker) = self.raw.find(QWEN_MARKER) {
                 self.mode = ProtocolStreamMode::Tool;
+                let mut updates = Vec::new();
                 let content = self.raw[..marker].to_owned();
                 if !content.trim().is_empty() {
                     if let Some(content) = self.content_update(&content)? {
                         updates.push(StreamUpdate::Content(content));
                     }
                 }
-            } else if self.mode == ProtocolStreamMode::Undecided
-                && MARKER.starts_with(self.raw.trim_start())
-            {
+                return self.push_qwen_tools(
+                    updates,
+                    registry,
+                    tool_choice,
+                    parallel_tool_calls,
+                    sequence,
+                );
+            } else if QWEN_MARKER.starts_with(trimmed) {
                 return Ok(Vec::new());
             } else {
                 self.mode = ProtocolStreamMode::Text;
-                let content = self.raw.as_str();
-                let marker_prefix = (1..MARKER.len())
-                    .rev()
-                    .find(|length| content.ends_with(&MARKER[..*length]))
-                    .unwrap_or(0);
-                let stable_end = content.len() - marker_prefix;
-                let stable = content[..stable_end].to_owned();
-                if let Some(content) = self.content_update(&stable)? {
-                    updates.push(StreamUpdate::Content(content));
-                }
-                return Ok(updates);
             }
         }
 
+        match self.mode {
+            ProtocolStreamMode::Inkling2 => {
+                self.push_inkling2(registry, tool_choice, parallel_tool_calls, sequence)
+            }
+            ProtocolStreamMode::Text => {
+                if let Some(marker) = self.raw.find(QWEN_MARKER) {
+                    self.mode = ProtocolStreamMode::Tool;
+                    let mut updates = Vec::new();
+                    let content = self.raw[..marker].to_owned();
+                    if !content.trim().is_empty() {
+                        if let Some(content) = self.content_update(&content)? {
+                            updates.push(StreamUpdate::Content(content));
+                        }
+                    }
+                    return self.push_qwen_tools(
+                        updates,
+                        registry,
+                        tool_choice,
+                        parallel_tool_calls,
+                        sequence,
+                    );
+                }
+                let content = self.raw.as_str();
+                let marker_prefix = (1..QWEN_MARKER.len())
+                    .rev()
+                    .find(|length| content.ends_with(&QWEN_MARKER[..*length]))
+                    .unwrap_or(0);
+                let stable_end = content.len() - marker_prefix;
+                let stable = content[..stable_end].to_owned();
+                let mut updates = Vec::new();
+                if let Some(content) = self.content_update(&stable)? {
+                    updates.push(StreamUpdate::Content(content));
+                }
+                Ok(updates)
+            }
+            ProtocolStreamMode::Tool => self.push_qwen_tools(
+                Vec::new(),
+                registry,
+                tool_choice,
+                parallel_tool_calls,
+                sequence,
+            ),
+            ProtocolStreamMode::Undecided => unreachable!("resolved above"),
+        }
+    }
+
+    fn push_qwen_tools(
+        &mut self,
+        mut updates: Vec<StreamUpdate>,
+        registry: &ToolRegistry,
+        tool_choice: &crate::tool_calling::ToolChoice,
+        parallel_tool_calls: bool,
+        sequence: u64,
+    ) -> Result<Vec<StreamUpdate>, ApiError> {
         let Some(end) = self.raw.rfind("</tool_call>") else {
             return Ok(updates);
         };
@@ -1009,8 +1959,99 @@ impl ProtocolStreamState {
         Ok(updates)
     }
 
+    fn push_inkling2(
+        &mut self,
+        registry: &ToolRegistry,
+        tool_choice: &crate::tool_calling::ToolChoice,
+        parallel_tool_calls: bool,
+        sequence: u64,
+    ) -> Result<Vec<StreamUpdate>, ApiError> {
+        const MSG: &str = "<|message_model|>";
+        const END_MSG: &str = "<|end_message|>";
+        const THINKING: &str = "<|content_thinking|>";
+        const TEXT: &str = "<|content_text|>";
+        const END_SAMPLING: &str = "<|content_model_end_sampling|>";
+        const ENDOFTEXT: &str = "<|endoftext|>";
+
+        let mut updates = Vec::new();
+        loop {
+            let rest = &self.raw[self.inkling_cursor..];
+            let ws = rest.len() - rest.trim_start().len();
+            let trimmed = &rest[ws..];
+            if trimmed.starts_with(END_SAMPLING) {
+                self.inkling_cursor += ws + END_SAMPLING.len();
+                continue;
+            }
+            if trimmed.starts_with(ENDOFTEXT) {
+                self.inkling_cursor += ws + ENDOFTEXT.len();
+                continue;
+            }
+            if !trimmed.starts_with(MSG) {
+                break;
+            }
+            let after_msg = &trimmed[MSG.len()..];
+            if let Some(end_pos) = after_msg.find(END_MSG) {
+                let block_end = self.inkling_cursor + ws + MSG.len() + end_pos + END_MSG.len();
+                let block = &self.raw[self.inkling_cursor + ws..block_end];
+                let body = &after_msg[..end_pos];
+                if let Some(thought) = body.strip_prefix(THINKING) {
+                    self.inkling_reasoning.push_str(thought);
+                    let full = self.inkling_reasoning.clone();
+                    if let Some(delta) = self.reasoning_update(&full)? {
+                        updates.push(StreamUpdate::Reasoning(delta));
+                    }
+                } else if let Some(text) = body.strip_prefix(TEXT) {
+                    self.inkling_content.push_str(text);
+                    let full = self.inkling_content.clone();
+                    if let Some(delta) = self.content_update(&full)? {
+                        updates.push(StreamUpdate::Content(delta));
+                    }
+                } else {
+                    let parsed = parse_inkling2_json(block, registry, tool_choice)?;
+                    if !parallel_tool_calls && self.sent_tool_calls + parsed.tool_calls.len() > 1 {
+                        return Err(ApiError::internal(
+                            "model emitted multiple calls while parallel_tool_calls was false",
+                        ));
+                    }
+                    for mut call in parsed.tool_calls {
+                        let index = self.sent_tool_calls;
+                        call.id = format!("call-{sequence:016x}-{index}");
+                        updates.push(StreamUpdate::ToolCall { index, call });
+                        self.sent_tool_calls += 1;
+                    }
+                }
+                self.inkling_cursor = block_end;
+            } else {
+                // Stream partial thinking or text inside an open block, holding back any
+                // suffix that could be the start of `<|end_message|>`.
+                if let Some(partial) = after_msg.strip_prefix(THINKING) {
+                    let stable = stable_before_tag(partial, END_MSG);
+                    let mut full = self.inkling_reasoning.clone();
+                    full.push_str(stable);
+                    if let Some(delta) = self.reasoning_update(&full)? {
+                        updates.push(StreamUpdate::Reasoning(delta));
+                    }
+                } else if let Some(partial) = after_msg.strip_prefix(TEXT) {
+                    let stable = stable_before_tag(partial, END_MSG);
+                    let mut full = self.inkling_content.clone();
+                    full.push_str(stable);
+                    if let Some(delta) = self.content_update(&full)? {
+                        updates.push(StreamUpdate::Content(delta));
+                    }
+                }
+                break;
+            }
+        }
+        Ok(updates)
+    }
+
     fn finish(&mut self, prepared: &PreparedCompletion) -> Result<Vec<StreamUpdate>, ApiError> {
         let mut updates = Vec::new();
+        if let Some(reasoning) = prepared.reasoning_content.as_deref() {
+            if let Some(delta) = self.reasoning_update(reasoning)? {
+                updates.push(StreamUpdate::Reasoning(delta));
+            }
+        }
         if let Some(content) = prepared.content.as_deref() {
             if let Some(content) = self.content_update(content)? {
                 updates.push(StreamUpdate::Content(content));
@@ -1028,6 +2069,17 @@ impl ProtocolStreamState {
         Ok(updates)
     }
 
+    fn reasoning_update(&mut self, reasoning: &str) -> Result<Option<String>, ApiError> {
+        let delta = reasoning
+            .strip_prefix(&self.streamed_reasoning)
+            .ok_or_else(|| {
+                ApiError::internal("streamed reasoning changed before generation completed")
+            })?
+            .to_owned();
+        self.streamed_reasoning = reasoning.to_owned();
+        Ok((!delta.is_empty()).then_some(delta))
+    }
+
     fn content_update(&mut self, content: &str) -> Result<Option<String>, ApiError> {
         let delta = content
             .strip_prefix(&self.streamed_content)
@@ -1038,6 +2090,14 @@ impl ProtocolStreamState {
         self.streamed_content = content.to_owned();
         Ok((!delta.is_empty()).then_some(delta))
     }
+}
+
+fn stable_before_tag<'a>(text: &'a str, tag: &str) -> &'a str {
+    let keep = (1..tag.len())
+        .rev()
+        .find(|&len| tag.is_char_boundary(len) && text.ends_with(&tag[..len]))
+        .unwrap_or(0);
+    &text[..text.len() - keep]
 }
 
 async fn send_stream_role(
@@ -1062,6 +2122,7 @@ async fn send_stream_update(
     update: StreamUpdate,
 ) -> bool {
     let delta = match update {
+        StreamUpdate::Reasoning(reasoning) => json!({"reasoning_content": reasoning}),
         StreamUpdate::Content(content) => json!({"content": content}),
         StreamUpdate::ToolCall { index, call } => json!({
             "tool_calls": [{
@@ -1167,7 +2228,10 @@ async fn decode_request_messages(
     .map_err(|e| ApiError::internal(format!("image decoding failed: {e}")))?
 }
 
-fn validate_request(request: &ChatCompletionRequest, config: &ApiConfig) -> Result<(), ApiError> {
+fn validate_request(
+    request: &ChatCompletionRequest,
+    config: &ApiConfig,
+) -> Result<Option<usize>, ApiError> {
     if request
         .model
         .as_ref()
@@ -1200,7 +2264,7 @@ fn validate_request(request: &ChatCompletionRequest, config: &ApiConfig) -> Resu
         ));
     }
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
-    if max_tokens == Some(0) || max_tokens.is_some_and(|value| value > config.max_output_tokens) {
+    if max_tokens == Some(0) {
         return Err(ApiError::invalid(
             format!(
                 "requested output tokens must be in 1..={}",
@@ -1209,6 +2273,17 @@ fn validate_request(request: &ChatCompletionRequest, config: &ApiConfig) -> Resu
             Some("max_tokens".to_owned()),
         ));
     }
+    let max_tokens = max_tokens.map(|requested| {
+        if requested > config.max_output_tokens {
+            eprintln!(
+                "clamped max_tokens: requested={requested} max_output_tokens={}",
+                config.max_output_tokens
+            );
+            config.max_output_tokens
+        } else {
+            requested
+        }
+    });
     if request.disable_spec_decode {
         return Err(ApiError::invalid(
             "disable_spec_decode requires a model runtime extension not included in this server",
@@ -1255,7 +2330,7 @@ fn validate_request(request: &ChatCompletionRequest, config: &ApiConfig) -> Resu
     validate_finite_range(request.top_p, f32::MIN_POSITIVE, 1.0, "top_p")?;
     validate_finite_range(request.frequency_penalty, -2.0, 2.0, "frequency_penalty")?;
     validate_finite_range(request.presence_penalty, -2.0, 2.0, "presence_penalty")?;
-    Ok(())
+    Ok(max_tokens)
 }
 
 fn validate_finite_range(

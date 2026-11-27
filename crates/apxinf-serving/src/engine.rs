@@ -81,6 +81,23 @@ pub struct ApxInfEngineConfig {
     pub load_options: LoadOptions,
     pub default_max_tokens: usize,
     pub max_input_tokens: usize,
+    pub sampling_default: SamplingDefault,
+}
+
+/// Token selection for requests that carry no sampling parameters of their own.
+///
+/// A checkpoint's `generation_config.json` decides this by default, and a model
+/// that sets `do_sample: true` makes every such request sample. Sampling is not
+/// a decoding-path detail: backends whose fast path is greedy-only (MTP verify
+/// on `metal_inkling2`, for example) fall back to a materially slower decode, so
+/// an operator serving agent traffic may prefer to decode greedily unless the
+/// caller asks otherwise. A request that does specify `temperature`, `top_k` or
+/// `top_p` always keeps its own choice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SamplingDefault {
+    #[default]
+    Model,
+    Greedy,
 }
 
 pub struct ApxInfChatEngine {
@@ -88,12 +105,33 @@ pub struct ApxInfChatEngine {
     model: LoadedModel,
     default_max_tokens: usize,
     max_input_tokens: usize,
+    sampling_default: SamplingDefault,
     /// Cache token IDs by structured request and template options. This cache
     /// only avoids repeated rendering/tokenization; it retains no model KV state.
     prompt_token_cache: VecDeque<(String, Vec<u32>)>,
 }
 
 const PROMPT_TOKEN_CACHE_ENTRIES: usize = 4;
+
+/// Resolve the request's sampling mode, or `None` to let the checkpoint's
+/// `generation_config.json` decide.
+fn requested_sampling_mode(
+    temperature: Option<f32>,
+    default: SamplingDefault,
+) -> Option<SamplingMode> {
+    temperature
+        .map(|temperature| {
+            if temperature == 0.0 {
+                SamplingMode::Greedy
+            } else {
+                SamplingMode::Random
+            }
+        })
+        .or(match default {
+            SamplingDefault::Greedy => Some(SamplingMode::Greedy),
+            SamplingDefault::Model => None,
+        })
+}
 
 impl ApxInfChatEngine {
     pub(crate) fn load(config: ApxInfEngineConfig) -> Result<Self, ApiError> {
@@ -139,6 +177,7 @@ impl ApxInfChatEngine {
             model,
             default_max_tokens: config.default_max_tokens,
             max_input_tokens: config.max_input_tokens,
+            sampling_default: config.sampling_default,
             prompt_token_cache: VecDeque::new(),
         })
     }
@@ -325,24 +364,26 @@ impl ChatEngine for ApxInfChatEngine {
             // Stop a single-tool response at its native closing token when
             // the tokenizer represents the delimiter as one exact token.
             // Other tokenizers retain normal EOS handling.
-            if let Ok(ids) = self.tokenizer.encode("</tool_call>") {
-                if let [tool_end] = ids.as_slice() {
-                    // An unknown-token fallback is not a tool terminator.
-                    if self
-                        .tokenizer
-                        .decode_with_options(&ids, false)
-                        .ok()
-                        .as_deref()
-                        == Some("</tool_call>")
-                    {
-                        let stop_ids = generation_eos_token_ids.get_or_insert_with(Vec::new);
-                        if !stop_ids.contains(tool_end) {
-                            stop_ids.push(*tool_end);
-                        }
-                        // Preserve the delimiter in both streamed and final text:
-                        // the structured-tool parser needs the closing tag.
-                        if let Some(hidden_eos) = eos_token_ids.as_mut() {
-                            hidden_eos.retain(|id| id != tool_end);
+            for delimiter in ["</tool_call>", "<|content_model_end_sampling|>"] {
+                if let Ok(ids) = self.tokenizer.encode(delimiter) {
+                    if let [tool_end] = ids.as_slice() {
+                        // An unknown-token fallback is not a tool terminator.
+                        if self
+                            .tokenizer
+                            .decode_with_options(&ids, false)
+                            .ok()
+                            .as_deref()
+                            == Some(delimiter)
+                        {
+                            let stop_ids = generation_eos_token_ids.get_or_insert_with(Vec::new);
+                            if !stop_ids.contains(tool_end) {
+                                stop_ids.push(*tool_end);
+                            }
+                            // Preserve the delimiter in both streamed and final text:
+                            // the structured-tool parser needs the closing tag.
+                            if let Some(hidden_eos) = eos_token_ids.as_mut() {
+                                hidden_eos.retain(|id| id != tool_end);
+                            }
                         }
                     }
                 }
@@ -351,13 +392,7 @@ impl ChatEngine for ApxInfChatEngine {
         let generation = GenerationOptions {
             max_new_tokens: Some(max_tokens),
             eos_token_ids: generation_eos_token_ids,
-            sampling_mode: request.temperature.map(|temperature| {
-                if temperature == 0.0 {
-                    SamplingMode::Greedy
-                } else {
-                    SamplingMode::Random
-                }
-            }),
+            sampling_mode: requested_sampling_mode(request.temperature, self.sampling_default),
             temperature: request.temperature,
             top_k: request.top_k,
             top_p: request.top_p,
@@ -418,10 +453,15 @@ impl ChatEngine for ApxInfChatEngine {
             }
         }
         let completion_tokens = output.profile.output_tokens();
+        let reused_prompt_tokens = self
+            .model
+            .text_mut()
+            .map(|m| m.last_reused_prompt_tokens())
+            .unwrap_or(0);
         Ok(EngineOutput {
             text,
             prompt_tokens: output.profile.input_tokens(),
-            reused_prompt_tokens: 0,
+            reused_prompt_tokens,
             completion_tokens,
             hit_length: !stopped_on_eos && completion_tokens >= max_tokens,
             ttft_ms: output.profile.ttft_ms(),

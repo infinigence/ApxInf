@@ -1,4 +1,4 @@
-//! Strict request validation and Qwen3 XML tool-call parsing.
+//! Strict request validation and model output/tool-call parsing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -6,6 +6,27 @@ use serde_json::{Map, Value};
 
 use crate::error::ApiError;
 use crate::protocol::{FunctionCall, FunctionDefinition, ToolCall, ToolDefinition};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ToolFormat {
+    #[default]
+    Auto,
+    Qwen3Xml,
+    Inkling2Json,
+}
+
+impl ToolFormat {
+    pub fn from_cli_name(name: &str) -> Result<Self, String> {
+        match name.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "qwen3" | "qwen3_xml" | "qwen3-xml" => Ok(Self::Qwen3Xml),
+            "inkling2" | "inkling2_json" | "inkling2-json" => Ok(Self::Inkling2Json),
+            other => Err(format!(
+                "unsupported tool format '{other}'; use auto, qwen3, or inkling2"
+            )),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolChoice {
@@ -22,6 +43,7 @@ pub struct ToolRegistry {
 
 #[derive(Debug, PartialEq)]
 pub struct ParsedAssistant {
+    pub reasoning_content: Option<String>,
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
@@ -138,6 +160,37 @@ fn require_tools(names: &BTreeSet<&str>, choice: &str) -> Result<(), ApiError> {
     }
 }
 
+pub fn parse_assistant_output(
+    text: &str,
+    format: ToolFormat,
+    registry: &ToolRegistry,
+    choice: &ToolChoice,
+) -> Result<ParsedAssistant, ApiError> {
+    match format {
+        ToolFormat::Auto => {
+            if looks_like_inkling2(text) {
+                parse_inkling2_json(text, registry, choice)
+            } else {
+                parse_qwen3_xml(text, registry, choice)
+            }
+        }
+        ToolFormat::Qwen3Xml => parse_qwen3_xml(text, registry, choice),
+        ToolFormat::Inkling2Json => parse_inkling2_json(text, registry, choice),
+    }
+}
+
+pub fn looks_like_inkling2(text: &str) -> bool {
+    [
+        "<|message_model|>",
+        "<|content_thinking|>",
+        "<|content_text|>",
+        "<|content_invoke_tool_json|>",
+        "<|content_model_end_sampling|>",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
 /// Parse the XML-like protocol emitted by Qwen3 provider templates.
 ///
 /// Natural-language content may precede the first call. Nothing except
@@ -159,6 +212,7 @@ pub fn parse_qwen3_xml(
             ));
         }
         return Ok(ParsedAssistant {
+            reasoning_content: None,
             content: nonempty(text),
             tool_calls: Vec::new(),
         });
@@ -254,7 +308,162 @@ pub fn parse_qwen3_xml(
     }
 
     Ok(ParsedAssistant {
+        reasoning_content: None,
         content: prefix,
+        tool_calls: calls,
+    })
+}
+
+/// Parse Inkling2's structured message protocol:
+/// `<|message_model|><|content_thinking|>...<|end_message|>`
+/// `<|message_model|><|content_text|>...<|end_message|>`
+/// `<|message_model|>{fn}<|content_invoke_tool_json|>{"name":"...","args":{...}}<|end_message|>`
+/// optionally followed by `<|content_model_end_sampling|>` / `<|endoftext|>`.
+pub fn parse_inkling2_json(
+    text: &str,
+    registry: &ToolRegistry,
+    choice: &ToolChoice,
+) -> Result<ParsedAssistant, ApiError> {
+    const MSG: &str = "<|message_model|>";
+    const END_MSG: &str = "<|end_message|>";
+    const THINKING: &str = "<|content_thinking|>";
+    const TEXT: &str = "<|content_text|>";
+    const TOOL_JSON: &str = "<|content_invoke_tool_json|>";
+    const END_SAMPLING: &str = "<|content_model_end_sampling|>";
+    const ENDOFTEXT: &str = "<|endoftext|>";
+
+    if !looks_like_inkling2(text) {
+        if matches!(choice, ToolChoice::Required | ToolChoice::Function(_)) {
+            return Err(protocol_error(
+                "the selected tool_choice did not produce a tool call",
+            ));
+        }
+        return Ok(ParsedAssistant {
+            reasoning_content: None,
+            content: nonempty(text),
+            tool_calls: Vec::new(),
+        });
+    }
+
+    let mut cursor = Cursor::new(text);
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    let mut calls = Vec::new();
+
+    loop {
+        cursor.skip_ws();
+        let rem = cursor.remaining();
+        if rem.is_empty() {
+            break;
+        }
+        if rem.starts_with(END_SAMPLING) {
+            cursor.expect(END_SAMPLING)?;
+            continue;
+        }
+        if rem.starts_with(ENDOFTEXT) {
+            cursor.expect(ENDOFTEXT)?;
+            continue;
+        }
+        if !rem.starts_with(MSG) {
+            return Err(protocol_error(
+                "unexpected trailing content in Inkling2 output",
+            ));
+        }
+        cursor.expect(MSG)?;
+        // Graceful truncation: when the model hits max_tokens before emitting
+        // <|end_message|>, accept the remaining text as the block body instead
+        // of erroring. This lets callers see hit_length=true with partial
+        // reasoning/content rather than a 500.
+        let body = match cursor.take_until(END_MSG) {
+            Ok(b) => b,
+            Err(_) if cursor.remaining().is_empty() => "",
+            Err(_) => {
+                let b = cursor.remaining();
+                cursor.offset += b.len();
+                b
+            }
+        };
+        if let Some(thought) = body.strip_prefix(THINKING) {
+            reasoning.push_str(thought);
+        } else if let Some(text_part) = body.strip_prefix(TEXT) {
+            content.push_str(text_part);
+        } else if let Some(pos) = body.find(TOOL_JSON) {
+            if matches!(choice, ToolChoice::None) {
+                return Err(protocol_error(
+                    "the model emitted a tool call while tool_choice was 'none'",
+                ));
+            }
+            let header_name = body[..pos].trim();
+            if !valid_identifier(header_name) {
+                return Err(protocol_error("invalid function name in Inkling2 tool call"));
+            }
+            let raw_json = body[pos + TOOL_JSON.len()..].trim();
+            let value: Value = serde_json::from_str(raw_json)
+                .map_err(|error| protocol_error(format!("invalid Inkling2 tool JSON: {error}")))?;
+            let object = value
+                .as_object()
+                .ok_or_else(|| protocol_error("Inkling2 tool call must be a JSON object"))?;
+            if object.keys().any(|key| key != "name" && key != "args") {
+                return Err(protocol_error(
+                    "Inkling2 tool call contains an unknown field",
+                ));
+            }
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| protocol_error("Inkling2 tool call is missing 'name'"))?
+                .to_owned();
+            if name != header_name {
+                return Err(protocol_error(format!(
+                    "Inkling2 tool header '{header_name}' does not match JSON name '{name}'"
+                )));
+            }
+            let definition = registry.get(&name).ok_or_else(|| {
+                protocol_error(format!("model called unknown function '{name}'"))
+            })?;
+            if let ToolChoice::Function(required) = choice {
+                if required != &name {
+                    return Err(protocol_error(format!(
+                        "model called '{name}' but tool_choice requires '{required}'"
+                    )));
+                }
+            }
+            let arguments = match object.get("args") {
+                None => Map::new(),
+                Some(Value::Object(map)) => map.clone(),
+                Some(_) => {
+                    return Err(protocol_error(
+                        "Inkling2 tool call 'args' must be a JSON object",
+                    ))
+                }
+            };
+            validate_arguments(&name, &arguments, &definition.parameters)
+                .map_err(protocol_error)?;
+            calls.push(ToolCall {
+                id: String::new(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name,
+                    arguments: serde_json::to_string(&arguments)
+                        .map_err(|error| protocol_error(error.to_string()))?,
+                },
+            });
+        } else {
+            return Err(protocol_error(
+                "Inkling2 message block has unrecognized content tag",
+            ));
+        }
+    }
+
+    if calls.is_empty() && matches!(choice, ToolChoice::Required | ToolChoice::Function(_)) {
+        return Err(protocol_error(
+            "the selected tool_choice did not produce a tool call",
+        ));
+    }
+
+    Ok(ParsedAssistant {
+        reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+        content: (!content.is_empty()).then_some(content),
         tool_calls: calls,
     })
 }
@@ -637,5 +846,55 @@ mod tests {
             &ToolChoice::Function("other.tool".into())
         )
         .is_err());
+    }
+
+    #[test]
+    fn parses_inkling2_thinking_text_and_tool_call() {
+        let output = concat!(
+            "<|message_model|><|content_thinking|>Need weather.<|end_message|>",
+            "<|message_model|><|content_text|>Checking now.<|end_message|>",
+            "<|message_model|>weather.get<|content_invoke_tool_json|>",
+            "{\"name\":\"weather.get\",\"args\":{\"city\":\"上海\",\"days\":2}}",
+            "<|end_message|><|content_model_end_sampling|>"
+        );
+        let parsed =
+            parse_assistant_output(output, ToolFormat::Auto, &registry(), &ToolChoice::Auto)
+                .unwrap();
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("Need weather."));
+        assert_eq!(parsed.content.as_deref(), Some("Checking now."));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].function.name, "weather.get");
+        assert_eq!(
+            serde_json::from_str::<Value>(&parsed.tool_calls[0].function.arguments).unwrap(),
+            serde_json::json!({"city": "上海", "days": 2})
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_inkling2_outputs() {
+        for bad in [
+            "<|message_model|>weather.get<|content_invoke_tool_json|>{\"name\":\"other\",\"args\":{\"city\":\"x\"}}<|end_message|>",
+            "<|message_model|>weather.get<|content_invoke_tool_json|>{\"name\":\"weather.get\",\"args\":{\"city\":\"x\"},\"extra\":1}<|end_message|>",
+            "<|message_model|><|content_text|>ok<|end_message|> trailing",
+        ] {
+            assert!(
+                parse_inkling2_json(bad, &registry(), &ToolChoice::Auto).is_err(),
+                "accepted {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_a_message_body_truncated_before_its_end_marker() {
+        // Hitting max_tokens mid-message is ordinary for a reasoning model; the
+        // caller must see the partial body with the truncation, not a protocol
+        // error. See `hit_length` in the completion response.
+        let truncated = "<|message_model|><|content_text|>unclosed";
+        let parsed = parse_inkling2_json(truncated, &registry(), &ToolChoice::Auto).unwrap();
+        assert_eq!(parsed.content.as_deref(), Some("unclosed"));
+        assert!(parsed.tool_calls.is_empty());
+
+        let truncated_tool = "<|message_model|>weather.get<|content_invoke_tool_json|>{\"name\":\"weather.get\",\"args\":{\"city\":\"x\"}";
+        assert!(parse_inkling2_json(truncated_tool, &registry(), &ToolChoice::Auto).is_err());
     }
 }
