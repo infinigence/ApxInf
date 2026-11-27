@@ -108,11 +108,7 @@ impl CpuTokenSampler {
         let mut ranked = logits
             .iter()
             .enumerate()
-            .filter_map(|(token_id, &value)| {
-                value
-                    .is_finite()
-                    .then_some((token_id as u32, value / temperature))
-            })
+            .filter_map(|(token_id, &value)| value.is_finite().then_some((token_id as u32, value)))
             .collect::<Vec<_>>();
         ranked.sort_by(|(left_id, left), (right_id, right)| {
             right.total_cmp(left).then_with(|| left_id.cmp(right_id))
@@ -124,9 +120,12 @@ impl CpuTokenSampler {
             .first()
             .map(|(_, value)| *value)
             .ok_or_else(|| Error::Other("all token logits are invalid".into()))?;
+        // Subtract the max before scaling by temperature. Scaling first turns a
+        // saturated logit (adjusted_logit maps +inf to f32::MAX) into +inf for any
+        // temperature below 1.0, and the following inf - inf yields NaN.
         let mut candidates = ranked
             .into_iter()
-            .map(|(token_id, value)| (token_id, (value - max).exp()))
+            .map(|(token_id, value)| (token_id, ((value - max) / temperature).exp()))
             .collect::<Vec<_>>();
         let total = candidates.iter().map(|(_, weight)| *weight).sum::<f32>();
         if !total.is_finite() || total <= 0.0 {
@@ -341,6 +340,36 @@ mod tests {
             .sample(NextTokenLogits::last(&tensor, 3).unwrap())
             .unwrap();
         assert_eq!(sample.token_id, 0);
+        assert!((sample.logprob.unwrap() + 2.0f32.ln()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn random_logprob_is_stable_for_large_logits() {
+        // adjusted_logit maps +inf to f32::MAX. Dividing that by a temperature
+        // below 1.0 overflows to +inf, so the old code produced inf - inf = NaN
+        // and rejected the row as "token probability mass is invalid".
+        let tensor = Tensor::from_f32(vec![1, 3], &[f32::MAX, f32::MAX, 0.0]).unwrap();
+        let params = TokenSamplingParams {
+            selection: TokenSelection::Random {
+                temperature: 0.7,
+                top_k: None,
+                top_p: 1.0,
+            },
+            penalties: TokenPenalties::default(),
+            return_logprob: true,
+        };
+        let mut sampler = sampler(3, 4);
+        sampler
+            .begin(TokenSamplingInit {
+                prompt_token_ids: &[2],
+                params: &params,
+                rng: RngKey::new(11, 5, 2),
+            })
+            .unwrap();
+        let sample = sampler
+            .sample(NextTokenLogits::last(&tensor, 3).unwrap())
+            .unwrap();
+        assert!(sample.token_id < 2, "token_id={}", sample.token_id);
         assert!((sample.logprob.unwrap() + 2.0f32.ln()).abs() < 1e-6);
     }
 
