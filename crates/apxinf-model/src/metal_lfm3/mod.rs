@@ -88,16 +88,39 @@ pub fn lane_chat_prompt(messages: &[serde_json::Value]) -> Result<String> {
                 ))
             }
         };
-        if !matches!(role, "system" | "user" | "assistant") {
+        if !matches!(role, "system" | "user" | "assistant" | "tool") {
             return Err(Error::Other(format!(
-                "LFM3 lane ChatML: role `{role}` is unsupported (system, user, assistant)"
+                "LFM3 lane ChatML: role `{role}` is unsupported (system, user, assistant, tool)"
             )));
         }
         saw_user |= role == "user";
         text.push_str(IM_START);
         text.push_str(role);
         text.push('\n');
-        text.push_str(content);
+        if role == "tool" {
+            // The checkpoint template wraps every tool result in `<tool_response>`.
+            // Keep that shape so the model sees the protocol it was trained on.
+            if content.contains("<tool_response>") {
+                text.push_str(content);
+            } else {
+                text.push_str("<tool_response>\n");
+                text.push_str(content);
+                text.push_str("\n</tool_response>");
+            }
+        } else {
+            text.push_str(content);
+            if role == "assistant" {
+                if let Some(calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
+                    let rendered = calls
+                        .iter()
+                        .map(render_tool_call)
+                        .collect::<Result<Vec<_>>>()?;
+                    if !rendered.is_empty() {
+                        text.push_str(&rendered.join("\n\n"));
+                    }
+                }
+            }
+        }
         text.push_str(IM_END);
         text.push('\n');
     }
@@ -111,6 +134,51 @@ pub fn lane_chat_prompt(messages: &[serde_json::Value]) -> Result<String> {
     text.push_str(IM_START);
     text.push_str("assistant\n");
     Ok(text)
+}
+
+/// One `<tool_call>` block, byte-identical to the checkpoint template's
+/// `render_tool_calls` macro.
+fn render_tool_call(call: &serde_json::Value) -> Result<String> {
+    let function = call.get("function").unwrap_or(call);
+    let name = function
+        .get("name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| Error::Other("LFM3 lane ChatML: a tool call has no name".into()))?;
+    let mut text = format!("<tool_call>\n<function={name}>\n");
+    if let Some(arguments) = function.get("arguments") {
+        let arguments = match arguments {
+            serde_json::Value::Object(map) => map.clone(),
+            serde_json::Value::String(raw) => serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .ok_or_else(|| {
+                    Error::Other(
+                        "LFM3 lane ChatML: tool call arguments must be a JSON object".into(),
+                    )
+                })?,
+            _ => {
+                return Err(Error::Other(
+                    "LFM3 lane ChatML: tool call arguments must be a JSON object".into(),
+                ))
+            }
+        };
+        for (name, value) in arguments {
+            text.push_str(&format!(
+                "<parameter={name}>\n{}\n</parameter>\n",
+                render_value(&value)
+            ));
+        }
+    }
+    text.push_str("</function>\n</tool_call>");
+    Ok(text)
+}
+
+fn render_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => "null".into(),
+        other => other.to_string(),
+    }
 }
 
 /// Device-independent option admission, checked before the checkpoint is read.
@@ -172,5 +240,42 @@ mod tests {
         let mut fp32 = options(None);
         fp32.text_weight_dtype = Some(DType::F32);
         assert!(admit(&fp32).is_err());
+    }
+
+    #[test]
+    fn lane_prompt_renders_tool_calls_and_results() {
+        let messages = serde_json::json!([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "read notes.txt"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read", "arguments": {"filePath": "notes.txt", "limit": 5}}
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "alpha"}
+        ]);
+        let prompt = lane_chat_prompt(messages.as_array().unwrap()).unwrap();
+        assert_eq!(
+            prompt,
+            "<|startoftext|><|im_start|>system\nsys<|im_end|>\n\
+             <|im_start|>user\nread notes.txt<|im_end|>\n\
+             <|im_start|>assistant\n\
+             <tool_call>\n<function=read>\n\
+             <parameter=filePath>\nnotes.txt\n</parameter>\n\
+             <parameter=limit>\n5\n</parameter>\n\
+             </function>\n</tool_call><|im_end|>\n\
+             <|im_start|>tool\n<tool_response>\nalpha\n</tool_response><|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn lane_prompt_keeps_an_already_wrapped_tool_response() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "go"},
+            {"role": "tool", "content": "<tool_response>\nbeta\n</tool_response>"}
+        ]);
+        let prompt = lane_chat_prompt(messages.as_array().unwrap()).unwrap();
+        assert!(prompt.contains("<|im_start|>tool\n<tool_response>\nbeta\n</tool_response><|im_end|>\n"));
     }
 }
