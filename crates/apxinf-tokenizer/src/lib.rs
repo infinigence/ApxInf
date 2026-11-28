@@ -314,6 +314,10 @@ pub struct Tokenizer {
     inner: HfTokenizer,
     config: TokenizerConfig,
     chat_template: Option<String>,
+    // `HfTokenizer::get_vocab_size(true)` builds and clones the whole vocab
+    // map, which costs milliseconds on a 128k-token model. The size changes
+    // only through `add_tokens`, so compute it once at load.
+    vocab_size: usize,
 }
 
 impl Tokenizer {
@@ -352,6 +356,7 @@ impl Tokenizer {
         });
 
         Ok(Self {
+            vocab_size: inner.get_vocab_size(true),
             inner,
             config,
             chat_template,
@@ -359,11 +364,25 @@ impl Tokenizer {
     }
 
     /// Load packaged tokenizer assets without filesystem or network access.
-    pub fn from_json_assets(tokenizer: &[u8], config: &[u8], template: Option<&str>) -> Result<Self> {
-        let inner=HfTokenizer::from_bytes(tokenizer).map_err(|e| Error::Other(format!("tokenizer load: {e}")))?;
-        let config:TokenizerConfig=serde_json::from_slice(config).map_err(|e| Error::Other(format!("tokenizer config: {e}")))?;
-        let chat_template=config.chat_template.clone().or_else(|| template.map(str::to_owned));
-        Ok(Self {inner,config,chat_template})
+    pub fn from_json_assets(
+        tokenizer: &[u8],
+        config: &[u8],
+        template: Option<&str>,
+    ) -> Result<Self> {
+        let inner = HfTokenizer::from_bytes(tokenizer)
+            .map_err(|e| Error::Other(format!("tokenizer load: {e}")))?;
+        let config: TokenizerConfig = serde_json::from_slice(config)
+            .map_err(|e| Error::Other(format!("tokenizer config: {e}")))?;
+        let chat_template = config
+            .chat_template
+            .clone()
+            .or_else(|| template.map(str::to_owned));
+        Ok(Self {
+            vocab_size: inner.get_vocab_size(true),
+            inner,
+            config,
+            chat_template,
+        })
     }
 
     /// Build the byte-level BPE tokenizer that Transformers 5 `Qwen2Tokenizer`
@@ -449,6 +468,7 @@ impl Tokenizer {
             .clone()
             .or_else(|| std::fs::read_to_string(template).ok());
         Ok(Self {
+            vocab_size: inner.get_vocab_size(true),
             inner,
             config,
             chat_template,
@@ -476,7 +496,9 @@ impl Tokenizer {
             .cloned()
             .map(|token| AddedToken::from(token, false))
             .collect::<Vec<_>>();
-        self.inner.add_tokens(&tokens)
+        let added = self.inner.add_tokens(&tokens);
+        self.vocab_size = self.inner.get_vocab_size(true);
+        added
     }
 
     /// Resolve one token to its vocabulary ID.
@@ -499,7 +521,7 @@ impl Tokenizer {
 
     /// Get the vocabulary size.
     pub fn vocab_size(&self) -> usize {
-        self.inner.get_vocab_size(true)
+        self.vocab_size
     }
 
     /// Get the EOS token ID.
@@ -757,6 +779,20 @@ mod tests {
     use std::collections::HashMap;
     use tokenizers::models::wordlevel::WordLevel;
 
+    fn test_tokenizer(
+        inner: HfTokenizer,
+        config: TokenizerConfig,
+        chat_template: Option<String>,
+    ) -> Tokenizer {
+        let vocab_size = inner.get_vocab_size(true);
+        Tokenizer {
+            inner,
+            config,
+            chat_template,
+            vocab_size,
+        }
+    }
+
     fn render_json_filter(template: &str) -> String {
         let mut env = Environment::new();
         env.add_filter("tojson", hf_tojson);
@@ -846,6 +882,18 @@ mod tests {
     }
 
     #[test]
+    fn vocab_size_is_cached_and_follows_added_tokens() {
+        let dir = qwen2_dir("vocabsize", qwen2_config(13));
+        let mut tokenizer = Tokenizer::from_qwen2_vocab(&dir).unwrap();
+        let before = tokenizer.vocab_size();
+        assert_eq!(before, tokenizer.inner.get_vocab_size(true));
+        assert_eq!(tokenizer.add_tokens(&["<|reserved_0|>".to_string()]), 1);
+        assert_eq!(tokenizer.vocab_size(), before + 1);
+        assert_eq!(tokenizer.vocab_size(), tokenizer.inner.get_vocab_size(true));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn hf_json_unicode_order_and_spacing_match_python_defaults() {
         assert_eq!(
             render_json_filter("{{ data | tojson }}"),
@@ -888,11 +936,11 @@ mod tests {
 
     #[test]
     fn hf_helpers_are_only_registered_for_explicit_template_options() {
-        let mut tokenizer = Tokenizer {
-            inner: HfTokenizer::new(WordLevel::default()),
-            config: TokenizerConfig::default(),
-            chat_template: Some("{{ 'a<&' | tojson }}".into()),
-        };
+        let mut tokenizer = test_tokenizer(
+            HfTokenizer::new(WordLevel::default()),
+            TokenizerConfig::default(),
+            Some("{{ 'a<&' | tojson }}".into()),
+        );
         // Compare the legacy path to the unmodified upstream environment,
         // including builds that enable MiniJinja's optional builtin tojson.
         let source = tokenizer.chat_template.as_ref().unwrap();
@@ -920,11 +968,11 @@ mod tests {
 
     #[test]
     fn explicit_template_uses_hf_block_whitespace_without_changing_legacy() {
-        let tokenizer = Tokenizer {
-            inner: HfTokenizer::new(WordLevel::default()),
-            config: TokenizerConfig::default(),
-            chat_template: Some("before\n   {% if true %}\nafter\n   {% endif %}\nend".into()),
-        };
+        let tokenizer = test_tokenizer(
+            HfTokenizer::new(WordLevel::default()),
+            TokenizerConfig::default(),
+            Some("before\n   {% if true %}\nafter\n   {% endif %}\nend".into()),
+        );
         assert_eq!(
             tokenizer
                 .apply_chat_template_with_options(&[], &serde_json::Map::new())
@@ -939,11 +987,11 @@ mod tests {
 
     #[test]
     fn explicit_template_options_preserve_exact_prompt_bytes() {
-        let tokenizer = Tokenizer {
-            inner: HfTokenizer::new(WordLevel::default()),
-            config: TokenizerConfig::default(),
-            chat_template: Some("{{ messages[0].content }}\n\n{% if enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}".into()),
-        };
+        let tokenizer = test_tokenizer(
+            HfTokenizer::new(WordLevel::default()),
+            TokenizerConfig::default(),
+            Some("{{ messages[0].content }}\n\n{% if enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}".into()),
+        );
         let messages = [ChatMessage::user("hello")];
         let mut options = serde_json::Map::new();
         options.insert("enable_thinking".into(), false.into());
@@ -973,11 +1021,11 @@ mod tests {
             .unk_token("[UNK]".to_owned())
             .build()
             .unwrap();
-        Tokenizer {
-            inner: HfTokenizer::new(model),
-            config: TokenizerConfig::default(),
-            chat_template: Some("{{ bos_token }}|{{ eos_token }}".to_owned()),
-        }
+        test_tokenizer(
+            HfTokenizer::new(model),
+            TokenizerConfig::default(),
+            Some("{{ bos_token }}|{{ eos_token }}".to_owned()),
+        )
     }
 
     fn legacy_fallback_prompt(tokenizer: &Tokenizer) -> String {
@@ -1189,14 +1237,14 @@ mod tests {
 
     #[test]
     fn rich_messages_render_tool_calls_and_tool_responses() {
-        let tokenizer = Tokenizer {
-            inner: HfTokenizer::new(WordLevel::default()),
-            config: TokenizerConfig::default(),
-            chat_template: Some(
+        let tokenizer = test_tokenizer(
+            HfTokenizer::new(WordLevel::default()),
+            TokenizerConfig::default(),
+            Some(
                 "{{ messages[0].role }}|{{ messages[0].tool_calls[0].function.name }}|{{ messages[0].tool_calls[0].function.arguments.city }}|{{ messages[1].role }}|{{ messages[1].tool_call_id }}|{{ messages[1].content }}"
                     .into(),
             ),
-        };
+        );
         let messages = [
             ChatTemplateMessage::assistant_tool_calls(
                 None,
@@ -1244,11 +1292,11 @@ mod tests {
             .unk_token("[UNK]".to_string())
             .build()
             .unwrap();
-        let mut tokenizer = Tokenizer {
-            inner: HfTokenizer::new(model),
-            config: TokenizerConfig::default(),
-            chat_template: None,
-        };
+        let mut tokenizer = test_tokenizer(
+            HfTokenizer::new(model),
+            TokenizerConfig::default(),
+            None,
+        );
 
         assert_eq!(
             tokenizer.add_tokens(&["<|propri|>".to_string(), "<|action|>".to_string()]),
@@ -1262,11 +1310,11 @@ mod tests {
 
     #[test]
     fn explicit_decode_keeps_tool_protocol_special_tokens() {
-        let mut tokenizer = Tokenizer {
-            inner: HfTokenizer::new(WordLevel::default()),
-            config: TokenizerConfig::default(),
-            chat_template: None,
-        };
+        let mut tokenizer = test_tokenizer(
+            HfTokenizer::new(WordLevel::default()),
+            TokenizerConfig::default(),
+            None,
+        );
         tokenizer
             .inner
             .add_special_tokens(&[AddedToken::from("<function>", true)]);
