@@ -17,7 +17,7 @@ code.
 | Precision / variant | BF16 only; `auto` and `bf16-eager` (the only implemented variant) |
 | Config pins | hidden 2048, intermediate 7680, 24 layers (13 `conv` / 6 `full_attention` / 5 `sliding_attention`), 16 query / 4 KV heads of 128, vocab 128000, norm eps 1e-5, conv width 7, sliding window 256, tied embeddings, sandwich norms |
 | Rotary | two schemes: full theta 1e6 with partial factor 0.5 (64 rotated dims), sliding theta 1e4 (128 rotated dims); zero tail, FP32 tables |
-| Context | **8192 positions** total (`MAX_CONTEXT`). The checkpoint declares 262144, but full-attention layers keep an unbounded dense KV row (12 KiB/token over six layers), so this port admits a smaller envelope instead of promising the checkpoint bound. |
+| Context | **16384 positions** total (`MAX_CONTEXT`). The checkpoint declares 262144, but full-attention layers keep an unbounded dense KV row (12 KiB/token over six layers, about 192 MiB at this ceiling), so this port admits a smaller envelope instead of promising the checkpoint bound. |
 | Prompt protocol | lane ChatML — see below |
 | Serving | OpenAI-compatible gateway through `--provider native` |
 
@@ -145,8 +145,8 @@ hashes every artifact).
 
 ## Known limits and follow-ups
 
-- Context is capped at 8192 positions (see above); long-context work would need
-  a bounded or paged full-attention KV before raising it.
+- Context is capped at 16384 positions (see above); going further would need
+  a bounded or paged full-attention KV.
 - No compiled or captured decode scope yet; `preparation_status` says so.
 - The port uses the ordinary lazy MLX dispatch path outside the optional ANE
   MLP column split above; the Python lane's ANE-composed prefill and 4-bit

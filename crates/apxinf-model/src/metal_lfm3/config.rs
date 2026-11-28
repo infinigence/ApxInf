@@ -13,7 +13,10 @@ use serde::Deserialize;
 /// The checkpoint declares `max_position_embeddings = 262144`, but full-attention
 /// layers keep an unbounded dense KV row (12 KiB per token over six layers), so
 /// this port admits a smaller envelope instead of promising the checkpoint bound.
-pub const MAX_CONTEXT: usize = 8192;
+/// At 16,384 positions the dense KV rows take about 192 MiB, which leaves the
+/// 4-bit checkpoint and the worker's scratch well inside a 16 GB host, and it
+/// matches the ceiling `apxinf-serve` enforces for the native text provider.
+pub const MAX_CONTEXT: usize = 16384;
 
 /// Capacity rounding so a growing request set does not reallocate every prompt.
 const CAPACITY_GRAIN: usize = 256;
